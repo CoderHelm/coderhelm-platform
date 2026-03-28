@@ -27,6 +27,8 @@ export class WorkerStack extends cdk.Stack {
     super(scope, id, props);
 
     const prefix = `d3ftly-${props.stage}`;
+    const workerAssetPath =
+      process.env.WORKER_ZIP ?? "../services/worker/target/lambda/worker";
 
     const secrets = secretsmanager.Secret.fromSecretNameV2(
       this,
@@ -47,7 +49,7 @@ export class WorkerStack extends cdk.Stack {
       runtime: lambda.Runtime.PROVIDED_AL2023,
       architecture: lambda.Architecture.ARM_64,
       handler: "bootstrap",
-      code: lambda.Code.fromAsset("../services/worker/target/lambda/worker"),
+      code: lambda.Code.fromAsset(workerAssetPath),
       memorySize: 256,
       timeout: cdk.Duration.minutes(15),
       logGroup: workerLogGroup,

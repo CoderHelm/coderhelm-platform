@@ -154,6 +154,185 @@ pub async fn list_repos(
     Ok(Json(json!({ "repos": repos })))
 }
 
+/// GET /api/integrations/jira/check — quick Jira integration readiness check.
+pub async fn get_jira_integration_check(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let repos_result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":prefix", attr_s("REPO#"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query repos for Jira check: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let repo_items = repos_result.items();
+    let repo_count = repo_items.len();
+    let enabled_repo_count = repo_items
+        .iter()
+        .filter(|item| {
+            item.get("enabled")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(true)
+        })
+        .count();
+
+    let runs_result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("tenant_id = :tid")
+        .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
+        .scan_index_forward(false)
+        .limit(25)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query runs for Jira check: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let jira_seen = runs_result.items().iter().any(|item| {
+        item.get("ticket_source")
+            .and_then(|v| v.as_s().ok())
+            .map(|v| v == "jira")
+            .unwrap_or(false)
+    });
+
+    let secret_configured = state.secrets.jira_webhook_secret.is_some();
+    let ready = secret_configured && enabled_repo_count > 0;
+
+    Ok(Json(json!({
+        "ready": ready,
+        "secret_configured": secret_configured,
+        "configured_repos": {
+            "total": repo_count,
+            "enabled": enabled_repo_count
+        },
+        "jira_events_seen": jira_seen,
+        "recommended_flow": "Jira Automation rule -> Send web request -> /webhooks/jira",
+        "checklist": [
+            "Use issue events: jira:issue_created and jira:issue_updated",
+            "Keep webhook body included (do not exclude body)",
+            "Configure secret in Jira webhook and d3ftly secrets",
+            "Map repo_owner and repo_name in the payload",
+            "Return 2xx quickly and process async (already handled by queueing)"
+        ],
+        "payload_template": {
+            "repo_owner": "your-org",
+            "repo_name": "your-repo",
+            "installation_id": 123456,
+            "issue": {
+                "key": "PROJ-123",
+                "fields": {
+                    "summary": "Implement feature",
+                    "description": "Acceptance criteria"
+                }
+            }
+        },
+        "check_endpoint": "/api/integrations/jira/check",
+        "intake_endpoint": "/webhooks/jira"
+    })))
+}
+
+/// POST /api/integrations/jira/check — validate a candidate Jira payload before wiring automation.
+pub async fn validate_jira_integration_payload(
+    Extension(_claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let top = |key: &str| body.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let nested = |path1: &str, path2: &str| {
+        body.get(path1)
+            .and_then(|v| v.get(path2))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+
+    let repo_owner = top("repo_owner").or_else(|| nested("d3ftly", "repo_owner"));
+    let repo_name = top("repo_name").or_else(|| nested("d3ftly", "repo_name"));
+
+    let installation_id = body
+        .get("installation_id")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            body.get("d3ftly")
+                .and_then(|v| v.get("installation_id"))
+                .and_then(|v| v.as_u64())
+        });
+    let tenant_id = top("tenant_id").or_else(|| nested("d3ftly", "tenant_id"));
+
+    let issue_key = body
+        .get("issue")
+        .and_then(|v| v.get("key"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            body.get("issue")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+
+    let issue_summary = body
+        .get("issue")
+        .and_then(|v| v.get("fields"))
+        .and_then(|v| v.get("summary"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            body.get("issue")
+                .and_then(|v| v.get("title"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+
+    let mut missing = Vec::new();
+    if repo_owner.is_none() {
+        missing.push("repo_owner (or d3ftly.repo_owner)");
+    }
+    if repo_name.is_none() {
+        missing.push("repo_name (or d3ftly.repo_name)");
+    }
+    if installation_id.is_none() && tenant_id.is_none() {
+        missing.push("installation_id (or tenant_id)");
+    }
+    if issue_key.is_none() {
+        missing.push("issue.key (or issue.id)");
+    }
+    if issue_summary.is_none() {
+        missing.push("issue.fields.summary (or issue.title)");
+    }
+
+    let valid = missing.is_empty();
+
+    Ok(Json(json!({
+        "valid": valid,
+        "missing": missing,
+        "normalized_preview": {
+            "repo_owner": repo_owner,
+            "repo_name": repo_name,
+            "installation_id": installation_id,
+            "tenant_id": tenant_id,
+            "ticket_id": issue_key,
+            "title": issue_summary,
+            "event": body.get("webhookEvent").and_then(|v| v.as_str()).unwrap_or("unknown")
+        },
+        "next_step": if valid {
+            "Payload shape looks good. Point Jira automation/webhook to /webhooks/jira."
+        } else {
+            "Fix missing fields above and run this check again."
+        }
+    })))
+}
+
 /// POST /api/repos/:repo — update repo config.
 pub async fn update_repo(
     State(state): State<Arc<AppState>>,
