@@ -86,9 +86,12 @@ function InfrastructureContent() {
 
   const handleCopyPrompt = () => {
     if (!analysis?.suggested_prompt) return;
-    navigator.clipboard.writeText(analysis.suggested_prompt);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    navigator.clipboard.writeText(analysis.suggested_prompt).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {
+      toast("Failed to copy to clipboard", "error");
+    });
   };
 
   if (loading) {

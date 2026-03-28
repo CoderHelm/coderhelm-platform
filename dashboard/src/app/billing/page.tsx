@@ -262,8 +262,12 @@ export default function BillingPage() {
                       {inv.invoice_id && (
                         <button
                           onClick={async () => {
-                            const { pdf_url } = await api.getInvoicePdf(inv.invoice_id!);
-                            window.open(pdf_url, "_blank");
+                              try {
+                                const { pdf_url } = await api.getInvoicePdf(inv.invoice_id!);
+                                window.open(pdf_url, "_blank");
+                              } catch {
+                                toast("Failed to download invoice", "error");
+                              }
                           }}
                           className="text-blue-400 hover:underline text-xs"
                         >
