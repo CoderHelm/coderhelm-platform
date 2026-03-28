@@ -1,38 +1,66 @@
 #!/bin/bash
 set -euo pipefail
 
+# Idempotent Stripe setup — safe to run in CI on every deploy.
 # Usage: STRIPE_SECRET_KEY=sk_test_... ./scripts/setup-stripe.sh
 
 if [[ -z "${STRIPE_SECRET_KEY:-}" ]]; then
   echo "Error: STRIPE_SECRET_KEY not set"
-  echo "Usage: STRIPE_SECRET_KEY=sk_test_... ./scripts/setup-stripe.sh"
   exit 1
 fi
 
 SK="$STRIPE_SECRET_KEY"
+DESIRED_AMOUNT=19900  # $199.00/month
 
-echo "=== 1. Creating Product ==="
-PRODUCT=$(curl -sf https://api.stripe.com/v1/products \
-  -u "$SK:" \
-  -d "name=d3ftly Pro" \
-  -d "description=AI-powered code review for your repositories" \
-  -d "metadata[app]=d3ftly")
+echo "=== 1. Finding or creating Product ==="
+EXISTING=$(curl -sf "https://api.stripe.com/v1/products/search?query=metadata[%27app%27]:%27d3ftly%27" \
+  -u "$SK:" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+products = [p for p in data.get('data', []) if p.get('active')]
+print(products[0]['id'] if products else '')
+")
 
-PRODUCT_ID=$(echo "$PRODUCT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-echo "Product ID: $PRODUCT_ID"
+if [[ -n "$EXISTING" ]]; then
+  PRODUCT_ID="$EXISTING"
+  echo "Using existing product: $PRODUCT_ID"
+else
+  PRODUCT=$(curl -sf https://api.stripe.com/v1/products \
+    -u "$SK:" \
+    -d "name=d3ftly Pro" \
+    -d "description=AI-powered code review for your repositories" \
+    -d "metadata[app]=d3ftly")
+  PRODUCT_ID=$(echo "$PRODUCT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+  echo "Created product: $PRODUCT_ID"
+fi
 
 echo ""
-echo "=== 2. Creating Price (\$29.99/month) ==="
-PRICE=$(curl -sf https://api.stripe.com/v1/prices \
-  -u "$SK:" \
-  -d "product=$PRODUCT_ID" \
-  -d "unit_amount=2999" \
-  -d "currency=usd" \
-  -d "recurring[interval]=month" \
-  -d "metadata[app]=d3ftly")
+echo "=== 2. Finding or creating Price (\$199/month) ==="
+PRICE_ID=$(curl -sf "https://api.stripe.com/v1/prices?product=$PRODUCT_ID&active=true&limit=10" \
+  -u "$SK:" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for p in data.get('data', []):
+    if p.get('unit_amount') == $DESIRED_AMOUNT and p.get('recurring', {}).get('interval') == 'month':
+        print(p['id'])
+        break
+else:
+    print('')
+")
 
-PRICE_ID=$(echo "$PRICE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-echo "Price ID: $PRICE_ID"
+if [[ -n "$PRICE_ID" ]]; then
+  echo "Using existing price: $PRICE_ID"
+else
+  PRICE=$(curl -sf https://api.stripe.com/v1/prices \
+    -u "$SK:" \
+    -d "product=$PRODUCT_ID" \
+    -d "unit_amount=$DESIRED_AMOUNT" \
+    -d "currency=usd" \
+    -d "recurring[interval]=month" \
+    -d "metadata[app]=d3ftly")
+  PRICE_ID=$(echo "$PRICE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+  echo "Created price: $PRICE_ID"
+fi
 
 echo ""
 echo "=== 3. Configuring Customer Portal ==="

@@ -205,6 +205,12 @@ async fn onboard_repo(
         .await?;
 
     info!(repo = %full_name, "Committed .d3ftly/AGENTS.md");
+
+    // Generate .d3ftly/VOICE.md from recent PRs and commits
+    if let Err(e) = generate_voice_md(state, github, repo).await {
+        warn!(repo = %full_name, error = %e, "Failed to generate VOICE.md");
+    }
+
     Ok(())
 }
 
@@ -270,6 +276,102 @@ fn extract_text_from_response(
         }
         _ => Err("Unexpected output type".into()),
     }
+}
+
+async fn generate_voice_md(
+    state: &WorkerState,
+    github: &GitHubClient,
+    repo: &crate::models::OnboardRepo,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let full_name = format!("{}/{}", repo.owner, repo.name);
+
+    // Collect recent PR descriptions and review comments for voice analysis
+    let prs = github
+        .list_pull_requests(&repo.owner, &repo.name, "closed", 10)
+        .await
+        .unwrap_or_default();
+
+    let mut samples: Vec<String> = Vec::new();
+
+    for pr in prs.as_array().unwrap_or(&vec![]).iter().take(10) {
+        if let Some(body) = pr.get("body").and_then(|b| b.as_str()) {
+            if !body.is_empty() {
+                let truncated = if body.len() > 2048 {
+                    &body[..2048]
+                } else {
+                    body
+                };
+                samples.push(format!("--- PR description ---\n{truncated}"));
+            }
+        }
+    }
+
+    // Get recent commit messages
+    let commits = github
+        .list_commits(&repo.owner, &repo.name, &repo.default_branch, 20)
+        .await
+        .unwrap_or_default();
+
+    for commit in commits.as_array().unwrap_or(&vec![]).iter().take(20) {
+        if let Some(message) = commit.pointer("/commit/message").and_then(|m| m.as_str()) {
+            samples.push(format!("--- Commit message ---\n{message}"));
+        }
+    }
+
+    if samples.is_empty() {
+        info!(repo = %full_name, "No PR/commit samples found, skipping VOICE.md");
+        return Ok(());
+    }
+
+    let system = "You analyze code repository communication patterns (PR descriptions, commit messages, review comments) \
+                  and generate a concise style guide. Output ONLY the markdown content, no code fences.";
+
+    let prompt = format!(
+        "Analyze these PR descriptions and commit messages from {full_name} and create a VOICE.md style guide.\n\n\
+         {samples}\n\n\
+         Generate a VOICE.md with these sections:\n\
+         1. **Tone** — Formal/casual/terse? Emoji usage?\n\
+         2. **Commit Messages** — Convention (conventional commits, imperative, etc.), typical length\n\
+         3. **PR Descriptions** — Structure, level of detail, typical sections\n\
+         4. **Language** — Technical jargon level, abbreviation patterns\n\
+         5. **Examples** — 2-3 short examples of commit messages and PR titles matching this voice\n\n\
+         Keep it under 80 lines. Be specific about observed patterns, not generic advice.",
+        samples = samples.join("\n\n")
+    );
+
+    let messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
+        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
+        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
+        .build()
+        .map_err(|e| format!("Failed to build message: {e}"))?];
+
+    let response = state
+        .bedrock
+        .converse()
+        .model_id(&state.config.model_id)
+        .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
+            system.to_string(),
+        ))
+        .set_messages(Some(messages))
+        .send()
+        .await?;
+
+    let voice_md = extract_text_from_response(&response)?;
+
+    github
+        .write_file(
+            &repo.owner,
+            &repo.name,
+            ".d3ftly/VOICE.md",
+            &voice_md,
+            &repo.default_branch,
+            "chore: add .d3ftly/VOICE.md for team voice and tone",
+            None,
+        )
+        .await?;
+
+    info!(repo = %full_name, "Committed .d3ftly/VOICE.md");
+    Ok(())
 }
 
 async fn load_instructions(state: &WorkerState, tenant_id: &str, sk: &str) -> String {

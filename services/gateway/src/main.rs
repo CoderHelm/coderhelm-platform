@@ -77,6 +77,15 @@ async fn main() -> Result<(), Error> {
             "/instructions/repo/:repo",
             get(routes::api::get_repo_instructions).put(routes::api::update_repo_instructions),
         )
+        // Must-rules endpoints
+        .route(
+            "/rules/global",
+            get(routes::api::get_global_rules).put(routes::api::update_global_rules),
+        )
+        .route(
+            "/rules/repo/:repo",
+            get(routes::api::get_repo_rules).put(routes::api::update_repo_rules),
+        )
         // Billing endpoints
         .route("/billing", get(routes::billing::get_billing))
         .route(

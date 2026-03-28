@@ -517,6 +517,33 @@ impl GitHubClient {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
         self.get(&url).await.is_ok()
     }
+
+    /// List pull requests (state: "open", "closed", "all").
+    pub async fn list_pull_requests(
+        &self,
+        owner: &str,
+        repo: &str,
+        state: &str,
+        per_page: u32,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/pulls?state={state}&per_page={per_page}&sort=updated&direction=desc"
+        );
+        self.get(&url).await
+    }
+
+    /// List recent commits on a branch.
+    pub async fn list_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        per_page: u32,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url =
+            format!("{API_BASE}/repos/{owner}/{repo}/commits?sha={branch}&per_page={per_page}");
+        self.get(&url).await
+    }
 }
 
 // ─── Types ──────────────────────────────────────────────────
