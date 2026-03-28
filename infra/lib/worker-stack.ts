@@ -60,7 +60,7 @@ export class WorkerStack extends cdk.Stack {
         ANALYTICS_TABLE_NAME: props.analyticsTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
         SECRETS_NAME: `d3ftly/${props.stage}/secrets`,
-        MODEL_ID: process.env.MODEL_ID!,
+        MODEL_ID: process.env.MODEL_ID || "us.anthropic.claude-opus-4-6-v1",
         SES_FROM_ADDRESS: "notifications@d3ftly.com",
         SES_TEMPLATE_PREFIX: `d3ftly-${props.stage}`,
         RUST_LOG: "info",
