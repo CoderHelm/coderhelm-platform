@@ -2,7 +2,7 @@ use tracing::info;
 
 use crate::agent::llm;
 use crate::clients::github::GitHubClient;
-use crate::models::{TicketMessage, TokenUsage};
+use crate::models::{TicketMessage, TicketSource, TokenUsage};
 use crate::passes::plan::PlanResult;
 use crate::WorkerState;
 
@@ -39,8 +39,13 @@ pub async fn run(
         "You are writing a pull request description. Be concise and technical. Return only markdown.{voice_block}"
     );
 
+    let ticket_ref = match msg.source {
+        TicketSource::Github => format!("#{}", msg.issue_number),
+        TicketSource::Jira => msg.ticket_id.clone(),
+    };
+
     let prompt = format!(
-        r#"Write a concise pull request description for issue #{number}: {title}
+        r#"Write a concise pull request description for ticket {ticket_ref}: {title}
 
 ## Summary
 {summary}
@@ -63,7 +68,7 @@ Rules:
 - Bold for emphasis on key concepts.
 
 Return ONLY the markdown body text."#,
-        number = msg.issue_number,
+        ticket_ref = ticket_ref,
         title = msg.title,
         summary = plan.proposal,
         diff_summary = diff_summary,
@@ -84,15 +89,22 @@ Return ONLY the markdown body text."#,
     )
     .await?;
 
-    // Add issue link at the top
-    let full_body = format!(
-        "Closes #{number}\n\n{body_text}",
-        number = msg.issue_number,
-        body_text = body_text.trim(),
-    );
+    // Add issue link for GitHub tickets.
+    let full_body = if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+        format!(
+            "Closes #{number}\n\n{body_text}",
+            number = msg.issue_number,
+            body_text = body_text.trim(),
+        )
+    } else {
+        format!("Source ticket: {}\n\n{}", msg.ticket_id, body_text.trim())
+    };
 
     // Create PR title
-    let mut title = format!("#{}: {}", msg.issue_number, msg.title);
+    let mut title = match msg.source {
+        TicketSource::Github => format!("#{}: {}", msg.issue_number, msg.title),
+        TicketSource::Jira => format!("{}: {}", msg.ticket_id, msg.title),
+    };
     if title.len() > 72 {
         title.truncate(69);
         title.push_str("...");
