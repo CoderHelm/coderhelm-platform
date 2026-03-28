@@ -889,3 +889,59 @@ pub async fn update_repo_agents(
     let sk = format!("AGENTS#REPO#{repo}");
     update_instructions_inner(&state, &claims.tenant_id, &sk, content).await
 }
+
+/// GET /api/settings/budget — get monthly budget cap.
+pub async fn get_budget(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("SETTINGS#BUDGET"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch budget: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let max_budget_cents = result
+        .item()
+        .and_then(|i| i.get("max_budget_cents"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0); // 0 = no cap
+
+    Ok(Json(json!({ "max_budget_cents": max_budget_cents })))
+}
+
+/// PUT /api/settings/budget — set monthly budget cap.
+pub async fn update_budget(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    let max_budget_cents = body["max_budget_cents"].as_u64().unwrap_or(0);
+
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.table_name)
+        .item("pk", attr_s(&claims.tenant_id))
+        .item("sk", attr_s("SETTINGS#BUDGET"))
+        .item(
+            "max_budget_cents",
+            aws_sdk_dynamodb::types::AttributeValue::N(max_budget_cents.to_string()),
+        )
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to update budget: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(StatusCode::OK)
+}

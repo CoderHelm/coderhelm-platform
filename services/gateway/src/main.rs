@@ -102,6 +102,11 @@ async fn main() -> Result<(), Error> {
             "/agents/repo/:repo",
             get(routes::api::get_repo_agents).put(routes::api::update_repo_agents),
         )
+        // Budget settings
+        .route(
+            "/settings/budget",
+            get(routes::api::get_budget).put(routes::api::update_budget),
+        )
         // Billing endpoints
         .route("/billing", get(routes::billing::get_billing))
         .route(
