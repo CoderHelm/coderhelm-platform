@@ -69,6 +69,12 @@ export class ApiStack extends cdk.Stack {
 
     // --- Gateway Lambda (Rust) ---
 
+    const gatewayLogGroup = new logs.LogGroup(this, "GatewayLogGroup", {
+      logGroupName: `/aws/lambda/${prefix}-gateway`,
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     this.gatewayFunction = new lambda.Function(this, "Gateway", {
       functionName: `${prefix}-gateway`,
       runtime: lambda.Runtime.PROVIDED_AL2023,
@@ -77,7 +83,7 @@ export class ApiStack extends cdk.Stack {
       code: lambda.Code.fromAsset("../services/gateway/target/lambda/gateway"),
       memorySize: 128,
       timeout: cdk.Duration.seconds(10),
-      logRetention: logs.RetentionDays.ONE_MONTH,
+      logGroup: gatewayLogGroup,
       environment: {
         STAGE: props.stage,
         TABLE_NAME: props.table.tableName,
