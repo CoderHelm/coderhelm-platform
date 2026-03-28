@@ -15,7 +15,6 @@ env:
 jobs:
   build-gateway:
     name: Build Gateway
-    if: contains(github.event.head_commit.message, 'CI:DEPLOY_PROD')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +44,6 @@ jobs:
 
   build-worker:
     name: Build Worker
-    if: contains(github.event.head_commit.message, 'CI:DEPLOY_PROD')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
