@@ -15,10 +15,12 @@ export default function PlansPage() {
   const [plans, setPlans] = useState<Plan[]>([]);
   const [loading, setLoading] = useState(true);
 
+  const [error, setError] = useState(false);
+
   useEffect(() => {
     api.listPlans()
       .then((data) => setPlans(data.plans))
-      .catch(() => {})
+      .catch(() => setError(true))
       .finally(() => setLoading(false));
   }, []);
 
@@ -41,6 +43,10 @@ export default function PlansPage() {
 
       {loading ? (
         <TableSkeleton rows={4} cols={4} />
+      ) : error ? (
+        <div className="text-red-400 border border-red-500/20 bg-red-500/5 rounded-lg p-8 text-center">
+          <p className="text-sm">Failed to load plans. Please refresh.</p>
+        </div>
       ) : plans.length === 0 ? (
         <div className="border border-zinc-800 rounded-lg p-12 text-center text-zinc-500">
           <p className="text-lg mb-2">No plans yet</p>

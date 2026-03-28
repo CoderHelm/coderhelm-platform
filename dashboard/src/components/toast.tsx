@@ -16,9 +16,10 @@ export function useToast() {
   return useContext(ToastContext);
 }
 
+let nextId = 0;
+
 export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
-  let nextId = 0;
 
   const toast = useCallback((message: string, type: "success" | "error" = "success") => {
     const id = ++nextId;

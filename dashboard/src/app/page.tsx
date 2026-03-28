@@ -7,12 +7,13 @@ import { TableSkeleton } from "@/components/skeleton";
 export default function RunsPage() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
 
   useEffect(() => {
-    api.listRuns().then((data) => {
-      setRuns(data.runs);
-      setLoading(false);
-    }).catch(() => setLoading(false));
+    api.listRuns()
+      .then((data) => setRuns(data.runs))
+      .catch(() => setError(true))
+      .finally(() => setLoading(false));
   }, []);
 
   return (
@@ -20,6 +21,10 @@ export default function RunsPage() {
       <h1 className="text-2xl font-bold mb-6">Runs</h1>
       {loading ? (
         <TableSkeleton rows={5} cols={5} />
+      ) : error ? (
+        <div className="text-red-400 border border-red-500/20 bg-red-500/5 rounded-lg p-8 text-center">
+          <p className="text-sm">Failed to load runs. Please refresh.</p>
+        </div>
       ) : runs.length === 0 ? (
         <div className="text-zinc-500 border border-zinc-800 rounded-lg p-8 text-center">
           <p className="text-lg mb-2">No runs yet</p>
@@ -41,9 +46,7 @@ export default function RunsPage() {
               {runs.map((run) => (
                 <tr key={run.run_id} className="hover:bg-zinc-900/50">
                   <td className="px-4 py-3">
-                    <a href={`/runs/${run.run_id}`} className="text-zinc-100 hover:underline">
-                      {run.title}
-                    </a>
+                    <span className="text-zinc-100">{run.title}</span>
                   </td>
                   <td className="px-4 py-3 text-zinc-400 font-mono text-xs">{run.repo}</td>
                   <td className="px-4 py-3">
