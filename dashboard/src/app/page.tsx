@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, type Run } from "@/lib/api";
+import { TableSkeleton } from "@/components/skeleton";
 
 export default function RunsPage() {
   const [runs, setRuns] = useState<Run[]>([]);
@@ -18,7 +19,7 @@ export default function RunsPage() {
     <div>
       <h1 className="text-2xl font-bold mb-6">Runs</h1>
       {loading ? (
-        <p className="text-zinc-500">Loading...</p>
+        <TableSkeleton rows={5} cols={5} />
       ) : runs.length === 0 ? (
         <div className="text-zinc-500 border border-zinc-800 rounded-lg p-8 text-center">
           <p className="text-lg mb-2">No runs yet</p>

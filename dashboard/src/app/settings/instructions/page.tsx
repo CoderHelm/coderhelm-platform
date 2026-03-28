@@ -2,11 +2,14 @@
 
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { useToast } from "@/components/toast";
+import { TextareaSkeleton } from "@/components/skeleton";
 
 export default function InstructionsPage() {
   const [content, setContent] = useState("");
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
+  const { toast } = useToast();
 
   useEffect(() => {
     api.getGlobalInstructions().then((data) => {
@@ -19,8 +22,9 @@ export default function InstructionsPage() {
     setSaving(true);
     try {
       await api.updateGlobalInstructions(content);
-    } catch (e) {
-      console.error("Failed to save instructions:", e);
+      toast("Instructions saved");
+    } catch {
+      toast("Failed to save instructions", "error");
     }
     setSaving(false);
   };
@@ -34,7 +38,7 @@ export default function InstructionsPage() {
       </p>
 
       {loading ? (
-        <p className="text-zinc-500">Loading...</p>
+        <TextareaSkeleton />
       ) : (
         <>
           <textarea
