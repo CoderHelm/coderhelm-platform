@@ -598,3 +598,55 @@ async fn update_rules_inner(
 
     Ok(StatusCode::OK)
 }
+
+// ─── Voice settings ─────────────────────────────────────────────────
+
+/// GET /api/voice/repo/:repo — get voice/tone settings for a repo.
+pub async fn get_repo_voice(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(repo): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    validate_repo_name(&repo)?;
+    let sk = format!("VOICE#REPO#{repo}");
+    get_instructions_inner(&state, &claims.tenant_id, &sk).await
+}
+
+/// PUT /api/voice/repo/:repo — update voice/tone settings for a repo.
+pub async fn update_repo_voice(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(repo): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    validate_repo_name(&repo)?;
+    let content = body["content"].as_str().unwrap_or("");
+    let sk = format!("VOICE#REPO#{repo}");
+    update_instructions_inner(&state, &claims.tenant_id, &sk, content).await
+}
+
+// ─── Agents context ─────────────────────────────────────────────────
+
+/// GET /api/agents/repo/:repo — get agents context for a repo.
+pub async fn get_repo_agents(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(repo): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    validate_repo_name(&repo)?;
+    let sk = format!("AGENTS#REPO#{repo}");
+    get_instructions_inner(&state, &claims.tenant_id, &sk).await
+}
+
+/// PUT /api/agents/repo/:repo — update agents context for a repo.
+pub async fn update_repo_agents(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(repo): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    validate_repo_name(&repo)?;
+    let content = body["content"].as_str().unwrap_or("");
+    let sk = format!("AGENTS#REPO#{repo}");
+    update_instructions_inner(&state, &claims.tenant_id, &sk, content).await
+}
