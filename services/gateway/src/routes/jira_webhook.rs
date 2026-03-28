@@ -22,20 +22,7 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    // Verify signature only when secret is configured.
-    if let Some(secret) = &state.secrets.jira_webhook_secret {
-        let signature = headers
-            .get("x-hub-signature-256")
-            .or_else(|| headers.get("x-hub-signature"))
-            .and_then(|v| v.to_str().ok())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-
-        if !verify_jira_signature(secret, &body, signature) {
-            warn!("Invalid Jira webhook signature");
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-    }
-
+    // Parse payload first so we can resolve tenant for per-tenant secret lookup.
     let payload: Value = serde_json::from_slice(&body).map_err(|e| {
         error!("Failed to parse Jira webhook body: {e}");
         StatusCode::BAD_REQUEST
@@ -135,6 +122,25 @@ pub async fn handle(
         }
         (None, None) => return Err(StatusCode::BAD_REQUEST),
     };
+
+    // Verify signature: per-tenant secret (DynamoDB) > global secret (Secrets Manager) > skip.
+    let tenant_secret = super::api::load_jira_secret(&state, &tenant_id).await;
+    let effective_secret = tenant_secret
+        .as_deref()
+        .or(state.secrets.jira_webhook_secret.as_deref());
+
+    if let Some(secret) = effective_secret {
+        let signature = headers
+            .get("x-hub-signature-256")
+            .or_else(|| headers.get("x-hub-signature"))
+            .and_then(|v| v.to_str().ok())
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+
+        if !verify_jira_signature(secret, &body, signature) {
+            warn!("Invalid Jira webhook signature");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
 
     let title = issue
         .get("fields")
