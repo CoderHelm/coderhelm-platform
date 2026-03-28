@@ -1,0 +1,140 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+# Only deploy when the commit message contains CI:DEPLOY_PROD
+
+env:
+  AWS_REGION: us-east-1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-gateway:
+    name: Build Gateway
+    if: contains(github.event.head_commit.message, 'CI:DEPLOY_PROD')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/gateway
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build
+        working-directory: services/gateway
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target aarch64-unknown-linux-musl
+      - name: Package bootstrap
+        run: |
+          cp services/gateway/target/aarch64-unknown-linux-musl/release/gateway bootstrap
+          zip gateway.zip bootstrap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gateway
+          path: gateway.zip
+
+  build-worker:
+    name: Build Worker
+    if: contains(github.event.head_commit.message, 'CI:DEPLOY_PROD')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services/worker
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build
+        working-directory: services/worker
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target aarch64-unknown-linux-musl
+      - name: Package bootstrap
+        run: |
+          cp services/worker/target/aarch64-unknown-linux-musl/release/worker bootstrap
+          zip worker.zip bootstrap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worker
+          path: worker.zip
+
+  build-dashboard:
+    name: Build Dashboard
+    if: contains(github.event.head_commit.message, 'CI:DEPLOY_PROD')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - working-directory: dashboard
+        run: npm ci
+      - working-directory: dashboard
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: https://api.d3ftly.com
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard
+          path: dashboard/out
+
+  deploy:
+    name: CDK Deploy
+    needs: [build-gateway, build-worker, build-dashboard]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: infra/package-lock.json
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gateway
+          path: artifacts/
+      - uses: actions/download-artifact@v4
+        with:
+          name: worker
+          path: artifacts/
+      - uses: actions/download-artifact@v4
+        with:
+          name: dashboard
+          path: artifacts/dashboard/
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::654654210434:role/d3ftly-github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - working-directory: infra
+        run: npm ci
+      - working-directory: infra
+        run: npx cdk deploy --all --require-approval never
+        env:
+          GATEWAY_ZIP: ${{ github.workspace }}/artifacts/gateway.zip
+          WORKER_ZIP: ${{ github.workspace }}/artifacts/worker.zip
+          DASHBOARD_DIR: ${{ github.workspace }}/artifacts/dashboard/
