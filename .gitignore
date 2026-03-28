@@ -9,6 +9,10 @@ infra/cdk.out/
 infra/**/*.js
 infra/**/*.d.ts
 
+# Dashboard build
+dashboard/.next/
+dashboard/out/
+
 # Environment
 .env
 .env.*

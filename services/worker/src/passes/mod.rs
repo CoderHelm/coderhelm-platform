@@ -62,11 +62,13 @@ async fn run_passes(
     // Load must-rules (global + repo-specific)
     let rules = load_rules(state, msg).await;
 
-    // Load voice instructions from .d3ftly/VOICE.md (if exists)
-    let voice = github
-        .read_file(&msg.repo_owner, &msg.repo_name, ".d3ftly/VOICE.md", "main")
-        .await
-        .unwrap_or_default();
+    // Load voice instructions from DynamoDB
+    let voice = load_content(
+        state,
+        &msg.tenant_id,
+        &format!("VOICE#REPO#{}/{}", msg.repo_owner, msg.repo_name),
+    )
+    .await;
 
     // Post "working on it" comment on the issue
     github
@@ -410,7 +412,11 @@ fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValu
 
 /// Load must-rules (global + repo-specific) from DynamoDB and merge them.
 async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<String> {
-    let mut rules = Vec::new();
+    // Hardcoded safety rules that always apply
+    let mut rules = vec![
+        "Never push directly to the default/main branch. Always create a feature branch."
+            .to_string(),
+    ];
 
     // Load global rules
     if let Some(global) = load_rule_list(state, &msg.tenant_id, "RULES#GLOBAL").await {
@@ -423,9 +429,7 @@ async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<String> {
         rules.extend(repo_rules);
     }
 
-    if !rules.is_empty() {
-        info!(count = rules.len(), "Loaded must-rules");
-    }
+    info!(count = rules.len(), "Loaded must-rules");
     rules
 }
 
@@ -462,4 +466,28 @@ pub fn format_rules_block(rules: &[String]) -> String {
         block.push_str(&format!("- {rule}\n"));
     }
     block
+}
+
+/// Load a text content field from single-table DynamoDB (voice, agents, etc.).
+async fn load_content(state: &WorkerState, tenant_id: &str, sk: &str) -> String {
+    match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("sk", AttributeValue::S(sk.to_string()))
+        .send()
+        .await
+    {
+        Ok(output) => output
+            .item()
+            .and_then(|item| item.get("content"))
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default(),
+        Err(e) => {
+            warn!(error = %e, "Failed to load content from {sk}");
+            String::new()
+        }
+    }
 }

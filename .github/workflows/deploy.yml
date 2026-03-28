@@ -88,7 +88,9 @@ jobs:
         with:
           node-version: lts/*
           cache: npm
-          cache-dependency-path: infra/package-lock.json
+          cache-dependency-path: |
+            infra/package-lock.json
+            dashboard/package-lock.json
 
       - uses: actions/download-artifact@v4
         with:
@@ -104,10 +106,12 @@ jobs:
           role-to-assume: arn:aws:iam::REDACTED_AWS_ACCOUNT_ID:role/d3ftly-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Build dashboard
+        working-directory: dashboard
+        run: npm ci && npm run build
+
       - name: Stripe setup (idempotent)
         run: bash scripts/setup-stripe.sh
-        env:
-          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
 
       - working-directory: infra
         run: npm ci

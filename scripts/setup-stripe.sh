@@ -2,14 +2,23 @@
 set -euo pipefail
 
 # Idempotent Stripe setup — safe to run in CI on every deploy.
-# Usage: STRIPE_SECRET_KEY=sk_test_... ./scripts/setup-stripe.sh
+# Pulls Stripe key from AWS Secrets Manager (d3ftly/prod/secrets).
+# Requires AWS credentials to be configured.
 
-if [[ -z "${STRIPE_SECRET_KEY:-}" ]]; then
-  echo "Error: STRIPE_SECRET_KEY not set"
-  exit 1
+STAGE="${STAGE:-prod}"
+SECRET_NAME="d3ftly/${STAGE}/secrets"
+
+echo "Fetching Stripe key from AWS Secrets Manager (${SECRET_NAME})..."
+SK=$(aws secretsmanager get-secret-value \
+  --secret-id "$SECRET_NAME" \
+  --query 'SecretString' \
+  --output text | python3 -c "import sys,json; print(json.load(sys.stdin).get('stripe_secret_key',''))")
+
+if [[ -z "$SK" ]]; then
+  echo "Warning: No stripe_secret_key found in ${SECRET_NAME}, skipping Stripe setup"
+  exit 0
 fi
 
-SK="$STRIPE_SECRET_KEY"
 DESIRED_AMOUNT=19900  # $199.00/month
 
 echo "=== 1. Finding or creating Product ==="

@@ -86,6 +86,16 @@ async fn main() -> Result<(), Error> {
             "/rules/repo/:repo",
             get(routes::api::get_repo_rules).put(routes::api::update_repo_rules),
         )
+        // Voice settings (per-repo)
+        .route(
+            "/voice/repo/:repo",
+            get(routes::api::get_repo_voice).put(routes::api::update_repo_voice),
+        )
+        // Agents context (per-repo)
+        .route(
+            "/agents/repo/:repo",
+            get(routes::api::get_repo_agents).put(routes::api::update_repo_agents),
+        )
         // Billing endpoints
         .route("/billing", get(routes::billing::get_billing))
         .route(

@@ -39,6 +39,7 @@ pub async fn run(
             state,
             &github,
             repo,
+            &msg.tenant_id,
             &global_instructions,
             &repo_instructions,
         )
@@ -52,14 +53,35 @@ pub async fn run(
         }
     }
 
-    // If multi-repo install (org), generate a global AGENTS.md in .github repo
+    // For multi-repo install, store a global agents overview in DynamoDB
     if msg.repos.len() > 1 {
-        if let Some(first) = msg.repos.first() {
-            if let Err(e) =
-                generate_global_agents_md(state, &github, &first.owner, &msg.repos).await
-            {
-                warn!(error = %e, "Failed to create global AGENTS.md");
-            }
+        let repo_list: Vec<String> = msg
+            .repos
+            .iter()
+            .map(|r| format!("- **{}**: default branch `{}`", r.name, r.default_branch))
+            .collect();
+        let global_content = format!(
+            "# Organization Agent Context\n\n\
+             This organization has {} repositories configured with d3ftly:\n\n\
+             {}\n",
+            msg.repos.len(),
+            repo_list.join("\n")
+        );
+        if let Err(e) = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.table_name)
+            .item("pk", AttributeValue::S(msg.tenant_id.clone()))
+            .item("sk", AttributeValue::S("AGENTS#GLOBAL".to_string()))
+            .item("content", AttributeValue::S(global_content))
+            .item(
+                "updated_at",
+                AttributeValue::S(chrono::Utc::now().to_rfc3339()),
+            )
+            .send()
+            .await
+        {
+            warn!(error = %e, "Failed to store global AGENTS.md");
         }
     }
 
@@ -91,6 +113,7 @@ async fn onboard_repo(
     state: &WorkerState,
     github: &GitHubClient,
     repo: &crate::models::OnboardRepo,
+    tenant_id: &str,
     global_instructions: &str,
     repo_instructions: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -191,71 +214,27 @@ async fn onboard_repo(
 
     let agents_md = extract_text_from_response(&response)?;
 
-    // Commit .d3ftly/AGENTS.md to default branch
-    github
-        .write_file(
-            &repo.owner,
-            &repo.name,
-            ".d3ftly/AGENTS.md",
-            &agents_md,
-            &repo.default_branch,
-            "chore: add .d3ftly/AGENTS.md for AI agent context",
-            None,
+    // Store AGENTS.md in DynamoDB (not committed to repo)
+    let agents_sk = format!("AGENTS#REPO#{full_name}");
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.table_name)
+        .item("pk", AttributeValue::S(tenant_id.to_string()))
+        .item("sk", AttributeValue::S(agents_sk))
+        .item("content", AttributeValue::S(agents_md))
+        .item(
+            "updated_at",
+            AttributeValue::S(chrono::Utc::now().to_rfc3339()),
         )
+        .send()
         .await?;
 
-    info!(repo = %full_name, "Committed .d3ftly/AGENTS.md");
+    info!(repo = %full_name, "Stored AGENTS.md in DynamoDB");
 
-    // Generate .d3ftly/VOICE.md from recent PRs and commits
-    if let Err(e) = generate_voice_md(state, github, repo).await {
+    // Generate and store VOICE.md in DynamoDB
+    if let Err(e) = generate_voice_md(state, github, repo, tenant_id).await {
         warn!(repo = %full_name, error = %e, "Failed to generate VOICE.md");
-    }
-
-    Ok(())
-}
-
-async fn generate_global_agents_md(
-    _state: &WorkerState,
-    github: &GitHubClient,
-    owner: &str,
-    repos: &[crate::models::OnboardRepo],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let repo_list: Vec<String> = repos
-        .iter()
-        .map(|r| format!("- **{}**: default branch `{}`", r.name, r.default_branch))
-        .collect();
-
-    let content = format!(
-        "# Organization Agent Context\n\n\
-         This organization has {} repositories configured with d3ftly:\n\n\
-         {}\n\n\
-         Each repository has its own `.d3ftly/AGENTS.md` with detailed context.\n",
-        repos.len(),
-        repo_list.join("\n")
-    );
-
-    // Try committing to .github repo first, fall back to first repo
-    let target_repo = ".github";
-    let default_branch = "main";
-
-    match github
-        .write_file(
-            owner,
-            target_repo,
-            "AGENTS.md",
-            &content,
-            default_branch,
-            "chore: add global AGENTS.md for d3ftly",
-            None,
-        )
-        .await
-    {
-        Ok(_) => {
-            info!(owner, "Committed global AGENTS.md to .github repo");
-        }
-        Err(e) => {
-            warn!(error = %e, "Could not write to .github repo, skipping global AGENTS.md");
-        }
     }
 
     Ok(())
@@ -282,6 +261,7 @@ async fn generate_voice_md(
     state: &WorkerState,
     github: &GitHubClient,
     repo: &crate::models::OnboardRepo,
+    tenant_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let full_name = format!("{}/{}", repo.owner, repo.name);
 
@@ -358,19 +338,23 @@ async fn generate_voice_md(
 
     let voice_md = extract_text_from_response(&response)?;
 
-    github
-        .write_file(
-            &repo.owner,
-            &repo.name,
-            ".d3ftly/VOICE.md",
-            &voice_md,
-            &repo.default_branch,
-            "chore: add .d3ftly/VOICE.md for team voice and tone",
-            None,
+    // Store VOICE.md in DynamoDB (not committed to repo)
+    let voice_sk = format!("VOICE#REPO#{full_name}");
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.table_name)
+        .item("pk", AttributeValue::S(tenant_id.to_string()))
+        .item("sk", AttributeValue::S(voice_sk))
+        .item("content", AttributeValue::S(voice_md))
+        .item(
+            "updated_at",
+            AttributeValue::S(chrono::Utc::now().to_rfc3339()),
         )
+        .send()
         .await?;
 
-    info!(repo = %full_name, "Committed .d3ftly/VOICE.md");
+    info!(repo = %full_name, "Stored VOICE.md in DynamoDB");
     Ok(())
 }
 
