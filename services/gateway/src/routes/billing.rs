@@ -118,14 +118,10 @@ pub async fn create_portal_session(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    let stripe_key = state
-        .secrets
-        .stripe_secret_key
-        .as_deref()
-        .ok_or_else(|| {
-            error!("Stripe secret key not configured");
-            StatusCode::SERVICE_UNAVAILABLE
-        })?;
+    let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
+        error!("Stripe secret key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
 
     // Get the Stripe customer ID for this tenant
     let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
@@ -166,14 +162,10 @@ pub async fn create_subscription(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    let stripe_key = state
-        .secrets
-        .stripe_secret_key
-        .as_deref()
-        .ok_or_else(|| {
-            error!("Stripe secret key not configured");
-            StatusCode::SERVICE_UNAVAILABLE
-        })?;
+    let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
+        error!("Stripe secret key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
 
     let price_id = body["price_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
 
@@ -223,7 +215,10 @@ pub async fn create_subscription(
             ("customer", customer_id.as_str()),
             ("items[0][price]", price_id),
             ("payment_behavior", "default_incomplete"),
-            ("payment_settings[save_default_payment_method]", "on_subscription"),
+            (
+                "payment_settings[save_default_payment_method]",
+                "on_subscription",
+            ),
             ("expand[]", "latest_invoice.payment_intent"),
             ("metadata[tenant_id]", &claims.tenant_id),
         ])
@@ -323,10 +318,7 @@ async fn create_stripe_customer(
         .http
         .post("https://api.stripe.com/v1/customers")
         .header("Authorization", format!("Bearer {stripe_key}"))
-        .form(&[
-            ("name", name),
-            ("metadata[tenant_id]", tenant_id),
-        ])
+        .form(&[("name", name), ("metadata[tenant_id]", tenant_id)])
         .send()
         .await
         .map_err(|e| {
@@ -428,10 +420,7 @@ pub async fn download_invoice_pdf(
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-async fn get_stripe_customer_id(
-    state: &AppState,
-    tenant_id: &str,
-) -> Result<String, StatusCode> {
+async fn get_stripe_customer_id(state: &AppState, tenant_id: &str) -> Result<String, StatusCode> {
     let result = state
         .dynamo
         .get_item()

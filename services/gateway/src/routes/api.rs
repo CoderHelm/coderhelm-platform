@@ -221,13 +221,39 @@ pub async fn get_stats(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let extract = |item: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>| {
-        let total: u64 = item.and_then(|i| i.get("total_runs")).and_then(|v| v.as_n().ok()).and_then(|n| n.parse().ok()).unwrap_or(0);
-        let completed: u64 = item.and_then(|i| i.get("completed")).and_then(|v| v.as_n().ok()).and_then(|n| n.parse().ok()).unwrap_or(0);
-        let failed: u64 = item.and_then(|i| i.get("failed")).and_then(|v| v.as_n().ok()).and_then(|n| n.parse().ok()).unwrap_or(0);
-        let cost: f64 = item.and_then(|i| i.get("total_cost_usd")).and_then(|v| v.as_n().ok()).and_then(|n| n.parse().ok()).unwrap_or(0.0);
-        let tokens_in: u64 = item.and_then(|i| i.get("total_tokens_in")).and_then(|v| v.as_n().ok()).and_then(|n| n.parse().ok()).unwrap_or(0);
-        let tokens_out: u64 = item.and_then(|i| i.get("total_tokens_out")).and_then(|v| v.as_n().ok()).and_then(|n| n.parse().ok()).unwrap_or(0);
+    let extract = |item: Option<
+        &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+    >| {
+        let total: u64 = item
+            .and_then(|i| i.get("total_runs"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        let completed: u64 = item
+            .and_then(|i| i.get("completed"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        let failed: u64 = item
+            .and_then(|i| i.get("failed"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        let cost: f64 = item
+            .and_then(|i| i.get("total_cost_usd"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0.0);
+        let tokens_in: u64 = item
+            .and_then(|i| i.get("total_tokens_in"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        let tokens_out: u64 = item
+            .and_then(|i| i.get("total_tokens_out"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
         json!({
             "total_runs": total,
             "completed": completed,
@@ -389,7 +415,9 @@ fn validate_repo_name(repo: &str) -> Result<(), StatusCode> {
         || repo.len() > 200
         || repo.contains("..")
         || repo.contains('\0')
-        || !repo.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
+        || !repo
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
     {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -441,10 +469,7 @@ async fn update_instructions_inner(
         .item("pk", attr_s(tenant_id))
         .item("sk", attr_s(sk))
         .item("content", attr_s(content))
-        .item(
-            "updated_at",
-            attr_s(&chrono::Utc::now().to_rfc3339()),
-        )
+        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
         .send()
         .await
         .map_err(|e| {

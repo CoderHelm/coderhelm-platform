@@ -97,7 +97,11 @@ mod tests {
 
     #[test]
     fn test_verify_github_signature_invalid() {
-        assert!(!verify_github_signature("secret", b"body", "sha256=deadbeef"));
+        assert!(!verify_github_signature(
+            "secret",
+            b"body",
+            "sha256=deadbeef"
+        ));
     }
 
     #[test]

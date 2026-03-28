@@ -24,8 +24,7 @@ pub async fn require_auth(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let token = extract_cookie(cookie_header, "d3ftly_session")
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let token = extract_cookie(cookie_header, "d3ftly_session").ok_or(StatusCode::UNAUTHORIZED)?;
 
     let claims = jwt::validate_token(&token, &state.secrets.jwt_secret)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;

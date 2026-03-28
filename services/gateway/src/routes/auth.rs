@@ -71,7 +71,10 @@ pub async fn callback(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-    let user: serde_json::Value = user_resp.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let user: serde_json::Value = user_resp
+        .json()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
     let github_id = user["id"].as_u64().ok_or(StatusCode::BAD_GATEWAY)?;
     let github_login = user["login"].as_str().ok_or(StatusCode::BAD_GATEWAY)?;
 
@@ -84,8 +87,10 @@ pub async fn callback(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-    let installs: serde_json::Value =
-        installs_resp.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let installs: serde_json::Value = installs_resp
+        .json()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
     // Find the first d3ftly installation
     let installation_id = installs["installations"]
@@ -113,10 +118,7 @@ pub async fn callback(
         .item("sk", attr_s(&user_id))
         .item("github_id", attr_n(github_id))
         .item("github_login", attr_s(github_login))
-        .item(
-            "email",
-            attr_s(user["email"].as_str().unwrap_or("")),
-        )
+        .item("email", attr_s(user["email"].as_str().unwrap_or("")))
         .item(
             "avatar_url",
             attr_s(user["avatar_url"].as_str().unwrap_or("")),
@@ -148,12 +150,14 @@ pub async fn callback(
         "http://localhost:3000/dashboard"
     };
 
-    let cookie = format!(
-        "d3ftly_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
-    );
+    let cookie =
+        format!("d3ftly_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400");
 
     Ok((
-        [(header::SET_COOKIE, cookie), (header::LOCATION, dashboard_url.to_string())],
+        [
+            (header::SET_COOKIE, cookie),
+            (header::LOCATION, dashboard_url.to_string()),
+        ],
         StatusCode::FOUND,
     )
         .into_response())
@@ -162,10 +166,7 @@ pub async fn callback(
 /// Logout — clear session cookie.
 pub async fn logout() -> impl IntoResponse {
     let cookie = "d3ftly_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
-    (
-        [(header::SET_COOKIE, cookie.to_string())],
-        StatusCode::OK,
-    )
+    ([(header::SET_COOKIE, cookie.to_string())], StatusCode::OK)
 }
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {

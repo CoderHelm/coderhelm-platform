@@ -67,23 +67,26 @@ async fn main() -> Result<(), Error> {
         .route("/stats", get(routes::api::get_stats))
         .route(
             "/notifications",
-            get(routes::api::get_notification_prefs)
-                .put(routes::api::update_notification_prefs),
+            get(routes::api::get_notification_prefs).put(routes::api::update_notification_prefs),
         )
         .route(
             "/instructions/global",
-            get(routes::api::get_global_instructions)
-                .put(routes::api::update_global_instructions),
+            get(routes::api::get_global_instructions).put(routes::api::update_global_instructions),
         )
         .route(
             "/instructions/repo/:repo",
-            get(routes::api::get_repo_instructions)
-                .put(routes::api::update_repo_instructions),
+            get(routes::api::get_repo_instructions).put(routes::api::update_repo_instructions),
         )
         // Billing endpoints
         .route("/billing", get(routes::billing::get_billing))
-        .route("/billing/portal", post(routes::billing::create_portal_session))
-        .route("/billing/subscribe", post(routes::billing::create_subscription))
+        .route(
+            "/billing/portal",
+            post(routes::billing::create_portal_session),
+        )
+        .route(
+            "/billing/subscribe",
+            post(routes::billing::create_subscription),
+        )
         .route("/billing/invoices", get(routes::billing::list_invoices))
         .route(
             "/billing/invoices/:invoice_id/pdf",
