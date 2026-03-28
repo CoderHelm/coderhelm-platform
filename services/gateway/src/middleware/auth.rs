@@ -7,7 +7,6 @@ use axum::{
 use std::sync::Arc;
 
 use crate::auth::jwt;
-use crate::models::Claims;
 use crate::AppState;
 
 /// Extract and validate JWT from cookie, inject Claims into request extensions.
@@ -26,7 +25,7 @@ pub async fn require_auth(
 
     let token = extract_cookie(cookie_header, "d3ftly_session").ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let claims = jwt::validate_token(&token, &state.secrets.jwt_secret)
+    let claims = jwt::validate_token(token, &state.secrets.jwt_secret)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     req.extensions_mut().insert(claims);

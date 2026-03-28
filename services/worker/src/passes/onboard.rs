@@ -114,24 +114,26 @@ async fn onboard_repo(
         "Dockerfile",
     ];
 
-    let tree_str: String = tree.iter().map(|e| format!("{} {}", e.entry_type, e.path)).collect::<Vec<_>>().join("\n");
-    let mut context_parts: Vec<String> = vec![format!("Repository: {full_name}\n\nTree:\n{tree_str}")];
+    let tree_str: String = tree
+        .iter()
+        .map(|e| format!("{} {}", e.entry_type, e.path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut context_parts: Vec<String> =
+        vec![format!("Repository: {full_name}\n\nTree:\n{tree_str}")];
 
     for path in &signal_files {
-        match github
+        if let Ok(content) = github
             .read_file(&repo.owner, &repo.name, path, &repo.default_branch)
             .await
         {
-            Ok(content) => {
-                // Limit each file to ~4KB to stay within context window
-                let truncated = if content.len() > 4096 {
-                    format!("{}...(truncated)", &content[..4096])
-                } else {
-                    content
-                };
-                context_parts.push(format!("--- {path} ---\n{truncated}"));
-            }
-            Err(_) => {} // File doesn't exist, skip
+            // Limit each file to ~4KB to stay within context window
+            let truncated = if content.len() > 4096 {
+                format!("{}...(truncated)", &content[..4096])
+            } else {
+                content
+            };
+            context_parts.push(format!("--- {path} ---\n{truncated}"));
         }
     }
 

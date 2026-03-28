@@ -28,6 +28,7 @@ pub fn verify_github_signature(secret: &str, body: &[u8], signature_header: &str
 
 /// Verify Jira webhook signature (HMAC-SHA256).
 /// Header: X-Hub-Signature: sha256=<hex>
+#[allow(dead_code)]
 pub fn verify_jira_signature(secret: &str, body: &[u8], signature_header: &str) -> bool {
     // Same HMAC-SHA256 scheme
     verify_github_signature(secret, body, signature_header)
@@ -35,6 +36,7 @@ pub fn verify_jira_signature(secret: &str, body: &[u8], signature_header: &str) 
 
 /// Verify Stripe webhook signature.
 /// Uses Stripe's `t=timestamp,v1=signature` format in Stripe-Signature header.
+#[allow(dead_code)]
 pub fn verify_stripe_signature(
     secret: &str,
     body: &[u8],

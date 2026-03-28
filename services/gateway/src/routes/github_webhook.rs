@@ -2,7 +2,6 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    Json,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -408,9 +407,9 @@ async fn handle_pr_review_comment(
 
 /// Handle check_suite events — re-run CI fix if an entire suite fails.
 async fn handle_check_suite(
-    state: &AppState,
+    _state: &AppState,
     payload: &Value,
-    installation_id: u64,
+    _installation_id: u64,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     if action != "completed" {

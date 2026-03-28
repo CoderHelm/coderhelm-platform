@@ -2,11 +2,48 @@ use aws_sdk_bedrockruntime::types::{
     CachePointBlock, ContentBlock, ConversationRole, Message, SystemContentBlock, Tool,
     ToolConfiguration, ToolInputSchema, ToolSpecification,
 };
+use aws_smithy_types::Document;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::models::TokenUsage;
 use crate::WorkerState;
+
+fn json_to_document(val: &Value) -> Document {
+    match val {
+        Value::Null => Document::Null,
+        Value::Bool(b) => Document::Bool(*b),
+        Value::Number(n) => {
+            Document::Number(aws_smithy_types::Number::Float(n.as_f64().unwrap_or(0.0)))
+        }
+        Value::String(s) => Document::String(s.clone()),
+        Value::Array(arr) => Document::Array(arr.iter().map(json_to_document).collect()),
+        Value::Object(obj) => Document::Object(
+            obj.iter()
+                .map(|(k, v)| (k.clone(), json_to_document(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn document_to_json(doc: &Document) -> Value {
+    match doc {
+        Document::Null => Value::Null,
+        Document::Bool(b) => Value::Bool(*b),
+        Document::Number(n) => {
+            json!(n.to_f64_lossy())
+        }
+        Document::String(s) => Value::String(s.clone()),
+        Document::Array(arr) => Value::Array(arr.iter().map(document_to_json).collect()),
+        Document::Object(obj) => {
+            let map: serde_json::Map<String, Value> = obj
+                .iter()
+                .map(|(k, v)| (k.clone(), document_to_json(v)))
+                .collect();
+            Value::Object(map)
+        }
+    }
+}
 
 /// Call the LLM via Bedrock Converse API with tool use loop.
 /// Uses prompt caching: a CachePoint is placed after the system prompt
@@ -97,7 +134,7 @@ pub async fn converse(
         let mut tool_results = Vec::new();
         for tool_use in &tool_uses {
             info!(tool = tool_use.name(), "Executing tool");
-            let input: Value = serde_json::to_value(tool_use.input()).unwrap_or(json!({}));
+            let input: Value = document_to_json(tool_use.input());
 
             match tool_executor.execute(tool_use.name(), &input).await {
                 Ok(result) => {
@@ -149,12 +186,7 @@ fn build_tool_config(tools: &[ToolDefinition]) -> ToolConfiguration {
                 ToolSpecification::builder()
                     .name(&t.name)
                     .description(&t.description)
-                    .input_schema(ToolInputSchema::Json(
-                        aws_smithy_types::Document::try_from(
-                            serde_json::to_value(&t.input_schema).unwrap(),
-                        )
-                        .unwrap(),
-                    ))
+                    .input_schema(ToolInputSchema::Json(json_to_document(&t.input_schema)))
                     .build()
                     .unwrap(),
             )

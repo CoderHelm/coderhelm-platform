@@ -1,6 +1,6 @@
 use axum::{
     middleware as axum_middleware,
-    routing::{get, post, put},
+    routing::{get, post},
     Router,
 };
 use lambda_http::{run, Error};

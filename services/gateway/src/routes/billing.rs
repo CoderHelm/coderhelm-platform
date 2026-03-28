@@ -30,12 +30,12 @@ pub async fn get_billing(
     let subscription_status = item
         .and_then(|i| i.get("subscription_status"))
         .and_then(|v| v.as_s().ok())
-        .unwrap_or("none");
+        .map_or("none", |v| v);
 
     let stripe_customer_id = item
         .and_then(|i| i.get("stripe_customer_id"))
         .and_then(|v| v.as_s().ok())
-        .unwrap_or("");
+        .map_or("", |v| v);
 
     // Get current month usage from analytics
     let month = chrono::Utc::now().format("%Y-%m").to_string();
@@ -188,7 +188,7 @@ pub async fn create_subscription(
     let current_status = item
         .and_then(|i| i.get("subscription_status"))
         .and_then(|v| v.as_s().ok())
-        .unwrap_or("none");
+        .map_or("none", |v| v);
 
     if current_status == "active" {
         return Err(StatusCode::CONFLICT); // Already subscribed, use portal to manage
@@ -312,7 +312,7 @@ async fn create_stripe_customer(
         .item()
         .and_then(|i| i.get("name"))
         .and_then(|v| v.as_s().ok())
-        .unwrap_or(tenant_id);
+        .map_or(tenant_id, |v| v.as_str());
 
     let response = state
         .http

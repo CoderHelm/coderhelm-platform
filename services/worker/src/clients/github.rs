@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-
 const API_BASE: &str = "https://api.github.com";
 
 /// Cached installation token.
@@ -275,6 +274,7 @@ impl GitHubClient {
     // ─── Single file write ──────────────────────────────────────
 
     /// Create or update a single file via Contents API.
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_file(
         &self,
         owner: &str,
@@ -421,6 +421,7 @@ impl GitHubClient {
     // ─── Pull requests ─────────────────────────────────────────
 
     /// Create a pull request.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_pull_request(
         &self,
         owner: &str,
@@ -457,6 +458,7 @@ impl GitHubClient {
     }
 
     /// Get review comments on a PR.
+    #[allow(dead_code)]
     pub async fn get_review_comments(
         &self,
         owner: &str,
@@ -470,6 +472,7 @@ impl GitHubClient {
     }
 
     /// Reply to a review comment thread.
+    #[allow(dead_code)]
     pub async fn reply_to_review_comment(
         &self,
         owner: &str,
@@ -519,6 +522,7 @@ impl GitHubClient {
 // ─── Types ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct TreeEntry {
     pub path: String,
     #[serde(rename = "type")]
@@ -527,6 +531,7 @@ pub struct TreeEntry {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct DirEntry {
     pub name: String,
     #[serde(rename = "type")]

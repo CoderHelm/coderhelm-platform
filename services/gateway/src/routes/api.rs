@@ -112,7 +112,7 @@ pub async fn get_run(
         "tokens_in": item.get("tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "tokens_out": item.get("tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "cost_usd": item.get("cost_usd").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<f64>().ok()),
-        "files_modified": item.get("files_modified").and_then(|v| v.as_l().ok()),
+        "files_modified": item.get("files_modified").and_then(|v| v.as_l().ok()).map(|list| list.iter().filter_map(|v| v.as_s().ok().map(|s| s.as_str())).collect::<Vec<_>>()),
         "duration_s": item.get("duration_s").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "error": item.get("error").and_then(|v| v.as_s().ok()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
@@ -298,14 +298,17 @@ pub async fn get_notification_prefs(
             email_run_complete: item
                 .get("email_run_complete")
                 .and_then(|v| v.as_bool().ok())
+                .copied()
                 .unwrap_or(true),
             email_run_failed: item
                 .get("email_run_failed")
                 .and_then(|v| v.as_bool().ok())
+                .copied()
                 .unwrap_or(true),
             email_weekly_summary: item
                 .get("email_weekly_summary")
                 .and_then(|v| v.as_bool().ok())
+                .copied()
                 .unwrap_or(true),
         },
         None => NotificationPrefs::default(),
