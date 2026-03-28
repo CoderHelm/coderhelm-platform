@@ -35,7 +35,8 @@ pub async fn run(
         )
         .await;
 
-        if let Err(e) = onboard_repo(
+        let full_name = format!("{}/{}", repo.owner, repo.name);
+        match onboard_repo(
             state,
             &github,
             repo,
@@ -45,11 +46,20 @@ pub async fn run(
         )
         .await
         {
-            error!(
-                repo = %format!("{}/{}", repo.owner, repo.name),
-                error = %e,
-                "Failed to onboard repo"
-            );
+            Ok(()) => {
+                set_onboard_status(state, &msg.tenant_id, &full_name, "ready", None).await;
+            }
+            Err(e) => {
+                error!(repo = %full_name, error = %e, "Failed to onboard repo");
+                set_onboard_status(
+                    state,
+                    &msg.tenant_id,
+                    &full_name,
+                    "failed",
+                    Some(&e.to_string()),
+                )
+                .await;
+            }
         }
     }
 
@@ -379,5 +389,36 @@ async fn load_instructions(state: &WorkerState, tenant_id: &str, sk: &str) -> St
             warn!(error = %e, "Failed to load instructions");
             String::new()
         }
+    }
+}
+
+async fn set_onboard_status(
+    state: &WorkerState,
+    tenant_id: &str,
+    repo: &str,
+    status: &str,
+    error_msg: Option<&str>,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut update = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.table_name)
+        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("sk", AttributeValue::S(format!("REPO#{repo}")))
+        .update_expression(if error_msg.is_some() {
+            "SET onboard_status = :s, onboard_error = :e, updated_at = :t"
+        } else {
+            "SET onboard_status = :s, updated_at = :t REMOVE onboard_error"
+        })
+        .expression_attribute_values(":s", AttributeValue::S(status.to_string()))
+        .expression_attribute_values(":t", AttributeValue::S(now));
+
+    if let Some(err) = error_msg {
+        update = update.expression_attribute_values(":e", AttributeValue::S(err.to_string()));
+    }
+
+    if let Err(e) = update.send().await {
+        warn!(error = %e, repo = %repo, "Failed to update onboard status");
     }
 }
