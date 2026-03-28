@@ -74,10 +74,15 @@ export class WorkerStack extends cdk.Stack {
     props.bucket.grantReadWrite(this.workerFunction);
     secrets.grantRead(this.workerFunction);
 
-    // Bedrock: invoke model only
+    // Bedrock: converse + invoke model
     this.workerFunction.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+        actions: [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",
+          "bedrock:Converse",
+          "bedrock:ConverseStream",
+        ],
         resources: [
           `arn:aws:bedrock:*::foundation-model/*`,
           `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
