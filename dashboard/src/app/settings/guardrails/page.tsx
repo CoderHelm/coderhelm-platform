@@ -2,12 +2,15 @@
 
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { useToast } from "@/components/toast";
+import { Skeleton } from "@/components/skeleton";
 
 export default function GuardrailsPage() {
   const [rules, setRules] = useState<string[]>([]);
   const [newRule, setNewRule] = useState("");
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
+  const { toast } = useToast();
 
   useEffect(() => {
     api.getGlobalRules().then((data) => {
@@ -35,8 +38,9 @@ export default function GuardrailsPage() {
     setSaving(true);
     try {
       await api.updateGlobalRules(updated);
-    } catch (e) {
-      console.error("Failed to save rules:", e);
+      toast("Rule saved");
+    } catch {
+      toast("Failed to save rules", "error");
     }
     setSaving(false);
   };
@@ -57,7 +61,11 @@ export default function GuardrailsPage() {
       </div>
 
       {loading ? (
-        <p className="text-zinc-500">Loading...</p>
+        <div className="space-y-2 mb-4">
+          <Skeleton className="h-12 w-full" />
+          <Skeleton className="h-12 w-full" />
+          <Skeleton className="h-10 w-full" />
+        </div>
       ) : (
         <>
           <div className="space-y-2 mb-4">

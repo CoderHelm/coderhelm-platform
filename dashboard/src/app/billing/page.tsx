@@ -4,6 +4,8 @@ import { useEffect, useState, useCallback } from "react";
 import { api, type BillingInfo, type Invoice } from "@/lib/api";
 import { loadStripe } from "@stripe/stripe-js";
 import { Elements, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
+import { useToast } from "@/components/toast";
+import { CardSkeleton, TableSkeleton } from "@/components/skeleton";
 
 const STRIPE_PK = process.env.NEXT_PUBLIC_STRIPE_PK || "";
 const PRICE_ID = process.env.NEXT_PUBLIC_STRIPE_PRICE_ID || "";
@@ -18,6 +20,7 @@ export default function BillingPage() {
   const [clientSecret, setClientSecret] = useState<string | null>(null);
   const [setupSecret, setSetupSecret] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
+  const { toast } = useToast();
 
   const refresh = useCallback(() => {
     setLoading(true);
@@ -39,7 +42,7 @@ export default function BillingPage() {
       setClientSecret(client_secret);
       setShowSubscribe(true);
     } catch {
-      alert("Failed to start subscription. Please try again.");
+      toast("Failed to start subscription. Please try again.", "error");
     } finally {
       setActionLoading(false);
     }
@@ -50,9 +53,10 @@ export default function BillingPage() {
     setActionLoading(true);
     try {
       await api.cancelSubscription();
+      toast("Subscription cancelled");
       refresh();
     } catch {
-      alert("Failed to cancel. Please try again.");
+      toast("Failed to cancel. Please try again.", "error");
     } finally {
       setActionLoading(false);
     }
@@ -62,9 +66,10 @@ export default function BillingPage() {
     setActionLoading(true);
     try {
       await api.reactivateSubscription();
+      toast("Subscription reactivated");
       refresh();
     } catch {
-      alert("Failed to reactivate. Please try again.");
+      toast("Failed to reactivate. Please try again.", "error");
     } finally {
       setActionLoading(false);
     }
@@ -77,7 +82,7 @@ export default function BillingPage() {
       setSetupSecret(client_secret);
       setShowUpdateCard(true);
     } catch {
-      alert("Failed to start card update. Please try again.");
+      toast("Failed to start card update. Please try again.", "error");
     } finally {
       setActionLoading(false);
     }
@@ -85,9 +90,12 @@ export default function BillingPage() {
 
   if (loading) {
     return (
-      <div>
+      <div className="max-w-3xl">
         <h1 className="text-2xl font-bold mb-6">Billing</h1>
-        <p className="text-zinc-500">Loading...</p>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+          <CardSkeleton /><CardSkeleton /><CardSkeleton /><CardSkeleton />
+        </div>
+        <TableSkeleton rows={3} cols={4} />
       </div>
     );
   }
@@ -104,7 +112,9 @@ export default function BillingPage() {
   const isActive = billing.subscription_status === "active";
   const isCancelling = billing.subscription_status === "active" && billing.access_until;
   const isPastDue = billing.subscription_status === "past_due";
+  const isCancelled = billing.subscription_status === "cancelled";
   const isFree = billing.subscription_status === "none" || !billing.subscription_status;
+  const canSubscribe = isFree || isCancelled;
 
   return (
     <div className="max-w-3xl">
@@ -132,8 +142,8 @@ export default function BillingPage() {
 
       {/* Plan + Usage */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-        <StatCard label="Plan" value={isFree ? "Free" : "Pro"} />
-        <StatCard label="Status" value={isCancelling ? "Cancelling" : billing.subscription_status || "free"} />
+        <StatCard label="Plan" value={canSubscribe ? "Free" : "Pro"} />
+        <StatCard label="Status" value={isCancelling ? "Cancelling" : isCancelled ? "Cancelled" : billing.subscription_status || "free"} />
         <StatCard label="Runs this month" value={billing.current_period.total_runs} />
         <StatCard label="Cost this month" value={`$${billing.current_period.usage_cost.toFixed(2)}`} />
       </div>
@@ -155,15 +165,22 @@ export default function BillingPage() {
         </div>
       )}
 
+      {/* Cancelled notice */}
+      {isCancelled && (
+        <div className="p-4 mb-6 bg-zinc-500/10 border border-zinc-500/30 rounded-lg text-zinc-400 text-sm">
+          Your subscription has ended. Subscribe again to continue using d3ftly Pro.
+        </div>
+      )}
+
       {/* Action buttons */}
       <div className="flex gap-3 mb-8">
-        {isFree && (
+        {canSubscribe && (
           <button
             onClick={handleSubscribe}
             disabled={actionLoading}
             className="px-5 py-2.5 bg-white text-zinc-900 rounded-lg text-sm font-semibold hover:bg-zinc-200 transition-colors disabled:opacity-50"
           >
-            {actionLoading ? "..." : "Subscribe to Pro — $199/mo"}
+            {actionLoading ? "..." : isCancelled ? "Re-subscribe to Pro — $199/mo" : "Subscribe to Pro — $199/mo"}
           </button>
         )}
         {(isActive || isPastDue) && !isCancelling && (

@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { api, type Repo } from "@/lib/api";
+import { useToast } from "@/components/toast";
+import { TextareaSkeleton } from "@/components/skeleton";
 
 export default function VoicePage() {
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -9,6 +11,7 @@ export default function VoicePage() {
   const [content, setContent] = useState("");
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
+  const { toast } = useToast();
 
   useEffect(() => {
     api.listRepos().then((data) => {
@@ -34,8 +37,9 @@ export default function VoicePage() {
     setSaving(true);
     try {
       await api.updateRepoVoice(selectedRepo, content);
-    } catch (e) {
-      console.error("Failed to save voice:", e);
+      toast("Voice saved");
+    } catch {
+      toast("Failed to save voice", "error");
     }
     setSaving(false);
   };
@@ -61,7 +65,7 @@ export default function VoicePage() {
       )}
 
       {loading ? (
-        <p className="text-zinc-500">Loading...</p>
+        <TextareaSkeleton />
       ) : (
         <>
           <textarea

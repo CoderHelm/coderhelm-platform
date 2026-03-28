@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, type Repo } from "@/lib/api";
+import { Skeleton } from "@/components/skeleton";
 
 export default function ReposPage() {
   const [repos, setRepos] = useState<Repo[]>([]);
@@ -22,7 +23,11 @@ export default function ReposPage() {
       </p>
 
       {loading ? (
-        <p className="text-zinc-500">Loading...</p>
+        <div className="space-y-2">
+          <Skeleton className="h-14 w-full" />
+          <Skeleton className="h-14 w-full" />
+          <Skeleton className="h-14 w-full" />
+        </div>
       ) : repos.length === 0 ? (
         <div className="text-zinc-500 border border-zinc-800 rounded-lg p-8 text-center">
           <p>No repos connected yet.</p>

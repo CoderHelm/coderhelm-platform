@@ -14,6 +14,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
+import { CardSkeleton, ChartSkeleton } from "@/components/skeleton";
 
 export default function AnalyticsPage() {
   const [stats, setStats] = useState<{ month: Stats; all_time: Stats } | null>(null);
@@ -34,7 +35,13 @@ export default function AnalyticsPage() {
     return (
       <div>
         <h1 className="text-2xl font-bold mb-6">Analytics</h1>
-        <p className="text-zinc-500">Loading...</p>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+          <CardSkeleton /><CardSkeleton /><CardSkeleton /><CardSkeleton />
+          <CardSkeleton /><CardSkeleton /><CardSkeleton /><CardSkeleton />
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <ChartSkeleton /><ChartSkeleton /><ChartSkeleton /><ChartSkeleton />
+        </div>
       </div>
     );
   }
