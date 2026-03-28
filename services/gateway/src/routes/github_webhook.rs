@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use super::billing::{INCLUDED_RUNS, OVERAGE_COST_PER_RUN_CENTS};
+use super::billing::{FREE_TIER_TOKENS, INCLUDED_TOKENS, OVERAGE_PER_1K_TOKENS_CENTS};
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
     CiFixMessage, FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo, TicketMessage,
@@ -591,7 +591,7 @@ fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValu
 
 /// Check whether this tenant has budget remaining. Returns Some(reason) if blocked.
 async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
-    // 1. Read current month's run count from analytics
+    // 1. Read current month's token usage from analytics
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     let analytics = state
         .dynamo
@@ -603,12 +603,21 @@ async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
         .await
         .ok()?;
 
-    let total_runs = analytics
+    let tokens_in: u64 = analytics
         .item()
-        .and_then(|i| i.get("total_runs"))
+        .and_then(|i| i.get("total_tokens_in"))
         .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<u64>().ok())
+        .and_then(|n| n.parse().ok())
         .unwrap_or(0);
+
+    let tokens_out: u64 = analytics
+        .item()
+        .and_then(|i| i.get("total_tokens_out"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let total_tokens = tokens_in + tokens_out;
 
     // 2. Read billing record (subscription status)
     let billing = state
@@ -630,13 +639,13 @@ async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
 
     let is_pro = sub_status == "active";
 
-    // Free tier: hard limit at 5 runs
-    if !is_pro && total_runs >= 5 {
-        return Some(
-            "You've used all **5 free runs** this month. \
-             [Upgrade to Pro](https://app.d3ftly.com/billing) for 30 runs/month."
-                .to_string(),
-        );
+    // Free tier: hard limit at 500K tokens
+    if !is_pro && total_tokens >= FREE_TIER_TOKENS {
+        return Some(format!(
+            "You've used all **{}K free tokens** this month. \
+             [Upgrade to Pro](https://app.d3ftly.com/billing) for 5M tokens/month.",
+            FREE_TIER_TOKENS / 1000,
+        ));
     }
 
     // Pro tier: check budget cap
@@ -659,9 +668,10 @@ async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
             .unwrap_or(0);
 
         if max_budget_cents > 0 {
-            // Calculate current spend: base $199 + overages
-            let overage_runs = total_runs.saturating_sub(INCLUDED_RUNS);
-            let current_spend = 19900 + overage_runs * OVERAGE_COST_PER_RUN_CENTS;
+            // Calculate current spend: base $199 + token overages
+            let overage_tokens = total_tokens.saturating_sub(INCLUDED_TOKENS);
+            let overage_1k = overage_tokens / 1000;
+            let current_spend = 19900 + overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
             if current_spend >= max_budget_cents {
                 return Some(format!(
                     "Monthly budget cap of **${:.2}** reached (current spend: **${:.2}**). \

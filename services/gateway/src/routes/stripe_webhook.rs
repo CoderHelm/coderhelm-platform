@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 
 use crate::AppState;
 
-use super::billing::{report_stripe_usage, INCLUDED_PLANS, INCLUDED_RUNS};
+use super::billing::{report_stripe_usage, INCLUDED_PLANS, INCLUDED_TOKENS};
 
 /// Stripe webhook handler — processes payment events.
 /// Stripe automatically retries failed webhook deliveries with exponential backoff.
@@ -408,6 +408,22 @@ async fn handle_invoice_finalized(
         .and_then(|n| n.parse::<f64>().ok())
         .unwrap_or(0.0);
 
+    let total_tokens_in: u64 = analytics
+        .as_ref()
+        .and_then(|i| i.get("total_tokens_in"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let total_tokens_out: u64 = analytics
+        .as_ref()
+        .and_then(|i| i.get("total_tokens_out"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let total_tokens = total_tokens_in + total_tokens_out;
+
     let total_plans: u64 = analytics
         .as_ref()
         .and_then(|i| i.get("total_plans"))
@@ -416,9 +432,9 @@ async fn handle_invoice_finalized(
         .unwrap_or(0);
 
     // Report metered overages to Stripe before invoice is final
-    let runs_overage = total_runs.saturating_sub(INCLUDED_RUNS);
+    let tokens_overage_1k = total_tokens.saturating_sub(INCLUDED_TOKENS) / 1000;
     let plans_overage = total_plans.saturating_sub(INCLUDED_PLANS);
-    report_stripe_usage(state, &tenant_id, "runs_overage", runs_overage).await;
+    report_stripe_usage(state, &tenant_id, "tokens_overage", tokens_overage_1k).await;
     report_stripe_usage(state, &tenant_id, "plans_overage", plans_overage).await;
 
     // Send invoice email

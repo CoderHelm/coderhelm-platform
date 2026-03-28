@@ -146,58 +146,59 @@ else
 fi
 
 echo ""
-echo "=== 4. Finding or creating Runs Meter and Price (\$5/run overage) ==="
+echo "=== 4. Finding or creating Tokens Meter and Price (\$50/1M token overage) ==="
 
-# Find or create the billing meter for runs
-RUNS_METER_ID=$(stripe_get "https://api.stripe.com/v1/billing/meters?limit=100" | python3 -c "
+# Find or create the billing meter for tokens
+TOKENS_METER_ID=$(stripe_get "https://api.stripe.com/v1/billing/meters?limit=100" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for m in data.get('data', []):
-    if m.get('event_name') == 'd3ftly_runs_overage' and m.get('status') == 'active':
+    if m.get('event_name') == 'd3ftly_tokens_overage' and m.get('status') == 'active':
         print(m['id'])
         break
 else:
     print('')
 ")
 
-if [[ -n "$RUNS_METER_ID" ]]; then
-  echo "Using existing runs meter: $RUNS_METER_ID"
+if [[ -n "$TOKENS_METER_ID" ]]; then
+  echo "Using existing tokens meter: $TOKENS_METER_ID"
 else
-  RUNS_METER=$(stripe_post "https://api.stripe.com/v1/billing/meters" \
-    -d "display_name=Run Overages" \
-    -d "event_name=d3ftly_runs_overage" \
+  TOKENS_METER=$(stripe_post "https://api.stripe.com/v1/billing/meters" \
+    -d "display_name=Token Overages (per 1K tokens)" \
+    -d "event_name=d3ftly_tokens_overage" \
     -d "default_aggregation[formula]=sum")
-  RUNS_METER_ID=$(printf '%s\n' "$RUNS_METER" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-  echo "Created runs meter: $RUNS_METER_ID"
+  TOKENS_METER_ID=$(printf '%s\n' "$TOKENS_METER" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+  echo "Created tokens meter: $TOKENS_METER_ID"
 fi
 
 # Find or create the metered price backed by the meter
-RUNS_PRICE_ID=$(stripe_get "https://api.stripe.com/v1/prices?product=${PRODUCT_ID}&active=true&limit=50" | python3 -c "
+# Priced at $0.05 per 1K tokens ($50 per 1M tokens)
+TOKENS_PRICE_ID=$(stripe_get "https://api.stripe.com/v1/prices?product=${PRODUCT_ID}&active=true&limit=50" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for p in data.get('data', []):
-    if p.get('nickname') == 'runs_overage' and p.get('recurring', {}).get('meter'):
+    if p.get('nickname') == 'tokens_overage' and p.get('recurring', {}).get('meter'):
         print(p['id'])
         break
 else:
     print('')
 ")
 
-if [[ -n "$RUNS_PRICE_ID" ]]; then
-  echo "Using existing runs overage price: $RUNS_PRICE_ID"
+if [[ -n "$TOKENS_PRICE_ID" ]]; then
+  echo "Using existing tokens overage price: $TOKENS_PRICE_ID"
 else
-  RUNS_PRICE=$(stripe_post "https://api.stripe.com/v1/prices" \
+  TOKENS_PRICE=$(stripe_post "https://api.stripe.com/v1/prices" \
     -d "product=${PRODUCT_ID}" \
-    -d "unit_amount=500" \
+    -d "unit_amount=5" \
     -d "currency=usd" \
     -d "recurring[interval]=month" \
     -d "recurring[usage_type]=metered" \
-    -d "recurring[meter]=${RUNS_METER_ID}" \
-    -d "nickname=runs_overage" \
+    -d "recurring[meter]=${TOKENS_METER_ID}" \
+    -d "nickname=tokens_overage" \
     -d "metadata[app]=d3ftly" \
-    -d "metadata[type]=runs_overage")
-  RUNS_PRICE_ID=$(printf '%s\n' "$RUNS_PRICE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-  echo "Created runs overage price: $RUNS_PRICE_ID"
+    -d "metadata[type]=tokens_overage")
+  TOKENS_PRICE_ID=$(printf '%s\n' "$TOKENS_PRICE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+  echo "Created tokens overage price: $TOKENS_PRICE_ID"
 fi
 
 echo ""
@@ -231,4 +232,4 @@ echo "=== DONE ==="
 echo ""
 echo "  STRIPE_PRICE_ID=${PRICE_ID}"
 echo "  STRIPE_PLANS_OVERAGE_PRICE_ID=${PLANS_PRICE_ID}"
-echo "  STRIPE_RUNS_OVERAGE_PRICE_ID=${RUNS_PRICE_ID}"
+echo "  STRIPE_TOKENS_OVERAGE_PRICE_ID=${TOKENS_PRICE_ID}"
