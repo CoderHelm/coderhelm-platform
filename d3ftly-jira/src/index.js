@@ -12,24 +12,34 @@ exports.handler = async (event, context) => {
     return;
   }
 
-  // Look for d3ftly config in a label like "d3ftly:owner/repo"
-  const labels = fields.labels || [];
-  const d3ftlyLabel = labels.find((l) => l.startsWith("d3ftly:"));
-  if (!d3ftlyLabel) {
-    console.log(`Skipping ${issue.key} — no d3ftly: label`);
-    return;
-  }
-
-  const [repoOwner, repoName] = d3ftlyLabel.replace("d3ftly:", "").split("/");
-  if (!repoOwner || !repoName) {
-    console.log(`Skipping ${issue.key} — invalid d3ftly label: ${d3ftlyLabel}`);
-    return;
-  }
-
   // Load config from Forge storage (set via admin page)
   const config = await storage.get("d3ftly-config");
   if (!config || !config.installationId) {
     console.log(`Skipping ${issue.key} — d3ftly not configured. Go to Apps > d3ftly Settings.`);
+    return;
+  }
+
+  // Resolve target repo: d3ftly:owner/repo label > bare d3ftly label + default repo
+  const labels = fields.labels || [];
+  const repoLabel = labels.find((l) => l.startsWith("d3ftly:"));
+  const bareLabel = labels.some((l) => l === "d3ftly");
+
+  let repoOwner, repoName;
+
+  if (repoLabel) {
+    [repoOwner, repoName] = repoLabel.replace("d3ftly:", "").split("/");
+    if (!repoOwner || !repoName) {
+      console.log(`Skipping ${issue.key} — invalid label: ${repoLabel}`);
+      return;
+    }
+  } else if (bareLabel && config.defaultRepo) {
+    [repoOwner, repoName] = config.defaultRepo.split("/");
+    if (!repoOwner || !repoName) {
+      console.log(`Skipping ${issue.key} — invalid default repo: ${config.defaultRepo}`);
+      return;
+    }
+  } else {
+    console.log(`Skipping ${issue.key} — no d3ftly label`);
     return;
   }
 

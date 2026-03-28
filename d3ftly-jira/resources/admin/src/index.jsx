@@ -5,6 +5,7 @@ import { invoke } from "@forge/bridge";
 function App() {
   const [installationId, setInstallationId] = useState("");
   const [tenantId, setTenantId] = useState("");
+  const [defaultRepo, setDefaultRepo] = useState("");
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(true);
 
@@ -12,13 +13,14 @@ function App() {
     invoke("getConfig").then((config) => {
       setInstallationId(config.installationId || "");
       setTenantId(config.tenantId || "");
+      setDefaultRepo(config.defaultRepo || "");
       setLoading(false);
     });
   }, []);
 
   const save = async () => {
     setStatus("Saving…");
-    const result = await invoke("saveConfig", { installationId, tenantId });
+    const result = await invoke("saveConfig", { installationId, tenantId, defaultRepo });
     setStatus(result.success ? "Saved" : `Error: ${result.error}`);
     setTimeout(() => setStatus(""), 3000);
   };
@@ -66,6 +68,19 @@ function App() {
           Only needed if your tenant ID differs from your GitHub installation ID.
         </p>
 
+        <label style={styles.label}>
+          Default Repository
+          <input
+            style={styles.input}
+            value={defaultRepo}
+            onChange={(e) => setDefaultRepo(e.target.value)}
+            placeholder="e.g. acme/backend"
+          />
+        </label>
+        <p style={styles.hint}>
+          Issues with a <code style={styles.code}>d3ftly</code> label (no repo specified) will use this repo. Issues with <code style={styles.code}>d3ftly:owner/repo</code> override this.
+        </p>
+
         <button style={styles.button} onClick={save}>
           Save
         </button>
@@ -75,10 +90,10 @@ function App() {
       <div style={styles.howTo}>
         <h3 style={styles.howToTitle}>How it works</h3>
         <ol style={styles.steps}>
-          <li>Add a label <code style={styles.code}>d3ftly:owner/repo</code> to any Jira issue to map it to a GitHub repo.</li>
-          <li>Assign the issue to someone — d3ftly picks it up automatically.</li>
-          <li>d3ftly creates a branch, implements the change, and opens a draft PR.</li>
-          <li>Track progress in the d3ftly dashboard at <strong>app.d3ftly.com</strong>.</li>
+          <li>Add a <code style={styles.code}>d3ftly</code> label to any Jira issue to trigger d3ftly (uses the default repo above).</li>
+          <li>Or use <code style={styles.code}>d3ftly:owner/repo</code> to target a specific repo.</li>
+          <li>Assign the issue — d3ftly creates a branch, implements the change, and opens a draft PR.</li>
+          <li>Track progress at <strong>app.d3ftly.com</strong>.</li>
         </ol>
       </div>
     </div>
