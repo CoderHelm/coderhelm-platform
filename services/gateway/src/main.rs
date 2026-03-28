@@ -115,7 +115,11 @@ async fn main() -> Result<(), Error> {
             "/voice/repo/:owner/:name",
             get(routes::api::get_repo_voice).put(routes::api::update_repo_voice),
         )
-        // Agents context (per-repo)
+        // Agents context (global + per-repo)
+        .route(
+            "/agents/global",
+            get(routes::api::get_global_agents).put(routes::api::update_global_agents),
+        )
         .route(
             "/agents/repo/:owner/:name",
             get(routes::api::get_repo_agents).put(routes::api::update_repo_agents),

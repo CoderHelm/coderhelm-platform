@@ -1068,6 +1068,24 @@ pub async fn update_repo_voice(
 
 // ─── Agents context ─────────────────────────────────────────────────
 
+/// GET /api/agents/global — get global agents context.
+pub async fn get_global_agents(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    get_instructions_inner(&state, &claims.tenant_id, "AGENTS#GLOBAL").await
+}
+
+/// PUT /api/agents/global — update global agents context.
+pub async fn update_global_agents(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    let content = body["content"].as_str().unwrap_or("");
+    update_instructions_inner(&state, &claims.tenant_id, "AGENTS#GLOBAL", content).await
+}
+
 /// GET /api/agents/repo/:owner/:name — get agents context for a repo.
 pub async fn get_repo_agents(
     State(state): State<Arc<AppState>>,
