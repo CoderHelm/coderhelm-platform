@@ -195,8 +195,8 @@ pub async fn create_portal_session(
     Ok(Json(json!({ "url": url })))
 }
 
-/// POST /api/billing/subscribe — create an embedded Stripe Checkout Session.
-/// Returns a client_secret the frontend uses to render Stripe checkout inline.
+/// POST /api/billing/subscribe — create a Stripe Subscription with incomplete status.
+/// Returns a client_secret the frontend uses to confirm payment via Stripe Elements.
 /// On success, the `invoice.payment_succeeded` webhook activates the subscription.
 pub async fn create_subscription(
     State(state): State<Arc<AppState>>,
@@ -279,13 +279,25 @@ pub async fn create_subscription(
         .and_then(|i| i.get("email").and_then(|v| v.as_s().ok()).cloned())
         .unwrap_or_default();
 
-    // Get or create Stripe customer
+    // Get or create Stripe customer (and ensure email is up to date)
     let customer_id = match item
         .and_then(|i| i.get("stripe_customer_id"))
         .and_then(|v| v.as_s().ok())
         .filter(|s| !s.is_empty())
     {
-        Some(cid) => cid.to_string(),
+        Some(cid) => {
+            // Update email on existing customer if we have one
+            if !user_email.is_empty() {
+                let _ = state
+                    .http
+                    .post(format!("https://api.stripe.com/v1/customers/{cid}"))
+                    .header("Authorization", format!("Bearer {stripe_key}"))
+                    .form(&[("email", user_email.as_str())])
+                    .send()
+                    .await;
+            }
+            cid.to_string()
+        }
         None => create_stripe_customer(&state, stripe_key, &claims.tenant_id, &user_email).await?,
     };
 
@@ -318,43 +330,62 @@ pub async fn create_subscription(
         .send()
         .await;
 
-    // Create Stripe Checkout Session in embedded mode — renders inline via iframe
+    // Create Stripe Subscription with incomplete status — frontend confirms payment via Elements
     let form_params: Vec<(&str, &str)> = vec![
-        ("mode", "subscription"),
-        ("ui_mode", "embedded_page"),
         ("customer", &customer_id),
-        ("line_items[0][price]", price_id),
-        ("line_items[0][quantity]", "1"),
-        ("return_url", "https://app.d3ftly.com/billing/?success=true"),
+        ("items[0][price]", price_id),
+        ("payment_behavior", "default_incomplete"),
+        ("payment_settings[save_default_payment_method]", "on_subscription"),
+        ("expand[]", "latest_invoice.payment_intent"),
         ("metadata[tenant_id]", &claims.tenant_id),
-        ("subscription_data[metadata][tenant_id]", &claims.tenant_id),
     ];
     let response = state
         .http
-        .post("https://api.stripe.com/v1/checkout/sessions")
+        .post("https://api.stripe.com/v1/subscriptions")
         .header("Authorization", format!("Bearer {stripe_key}"))
         .form(&form_params)
         .send()
         .await
         .map_err(|e| {
-            error!("Stripe checkout session request failed: {e}");
+            error!("Stripe subscription request failed: {e}");
             StatusCode::BAD_GATEWAY
         })?;
 
-    let session: Value = response.json().await.map_err(|e| {
-        error!("Failed to parse Stripe checkout response: {e}");
+    let subscription: Value = response.json().await.map_err(|e| {
+        error!("Failed to parse Stripe subscription response: {e}");
         StatusCode::BAD_GATEWAY
     })?;
 
-    if let Some(err) = session["error"]["message"].as_str() {
-        error!("Stripe error creating checkout session: {err}");
+    if let Some(err) = subscription["error"]["message"].as_str() {
+        error!("Stripe error creating subscription: {err}");
         return Err(StatusCode::BAD_GATEWAY);
     }
 
-    let client_secret = session["client_secret"].as_str().ok_or_else(|| {
-        error!("Stripe checkout session missing client_secret");
-        StatusCode::BAD_GATEWAY
-    })?;
+    let client_secret = subscription["latest_invoice"]["payment_intent"]["client_secret"]
+        .as_str()
+        .ok_or_else(|| {
+            error!("Stripe subscription missing payment_intent client_secret");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    // Store subscription ID so webhooks and cancel work
+    let sub_id = subscription["id"].as_str().unwrap_or("");
+    if !sub_id.is_empty() {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&claims.tenant_id))
+            .key("sk", attr_s("BILLING"))
+            .update_expression(
+                "SET stripe_subscription_id = :sid, subscription_status = :s, updated_at = :t",
+            )
+            .expression_attribute_values(":sid", attr_s(sub_id))
+            .expression_attribute_values(":s", attr_s("incomplete"))
+            .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+            .send()
+            .await;
+    }
 
     Ok(Json(json!({ "client_secret": client_secret })))
 }
