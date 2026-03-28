@@ -66,8 +66,6 @@ jobs:
           mkdir -p ../services/worker/target/lambda/worker
           touch ../services/gateway/target/lambda/gateway/bootstrap
           touch ../services/worker/target/lambda/worker/bootstrap
-          mkdir -p ../dashboard/out
-          touch ../dashboard/out/index.html
       - run: npx cdk synth --quiet
         env:
           CDK_DEFAULT_ACCOUNT: "REDACTED_AWS_ACCOUNT_ID"

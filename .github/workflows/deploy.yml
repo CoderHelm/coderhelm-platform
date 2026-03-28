@@ -79,16 +79,6 @@ jobs:
           role-to-assume: arn:aws:iam::REDACTED_AWS_ACCOUNT_ID:role/d3ftly-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Cleanup legacy app frontend stack (one-time)
-        run: |
-          if aws cloudformation describe-stacks --stack-name d3ftly-prod-app >/dev/null 2>&1; then
-            echo "Deleting legacy stack d3ftly-prod-app to release app.d3ftly.com alias"
-            aws cloudformation delete-stack --stack-name d3ftly-prod-app
-            aws cloudformation wait stack-delete-complete --stack-name d3ftly-prod-app
-          else
-            echo "Legacy stack d3ftly-prod-app not found; skipping cleanup"
-          fi
-
       - name: Stripe setup (idempotent)
         run: bash scripts/setup-stripe.sh
 
