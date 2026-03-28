@@ -40,7 +40,11 @@ pub async fn run(
         set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "running").await?;
 
         // Use task-level repo if set, otherwise fall back to plan repo
-        let task_repo = task.repo.as_deref().filter(|r| !r.is_empty()).unwrap_or(&plan_repo);
+        let task_repo = task
+            .repo
+            .as_deref()
+            .filter(|r| !r.is_empty())
+            .unwrap_or(&plan_repo);
         if task_repo.is_empty() {
             error!(task_id, "No repo configured for task or plan");
             set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
@@ -177,10 +181,7 @@ async fn get_task(
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or_default(),
-        repo: item
-            .get("repo")
-            .and_then(|v| v.as_s().ok())
-            .cloned(),
+        repo: item.get("repo").and_then(|v| v.as_s().ok()).cloned(),
     }))
 }
 

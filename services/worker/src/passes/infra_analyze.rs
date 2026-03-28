@@ -138,11 +138,7 @@ async fn get_tenant(
     let repos: Vec<String> = repos_result
         .items()
         .iter()
-        .filter_map(|item| {
-            item.get("repo_name")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-        })
+        .filter_map(|item| item.get("repo_name").and_then(|v| v.as_s().ok()).cloned())
         .collect();
 
     Ok(Some((install_id, repos)))
