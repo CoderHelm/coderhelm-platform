@@ -418,13 +418,14 @@ pub async fn validate_jira_integration_payload(
     })))
 }
 
-/// POST /api/repos/:repo — update repo config.
+/// POST /api/repos/:owner/:name — update repo config.
 pub async fn update_repo(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(repo): axum::extract::Path<String>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let enabled = body["enabled"].as_bool().unwrap_or(true);
 
@@ -450,12 +451,13 @@ pub async fn update_repo(
     Ok(StatusCode::OK)
 }
 
-/// DELETE /api/repos/:repo — remove a repo from this tenant.
+/// DELETE /api/repos/:owner/:name — remove a repo from this tenant.
 pub async fn delete_repo(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(repo): axum::extract::Path<String>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<StatusCode, StatusCode> {
+    let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
 
     state
@@ -736,24 +738,26 @@ pub async fn update_global_instructions(
     update_instructions_inner(&state, &claims.tenant_id, "INSTRUCTIONS#GLOBAL", content).await
 }
 
-/// GET /api/instructions/repo/:repo — get per-repo custom instructions.
+/// GET /api/instructions/repo/:owner/:name — get per-repo custom instructions.
 pub async fn get_repo_instructions(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(repo): axum::extract::Path<String>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
+    let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let sk = format!("INSTRUCTIONS#REPO#{repo}");
     get_instructions_inner(&state, &claims.tenant_id, &sk).await
 }
 
-/// PUT /api/instructions/repo/:repo — update per-repo custom instructions.
+/// PUT /api/instructions/repo/:owner/:name — update per-repo custom instructions.
 pub async fn update_repo_instructions(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(repo): axum::extract::Path<String>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let content = body["content"].as_str().unwrap_or("");
     let sk = format!("INSTRUCTIONS#REPO#{repo}");
@@ -853,24 +857,26 @@ pub async fn update_global_rules(
     update_rules_inner(&state, &claims.tenant_id, "RULES#GLOBAL", rules).await
 }
 
-/// GET /api/rules/repo/:repo — get per-repo must-rules.
+/// GET /api/rules/repo/:owner/:name — get per-repo must-rules.
 pub async fn get_repo_rules(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(repo): axum::extract::Path<String>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
+    let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let sk = format!("RULES#REPO#{repo}");
     get_rules_inner(&state, &claims.tenant_id, &sk).await
 }
 
-/// PUT /api/rules/repo/:repo — update per-repo must-rules.
+/// PUT /api/rules/repo/:owner/:name — update per-repo must-rules.
 pub async fn update_repo_rules(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(repo): axum::extract::Path<String>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let rules = body["rules"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
     let sk = format!("RULES#REPO#{repo}");
@@ -967,24 +973,26 @@ pub async fn update_global_voice(
     update_instructions_inner(&state, &claims.tenant_id, "VOICE#GLOBAL", content).await
 }
 
-/// GET /api/voice/repo/:repo — get voice/tone settings for a repo.
+/// GET /api/voice/repo/:owner/:name — get voice/tone settings for a repo.
 pub async fn get_repo_voice(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(repo): axum::extract::Path<String>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
+    let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let sk = format!("VOICE#REPO#{repo}");
     get_instructions_inner(&state, &claims.tenant_id, &sk).await
 }
 
-/// PUT /api/voice/repo/:repo — update voice/tone settings for a repo.
+/// PUT /api/voice/repo/:owner/:name — update voice/tone settings for a repo.
 pub async fn update_repo_voice(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(repo): axum::extract::Path<String>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let content = body["content"].as_str().unwrap_or("");
     let sk = format!("VOICE#REPO#{repo}");
@@ -993,36 +1001,39 @@ pub async fn update_repo_voice(
 
 // ─── Agents context ─────────────────────────────────────────────────
 
-/// GET /api/agents/repo/:repo — get agents context for a repo.
+/// GET /api/agents/repo/:owner/:name — get agents context for a repo.
 pub async fn get_repo_agents(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(repo): axum::extract::Path<String>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
+    let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let sk = format!("AGENTS#REPO#{repo}");
     get_instructions_inner(&state, &claims.tenant_id, &sk).await
 }
 
-/// PUT /api/agents/repo/:repo — update agents context for a repo.
+/// PUT /api/agents/repo/:owner/:name — update agents context for a repo.
 pub async fn update_repo_agents(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(repo): axum::extract::Path<String>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let content = body["content"].as_str().unwrap_or("");
     let sk = format!("AGENTS#REPO#{repo}");
     update_instructions_inner(&state, &claims.tenant_id, &sk, content).await
 }
 
-/// POST /api/repos/:repo/regenerate — re-run onboard (voice + agents) for a repo.
+/// POST /api/repos/:owner/:name/regenerate — re-run onboard (voice + agents) for a repo.
 pub async fn regenerate_repo(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(repo): axum::extract::Path<String>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
+    let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
 
     let parts: Vec<&str> = repo.splitn(2, '/').collect();
