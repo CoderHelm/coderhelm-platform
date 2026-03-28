@@ -18,6 +18,7 @@ pub async fn run(
     github: &GitHubClient,
     plan: &PlanResult,
     branch: &str,
+    rules: &[String],
     usage: &mut TokenUsage,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
     // Create the working branch from main
@@ -26,9 +27,10 @@ pub async fn run(
         .await?;
     info!(branch, "Created working branch");
 
+    let rules_block = super::format_rules_block(rules);
     let system = format!(
         "You are an implementation agent for the {owner}/{repo} repository. \
-         Implement each task from the checklist. Follow existing code patterns exactly.",
+         Implement each task from the checklist. Follow existing code patterns exactly.{rules_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );

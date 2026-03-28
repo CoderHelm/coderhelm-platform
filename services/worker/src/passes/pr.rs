@@ -20,6 +20,7 @@ pub async fn run(
     github: &GitHubClient,
     branch: &str,
     plan: &PlanResult,
+    voice: &str,
     usage: &mut TokenUsage,
 ) -> Result<PrResult, Box<dyn std::error::Error + Send + Sync>> {
     // Get diff for body summary
@@ -29,8 +30,14 @@ pub async fn run(
     let diff_summary = format_diff_summary(&diff);
 
     // Generate PR body via LLM
-    let system =
-        "You are writing a pull request description. Be concise and technical. Return only markdown.";
+    let voice_block = if voice.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nIMPORTANT — Match the team's voice and tone as described below:\n{voice}")
+    };
+    let system = format!(
+        "You are writing a pull request description. Be concise and technical. Return only markdown.{voice_block}"
+    );
 
     let prompt = format!(
         r#"Write a concise pull request description for issue #{number}: {title}
@@ -69,7 +76,7 @@ Return ONLY the markdown body text."#,
 
     let body_text = llm::converse(
         state,
-        system,
+        &system,
         &mut messages,
         &[],
         &super::triage::NoOpExecutor,

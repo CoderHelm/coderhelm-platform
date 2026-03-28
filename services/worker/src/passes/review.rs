@@ -11,11 +11,13 @@ pub async fn run(
     msg: &TicketMessage,
     github: &GitHubClient,
     branch: &str,
+    rules: &[String],
     usage: &mut TokenUsage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rules_block = super::format_rules_block(rules);
     let system = format!(
         "You are a code review agent for the {owner}/{repo} repository. \
-         Review the diff for correctness, completeness, conventions, bugs, and security.",
+         Review the diff for correctness, completeness, conventions, bugs, and security.{rules_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
@@ -30,6 +32,7 @@ Use the `get_diff` tool to see all changes compared to main. Then review for:
 3. **Convention compliance** — Does it follow the repo's patterns (naming, imports, structure)?
 4. **Obvious bugs** — Null checks, off-by-one, missing error handling, typos?
 5. **Security** — Any injection risks, exposed secrets, unsafe operations?
+6. **Must-rules** — If must-rules are listed in the system prompt, verify every rule is respected.
 
 If you find issues:
 - Fix them using `write_file` or `batch_write`

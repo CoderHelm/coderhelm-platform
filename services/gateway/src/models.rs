@@ -81,6 +81,17 @@ pub enum WorkerMessage {
     Feedback(FeedbackMessage),
     #[serde(rename = "onboard")]
     Onboard(OnboardMessage),
+    #[serde(rename = "mark_ready")]
+    MarkReady(MarkReadyMessage),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MarkReadyMessage {
+    pub tenant_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

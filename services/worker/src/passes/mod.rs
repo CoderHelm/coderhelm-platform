@@ -2,7 +2,8 @@ use crate::clients::email::{self, EmailEvent};
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
 use crate::WorkerState;
-use tracing::{error, info};
+use aws_sdk_dynamodb::types::AttributeValue;
+use tracing::{error, info, warn};
 
 pub mod ci_fix;
 pub mod feedback;
@@ -58,6 +59,15 @@ async fn run_passes(
         &state.http,
     )?;
 
+    // Load must-rules (global + repo-specific)
+    let rules = load_rules(state, msg).await;
+
+    // Load voice instructions from .d3ftly/VOICE.md (if exists)
+    let voice = github
+        .read_file(&msg.repo_owner, &msg.repo_name, ".d3ftly/VOICE.md", "main")
+        .await
+        .unwrap_or_default();
+
     // Post "working on it" comment on the issue
     github
         .create_issue_comment(
@@ -84,8 +94,16 @@ async fn run_passes(
     // --- Pass 3: Implement ---
     update_pass(state, &msg.tenant_id, run_id, "implement").await?;
     let branch_name = format!("d3ftly/{}", msg.ticket_id.to_lowercase());
-    let impl_result =
-        implement::run(state, msg, &github, &plan_result, &branch_name, usage).await?;
+    let impl_result = implement::run(
+        state,
+        msg,
+        &github,
+        &plan_result,
+        &branch_name,
+        &rules,
+        usage,
+    )
+    .await?;
     info!(
         run_id,
         files = impl_result.files_modified.len(),
@@ -94,12 +112,21 @@ async fn run_passes(
 
     // --- Pass 4: Review ---
     update_pass(state, &msg.tenant_id, run_id, "review").await?;
-    review::run(state, msg, &github, &branch_name, usage).await?;
+    review::run(state, msg, &github, &branch_name, &rules, usage).await?;
     info!(run_id, "Review complete");
 
     // --- Pass 5: Create PR ---
     update_pass(state, &msg.tenant_id, run_id, "pr").await?;
-    let pr_result = pr::run(state, msg, &github, &branch_name, &plan_result, usage).await?;
+    let pr_result = pr::run(
+        state,
+        msg,
+        &github,
+        &branch_name,
+        &plan_result,
+        &voice,
+        usage,
+    )
+    .await?;
     info!(run_id, pr_url = %pr_result.pr_url, "PR created");
 
     // Update run record with final state
@@ -379,4 +406,60 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 
 fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
+}
+
+/// Load must-rules (global + repo-specific) from DynamoDB and merge them.
+async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<String> {
+    let mut rules = Vec::new();
+
+    // Load global rules
+    if let Some(global) = load_rule_list(state, &msg.tenant_id, "RULES#GLOBAL").await {
+        rules.extend(global);
+    }
+
+    // Load repo-specific rules
+    let repo_sk = format!("RULES#REPO#{}/{}", msg.repo_owner, msg.repo_name);
+    if let Some(repo_rules) = load_rule_list(state, &msg.tenant_id, &repo_sk).await {
+        rules.extend(repo_rules);
+    }
+
+    if !rules.is_empty() {
+        info!(count = rules.len(), "Loaded must-rules");
+    }
+    rules
+}
+
+async fn load_rule_list(state: &WorkerState, tenant_id: &str, sk: &str) -> Option<Vec<String>> {
+    match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("sk", AttributeValue::S(sk.to_string()))
+        .send()
+        .await
+    {
+        Ok(output) => output
+            .item()
+            .and_then(|item| item.get("rules"))
+            .and_then(|v| v.as_l().ok())
+            .map(|list| list.iter().filter_map(|v| v.as_s().ok().cloned()).collect()),
+        Err(e) => {
+            warn!(error = %e, "Failed to load rules from {sk}");
+            None
+        }
+    }
+}
+
+/// Format must-rules as a string block for injection into system prompts.
+pub fn format_rules_block(rules: &[String]) -> String {
+    if rules.is_empty() {
+        return String::new();
+    }
+    let mut block =
+        String::from("\n\n## Must-Rules (MANDATORY — violating any of these is a failure)\n");
+    for rule in rules {
+        block.push_str(&format!("- {rule}\n"));
+    }
+    block
 }

@@ -482,3 +482,119 @@ async fn update_instructions_inner(
 
     Ok(StatusCode::OK)
 }
+
+// ─── Must-rules ─────────────────────────────────────────────────────
+
+const MAX_RULES_BYTES: usize = 10_240; // 10KB limit
+
+/// GET /api/rules/global — get global must-rules.
+pub async fn get_global_rules(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    get_rules_inner(&state, &claims.tenant_id, "RULES#GLOBAL").await
+}
+
+/// PUT /api/rules/global — update global must-rules.
+pub async fn update_global_rules(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    let rules = body["rules"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
+    update_rules_inner(&state, &claims.tenant_id, "RULES#GLOBAL", rules).await
+}
+
+/// GET /api/rules/repo/:repo — get per-repo must-rules.
+pub async fn get_repo_rules(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(repo): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    validate_repo_name(&repo)?;
+    let sk = format!("RULES#REPO#{repo}");
+    get_rules_inner(&state, &claims.tenant_id, &sk).await
+}
+
+/// PUT /api/rules/repo/:repo — update per-repo must-rules.
+pub async fn update_repo_rules(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(repo): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    validate_repo_name(&repo)?;
+    let rules = body["rules"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
+    let sk = format!("RULES#REPO#{repo}");
+    update_rules_inner(&state, &claims.tenant_id, &sk, rules).await
+}
+
+async fn get_rules_inner(
+    state: &AppState,
+    tenant_id: &str,
+    sk: &str,
+) -> Result<Json<Value>, StatusCode> {
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(tenant_id))
+        .key("sk", attr_s(sk))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch rules: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let rules: Vec<String> = result
+        .item()
+        .and_then(|item| item.get("rules"))
+        .and_then(|v| v.as_l().ok())
+        .map(|list| list.iter().filter_map(|v| v.as_s().ok().cloned()).collect())
+        .unwrap_or_default();
+
+    Ok(Json(json!({ "rules": rules })))
+}
+
+async fn update_rules_inner(
+    state: &AppState,
+    tenant_id: &str,
+    sk: &str,
+    rules: &[Value],
+) -> Result<StatusCode, StatusCode> {
+    let rule_strings: Vec<String> = rules
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+
+    let serialized = serde_json::to_string(&rule_strings).unwrap_or_default();
+    if serialized.len() > MAX_RULES_BYTES {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let rule_attrs: Vec<aws_sdk_dynamodb::types::AttributeValue> = rule_strings
+        .iter()
+        .map(|s| aws_sdk_dynamodb::types::AttributeValue::S(s.clone()))
+        .collect();
+
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.table_name)
+        .item("pk", attr_s(tenant_id))
+        .item("sk", attr_s(sk))
+        .item(
+            "rules",
+            aws_sdk_dynamodb::types::AttributeValue::L(rule_attrs),
+        )
+        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to update rules: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(StatusCode::OK)
+}

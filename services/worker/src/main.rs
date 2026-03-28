@@ -87,8 +87,35 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("Onboard failed: {e}");
                 }
             }
+            models::WorkerMessage::MarkReady(msg) => {
+                info!(tenant_id = %msg.tenant_id, pr_number = msg.pr_number, "Marking PR ready");
+                if let Err(e) = mark_pr_ready(&state, msg).await {
+                    error!("Mark PR ready failed: {e}");
+                }
+            }
         }
     }
 
+    Ok(())
+}
+
+async fn mark_pr_ready(
+    state: &WorkerState,
+    msg: models::MarkReadyMessage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let github = clients::github::GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    )?;
+    github
+        .mark_pr_ready(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await?;
+    info!(
+        pr_number = msg.pr_number,
+        repo = %format!("{}/{}", msg.repo_owner, msg.repo_name),
+        "PR marked ready for review"
+    );
     Ok(())
 }

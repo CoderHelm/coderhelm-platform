@@ -9,8 +9,8 @@ use tracing::{error, info, warn};
 
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
-    CiFixMessage, FeedbackMessage, OnboardMessage, OnboardRepo, TicketMessage, TicketSource,
-    WorkerMessage,
+    CiFixMessage, FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo, TicketMessage,
+    TicketSource, WorkerMessage,
 };
 use crate::AppState;
 
@@ -405,19 +405,14 @@ async fn handle_pr_review_comment(
     send_to_queue(state, &state.config.feedback_queue_url, &message).await
 }
 
-/// Handle check_suite events — re-run CI fix if an entire suite fails.
+/// Handle check_suite events — mark PR ready on success, log failures.
 async fn handle_check_suite(
-    _state: &AppState,
+    state: &AppState,
     payload: &Value,
-    _installation_id: u64,
+    installation_id: u64,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     if action != "completed" {
-        return Ok(StatusCode::OK);
-    }
-
-    let conclusion = payload["check_suite"]["conclusion"].as_str().unwrap_or("");
-    if conclusion != "failure" {
         return Ok(StatusCode::OK);
     }
 
@@ -426,13 +421,43 @@ async fn handle_check_suite(
         return Ok(StatusCode::OK);
     }
 
-    info!(
-        branch,
-        "Check suite failed on d3ftly branch — delegating to check_run handler"
-    );
-    // The individual check_run events will handle CI fixes;
-    // this is logged for observability.
-    Ok(StatusCode::OK)
+    let conclusion = payload["check_suite"]["conclusion"].as_str().unwrap_or("");
+    let repo = &payload["repository"];
+
+    match conclusion {
+        "success" => {
+            // All checks passed — find the open draft PR for this branch and mark it ready
+            let prs = payload["check_suite"]["pull_requests"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for pr in &prs {
+                let pr_number = pr["number"].as_u64().unwrap_or(0);
+                if pr_number == 0 {
+                    continue;
+                }
+                info!(branch, pr_number, "CI passed — marking PR ready");
+                let message = WorkerMessage::MarkReady(MarkReadyMessage {
+                    tenant_id: format!("TENANT#{installation_id}"),
+                    installation_id,
+                    repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
+                    repo_name: repo["name"].as_str().unwrap_or("").to_string(),
+                    pr_number,
+                });
+                let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+            }
+            Ok(StatusCode::OK)
+        }
+        "failure" => {
+            info!(
+                branch,
+                "Check suite failed on d3ftly branch — delegating to check_run handler"
+            );
+            // The individual check_run events will handle CI fixes
+            Ok(StatusCode::OK)
+        }
+        _ => Ok(StatusCode::OK),
+    }
 }
 
 /// Handle repository events — track renames, deletions, visibility changes.
