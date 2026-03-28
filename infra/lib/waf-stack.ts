@@ -129,10 +129,7 @@ export class WafStack extends cdk.Stack {
               arn: new wafv2.CfnRegexPatternSet(this, "BotPatterns", {
                 scope: "CLOUDFRONT",
                 regularExpressionList: [
-                  {
-                    regexString:
-                      "(?i)(scrapy|httpclient|python-urllib|python-requests|curl\\/|wget\\/|go-http|nikto|sqlmap|nmap|masscan|zgrab)",
-                  },
+                  "(?i)(scrapy|httpclient|python-urllib|python-requests|curl\\/|wget\\/|go-http|nikto|sqlmap|nmap|masscan|zgrab)",
                 ],
               }).attrArn,
               fieldToMatch: {
