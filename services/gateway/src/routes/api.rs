@@ -945,3 +945,171 @@ pub async fn update_budget(
 
     Ok(StatusCode::OK)
 }
+
+/// GET /api/health — system health check (stale runs, DLQ depth, queue depths).
+pub async fn health(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let now = chrono::Utc::now();
+    let mut checks: Vec<Value> = Vec::new();
+    let mut status = "healthy";
+
+    // 1. Stale runs — running for over 30 minutes
+    let stale_cutoff = (now - chrono::Duration::minutes(30)).to_rfc3339();
+    if let Ok(result) = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("tenant_id = :tid")
+        .filter_expression("(#s = :running OR #s = :queued) AND created_at < :cutoff")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":running", attr_s("running"))
+        .expression_attribute_values(":queued", attr_s("queued"))
+        .expression_attribute_values(":cutoff", attr_s(&stale_cutoff))
+        .limit(20)
+        .send()
+        .await
+    {
+        let stale_runs: Vec<Value> = result
+            .items()
+            .iter()
+            .map(|item| {
+                json!({
+                    "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
+                    "status": item.get("status").and_then(|v| v.as_s().ok()),
+                    "title": item.get("title").and_then(|v| v.as_s().ok()),
+                    "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
+                })
+            })
+            .collect();
+
+        let count = stale_runs.len();
+        if count > 0 {
+            status = "degraded";
+        }
+        checks.push(json!({
+            "name": "stale_runs",
+            "status": if count == 0 { "ok" } else { "warning" },
+            "count": count,
+            "items": stale_runs,
+        }));
+    }
+
+    // 2. DLQ depth
+    if !state.config.dlq_url.is_empty() {
+        if let Ok(attrs) = state
+            .sqs
+            .get_queue_attributes()
+            .queue_url(&state.config.dlq_url)
+            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)
+            .send()
+            .await
+        {
+            let depth: u64 = attrs
+                .attributes()
+                .and_then(|a| {
+                    a.get(&aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)
+                })
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+
+            if depth > 0 {
+                status = "degraded";
+            }
+            checks.push(json!({
+                "name": "dlq",
+                "status": if depth == 0 { "ok" } else { "critical" },
+                "depth": depth,
+            }));
+        }
+    }
+
+    // 3. Queue depths (tickets, ci-fix, feedback)
+    for (name, url) in [
+        ("tickets", &state.config.ticket_queue_url),
+        ("ci_fix", &state.config.ci_fix_queue_url),
+        ("feedback", &state.config.feedback_queue_url),
+    ] {
+        if let Ok(attrs) = state
+            .sqs
+            .get_queue_attributes()
+            .queue_url(url)
+            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)
+            .attribute_names(
+                aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessagesNotVisible,
+            )
+            .send()
+            .await
+        {
+            let visible: u64 = attrs
+                .attributes()
+                .and_then(|a| {
+                    a.get(&aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)
+                })
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let in_flight: u64 = attrs
+                .attributes()
+                .and_then(|a| {
+                    a.get(
+                        &aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessagesNotVisible,
+                    )
+                })
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+
+            checks.push(json!({
+                "name": name,
+                "status": "ok",
+                "visible": visible,
+                "in_flight": in_flight,
+            }));
+        }
+    }
+
+    // 4. Recent error runs (last 24h)
+    let error_cutoff = (now - chrono::Duration::hours(24)).to_rfc3339();
+    if let Ok(result) = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("tenant_id = :tid")
+        .filter_expression("#s = :failed AND created_at > :cutoff")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":failed", attr_s("failed"))
+        .expression_attribute_values(":cutoff", attr_s(&error_cutoff))
+        .limit(50)
+        .send()
+        .await
+    {
+        let failed_runs: Vec<Value> = result
+            .items()
+            .iter()
+            .map(|item| {
+                json!({
+                    "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
+                    "title": item.get("title").and_then(|v| v.as_s().ok()),
+                    "error": item.get("error").and_then(|v| v.as_s().ok()),
+                    "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
+                })
+            })
+            .collect();
+
+        let count = failed_runs.len();
+        checks.push(json!({
+            "name": "failed_runs_24h",
+            "status": if count == 0 { "ok" } else { "warning" },
+            "count": count,
+            "items": failed_runs,
+        }));
+    }
+
+    Ok(Json(json!({
+        "status": status,
+        "checked_at": now.to_rfc3339(),
+        "checks": checks,
+    })))
+}

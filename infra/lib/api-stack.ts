@@ -98,6 +98,7 @@ export class ApiStack extends cdk.Stack {
         TICKET_QUEUE_URL: this.ticketQueue.queueUrl,
         CI_FIX_QUEUE_URL: this.ciFixQueue.queueUrl,
         FEEDBACK_QUEUE_URL: this.feedbackQueue.queueUrl,
+        DLQ_URL: dlq.queueUrl,
         SECRETS_NAME: `d3ftly/${props.stage}/secrets`,
         SES_FROM_ADDRESS: "notifications@d3ftly.com",
         SES_TEMPLATE_PREFIX: `d3ftly-${props.stage}`,
@@ -113,6 +114,7 @@ export class ApiStack extends cdk.Stack {
     this.ticketQueue.grantSendMessages(this.gatewayFunction);
     this.ciFixQueue.grantSendMessages(this.gatewayFunction);
     this.feedbackQueue.grantSendMessages(this.gatewayFunction);
+    dlq.grantConsumeMessages(this.gatewayFunction);
     secrets.grantRead(this.gatewayFunction);
 
     // --- HTTP API Gateway ---
