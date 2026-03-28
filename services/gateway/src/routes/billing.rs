@@ -130,6 +130,7 @@ pub async fn get_billing(
         "subscription_status": subscription_status,
         "plan_id": item.and_then(|i| i.get("plan_id")).and_then(|v| v.as_s().ok()),
         "has_payment_method": !stripe_customer_id.is_empty(),
+        "stripe_publishable_key": state.secrets.stripe_publishable_key.as_deref().unwrap_or(""),
         "last_payment_at": item.and_then(|i| i.get("last_payment_at")).and_then(|v| v.as_s().ok()),
         "payment_retry_count": item.and_then(|i| i.get("payment_retry_count")).and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
         "last_failure_reason": item.and_then(|i| i.get("last_failure_reason")).and_then(|v| v.as_s().ok()),

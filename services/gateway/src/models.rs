@@ -56,6 +56,8 @@ pub struct Secrets {
     #[serde(default)]
     pub stripe_secret_key: Option<String>,
     #[serde(default)]
+    pub stripe_publishable_key: Option<String>,
+    #[serde(default)]
     pub stripe_price_id: Option<String>,
 }
 
