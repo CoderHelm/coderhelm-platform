@@ -6,6 +6,7 @@ use crate::models::{TicketMessage, TokenUsage};
 use crate::passes::plan::PlanResult;
 use crate::WorkerState;
 
+#[allow(dead_code)]
 pub struct PrResult {
     pub pr_number: u64,
     pub pr_url: String,

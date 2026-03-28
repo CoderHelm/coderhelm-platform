@@ -63,7 +63,7 @@ impl Secrets {
         let response = client.get_secret_value().secret_id(name).send().await?;
         let secret_string = response
             .secret_string()
-            .ok_or_else(|| "Secret has no string value")?;
+            .ok_or("Secret has no string value")?;
         let secrets: Secrets = serde_json::from_str(secret_string)?;
         Ok(secrets)
     }
@@ -138,7 +138,7 @@ pub struct ReviewComment {
 }
 
 /// JWT claims for authenticated dashboard sessions.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Claims {
     pub sub: String, // user_id
     pub tenant_id: String,
@@ -149,6 +149,7 @@ pub struct Claims {
 
 /// DynamoDB item types.
 #[derive(Serialize, Deserialize, Debug)]
+#[allow(dead_code)]
 pub struct Tenant {
     pub pk: String, // TENANT#<install_id>
     pub sk: String, // META
