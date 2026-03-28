@@ -86,7 +86,11 @@ async fn run_passes(
     let branch_name = format!("d3ftly/{}", msg.ticket_id.to_lowercase());
     let impl_result =
         implement::run(state, msg, &github, &plan_result, &branch_name, usage).await?;
-    info!(run_id, files = impl_result.files_modified.len(), "Implement complete");
+    info!(
+        run_id,
+        files = impl_result.files_modified.len(),
+        "Implement complete"
+    );
 
     // --- Pass 4: Review ---
     update_pass(state, &msg.tenant_id, run_id, "review").await?;
@@ -95,13 +99,21 @@ async fn run_passes(
 
     // --- Pass 5: Create PR ---
     update_pass(state, &msg.tenant_id, run_id, "pr").await?;
-    let pr_result =
-        pr::run(state, msg, &github, &branch_name, &plan_result, usage).await?;
+    let pr_result = pr::run(state, msg, &github, &branch_name, &plan_result, usage).await?;
     info!(run_id, pr_url = %pr_result.pr_url, "PR created");
 
     // Update run record with final state
     let duration = start.elapsed().as_secs();
-    complete_run(state, msg, run_id, &pr_result, &impl_result, usage, duration).await?;
+    complete_run(
+        state,
+        msg,
+        run_id,
+        &pr_result,
+        &impl_result,
+        usage,
+        duration,
+    )
+    .await?;
 
     // Post success comment on issue
     github
@@ -139,7 +151,10 @@ async fn create_run_record(
         // Composite SK for status-index GSI: "running#<run_id>" for efficient status queries
         .item("status_run_id", attr_s(&format!("running#{run_id}")))
         // Composite key for repo-index GSI
-        .item("tenant_repo", attr_s(&format!("{}#{}", msg.tenant_id, repo)))
+        .item(
+            "tenant_repo",
+            attr_s(&format!("{}#{}", msg.tenant_id, repo)),
+        )
         .item("ticket_source", attr_s("github"))
         .item("ticket_id", attr_s(&msg.ticket_id))
         .item("title", attr_s(&msg.title))

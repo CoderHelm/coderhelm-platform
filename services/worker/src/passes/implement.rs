@@ -189,15 +189,18 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                 Ok(json!(paths.join("\n")))
             }
             "read_file" => {
-                let path = input.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
-                let content = self
-                    .github
-                    .read_file(&self.owner, &self.repo, path, &self.branch)
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing path")?;
                     .await?;
                 Ok(json!(content))
             }
             "list_directory" => {
-                let path = input.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing path")?;
                 let entries = self
                     .github
                     .list_directory(&self.owner, &self.repo, path, &self.branch)
@@ -209,25 +212,53 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                 Ok(json!(lines.join("\n")))
             }
             "write_file" => {
-                let path = input.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
-                let content = input.get("content").and_then(|v| v.as_str()).ok_or("Missing content")?;
-                let message = input.get("message").and_then(|v| v.as_str()).ok_or("Missing message")?;
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing path")?;
+                let content = input
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing content")?;
+                let message = input
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing message")?;
                 let sha = input.get("sha").and_then(|v| v.as_str());
                 self.github
-                    .write_file(&self.owner, &self.repo, path, content, &self.branch, message, sha)
+                    .write_file(
+                        &self.owner,
+                        &self.repo,
+                        path,
+                        content,
+                        &self.branch,
+                        message,
+                        sha,
+                    )
                     .await?;
                 self.files_modified.lock().unwrap().insert(path.to_string());
                 Ok(json!(format!("Wrote {path}")))
             }
             "batch_write" => {
-                let message = input.get("message").and_then(|v| v.as_str()).ok_or("Missing message")?;
-                let files_arr = input.get("files").and_then(|v| v.as_array()).ok_or("Missing files")?;
+                let message = input
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing message")?;
+                let files_arr = input
+                    .get("files")
+                    .and_then(|v| v.as_array())
+                    .ok_or("Missing files")?;
                 let mut ops = Vec::new();
                 for f in files_arr {
-                    let path = f.get("path").and_then(|v| v.as_str()).ok_or("Missing file path")?;
+                    let path = f
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or("Missing file path")?;
                     let action = f.get("action").and_then(|v| v.as_str()).unwrap_or("write");
                     if action == "delete" {
-                        ops.push(FileOp::Delete { path: path.to_string() });
+                        ops.push(FileOp::Delete {
+                            path: path.to_string(),
+                        });
                     } else {
                         let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
                         ops.push(FileOp::Write {
@@ -241,7 +272,11 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .github
                     .batch_write(&self.owner, &self.repo, &self.branch, message, &ops)
                     .await?;
-                Ok(json!(format!("Batch commit {} — {} files", &sha[..8], ops.len())))
+                Ok(json!(format!(
+                    "Batch commit {} — {} files",
+                    &sha[..8],
+                    ops.len()
+                )))
             }
             "get_diff" => {
                 let diff = self

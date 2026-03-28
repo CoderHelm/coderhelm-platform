@@ -55,8 +55,7 @@ Output a brief summary of what you reviewed and any fixes applied."#,
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let response =
-        llm::converse(state, &system, &mut messages, &tools, &executor, usage).await?;
+    let response = llm::converse(state, &system, &mut messages, &tools, &executor, usage).await?;
     info!("Review result: {}", &response[..response.len().min(200)]);
     Ok(())
 }
@@ -143,8 +142,7 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                 if let Some(files) = files {
                     let mut lines = Vec::new();
                     for f in files {
-                        let filename =
-                            f.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+                        let filename = f.get("filename").and_then(|v| v.as_str()).unwrap_or("");
                         let status = f.get("status").and_then(|v| v.as_str()).unwrap_or("");
                         let adds = f.get("additions").and_then(|v| v.as_u64()).unwrap_or(0);
                         let dels = f.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -164,7 +162,10 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                 }
             }
             "read_file" => {
-                let path = input.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing path")?;
                 let content = self
                     .github
                     .read_file(self.owner, self.repo, path, self.branch)
@@ -172,8 +173,10 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                 Ok(json!(content))
             }
             "write_file" => {
-                let path =
-                    input.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing path")?;
                 let content = input
                     .get("content")
                     .and_then(|v| v.as_str())
@@ -184,7 +187,15 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                     .ok_or("Missing message")?;
                 let sha = input.get("sha").and_then(|v| v.as_str());
                 self.github
-                    .write_file(self.owner, self.repo, path, content, self.branch, message, sha)
+                    .write_file(
+                        self.owner,
+                        self.repo,
+                        path,
+                        content,
+                        self.branch,
+                        message,
+                        sha,
+                    )
                     .await?;
                 Ok(json!(format!("Wrote {path}")))
             }
@@ -199,8 +210,10 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                     .ok_or("Missing files")?;
                 let mut ops = Vec::new();
                 for f in files_arr {
-                    let path =
-                        f.get("path").and_then(|v| v.as_str()).ok_or("Missing file path")?;
+                    let path = f
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or("Missing file path")?;
                     let action = f.get("action").and_then(|v| v.as_str()).unwrap_or("write");
                     if action == "delete" {
                         ops.push(crate::clients::github::FileOp::Delete {

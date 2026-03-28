@@ -1,6 +1,6 @@
 use aws_sdk_bedrockruntime::types::{
-    CachePointBlock, ContentBlock, ConversationRole, Message, SystemContentBlock,
-    ToolConfiguration, ToolInputSchema, ToolSpecification, Tool,
+    CachePointBlock, ContentBlock, ConversationRole, Message, SystemContentBlock, Tool,
+    ToolConfiguration, ToolInputSchema, ToolSpecification,
 };
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -98,19 +98,22 @@ pub async fn converse(
         for tool_use in &tool_uses {
             info!(tool = tool_use.name(), "Executing tool");
             let input: Value = serde_json::from_str(
-                &tool_use.input().as_ref().map(|d| d.to_string()).unwrap_or_default()
-            ).unwrap_or(json!({}));
+                &tool_use
+                    .input()
+                    .as_ref()
+                    .map(|d| d.to_string())
+                    .unwrap_or_default(),
+            )
+            .unwrap_or(json!({}));
 
             match tool_executor.execute(tool_use.name(), &input).await {
                 Ok(result) => {
                     tool_results.push(ContentBlock::ToolResult(
                         aws_sdk_bedrockruntime::types::ToolResultBlock::builder()
                             .tool_use_id(tool_use.tool_use_id())
-                            .content(
-                                aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(
-                                    serde_json::to_string(&result)?,
-                                ),
-                            )
+                            .content(aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(
+                                serde_json::to_string(&result)?,
+                            ))
                             .build()?,
                     ));
                 }
@@ -119,11 +122,9 @@ pub async fn converse(
                     tool_results.push(ContentBlock::ToolResult(
                         aws_sdk_bedrockruntime::types::ToolResultBlock::builder()
                             .tool_use_id(tool_use.tool_use_id())
-                            .content(
-                                aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(
-                                    format!("Error: {e}"),
-                                ),
-                            )
+                            .content(aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(
+                                format!("Error: {e}"),
+                            ))
                             .status(aws_sdk_bedrockruntime::types::ToolResultStatus::Error)
                             .build()?,
                     ));
