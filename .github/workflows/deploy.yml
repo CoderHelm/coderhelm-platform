@@ -90,7 +90,7 @@ jobs:
       - working-directory: infra
         run: npm ci
       - working-directory: infra
-        run: npx cdk deploy d3ftly-prod-database d3ftly-prod-storage d3ftly-prod-api d3ftly-prod-worker d3ftly-prod-email d3ftly-prod-billing d3ftly-prod-waf d3ftly-prod-monitoring --require-approval never
+        run: npx cdk deploy --all --require-approval never
         env:
           GATEWAY_ZIP: ${{ github.workspace }}/artifacts/gateway.zip
           WORKER_ZIP: ${{ github.workspace }}/artifacts/worker.zip
