@@ -19,7 +19,7 @@ exports.handler = async (event, context) => {
     return;
   }
 
-  // Resolve target repo: d3ftly:owner/repo label > bare d3ftly label + default repo
+  // Check for d3ftly label: d3ftly:owner/repo (explicit) or d3ftly (auto-resolve)
   const labels = fields.labels || [];
   const repoLabel = labels.find((l) => l.startsWith("d3ftly:"));
   const bareLabel = labels.some((l) => l === "d3ftly");
@@ -32,13 +32,7 @@ exports.handler = async (event, context) => {
       console.log(`Skipping ${issue.key} — invalid label: ${repoLabel}`);
       return;
     }
-  } else if (bareLabel && config.defaultRepo) {
-    [repoOwner, repoName] = config.defaultRepo.split("/");
-    if (!repoOwner || !repoName) {
-      console.log(`Skipping ${issue.key} — invalid default repo: ${config.defaultRepo}`);
-      return;
-    }
-  } else {
+  } else if (!bareLabel) {
     console.log(`Skipping ${issue.key} — no d3ftly label`);
     return;
   }
@@ -58,8 +52,8 @@ exports.handler = async (event, context) => {
     },
     user: { displayName: assignee.displayName || "jira" },
     d3ftly: {
-      repo_owner: repoOwner,
-      repo_name: repoName,
+      repo_owner: repoOwner || undefined,
+      repo_name: repoName || undefined,
       installation_id: parseInt(config.installationId, 10),
       tenant_id: config.tenantId || undefined,
     },
