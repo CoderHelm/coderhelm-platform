@@ -7,9 +7,10 @@ use crate::models::Claims;
 use crate::AppState;
 
 // ─── Usage limits (included in Pro) ─────────────────────────────────
-pub const INCLUDED_RUNS: u64 = 30;
+pub const INCLUDED_TOKENS: u64 = 5_000_000; // 5M tokens (in+out)
+pub const FREE_TIER_TOKENS: u64 = 500_000; // 500K tokens for free tier
 pub const INCLUDED_PLANS: u64 = 5;
-pub const OVERAGE_COST_PER_RUN_CENTS: u64 = 500; // $5/run
+pub const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 5; // $0.05 per 1K tokens ($50/1M)
 pub const OVERAGE_COST_PER_PLAN_CENTS: u64 = 1000; // $10/plan
 
 /// GET /api/billing — get billing overview (subscription status, plan, payment method, balance).
@@ -77,6 +78,22 @@ pub async fn get_billing(
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
 
+    let current_tokens_in: u64 = usage
+        .as_ref()
+        .and_then(|i| i.get("total_tokens_in"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let current_tokens_out: u64 = usage
+        .as_ref()
+        .and_then(|i| i.get("total_tokens_out"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let current_tokens = current_tokens_in + current_tokens_out;
+
     // Get recent payments (last 5)
     let payments = state
         .dynamo
@@ -107,10 +124,11 @@ pub async fn get_billing(
         })
         .collect();
 
-    let runs_overage = current_runs.saturating_sub(INCLUDED_RUNS);
+    let tokens_overage = current_tokens.saturating_sub(INCLUDED_TOKENS);
+    let tokens_overage_1k = tokens_overage / 1000;
     let plans_overage = current_plans.saturating_sub(INCLUDED_PLANS);
-    let estimated_overage_cents =
-        runs_overage * OVERAGE_COST_PER_RUN_CENTS + plans_overage * OVERAGE_COST_PER_PLAN_CENTS;
+    let estimated_overage_cents = tokens_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS
+        + plans_overage * OVERAGE_COST_PER_PLAN_CENTS;
 
     Ok(Json(json!({
         "subscription_status": subscription_status,
@@ -122,15 +140,16 @@ pub async fn get_billing(
         "access_until": item.and_then(|i| i.get("access_until")).and_then(|v| v.as_s().ok()),
         "cancelled_at": item.and_then(|i| i.get("cancelled_at")).and_then(|v| v.as_s().ok()),
         "limits": {
-            "runs": INCLUDED_RUNS,
+            "tokens": INCLUDED_TOKENS,
             "plans": INCLUDED_PLANS,
-            "overage_per_run_cents": OVERAGE_COST_PER_RUN_CENTS,
+            "overage_per_1k_tokens_cents": OVERAGE_PER_1K_TOKENS_CENTS,
             "overage_per_plan_cents": OVERAGE_COST_PER_PLAN_CENTS,
         },
         "current_period": {
             "month": month,
             "usage_cost": current_usage_cost,
             "total_runs": current_runs,
+            "total_tokens": current_tokens,
             "total_plans": current_plans,
             "estimated_overage_cents": estimated_overage_cents,
         },
@@ -235,7 +254,7 @@ pub async fn create_subscription(
     // The frontend uses the client_secret with Stripe Elements to confirm payment.
     // We also look up the metered overage prices and attach them as additional items.
     let plans_overage_price = lookup_metered_price(&state, stripe_key, "plans_overage").await;
-    let runs_overage_price = lookup_metered_price(&state, stripe_key, "runs_overage").await;
+    let tokens_overage_price = lookup_metered_price(&state, stripe_key, "tokens_overage").await;
 
     let mut form_params: Vec<(&str, String)> = vec![
         ("customer", customer_id.clone()),
@@ -254,7 +273,7 @@ pub async fn create_subscription(
         form_params.push(("items[1][price]", pid.clone()));
         item_index = 2;
     }
-    if let Some(ref pid) = runs_overage_price {
+    if let Some(ref pid) = tokens_overage_price {
         let key = if item_index == 1 {
             "items[1][price]"
         } else {
@@ -679,7 +698,7 @@ async fn lookup_metered_price(
 }
 
 /// Report metered usage to Stripe via Billing Meter Events.
-/// `event_name` maps to the meter: "d3ftly_plans_overage" or "d3ftly_runs_overage".
+/// `event_name` maps to the meter: "d3ftly_plans_overage" or "d3ftly_tokens_overage".
 /// `quantity` is the number of units OVER the included limit (only overages).
 pub async fn report_stripe_usage(
     state: &AppState,
