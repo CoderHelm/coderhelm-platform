@@ -195,8 +195,9 @@ pub async fn create_portal_session(
     Ok(Json(json!({ "url": url })))
 }
 
-/// POST /api/billing/subscribe — create a Stripe Subscription (incomplete) for Stripe Elements.
-/// Returns the client_secret for the PaymentIntent so the frontend can confirm with card Element.
+/// POST /api/billing/subscribe — create a Stripe Checkout Session.
+/// Returns a URL the frontend redirects to. Stripe handles payment collection.
+/// On success, the `invoice.payment_succeeded` webhook activates the subscription.
 pub async fn create_subscription(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -242,7 +243,7 @@ pub async fn create_subscription(
         .map_or("none", |v| v);
 
     if current_status == "active" {
-        return Err(StatusCode::CONFLICT); // Already subscribed, use portal to manage
+        return Err(StatusCode::CONFLICT);
     }
 
     // Cancel any existing incomplete subscription before creating a new one
@@ -274,77 +275,7 @@ pub async fn create_subscription(
         None => create_stripe_customer(&state, stripe_key, &claims.tenant_id).await?,
     };
 
-    // Create subscription with payment_behavior=default_incomplete
-    // This creates the subscription + PaymentIntent but doesn't charge yet.
-    // The frontend uses the client_secret with Stripe Elements to confirm payment.
-    // We also look up the metered overage prices and attach them as additional items.
-    let plans_overage_price = None::<String>; // Plans are unlimited — no overage
-    let tokens_overage_price = lookup_metered_price(&state, stripe_key, "tokens_overage").await;
-
-    let mut form_params: Vec<(&str, String)> = vec![
-        ("customer", customer_id.clone()),
-        ("items[0][price]", price_id.to_string()),
-        ("payment_behavior", "default_incomplete".to_string()),
-        (
-            "payment_settings[save_default_payment_method]",
-            "on_subscription".to_string(),
-        ),
-        ("expand[]", "latest_invoice.payment_intent".to_string()),
-        ("metadata[tenant_id]", claims.tenant_id.clone()),
-    ];
-
-    let mut item_index = 1;
-    if let Some(ref pid) = plans_overage_price {
-        form_params.push(("items[1][price]", pid.clone()));
-        item_index = 2;
-    }
-    if let Some(ref pid) = tokens_overage_price {
-        let key = if item_index == 1 {
-            "items[1][price]"
-        } else {
-            "items[2][price]"
-        };
-        form_params.push((key, pid.clone()));
-    }
-
-    let form_pairs: Vec<(&str, &str)> = form_params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-
-    let response = state
-        .http
-        .post("https://api.stripe.com/v1/subscriptions")
-        .header("Authorization", format!("Bearer {stripe_key}"))
-        .form(&form_pairs)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Stripe subscription request failed: {e}");
-            StatusCode::BAD_GATEWAY
-        })?;
-
-    let sub: Value = response.json().await.map_err(|e| {
-        error!("Failed to parse Stripe response: {e}");
-        StatusCode::BAD_GATEWAY
-    })?;
-
-    if let Some(err) = sub["error"]["message"].as_str() {
-        error!("Stripe error creating subscription: {err}");
-        return Err(StatusCode::BAD_GATEWAY);
-    }
-
-    let subscription_id = sub["id"].as_str().unwrap_or("");
-    let client_secret = sub["latest_invoice"]["payment_intent"]["client_secret"]
-        .as_str()
-        .ok_or_else(|| {
-            error!(
-                "Stripe subscription response missing client_secret. status={}, latest_invoice.status={}, payment_intent.status={}",
-                sub["status"].as_str().unwrap_or("?"),
-                sub["latest_invoice"]["status"].as_str().unwrap_or("?"),
-                sub["latest_invoice"]["payment_intent"]["status"].as_str().unwrap_or("null"),
-            );
-            StatusCode::BAD_GATEWAY
-        })?;
-
-    // Store the pending subscription
+    // Store customer + reverse mapping before checkout so webhooks can resolve tenant
     let now = chrono::Utc::now().to_rfc3339();
     state
         .dynamo
@@ -352,22 +283,16 @@ pub async fn create_subscription(
         .table_name(&state.config.table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s("BILLING"))
-        .update_expression(
-            "SET stripe_customer_id = :cid, stripe_subscription_id = :sid, \
-             subscription_status = :status, updated_at = :t",
-        )
+        .update_expression("SET stripe_customer_id = :cid, updated_at = :t")
         .expression_attribute_values(":cid", attr_s(&customer_id))
-        .expression_attribute_values(":sid", attr_s(subscription_id))
-        .expression_attribute_values(":status", attr_s("incomplete"))
         .expression_attribute_values(":t", attr_s(&now))
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to store pending subscription: {e}");
+            error!("Failed to store billing customer: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Also store the reverse mapping: Stripe customer → tenant
     let _ = state
         .dynamo
         .put_item()
@@ -379,10 +304,50 @@ pub async fn create_subscription(
         .send()
         .await;
 
-    Ok(Json(json!({
-        "subscription_id": subscription_id,
-        "client_secret": client_secret,
-    })))
+    // Create Stripe Checkout Session — Stripe handles the entire payment flow
+    let response = state
+        .http
+        .post("https://api.stripe.com/v1/checkout/sessions")
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .form(&[
+            ("mode", "subscription"),
+            ("customer", &customer_id),
+            ("line_items[0][price]", price_id),
+            ("line_items[0][quantity]", "1"),
+            (
+                "success_url",
+                "https://app.d3ftly.com/billing/?success=true",
+            ),
+            ("cancel_url", "https://app.d3ftly.com/billing/"),
+            ("metadata[tenant_id]", &claims.tenant_id),
+            (
+                "subscription_data[metadata][tenant_id]",
+                &claims.tenant_id,
+            ),
+        ])
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Stripe checkout session request failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let session: Value = response.json().await.map_err(|e| {
+        error!("Failed to parse Stripe checkout response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    if let Some(err) = session["error"]["message"].as_str() {
+        error!("Stripe error creating checkout session: {err}");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let url = session["url"].as_str().ok_or_else(|| {
+        error!("Stripe checkout session missing URL");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    Ok(Json(json!({ "url": url })))
 }
 
 /// Create a Stripe customer for a tenant.
@@ -701,30 +666,6 @@ async fn get_stripe_customer_id(state: &AppState, tenant_id: &str) -> Result<Str
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
-}
-
-/// Look up a metered price by nickname from the d3ftly product.
-async fn lookup_metered_price(
-    state: &AppState,
-    stripe_key: &str,
-    nickname: &str,
-) -> Option<String> {
-    let resp = state
-        .http
-        .get("https://api.stripe.com/v1/prices?active=true&limit=50&type=recurring")
-        .header("Authorization", format!("Bearer {stripe_key}"))
-        .send()
-        .await
-        .ok()?;
-    let body: Value = resp.json().await.ok()?;
-    body["data"]
-        .as_array()?
-        .iter()
-        .find(|p| {
-            p["nickname"].as_str() == Some(nickname) && p["recurring"]["meter"].as_str().is_some()
-        })
-        .and_then(|p| p["id"].as_str())
-        .map(|s| s.to_string())
 }
 
 /// Report metered usage to Stripe via Billing Meter Events.
