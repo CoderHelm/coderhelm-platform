@@ -64,6 +64,11 @@ async fn main() -> Result<(), Error> {
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/repos", get(routes::api::list_repos))
         .route("/repos/:repo", post(routes::api::update_repo))
+        .route(
+            "/integrations/jira/check",
+            get(routes::api::get_jira_integration_check)
+                .post(routes::api::validate_jira_integration_payload),
+        )
         .route("/stats", get(routes::api::get_stats))
         .route("/stats/history", get(routes::api::get_stats_history))
         .route(

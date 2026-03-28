@@ -28,6 +28,8 @@ export class ApiStack extends cdk.Stack {
     super(scope, id, props);
 
     const prefix = `d3ftly-${props.stage}`;
+    const gatewayAssetPath =
+      process.env.GATEWAY_ZIP ?? "../services/gateway/target/lambda/gateway";
 
     // --- SQS Queues ---
 
@@ -80,7 +82,7 @@ export class ApiStack extends cdk.Stack {
       runtime: lambda.Runtime.PROVIDED_AL2023,
       architecture: lambda.Architecture.ARM_64,
       handler: "bootstrap",
-      code: lambda.Code.fromAsset("../services/gateway/target/lambda/gateway"),
+      code: lambda.Code.fromAsset(gatewayAssetPath),
       memorySize: 128,
       timeout: cdk.Duration.seconds(10),
       logGroup: gatewayLogGroup,

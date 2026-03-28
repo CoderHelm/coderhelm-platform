@@ -38,7 +38,9 @@ export class DatabaseStack extends cdk.Stack {
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
         this.encryptionKey
       ),
-      pointInTimeRecovery: true,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
       deletionProtection: isProd,
       removalPolicy: isProd
         ? cdk.RemovalPolicy.RETAIN
@@ -76,7 +78,9 @@ export class DatabaseStack extends cdk.Stack {
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
         this.encryptionKey
       ),
-      pointInTimeRecovery: true,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
       deletionProtection: isProd,
       removalPolicy: isProd
         ? cdk.RemovalPolicy.RETAIN
@@ -120,7 +124,9 @@ export class DatabaseStack extends cdk.Stack {
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
         this.encryptionKey
       ),
-      pointInTimeRecovery: true,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
       deletionProtection: isProd,
       removalPolicy: isProd
         ? cdk.RemovalPolicy.RETAIN
