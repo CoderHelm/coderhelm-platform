@@ -83,6 +83,10 @@ pub enum WorkerMessage {
     Onboard(OnboardMessage),
     #[serde(rename = "mark_ready")]
     MarkReady(MarkReadyMessage),
+    #[serde(rename = "plan_execute")]
+    PlanExecute(PlanExecuteMessage),
+    #[serde(rename = "infra_analyze")]
+    InfraAnalyze(InfraAnalyzeMessage),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -92,6 +96,20 @@ pub struct MarkReadyMessage {
     pub repo_owner: String,
     pub repo_name: String,
     pub pr_number: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PlanExecuteMessage {
+    pub tenant_id: String,
+    pub plan_id: String,
+    pub triggered_by: String,
+    pub tasks: Vec<String>, // ordered task_ids
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct InfraAnalyzeMessage {
+    pub tenant_id: String,
+    pub triggered_by: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -14,7 +14,7 @@ import { WafStack } from "../lib/waf-stack";
 const app = new cdk.App();
 
 const env = {
-  account: process.env.CDK_DEFAULT_ACCOUNT ?? "654654210434",
+  account: process.env.CDK_DEFAULT_ACCOUNT,
   region: process.env.CDK_DEFAULT_REGION ?? "us-east-1",
 };
 

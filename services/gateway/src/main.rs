@@ -149,6 +149,8 @@ async fn main() -> Result<(), Error> {
             post(routes::plans::reject_task),
         )
         .route("/plans/:plan_id/execute", post(routes::plans::execute_plan))
+        .route("/infrastructure", get(routes::infrastructure::get_infrastructure))
+        .route("/infrastructure/refresh", post(routes::infrastructure::refresh_infrastructure))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,
