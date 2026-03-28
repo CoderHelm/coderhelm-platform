@@ -185,6 +185,14 @@ async fn main() -> Result<(), Error> {
             "/infrastructure/refresh",
             post(routes::infrastructure::refresh_infrastructure),
         )
+        .route(
+            "/infrastructure/repo/:owner/:name",
+            get(routes::infrastructure::get_repo_infrastructure),
+        )
+        .route(
+            "/infrastructure/repo/:owner/:name/refresh",
+            post(routes::infrastructure::refresh_repo_infrastructure),
+        )
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

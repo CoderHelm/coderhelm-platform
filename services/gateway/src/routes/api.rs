@@ -489,6 +489,7 @@ pub async fn update_repo(
         let infra_msg = WorkerMessage::InfraAnalyze(InfraAnalyzeMessage {
             tenant_id: claims.tenant_id.clone(),
             triggered_by: claims.github_login.clone(),
+            repo: None,
         });
         if let Ok(body) = serde_json::to_string(&infra_msg) {
             let now = chrono::Utc::now().to_rfc3339();

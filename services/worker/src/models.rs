@@ -93,6 +93,8 @@ pub struct PlanExecuteMessage {
 pub struct InfraAnalyzeMessage {
     pub tenant_id: String,
     pub triggered_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -265,6 +265,20 @@ pub async fn create_subscription(
         }
     }
 
+    // Fetch user email for Stripe
+    let user_email = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s(&claims.sub))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .and_then(|i| i.get("email").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default();
+
     // Get or create Stripe customer
     let customer_id = match item
         .and_then(|i| i.get("stripe_customer_id"))
@@ -272,7 +286,7 @@ pub async fn create_subscription(
         .filter(|s| !s.is_empty())
     {
         Some(cid) => cid.to_string(),
-        None => create_stripe_customer(&state, stripe_key, &claims.tenant_id).await?,
+        None => create_stripe_customer(&state, stripe_key, &claims.tenant_id, &user_email).await?,
     };
 
     // Store customer + reverse mapping before checkout so webhooks can resolve tenant
@@ -305,20 +319,24 @@ pub async fn create_subscription(
         .await;
 
     // Create Stripe Checkout Session in embedded mode — renders inline via iframe
+    let mut form_params: Vec<(&str, &str)> = vec![
+        ("mode", "subscription"),
+        ("ui_mode", "embedded_page"),
+        ("customer", &customer_id),
+        ("line_items[0][price]", price_id),
+        ("line_items[0][quantity]", "1"),
+        ("return_url", "https://app.d3ftly.com/billing/?success=true"),
+        ("metadata[tenant_id]", &claims.tenant_id),
+        ("subscription_data[metadata][tenant_id]", &claims.tenant_id),
+    ];
+    if !user_email.is_empty() {
+        form_params.push(("customer_email", &user_email));
+    }
     let response = state
         .http
         .post("https://api.stripe.com/v1/checkout/sessions")
         .header("Authorization", format!("Bearer {stripe_key}"))
-        .form(&[
-            ("mode", "subscription"),
-            ("ui_mode", "embedded_page"),
-            ("customer", &customer_id),
-            ("line_items[0][price]", price_id),
-            ("line_items[0][quantity]", "1"),
-            ("return_url", "https://app.d3ftly.com/billing/?success=true"),
-            ("metadata[tenant_id]", &claims.tenant_id),
-            ("subscription_data[metadata][tenant_id]", &claims.tenant_id),
-        ])
+        .form(&form_params)
         .send()
         .await
         .map_err(|e| {
@@ -349,8 +367,9 @@ async fn create_stripe_customer(
     state: &AppState,
     stripe_key: &str,
     tenant_id: &str,
+    email: &str,
 ) -> Result<String, StatusCode> {
-    // Get tenant name/email for the customer record
+    // Get tenant name for the customer record
     let tenant = state
         .dynamo
         .get_item()
@@ -370,11 +389,15 @@ async fn create_stripe_customer(
         .and_then(|v| v.as_s().ok())
         .map_or(tenant_id, |v| v.as_str());
 
+    let mut form_params = vec![("name", name), ("metadata[tenant_id]", tenant_id)];
+    if !email.is_empty() {
+        form_params.push(("email", email));
+    }
     let response = state
         .http
         .post("https://api.stripe.com/v1/customers")
         .header("Authorization", format!("Bearer {stripe_key}"))
-        .form(&[("name", name), ("metadata[tenant_id]", tenant_id)])
+        .form(&form_params)
         .send()
         .await
         .map_err(|e| {
