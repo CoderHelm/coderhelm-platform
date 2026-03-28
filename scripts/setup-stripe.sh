@@ -91,12 +91,37 @@ else
 fi
 
 echo ""
-echo "=== 3. Finding or creating metered Plans price (\$10/plan overage) ==="
+echo "=== 3. Finding or creating Plans Meter and Price (\$10/plan overage) ==="
+
+# Find or create the billing meter for plans
+PLANS_METER_ID=$(stripe_get "https://api.stripe.com/v1/billing/meters?limit=100" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for m in data.get('data', []):
+    if m.get('event_name') == 'd3ftly_plans_overage' and m.get('status') == 'active':
+        print(m['id'])
+        break
+else:
+    print('')
+")
+
+if [[ -n "$PLANS_METER_ID" ]]; then
+  echo "Using existing plans meter: $PLANS_METER_ID"
+else
+  PLANS_METER=$(stripe_post "https://api.stripe.com/v1/billing/meters" \
+    -d "display_name=Plan Overages" \
+    -d "event_name=d3ftly_plans_overage" \
+    -d "default_aggregation[formula]=sum")
+  PLANS_METER_ID=$(printf '%s\n' "$PLANS_METER" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+  echo "Created plans meter: $PLANS_METER_ID"
+fi
+
+# Find or create the metered price backed by the meter
 PLANS_PRICE_ID=$(stripe_get "https://api.stripe.com/v1/prices?product=${PRODUCT_ID}&active=true&limit=50" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for p in data.get('data', []):
-    if p.get('unit_amount') == 1000 and p.get('recurring', {}).get('usage_type') == 'metered' and p.get('nickname') == 'plans_overage':
+    if p.get('nickname') == 'plans_overage' and p.get('recurring', {}).get('meter'):
         print(p['id'])
         break
 else:
@@ -111,7 +136,7 @@ else
     -d "unit_amount=1000" \
     -d "currency=usd" \
     -d "recurring[interval]=month" \
-    -d "recurring[usage_type]=metered" \
+    -d "recurring[meter]=${PLANS_METER_ID}" \
     -d "nickname=plans_overage" \
     -d "metadata[app]=d3ftly" \
     -d "metadata[type]=plans_overage")
@@ -120,12 +145,37 @@ else
 fi
 
 echo ""
-echo "=== 4. Finding or creating metered Runs price (\$3/run overage) ==="
+echo "=== 4. Finding or creating Runs Meter and Price (\$5/run overage) ==="
+
+# Find or create the billing meter for runs
+RUNS_METER_ID=$(stripe_get "https://api.stripe.com/v1/billing/meters?limit=100" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for m in data.get('data', []):
+    if m.get('event_name') == 'd3ftly_runs_overage' and m.get('status') == 'active':
+        print(m['id'])
+        break
+else:
+    print('')
+")
+
+if [[ -n "$RUNS_METER_ID" ]]; then
+  echo "Using existing runs meter: $RUNS_METER_ID"
+else
+  RUNS_METER=$(stripe_post "https://api.stripe.com/v1/billing/meters" \
+    -d "display_name=Run Overages" \
+    -d "event_name=d3ftly_runs_overage" \
+    -d "default_aggregation[formula]=sum")
+  RUNS_METER_ID=$(printf '%s\n' "$RUNS_METER" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+  echo "Created runs meter: $RUNS_METER_ID"
+fi
+
+# Find or create the metered price backed by the meter
 RUNS_PRICE_ID=$(stripe_get "https://api.stripe.com/v1/prices?product=${PRODUCT_ID}&active=true&limit=50" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for p in data.get('data', []):
-    if p.get('unit_amount') == 300 and p.get('recurring', {}).get('usage_type') == 'metered' and p.get('nickname') == 'runs_overage':
+    if p.get('nickname') == 'runs_overage' and p.get('recurring', {}).get('meter'):
         print(p['id'])
         break
 else:
@@ -137,10 +187,10 @@ if [[ -n "$RUNS_PRICE_ID" ]]; then
 else
   RUNS_PRICE=$(stripe_post "https://api.stripe.com/v1/prices" \
     -d "product=${PRODUCT_ID}" \
-    -d "unit_amount=300" \
+    -d "unit_amount=500" \
     -d "currency=usd" \
     -d "recurring[interval]=month" \
-    -d "recurring[usage_type]=metered" \
+    -d "recurring[meter]=${RUNS_METER_ID}" \
     -d "nickname=runs_overage" \
     -d "metadata[app]=d3ftly" \
     -d "metadata[type]=runs_overage")

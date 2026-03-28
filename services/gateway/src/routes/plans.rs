@@ -3,9 +3,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::error;
 
+use super::billing::{report_stripe_usage, INCLUDED_PLANS};
 use crate::models::Claims;
 use crate::AppState;
-use super::billing::{report_stripe_usage, INCLUDED_PLANS};
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
