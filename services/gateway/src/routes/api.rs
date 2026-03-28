@@ -448,6 +448,37 @@ pub async fn update_repo(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // When enabling a repo, trigger onboarding to generate voice, instructions, etc.
+    if enabled {
+        let installation_id = claims
+            .tenant_id
+            .strip_prefix("TENANT#")
+            .unwrap_or("0")
+            .parse::<u64>()
+            .unwrap_or(0);
+
+        let message = WorkerMessage::Onboard(OnboardMessage {
+            tenant_id: claims.tenant_id.clone(),
+            installation_id,
+            repos: vec![OnboardRepo {
+                owner: owner.clone(),
+                name: name.clone(),
+                default_branch: "main".to_string(),
+            }],
+        });
+
+        if let Ok(body) = serde_json::to_string(&message) {
+            let _ = state
+                .sqs
+                .send_message()
+                .queue_url(&state.config.ticket_queue_url)
+                .message_body(&body)
+                .send()
+                .await;
+            info!(repo = %repo, "Dispatched onboarding for newly enabled repo");
+        }
+    }
+
     Ok(StatusCode::OK)
 }
 

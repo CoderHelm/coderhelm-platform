@@ -153,22 +153,28 @@ async fn handle_payment_succeeded(
         .send()
         .await?;
 
-    // Reset retry counter on success
-    state
+    // Reset retry counter on success and store subscription ID
+    let sub_id = invoice["subscription"].as_str().unwrap_or("");
+    let mut update_expr = "SET last_payment_at = :t, payment_retry_count = :zero, \
+             subscription_status = :status, updated_at = :t"
+        .to_string();
+    if !sub_id.is_empty() {
+        update_expr.push_str(", stripe_subscription_id = :sid");
+    }
+    let mut update = state
         .dynamo
         .update_item()
         .table_name(&state.config.table_name)
         .key("pk", attr_s(&tenant_id))
         .key("sk", attr_s("BILLING"))
-        .update_expression(
-            "SET last_payment_at = :t, payment_retry_count = :zero, \
-             subscription_status = :status, updated_at = :t",
-        )
+        .update_expression(&update_expr)
         .expression_attribute_values(":t", attr_s(&now.to_rfc3339()))
         .expression_attribute_values(":zero", attr_n(0))
-        .expression_attribute_values(":status", attr_s("active"))
-        .send()
-        .await?;
+        .expression_attribute_values(":status", attr_s("active"));
+    if !sub_id.is_empty() {
+        update = update.expression_attribute_values(":sid", attr_s(sub_id));
+    }
+    update.send().await?;
 
     // Get card details for email
     let card_last4 = invoice["default_payment_method"]["card"]["last4"]
