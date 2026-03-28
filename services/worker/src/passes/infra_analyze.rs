@@ -49,12 +49,24 @@ pub async fn run(
         &state.http,
     )?;
 
-    let infra_code = collect_infra_code(&github, &repos).await;
+    // If a specific repo is requested, only scan that one
+    let scan_repos: Vec<String> = if let Some(ref repo) = msg.repo {
+        repos.into_iter().filter(|r| r == repo).collect()
+    } else {
+        repos
+    };
+
+    let infra_code = collect_infra_code(&github, &scan_repos).await;
+
+    // Determine the DynamoDB sort key based on per-repo vs global
+    let sk = match &msg.repo {
+        Some(repo) => format!("INFRA#REPO#{repo}"),
+        None => "INFRA#analysis".to_string(),
+    };
 
     if infra_code.is_empty() {
-        // Store "no_infra" result
-        store_no_infra(state, &msg.tenant_id).await?;
-        info!(tenant_id = %msg.tenant_id, "No infrastructure code found");
+        store_no_infra(state, &msg.tenant_id, &sk).await?;
+        info!(tenant_id = %msg.tenant_id, sk = %sk, "No infrastructure code found");
         return Ok(());
     }
 
@@ -77,7 +89,7 @@ pub async fn run(
         .put_item()
         .table_name(&state.config.table_name)
         .item("pk", AttributeValue::S(msg.tenant_id.clone()))
-        .item("sk", AttributeValue::S("INFRA#analysis".to_string()))
+        .item("sk", AttributeValue::S(sk.clone()))
         .item("status", AttributeValue::S("ready".to_string()))
         .item("has_infra", AttributeValue::Bool(true))
         .item("diagram", AttributeValue::S(diagram_str))
@@ -371,6 +383,7 @@ fn extract_block(text: &str, lang: &str) -> Option<String> {
 async fn store_no_infra(
     state: &WorkerState,
     tenant_id: &str,
+    sk: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
     state
@@ -378,7 +391,7 @@ async fn store_no_infra(
         .put_item()
         .table_name(&state.config.table_name)
         .item("pk", AttributeValue::S(tenant_id.to_string()))
-        .item("sk", AttributeValue::S("INFRA#analysis".to_string()))
+        .item("sk", AttributeValue::S(sk.to_string()))
         .item("status", AttributeValue::S("no_infra".to_string()))
         .item("has_infra", AttributeValue::Bool(false))
         .item("cached_at", AttributeValue::S(now))

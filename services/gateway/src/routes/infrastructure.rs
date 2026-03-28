@@ -159,6 +159,131 @@ pub async fn refresh_infrastructure(
     let msg = WorkerMessage::InfraAnalyze(crate::models::InfraAnalyzeMessage {
         tenant_id: claims.tenant_id.clone(),
         triggered_by: claims.github_login.clone(),
+        repo: None,
+    });
+
+    let body = serde_json::to_string(&msg).map_err(|e| {
+        error!("Failed to serialize infra message: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(body)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("SQS send_message failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(json!({ "status": "pending" })))
+}
+
+// ── GET /api/infrastructure/repo/:owner/:name ────────────────────────────────
+
+pub async fn get_repo_infrastructure(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    let sk = format!("INFRA#REPO#{owner}/{name}");
+
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", AttributeValue::S(claims.tenant_id.clone()))
+        .key("sk", AttributeValue::S(sk))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("DynamoDB get_item failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let analysis = match result.item() {
+        None => InfraAnalysis {
+            status: "no_infra".to_string(),
+            has_infra: false,
+            diagram: None,
+            diagram_title: None,
+            findings: None,
+            suggested_prompt: None,
+            cached_at: None,
+            scanned_repos: None,
+            error: None,
+        },
+        Some(item) => {
+            let status = item
+                .get("status")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_else(|| "pending".to_string());
+            let has_infra = item
+                .get("has_infra")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(false);
+            InfraAnalysis {
+                status,
+                has_infra,
+                diagram: item.get("diagram").and_then(|v| v.as_s().ok()).cloned(),
+                diagram_title: item
+                    .get("diagram_title")
+                    .and_then(|v| v.as_s().ok())
+                    .cloned(),
+                findings: item
+                    .get("findings")
+                    .and_then(|v| v.as_s().ok())
+                    .and_then(|s| serde_json::from_str(s).ok()),
+                suggested_prompt: None,
+                cached_at: item.get("cached_at").and_then(|v| v.as_s().ok()).cloned(),
+                scanned_repos: item
+                    .get("scanned_repos")
+                    .and_then(|v| v.as_s().ok())
+                    .and_then(|s| serde_json::from_str(s).ok()),
+                error: item.get("error").and_then(|v| v.as_s().ok()).cloned(),
+            }
+        }
+    };
+
+    Ok(Json(json!(analysis)))
+}
+
+// ── POST /api/infrastructure/repo/:owner/:name/refresh ───────────────────────
+
+pub async fn refresh_repo_infrastructure(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    let repo_full = format!("{owner}/{name}");
+    let now = chrono::Utc::now().to_rfc3339();
+    let sk = format!("INFRA#REPO#{repo_full}");
+
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.table_name)
+        .item("pk", AttributeValue::S(claims.tenant_id.clone()))
+        .item("sk", AttributeValue::S(sk))
+        .item("status", AttributeValue::S("pending".to_string()))
+        .item("has_infra", AttributeValue::Bool(false))
+        .item("updated_at", AttributeValue::S(now))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("DynamoDB put_item failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let msg = WorkerMessage::InfraAnalyze(crate::models::InfraAnalyzeMessage {
+        tenant_id: claims.tenant_id.clone(),
+        triggered_by: claims.github_login.clone(),
+        repo: Some(repo_full),
     });
 
     let body = serde_json::to_string(&msg).map_err(|e| {
