@@ -955,17 +955,57 @@ pub async fn health(
     let mut checks: Vec<Value> = Vec::new();
     let mut status = "healthy";
 
-    // 1. Stale runs — running for over 30 minutes
+    // 1. Crashed runs — "running" for over 10 minutes (worker likely died)
+    let crash_cutoff = (now - chrono::Duration::minutes(10)).to_rfc3339();
+    if let Ok(result) = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("tenant_id = :tid")
+        .filter_expression("#s = :running AND created_at < :cutoff")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":running", attr_s("running"))
+        .expression_attribute_values(":cutoff", attr_s(&crash_cutoff))
+        .limit(20)
+        .send()
+        .await
+    {
+        let crashed: Vec<Value> = result
+            .items()
+            .iter()
+            .map(|item| {
+                json!({
+                    "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
+                    "status": item.get("status").and_then(|v| v.as_s().ok()),
+                    "title": item.get("title").and_then(|v| v.as_s().ok()),
+                    "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
+                })
+            })
+            .collect();
+
+        let count = crashed.len();
+        if count > 0 {
+            status = "degraded";
+        }
+        checks.push(json!({
+            "name": "crashed_runs",
+            "status": if count == 0 { "ok" } else { "critical" },
+            "count": count,
+            "items": crashed,
+        }));
+    }
+
+    // 2. Stale queued — sitting in queue for over 30 minutes
     let stale_cutoff = (now - chrono::Duration::minutes(30)).to_rfc3339();
     if let Ok(result) = state
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
         .key_condition_expression("tenant_id = :tid")
-        .filter_expression("(#s = :running OR #s = :queued) AND created_at < :cutoff")
+        .filter_expression("#s = :queued AND created_at < :cutoff")
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
-        .expression_attribute_values(":running", attr_s("running"))
         .expression_attribute_values(":queued", attr_s("queued"))
         .expression_attribute_values(":cutoff", attr_s(&stale_cutoff))
         .limit(20)
@@ -990,14 +1030,14 @@ pub async fn health(
             status = "degraded";
         }
         checks.push(json!({
-            "name": "stale_runs",
+            "name": "stale_queued",
             "status": if count == 0 { "ok" } else { "warning" },
             "count": count,
             "items": stale_runs,
         }));
     }
 
-    // 2. DLQ depth
+    // 3. DLQ depth
     if !state.config.dlq_url.is_empty() {
         if let Ok(attrs) = state
             .sqs
@@ -1026,7 +1066,7 @@ pub async fn health(
         }
     }
 
-    // 3. Queue depths (tickets, ci-fix, feedback)
+    // 4. Queue depths (tickets, ci-fix, feedback)
     for (name, url) in [
         ("tickets", &state.config.ticket_queue_url),
         ("ci_fix", &state.config.ci_fix_queue_url),
@@ -1069,7 +1109,7 @@ pub async fn health(
         }
     }
 
-    // 4. Recent error runs (last 24h)
+    // 5. Recent failed runs (last 24h)
     let error_cutoff = (now - chrono::Duration::hours(24)).to_rfc3339();
     if let Ok(result) = state
         .dynamo
