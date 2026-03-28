@@ -193,6 +193,9 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
+                let content = self
+                    .github
+                    .read_file(&self.owner, &self.repo, path, &self.branch)
                     .await?;
                 Ok(json!(content))
             }
