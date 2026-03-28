@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { api, type Plan } from "@/lib/api";
+import { api, type BillingInfo, type Plan } from "@/lib/api";
 import { TableSkeleton } from "@/components/skeleton";
 
 const STATUS_STYLES: Record<string, string> = {
@@ -13,16 +13,22 @@ const STATUS_STYLES: Record<string, string> = {
 
 export default function PlansPage() {
   const [plans, setPlans] = useState<Plan[]>([]);
+  const [billing, setBilling] = useState<BillingInfo | null>(null);
   const [loading, setLoading] = useState(true);
 
   const [error, setError] = useState(false);
 
   useEffect(() => {
-    api.listPlans()
-      .then((data) => setPlans(data.plans))
+    Promise.all([api.listPlans(), api.getBilling()])
+      .then(([data, b]) => {
+        setPlans(data.plans);
+        setBilling(b);
+      })
       .catch(() => setError(true))
       .finally(() => setLoading(false));
   }, []);
+
+  const plansEnabled = billing?.subscription_status === "active";
 
   return (
     <div>
@@ -33,19 +39,45 @@ export default function PlansPage() {
             Chat with d3ftly to break work into epics and ordered tasks, then approve and execute.
           </p>
         </div>
-        <Link
-          href="/plans/new"
-          className="px-4 py-2 bg-white text-zinc-900 rounded-lg text-sm font-semibold hover:bg-zinc-200 transition-colors"
-        >
-          + New plan
-        </Link>
+        {plansEnabled ? (
+          <Link
+            href="/plans/new"
+            className="px-4 py-2 bg-white text-zinc-900 rounded-lg text-sm font-semibold hover:bg-zinc-200 transition-colors"
+          >
+            + New plan
+          </Link>
+        ) : (
+          <Link
+            href="/billing"
+            className="px-4 py-2 border border-yellow-500/30 text-yellow-400 rounded-lg text-sm font-semibold hover:bg-yellow-500/10 transition-colors"
+          >
+            Upgrade to unlock Plans
+          </Link>
+        )}
       </div>
+
+      {!loading && !error && !plansEnabled && (
+        <div className="mb-6 rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-4">
+          <p className="text-sm text-yellow-300 font-medium">Plans is a paid feature</p>
+          <p className="text-xs text-yellow-200/80 mt-1">
+            Upgrade to Pro (or add the Plans add-on) to create, approve, and execute plans.
+          </p>
+        </div>
+      )}
 
       {loading ? (
         <TableSkeleton rows={4} cols={4} />
       ) : error ? (
         <div className="text-red-400 border border-red-500/20 bg-red-500/5 rounded-lg p-8 text-center">
           <p className="text-sm">Failed to load plans. Please refresh.</p>
+        </div>
+      ) : !plansEnabled ? (
+        <div className="border border-zinc-800 rounded-lg p-10 text-center text-zinc-500">
+          <p className="text-lg mb-2 text-zinc-300">Plans is locked on Free</p>
+          <p className="text-sm mb-4">Upgrade your subscription to unlock planning workflows.</p>
+          <Link href="/billing" className="text-zinc-300 underline text-sm">
+            Go to Billing
+          </Link>
         </div>
       ) : plans.length === 0 ? (
         <div className="border border-zinc-800 rounded-lg p-12 text-center text-zinc-500">
