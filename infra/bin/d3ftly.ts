@@ -5,11 +5,9 @@ import { DatabaseStack } from "../lib/database-stack";
 import { StorageStack } from "../lib/storage-stack";
 import { ApiStack } from "../lib/api-stack";
 import { WorkerStack } from "../lib/worker-stack";
-import { FrontendStack } from "../lib/frontend-stack";
 import { MonitoringStack } from "../lib/monitoring-stack";
 import { EmailStack } from "../lib/email-stack";
 import { BillingStack } from "../lib/billing-stack";
-import { WafStack } from "../lib/waf-stack";
 
 const app = new cdk.App();
 
@@ -78,24 +76,6 @@ api.gatewayFunction.addEnvironment(
   "INVOICE_BUCKET_NAME",
   billing.invoiceBucket.bucketName
 );
-
-// --- WAF (must be us-east-1 for CloudFront) ---
-
-const waf = new WafStack(app, `${prefix}-waf`, {
-  env: { account: env.account, region: "us-east-1" },
-  stage,
-  target: "api",
-  crossRegionReferences: true,
-});
-
-// --- Frontend ---
-
-const frontend = new FrontendStack(app, `${prefix}-app`, {
-  env,
-  stage,
-  webAclArn: waf.webAclArn,
-  crossRegionReferences: true,
-});
 
 // --- Monitoring ---
 
