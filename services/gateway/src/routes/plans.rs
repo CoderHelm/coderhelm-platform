@@ -121,12 +121,10 @@ pub async fn create_plan(
                 put = put.item("repo", attr_s(task_repo));
             }
 
-            put.send()
-                .await
-                .map_err(|e| {
-                    error!("Failed to create task: {e}");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
+            put.send().await.map_err(|e| {
+                error!("Failed to create task: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
         }
 
         // Update task count
@@ -364,12 +362,10 @@ pub async fn add_task(
         put = put.item("repo", attr_s(task_repo));
     }
 
-    put.send()
-        .await
-        .map_err(|e| {
-            error!("Failed to create task: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    put.send().await.map_err(|e| {
+        error!("Failed to create task: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Increment task count
     let plan_sk = format!("PLAN#{plan_id}");
@@ -665,7 +661,10 @@ pub async fn execute_plan(
         tenant_id: claims.tenant_id.clone(),
         plan_id: plan_id.clone(),
         triggered_by: claims.github_login.clone(),
-        tasks: approved_task_ids.iter().map(|(tid, _)| tid.clone()).collect(),
+        tasks: approved_task_ids
+            .iter()
+            .map(|(tid, _)| tid.clone())
+            .collect(),
     });
 
     state
