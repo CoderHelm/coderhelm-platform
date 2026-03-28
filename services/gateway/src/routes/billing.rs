@@ -654,10 +654,6 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
 }
 
-fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
-    aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
-}
-
 /// Look up a metered price by nickname from the d3ftly product.
 async fn lookup_metered_price(
     state: &AppState,
