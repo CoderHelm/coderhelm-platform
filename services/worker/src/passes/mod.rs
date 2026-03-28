@@ -1,6 +1,6 @@
 use crate::clients::email::{self, EmailEvent};
 use crate::clients::github::GitHubClient;
-use crate::models::{TicketMessage, TokenUsage};
+use crate::models::{TicketMessage, TicketSource, TokenUsage};
 use crate::WorkerState;
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{error, info, warn};
@@ -72,18 +72,20 @@ async fn run_passes(
     )
     .await;
 
-    // Post "working on it" comment on the issue
-    github
-        .create_issue_comment(
-            &msg.repo_owner,
-            &msg.repo_name,
-            msg.issue_number,
-            &format!(
-                "🔄 **d3ftly is working on this**\n\n| Phase | Status |\n|-------|--------|\n| Triage | 🔄 In progress |\n| Plan | ⏳ Pending |\n| Implement | ⏳ Pending |\n| Review | ⏳ Pending |\n| PR | ⏳ Pending |\n\n[View run →](https://app.d3ftly.com/dashboard/runs/{})",
-                run_id,
-            ),
-        )
-        .await?;
+    // Post "working on it" comment only for GitHub-sourced tickets.
+    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+        github
+            .create_issue_comment(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                &format!(
+                    "🔄 **d3ftly is working on this**\n\n| Phase | Status |\n|-------|--------|\n| Triage | 🔄 In progress |\n| Plan | ⏳ Pending |\n| Implement | ⏳ Pending |\n| Review | ⏳ Pending |\n| PR | ⏳ Pending |\n\n[View run →](https://app.d3ftly.com/dashboard/runs/{})",
+                    run_id,
+                ),
+            )
+            .await?;
+    }
 
     // --- Pass 1: Triage ---
     update_pass(state, &msg.tenant_id, run_id, "triage").await?;
@@ -146,21 +148,23 @@ async fn run_passes(
     )
     .await?;
 
-    // Post success comment on issue
-    github
-        .create_issue_comment(
-            &msg.repo_owner,
-            &msg.repo_name,
-            msg.issue_number,
-            &format!(
-                "✅ **d3ftly completed this ticket**\n\n**PR**: {}\n**Files**: {} modified\n**Cost**: ${:.2}\n\n[View run →](https://app.d3ftly.com/dashboard/runs/{})",
-                pr_result.pr_url,
-                impl_result.files_modified.len(),
-                usage.estimated_cost(),
-                run_id,
-            ),
-        )
-        .await?;
+    // Post success comment only for GitHub-sourced tickets.
+    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+        github
+            .create_issue_comment(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                &format!(
+                    "✅ **d3ftly completed this ticket**\n\n**PR**: {}\n**Files**: {} modified\n**Cost**: ${:.2}\n\n[View run →](https://app.d3ftly.com/dashboard/runs/{})",
+                    pr_result.pr_url,
+                    impl_result.files_modified.len(),
+                    usage.estimated_cost(),
+                    run_id,
+                ),
+            )
+            .await?;
+    }
 
     Ok(())
 }
@@ -186,7 +190,13 @@ async fn create_run_record(
             "tenant_repo",
             attr_s(&format!("{}#{}", msg.tenant_id, repo)),
         )
-        .item("ticket_source", attr_s("github"))
+        .item(
+            "ticket_source",
+            attr_s(match msg.source {
+                TicketSource::Github => "github",
+                TicketSource::Jira => "jira",
+            }),
+        )
         .item("ticket_id", attr_s(&msg.ticket_id))
         .item("title", attr_s(&msg.title))
         .item("repo", attr_s(&repo))
