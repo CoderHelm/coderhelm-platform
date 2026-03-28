@@ -118,8 +118,14 @@ fn parse_openspec_files(response: &str) -> PlanResult {
     for filename in &filenames {
         let marker = format!("```{filename}");
         if let Some(start) = response.find(&marker) {
-            let content_start = response[start..].find('\n').map(|i| start + i + 1).unwrap_or(start);
-            let end = response[content_start..].find("```").map(|i| content_start + i).unwrap_or(response.len());
+            let content_start = response[start..]
+                .find('\n')
+                .map(|i| start + i + 1)
+                .unwrap_or(start);
+            let end = response[content_start..]
+                .find("```")
+                .map(|i| content_start + i)
+                .unwrap_or(response.len());
             contents.push(response[content_start..end].trim().to_string());
         } else {
             contents.push(String::new());
@@ -187,7 +193,10 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             "read_tree" => {
-                let tree = self.github.get_tree(self.owner, self.repo, self.branch).await?;
+                let tree = self
+                    .github
+                    .get_tree(self.owner, self.repo, self.branch)
+                    .await?;
                 let paths: Vec<&str> = tree
                     .iter()
                     .filter(|e| e.entry_type == "blob")

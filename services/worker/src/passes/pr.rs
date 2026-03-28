@@ -118,12 +118,7 @@ Return ONLY the markdown body text."#,
 
     // Check if repo has CI — if not, mark ready immediately
     let has_ci = github
-        .check_path_exists(
-            &msg.repo_owner,
-            &msg.repo_name,
-            ".github/workflows",
-            "main",
-        )
+        .check_path_exists(&msg.repo_owner, &msg.repo_name, ".github/workflows", "main")
         .await;
 
     let draft = if has_ci {
@@ -154,7 +149,10 @@ fn format_diff_summary(diff: &serde_json::Value) -> String {
         .iter()
         .map(|f| {
             let path = f.get("filename").and_then(|v| v.as_str()).unwrap_or("");
-            let status = f.get("status").and_then(|v| v.as_str()).unwrap_or("modified");
+            let status = f
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("modified");
             let adds = f.get("additions").and_then(|v| v.as_u64()).unwrap_or(0);
             let dels = f.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0);
             format!("- {path} ({status}: +{adds}/-{dels})")

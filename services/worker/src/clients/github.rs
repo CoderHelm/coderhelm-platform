@@ -193,9 +193,8 @@ impl GitHubClient {
     ) -> Result<Vec<TreeEntry>, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/git/trees/{git_ref}?recursive=1");
         let data = self.get(&url).await?;
-        let tree: Vec<TreeEntry> = serde_json::from_value(
-            data.get("tree").cloned().unwrap_or(serde_json::json!([])),
-        )?;
+        let tree: Vec<TreeEntry> =
+            serde_json::from_value(data.get("tree").cloned().unwrap_or(serde_json::json!([])))?;
         Ok(tree)
     }
 
@@ -209,10 +208,7 @@ impl GitHubClient {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
         let data = self.get(&url).await?;
-        let content = data
-            .get("content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+        let content = data.get("content").and_then(|c| c.as_str()).unwrap_or("");
         let clean = content.replace('\n', "");
         let bytes = B64.decode(&clean)?;
         Ok(String::from_utf8(bytes)?)
@@ -457,8 +453,7 @@ impl GitHubClient {
         pr_number: u64,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}");
-        self.patch(&url, &serde_json::json!({"draft": false}))
-            .await
+        self.patch(&url, &serde_json::json!({"draft": false})).await
     }
 
     /// Get review comments on a PR.

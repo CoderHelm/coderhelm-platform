@@ -124,10 +124,7 @@ pub async fn send_notification(
                     "pk",
                     aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
                 )
-                .key(
-                    "sk",
-                    aws_sdk_dynamodb::types::AttributeValue::S(pref_sk),
-                )
+                .key("sk", aws_sdk_dynamodb::types::AttributeValue::S(pref_sk))
                 .send()
                 .await?;
 

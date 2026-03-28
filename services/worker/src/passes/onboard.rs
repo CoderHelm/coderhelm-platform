@@ -35,8 +35,14 @@ pub async fn run(
         )
         .await;
 
-        if let Err(e) =
-            onboard_repo(state, &github, repo, &global_instructions, &repo_instructions).await
+        if let Err(e) = onboard_repo(
+            state,
+            &github,
+            repo,
+            &global_instructions,
+            &repo_instructions,
+        )
+        .await
         {
             error!(
                 repo = %format!("{}/{}", repo.owner, repo.name),
@@ -92,7 +98,9 @@ async fn onboard_repo(
     info!(repo = %full_name, "Onboarding repo");
 
     // Get repository tree (top 2 levels)
-    let tree = github.get_tree(&repo.owner, &repo.name, &repo.default_branch).await?;
+    let tree = github
+        .get_tree(&repo.owner, &repo.name, &repo.default_branch)
+        .await?;
 
     // Read signal files if they exist
     let signal_files = [
@@ -109,7 +117,10 @@ async fn onboard_repo(
     let mut context_parts: Vec<String> = vec![format!("Repository: {full_name}\n\nTree:\n{tree}")];
 
     for path in &signal_files {
-        match github.read_file(&repo.owner, &repo.name, path, &repo.default_branch).await {
+        match github
+            .read_file(&repo.owner, &repo.name, path, &repo.default_branch)
+            .await
+        {
             Ok(content) => {
                 // Limit each file to ~4KB to stay within context window
                 let truncated = if content.len() > 4096 {
@@ -164,11 +175,13 @@ async fn onboard_repo(
         .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
             system,
         ))
-        .system(aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
-            aws_sdk_bedrockruntime::types::CachePointBlock::builder()
-                .build()
-                .unwrap(),
-        ))
+        .system(
+            aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
+                aws_sdk_bedrockruntime::types::CachePointBlock::builder()
+                    .build()
+                    .unwrap(),
+            ),
+        )
         .set_messages(Some(messages))
         .send()
         .await?;

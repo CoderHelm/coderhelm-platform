@@ -17,8 +17,7 @@ impl Config {
         Self {
             stage: std::env::var("STAGE").unwrap_or_else(|_| "dev".to_string()),
             table_name: std::env::var("TABLE_NAME").expect("TABLE_NAME required"),
-            runs_table_name: std::env::var("RUNS_TABLE_NAME")
-                .expect("RUNS_TABLE_NAME required"),
+            runs_table_name: std::env::var("RUNS_TABLE_NAME").expect("RUNS_TABLE_NAME required"),
             analytics_table_name: std::env::var("ANALYTICS_TABLE_NAME")
                 .expect("ANALYTICS_TABLE_NAME required"),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),

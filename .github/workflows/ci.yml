@@ -60,4 +60,10 @@ jobs:
           cache: npm
           cache-dependency-path: infra/package-lock.json
       - run: npm ci
+      - name: Create placeholder Lambda assets for synth
+        run: |
+          mkdir -p ../services/gateway/target/lambda/gateway
+          mkdir -p ../services/worker/target/lambda/worker
+          touch ../services/gateway/target/lambda/gateway/bootstrap
+          touch ../services/worker/target/lambda/worker/bootstrap
       - run: npx cdk synth --quiet

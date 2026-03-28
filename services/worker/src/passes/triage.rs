@@ -64,11 +64,7 @@ Rules:
     // Parse JSON from response (strip markdown fences if present)
     let raw = response.trim();
     let json_str = if raw.starts_with("```") {
-        let inner = raw
-            .split('\n')
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let inner = raw.split('\n').skip(1).collect::<Vec<_>>().join("\n");
         inner.trim_end_matches("```").trim().to_string()
     } else {
         raw.to_string()
