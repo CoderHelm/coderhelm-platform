@@ -45,3 +45,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 subtle = "2"  # constant-time comparison
 ulid = "1"
 thiserror = "2"
+rand = "0.9"

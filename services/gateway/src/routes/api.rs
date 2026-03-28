@@ -5,6 +5,7 @@ use tracing::{error, info};
 
 use crate::models::{Claims, NotificationPrefs, OnboardMessage, OnboardRepo, WorkerMessage};
 use crate::AppState;
+use aws_sdk_dynamodb::types::AttributeValue;
 
 /// GET /api/me — return current user info.
 pub async fn me(
@@ -175,7 +176,7 @@ pub async fn get_jira_integration_check(
 
     let repo_items = repos_result.items();
     let repo_count = repo_items.len();
-    let enabled_repo_count = repo_items
+    let enabled_repos: Vec<_> = repo_items
         .iter()
         .filter(|item| {
             item.get("enabled")
@@ -183,7 +184,12 @@ pub async fn get_jira_integration_check(
                 .copied()
                 .unwrap_or(true)
         })
-        .count();
+        .filter_map(|item| {
+            let sk = item.get("sk")?.as_s().ok()?;
+            Some(sk.strip_prefix("REPO#")?.to_string())
+        })
+        .collect();
+    let enabled_repo_count = enabled_repos.len();
 
     let runs_result = state
         .dynamo
@@ -207,8 +213,29 @@ pub async fn get_jira_integration_check(
             .unwrap_or(false)
     });
 
-    let secret_configured = state.secrets.jira_webhook_secret.is_some();
+    // Load per-tenant JIRA secret from DynamoDB
+    let tenant_secret = load_jira_secret(&state, &claims.tenant_id).await;
+    let secret_configured = tenant_secret.is_some() || state.secrets.jira_webhook_secret.is_some();
     let ready = secret_configured && enabled_repo_count > 0;
+
+    // Load installation_id from tenant META
+    let meta_result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("META"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item);
+
+    let installation_id = meta_result
+        .as_ref()
+        .and_then(|item| item.get("github_install_id"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
 
     Ok(Json(json!({
         "ready": ready,
@@ -217,30 +244,88 @@ pub async fn get_jira_integration_check(
             "total": repo_count,
             "enabled": enabled_repo_count
         },
+        "enabled_repos": enabled_repos,
         "jira_events_seen": jira_seen,
-        "recommended_flow": "Jira Automation rule -> Send web request -> /webhooks/jira",
+        "installation_id": installation_id,
+        "tenant_id": claims.tenant_id,
+        "webhook_url": "https://api.d3ftly.com/webhooks/jira",
         "checklist": [
-            "Use issue events: jira:issue_created and jira:issue_updated",
-            "Keep webhook body included (do not exclude body)",
-            "Configure secret in Jira webhook and d3ftly secrets",
-            "Map repo_owner and repo_name in the payload",
-            "Return 2xx quickly and process async (already handled by queueing)"
+            "Generate a webhook secret below",
+            "Create a Jira Automation rule with a Send web request action",
+            "Paste the webhook URL and payload template",
+            "Add the secret as x-hub-signature-256 header in Jira",
+            "Create a test issue to verify"
         ],
-        "payload_template": {
-            "repo_owner": "your-org",
-            "repo_name": "your-repo",
-            "installation_id": 123456,
-            "issue": {
-                "key": "PROJ-123",
-                "fields": {
-                    "summary": "Implement feature",
-                    "description": "Acceptance criteria"
-                }
-            }
-        },
-        "check_endpoint": "/api/integrations/jira/check",
-        "intake_endpoint": "/webhooks/jira"
     })))
+}
+
+/// POST /api/integrations/jira/secret — generate a JIRA webhook secret for this tenant.
+pub async fn generate_jira_secret(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    use rand::Rng;
+    let secret: String = rand::rng()
+        .sample_iter(&rand::distr::Alphanumeric)
+        .take(40)
+        .map(char::from)
+        .collect();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.table_name)
+        .item("pk", attr_s(&claims.tenant_id))
+        .item("sk", attr_s("JIRA_SECRET"))
+        .item("secret", attr_s(&secret))
+        .item("created_at", attr_s(&now))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to store JIRA secret: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(tenant_id = %claims.tenant_id, "Generated JIRA webhook secret");
+    Ok(Json(json!({ "secret": secret })))
+}
+
+/// DELETE /api/integrations/jira/secret — remove the JIRA webhook secret.
+pub async fn delete_jira_secret(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<StatusCode, StatusCode> {
+    state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("JIRA_SECRET"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to delete JIRA secret: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(tenant_id = %claims.tenant_id, "Deleted JIRA webhook secret");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Load per-tenant JIRA secret from DynamoDB.
+pub async fn load_jira_secret(state: &AppState, tenant_id: &str) -> Option<String> {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("sk", AttributeValue::S("JIRA_SECRET".to_string()))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .and_then(|item| item.get("secret").and_then(|v| v.as_s().ok()).cloned())
 }
 
 /// POST /api/integrations/jira/check — validate a candidate Jira payload before wiring automation.
