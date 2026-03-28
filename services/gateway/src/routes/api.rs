@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{error, info};
 
-use crate::models::{Claims, NotificationPrefs, OnboardMessage, OnboardRepo, WorkerMessage};
+use crate::models::{Claims, InfraAnalyzeMessage, NotificationPrefs, OnboardMessage, OnboardRepo, WorkerMessage};
 use crate::AppState;
 use aws_sdk_dynamodb::types::AttributeValue;
 
@@ -476,6 +476,34 @@ pub async fn update_repo(
                 .send()
                 .await;
             info!(repo = %repo, "Dispatched onboarding for newly enabled repo");
+        }
+
+        // Also trigger infrastructure analysis for the tenant
+        let infra_msg = WorkerMessage::InfraAnalyze(InfraAnalyzeMessage {
+            tenant_id: claims.tenant_id.clone(),
+            triggered_by: claims.github_login.clone(),
+        });
+        if let Ok(body) = serde_json::to_string(&infra_msg) {
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = state
+                .dynamo
+                .put_item()
+                .table_name(&state.config.table_name)
+                .item("pk", attr_s(&claims.tenant_id))
+                .item("sk", attr_s("INFRA#analysis"))
+                .item("status", attr_s("pending"))
+                .item("has_infra", AttributeValue::Bool(false))
+                .item("updated_at", attr_s(&now))
+                .send()
+                .await;
+            let _ = state
+                .sqs
+                .send_message()
+                .queue_url(&state.config.ticket_queue_url)
+                .message_body(&body)
+                .send()
+                .await;
+            info!(repo = %repo, "Dispatched infra analysis for tenant");
         }
     }
 
