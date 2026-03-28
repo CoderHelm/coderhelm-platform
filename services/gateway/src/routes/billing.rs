@@ -210,7 +210,11 @@ pub async fn create_subscription(
     let price_id = body["price_id"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .or(state.secrets.stripe_price_id.as_deref().filter(|s| !s.is_empty()))
+        .or(state
+            .secrets
+            .stripe_price_id
+            .as_deref()
+            .filter(|s| !s.is_empty()))
         .ok_or_else(|| {
             error!("No stripe_price_id provided in request body or secrets");
             StatusCode::BAD_REQUEST
