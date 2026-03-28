@@ -18,7 +18,12 @@ export default function RunsPage() {
 
   return (
     <div>
-      <h1 className="text-2xl font-bold mb-6">Runs</h1>
+         <div className="mb-8">
+           <h1 className="text-xl font-semibold text-zinc-100">Runs</h1>
+           <p className="text-sm text-zinc-500 mt-1">
+             All agent runs across your repositories.
+           </p>
+         </div>
       {loading ? (
         <TableSkeleton rows={5} cols={5} />
       ) : error ? (
@@ -65,14 +70,17 @@ export default function RunsPage() {
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const colors: Record<string, string> = {
-    running: "bg-blue-500/10 text-blue-400 border-blue-500/20",
-    completed: "bg-green-500/10 text-green-400 border-green-500/20",
-    failed: "bg-red-500/10 text-red-400 border-red-500/20",
-  };
-  return (
-    <span className={`px-2 py-0.5 rounded-full text-xs border ${colors[status] || "bg-zinc-800 text-zinc-400 border-zinc-700"}`}>
-      {status}
-    </span>
-  );
+   const map: Record<string, { dot: string; text: string; bg: string }> = {
+     running: { dot: "bg-blue-400", text: "text-blue-400", bg: "bg-blue-500/10 border-blue-500/20" },
+     completed: { dot: "bg-emerald-400", text: "text-emerald-400", bg: "bg-emerald-500/10 border-emerald-500/20" },
+     failed: { dot: "bg-red-400", text: "text-red-400", bg: "bg-red-500/10 border-red-500/20" },
+     pending: { dot: "bg-yellow-400", text: "text-yellow-400", bg: "bg-yellow-500/10 border-yellow-500/20" },
+   };
+   const s = map[status] ?? { dot: "bg-zinc-500", text: "text-zinc-400", bg: "bg-zinc-800 border-zinc-700" };
+   return (
+     <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium border ${s.bg} ${s.text}`}>
+       <span className={`w-1.5 h-1.5 rounded-full ${s.dot} ${status === "running" ? "animate-pulse" : ""}`} />
+       {status}
+     </span>
+   );
 }

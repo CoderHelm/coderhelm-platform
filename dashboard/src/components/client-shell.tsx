@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { ToastProvider } from "./toast";
 
 const links = [
@@ -17,6 +18,7 @@ const links = [
 ];
 
 export function ClientShell({ children }: { children: React.ReactNode }) {
+  const router = useRouter();
   return (
     <ToastProvider>
       <div className="flex min-h-screen">
@@ -30,6 +32,11 @@ export function ClientShell({ children }: { children: React.ReactNode }) {
 function Sidebar() {
   const pathname = usePathname();
 
+interface User {
+  github_login: string;
+  email: string;
+  avatar_url: string;
+}
   const isActive = (href: string) => {
     if (href === "/") return pathname === "/";
     return pathname.startsWith(href);
