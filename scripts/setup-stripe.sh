@@ -136,6 +136,7 @@ else
     -d "unit_amount=1000" \
     -d "currency=usd" \
     -d "recurring[interval]=month" \
+    -d "recurring[usage_type]=metered" \
     -d "recurring[meter]=${PLANS_METER_ID}" \
     -d "nickname=plans_overage" \
     -d "metadata[app]=d3ftly" \
@@ -190,6 +191,7 @@ else
     -d "unit_amount=500" \
     -d "currency=usd" \
     -d "recurring[interval]=month" \
+    -d "recurring[usage_type]=metered" \
     -d "recurring[meter]=${RUNS_METER_ID}" \
     -d "nickname=runs_overage" \
     -d "metadata[app]=d3ftly" \
