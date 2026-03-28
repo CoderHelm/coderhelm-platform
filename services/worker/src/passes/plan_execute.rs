@@ -43,10 +43,21 @@ pub async fn run(
         let (owner, repo) = split_repo(&plan_repo);
         let issue_body = format_issue_body(&task.description, &task.acceptance_criteria);
 
-        match github.create_issue(owner, repo, &task.title, &issue_body).await {
+        match github
+            .create_issue(owner, repo, &task.title, &issue_body)
+            .await
+        {
             Ok((issue_number, issue_url)) => {
                 // Update task with issue info and mark done
-                update_task_with_issue(state, &msg.tenant_id, &msg.plan_id, task_id, issue_number, &issue_url).await?;
+                update_task_with_issue(
+                    state,
+                    &msg.tenant_id,
+                    &msg.plan_id,
+                    task_id,
+                    issue_number,
+                    &issue_url,
+                )
+                .await?;
                 info!(task_id, issue_number, "Created GitHub issue for task");
             }
             Err(e) => {
@@ -135,14 +146,29 @@ async fn get_task(
         .get_item()
         .table_name(&state.config.table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
-        .key("sk", AttributeValue::S(format!("PLAN#{plan_id}#TASK#{task_id}")))
+        .key(
+            "sk",
+            AttributeValue::S(format!("PLAN#{plan_id}#TASK#{task_id}")),
+        )
         .send()
         .await?;
 
     Ok(result.item().map(|item| TaskData {
-        title: item.get("title").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default(),
-        description: item.get("description").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default(),
-        acceptance_criteria: item.get("acceptance_criteria").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default(),
+        title: item
+            .get("title")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default(),
+        description: item
+            .get("description")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default(),
+        acceptance_criteria: item
+            .get("acceptance_criteria")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default(),
     }))
 }
 
@@ -158,7 +184,10 @@ async fn set_task_status(
         .update_item()
         .table_name(&state.config.table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
-        .key("sk", AttributeValue::S(format!("PLAN#{plan_id}#TASK#{task_id}")))
+        .key(
+            "sk",
+            AttributeValue::S(format!("PLAN#{plan_id}#TASK#{task_id}")),
+        )
         .update_expression("SET #s = :s")
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":s", AttributeValue::S(status.to_string()))
@@ -181,7 +210,10 @@ async fn update_task_with_issue(
         .update_item()
         .table_name(&state.config.table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
-        .key("sk", AttributeValue::S(format!("PLAN#{plan_id}#TASK#{task_id}")))
+        .key(
+            "sk",
+            AttributeValue::S(format!("PLAN#{plan_id}#TASK#{task_id}")),
+        )
         .update_expression("SET #s = :s, issue_number = :in, issue_url = :iu, completed_at = :ca")
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":s", AttributeValue::S("done".to_string()))

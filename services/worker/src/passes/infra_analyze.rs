@@ -81,9 +81,15 @@ pub async fn run(
         .item("status", AttributeValue::S("ready".to_string()))
         .item("has_infra", AttributeValue::Bool(true))
         .item("diagram", AttributeValue::S(diagram_str))
-        .item("diagram_title", AttributeValue::S("Architecture".to_string()))
+        .item(
+            "diagram_title",
+            AttributeValue::S("Architecture".to_string()),
+        )
         .item("findings", AttributeValue::S(findings_str))
-        .item("scanned_repos", AttributeValue::S(serde_json::to_string(&scanned)?))
+        .item(
+            "scanned_repos",
+            AttributeValue::S(serde_json::to_string(&scanned)?),
+        )
         .item("cached_at", AttributeValue::S(now))
         .send()
         .await?;
@@ -132,7 +138,11 @@ async fn get_tenant(
     let repos: Vec<String> = repos_result
         .items()
         .iter()
-        .filter_map(|item| item.get("repo_full_name").and_then(|v| v.as_s().ok()).cloned())
+        .filter_map(|item| {
+            item.get("repo_full_name")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+        })
         .collect();
 
     Ok(Some((install_id, repos)))
@@ -142,7 +152,14 @@ async fn collect_infra_code(
     github: &crate::clients::github::GitHubClient,
     repos: &[String],
 ) -> Vec<(String, String)> {
-    let infra_globs = ["cdk.json", "bin/*.ts", "lib/*-stack.ts", "lib/*.ts", "infra/**/*.ts", "*.tf"];
+    let infra_globs = [
+        "cdk.json",
+        "bin/*.ts",
+        "lib/*-stack.ts",
+        "lib/*.ts",
+        "infra/**/*.ts",
+        "*.tf",
+    ];
     let mut found: Vec<(String, String)> = Vec::new();
 
     for repo_full in repos.iter().take(5) {
@@ -158,7 +175,12 @@ async fn collect_infra_code(
             if let Ok(content) = github.get_file_content(owner, repo, path).await {
                 found.push((format!("{repo_full}/{path}"), content));
                 // If we found a cdk.json, also try to get the key stack files
-                for stack_path in &["infra/bin/index.ts", "infra/lib/stack.ts", "bin/app.ts", "lib/stack.ts"] {
+                for stack_path in &[
+                    "infra/bin/index.ts",
+                    "infra/lib/stack.ts",
+                    "bin/app.ts",
+                    "lib/stack.ts",
+                ] {
                     if let Ok(c) = github.get_file_content(owner, repo, stack_path).await {
                         found.push((format!("{repo_full}/{stack_path}"), c));
                     }
@@ -187,7 +209,11 @@ fn format_code_context(infra_code: &[(String, String)]) -> String {
     infra_code
         .iter()
         .map(|(path, content)| {
-            let trimmed = if content.len() > 4000 { &content[..4000] } else { content };
+            let trimmed = if content.len() > 4000 {
+                &content[..4000]
+            } else {
+                content
+            };
             format!("### {path}\n```typescript\n{trimmed}\n```")
         })
         .collect::<Vec<_>>()
@@ -198,7 +224,9 @@ async fn call_bedrock(
     state: &WorkerState,
     code_context: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let prompt = format!("Analyze this infrastructure code and generate the diagram and findings:\n\n{code_context}");
+    let prompt = format!(
+        "Analyze this infrastructure code and generate the diagram and findings:\n\n{code_context}"
+    );
 
     let messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
         .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
@@ -218,18 +246,17 @@ async fn call_bedrock(
         .await?;
 
     let text = match response.output() {
-        Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => {
-            msg.content()
-                .iter()
-                .find_map(|block| {
-                    if let aws_sdk_bedrockruntime::types::ContentBlock::Text(t) = block {
-                        Some(t.clone())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default()
-        }
+        Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg
+            .content()
+            .iter()
+            .find_map(|block| {
+                if let aws_sdk_bedrockruntime::types::ContentBlock::Text(t) = block {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default(),
         _ => String::new(),
     };
 
@@ -248,7 +275,11 @@ fn extract_block(text: &str, lang: &str) -> Option<String> {
     let after_open = start + open.len();
     let end = text[after_open..].find("```")?;
     let content = text[after_open..after_open + end].trim().to_string();
-    if content.is_empty() { None } else { Some(content) }
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
 }
 
 async fn store_no_infra(
