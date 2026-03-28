@@ -8,8 +8,6 @@ concurrency:
   group: deploy
   cancel-in-progress: false
 
-# Only deploy when the commit message contains CI:DEPLOY_PROD
-
 env:
   AWS_REGION: us-east-1
   CARGO_TERM_COLOR: always
@@ -75,31 +73,9 @@ jobs:
           name: worker
           path: worker.zip
 
-  build-dashboard:
-    name: Build Dashboard
-    if: contains(github.event.head_commit.message, 'CI:DEPLOY_PROD')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: dashboard/package-lock.json
-      - working-directory: dashboard
-        run: npm ci
-      - working-directory: dashboard
-        run: npm run build
-        env:
-          NEXT_PUBLIC_API_URL: https://api.d3ftly.com
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dashboard
-          path: dashboard/out
-
   deploy:
     name: CDK Deploy
-    needs: [build-gateway, build-worker, build-dashboard]
+    needs: [build-gateway, build-worker]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -108,7 +84,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: lts/*
           cache: npm
           cache-dependency-path: infra/package-lock.json
 
@@ -120,10 +96,6 @@ jobs:
         with:
           name: worker
           path: artifacts/
-      - uses: actions/download-artifact@v4
-        with:
-          name: dashboard
-          path: artifacts/dashboard/
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -137,4 +109,3 @@ jobs:
         env:
           GATEWAY_ZIP: ${{ github.workspace }}/artifacts/gateway.zip
           WORKER_ZIP: ${{ github.workspace }}/artifacts/worker.zip
-          DASHBOARD_DIR: ${{ github.workspace }}/artifacts/dashboard/
