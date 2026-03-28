@@ -177,16 +177,17 @@ async fn collect_infra_code(
             } else {
                 format!("{base}/cdk.json")
             };
-            if github.get_file_content(owner, repo, &cdk_json).await.is_ok() {
+            if github
+                .get_file_content(owner, repo, &cdk_json)
+                .await
+                .is_ok()
+            {
                 // Determine the root directory for CDK files
                 let cdk_root = if base.is_empty() { "." } else { base };
 
                 // Scan common CDK subdirectories for .ts, .py, .js files
                 let scan_dirs: Vec<String> = if cdk_root == "." {
-                    vec![
-                        "bin".to_string(),
-                        "lib".to_string(),
-                    ]
+                    vec!["bin".to_string(), "lib".to_string()]
                 } else {
                     vec![
                         format!("{cdk_root}/bin"),
