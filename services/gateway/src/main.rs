@@ -1,6 +1,6 @@
 use axum::{
     middleware as axum_middleware,
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use lambda_http::{run, Error};
@@ -124,6 +124,31 @@ async fn main() -> Result<(), Error> {
             "/billing/invoices/:invoice_id/pdf",
             get(routes::billing::download_invoice_pdf),
         )
+        // Plan endpoints
+        .route(
+            "/plans",
+            get(routes::plans::list_plans).post(routes::plans::create_plan),
+        )
+        .route(
+            "/plans/:plan_id",
+            get(routes::plans::get_plan)
+                .put(routes::plans::update_plan)
+                .delete(routes::plans::delete_plan),
+        )
+        .route("/plans/:plan_id/tasks", post(routes::plans::add_task))
+        .route(
+            "/plans/:plan_id/tasks/:task_id",
+            put(routes::plans::update_task).delete(routes::plans::delete_task),
+        )
+        .route(
+            "/plans/:plan_id/tasks/:task_id/approve",
+            post(routes::plans::approve_task),
+        )
+        .route(
+            "/plans/:plan_id/tasks/:task_id/reject",
+            post(routes::plans::reject_task),
+        )
+        .route("/plans/:plan_id/execute", post(routes::plans::execute_plan))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

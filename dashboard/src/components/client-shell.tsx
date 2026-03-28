@@ -6,6 +6,7 @@ import { ToastProvider } from "./toast";
 
 const links = [
   { href: "/", label: "Runs", icon: "▶" },
+  { href: "/plans", label: "Plans", icon: "◉" },
   { href: "/analytics", label: "Analytics", icon: "◪" },
   { href: "/settings/guardrails", label: "Guardrails", icon: "⛨" },
   { href: "/settings/voice", label: "Voice", icon: "✎" },

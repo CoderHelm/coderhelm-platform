@@ -60,6 +60,27 @@ export const api = {
   createSetupIntent: () => request<{ client_secret: string }>("/api/billing/payment-method", { method: "POST" }),
   listInvoices: () => request<{ invoices: Invoice[] }>("/api/billing/invoices"),
   getInvoicePdf: (id: string) => request<{ pdf_url: string }>(`/api/billing/invoices/${id}/pdf`),
+
+  // Plans
+  listPlans: () => request<{ plans: Plan[] }>("/api/plans"),
+  createPlan: (body: { title: string; description?: string; repo?: string; tasks?: Partial<Task>[] }) =>
+    request<{ plan_id: string }>("/api/plans", { method: "POST", body: JSON.stringify(body) }),
+  getPlan: (planId: string) => request<Plan & { tasks: Task[] }>(`/api/plans/${planId}`),
+  updatePlan: (planId: string, body: Partial<{ title: string; description: string; status: string }>) =>
+    request<void>(`/api/plans/${planId}`, { method: "PUT", body: JSON.stringify(body) }),
+  deletePlan: (planId: string) => request<void>(`/api/plans/${planId}`, { method: "DELETE" }),
+  addTask: (planId: string, body: Partial<Task>) =>
+    request<{ task_id: string }>(`/api/plans/${planId}/tasks`, { method: "POST", body: JSON.stringify(body) }),
+  updateTask: (planId: string, taskId: string, body: Partial<Task>) =>
+    request<void>(`/api/plans/${planId}/tasks/${taskId}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteTask: (planId: string, taskId: string) =>
+    request<void>(`/api/plans/${planId}/tasks/${taskId}`, { method: "DELETE" }),
+  approveTask: (planId: string, taskId: string) =>
+    request<void>(`/api/plans/${planId}/tasks/${taskId}/approve`, { method: "POST" }),
+  rejectTask: (planId: string, taskId: string) =>
+    request<void>(`/api/plans/${planId}/tasks/${taskId}/reject`, { method: "POST" }),
+  executePlan: (planId: string) =>
+    request<{ status: string; tasks_queued: number }>(`/api/plans/${planId}/execute`, { method: "POST" }),
 };
 
 export interface Run {
@@ -141,4 +162,36 @@ export interface Invoice {
   period: string | null;
   status: string | null;
   created_at: string | null;
+}
+
+export interface Plan {
+  plan_id: string;
+  title: string;
+  description: string;
+  repo: string;
+  status: "draft" | "executing" | "done" | string;
+  task_count: number;
+  created_at: string;
+  updated_at: string;
+  executed_at?: string;
+  executed_by?: string;
+  tasks?: Task[];
+}
+
+export interface Task {
+  task_id: string;
+  plan_id: string;
+  title: string;
+  description: string;
+  acceptance_criteria: string;
+  status: "draft" | "approved" | "rejected" | "queued" | "running" | "done" | string;
+  order: number;
+  issue_number?: number;
+  issue_url?: string;
+  run_id?: string;
+  approved_at?: string;
+  approved_by?: string;
+  rejected_at?: string;
+  rejected_by?: string;
+  created_at: string;
 }

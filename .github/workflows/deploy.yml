@@ -24,18 +24,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: services/gateway
-      - name: Install musl cross toolchain
-        run: |
-          curl -fsSL --retry 3 --retry-delay 5 https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/musl.tgz
-          sudo tar xzf /tmp/musl.tgz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+      - uses: mlugg/setup-zig@v2
+      - name: Install cargo-zigbuild
+        run: pip3 install cargo-zigbuild
       - name: Build
         working-directory: services/gateway
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
-          AR_aarch64_unknown_linux_musl: aarch64-linux-musl-ar
-        run: cargo build --release --target aarch64-unknown-linux-musl
+        run: cargo zigbuild --release --target aarch64-unknown-linux-musl
       - name: Package bootstrap
         run: |
           cp services/gateway/target/aarch64-unknown-linux-musl/release/gateway bootstrap
@@ -56,18 +50,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: services/worker
-      - name: Install musl cross toolchain
-        run: |
-          curl -fsSL --retry 3 --retry-delay 5 https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/musl.tgz
-          sudo tar xzf /tmp/musl.tgz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+      - uses: mlugg/setup-zig@v2
+      - name: Install cargo-zigbuild
+        run: pip3 install cargo-zigbuild
       - name: Build
         working-directory: services/worker
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
-          AR_aarch64_unknown_linux_musl: aarch64-linux-musl-ar
-        run: cargo build --release --target aarch64-unknown-linux-musl
+        run: cargo zigbuild --release --target aarch64-unknown-linux-musl
       - name: Package bootstrap
         run: |
           cp services/worker/target/aarch64-unknown-linux-musl/release/worker bootstrap
