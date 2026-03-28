@@ -5,6 +5,7 @@ use tracing::error;
 
 use crate::models::Claims;
 use crate::AppState;
+use super::billing::{report_stripe_usage, INCLUDED_PLANS};
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
@@ -137,7 +138,48 @@ pub async fn create_plan(
             .ok();
     }
 
+    // Track plan usage and report overage to Stripe
+    track_plan_usage(&state, &claims.tenant_id).await;
+
     Ok(Json(json!({ "plan_id": plan_id })))
+}
+
+/// Increment total_plans in analytics and report Stripe overage.
+async fn track_plan_usage(state: &Arc<AppState>, tenant_id: &str) {
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    for period in &[month.as_str(), "ALL_TIME"] {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.analytics_table_name)
+            .key("tenant_id", attr_s(tenant_id))
+            .key("period", attr_s(period))
+            .update_expression("ADD total_plans :one")
+            .expression_attribute_values(":one", attr_n(1))
+            .send()
+            .await;
+    }
+
+    // Read new total to decide if overage
+    if let Ok(resp) = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.analytics_table_name)
+        .key("tenant_id", attr_s(tenant_id))
+        .key("period", attr_s(&month))
+        .send()
+        .await
+    {
+        let total: u64 = resp
+            .item()
+            .and_then(|i| i.get("total_plans"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+
+        let overage = total.saturating_sub(INCLUDED_PLANS);
+        report_stripe_usage(state, tenant_id, "plans_overage", overage).await;
+    }
 }
 
 /// GET /api/plans/:plan_id — get plan with all tasks.

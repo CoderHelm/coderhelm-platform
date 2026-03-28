@@ -1,10 +1,16 @@
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::models::Claims;
 use crate::AppState;
+
+// ─── Usage limits (included in Pro) ─────────────────────────────────
+pub const INCLUDED_RUNS: u64 = 100;
+pub const INCLUDED_PLANS: u64 = 5;
+pub const OVERAGE_COST_PER_RUN_CENTS: u64 = 300;  // $3/run
+pub const OVERAGE_COST_PER_PLAN_CENTS: u64 = 1000; // $10/plan
 
 /// GET /api/billing — get billing overview (subscription status, plan, payment method, balance).
 pub async fn get_billing(
@@ -64,6 +70,13 @@ pub async fn get_billing(
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
 
+    let current_plans: u64 = usage
+        .as_ref()
+        .and_then(|i| i.get("total_plans"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
     // Get recent payments (last 5)
     let payments = state
         .dynamo
@@ -94,6 +107,11 @@ pub async fn get_billing(
         })
         .collect();
 
+    let runs_overage = current_runs.saturating_sub(INCLUDED_RUNS);
+    let plans_overage = current_plans.saturating_sub(INCLUDED_PLANS);
+    let estimated_overage_cents = runs_overage * OVERAGE_COST_PER_RUN_CENTS
+        + plans_overage * OVERAGE_COST_PER_PLAN_CENTS;
+
     Ok(Json(json!({
         "subscription_status": subscription_status,
         "plan_id": item.and_then(|i| i.get("plan_id")).and_then(|v| v.as_s().ok()),
@@ -103,10 +121,18 @@ pub async fn get_billing(
         "last_failure_reason": item.and_then(|i| i.get("last_failure_reason")).and_then(|v| v.as_s().ok()),
         "access_until": item.and_then(|i| i.get("access_until")).and_then(|v| v.as_s().ok()),
         "cancelled_at": item.and_then(|i| i.get("cancelled_at")).and_then(|v| v.as_s().ok()),
+        "limits": {
+            "runs": INCLUDED_RUNS,
+            "plans": INCLUDED_PLANS,
+            "overage_per_run_cents": OVERAGE_COST_PER_RUN_CENTS,
+            "overage_per_plan_cents": OVERAGE_COST_PER_PLAN_CENTS,
+        },
         "current_period": {
             "month": month,
             "usage_cost": current_usage_cost,
             "total_runs": current_runs,
+            "total_plans": current_plans,
+            "estimated_overage_cents": estimated_overage_cents,
         },
         "recent_payments": recent_payments,
     })))
@@ -207,21 +233,42 @@ pub async fn create_subscription(
     // Create subscription with payment_behavior=default_incomplete
     // This creates the subscription + PaymentIntent but doesn't charge yet.
     // The frontend uses the client_secret with Stripe Elements to confirm payment.
+    // We also look up the metered overage prices and attach them as additional items.
+    let plans_overage_price = lookup_metered_price(&state, stripe_key, "plans_overage").await;
+    let runs_overage_price = lookup_metered_price(&state, stripe_key, "runs_overage").await;
+
+    let mut form_params: Vec<(&str, String)> = vec![
+        ("customer", customer_id.clone()),
+        ("items[0][price]", price_id.to_string()),
+        ("payment_behavior", "default_incomplete".to_string()),
+        (
+            "payment_settings[save_default_payment_method]",
+            "on_subscription".to_string(),
+        ),
+        ("expand[]", "latest_invoice.payment_intent".to_string()),
+        ("metadata[tenant_id]", claims.tenant_id.clone()),
+    ];
+
+    let mut item_index = 1;
+    if let Some(ref pid) = plans_overage_price {
+        form_params.push((
+            "items[1][price]",
+            pid.clone(),
+        ));
+        item_index = 2;
+    }
+    if let Some(ref pid) = runs_overage_price {
+        let key = if item_index == 1 { "items[1][price]" } else { "items[2][price]" };
+        form_params.push((key, pid.clone()));
+    }
+
+    let form_pairs: Vec<(&str, &str)> = form_params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
     let response = state
         .http
         .post("https://api.stripe.com/v1/subscriptions")
         .header("Authorization", format!("Bearer {stripe_key}"))
-        .form(&[
-            ("customer", customer_id.as_str()),
-            ("items[0][price]", price_id),
-            ("payment_behavior", "default_incomplete"),
-            (
-                "payment_settings[save_default_payment_method]",
-                "on_subscription",
-            ),
-            ("expand[]", "latest_invoice.payment_intent"),
-            ("metadata[tenant_id]", &claims.tenant_id),
-        ])
+        .form(&form_pairs)
         .send()
         .await
         .map_err(|e| {
@@ -604,4 +651,133 @@ async fn get_stripe_customer_id(state: &AppState, tenant_id: &str) -> Result<Str
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
+}
+
+fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
+    aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
+}
+
+/// Look up a metered price by nickname from the d3ftly product.
+async fn lookup_metered_price(
+    state: &AppState,
+    stripe_key: &str,
+    nickname: &str,
+) -> Option<String> {
+    let resp = state
+        .http
+        .get("https://api.stripe.com/v1/prices?active=true&limit=50&type=recurring")
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+        .ok()?;
+    let body: Value = resp.json().await.ok()?;
+    body["data"]
+        .as_array()?
+        .iter()
+        .find(|p| p["nickname"].as_str() == Some(nickname) && p["recurring"]["usage_type"].as_str() == Some("metered"))
+        .and_then(|p| p["id"].as_str())
+        .map(|s| s.to_string())
+}
+
+/// Report metered usage to Stripe for overage billing.
+/// `quantity` is the number of units OVER the included limit (only overages).
+pub async fn report_stripe_usage(
+    state: &AppState,
+    tenant_id: &str,
+    usage_type: &str, // "plans_overage" or "runs_overage"
+    quantity: u64,
+) {
+    if quantity == 0 {
+        return;
+    }
+
+    let stripe_key = match &state.secrets.stripe_secret_key {
+        Some(k) => k.clone(),
+        None => return,
+    };
+
+    // Get subscription ID
+    let billing = match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(tenant_id))
+        .key("sk", attr_s("BILLING"))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to fetch billing for usage report: {e}");
+            return;
+        }
+    };
+
+    let sub_id = match billing
+        .item()
+        .and_then(|i| i.get("stripe_subscription_id"))
+        .and_then(|v| v.as_s().ok())
+    {
+        Some(id) => id.to_string(),
+        None => return,
+    };
+
+    // Find the subscription item for this metered price
+    let resp = match state
+        .http
+        .get(format!(
+            "https://api.stripe.com/v1/subscriptions/{sub_id}"
+        ))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to fetch subscription for usage report: {e}");
+            return;
+        }
+    };
+
+    let sub: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let si_id = sub["items"]["data"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item["price"]["nickname"].as_str() == Some(usage_type)
+            })
+        })
+        .and_then(|item| item["id"].as_str());
+
+    let si_id = match si_id {
+        Some(id) => id.to_string(),
+        None => {
+            warn!("No subscription item found for {usage_type}");
+            return;
+        }
+    };
+
+    // Report usage
+    let ts = chrono::Utc::now().timestamp().to_string();
+    let qty = quantity.to_string();
+    if let Err(e) = state
+        .http
+        .post(format!(
+            "https://api.stripe.com/v1/subscription_items/{si_id}/usage_records"
+        ))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .form(&[
+            ("quantity", qty.as_str()),
+            ("timestamp", ts.as_str()),
+            ("action", "set"),
+        ])
+        .send()
+        .await
+    {
+        warn!("Failed to report Stripe usage for {usage_type}: {e}");
+    }
 }
