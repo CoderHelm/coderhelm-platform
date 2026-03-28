@@ -206,7 +206,11 @@ pub async fn create_subscription(
         StatusCode::SERVICE_UNAVAILABLE
     })?;
 
-    let price_id = body["price_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    let price_id = body["price_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or(state.secrets.stripe_price_id.as_deref())
+        .ok_or(StatusCode::BAD_REQUEST)?;
 
     // Check if already has an active subscription
     let billing = state

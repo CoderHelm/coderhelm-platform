@@ -305,11 +305,33 @@ async fn handle_installation(
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            // Enqueue onboard for all repos in the installation
+            // Write REPO# items so the dashboard can list them
             let repos = extract_repos_from_installation(payload);
+            let tenant_id = format!("TENANT#{installation_id}");
+            let now_str = now.clone();
+            for repo in &repos {
+                let full = format!("{}/{}", repo.owner, repo.name);
+                let _ = state
+                    .dynamo
+                    .put_item()
+                    .table_name(&state.config.table_name)
+                    .item("pk", attr_s(&tenant_id))
+                    .item("sk", attr_s(&format!("REPO#{full}")))
+                    .item("repo_name", attr_s(&full))
+                    .item(
+                        "enabled",
+                        aws_sdk_dynamodb::types::AttributeValue::Bool(true),
+                    )
+                    .item("ticket_source", attr_s("github"))
+                    .item("created_at", attr_s(&now_str))
+                    .send()
+                    .await;
+            }
+
+            // Enqueue onboard for all repos in the installation
             if !repos.is_empty() {
                 let onboard = WorkerMessage::Onboard(OnboardMessage {
-                    tenant_id: format!("TENANT#{installation_id}"),
+                    tenant_id,
                     installation_id,
                     repos,
                 });
@@ -376,8 +398,30 @@ async fn handle_installation_repos(
         return Ok(StatusCode::OK);
     }
 
+    // Write REPO# items so the dashboard can list them
+    let tenant_id = format!("TENANT#{installation_id}");
+    let now = chrono::Utc::now().to_rfc3339();
+    for repo in &repos {
+        let full = format!("{}/{}", repo.owner, repo.name);
+        let _ = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.table_name)
+            .item("pk", attr_s(&tenant_id))
+            .item("sk", attr_s(&format!("REPO#{full}")))
+            .item("repo_name", attr_s(&full))
+            .item(
+                "enabled",
+                aws_sdk_dynamodb::types::AttributeValue::Bool(true),
+            )
+            .item("ticket_source", attr_s("github"))
+            .item("created_at", attr_s(&now))
+            .send()
+            .await;
+    }
+
     let onboard = WorkerMessage::Onboard(OnboardMessage {
-        tenant_id: format!("TENANT#{installation_id}"),
+        tenant_id,
         installation_id,
         repos,
     });
