@@ -94,3 +94,5 @@ jobs:
         env:
           GATEWAY_ZIP: ${{ github.workspace }}/artifacts/gateway.zip
           WORKER_ZIP: ${{ github.workspace }}/artifacts/worker.zip
+          CDK_DEFAULT_ACCOUNT: "REDACTED_AWS_ACCOUNT_ID"
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}

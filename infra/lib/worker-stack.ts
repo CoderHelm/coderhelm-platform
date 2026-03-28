@@ -36,6 +36,12 @@ export class WorkerStack extends cdk.Stack {
 
     // --- Worker Lambda (Rust) ---
 
+    const workerLogGroup = new logs.LogGroup(this, "WorkerLogGroup", {
+      logGroupName: `/aws/lambda/${prefix}-worker`,
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     this.workerFunction = new lambda.Function(this, "Worker", {
       functionName: `${prefix}-worker`,
       runtime: lambda.Runtime.PROVIDED_AL2023,
@@ -44,7 +50,7 @@ export class WorkerStack extends cdk.Stack {
       code: lambda.Code.fromAsset("../services/worker/target/lambda/worker"),
       memorySize: 256,
       timeout: cdk.Duration.minutes(15),
-      logRetention: logs.RetentionDays.ONE_MONTH,
+      logGroup: workerLogGroup,
       reservedConcurrentExecutions: 10, // tenant-level limiting in code
       environment: {
         STAGE: props.stage,
