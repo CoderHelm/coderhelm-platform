@@ -5,9 +5,20 @@ modules:
       events:
         - avi:jira:assigned:issue
         - avi:jira:updated:issue
+  jira:adminPage:
+    - key: d3ftly-admin-page
+      resource: adminPage
+      resolver:
+        function: adminResolver
+      title: d3ftly Settings
   function:
     - key: jiraHandler
       handler: index.handler
+    - key: adminResolver
+      handler: admin.resolver
+resources:
+  - key: adminPage
+    path: resources/admin/build
 permissions:
   scopes:
     - read:jira-work
