@@ -365,6 +365,30 @@ pub async fn update_repo(
     Ok(StatusCode::OK)
 }
 
+/// DELETE /api/repos/:repo — remove a repo from this tenant.
+pub async fn delete_repo(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(repo): axum::extract::Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    validate_repo_name(&repo)?;
+
+    state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s(&format!("REPO#{repo}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to delete repo: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(StatusCode::OK)
+}
+
 /// GET /api/stats — pre-computed analytics (O(1) read from analytics table).
 pub async fn get_stats(
     State(state): State<Arc<AppState>>,

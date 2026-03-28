@@ -69,7 +69,10 @@ pub async fn converse(
             // On subsequent calls with the same system prompt prefix, Bedrock
             // serves cached tokens at 0.1x input price instead of full price.
             .system(SystemContentBlock::CachePoint(
-                CachePointBlock::builder().build().unwrap(),
+                CachePointBlock::builder()
+                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
+                    .build()
+                    .unwrap(),
             ));
 
         for msg in messages.iter() {
