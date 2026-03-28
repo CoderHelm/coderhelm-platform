@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use super::billing::{INCLUDED_RUNS, OVERAGE_COST_PER_RUN_CENTS};
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
     CiFixMessage, FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo, TicketMessage,
@@ -128,6 +129,15 @@ async fn handle_issue_event(
             .to_string(),
     });
 
+    // Check usage limits before dispatching
+    if let Some(reason) = check_run_budget(state, &tenant_id).await {
+        let owner = repo["owner"]["login"].as_str().unwrap_or("");
+        let name = repo["name"].as_str().unwrap_or("");
+        let number = issue["number"].as_u64().unwrap_or(0);
+        post_limit_comment(state, installation_id, owner, name, number, &reason).await;
+        return Ok(StatusCode::OK);
+    }
+
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
 
@@ -153,7 +163,7 @@ async fn handle_issue_comment(
     let repo = &payload["repository"];
 
     let message = WorkerMessage::Ticket(TicketMessage {
-        tenant_id,
+        tenant_id: tenant_id.clone(),
         installation_id,
         source: TicketSource::Github,
         ticket_id: format!("GH-{}", issue["number"].as_u64().unwrap_or(0)),
@@ -167,6 +177,15 @@ async fn handle_issue_comment(
             .unwrap_or("")
             .to_string(),
     });
+
+    // Check usage limits before dispatching
+    if let Some(reason) = check_run_budget(state, &tenant_id).await {
+        let owner = repo["owner"]["login"].as_str().unwrap_or("");
+        let name = repo["name"].as_str().unwrap_or("");
+        let number = issue["number"].as_u64().unwrap_or(0);
+        post_limit_comment(state, installation_id, owner, name, number, &reason).await;
+        return Ok(StatusCode::OK);
+    }
 
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
@@ -568,4 +587,133 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 
 fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
+}
+
+/// Check whether this tenant has budget remaining. Returns Some(reason) if blocked.
+async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
+    // 1. Read current month's run count from analytics
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    let analytics = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.analytics_table_name)
+        .key("tenant_id", attr_s(tenant_id))
+        .key("period", attr_s(&month))
+        .send()
+        .await
+        .ok()?;
+
+    let total_runs = analytics
+        .item()
+        .and_then(|i| i.get("total_runs"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    // 2. Read billing record (subscription status)
+    let billing = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(tenant_id))
+        .key("sk", attr_s("BILLING"))
+        .send()
+        .await
+        .ok()?;
+
+    let sub_status = billing
+        .item()
+        .and_then(|i| i.get("subscription_status"))
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("none");
+
+    let is_pro = sub_status == "active";
+
+    // Free tier: hard limit at 5 runs
+    if !is_pro && total_runs >= 5 {
+        return Some(
+            "You've used all **5 free runs** this month. \
+             [Upgrade to Pro](https://app.d3ftly.com/billing) for 30 runs/month."
+                .to_string(),
+        );
+    }
+
+    // Pro tier: check budget cap
+    if is_pro {
+        let budget = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(tenant_id))
+            .key("sk", attr_s("SETTINGS#BUDGET"))
+            .send()
+            .await
+            .ok()?;
+
+        let max_budget_cents = budget
+            .item()
+            .and_then(|i| i.get("max_budget_cents"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        if max_budget_cents > 0 {
+            // Calculate current spend: base $199 + overages
+            let overage_runs = total_runs.saturating_sub(INCLUDED_RUNS);
+            let current_spend = 19900 + overage_runs * OVERAGE_COST_PER_RUN_CENTS;
+            if current_spend >= max_budget_cents {
+                return Some(format!(
+                    "Monthly budget cap of **${:.2}** reached (current spend: **${:.2}**). \
+                     Adjust your budget in [Settings](https://app.d3ftly.com/settings/budget).",
+                    max_budget_cents as f64 / 100.0,
+                    current_spend as f64 / 100.0,
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// Post a comment on a GitHub issue explaining why the run was skipped.
+async fn post_limit_comment(
+    state: &AppState,
+    installation_id: u64,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+    reason: &str,
+) {
+    if owner.is_empty() || repo.is_empty() || issue_number == 0 {
+        return;
+    }
+
+    // Get installation access token
+    let token = match crate::auth::github_app::get_installation_token(state, installation_id).await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("Failed to get installation token for limit comment: {e}");
+            return;
+        }
+    };
+
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments");
+    let body = serde_json::json!({
+        "body": format!("⚠️ **d3ftly — run skipped**\n\n{reason}")
+    });
+
+    if let Err(e) = state
+        .http
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "d3ftly-bot")
+        .json(&body)
+        .send()
+        .await
+    {
+        warn!("Failed to post limit comment: {e}");
+    }
 }
