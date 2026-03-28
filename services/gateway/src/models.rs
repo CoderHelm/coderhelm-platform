@@ -1,0 +1,265 @@
+use serde::{Deserialize, Serialize};
+
+/// App configuration from environment variables.
+pub struct Config {
+    pub stage: String,
+    pub table_name: String,
+    pub runs_table_name: String,
+    pub analytics_table_name: String,
+    pub bucket_name: String,
+    pub invoice_bucket_name: String,
+    pub ticket_queue_url: String,
+    pub ci_fix_queue_url: String,
+    pub feedback_queue_url: String,
+    pub ses_from_address: String,
+    pub ses_template_prefix: String,
+}
+
+impl Config {
+    pub fn from_env() -> Self {
+        Self {
+            stage: std::env::var("STAGE").unwrap_or_else(|_| "dev".to_string()),
+            table_name: std::env::var("TABLE_NAME").expect("TABLE_NAME required"),
+            runs_table_name: std::env::var("RUNS_TABLE_NAME")
+                .expect("RUNS_TABLE_NAME required"),
+            analytics_table_name: std::env::var("ANALYTICS_TABLE_NAME")
+                .expect("ANALYTICS_TABLE_NAME required"),
+            bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
+            invoice_bucket_name: std::env::var("INVOICE_BUCKET_NAME")
+                .unwrap_or_else(|_| "d3ftly-prod-invoices".to_string()),
+            ticket_queue_url: std::env::var("TICKET_QUEUE_URL").expect("TICKET_QUEUE_URL required"),
+            ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").expect("CI_FIX_QUEUE_URL required"),
+            feedback_queue_url: std::env::var("FEEDBACK_QUEUE_URL")
+                .expect("FEEDBACK_QUEUE_URL required"),
+            ses_from_address: std::env::var("SES_FROM_ADDRESS")
+                .unwrap_or_else(|_| "notifications@d3ftly.com".to_string()),
+            ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")
+                .unwrap_or_else(|_| "d3ftly-prod".to_string()),
+        }
+    }
+}
+
+/// Secrets loaded from AWS Secrets Manager.
+#[derive(Deserialize)]
+pub struct Secrets {
+    pub github_app_id: String,
+    pub github_private_key: String,
+    pub github_webhook_secret: String,
+    pub github_client_id: String,
+    pub github_client_secret: String,
+    pub jwt_secret: String,
+    #[serde(default)]
+    pub jira_webhook_secret: Option<String>,
+    #[serde(default)]
+    pub stripe_webhook_secret: Option<String>,
+    #[serde(default)]
+    pub stripe_secret_key: Option<String>,
+}
+
+impl Secrets {
+    pub async fn load(
+        client: &aws_sdk_secretsmanager::Client,
+        name: &str,
+    ) -> Result<Self, lambda_http::Error> {
+        let response = client.get_secret_value().secret_id(name).send().await?;
+        let secret_string = response
+            .secret_string()
+            .ok_or_else(|| "Secret has no string value")?;
+        let secrets: Secrets = serde_json::from_str(secret_string)?;
+        Ok(secrets)
+    }
+}
+
+/// SQS message types sent from gateway → worker.
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+pub enum WorkerMessage {
+    #[serde(rename = "ticket")]
+    Ticket(TicketMessage),
+    #[serde(rename = "ci_fix")]
+    CiFix(CiFixMessage),
+    #[serde(rename = "feedback")]
+    Feedback(FeedbackMessage),
+    #[serde(rename = "onboard")]
+    Onboard(OnboardMessage),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TicketMessage {
+    pub tenant_id: String,
+    pub installation_id: u64,
+    pub source: TicketSource,
+    pub ticket_id: String,
+    pub title: String,
+    pub body: String,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub issue_number: u64,
+    pub sender: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum TicketSource {
+    Github,
+    Jira,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CiFixMessage {
+    pub tenant_id: String,
+    pub installation_id: u64,
+    pub run_id: String,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub branch: String,
+    pub pr_number: u64,
+    pub check_run_id: u64,
+    pub attempt: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FeedbackMessage {
+    pub tenant_id: String,
+    pub installation_id: u64,
+    pub run_id: String,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub review_id: u64,
+    pub review_body: String,
+    pub comments: Vec<ReviewComment>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ReviewComment {
+    pub path: String,
+    pub line: Option<u64>,
+    pub body: String,
+}
+
+/// JWT claims for authenticated dashboard sessions.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Claims {
+    pub sub: String,         // user_id
+    pub tenant_id: String,
+    pub github_login: String,
+    pub exp: u64,
+    pub iat: u64,
+}
+
+/// DynamoDB item types.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Tenant {
+    pub pk: String,         // TENANT#<install_id>
+    pub sk: String,         // META
+    pub github_install_id: u64,
+    pub github_org: String,
+    pub plan: String,       // "free" | "supporter"
+    pub status: String,     // "active" | "suspended"
+    pub run_count_mtd: u32, // month-to-date run count
+    pub created_at: String,
+}
+
+/// Notification preferences (stored in main table: pk=TENANT#<id>, sk=NOTIFICATIONS#<user_id>)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NotificationPrefs {
+    pub email_run_complete: bool,
+    pub email_run_failed: bool,
+    pub email_weekly_summary: bool,
+}
+
+impl Default for NotificationPrefs {
+    fn default() -> Self {
+        Self {
+            email_run_complete: true,
+            email_run_failed: true,
+            email_weekly_summary: true,
+        }
+    }
+}
+
+// --- Onboard types ---
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct OnboardMessage {
+    pub tenant_id: String,
+    pub installation_id: u64,
+    pub repos: Vec<OnboardRepo>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OnboardRepo {
+    pub owner: String,
+    pub name: String,
+    pub default_branch: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ticket_message_roundtrip() {
+        let msg = WorkerMessage::Ticket(TicketMessage {
+            tenant_id: "TENANT#1".into(),
+            installation_id: 1,
+            source: TicketSource::Github,
+            ticket_id: "GH-42".into(),
+            title: "Fix bug".into(),
+            body: "details".into(),
+            repo_owner: "org".into(),
+            repo_name: "repo".into(),
+            issue_number: 42,
+            sender: "user".into(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, WorkerMessage::Ticket(_)));
+    }
+
+    #[test]
+    fn onboard_message_roundtrip() {
+        let msg = WorkerMessage::Onboard(OnboardMessage {
+            tenant_id: "TENANT#1".into(),
+            installation_id: 1,
+            repos: vec![OnboardRepo {
+                owner: "org".into(),
+                name: "repo".into(),
+                default_branch: "main".into(),
+            }],
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, WorkerMessage::Onboard(_)));
+    }
+
+    #[test]
+    fn secrets_serde() {
+        let json = r#"{
+            "github_app_id":"1",
+            "github_private_key":"k",
+            "github_webhook_secret":"ws",
+            "github_client_id":"ci",
+            "github_client_secret":"cs",
+            "jwt_secret":"js"
+        }"#;
+        let s: Secrets = serde_json::from_str(json).unwrap();
+        assert_eq!(s.github_app_id, "1");
+        assert!(s.jira_webhook_secret.is_none());
+    }
+
+    #[test]
+    fn claims_roundtrip() {
+        let c = Claims {
+            sub: "user1".into(),
+            tenant_id: "TENANT#1".into(),
+            github_login: "octocat".into(),
+            exp: 9999999999,
+            iat: 1000000000,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let parsed: Claims = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.sub, "user1");
+    }
+}

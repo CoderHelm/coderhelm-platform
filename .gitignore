@@ -1,0 +1,24 @@
+# Rust
+target/
+
+# Node (CDK)
+node_modules/
+
+# CDK compiled output
+infra/cdk.out/
+infra/**/*.js
+infra/**/*.d.ts
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
