@@ -9,9 +9,7 @@ use crate::AppState;
 // ─── Usage limits (included in Pro) ─────────────────────────────────
 pub const INCLUDED_TOKENS: u64 = 5_000_000; // 5M tokens (in+out)
 pub const FREE_TIER_TOKENS: u64 = 500_000; // 500K tokens for free tier
-pub const INCLUDED_PLANS: u64 = 5;
 pub const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 5; // $0.05 per 1K tokens ($50/1M)
-pub const OVERAGE_COST_PER_PLAN_CENTS: u64 = 1000; // $10/plan
 
 /// GET /api/billing — get billing overview (subscription status, plan, payment method, balance).
 pub async fn get_billing(
@@ -126,9 +124,7 @@ pub async fn get_billing(
 
     let tokens_overage = current_tokens.saturating_sub(INCLUDED_TOKENS);
     let tokens_overage_1k = tokens_overage / 1000;
-    let plans_overage = current_plans.saturating_sub(INCLUDED_PLANS);
-    let estimated_overage_cents = tokens_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS
-        + plans_overage * OVERAGE_COST_PER_PLAN_CENTS;
+    let estimated_overage_cents = tokens_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
 
     Ok(Json(json!({
         "subscription_status": subscription_status,
@@ -141,9 +137,7 @@ pub async fn get_billing(
         "cancelled_at": item.and_then(|i| i.get("cancelled_at")).and_then(|v| v.as_s().ok()),
         "limits": {
             "tokens": INCLUDED_TOKENS,
-            "plans": INCLUDED_PLANS,
             "overage_per_1k_tokens_cents": OVERAGE_PER_1K_TOKENS_CENTS,
-            "overage_per_plan_cents": OVERAGE_COST_PER_PLAN_CENTS,
         },
         "current_period": {
             "month": month,
@@ -253,7 +247,7 @@ pub async fn create_subscription(
     // This creates the subscription + PaymentIntent but doesn't charge yet.
     // The frontend uses the client_secret with Stripe Elements to confirm payment.
     // We also look up the metered overage prices and attach them as additional items.
-    let plans_overage_price = lookup_metered_price(&state, stripe_key, "plans_overage").await;
+    let plans_overage_price = None::<String>; // Plans are unlimited — no overage
     let tokens_overage_price = lookup_metered_price(&state, stripe_key, "tokens_overage").await;
 
     let mut form_params: Vec<(&str, String)> = vec![

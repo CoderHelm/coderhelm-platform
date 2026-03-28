@@ -3,7 +3,6 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::error;
 
-use super::billing::{report_stripe_usage, INCLUDED_PLANS};
 use crate::models::{Claims, PlanExecuteMessage, WorkerMessage};
 use crate::AppState;
 
@@ -150,7 +149,7 @@ pub async fn create_plan(
     Ok(Json(json!({ "plan_id": plan_id })))
 }
 
-/// Increment total_plans in analytics and report Stripe overage.
+/// Increment total_plans in analytics (plans are unlimited, no overage billing).
 async fn track_plan_usage(state: &Arc<AppState>, tenant_id: &str) {
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     for period in &[month.as_str(), "ALL_TIME"] {
@@ -164,27 +163,6 @@ async fn track_plan_usage(state: &Arc<AppState>, tenant_id: &str) {
             .expression_attribute_values(":one", attr_n(1))
             .send()
             .await;
-    }
-
-    // Read new total to decide if overage
-    if let Ok(resp) = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.analytics_table_name)
-        .key("tenant_id", attr_s(tenant_id))
-        .key("period", attr_s(&month))
-        .send()
-        .await
-    {
-        let total: u64 = resp
-            .item()
-            .and_then(|i| i.get("total_plans"))
-            .and_then(|v| v.as_n().ok())
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(0);
-
-        let overage = total.saturating_sub(INCLUDED_PLANS);
-        report_stripe_usage(state, tenant_id, "plans_overage", overage).await;
     }
 }
 
