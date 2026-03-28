@@ -50,8 +50,8 @@ pub async fn converse(
             usage.add(
                 u.input_tokens() as u64,
                 u.output_tokens() as u64,
-                u.cache_read_input_token_count().unwrap_or(0) as u64,
-                u.cache_write_input_token_count().unwrap_or(0) as u64,
+                u.cache_read_input_tokens().unwrap_or(0) as u64,
+                u.cache_write_input_tokens().unwrap_or(0) as u64,
             );
         }
 
@@ -97,14 +97,7 @@ pub async fn converse(
         let mut tool_results = Vec::new();
         for tool_use in &tool_uses {
             info!(tool = tool_use.name(), "Executing tool");
-            let input: Value = serde_json::from_str(
-                &tool_use
-                    .input()
-                    .as_ref()
-                    .map(|d| d.to_string())
-                    .unwrap_or_default(),
-            )
-            .unwrap_or(json!({}));
+            let input: Value = serde_json::to_value(tool_use.input()).unwrap_or(json!({}));
 
             match tool_executor.execute(tool_use.name(), &input).await {
                 Ok(result) => {
@@ -157,7 +150,7 @@ fn build_tool_config(tools: &[ToolDefinition]) -> ToolConfiguration {
                     .name(&t.name)
                     .description(&t.description)
                     .input_schema(ToolInputSchema::Json(
-                        aws_sdk_bedrockruntime::types::Document::try_from(
+                        aws_smithy_types::Document::try_from(
                             serde_json::to_value(&t.input_schema).unwrap(),
                         )
                         .unwrap(),

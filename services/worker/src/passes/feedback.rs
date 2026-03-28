@@ -1,5 +1,5 @@
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::clients::github::GitHubClient;
@@ -20,7 +20,7 @@ pub async fn run(
     )?;
 
     // Fetch the PR to find the branch
-    let pr_data = github
+    let _pr_data = github
         .get_diff(
             &msg.repo_owner,
             &msg.repo_name,
@@ -86,7 +86,7 @@ Rules:
     );
 
     // Reply to each top-level review comment
-    for comment in &msg.comments {
+    for _comment in &msg.comments {
         // We don't have comment IDs in our FeedbackMessage yet,
         // so we post a single comment on the PR
     }

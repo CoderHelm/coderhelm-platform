@@ -114,7 +114,8 @@ async fn onboard_repo(
         "Dockerfile",
     ];
 
-    let mut context_parts: Vec<String> = vec![format!("Repository: {full_name}\n\nTree:\n{tree}")];
+    let tree_str: String = tree.iter().map(|e| format!("{} {}", e.entry_type, e.path)).collect::<Vec<_>>().join("\n");
+    let mut context_parts: Vec<String> = vec![format!("Repository: {full_name}\n\nTree:\n{tree_str}")];
 
     for path in &signal_files {
         match github
@@ -195,8 +196,9 @@ async fn onboard_repo(
             &repo.name,
             ".d3ftly/AGENTS.md",
             &agents_md,
-            "chore: add .d3ftly/AGENTS.md for AI agent context",
             &repo.default_branch,
+            "chore: add .d3ftly/AGENTS.md for AI agent context",
+            None,
         )
         .await?;
 
@@ -234,8 +236,9 @@ async fn generate_global_agents_md(
             target_repo,
             "AGENTS.md",
             &content,
-            "chore: add global AGENTS.md for d3ftly",
             default_branch,
+            "chore: add global AGENTS.md for d3ftly",
+            None,
         )
         .await
     {
