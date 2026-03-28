@@ -311,7 +311,7 @@ pub async fn create_subscription(
         .header("Authorization", format!("Bearer {stripe_key}"))
         .form(&[
             ("mode", "subscription"),
-            ("ui_mode", "embedded"),
+            ("ui_mode", "embedded_page"),
             ("customer", &customer_id),
             ("line_items[0][price]", price_id),
             ("line_items[0][quantity]", "1"),
