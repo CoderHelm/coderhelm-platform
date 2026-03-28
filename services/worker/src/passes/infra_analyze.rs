@@ -157,20 +157,62 @@ async fn collect_infra_code(
         }
         let (owner, repo) = (parts[0], parts[1]);
 
-        // Search repo for CDK entry files
-        let search_paths = ["cdk.json", "infra/cdk.json", "infrastructure/cdk.json"];
-        for path in &search_paths {
-            if let Ok(content) = github.get_file_content(owner, repo, path).await {
-                found.push((format!("{repo_full}/{path}"), content));
-                // If we found a cdk.json, also try to get the key stack files
-                for stack_path in &[
-                    "infra/bin/index.ts",
-                    "infra/lib/stack.ts",
-                    "bin/app.ts",
-                    "lib/stack.ts",
-                ] {
-                    if let Ok(c) = github.get_file_content(owner, repo, stack_path).await {
-                        found.push((format!("{repo_full}/{stack_path}"), c));
+        // AWS CDK — detect cdk.json then discover stack files via directory listing
+        let cdk_locations = ["", "infra", "infrastructure"];
+        for base in &cdk_locations {
+            let cdk_json = if base.is_empty() {
+                "cdk.json".to_string()
+            } else {
+                format!("{base}/cdk.json")
+            };
+            if github.get_file_content(owner, repo, &cdk_json).await.is_ok() {
+                // Determine the root directory for CDK files
+                let cdk_root = if base.is_empty() { "." } else { base };
+
+                // Scan common CDK subdirectories for .ts, .py, .js files
+                let scan_dirs: Vec<String> = if cdk_root == "." {
+                    vec![
+                        "bin".to_string(),
+                        "lib".to_string(),
+                    ]
+                } else {
+                    vec![
+                        format!("{cdk_root}/bin"),
+                        format!("{cdk_root}/lib"),
+                        cdk_root.to_string(),
+                    ]
+                };
+
+                // Also grab the CDK app entry if it's a Python CDK project (app.py)
+                let app_path = if cdk_root == "." {
+                    "app.py".to_string()
+                } else {
+                    format!("{cdk_root}/app.py")
+                };
+                if let Ok(c) = github.get_file_content(owner, repo, &app_path).await {
+                    found.push((format!("{repo_full}/{app_path}"), c));
+                }
+
+                for dir in &scan_dirs {
+                    if let Ok(entries) = github.list_directory(owner, repo, dir, "HEAD").await {
+                        for entry in entries {
+                            if entry.entry_type != "file" {
+                                continue;
+                            }
+                            let is_cdk_file = entry.name.ends_with(".ts")
+                                || entry.name.ends_with(".py")
+                                || entry.name.ends_with(".js");
+                            let skip = entry.name.ends_with(".test.ts")
+                                || entry.name.ends_with(".d.ts")
+                                || entry.name == "jest.config.js";
+                            if is_cdk_file && !skip {
+                                if let Ok(c) =
+                                    github.get_file_content(owner, repo, &entry.path).await
+                                {
+                                    found.push((format!("{repo_full}/{}", entry.path), c));
+                                }
+                            }
+                        }
                     }
                 }
                 break;
@@ -217,7 +259,6 @@ async fn collect_infra_code(
         for pulumi_path in &["Pulumi.yaml", "infra/Pulumi.yaml"] {
             if let Ok(content) = github.get_file_content(owner, repo, pulumi_path).await {
                 found.push((format!("{repo_full}/{pulumi_path}"), content));
-                // Also try to get the main Pulumi program
                 for prog_path in &["index.ts", "__main__.py", "main.go", "Pulumi.ts"] {
                     if let Ok(c) = github.get_file_content(owner, repo, prog_path).await {
                         found.push((format!("{repo_full}/{prog_path}"), c));
@@ -227,7 +268,7 @@ async fn collect_infra_code(
             }
         }
 
-        if found.len() >= 10 {
+        if found.len() >= 15 {
             break;
         }
     }
