@@ -1,10 +1,12 @@
 use axum::{
+    http::header,
     middleware as axum_middleware,
     routing::{get, post, put},
     Router,
 };
 use lambda_http::{run, Error};
 use std::sync::Arc;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod auth;
@@ -183,6 +185,10 @@ async fn main() -> Result<(), Error> {
         .route("/auth/logout", post(routes::auth::logout))
         // Nest protected routes under /api
         .nest("/api", api_routes)
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        ))
         .with_state(state);
 
     run(app).await
