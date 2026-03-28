@@ -93,6 +93,18 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("Mark PR ready failed: {e}");
                 }
             }
+            models::WorkerMessage::PlanExecute(msg) => {
+                info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, "Executing plan");
+                if let Err(e) = passes::plan_execute::run(&state, msg).await {
+                    error!("Plan execute failed: {e}");
+                }
+            }
+            models::WorkerMessage::InfraAnalyze(msg) => {
+                info!(tenant_id = %msg.tenant_id, "Analyzing infrastructure");
+                if let Err(e) = passes::infra_analyze::run(&state, msg).await {
+                    error!("Infra analyze failed: {e}");
+                }
+            }
         }
     }
 

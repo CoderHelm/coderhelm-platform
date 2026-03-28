@@ -544,6 +544,32 @@ impl GitHubClient {
             format!("{API_BASE}/repos/{owner}/{repo}/commits?sha={branch}&per_page={per_page}");
         self.get(&url).await
     }
+
+    /// Get file content from the default branch (HEAD).
+    pub async fn get_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.read_file(owner, repo, path, "HEAD").await
+    }
+
+    /// Create a GitHub issue and return (issue_number, issue_url).
+    pub async fn create_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<(u64, String), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/issues");
+        let payload = serde_json::json!({ "title": title, "body": body });
+        let data = self.post(&url, &payload).await?;
+        let number = data["number"].as_u64().unwrap_or(0);
+        let html_url = data["html_url"].as_str().unwrap_or("").to_string();
+        Ok((number, html_url))
+    }
 }
 
 // ─── Types ──────────────────────────────────────────────────

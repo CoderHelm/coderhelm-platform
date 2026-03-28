@@ -81,6 +81,11 @@ export const api = {
     request<void>(`/api/plans/${planId}/tasks/${taskId}/reject`, { method: "POST" }),
   executePlan: (planId: string) =>
     request<{ status: string; tasks_queued: number }>(`/api/plans/${planId}/execute`, { method: "POST" }),
+
+  // Infrastructure
+  getInfrastructure: () => request<InfraAnalysis>("/api/infrastructure"),
+  refreshInfrastructure: () =>
+    request<{ status: string }>("/api/infrastructure/refresh", { method: "POST" }),
 };
 
 export interface Run {
@@ -194,4 +199,24 @@ export interface Task {
   rejected_at?: string;
   rejected_by?: string;
   created_at: string;
+}
+
+
+export interface InfraFinding {
+  severity: "error" | "warning" | "info";
+  category: "security" | "performance" | "cost" | "reliability";
+  title: string;
+  detail: string;
+  file?: string;
+}
+
+export interface InfraAnalysis {
+  status: "pending" | "ready" | "no_infra";
+  has_infra: boolean;
+  diagram?: string;
+  diagram_title?: string;
+  findings?: InfraFinding[];
+  suggested_prompt?: string;
+  cached_at?: string;
+  scanned_repos?: string[];
 }
