@@ -204,6 +204,7 @@ async fn onboard_repo(
         .system(
             aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
                 aws_sdk_bedrockruntime::types::CachePointBlock::builder()
+                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
                     .build()
                     .unwrap(),
             ),

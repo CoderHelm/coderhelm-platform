@@ -320,7 +320,7 @@ async fn handle_installation(
                     .item("repo_name", attr_s(&full))
                     .item(
                         "enabled",
-                        aws_sdk_dynamodb::types::AttributeValue::Bool(true),
+                        aws_sdk_dynamodb::types::AttributeValue::Bool(false),
                     )
                     .item("ticket_source", attr_s("github"))
                     .item("created_at", attr_s(&now_str))
@@ -412,7 +412,7 @@ async fn handle_installation_repos(
             .item("repo_name", attr_s(&full))
             .item(
                 "enabled",
-                aws_sdk_dynamodb::types::AttributeValue::Bool(true),
+                aws_sdk_dynamodb::types::AttributeValue::Bool(false),
             )
             .item("ticket_source", attr_s("github"))
             .item("created_at", attr_s(&now))
