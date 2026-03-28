@@ -210,8 +210,11 @@ pub async fn create_subscription(
     let price_id = body["price_id"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .or(state.secrets.stripe_price_id.as_deref())
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .or(state.secrets.stripe_price_id.as_deref().filter(|s| !s.is_empty()))
+        .ok_or_else(|| {
+            error!("No stripe_price_id provided in request body or secrets");
+            StatusCode::BAD_REQUEST
+        })?;
 
     // Check if already has an active subscription
     let billing = state
@@ -236,6 +239,25 @@ pub async fn create_subscription(
 
     if current_status == "active" {
         return Err(StatusCode::CONFLICT); // Already subscribed, use portal to manage
+    }
+
+    // Cancel any existing incomplete subscription before creating a new one
+    if current_status == "incomplete" || current_status == "past_due" {
+        if let Some(old_sub_id) = item
+            .and_then(|i| i.get("stripe_subscription_id"))
+            .and_then(|v| v.as_s().ok())
+            .filter(|s| !s.is_empty())
+        {
+            warn!("Cancelling stale {current_status} subscription {old_sub_id}");
+            let _ = state
+                .http
+                .delete(format!(
+                    "https://api.stripe.com/v1/subscriptions/{old_sub_id}"
+                ))
+                .header("Authorization", format!("Bearer {stripe_key}"))
+                .send()
+                .await;
+        }
     }
 
     // Get or create Stripe customer
@@ -309,7 +331,12 @@ pub async fn create_subscription(
     let client_secret = sub["latest_invoice"]["payment_intent"]["client_secret"]
         .as_str()
         .ok_or_else(|| {
-            error!("Stripe subscription response missing client_secret");
+            error!(
+                "Stripe subscription response missing client_secret. status={}, latest_invoice.status={}, payment_intent.status={}",
+                sub["status"].as_str().unwrap_or("?"),
+                sub["latest_invoice"]["status"].as_str().unwrap_or("?"),
+                sub["latest_invoice"]["payment_intent"]["status"].as_str().unwrap_or("null"),
+            );
             StatusCode::BAD_GATEWAY
         })?;
 
