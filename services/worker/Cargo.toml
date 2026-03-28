@@ -20,6 +20,7 @@ aws-sdk-s3 = "1"
 aws-sdk-bedrockruntime = "1"
 aws-sdk-secretsmanager = "1"
 aws-sdk-sesv2 = "1"
+aws-smithy-types = "1"
 
 # HTTP client (GitHub API, Jira API)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

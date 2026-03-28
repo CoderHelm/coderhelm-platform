@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+
 
 const API_BASE: &str = "https://api.github.com";
 

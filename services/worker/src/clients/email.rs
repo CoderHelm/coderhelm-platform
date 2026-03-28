@@ -132,7 +132,7 @@ pub async fn send_notification(
                 .item()
                 .and_then(|item| item.get(pref_field))
                 .and_then(|v| v.as_bool().ok())
-                .unwrap_or(true); // default: notifications ON
+                .unwrap_or(&true); // default: notifications ON
 
             if !enabled {
                 info!(email = %email, pref = pref_field, "Skipping — user opted out");
