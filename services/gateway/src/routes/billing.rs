@@ -7,9 +7,9 @@ use crate::models::Claims;
 use crate::AppState;
 
 // ─── Usage limits (included in Pro) ─────────────────────────────────
-pub const INCLUDED_RUNS: u64 = 100;
+pub const INCLUDED_RUNS: u64 = 30;
 pub const INCLUDED_PLANS: u64 = 5;
-pub const OVERAGE_COST_PER_RUN_CENTS: u64 = 300;  // $3/run
+pub const OVERAGE_COST_PER_RUN_CENTS: u64 = 500; // $5/run
 pub const OVERAGE_COST_PER_PLAN_CENTS: u64 = 1000; // $10/plan
 
 /// GET /api/billing — get billing overview (subscription status, plan, payment method, balance).
@@ -109,8 +109,8 @@ pub async fn get_billing(
 
     let runs_overage = current_runs.saturating_sub(INCLUDED_RUNS);
     let plans_overage = current_plans.saturating_sub(INCLUDED_PLANS);
-    let estimated_overage_cents = runs_overage * OVERAGE_COST_PER_RUN_CENTS
-        + plans_overage * OVERAGE_COST_PER_PLAN_CENTS;
+    let estimated_overage_cents =
+        runs_overage * OVERAGE_COST_PER_RUN_CENTS + plans_overage * OVERAGE_COST_PER_PLAN_CENTS;
 
     Ok(Json(json!({
         "subscription_status": subscription_status,
@@ -251,14 +251,15 @@ pub async fn create_subscription(
 
     let mut item_index = 1;
     if let Some(ref pid) = plans_overage_price {
-        form_params.push((
-            "items[1][price]",
-            pid.clone(),
-        ));
+        form_params.push(("items[1][price]", pid.clone()));
         item_index = 2;
     }
     if let Some(ref pid) = runs_overage_price {
-        let key = if item_index == 1 { "items[1][price]" } else { "items[2][price]" };
+        let key = if item_index == 1 {
+            "items[1][price]"
+        } else {
+            "items[2][price]"
+        };
         form_params.push((key, pid.clone()));
     }
 
@@ -674,12 +675,15 @@ async fn lookup_metered_price(
     body["data"]
         .as_array()?
         .iter()
-        .find(|p| p["nickname"].as_str() == Some(nickname) && p["recurring"]["usage_type"].as_str() == Some("metered"))
+        .find(|p| {
+            p["nickname"].as_str() == Some(nickname) && p["recurring"]["meter"].as_str().is_some()
+        })
         .and_then(|p| p["id"].as_str())
         .map(|s| s.to_string())
 }
 
-/// Report metered usage to Stripe for overage billing.
+/// Report metered usage to Stripe via Billing Meter Events.
+/// `event_name` maps to the meter: "d3ftly_plans_overage" or "d3ftly_runs_overage".
 /// `quantity` is the number of units OVER the included limit (only overages).
 pub async fn report_stripe_usage(
     state: &AppState,
@@ -696,7 +700,7 @@ pub async fn report_stripe_usage(
         None => return,
     };
 
-    // Get subscription ID
+    // Get the Stripe customer ID for this tenant
     let billing = match state
         .dynamo
         .get_item()
@@ -713,71 +717,32 @@ pub async fn report_stripe_usage(
         }
     };
 
-    let sub_id = match billing
+    let customer_id = match billing
         .item()
-        .and_then(|i| i.get("stripe_subscription_id"))
+        .and_then(|i| i.get("stripe_customer_id"))
         .and_then(|v| v.as_s().ok())
     {
         Some(id) => id.to_string(),
         None => return,
     };
 
-    // Find the subscription item for this metered price
-    let resp = match state
-        .http
-        .get(format!(
-            "https://api.stripe.com/v1/subscriptions/{sub_id}"
-        ))
-        .header("Authorization", format!("Bearer {stripe_key}"))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Failed to fetch subscription for usage report: {e}");
-            return;
-        }
-    };
-
-    let sub: Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let si_id = sub["items"]["data"]
-        .as_array()
-        .and_then(|items| {
-            items.iter().find(|item| {
-                item["price"]["nickname"].as_str() == Some(usage_type)
-            })
-        })
-        .and_then(|item| item["id"].as_str());
-
-    let si_id = match si_id {
-        Some(id) => id.to_string(),
-        None => {
-            warn!("No subscription item found for {usage_type}");
-            return;
-        }
-    };
-
-    // Report usage
+    let event_name = format!("d3ftly_{usage_type}");
     let ts = chrono::Utc::now().timestamp().to_string();
     let qty = quantity.to_string();
+
     if let Err(e) = state
         .http
-        .post(format!(
-            "https://api.stripe.com/v1/subscription_items/{si_id}/usage_records"
-        ))
+        .post("https://api.stripe.com/v1/billing/meter_events")
         .header("Authorization", format!("Bearer {stripe_key}"))
         .form(&[
-            ("quantity", qty.as_str()),
+            ("event_name", event_name.as_str()),
             ("timestamp", ts.as_str()),
-            ("action", "set"),
+            ("payload[value]", qty.as_str()),
+            ("payload[stripe_customer_id]", customer_id.as_str()),
         ])
         .send()
         .await
     {
-        warn!("Failed to report Stripe usage for {usage_type}: {e}");
+        warn!("Failed to report Stripe meter event for {usage_type}: {e}");
     }
 }
