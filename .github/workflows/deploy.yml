@@ -13,53 +13,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-gateway:
-    name: Build Gateway
+  build:
+    name: Build Rust (workspace)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
+      # Cache ~/.cargo/registry + services/target in one hit for both crates
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: services/gateway
+          workspaces: services
+          cache-on-failure: true
       - uses: mlugg/setup-zig@v2
       - name: Install cargo-zigbuild
         run: pip3 install cargo-zigbuild
-      - name: Build
-        working-directory: services/gateway
-        run: cargo zigbuild --release --target aarch64-unknown-linux-musl
-      - name: Package bootstrap
+      # Build both gateway + worker in one invocation — shared deps compiled once
+      - name: Build workspace
+        working-directory: services
+        run: cargo zigbuild --workspace --release --target aarch64-unknown-linux-musl
+      - name: Package artifacts
         run: |
-          cp services/gateway/target/aarch64-unknown-linux-musl/release/gateway bootstrap
+          cp services/target/aarch64-unknown-linux-musl/release/gateway bootstrap
           zip gateway.zip bootstrap
+          rm bootstrap
+          cp services/target/aarch64-unknown-linux-musl/release/worker bootstrap
+          zip worker.zip bootstrap
       - uses: actions/upload-artifact@v4
         with:
           name: gateway
           path: gateway.zip
-
-  build-worker:
-    name: Build Worker
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: services/worker
-      - uses: mlugg/setup-zig@v2
-      - name: Install cargo-zigbuild
-        run: pip3 install cargo-zigbuild
-      - name: Build
-        working-directory: services/worker
-        run: cargo zigbuild --release --target aarch64-unknown-linux-musl
-      - name: Package bootstrap
-        run: |
-          cp services/worker/target/aarch64-unknown-linux-musl/release/worker bootstrap
-          zip worker.zip bootstrap
       - uses: actions/upload-artifact@v4
         with:
           name: worker
@@ -67,7 +51,7 @@ jobs:
 
   deploy:
     name: CDK Deploy
-    needs: [build-gateway, build-worker]
+    needs: [build]
     runs-on: ubuntu-latest
     permissions:
       id-token: write

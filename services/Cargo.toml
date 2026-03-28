@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "gateway",
+    "worker",
+]
+resolver = "2"
+
+# Shared release profile — optimises binary size (Lambda cold start) and build speed.
+[profile.release]
+opt-level = 3
+lto = "thin"           # thin LTO: good balance of opt vs compile time
+codegen-units = 4      # parallel codegen units (default=1 for release, this is faster)
+strip = true           # strip debug symbols → smaller Lambda binary
+panic = "abort"        # no unwinding → smaller + faster
