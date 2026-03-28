@@ -28,5 +28,3 @@ app:
     memoryMB: 256
     architecture: arm64
   id: ari:cloud:ecosystem::app/0f707126-f6c4-4cae-9332-d736617d4d53
-  licensing:
-    enabled: true
