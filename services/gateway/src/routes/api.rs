@@ -1,9 +1,9 @@
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info};
 
-use crate::models::{Claims, NotificationPrefs};
+use crate::models::{Claims, NotificationPrefs, OnboardMessage, OnboardRepo, WorkerMessage};
 use crate::AppState;
 
 /// GET /api/me — return current user info.
@@ -912,6 +912,57 @@ pub async fn update_repo_agents(
     let content = body["content"].as_str().unwrap_or("");
     let sk = format!("AGENTS#REPO#{repo}");
     update_instructions_inner(&state, &claims.tenant_id, &sk, content).await
+}
+
+/// POST /api/repos/:repo/regenerate — re-run onboard (voice + agents) for a repo.
+pub async fn regenerate_repo(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(repo): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    validate_repo_name(&repo)?;
+
+    let parts: Vec<&str> = repo.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let installation_id = claims
+        .tenant_id
+        .strip_prefix("TENANT#")
+        .unwrap_or("0")
+        .parse::<u64>()
+        .unwrap_or(0);
+
+    let message = WorkerMessage::Onboard(OnboardMessage {
+        tenant_id: claims.tenant_id.clone(),
+        installation_id,
+        repos: vec![OnboardRepo {
+            owner: parts[0].to_string(),
+            name: parts[1].to_string(),
+            default_branch: "main".to_string(),
+        }],
+    });
+
+    let body = serde_json::to_string(&message).map_err(|e| {
+        error!("Failed to serialize onboard message: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to send regenerate message: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(repo = %repo, "Dispatched regeneration to SQS");
+    Ok(Json(json!({ "status": "regenerating" })))
 }
 
 /// GET /api/settings/budget — get monthly budget cap.

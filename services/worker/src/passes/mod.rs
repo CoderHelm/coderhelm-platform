@@ -428,6 +428,8 @@ async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<String> {
     let mut rules = vec![
         "Never push directly to the default/main branch. Always create a feature branch."
             .to_string(),
+        "Never commit secrets, credentials, API keys, tokens, or sensitive information. Use environment variables or secret managers instead."
+            .to_string(),
     ];
 
     // Load global rules

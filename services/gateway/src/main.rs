@@ -71,6 +71,10 @@ async fn main() -> Result<(), Error> {
             post(routes::api::update_repo).delete(routes::api::delete_repo),
         )
         .route(
+            "/repos/:repo/regenerate",
+            post(routes::api::regenerate_repo),
+        )
+        .route(
             "/integrations/jira/check",
             get(routes::api::get_jira_integration_check)
                 .post(routes::api::validate_jira_integration_payload),
