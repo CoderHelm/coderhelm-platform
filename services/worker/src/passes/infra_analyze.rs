@@ -152,14 +152,6 @@ async fn collect_infra_code(
     github: &crate::clients::github::GitHubClient,
     repos: &[String],
 ) -> Vec<(String, String)> {
-    let infra_globs = [
-        "cdk.json",
-        "bin/*.ts",
-        "lib/*-stack.ts",
-        "lib/*.ts",
-        "infra/**/*.ts",
-        "*.tf",
-    ];
     let mut found: Vec<(String, String)> = Vec::new();
 
     for repo_full in repos.iter().take(5) {
