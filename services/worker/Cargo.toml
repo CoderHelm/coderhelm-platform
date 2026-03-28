@@ -39,4 +39,4 @@ ulid = "1"
 thiserror = "2"
 base64 = "0.22"
 async-trait = "0.1"
-rsa = { version = "0.9", features = ["pkcs1"] }
+rsa = "0.9"
