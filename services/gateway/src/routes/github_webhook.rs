@@ -9,7 +9,10 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::auth::verify::verify_github_signature;
-use crate::models::{TicketMessage, TicketSource, WorkerMessage, CiFixMessage, FeedbackMessage, OnboardMessage, OnboardRepo};
+use crate::models::{
+    CiFixMessage, FeedbackMessage, OnboardMessage, OnboardRepo, TicketMessage, TicketSource,
+    WorkerMessage,
+};
 use crate::AppState;
 
 pub async fn handle(
@@ -120,7 +123,10 @@ async fn handle_issue_event(
         repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
         repo_name: repo["name"].as_str().unwrap_or("").to_string(),
         issue_number: issue["number"].as_u64().unwrap_or(0),
-        sender: payload["sender"]["login"].as_str().unwrap_or("").to_string(),
+        sender: payload["sender"]["login"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
     });
 
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
@@ -157,7 +163,10 @@ async fn handle_issue_comment(
         repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
         repo_name: repo["name"].as_str().unwrap_or("").to_string(),
         issue_number: issue["number"].as_u64().unwrap_or(0),
-        sender: payload["sender"]["login"].as_str().unwrap_or("").to_string(),
+        sender: payload["sender"]["login"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
     });
 
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
@@ -174,7 +183,9 @@ async fn handle_pr_review(
     }
 
     // Only process reviews on our PRs
-    let pr_user = payload["pull_request"]["user"]["login"].as_str().unwrap_or("");
+    let pr_user = payload["pull_request"]["user"]["login"]
+        .as_str()
+        .unwrap_or("");
     if !pr_user.contains("d3ftly") {
         return Ok(StatusCode::OK);
     }
@@ -251,7 +262,10 @@ async fn handle_installation(
             let org = payload["installation"]["account"]["login"]
                 .as_str()
                 .unwrap_or("unknown");
-            info!(installation_id, org, "New GitHub App installation — provisioning tenant");
+            info!(
+                installation_id,
+                org, "New GitHub App installation — provisioning tenant"
+            );
 
             let now = chrono::Utc::now().to_rfc3339();
             state
@@ -287,7 +301,10 @@ async fn handle_installation(
             Ok(StatusCode::CREATED)
         }
         "deleted" => {
-            info!(installation_id, "GitHub App uninstalled — deactivating tenant");
+            info!(
+                installation_id,
+                "GitHub App uninstalled — deactivating tenant"
+            );
             state
                 .dynamo
                 .update_item()
@@ -332,10 +349,7 @@ async fn handle_installation_repos(
             Some(OnboardRepo {
                 owner: parts[0].to_string(),
                 name: parts[1].to_string(),
-                default_branch: r["default_branch"]
-                    .as_str()
-                    .unwrap_or("main")
-                    .to_string(),
+                default_branch: r["default_branch"].as_str().unwrap_or("main").to_string(),
             })
         })
         .collect();
@@ -366,7 +380,9 @@ async fn handle_pr_review_comment(
     }
 
     // Only process comments on our PRs
-    let pr_user = payload["pull_request"]["user"]["login"].as_str().unwrap_or("");
+    let pr_user = payload["pull_request"]["user"]["login"]
+        .as_str()
+        .unwrap_or("");
     if !pr_user.contains("d3ftly") {
         return Ok(StatusCode::OK);
     }
@@ -411,7 +427,10 @@ async fn handle_check_suite(
         return Ok(StatusCode::OK);
     }
 
-    info!(branch, "Check suite failed on d3ftly branch — delegating to check_run handler");
+    info!(
+        branch,
+        "Check suite failed on d3ftly branch — delegating to check_run handler"
+    );
     // The individual check_run events will handle CI fixes;
     // this is logged for observability.
     Ok(StatusCode::OK)
@@ -429,7 +448,10 @@ async fn handle_repository_event(
 
     match action {
         "deleted" | "archived" => {
-            info!(action, repo_name, installation_id, "Repository removed — deactivating repo record");
+            info!(
+                action,
+                repo_name, installation_id, "Repository removed — deactivating repo record"
+            );
             let tenant_id = format!("TENANT#{installation_id}");
             let parts: Vec<&str> = repo_name.splitn(2, '/').collect();
             if parts.len() == 2 {
@@ -449,11 +471,17 @@ async fn handle_repository_event(
             Ok(StatusCode::OK)
         }
         "renamed" => {
-            info!(action, repo_name, installation_id, "Repository renamed — logged");
+            info!(
+                action,
+                repo_name, installation_id, "Repository renamed — logged"
+            );
             Ok(StatusCode::OK)
         }
         "unarchived" => {
-            info!(action, repo_name, installation_id, "Repository unarchived — logged");
+            info!(
+                action,
+                repo_name, installation_id, "Repository unarchived — logged"
+            );
             Ok(StatusCode::OK)
         }
         _ => {
@@ -477,10 +505,7 @@ fn extract_repos_from_installation(payload: &Value) -> Vec<OnboardRepo> {
             Some(OnboardRepo {
                 owner: parts[0].to_string(),
                 name: parts[1].to_string(),
-                default_branch: r["default_branch"]
-                    .as_str()
-                    .unwrap_or("main")
-                    .to_string(),
+                default_branch: r["default_branch"].as_str().unwrap_or("main").to_string(),
             })
         })
         .collect()

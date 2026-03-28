@@ -1,4 +1,8 @@
-use axum::{body::Bytes, extract::State, http::{HeaderMap, StatusCode}};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+};
 use std::sync::Arc;
 use tracing::info;
 

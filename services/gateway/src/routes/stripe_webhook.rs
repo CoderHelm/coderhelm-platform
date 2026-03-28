@@ -1,4 +1,8 @@
-use axum::{body::Bytes, extract::State, http::{HeaderMap, StatusCode}};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+};
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -13,7 +17,10 @@ pub async fn handle(
     body: Bytes,
 ) -> StatusCode {
     // Verify Stripe signature
-    let signature = match headers.get("stripe-signature").and_then(|v| v.to_str().ok()) {
+    let signature = match headers
+        .get("stripe-signature")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(sig) => sig.to_string(),
         None => {
             warn!("Missing Stripe signature header");
@@ -71,9 +78,7 @@ pub async fn handle(
         }
 
         // Payment failed — Stripe has built-in smart retries, we just notify
-        "invoice.payment_failed" => {
-            handle_payment_failed(&state, &event["data"]["object"]).await
-        }
+        "invoice.payment_failed" => handle_payment_failed(&state, &event["data"]["object"]).await,
 
         // Subscription cancelled (by user or non-payment)
         "customer.subscription.deleted" => {
@@ -86,9 +91,7 @@ pub async fn handle(
         }
 
         // Invoice finalized — ready for download
-        "invoice.finalized" => {
-            handle_invoice_finalized(&state, &event["data"]["object"]).await
-        }
+        "invoice.finalized" => handle_invoice_finalized(&state, &event["data"]["object"]).await,
 
         // Payment method updated
         "payment_method.attached" | "customer.updated" => {
@@ -317,9 +320,7 @@ async fn handle_subscription_updated(
         .table_name(&state.config.table_name)
         .key("pk", attr_s(&tenant_id))
         .key("sk", attr_s("BILLING"))
-        .update_expression(
-            "SET subscription_status = :status, plan_id = :plan, updated_at = :t",
-        )
+        .update_expression("SET subscription_status = :status, plan_id = :plan, updated_at = :t")
         .expression_attribute_values(":status", attr_s(status))
         .expression_attribute_values(":plan", attr_s(plan_id))
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
@@ -367,7 +368,10 @@ async fn handle_invoice_finalized(
         .item("period", attr_s(&period))
         .item("status", attr_s("finalized"))
         .item("stripe_invoice_id", attr_s(invoice_id))
-        .item("stripe_pdf_url", attr_s(invoice["invoice_pdf"].as_str().unwrap_or("")))
+        .item(
+            "stripe_pdf_url",
+            attr_s(invoice["invoice_pdf"].as_str().unwrap_or("")),
+        )
         .item("created_at", attr_s(&chrono::Utc::now().to_rfc3339()))
         .send()
         .await?;
@@ -448,7 +452,12 @@ async fn resolve_tenant(
 }
 
 /// Send a billing email to all users under a tenant.
-async fn send_billing_email(state: &AppState, tenant_id: &str, template_suffix: &str, data: &Value) {
+async fn send_billing_email(
+    state: &AppState,
+    tenant_id: &str,
+    template_suffix: &str,
+    data: &Value,
+) {
     let template_name = format!("{}-{}", state.config.ses_template_prefix, template_suffix);
 
     // Query all users for this tenant
