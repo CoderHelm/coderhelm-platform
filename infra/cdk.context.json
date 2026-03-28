@@ -1,6 +1,6 @@
 {
   "hosted-zone:account=REDACTED_AWS_ACCOUNT_ID:domainName=d3ftly.com:region=us-east-1": {
-    "Id": "/hostedzone/ZPLACEHOLDER",
+    "Id": "/hostedzone/Z04548353MTT13HZWFOY2",
     "Name": "d3ftly.com."
   }
 }
