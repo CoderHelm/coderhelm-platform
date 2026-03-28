@@ -91,3 +91,4 @@ jobs:
           WORKER_ZIP: ${{ github.workspace }}/artifacts/worker.zip
           CDK_DEFAULT_ACCOUNT: "654654210434"
           CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          MODEL_ID: us.anthropic.claude-sonnet-4-20250514-v1:0

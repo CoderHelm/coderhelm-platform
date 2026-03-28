@@ -11,6 +11,7 @@ pub struct Config {
     pub ticket_queue_url: String,
     pub ci_fix_queue_url: String,
     pub feedback_queue_url: String,
+    pub dlq_url: String,
     pub ses_from_address: String,
     pub ses_template_prefix: String,
 }
@@ -30,6 +31,7 @@ impl Config {
             ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").expect("CI_FIX_QUEUE_URL required"),
             feedback_queue_url: std::env::var("FEEDBACK_QUEUE_URL")
                 .expect("FEEDBACK_QUEUE_URL required"),
+            dlq_url: std::env::var("DLQ_URL").unwrap_or_default(),
             ses_from_address: std::env::var("SES_FROM_ADDRESS")
                 .unwrap_or_else(|_| "notifications@d3ftly.com".to_string()),
             ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")

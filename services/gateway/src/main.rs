@@ -62,6 +62,7 @@ async fn main() -> Result<(), Error> {
     // Protected API routes — require valid JWT with tenant scoping
     let api_routes = Router::new()
         .route("/me", get(routes::api::me))
+        .route("/health", get(routes::api::health))
         .route("/runs", get(routes::api::list_runs))
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/repos", get(routes::api::list_repos))
