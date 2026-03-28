@@ -69,3 +69,6 @@ jobs:
           mkdir -p ../dashboard/out
           touch ../dashboard/out/index.html
       - run: npx cdk synth --quiet
+        env:
+          CDK_DEFAULT_ACCOUNT: "654654210434"
+          CDK_DEFAULT_REGION: us-east-1
