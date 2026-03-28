@@ -25,13 +25,16 @@ jobs:
         with:
           workspaces: services/gateway
       - name: Install musl cross toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
+        run: |
+          curl -fsSL --retry 3 --retry-delay 5 https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/musl.tgz
+          sudo tar xzf /tmp/musl.tgz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
       - name: Build
         working-directory: services/gateway
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
+          AR_aarch64_unknown_linux_musl: aarch64-linux-musl-ar
         run: cargo build --release --target aarch64-unknown-linux-musl
       - name: Package bootstrap
         run: |
@@ -54,13 +57,16 @@ jobs:
         with:
           workspaces: services/worker
       - name: Install musl cross toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
+        run: |
+          curl -fsSL --retry 3 --retry-delay 5 https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/musl.tgz
+          sudo tar xzf /tmp/musl.tgz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
       - name: Build
         working-directory: services/worker
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
+          AR_aarch64_unknown_linux_musl: aarch64-linux-musl-ar
         run: cargo build --release --target aarch64-unknown-linux-musl
       - name: Package bootstrap
         run: |
