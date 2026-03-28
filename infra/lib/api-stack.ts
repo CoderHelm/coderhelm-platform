@@ -2,6 +2,9 @@ import * as cdk from "aws-cdk-lib";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as apigatewayv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as integrations from "aws-cdk-lib/aws-apigatewayv2-integrations";
+import * as acm from "aws-cdk-lib/aws-certificatemanager";
+import * as route53 from "aws-cdk-lib/aws-route53";
+import * as route53Targets from "aws-cdk-lib/aws-route53-targets";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as s3 from "aws-cdk-lib/aws-s3";
@@ -182,5 +185,44 @@ export class ApiStack extends cdk.Stack {
     new cdk.CfnOutput(this, "ApiUrl", {
       value: httpApi.apiEndpoint,
     });
+
+    // --- Custom domain: api.d3ftly.com ---
+    if (props.stage === "prod") {
+      const apiDomain = "api.d3ftly.com";
+
+      const hostedZone = route53.HostedZone.fromLookup(this, "Zone", {
+        domainName: "d3ftly.com",
+      });
+
+      const certificate = new acm.Certificate(this, "ApiCertificate", {
+        domainName: apiDomain,
+        validation: acm.CertificateValidation.fromDns(hostedZone),
+      });
+
+      const customDomain = new apigatewayv2.DomainName(this, "ApiCustomDomain", {
+        domainName: apiDomain,
+        certificate,
+      });
+
+      new apigatewayv2.ApiMapping(this, "ApiMapping", {
+        api: httpApi,
+        domainName: customDomain,
+      });
+
+      new route53.ARecord(this, "ApiAliasRecord", {
+        zone: hostedZone,
+        recordName: "api",
+        target: route53.RecordTarget.fromAlias(
+          new route53Targets.ApiGatewayv2DomainProperties(
+            customDomain.regionalDomainName,
+            customDomain.regionalHostedZoneId
+          )
+        ),
+      });
+
+      new cdk.CfnOutput(this, "ApiCustomDomainUrl", {
+        value: `https://${apiDomain}`,
+      });
+    }
   }
 }
