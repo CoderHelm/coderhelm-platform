@@ -420,6 +420,166 @@ pub async fn download_invoice_pdf(
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
+/// POST /api/billing/cancel — cancel the current subscription at period end.
+pub async fn cancel_subscription(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
+        error!("Stripe secret key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    // Get subscription ID
+    let billing = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("BILLING"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch billing: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let sub_id = billing
+        .item()
+        .and_then(|i| i.get("stripe_subscription_id"))
+        .and_then(|v| v.as_s().ok())
+        .ok_or(StatusCode::NOT_FOUND)?
+        .to_string();
+
+    // Cancel at period end (not immediately)
+    let response = state
+        .http
+        .post(format!("https://api.stripe.com/v1/subscriptions/{sub_id}"))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .form(&[("cancel_at_period_end", "true")])
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Stripe cancel request failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let body: Value = response.json().await.map_err(|e| {
+        error!("Failed to parse Stripe response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    if body["error"].is_object() {
+        error!(
+            "Stripe error cancelling subscription: {}",
+            body["error"]["message"]
+        );
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    Ok(Json(json!({ "status": "cancelling" })))
+}
+
+/// POST /api/billing/reactivate — undo a pending cancellation.
+pub async fn reactivate_subscription(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
+        error!("Stripe secret key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let billing = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("BILLING"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch billing: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let sub_id = billing
+        .item()
+        .and_then(|i| i.get("stripe_subscription_id"))
+        .and_then(|v| v.as_s().ok())
+        .ok_or(StatusCode::NOT_FOUND)?
+        .to_string();
+
+    let response = state
+        .http
+        .post(format!("https://api.stripe.com/v1/subscriptions/{sub_id}"))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .form(&[("cancel_at_period_end", "false")])
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Stripe reactivate request failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let body: Value = response.json().await.map_err(|e| {
+        error!("Failed to parse Stripe response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    if body["error"].is_object() {
+        error!(
+            "Stripe error reactivating subscription: {}",
+            body["error"]["message"]
+        );
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    Ok(Json(json!({ "status": "active" })))
+}
+
+/// POST /api/billing/payment-method — create a SetupIntent for updating the payment method.
+/// Returns client_secret for Stripe Elements to collect new card details.
+pub async fn create_setup_intent(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
+        error!("Stripe secret key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+
+    let response = state
+        .http
+        .post("https://api.stripe.com/v1/setup_intents")
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .form(&[
+            ("customer", customer_id.as_str()),
+            ("payment_method_types[]", "card"),
+            ("usage", "off_session"),
+        ])
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Stripe setup intent request failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let body: Value = response.json().await.map_err(|e| {
+        error!("Failed to parse Stripe response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let client_secret = body["client_secret"].as_str().ok_or_else(|| {
+        error!("Stripe setup intent response missing client_secret");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    Ok(Json(json!({ "client_secret": client_secret })))
+}
+
 async fn get_stripe_customer_id(state: &AppState, tenant_id: &str) -> Result<String, StatusCode> {
     let result = state
         .dynamo

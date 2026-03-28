@@ -26,6 +26,7 @@ export default function RootLayout({
 function Sidebar() {
   const links = [
     { href: "/", label: "Runs", icon: "▶" },
+    { href: "/analytics", label: "Analytics", icon: "◪" },
     { href: "/settings/guardrails", label: "Guardrails", icon: "⛨" },
     { href: "/settings/voice", label: "Voice", icon: "✎" },
     { href: "/settings/instructions", label: "Instructions", icon: "⚙" },

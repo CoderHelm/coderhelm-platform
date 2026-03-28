@@ -28,6 +28,7 @@ export const api = {
 
   // Stats
   getStats: () => request<{ month: Stats; all_time: Stats }>("/api/stats"),
+  getStatsHistory: () => request<{ months: MonthStats[] }>("/api/stats/history"),
 
   // Rules (guardrails)
   getGlobalRules: () => request<{ rules: string[] }>("/api/rules/global"),
@@ -52,8 +53,13 @@ export const api = {
   updateNotifications: (prefs: NotificationPrefs) => request<void>("/api/notifications", { method: "PUT", body: JSON.stringify(prefs) }),
 
   // Billing
-  getBilling: () => request<Billing>("/api/billing"),
-  createPortal: () => request<{ url: string }>("/api/billing/portal", { method: "POST" }),
+  getBilling: () => request<BillingInfo>("/api/billing"),
+  createSubscription: (priceId: string) => request<{ subscription_id: string; client_secret: string }>("/api/billing/subscribe", { method: "POST", body: JSON.stringify({ price_id: priceId }) }),
+  cancelSubscription: () => request<{ status: string }>("/api/billing/cancel", { method: "POST" }),
+  reactivateSubscription: () => request<{ status: string }>("/api/billing/reactivate", { method: "POST" }),
+  createSetupIntent: () => request<{ client_secret: string }>("/api/billing/payment-method", { method: "POST" }),
+  listInvoices: () => request<{ invoices: Invoice[] }>("/api/billing/invoices"),
+  getInvoicePdf: (id: string) => request<{ pdf_url: string }>(`/api/billing/invoices/${id}/pdf`),
 };
 
 export interface Run {
@@ -64,6 +70,8 @@ export interface Run {
   repo: string;
   pr_url?: string;
   cost_usd?: number;
+  tokens_in?: number;
+  tokens_out?: number;
   duration_s?: number;
   created_at: string;
   current_pass?: string;
@@ -81,7 +89,19 @@ export interface Stats {
   failed: number;
   in_progress: number;
   total_cost_usd: number;
+  total_tokens_in: number;
+  total_tokens_out: number;
   merge_rate: number;
+}
+
+export interface MonthStats {
+  period: string;
+  total_runs: number;
+  completed: number;
+  failed: number;
+  total_cost_usd: number;
+  total_tokens_in: number;
+  total_tokens_out: number;
 }
 
 export interface NotificationPrefs {
@@ -90,9 +110,35 @@ export interface NotificationPrefs {
   email_weekly_summary: boolean;
 }
 
-export interface Billing {
-  plan: string;
-  status: string;
-  runs_used: number;
-  runs_limit: number;
+export interface BillingInfo {
+  subscription_status: string;
+  plan_id: string | null;
+  has_payment_method: boolean;
+  last_payment_at: string | null;
+  payment_retry_count: number;
+  last_failure_reason: string | null;
+  access_until: string | null;
+  cancelled_at: string | null;
+  current_period: {
+    month: string;
+    usage_cost: number;
+    total_runs: number;
+  };
+  recent_payments: Payment[];
+}
+
+export interface Payment {
+  invoice_number: string | null;
+  amount_cents: number | null;
+  status: string | null;
+  created_at: string | null;
+}
+
+export interface Invoice {
+  invoice_id: string | null;
+  invoice_number: string | null;
+  amount_cents: number | null;
+  period: string | null;
+  status: string | null;
+  created_at: string | null;
 }
