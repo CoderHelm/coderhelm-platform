@@ -864,6 +864,24 @@ async fn update_rules_inner(
 
 // ─── Voice settings ─────────────────────────────────────────────────
 
+/// GET /api/voice/global — get global voice settings.
+pub async fn get_global_voice(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    get_instructions_inner(&state, &claims.tenant_id, "VOICE#GLOBAL").await
+}
+
+/// PUT /api/voice/global — update global voice settings.
+pub async fn update_global_voice(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    let content = body["content"].as_str().unwrap_or("");
+    update_instructions_inner(&state, &claims.tenant_id, "VOICE#GLOBAL", content).await
+}
+
 /// GET /api/voice/repo/:repo — get voice/tone settings for a repo.
 pub async fn get_repo_voice(
     State(state): State<Arc<AppState>>,

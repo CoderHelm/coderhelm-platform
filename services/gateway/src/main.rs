@@ -102,7 +102,11 @@ async fn main() -> Result<(), Error> {
             "/rules/repo/:repo",
             get(routes::api::get_repo_rules).put(routes::api::update_repo_rules),
         )
-        // Voice settings (per-repo)
+        // Voice settings (global + per-repo)
+        .route(
+            "/voice/global",
+            get(routes::api::get_global_voice).put(routes::api::update_global_voice),
+        )
         .route(
             "/voice/repo/:repo",
             get(routes::api::get_repo_voice).put(routes::api::update_repo_voice),

@@ -570,6 +570,20 @@ impl GitHubClient {
         let html_url = data["html_url"].as_str().unwrap_or("").to_string();
         Ok((number, html_url))
     }
+
+    /// Add a label to a GitHub issue.
+    pub async fn add_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        label: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/labels");
+        let payload = serde_json::json!({ "labels": [label] });
+        self.post(&url, &payload).await?;
+        Ok(())
+    }
 }
 
 // ─── Types ──────────────────────────────────────────────────
