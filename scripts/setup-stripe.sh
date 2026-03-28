@@ -91,7 +91,65 @@ else
 fi
 
 echo ""
-echo "=== 3. Configuring Customer Portal (non-fatal) ==="
+echo "=== 3. Finding or creating metered Plans price (\$10/plan overage) ==="
+PLANS_PRICE_ID=$(stripe_get "https://api.stripe.com/v1/prices?product=${PRODUCT_ID}&active=true&limit=50" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for p in data.get('data', []):
+    if p.get('unit_amount') == 1000 and p.get('recurring', {}).get('usage_type') == 'metered' and p.get('nickname') == 'plans_overage':
+        print(p['id'])
+        break
+else:
+    print('')
+")
+
+if [[ -n "$PLANS_PRICE_ID" ]]; then
+  echo "Using existing plans overage price: $PLANS_PRICE_ID"
+else
+  PLANS_PRICE=$(stripe_post "https://api.stripe.com/v1/prices" \
+    -d "product=${PRODUCT_ID}" \
+    -d "unit_amount=1000" \
+    -d "currency=usd" \
+    -d "recurring[interval]=month" \
+    -d "recurring[usage_type]=metered" \
+    -d "nickname=plans_overage" \
+    -d "metadata[app]=d3ftly" \
+    -d "metadata[type]=plans_overage")
+  PLANS_PRICE_ID=$(printf '%s\n' "$PLANS_PRICE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+  echo "Created plans overage price: $PLANS_PRICE_ID"
+fi
+
+echo ""
+echo "=== 4. Finding or creating metered Runs price (\$3/run overage) ==="
+RUNS_PRICE_ID=$(stripe_get "https://api.stripe.com/v1/prices?product=${PRODUCT_ID}&active=true&limit=50" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for p in data.get('data', []):
+    if p.get('unit_amount') == 300 and p.get('recurring', {}).get('usage_type') == 'metered' and p.get('nickname') == 'runs_overage':
+        print(p['id'])
+        break
+else:
+    print('')
+")
+
+if [[ -n "$RUNS_PRICE_ID" ]]; then
+  echo "Using existing runs overage price: $RUNS_PRICE_ID"
+else
+  RUNS_PRICE=$(stripe_post "https://api.stripe.com/v1/prices" \
+    -d "product=${PRODUCT_ID}" \
+    -d "unit_amount=300" \
+    -d "currency=usd" \
+    -d "recurring[interval]=month" \
+    -d "recurring[usage_type]=metered" \
+    -d "nickname=runs_overage" \
+    -d "metadata[app]=d3ftly" \
+    -d "metadata[type]=runs_overage")
+  RUNS_PRICE_ID=$(printf '%s\n' "$RUNS_PRICE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+  echo "Created runs overage price: $RUNS_PRICE_ID"
+fi
+
+echo ""
+echo "=== 5. Configuring Customer Portal (non-fatal) ==="
 # Portal configuration may already exist — treat failure as a warning, not an error.
 PORTAL_JSON=$(curl -s -X POST "https://api.stripe.com/v1/billing_portal/configurations" \
   -u "$SK:" \
@@ -120,3 +178,5 @@ echo ""
 echo "=== DONE ==="
 echo ""
 echo "  STRIPE_PRICE_ID=${PRICE_ID}"
+echo "  STRIPE_PLANS_OVERAGE_PRICE_ID=${PLANS_PRICE_ID}"
+echo "  STRIPE_RUNS_OVERAGE_PRICE_ID=${RUNS_PRICE_ID}"
