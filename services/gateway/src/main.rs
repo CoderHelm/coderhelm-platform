@@ -67,11 +67,11 @@ async fn main() -> Result<(), Error> {
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/repos", get(routes::api::list_repos))
         .route(
-            "/repos/:repo",
+            "/repos/:owner/:name",
             post(routes::api::update_repo).delete(routes::api::delete_repo),
         )
         .route(
-            "/repos/:repo/regenerate",
+            "/repos/:owner/:name/regenerate",
             post(routes::api::regenerate_repo),
         )
         .route(
@@ -94,7 +94,7 @@ async fn main() -> Result<(), Error> {
             get(routes::api::get_global_instructions).put(routes::api::update_global_instructions),
         )
         .route(
-            "/instructions/repo/:repo",
+            "/instructions/repo/:owner/:name",
             get(routes::api::get_repo_instructions).put(routes::api::update_repo_instructions),
         )
         // Must-rules endpoints
@@ -103,7 +103,7 @@ async fn main() -> Result<(), Error> {
             get(routes::api::get_global_rules).put(routes::api::update_global_rules),
         )
         .route(
-            "/rules/repo/:repo",
+            "/rules/repo/:owner/:name",
             get(routes::api::get_repo_rules).put(routes::api::update_repo_rules),
         )
         // Voice settings (global + per-repo)
@@ -112,12 +112,12 @@ async fn main() -> Result<(), Error> {
             get(routes::api::get_global_voice).put(routes::api::update_global_voice),
         )
         .route(
-            "/voice/repo/:repo",
+            "/voice/repo/:owner/:name",
             get(routes::api::get_repo_voice).put(routes::api::update_repo_voice),
         )
         // Agents context (per-repo)
         .route(
-            "/agents/repo/:repo",
+            "/agents/repo/:owner/:name",
             get(routes::api::get_repo_agents).put(routes::api::update_repo_agents),
         )
         // Budget settings
