@@ -7,8 +7,8 @@ use tracing::{error, info, warn};
 
 pub mod ci_fix;
 pub mod feedback;
-pub mod infra_analyze;
 mod implement;
+pub mod infra_analyze;
 pub mod onboard;
 mod plan;
 pub mod plan_execute;

@@ -1,12 +1,12 @@
-use axum::{extract::State, http::StatusCode, response::Json, Extension};
 use aws_sdk_dynamodb::types::AttributeValue;
+use axum::{extract::State, http::StatusCode, response::Json, Extension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::error;
 
-use crate::AppState;
 use crate::models::{Claims, WorkerMessage};
+use crate::AppState;
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -74,10 +74,21 @@ pub async fn get_infrastructure(
             }
         }
         Some(item) => {
-            let status = item.get("status").and_then(|v| v.as_s().ok()).cloned().unwrap_or_else(|| "pending".to_string());
-            let has_infra = item.get("has_infra").and_then(|v| v.as_bool().ok()).copied().unwrap_or(false);
+            let status = item
+                .get("status")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_else(|| "pending".to_string());
+            let has_infra = item
+                .get("has_infra")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(false);
             let diagram = item.get("diagram").and_then(|v| v.as_s().ok()).cloned();
-            let diagram_title = item.get("diagram_title").and_then(|v| v.as_s().ok()).cloned();
+            let diagram_title = item
+                .get("diagram_title")
+                .and_then(|v| v.as_s().ok())
+                .cloned();
             let cached_at = item.get("cached_at").and_then(|v| v.as_s().ok()).cloned();
 
             let findings: Option<Vec<Finding>> = item
