@@ -319,7 +319,7 @@ pub async fn create_subscription(
         .await;
 
     // Create Stripe Checkout Session in embedded mode — renders inline via iframe
-    let mut form_params: Vec<(&str, &str)> = vec![
+    let form_params: Vec<(&str, &str)> = vec![
         ("mode", "subscription"),
         ("ui_mode", "embedded_page"),
         ("customer", &customer_id),
@@ -329,9 +329,6 @@ pub async fn create_subscription(
         ("metadata[tenant_id]", &claims.tenant_id),
         ("subscription_data[metadata][tenant_id]", &claims.tenant_id),
     ];
-    if !user_email.is_empty() {
-        form_params.push(("customer_email", &user_email));
-    }
     let response = state
         .http
         .post("https://api.stripe.com/v1/checkout/sessions")
