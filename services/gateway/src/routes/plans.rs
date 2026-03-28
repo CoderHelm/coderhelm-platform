@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::error;
 
 use super::billing::{report_stripe_usage, INCLUDED_PLANS};
-use crate::models::Claims;
+use crate::models::{Claims, PlanExecuteMessage, WorkerMessage};
 use crate::AppState;
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
@@ -99,10 +99,11 @@ pub async fn create_plan(
             let task_title = task["title"].as_str().unwrap_or("Untitled task");
             let task_desc = task["description"].as_str().unwrap_or("");
             let task_criteria = task["acceptance_criteria"].as_str().unwrap_or("");
+            let task_repo = task["repo"].as_str().unwrap_or("");
             let task_id = ulid::Ulid::new().to_string();
             let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
 
-            state
+            let mut put = state
                 .dynamo
                 .put_item()
                 .table_name(&state.config.table_name)
@@ -115,8 +116,13 @@ pub async fn create_plan(
                 .item("acceptance_criteria", attr_s(task_criteria))
                 .item("status", attr_s("draft"))
                 .item("task_order", attr_n(i))
-                .item("created_at", attr_s(&now))
-                .send()
+                .item("created_at", attr_s(&now));
+
+            if !task_repo.is_empty() {
+                put = put.item("repo", attr_s(task_repo));
+            }
+
+            put.send()
                 .await
                 .map_err(|e| {
                     error!("Failed to create task: {e}");
@@ -354,13 +360,14 @@ pub async fn add_task(
     let title = body["title"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
     let description = body["description"].as_str().unwrap_or("");
     let acceptance_criteria = body["acceptance_criteria"].as_str().unwrap_or("");
+    let task_repo = body["repo"].as_str().unwrap_or("");
     let order = body["order"].as_u64().unwrap_or(0);
 
     let task_id = ulid::Ulid::new().to_string();
     let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
     let now = chrono::Utc::now().to_rfc3339();
 
-    state
+    let mut put = state
         .dynamo
         .put_item()
         .table_name(&state.config.table_name)
@@ -373,8 +380,13 @@ pub async fn add_task(
         .item("acceptance_criteria", attr_s(acceptance_criteria))
         .item("status", attr_s("draft"))
         .item("task_order", attr_n(order))
-        .item("created_at", attr_s(&now))
-        .send()
+        .item("created_at", attr_s(&now));
+
+    if !task_repo.is_empty() {
+        put = put.item("repo", attr_s(task_repo));
+    }
+
+    put.send()
         .await
         .map_err(|e| {
             error!("Failed to create task: {e}");
@@ -428,6 +440,10 @@ pub async fn update_task(
     if let Some(criteria) = body["acceptance_criteria"].as_str() {
         update_parts.push("acceptance_criteria = :ac");
         expr_values.push((":ac", attr_s(criteria)));
+    }
+    if let Some(repo) = body["repo"].as_str() {
+        update_parts.push("repo = :r");
+        expr_values.push((":r", attr_s(repo)));
     }
     if let Some(order) = body["order"].as_u64() {
         update_parts.push("task_order = :o");
@@ -605,9 +621,8 @@ pub async fn execute_plan(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Collect approved tasks
-    let mut approved_tasks: Vec<(String, String, String, u64)> = Vec::new(); // (task_id, title, body, order)
-    let mut plan_repo = String::new();
+    // Collect approved task IDs (worker reads full task data from DynamoDB)
+    let mut approved_task_ids: Vec<(String, u64)> = Vec::new(); // (task_id, order)
 
     for item in result.items() {
         let sk = item
@@ -628,48 +643,22 @@ pub async fn execute_plan(
                     .and_then(|v| v.as_s().ok())
                     .cloned()
                     .unwrap_or_default();
-                let title = item
-                    .get("title")
-                    .and_then(|v| v.as_s().ok())
-                    .cloned()
-                    .unwrap_or_default();
-                let desc = item
-                    .get("description")
-                    .and_then(|v| v.as_s().ok())
-                    .cloned()
-                    .unwrap_or_default();
-                let criteria = item
-                    .get("acceptance_criteria")
-                    .and_then(|v| v.as_s().ok())
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                let body = if criteria.is_empty() {
-                    desc.clone()
-                } else {
-                    format!("{desc}\n\n## Acceptance Criteria\n{criteria}")
-                };
                 let order = item
                     .get("task_order")
                     .and_then(|v| v.as_n().ok())
                     .and_then(|n| n.parse().ok())
                     .unwrap_or(0u64);
-                approved_tasks.push((tid, title, body, order));
+                approved_task_ids.push((tid, order));
             }
-        } else {
-            plan_repo = item
-                .get("repo")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-                .unwrap_or_default();
         }
     }
 
-    if approved_tasks.is_empty() {
+    if approved_task_ids.is_empty() {
         return Err(StatusCode::BAD_REQUEST); // No approved tasks
     }
 
     // Sort by order
-    approved_tasks.sort_by_key(|t| t.3);
+    approved_task_ids.sort_by_key(|t| t.1);
 
     // Mark plan as executing
     let plan_sk = format!("PLAN#{plan_id}");
@@ -694,26 +683,21 @@ pub async fn execute_plan(
         })?;
 
     // Send SQS message for plan execution (worker creates issues + queues runs)
-    let plan_msg = json!({
-        "type": "plan_execute",
-        "tenant_id": claims.tenant_id,
-        "plan_id": plan_id,
-        "repo": plan_repo,
-        "tasks": approved_tasks.iter().map(|(tid, title, body, order)| {
-            json!({
-                "task_id": tid,
-                "title": title,
-                "body": body,
-                "order": order,
-            })
-        }).collect::<Vec<_>>(),
+    let plan_msg = WorkerMessage::PlanExecute(PlanExecuteMessage {
+        tenant_id: claims.tenant_id.clone(),
+        plan_id: plan_id.clone(),
+        triggered_by: claims.github_login.clone(),
+        tasks: approved_task_ids.iter().map(|(tid, _)| tid.clone()).collect(),
     });
 
     state
         .sqs
         .send_message()
         .queue_url(&state.config.ticket_queue_url)
-        .message_body(plan_msg.to_string())
+        .message_body(serde_json::to_string(&plan_msg).map_err(|e| {
+            error!("Failed to serialize plan message: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?)
         .send()
         .await
         .map_err(|e| {
@@ -722,7 +706,7 @@ pub async fn execute_plan(
         })?;
 
     // Mark each approved task as "queued"
-    for (task_id, _, _, _) in &approved_tasks {
+    for (task_id, _) in &approved_task_ids {
         let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
         state
             .dynamo
@@ -740,7 +724,7 @@ pub async fn execute_plan(
 
     Ok(Json(json!({
         "status": "executing",
-        "tasks_queued": approved_tasks.len(),
+        "tasks_queued": approved_task_ids.len(),
     })))
 }
 
@@ -780,6 +764,7 @@ fn task_from_item(
         "description": item.get("description").and_then(|v| v.as_s().ok()),
         "acceptance_criteria": item.get("acceptance_criteria").and_then(|v| v.as_s().ok()),
         "status": item.get("status").and_then(|v| v.as_s().ok()),
+        "repo": item.get("repo").and_then(|v| v.as_s().ok()),
         "order": item.get("task_order").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
         "issue_number": item.get("issue_number").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "issue_url": item.get("issue_url").and_then(|v| v.as_s().ok()),
