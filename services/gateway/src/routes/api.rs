@@ -272,6 +272,66 @@ pub async fn get_stats(
     })))
 }
 
+/// GET /api/stats/history — last 6 months of analytics for charts.
+pub async fn get_stats_history(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let now = chrono::Utc::now();
+    // Build period keys for the last 6 months
+    let periods: Vec<String> = (0..6)
+        .map(|i| {
+            let d = now - chrono::Duration::days(i * 30);
+            d.format("%Y-%m").to_string()
+        })
+        .collect();
+
+    // Batch get all 6 months
+    let mut months = Vec::new();
+    for period in &periods {
+        let result = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.analytics_table_name)
+            .key("tenant_id", attr_s(&claims.tenant_id))
+            .key("period", attr_s(period))
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to read stats for {period}: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let item = result.item();
+        let get_n = |key: &str| -> u64 {
+            item.and_then(|i| i.get(key))
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        };
+        let get_f = |key: &str| -> f64 {
+            item.and_then(|i| i.get(key))
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0.0)
+        };
+        months.push(json!({
+            "period": period,
+            "total_runs": get_n("total_runs"),
+            "completed": get_n("completed"),
+            "failed": get_n("failed"),
+            "total_cost_usd": get_f("total_cost_usd"),
+            "total_tokens_in": get_n("total_tokens_in"),
+            "total_tokens_out": get_n("total_tokens_out"),
+        }));
+    }
+
+    // Reverse so oldest is first (for chart x-axis)
+    months.reverse();
+
+    Ok(Json(json!({ "months": months })))
+}
+
 // ─── Notification preferences ───────────────────────────────────────
 
 /// GET /api/notifications — get notification preferences for calling user.

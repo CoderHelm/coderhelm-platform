@@ -65,6 +65,7 @@ async fn main() -> Result<(), Error> {
         .route("/repos", get(routes::api::list_repos))
         .route("/repos/:repo", post(routes::api::update_repo))
         .route("/stats", get(routes::api::get_stats))
+        .route("/stats/history", get(routes::api::get_stats_history))
         .route(
             "/notifications",
             get(routes::api::get_notification_prefs).put(routes::api::update_notification_prefs),
@@ -105,6 +106,18 @@ async fn main() -> Result<(), Error> {
         .route(
             "/billing/subscribe",
             post(routes::billing::create_subscription),
+        )
+        .route(
+            "/billing/cancel",
+            post(routes::billing::cancel_subscription),
+        )
+        .route(
+            "/billing/reactivate",
+            post(routes::billing::reactivate_subscription),
+        )
+        .route(
+            "/billing/payment-method",
+            post(routes::billing::create_setup_intent),
         )
         .route("/billing/invoices", get(routes::billing::list_invoices))
         .route(
