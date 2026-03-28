@@ -203,6 +203,42 @@ export default function BillingPage() {
         )}
       </div>
 
+      {/* Add-ons */}
+      <div className="mb-8 border border-zinc-800 rounded-lg p-4 bg-zinc-900/30">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-zinc-100">Plans Add-on</p>
+            <p className="text-xs text-zinc-500 mt-1">
+              Unlock AI planning, task approval workflows, and plan execution.
+            </p>
+          </div>
+          {isActive ? (
+            <span className="px-2 py-0.5 rounded-full text-[11px] border border-emerald-500/30 text-emerald-400 bg-emerald-500/10">
+              Included in Pro
+            </span>
+          ) : (
+            <span className="px-2 py-0.5 rounded-full text-[11px] border border-yellow-500/30 text-yellow-400 bg-yellow-500/10">
+              Paid feature
+            </span>
+          )}
+        </div>
+        <div className="mt-3 flex items-center justify-between text-xs text-zinc-500">
+          <span>Price: $49/mo as standalone add-on (or included with Pro)</span>
+          <button
+            onClick={() => {
+              if (isActive) {
+                toast("Plans is included in your Pro subscription");
+              } else {
+                toast("Upgrade to Pro or contact support to enable standalone add-on");
+              }
+            }}
+            className="px-3 py-1.5 rounded-md border border-zinc-700 text-zinc-300 hover:bg-zinc-800"
+          >
+            {isActive ? "Included" : "Enable add-on"}
+          </button>
+        </div>
+      </div>
+
       {/* Recent Payments */}
       {billing.recent_payments.length > 0 && (
         <div className="mb-8">
