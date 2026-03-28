@@ -195,8 +195,8 @@ pub async fn create_portal_session(
     Ok(Json(json!({ "url": url })))
 }
 
-/// POST /api/billing/subscribe — create a Stripe Checkout Session.
-/// Returns a URL the frontend redirects to. Stripe handles payment collection.
+/// POST /api/billing/subscribe — create an embedded Stripe Checkout Session.
+/// Returns a client_secret the frontend uses to render Stripe checkout inline.
 /// On success, the `invoice.payment_succeeded` webhook activates the subscription.
 pub async fn create_subscription(
     State(state): State<Arc<AppState>>,
@@ -304,21 +304,18 @@ pub async fn create_subscription(
         .send()
         .await;
 
-    // Create Stripe Checkout Session — Stripe handles the entire payment flow
+    // Create Stripe Checkout Session in embedded mode — renders inline via iframe
     let response = state
         .http
         .post("https://api.stripe.com/v1/checkout/sessions")
         .header("Authorization", format!("Bearer {stripe_key}"))
         .form(&[
             ("mode", "subscription"),
+            ("ui_mode", "embedded"),
             ("customer", &customer_id),
             ("line_items[0][price]", price_id),
             ("line_items[0][quantity]", "1"),
-            (
-                "success_url",
-                "https://app.d3ftly.com/billing/?success=true",
-            ),
-            ("cancel_url", "https://app.d3ftly.com/billing/"),
+            ("return_url", "https://app.d3ftly.com/billing/?success=true"),
             ("metadata[tenant_id]", &claims.tenant_id),
             ("subscription_data[metadata][tenant_id]", &claims.tenant_id),
         ])
@@ -339,12 +336,12 @@ pub async fn create_subscription(
         return Err(StatusCode::BAD_GATEWAY);
     }
 
-    let url = session["url"].as_str().ok_or_else(|| {
-        error!("Stripe checkout session missing URL");
+    let client_secret = session["client_secret"].as_str().ok_or_else(|| {
+        error!("Stripe checkout session missing client_secret");
         StatusCode::BAD_GATEWAY
     })?;
 
-    Ok(Json(json!({ "url": url })))
+    Ok(Json(json!({ "client_secret": client_secret })))
 }
 
 /// Create a Stripe customer for a tenant.
