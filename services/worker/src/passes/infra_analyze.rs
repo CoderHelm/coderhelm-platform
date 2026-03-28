@@ -6,7 +6,7 @@ use crate::WorkerState;
 
 /// System prompt for infra analysis.
 const SYSTEM: &str = r#"You are an expert AWS infrastructure reviewer.
-Given CDK TypeScript code extracted from a repository, you will:
+Given infrastructure-as-code (CDK, Terraform, Serverless Framework, SAM/CloudFormation, or Pulumi) extracted from a repository, you will:
 1. Generate a mermaid architecture-beta diagram of the infrastructure.
 2. List findings with severity (error/warning/info), category (security/performance/cost/reliability), and a concise title + detail.
 
@@ -139,7 +139,7 @@ async fn get_tenant(
         .items()
         .iter()
         .filter_map(|item| {
-            item.get("repo_full_name")
+            item.get("repo_name")
                 .and_then(|v| v.as_s().ok())
                 .cloned()
         })
@@ -181,10 +181,52 @@ async fn collect_infra_code(
             }
         }
 
-        // Also look for Terraform
+        // Terraform
         for tf_path in &["main.tf", "infra/main.tf", "terraform/main.tf"] {
             if let Ok(content) = github.get_file_content(owner, repo, tf_path).await {
                 found.push((format!("{repo_full}/{tf_path}"), content));
+                break;
+            }
+        }
+
+        // Serverless Framework
+        for sls_path in &[
+            "serverless.yml",
+            "serverless.yaml",
+            "serverless.ts",
+            "infra/serverless.yml",
+        ] {
+            if let Ok(content) = github.get_file_content(owner, repo, sls_path).await {
+                found.push((format!("{repo_full}/{sls_path}"), content));
+                break;
+            }
+        }
+
+        // SAM / CloudFormation
+        for cfn_path in &[
+            "template.yaml",
+            "template.yml",
+            "template.json",
+            "sam/template.yaml",
+            "cloudformation/template.yaml",
+            "infra/template.yaml",
+        ] {
+            if let Ok(content) = github.get_file_content(owner, repo, cfn_path).await {
+                found.push((format!("{repo_full}/{cfn_path}"), content));
+                break;
+            }
+        }
+
+        // Pulumi
+        for pulumi_path in &["Pulumi.yaml", "infra/Pulumi.yaml"] {
+            if let Ok(content) = github.get_file_content(owner, repo, pulumi_path).await {
+                found.push((format!("{repo_full}/{pulumi_path}"), content));
+                // Also try to get the main Pulumi program
+                for prog_path in &["index.ts", "__main__.py", "main.go", "Pulumi.ts"] {
+                    if let Ok(c) = github.get_file_content(owner, repo, prog_path).await {
+                        found.push((format!("{repo_full}/{prog_path}"), c));
+                    }
+                }
                 break;
             }
         }
@@ -206,7 +248,22 @@ fn format_code_context(infra_code: &[(String, String)]) -> String {
             } else {
                 content
             };
-            format!("### {path}\n```typescript\n{trimmed}\n```")
+            let lang = if path.ends_with(".ts") {
+                "typescript"
+            } else if path.ends_with(".py") {
+                "python"
+            } else if path.ends_with(".go") {
+                "go"
+            } else if path.ends_with(".tf") {
+                "hcl"
+            } else if path.ends_with(".yaml") || path.ends_with(".yml") {
+                "yaml"
+            } else if path.ends_with(".json") {
+                "json"
+            } else {
+                ""
+            };
+            format!("### {path}\n```{lang}\n{trimmed}\n```")
         })
         .collect::<Vec<_>>()
         .join("\n\n")

@@ -39,8 +39,15 @@ pub async fn run(
         // Update task status to "running"
         set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "running").await?;
 
-        // Create GitHub issue
-        let (owner, repo) = split_repo(&plan_repo);
+        // Use task-level repo if set, otherwise fall back to plan repo
+        let task_repo = task.repo.as_deref().filter(|r| !r.is_empty()).unwrap_or(&plan_repo);
+        if task_repo.is_empty() {
+            error!(task_id, "No repo configured for task or plan");
+            set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+            continue;
+        }
+
+        let (owner, repo) = split_repo(task_repo);
         let issue_body = format_issue_body(&task.description, &task.acceptance_criteria);
 
         match github
@@ -133,6 +140,7 @@ struct TaskData {
     title: String,
     description: String,
     acceptance_criteria: String,
+    repo: Option<String>,
 }
 
 async fn get_task(
@@ -169,6 +177,10 @@ async fn get_task(
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or_default(),
+        repo: item
+            .get("repo")
+            .and_then(|v| v.as_s().ok())
+            .cloned(),
     }))
 }
 
