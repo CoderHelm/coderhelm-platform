@@ -33,7 +33,7 @@ export class FrontendStack extends cdk.Stack {
 
     // S3 bucket for static site
     const siteBucket = new s3.Bucket(this, "SiteBucket", {
-      bucketName: `${prefix}-frontend`,
+      bucketName: `${prefix}-app`,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       removalPolicy:
@@ -45,7 +45,7 @@ export class FrontendStack extends cdk.Stack {
 
     // CloudFront OAC
     const oac = new cloudfront.S3OriginAccessControl(this, "OAC", {
-      originAccessControlName: `${prefix}-oac`,
+      originAccessControlName: `${prefix}-app-oac`,
     });
 
     // Security headers policy
@@ -53,7 +53,7 @@ export class FrontendStack extends cdk.Stack {
       this,
       "SecurityHeaders",
       {
-        responseHeadersPolicyName: `${prefix}-security-headers`,
+        responseHeadersPolicyName: `${prefix}-app-security-headers`,
         securityHeadersBehavior: {
           strictTransportSecurity: {
             accessControlMaxAge: cdk.Duration.days(365),
@@ -98,7 +98,7 @@ export class FrontendStack extends cdk.Stack {
     // SPA rewrite function: routes without file extensions → /index.html
     // Real files (.js, .css, .png, etc.) pass through normally.
     const spaRewrite = new cloudfront.Function(this, "SpaRewrite", {
-      functionName: `${prefix}-spa-rewrite`,
+      functionName: `${prefix}-app-spa-rewrite`,
       code: cloudfront.FunctionCode.fromInline(`
 function handler(event) {
   var request = event.request;

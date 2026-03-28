@@ -90,7 +90,7 @@ const waf = new WafStack(app, `${prefix}-waf`, {
 
 // --- Frontend ---
 
-const frontend = new FrontendStack(app, `${prefix}-frontend`, {
+const frontend = new FrontendStack(app, `${prefix}-app`, {
   env,
   stage,
   webAclArn: waf.webAclArn,

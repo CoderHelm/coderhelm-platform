@@ -53,8 +53,7 @@ export class WorkerStack extends cdk.Stack {
       memorySize: 256,
       timeout: cdk.Duration.minutes(15),
       logGroup: workerLogGroup,
-      reservedConcurrentExecutions: 10, // tenant-level limiting in code
-      environment: {
+        environment: {
         STAGE: props.stage,
         TABLE_NAME: props.table.tableName,
         RUNS_TABLE_NAME: props.runsTable.tableName,
