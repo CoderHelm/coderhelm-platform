@@ -101,8 +101,40 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
             }
             models::WorkerMessage::InfraAnalyze(msg) => {
                 info!(tenant_id = %msg.tenant_id, "Analyzing infrastructure");
+                let tenant_id = msg.tenant_id.clone();
                 if let Err(e) = passes::infra_analyze::run(&state, msg).await {
                     error!("Infra analyze failed: {e}");
+                    // Store failed status so the dashboard can show the error
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let _ = state
+                        .dynamo
+                        .put_item()
+                        .table_name(&state.config.table_name)
+                        .item("pk", aws_sdk_dynamodb::types::AttributeValue::S(tenant_id))
+                        .item(
+                            "sk",
+                            aws_sdk_dynamodb::types::AttributeValue::S(
+                                "INFRA#analysis".to_string(),
+                            ),
+                        )
+                        .item(
+                            "status",
+                            aws_sdk_dynamodb::types::AttributeValue::S("failed".to_string()),
+                        )
+                        .item(
+                            "has_infra",
+                            aws_sdk_dynamodb::types::AttributeValue::Bool(false),
+                        )
+                        .item(
+                            "error",
+                            aws_sdk_dynamodb::types::AttributeValue::S(e.to_string()),
+                        )
+                        .item(
+                            "updated_at",
+                            aws_sdk_dynamodb::types::AttributeValue::S(now),
+                        )
+                        .send()
+                        .await;
                 }
             }
         }

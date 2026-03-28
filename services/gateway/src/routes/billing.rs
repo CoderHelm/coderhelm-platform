@@ -320,10 +320,7 @@ pub async fn create_subscription(
             ),
             ("cancel_url", "https://app.d3ftly.com/billing/"),
             ("metadata[tenant_id]", &claims.tenant_id),
-            (
-                "subscription_data[metadata][tenant_id]",
-                &claims.tenant_id,
-            ),
+            ("subscription_data[metadata][tenant_id]", &claims.tenant_id),
         ])
         .send()
         .await

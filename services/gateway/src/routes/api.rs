@@ -3,7 +3,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{error, info};
 
-use crate::models::{Claims, InfraAnalyzeMessage, NotificationPrefs, OnboardMessage, OnboardRepo, WorkerMessage};
+use crate::models::{
+    Claims, InfraAnalyzeMessage, NotificationPrefs, OnboardMessage, OnboardRepo, WorkerMessage,
+};
 use crate::AppState;
 use aws_sdk_dynamodb::types::AttributeValue;
 
@@ -148,6 +150,8 @@ pub async fn list_repos(
                 "name": item.get("repo_name").and_then(|v| v.as_s().ok()),
                 "enabled": item.get("enabled").and_then(|v| v.as_bool().ok()),
                 "ticket_source": item.get("ticket_source").and_then(|v| v.as_s().ok()),
+                "onboard_status": item.get("onboard_status").and_then(|v| v.as_s().ok()),
+                "onboard_error": item.get("onboard_error").and_then(|v| v.as_s().ok()),
             })
         })
         .collect();
@@ -429,7 +433,7 @@ pub async fn update_repo(
     validate_repo_name(&repo)?;
     let enabled = body["enabled"].as_bool().unwrap_or(true);
 
-    state
+    let mut put = state
         .dynamo
         .put_item()
         .table_name(&state.config.table_name)
@@ -440,13 +444,16 @@ pub async fn update_repo(
             "enabled",
             aws_sdk_dynamodb::types::AttributeValue::Bool(enabled),
         )
-        .item("ticket_source", attr_s("github"))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to update repo: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .item("ticket_source", attr_s("github"));
+
+    if enabled {
+        put = put.item("onboard_status", attr_s("pending"));
+    }
+
+    put.send().await.map_err(|e| {
+        error!("Failed to update repo: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // When enabling a repo, trigger onboarding to generate voice, instructions, etc.
     if enabled {

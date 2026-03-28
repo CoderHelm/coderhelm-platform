@@ -22,7 +22,7 @@ pub struct Finding {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct InfraAnalysis {
-    pub status: String, // "pending" | "ready" | "no_infra"
+    pub status: String, // "pending" | "ready" | "no_infra" | "failed"
     pub has_infra: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagram: Option<String>,
@@ -36,6 +36,8 @@ pub struct InfraAnalysis {
     pub cached_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scanned_repos: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // ── GET /api/infrastructure ────────────────────────────────────────────────────
@@ -71,6 +73,7 @@ pub async fn get_infrastructure(
                 suggested_prompt: Some(default_infra_prompt()),
                 cached_at: None,
                 scanned_repos: None,
+                error: None,
             }
         }
         Some(item) => {
@@ -101,6 +104,8 @@ pub async fn get_infrastructure(
                 .and_then(|v| v.as_s().ok())
                 .and_then(|s| serde_json::from_str(s).ok());
 
+            let error_msg = item.get("error").and_then(|v| v.as_s().ok()).cloned();
+
             let suggested_prompt = if has_infra {
                 None
             } else {
@@ -116,6 +121,7 @@ pub async fn get_infrastructure(
                 suggested_prompt,
                 cached_at,
                 scanned_repos,
+                error: error_msg,
             }
         }
     };
