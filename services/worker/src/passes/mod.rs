@@ -64,13 +64,20 @@ async fn run_passes(
     // Load must-rules (global + repo-specific)
     let rules = load_rules(state, msg).await;
 
-    // Load voice instructions from DynamoDB
-    let voice = load_content(
-        state,
-        &msg.tenant_id,
-        &format!("VOICE#REPO#{}/{}", msg.repo_owner, msg.repo_name),
-    )
-    .await;
+    // Load voice instructions from DynamoDB (repo-specific falls back to global)
+    let voice = {
+        let repo_voice = load_content(
+            state,
+            &msg.tenant_id,
+            &format!("VOICE#REPO#{}/{}", msg.repo_owner, msg.repo_name),
+        )
+        .await;
+        if repo_voice.is_empty() {
+            load_content(state, &msg.tenant_id, "VOICE#GLOBAL").await
+        } else {
+            repo_voice
+        }
+    };
 
     // Post "working on it" comment only for GitHub-sourced tickets.
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
