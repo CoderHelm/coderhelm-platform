@@ -63,18 +63,41 @@ pub async fn run(
         }
     }
 
-    // For multi-repo install, store a global agents overview in DynamoDB
-    if msg.repos.len() > 1 {
-        let repo_list: Vec<String> = msg
-            .repos
+    // Update global agents overview from all enabled repos in DynamoDB
+    let enabled_repos = state
+        .dynamo
+        .query()
+        .table_name(&state.config.table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(msg.tenant_id.clone()))
+        .expression_attribute_values(":prefix", AttributeValue::S("REPO#".to_string()))
+        .send()
+        .await
+        .ok()
+        .map(|r| {
+            r.items()
+                .iter()
+                .filter(|item| {
+                    item.get("enabled")
+                        .and_then(|v| v.as_bool().ok())
+                        .copied()
+                        .unwrap_or(false)
+                })
+                .filter_map(|item| item.get("repo_name").and_then(|v| v.as_s().ok()).cloned())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    if !enabled_repos.is_empty() {
+        let repo_list: Vec<String> = enabled_repos
             .iter()
-            .map(|r| format!("- **{}**: default branch `{}`", r.name, r.default_branch))
+            .map(|r| format!("- **{r}**"))
             .collect();
         let global_content = format!(
             "# Organization Agent Context\n\n\
              This organization has {} repositories configured with d3ftly:\n\n\
              {}\n",
-            msg.repos.len(),
+            enabled_repos.len(),
             repo_list.join("\n")
         );
         if let Err(e) = state
