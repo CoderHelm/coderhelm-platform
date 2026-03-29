@@ -169,6 +169,8 @@ async fn main() -> Result<(), Error> {
             "/billing/invoices/:invoice_id/pdf",
             get(routes::billing::download_invoice_pdf),
         )
+        // Banners
+        .route("/banners", get(routes::banners::list_banners))
         // Plan endpoints
         .route(
             "/plans",
