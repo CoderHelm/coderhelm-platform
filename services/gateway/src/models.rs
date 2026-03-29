@@ -14,6 +14,7 @@ pub struct Config {
     pub dlq_url: String,
     pub ses_from_address: String,
     pub ses_template_prefix: String,
+    pub model_id: String,
 }
 
 impl Config {
@@ -36,6 +37,8 @@ impl Config {
                 .unwrap_or_else(|_| "notifications@coderhelm.com".to_string()),
             ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")
                 .unwrap_or_else(|_| "coderhelm-prod".to_string()),
+            model_id: std::env::var("MODEL_ID")
+                .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-20250514".to_string()),
         }
     }
 }
@@ -59,6 +62,8 @@ pub struct Secrets {
     pub stripe_publishable_key: Option<String>,
     #[serde(default)]
     pub stripe_price_id: Option<String>,
+    #[serde(default)]
+    pub stripe_overage_price_id: Option<String>,
 }
 
 impl Secrets {

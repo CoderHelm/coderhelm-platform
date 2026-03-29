@@ -89,17 +89,25 @@ pub async fn run(
         .unwrap_or_default();
 
     if !enabled_repos.is_empty() {
-        // Pull a one-line summary from each repo's AGENTS.md
+        // Pull a structured summary from each repo's AGENTS.md
         let mut repo_entries: Vec<String> = Vec::new();
         for repo_name in &enabled_repos {
-            let summary =
+            let agents_md =
                 load_instructions(state, &msg.tenant_id, &format!("AGENTS#REPO#{repo_name}")).await;
-            let desc = extract_first_sentence(&summary);
-            if desc.is_empty() {
-                repo_entries.push(format!("- **{repo_name}**"));
-            } else {
-                repo_entries.push(format!("- **{repo_name}** — {desc}"));
+            let desc = extract_first_sentence(&agents_md);
+            let tech = extract_tech_stack(&agents_md);
+            let role = detect_repo_role(&agents_md);
+            let mut entry = format!("- **{repo_name}**");
+            if !role.is_empty() {
+                entry.push_str(&format!(" ({role})"));
             }
+            if !desc.is_empty() {
+                entry.push_str(&format!(" — {desc}"));
+            }
+            if !tech.is_empty() {
+                entry.push_str(&format!("\n  Tech: {tech}"));
+            }
+            repo_entries.push(entry);
         }
         let global_content = format!(
             "# Organization Agent Context\n\n\
@@ -502,4 +510,88 @@ fn extract_first_sentence(content: &str) -> String {
         return sentence.to_string();
     }
     String::new()
+}
+
+/// Extract tech stack keywords from AGENTS.md content.
+/// Looks for a "Tech Stack" or "Dependencies" section and grabs key technologies.
+fn extract_tech_stack(content: &str) -> String {
+    let lower = content.to_lowercase();
+    let mut techs: Vec<&str> = Vec::new();
+
+    // Detect languages and frameworks by scanning for keywords
+    let patterns: &[(&str, &str)] = &[
+        ("rust", "Rust"),
+        ("typescript", "TypeScript"),
+        ("next.js", "Next.js"),
+        ("nextjs", "Next.js"),
+        ("react", "React"),
+        ("python", "Python"),
+        ("node.js", "Node.js"),
+        ("express", "Express"),
+        ("go ", "Go"),
+        ("golang", "Go"),
+        ("terraform", "Terraform"),
+        ("cdk", "CDK"),
+        ("dynamodb", "DynamoDB"),
+        ("postgresql", "PostgreSQL"),
+        ("mongodb", "MongoDB"),
+        ("redis", "Redis"),
+        ("docker", "Docker"),
+        ("graphql", "GraphQL"),
+        ("tailwind", "Tailwind"),
+        ("swift", "Swift"),
+        ("kotlin", "Kotlin"),
+        ("flutter", "Flutter"),
+        ("expo", "Expo"),
+        ("react native", "React Native"),
+    ];
+
+    for (pattern, label) in patterns {
+        if lower.contains(pattern) && !techs.contains(label) {
+            techs.push(label);
+        }
+    }
+
+    if techs.len() > 6 {
+        techs.truncate(6);
+    }
+    techs.join(", ")
+}
+
+/// Detect the role of a repo (frontend, backend, infrastructure, etc.) from AGENTS.md.
+fn detect_repo_role(content: &str) -> String {
+    let lower = content.to_lowercase();
+    let mut roles: Vec<&str> = Vec::new();
+
+    if lower.contains("frontend")
+        || lower.contains("dashboard")
+        || lower.contains("next.js")
+        || lower.contains("react")
+        || lower.contains("ui component")
+    {
+        roles.push("frontend");
+    }
+    if lower.contains("backend")
+        || lower.contains("api gateway")
+        || lower.contains("lambda handler")
+        || lower.contains("rest api")
+        || lower.contains("server")
+    {
+        roles.push("backend");
+    }
+    if lower.contains("infrastructure")
+        || lower.contains("cdk")
+        || lower.contains("terraform")
+        || lower.contains("cloudformation")
+    {
+        roles.push("infrastructure");
+    }
+    if lower.contains("mobile") || lower.contains("ios") || lower.contains("android") {
+        roles.push("mobile");
+    }
+    if lower.contains("worker") || lower.contains("queue consumer") || lower.contains("sqs") {
+        roles.push("worker");
+    }
+
+    roles.join(", ")
 }

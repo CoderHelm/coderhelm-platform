@@ -87,7 +87,7 @@ export class ApiStack extends cdk.Stack {
       handler: "bootstrap",
       code: lambda.Code.fromAsset(gatewayAssetPath),
       memorySize: 128,
-      timeout: cdk.Duration.seconds(10),
+      timeout: cdk.Duration.seconds(30),
       logGroup: gatewayLogGroup,
       environment: {
         STAGE: props.stage,
@@ -102,6 +102,7 @@ export class ApiStack extends cdk.Stack {
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
+        MODEL_ID: "us.anthropic.claude-sonnet-4-20250514",
         RUST_LOG: "info",
       },
     });
@@ -116,6 +117,17 @@ export class ApiStack extends cdk.Stack {
     this.feedbackQueue.grantSendMessages(this.gatewayFunction);
     dlq.grantConsumeMessages(this.gatewayFunction);
     secrets.grantRead(this.gatewayFunction);
+
+    // Bedrock access for plan chat
+    this.gatewayFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["bedrock:InvokeModel", "bedrock:Converse"],
+        resources: [
+          `arn:aws:bedrock:*::foundation-model/*`,
+          `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
+        ],
+      })
+    );
 
     // --- HTTP API Gateway ---
 

@@ -332,7 +332,7 @@ pub async fn create_subscription(
     // (handles race conditions where DynamoDB status hasn't been updated yet)
     cancel_incomplete_subscriptions(&state, stripe_key, &customer_id).await;
 
-    let form_params: Vec<(&str, &str)> = vec![
+    let mut form_params: Vec<(&str, &str)> = vec![
         ("customer", &customer_id),
         ("items[0][price]", price_id),
         ("payment_behavior", "default_incomplete"),
@@ -344,6 +344,19 @@ pub async fn create_subscription(
         ("expand[]", "latest_invoice.payment_intent"),
         ("metadata[tenant_id]", &claims.tenant_id),
     ];
+
+    // Add metered overage price as second line item if configured
+    let overage_price_id = state
+        .secrets
+        .stripe_overage_price_id
+        .as_deref()
+        .unwrap_or("");
+    if !overage_price_id.is_empty() {
+        form_params.push(("items[1][price]", overage_price_id));
+        // Bill overage in $50 increments
+        form_params.push(("billing_thresholds[amount_gte]", "5000"));
+    }
+
     let response = state
         .http
         .post("https://api.stripe.com/v1/subscriptions")

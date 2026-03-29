@@ -756,3 +756,135 @@ fn task_from_item(
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
     })
 }
+
+// ─── Plan Chat ────────────────────────────────────────────────────────
+
+const PLAN_CHAT_SYSTEM: &str = r#"You are a planning assistant for Coderhelm, an autonomous AI coding agent.
+Your job is to help the user break down a feature, epic, or large piece of work into a structured plan.
+
+When the user describes what they want to build, you should:
+1. If the user already specified the repo, tech constraints, and scope — go straight to generating the plan.
+2. Only ask clarifying questions when truly critical info is missing (e.g. no repo specified at all).
+3. Never ask more than 2 clarifying questions before generating a plan.
+
+When generating the final plan, output it in this EXACT JSON format inside a code fence:
+
+```json
+{
+  "title": "Short epic title",
+  "description": "1-2 sentence overview",
+  "repo": "owner/repo",
+  "tasks": [
+    {
+      "title": "Concise task title",
+      "description": "What to build and why. Be specific about files, APIs, UI components.",
+      "acceptance_criteria": "- Bullet list\n- Of verifiable criteria",
+      "order": 0
+    }
+  ]
+}
+```
+
+Rules:
+- Tasks should be independently implementable (one PR each)
+- Order matters — Coderhelm works on them sequentially
+- Each task title should be a GitHub issue title (imperative, max 60 chars)
+- Acceptance criteria should be machine-verifiable where possible
+- 3-10 tasks is ideal
+- If the user mentions a specific repo, USE IT — don't ask again
+- Be direct and action-oriented, not verbose"#;
+
+/// POST /api/plans/chat — AI-powered plan generation chat.
+pub async fn plan_chat(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let messages_input = body["messages"]
+        .as_array()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    if messages_input.is_empty() || messages_input.len() > 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Load org context to give the AI awareness of available repos
+    let org_context = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("AGENTS#GLOBAL"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .and_then(|i| i.get("content").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default();
+
+    // Build system prompt with org context
+    let system_prompt = if org_context.is_empty() {
+        PLAN_CHAT_SYSTEM.to_string()
+    } else {
+        format!(
+            "{PLAN_CHAT_SYSTEM}\n\nThe user's organization context:\n{org_context}"
+        )
+    };
+
+    // Convert messages to Bedrock format
+    let mut bedrock_messages = Vec::new();
+    for msg in messages_input {
+        let role_str = msg["role"].as_str().unwrap_or("user");
+        let content = msg["content"].as_str().unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+        let role = match role_str {
+            "assistant" => aws_sdk_bedrockruntime::types::ConversationRole::Assistant,
+            _ => aws_sdk_bedrockruntime::types::ConversationRole::User,
+        };
+        let message = aws_sdk_bedrockruntime::types::Message::builder()
+            .role(role)
+            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(
+                content.to_string(),
+            ))
+            .build()
+            .map_err(|e| {
+                error!("Failed to build Bedrock message: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        bedrock_messages.push(message);
+    }
+
+    let response = state
+        .bedrock
+        .converse()
+        .model_id(&state.config.model_id)
+        .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
+            system_prompt,
+        ))
+        .set_messages(Some(bedrock_messages))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Bedrock converse failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let text = match response.output() {
+        Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg
+            .content()
+            .iter()
+            .find_map(|block| {
+                if let aws_sdk_bedrockruntime::types::ContentBlock::Text(t) = block {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+
+    Ok(Json(json!({ "content": text })))
+}

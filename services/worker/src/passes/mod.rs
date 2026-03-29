@@ -330,6 +330,10 @@ async fn complete_run(
         .send()
         .await?;
 
+    // Report token overage to Stripe (after analytics are updated)
+    let total_tokens = usage.input_tokens + usage.output_tokens;
+    crate::clients::billing::report_token_overage(state, &msg.tenant_id, total_tokens).await;
+
     // Send run-complete notification
     let duration_str = format!("{}m {}s", duration / 60, duration % 60);
     if let Err(e) = email::send_notification(
