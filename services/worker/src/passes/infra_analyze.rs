@@ -35,6 +35,9 @@ Rules for the mermaid diagram:
   * Use only alphanumeric, spaces, hyphens, and periods in labels.
   * Service IDs and group IDs must be alphanumeric with underscores only. No hyphens in IDs.
   * Each service port (T/B/L/R) can only have ONE edge. If you need multiple edges from a service, use a junction.
+  * NEVER use pipe labels like -->|text| or --|text|— that is flowchart syntax, NOT architecture-beta.
+  * NEVER use reverse arrows <--. Only use --> (forward arrow) or -- (no arrow). Swap service positions instead.
+  * NEVER use subgraph/end. Only use group.
 - Group services into logical tiers: edge, compute, data, async.
 - Keep it under 15 services — collapse related resources where needed.
 - Flow left to right: internet → CDN/WAF → API → compute → data.
@@ -431,7 +434,7 @@ async fn call_bedrock_retry(
         "Analyze this infrastructure code and generate the diagram and findings:\n\n{code_context}"
     );
     let fix_prompt = format!(
-        "Your previous diagram had syntax errors:\n{errors}\n\nHere was the broken diagram:\n```mermaid\n{bad_diagram}\n```\n\nFix ALL the syntax errors and regenerate. Remember: groups MUST have (icon) before [label], labels must not contain slashes, and services with 3+ connections need junctions."
+        "Your previous diagram had syntax errors:\n{errors}\n\nHere was the broken diagram:\n```mermaid\n{bad_diagram}\n```\n\nFix ALL the syntax errors and regenerate. Remember: groups MUST have (icon) before [label], labels must not contain slashes, NO pipe labels (-->|text|), NO reverse arrows (<--), NO subgraph/end (use group instead), and services with 3+ connections need junctions."
     );
 
     let messages = vec![
@@ -513,10 +516,13 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
         let trimmed = line.trim();
         let line_num = i + 1;
 
+        // Skip blank lines and the architecture-beta declaration
+        if trimmed.is_empty() || trimmed == "architecture-beta" {
+            continue;
+        }
+
         // Check group declarations have (icon) before [label]
         if let Some(after_group) = trimmed.strip_prefix("group ") {
-            // Valid: group id(icon)[Label]  or  group id(icon)[Label] in parent
-            // Invalid: group id[Label]
             if let Some(bracket_pos) = after_group.find('[') {
                 let before_bracket = &after_group[..bracket_pos];
                 if !before_bracket.contains('(') {
@@ -535,6 +541,27 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
                     errors.push(format!("line {line_num}: label contains slash: [{label}]"));
                 }
             }
+        }
+
+        // Reject flowchart-style pipe labels: -->|label|  or --|label|
+        if trimmed.contains("-->|") || trimmed.contains("--|") || trimmed.contains("|-->") {
+            errors.push(format!(
+                "line {line_num}: pipe labels not allowed in architecture-beta (flowchart syntax): {trimmed}"
+            ));
+        }
+
+        // Reject reverse arrows <-- (architecture-beta only supports -->)
+        if trimmed.contains("<--") {
+            errors.push(format!(
+                "line {line_num}: reverse arrows <-- not supported, use --> with swapped sides: {trimmed}"
+            ));
+        }
+
+        // Reject subgraph (flowchart syntax, not architecture-beta)
+        if trimmed.starts_with("subgraph ") || trimmed == "end" {
+            errors.push(format!(
+                "line {line_num}: subgraph/end is flowchart syntax, use group in architecture-beta: {trimmed}"
+            ));
         }
     }
 
