@@ -29,18 +29,34 @@ Rules for the mermaid diagram:
   logos:aws-cloudfront, logos:aws-api-gateway, logos:aws-ses,
   logos:aws-secrets-manager, logos:aws-cloudwatch, logos:aws-waf,
   logos:aws-route53, logos:aws-iam, logos:aws-sns, logos:aws-eventbridge.
+- CRITICAL SYNTAX RULES (violating these causes parse errors):
+  * Groups MUST include (icon): group myGroup(cloud)[Label]. NEVER write group myGroup[Label] without (icon).
+  * Labels inside [] must NOT contain special characters: no slashes /, no brackets [], no braces {}.
+  * Use only alphanumeric, spaces, hyphens, and periods in labels.
+  * Service IDs and group IDs must be alphanumeric with underscores only. No hyphens in IDs.
+  * Each service port (T/B/L/R) can only have ONE edge. If you need multiple edges from a service, use a junction.
 - Group services into logical tiers: edge, compute, data, async.
 - Keep it under 15 services — collapse related resources where needed.
 - Flow left to right: internet → CDN/WAF → API → compute → data.
-- Use junctions for fan-out when one service connects to 3+ others. Example:
-  junction jFan
-  svcA:R --> L:jFan
-  jFan:R --> L:svcB
-  jFan:T --> B:svcC
-  jFan:B --> T:svcD
+- MANDATORY: If a service has 3+ edges, you MUST use a junction. Never draw 3+ edges directly from one service.
+  Example — fan-out from Lambda to 3 targets:
+  junction jFan in computeGroup
+  lambda:R --> L:jFan
+  jFan:R --> L:targetA
+  jFan:T --> B:targetB
+  jFan:B --> T:targetC
+  Example — fan-in from 3 sources to one service:
+  junction jIn
+  srcA:R --> L:jIn
+  srcB:B --> T:jIn
+  srcC:T --> B:jIn
+  jIn:R --> L:target
+- Use MULTIPLE junctions when a service connects to 5+ others. Chain junctions: svc -> j1 -> j2, each junction fans to max 3 services.
+- Place junctions INSIDE the same group as the source service.
 - Avoid crossing edges. Place services so edges flow in the same direction.
 - Each edge uses exactly one direction pair: R-->L (left to right), B-->T (top to bottom), L-->R (right to left), or T-->B (bottom to top).
 - Do NOT create edges between services in different groups that would cross other groups. Route through junctions instead.
+- Arrange services in a clean grid. Services in the same group should align horizontally or vertically.
 
 Rules for findings:
 - Only output error and warning severity. Do NOT output info-level notes.
@@ -95,10 +111,28 @@ pub async fn run(
     // 4. Parse response
     let (diagram, findings_json) = parse_response(&response);
 
-    let diagram_str = diagram.unwrap_or_default();
-    let findings_str = findings_json.unwrap_or_else(|| "[]".to_string());
+    // 5. Validate diagram; if invalid, retry once with error feedback
+    let (diagram_str, findings_str) = match &diagram {
+        Some(d) if validate_diagram(d).is_err() => {
+            let errs = validate_diagram(d).unwrap_err();
+            warn!(tenant_id = %msg.tenant_id, errors = %errs, "Diagram validation failed, retrying");
+            let retry = call_bedrock_retry(state, &code_context, d, &errs).await?;
+            let (retry_diagram, retry_findings) = parse_response(&retry);
+            let rd = retry_diagram.unwrap_or_default();
+            let rf =
+                retry_findings.unwrap_or_else(|| findings_json.unwrap_or_else(|| "[]".to_string()));
+            if let Err(e2) = validate_diagram(&rd) {
+                warn!(tenant_id = %msg.tenant_id, errors = %e2, "Diagram still invalid after retry, using as-is");
+            }
+            (rd, rf)
+        }
+        _ => (
+            diagram.unwrap_or_default(),
+            findings_json.unwrap_or_else(|| "[]".to_string()),
+        ),
+    };
 
-    // 5. Store in DynamoDB
+    // 6. Store in DynamoDB
     let now = chrono::Utc::now().to_rfc3339();
     let scanned: Vec<String> = infra_code.iter().map(|(f, _)| f.clone()).collect();
 
@@ -386,6 +420,71 @@ async fn call_bedrock(
     Ok(text)
 }
 
+/// Retry Bedrock with the original diagram and validation errors as feedback.
+async fn call_bedrock_retry(
+    state: &WorkerState,
+    code_context: &str,
+    bad_diagram: &str,
+    errors: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let prompt = format!(
+        "Analyze this infrastructure code and generate the diagram and findings:\n\n{code_context}"
+    );
+    let fix_prompt = format!(
+        "Your previous diagram had syntax errors:\n{errors}\n\nHere was the broken diagram:\n```mermaid\n{bad_diagram}\n```\n\nFix ALL the syntax errors and regenerate. Remember: groups MUST have (icon) before [label], labels must not contain slashes, and services with 3+ connections need junctions."
+    );
+
+    let messages = vec![
+        aws_sdk_bedrockruntime::types::Message::builder()
+            .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
+            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
+            .build()
+            .map_err(|e| format!("Failed to build message: {e}"))?,
+        aws_sdk_bedrockruntime::types::Message::builder()
+            .role(aws_sdk_bedrockruntime::types::ConversationRole::Assistant)
+            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(format!(
+                "```mermaid\n{bad_diagram}\n```"
+            )))
+            .build()
+            .map_err(|e| format!("Failed to build message: {e}"))?,
+        aws_sdk_bedrockruntime::types::Message::builder()
+            .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
+            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(
+                fix_prompt,
+            ))
+            .build()
+            .map_err(|e| format!("Failed to build message: {e}"))?,
+    ];
+
+    let response = state
+        .bedrock
+        .converse()
+        .model_id(&state.config.model_id)
+        .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
+            SYSTEM.to_string(),
+        ))
+        .set_messages(Some(messages))
+        .send()
+        .await?;
+
+    let text = match response.output() {
+        Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg
+            .content()
+            .iter()
+            .find_map(|block| {
+                if let aws_sdk_bedrockruntime::types::ContentBlock::Text(t) = block {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+
+    Ok(text)
+}
+
 fn parse_response(response: &str) -> (Option<String>, Option<String>) {
     let mermaid = extract_block(response, "mermaid");
     let json_block = extract_block(response, "json");
@@ -402,6 +501,48 @@ fn extract_block(text: &str, lang: &str) -> Option<String> {
         None
     } else {
         Some(content)
+    }
+}
+
+/// Validate architecture-beta diagram syntax before storing.
+/// Returns Ok(()) if valid, Err with description of problems if not.
+fn validate_diagram(diagram: &str) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, line) in diagram.lines().enumerate() {
+        let trimmed = line.trim();
+        let line_num = i + 1;
+
+        // Check group declarations have (icon) before [label]
+        if trimmed.starts_with("group ") {
+            // Valid: group id(icon)[Label]  or  group id(icon)[Label] in parent
+            // Invalid: group id[Label]
+            let after_group = &trimmed["group ".len()..];
+            if let Some(bracket_pos) = after_group.find('[') {
+                let before_bracket = &after_group[..bracket_pos];
+                if !before_bracket.contains('(') {
+                    errors.push(format!(
+                        "line {line_num}: group missing (icon) before [label]: {trimmed}"
+                    ));
+                }
+            }
+        }
+
+        // Check labels don't contain slashes
+        if let Some(start) = trimmed.find('[') {
+            if let Some(end) = trimmed[start..].find(']') {
+                let label = &trimmed[start + 1..start + end];
+                if label.contains('/') {
+                    errors.push(format!("line {line_num}: label contains slash: [{label}]"));
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
