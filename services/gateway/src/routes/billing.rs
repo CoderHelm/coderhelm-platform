@@ -344,6 +344,7 @@ pub async fn create_subscription(
         .http
         .post("https://api.stripe.com/v1/subscriptions")
         .header("Authorization", format!("Bearer {stripe_key}"))
+        .header("Stripe-Version", "2023-10-16")
         .form(&form_params)
         .send()
         .await
