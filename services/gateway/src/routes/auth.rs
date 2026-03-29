@@ -145,9 +145,9 @@ pub async fn callback(
 
     // Set cookie and redirect to dashboard
     let dashboard_url = if state.config.stage == "prod" {
-        "https://app.coderhelm.com/dashboard"
+        "https://app.coderhelm.com"
     } else {
-        "http://localhost:3000/dashboard"
+        "http://localhost:3000"
     };
 
     let cookie = format!(
