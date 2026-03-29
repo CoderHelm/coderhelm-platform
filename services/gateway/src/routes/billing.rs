@@ -328,6 +328,10 @@ pub async fn create_subscription(
         .await;
 
     // Create Stripe Subscription with incomplete status — frontend confirms payment via Elements
+    // First, cancel any incomplete subscriptions on the Stripe customer to prevent duplicates
+    // (handles race conditions where DynamoDB status hasn't been updated yet)
+    cancel_incomplete_subscriptions(&state, stripe_key, &customer_id).await;
+
     let form_params: Vec<(&str, &str)> = vec![
         ("customer", &customer_id),
         ("items[0][price]", price_id),
@@ -390,6 +394,43 @@ pub async fn create_subscription(
     }
 
     Ok(Json(json!({ "client_secret": client_secret })))
+}
+
+/// Cancel all incomplete/past_due subscriptions for a Stripe customer.
+/// Prevents duplicates when concurrent subscribe requests arrive.
+async fn cancel_incomplete_subscriptions(state: &AppState, stripe_key: &str, customer_id: &str) {
+    for status in &["incomplete", "past_due"] {
+        let url = format!(
+            "https://api.stripe.com/v1/subscriptions?customer={customer_id}&status={status}&limit=10"
+        );
+        let Ok(resp) = state
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {stripe_key}"))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let Ok(body) = resp.json::<Value>().await else {
+            continue;
+        };
+        if let Some(subs) = body["data"].as_array() {
+            for sub in subs {
+                if let Some(sub_id) = sub["id"].as_str() {
+                    warn!("Cancelling stale {status} subscription {sub_id} for customer {customer_id}");
+                    let _ = state
+                        .http
+                        .delete(format!(
+                            "https://api.stripe.com/v1/subscriptions/{sub_id}"
+                        ))
+                        .header("Authorization", format!("Bearer {stripe_key}"))
+                        .send()
+                        .await;
+                }
+            }
+        }
+    }
 }
 
 /// Create a Stripe customer for a tenant.
