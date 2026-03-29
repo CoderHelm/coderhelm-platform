@@ -42,7 +42,7 @@ async fn main() -> Result<(), Error> {
         ses,
         bedrock,
         http: reqwest::Client::builder()
-            .user_agent("d3ftly-worker/0.1")
+            .user_agent("coderhelm-worker/0.1")
             .build()?,
         config,
         secrets,

@@ -22,12 +22,12 @@ impl Config {
                 .expect("ANALYTICS_TABLE_NAME required"),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
             secrets_name: std::env::var("SECRETS_NAME")
-                .unwrap_or_else(|_| "d3ftly/prod/secrets".to_string()),
+                .unwrap_or_else(|_| "coderhelm/prod/secrets".to_string()),
             model_id: std::env::var("MODEL_ID").expect("MODEL_ID required"),
             ses_from_address: std::env::var("SES_FROM_ADDRESS")
-                .unwrap_or_else(|_| "notifications@d3ftly.com".to_string()),
+                .unwrap_or_else(|_| "notifications@coderhelm.com".to_string()),
             ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")
-                .unwrap_or_else(|_| "d3ftly-prod".to_string()),
+                .unwrap_or_else(|_| "coderhelm-prod".to_string()),
         }
     }
 }
@@ -231,7 +231,7 @@ mod tests {
             run_id: "run1".into(),
             repo_owner: "org".into(),
             repo_name: "repo".into(),
-            branch: "d3ftly/fix".into(),
+            branch: "coderhelm/fix".into(),
             pr_number: 10,
             check_run_id: 99,
             attempt: 1,

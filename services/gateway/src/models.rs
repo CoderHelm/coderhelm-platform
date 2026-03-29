@@ -26,16 +26,16 @@ impl Config {
                 .expect("ANALYTICS_TABLE_NAME required"),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
             invoice_bucket_name: std::env::var("INVOICE_BUCKET_NAME")
-                .unwrap_or_else(|_| "d3ftly-prod-invoices".to_string()),
+                .unwrap_or_else(|_| "coderhelm-prod-invoices".to_string()),
             ticket_queue_url: std::env::var("TICKET_QUEUE_URL").expect("TICKET_QUEUE_URL required"),
             ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").expect("CI_FIX_QUEUE_URL required"),
             feedback_queue_url: std::env::var("FEEDBACK_QUEUE_URL")
                 .expect("FEEDBACK_QUEUE_URL required"),
             dlq_url: std::env::var("DLQ_URL").unwrap_or_default(),
             ses_from_address: std::env::var("SES_FROM_ADDRESS")
-                .unwrap_or_else(|_| "notifications@d3ftly.com".to_string()),
+                .unwrap_or_else(|_| "notifications@coderhelm.com".to_string()),
             ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")
-                .unwrap_or_else(|_| "d3ftly-prod".to_string()),
+                .unwrap_or_else(|_| "coderhelm-prod".to_string()),
         }
     }
 }

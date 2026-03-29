@@ -42,7 +42,7 @@ pub async fn get_installation_token(
         ))
         .header("Authorization", format!("Bearer {jwt}"))
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "d3ftly-bot")
+        .header("User-Agent", "Coderhelm-bot")
         .send()
         .await?
         .error_for_status()?

@@ -92,17 +92,17 @@ async fn handle_issue_event(
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
 
-    // Trigger on: issue assigned to d3ftly[bot], or labeled "d3ftly"
+    // Trigger on: issue assigned to coderhelm[bot], or labeled "coderhelm"
     let is_assigned_to_bot = action == "assigned"
         && payload["assignee"]["login"]
             .as_str()
-            .map(|l| l.contains("d3ftly"))
+            .map(|l| l.contains("coderhelm"))
             .unwrap_or(false);
 
     let is_labeled = action == "labeled"
         && payload["label"]["name"]
             .as_str()
-            .map(|l| l == "d3ftly")
+            .map(|l| l == "coderhelm")
             .unwrap_or(false);
 
     if !is_assigned_to_bot && !is_labeled {
@@ -153,8 +153,8 @@ async fn handle_issue_comment(
 
     let body = payload["comment"]["body"].as_str().unwrap_or("");
 
-    // Trigger on `/d3ftly` slash command
-    if !body.starts_with("/d3ftly") {
+    // Trigger on `/coderhelm` slash command
+    if !body.starts_with("/coderhelm") {
         return Ok(StatusCode::OK);
     }
 
@@ -204,7 +204,7 @@ async fn handle_pr_review(
     let pr_user = payload["pull_request"]["user"]["login"]
         .as_str()
         .unwrap_or("");
-    if !pr_user.contains("d3ftly") {
+    if !pr_user.contains("coderhelm") {
         return Ok(StatusCode::OK);
     }
 
@@ -245,7 +245,7 @@ async fn handle_check_run(
     let branch = payload["check_run"]["check_suite"]["head_branch"]
         .as_str()
         .unwrap_or("");
-    if !branch.starts_with("d3ftly/") {
+    if !branch.starts_with("coderhelm/") {
         return Ok(StatusCode::OK);
     }
 
@@ -445,7 +445,7 @@ async fn handle_pr_review_comment(
     let pr_user = payload["pull_request"]["user"]["login"]
         .as_str()
         .unwrap_or("");
-    if !pr_user.contains("d3ftly") {
+    if !pr_user.contains("coderhelm") {
         return Ok(StatusCode::OK);
     }
 
@@ -480,7 +480,7 @@ async fn handle_check_suite(
     }
 
     let branch = payload["check_suite"]["head_branch"].as_str().unwrap_or("");
-    if !branch.starts_with("d3ftly/") {
+    if !branch.starts_with("coderhelm/") {
         return Ok(StatusCode::OK);
     }
 
@@ -514,7 +514,7 @@ async fn handle_check_suite(
         "failure" => {
             info!(
                 branch,
-                "Check suite failed on d3ftly branch — delegating to check_run handler"
+                "Check suite failed on coderhelm branch — delegating to check_run handler"
             );
             // The individual check_run events will handle CI fixes
             Ok(StatusCode::OK)
@@ -687,7 +687,7 @@ async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
     if !is_pro && total_tokens >= FREE_TIER_TOKENS {
         return Some(format!(
             "You've used all **{}K free tokens** this month. \
-             [Upgrade to Pro](https://app.d3ftly.com/billing) for 5M tokens/month.",
+             [Upgrade to Pro](https://app.coderhelm.com/billing) for 5M tokens/month.",
             FREE_TIER_TOKENS / 1000,
         ));
     }
@@ -719,7 +719,7 @@ async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
             if current_spend >= max_budget_cents {
                 return Some(format!(
                     "Monthly budget cap of **${:.2}** reached (current spend: **${:.2}**). \
-                     Adjust your budget in [Settings](https://app.d3ftly.com/settings/budget).",
+                     Adjust your budget in [Settings](https://app.coderhelm.com/settings/budget).",
                     max_budget_cents as f64 / 100.0,
                     current_spend as f64 / 100.0,
                 ));
@@ -755,7 +755,7 @@ async fn post_limit_comment(
 
     let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments");
     let body = serde_json::json!({
-        "body": format!("⚠️ **d3ftly — run skipped**\n\n{reason}")
+        "body": format!("⚠️ **Coderhelm — run skipped**\n\n{reason}")
     });
 
     if let Err(e) = state
@@ -763,7 +763,7 @@ async fn post_limit_comment(
         .post(&url)
         .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "d3ftly-bot")
+        .header("User-Agent", "Coderhelm-bot")
         .json(&body)
         .send()
         .await

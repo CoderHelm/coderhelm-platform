@@ -33,10 +33,10 @@ function App() {
           <polygon points="196,416 248,416 316,96 264,96" fill="#3B82F6" />
           <polygon points="286,416 338,416 406,96 354,96" fill="#000" />
         </svg>
-        <h2 style={styles.title}>d3ftly</h2>
+        <h2 style={styles.title}>coderhelm</h2>
       </div>
       <p style={styles.subtitle}>
-        Connect your Jira site to d3ftly so assigned issues become pull requests automatically.
+        Connect your Jira site to coderhelm so assigned issues become pull requests automatically.
       </p>
 
       <div style={styles.card}>
@@ -50,7 +50,7 @@ function App() {
           />
         </label>
         <p style={styles.hint}>
-          Find this in your d3ftly dashboard under Settings → Jira.
+          Find this in your coderhelm dashboard under Settings → Jira.
         </p>
 
         <label style={styles.label}>
@@ -75,10 +75,10 @@ function App() {
       <div style={styles.howTo}>
         <h3 style={styles.howToTitle}>How it works</h3>
         <ol style={styles.steps}>
-          <li>Add a <code style={styles.code}>d3ftly</code> label to any Jira issue.</li>
-          <li>Assign the issue — d3ftly determines the right repo from the ticket and starts working.</li>
-          <li>d3ftly creates a branch, implements the change, and opens a draft PR.</li>
-          <li>Track progress at <strong>app.d3ftly.com</strong>.</li>
+          <li>Add a <code style={styles.code}>coderhelm</code> label to any Jira issue.</li>
+          <li>Assign the issue — coderhelm determines the right repo from the ticket and starts working.</li>
+          <li>coderhelm creates a branch, implements the change, and opens a draft PR.</li>
+          <li>Track progress at <strong>app.coderhelm.com</strong>.</li>
         </ol>
       </div>
     </div>

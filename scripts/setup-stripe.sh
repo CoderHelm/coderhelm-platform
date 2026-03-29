@@ -5,7 +5,7 @@ set -euo pipefail
 # Pulls Stripe key from AWS Secrets Manager.
 
 STAGE="${STAGE:-prod}"
-SECRET_NAME="d3ftly/${STAGE}/secrets"
+SECRET_NAME="coderhelm/${STAGE}/secrets"
 
 echo "Fetching Stripe key from AWS Secrets Manager (${SECRET_NAME})..."
 SK=$(aws secretsmanager get-secret-value \
@@ -48,7 +48,7 @@ echo "=== 1. Finding or creating Product ==="
 EXISTING=$(stripe_get "https://api.stripe.com/v1/products?limit=100&active=true" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
-products = [p for p in data.get('data', []) if p.get('metadata', {}).get('app') == 'd3ftly' and p.get('active')]
+products = [p for p in data.get('data', []) if p.get('metadata', {}).get('app') == 'coderhelm' and p.get('active')]
 print(products[0]['id'] if products else '')
 ")
 
@@ -57,9 +57,9 @@ if [[ -n "$EXISTING" ]]; then
   echo "Using existing product: $PRODUCT_ID"
 else
   PRODUCT=$(stripe_post "https://api.stripe.com/v1/products" \
-    -d "name=d3ftly Pro" \
+    -d "name=Coderhelm Pro" \
     -d "description=AI-powered autonomous coding agent for your repositories" \
-    -d "metadata[app]=d3ftly")
+    -d "metadata[app]=coderhelm")
   PRODUCT_ID=$(printf '%s\n' "$PRODUCT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
   echo "Created product: $PRODUCT_ID"
 fi
@@ -85,7 +85,7 @@ else
     -d "unit_amount=${DESIRED_AMOUNT}" \
     -d "currency=usd" \
     -d "recurring[interval]=month" \
-    -d "metadata[app]=d3ftly")
+    -d "metadata[app]=coderhelm")
   PRICE_ID=$(printf '%s\n' "$PRICE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
   echo "Created price: $PRICE_ID"
 fi
@@ -98,7 +98,7 @@ PLANS_METER_ID=$(stripe_get "https://api.stripe.com/v1/billing/meters?limit=100"
 import sys, json
 data = json.load(sys.stdin)
 for m in data.get('data', []):
-    if m.get('event_name') == 'd3ftly_plans_overage' and m.get('status') == 'active':
+    if m.get('event_name') == 'coderhelm_plans_overage' and m.get('status') == 'active':
         print(m['id'])
         break
 else:
@@ -110,7 +110,7 @@ if [[ -n "$PLANS_METER_ID" ]]; then
 else
   PLANS_METER=$(stripe_post "https://api.stripe.com/v1/billing/meters" \
     -d "display_name=Plan Overages" \
-    -d "event_name=d3ftly_plans_overage" \
+    -d "event_name=coderhelm_plans_overage" \
     -d "default_aggregation[formula]=sum")
   PLANS_METER_ID=$(printf '%s\n' "$PLANS_METER" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
   echo "Created plans meter: $PLANS_METER_ID"
@@ -139,7 +139,7 @@ else
     -d "recurring[usage_type]=metered" \
     -d "recurring[meter]=${PLANS_METER_ID}" \
     -d "nickname=plans_overage" \
-    -d "metadata[app]=d3ftly" \
+    -d "metadata[app]=coderhelm" \
     -d "metadata[type]=plans_overage")
   PLANS_PRICE_ID=$(printf '%s\n' "$PLANS_PRICE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
   echo "Created plans overage price: $PLANS_PRICE_ID"
@@ -153,7 +153,7 @@ TOKENS_METER_ID=$(stripe_get "https://api.stripe.com/v1/billing/meters?limit=100
 import sys, json
 data = json.load(sys.stdin)
 for m in data.get('data', []):
-    if m.get('event_name') == 'd3ftly_tokens_overage' and m.get('status') == 'active':
+    if m.get('event_name') == 'coderhelm_tokens_overage' and m.get('status') == 'active':
         print(m['id'])
         break
 else:
@@ -165,7 +165,7 @@ if [[ -n "$TOKENS_METER_ID" ]]; then
 else
   TOKENS_METER=$(stripe_post "https://api.stripe.com/v1/billing/meters" \
     -d "display_name=Token Overages (per 1K tokens)" \
-    -d "event_name=d3ftly_tokens_overage" \
+    -d "event_name=coderhelm_tokens_overage" \
     -d "default_aggregation[formula]=sum")
   TOKENS_METER_ID=$(printf '%s\n' "$TOKENS_METER" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
   echo "Created tokens meter: $TOKENS_METER_ID"
@@ -195,7 +195,7 @@ else
     -d "recurring[usage_type]=metered" \
     -d "recurring[meter]=${TOKENS_METER_ID}" \
     -d "nickname=tokens_overage" \
-    -d "metadata[app]=d3ftly" \
+    -d "metadata[app]=coderhelm" \
     -d "metadata[type]=tokens_overage")
   TOKENS_PRICE_ID=$(printf '%s\n' "$TOKENS_PRICE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
   echo "Created tokens overage price: $TOKENS_PRICE_ID"
@@ -206,9 +206,9 @@ echo "=== 5. Configuring Customer Portal (non-fatal) ==="
 # Portal configuration may already exist — treat failure as a warning, not an error.
 PORTAL_JSON=$(curl -s -X POST "https://api.stripe.com/v1/billing_portal/configurations" \
   -u "$SK:" \
-  -d "business_profile[headline]=Manage your d3ftly subscription" \
-  -d "business_profile[privacy_policy_url]=https://d3ftly.com/privacy" \
-  -d "business_profile[terms_of_service_url]=https://d3ftly.com/terms" \
+  -d "business_profile[headline]=Manage your Coderhelm subscription" \
+  -d "business_profile[privacy_policy_url]=https://coderhelm.com/privacy" \
+  -d "business_profile[terms_of_service_url]=https://coderhelm.com/terms" \
   -d "features[customer_update][enabled]=true" \
   -d "features[customer_update][allowed_updates][0]=email" \
   -d "features[invoice_history][enabled]=true" \
@@ -221,7 +221,7 @@ PORTAL_JSON=$(curl -s -X POST "https://api.stripe.com/v1/billing_portal/configur
   -d "features[subscription_cancel][cancellation_reason][options][2]=switched_service" \
   -d "features[subscription_cancel][cancellation_reason][options][3]=unused" \
   -d "features[subscription_cancel][cancellation_reason][options][4]=other" \
-  -d "default_return_url=https://app.d3ftly.com/billing")
+  -d "default_return_url=https://app.coderhelm.com/billing")
 PORTAL_ID=$(printf '%s\n' "$PORTAL_JSON" | python3 -c \
   "import sys,json; d=json.load(sys.stdin); print(d.get('id') or 'warning: ' + d.get('error',{}).get('message','unknown'))" \
   2>/dev/null || echo "(skipped)")

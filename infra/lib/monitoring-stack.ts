@@ -19,7 +19,7 @@ export class MonitoringStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: MonitoringStackProps) {
     super(scope, id, props);
 
-    const prefix = `d3ftly-${props.stage}`;
+    const prefix = `coderhelm-${props.stage}`;
 
     // Alert topic
     const alertTopic = new sns.Topic(this, "AlertTopic", {

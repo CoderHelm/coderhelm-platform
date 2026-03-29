@@ -14,14 +14,14 @@ export class StorageStack extends cdk.Stack {
     super(scope, id, props);
 
     const encryptionKey = new kms.Key(this, "BucketKey", {
-      alias: `d3ftly-${props.stage}-s3`,
-      description: "d3ftly S3 encryption key",
+      alias: `coderhelm-${props.stage}-s3`,
+      description: "Coderhelm S3 encryption key",
       enableKeyRotation: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
     this.bucket = new s3.Bucket(this, "DataBucket", {
-      bucketName: `d3ftly-${props.stage}-data`,
+      bucketName: `coderhelm-${props.stage}-data`,
       encryption: s3.BucketEncryption.KMS,
       encryptionKey,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,

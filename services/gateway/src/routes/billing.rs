@@ -173,7 +173,7 @@ pub async fn create_portal_session(
         .header("Authorization", format!("Bearer {stripe_key}"))
         .form(&[
             ("customer", customer_id.as_str()),
-            ("return_url", "https://app.d3ftly.com/dashboard/billing"),
+            ("return_url", "https://app.coderhelm.com/dashboard/billing"),
         ])
         .send()
         .await
@@ -963,7 +963,7 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 }
 
 /// Report metered usage to Stripe via Billing Meter Events.
-/// `event_name` maps to the meter: "d3ftly_plans_overage" or "d3ftly_tokens_overage".
+/// `event_name` maps to the meter: "coderhelm_plans_overage" or "coderhelm_tokens_overage".
 /// `quantity` is the number of units OVER the included limit (only overages).
 pub async fn report_stripe_usage(
     state: &AppState,
@@ -1006,7 +1006,7 @@ pub async fn report_stripe_usage(
         None => return,
     };
 
-    let event_name = format!("d3ftly_{usage_type}");
+    let event_name = format!("coderhelm_{usage_type}");
     let ts = chrono::Utc::now().timestamp().to_string();
     let qty = quantity.to_string();
 

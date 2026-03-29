@@ -6,7 +6,7 @@ use crate::clients::github::GitHubClient;
 use crate::models::OnboardMessage;
 use crate::WorkerState;
 
-/// Run onboard pass: analyze each repo and commit .d3ftly/AGENTS.md.
+/// Run onboard pass: analyze each repo and commit .coderhelm/AGENTS.md.
 pub async fn run(
     state: &WorkerState,
     msg: OnboardMessage,
@@ -92,7 +92,7 @@ pub async fn run(
         let repo_list: Vec<String> = enabled_repos.iter().map(|r| format!("- **{r}**")).collect();
         let global_content = format!(
             "# Organization Agent Context\n\n\
-             This organization has {} repositories configured with d3ftly:\n\n\
+             This organization has {} repositories configured with Coderhelm:\n\n\
              {}\n",
             enabled_repos.len(),
             repo_list.join("\n")

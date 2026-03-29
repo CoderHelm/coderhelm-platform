@@ -14,7 +14,7 @@ export class BillingStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: BillingStackProps) {
     super(scope, id, props);
 
-    const prefix = `d3ftly-${props.stage}`;
+    const prefix = `coderhelm-${props.stage}`;
 
     // S3 bucket for invoice PDFs (presigned URL downloads)
     this.invoiceBucket = new s3.Bucket(this, "InvoiceBucket", {

@@ -41,7 +41,7 @@ pub async fn handle(
         .and_then(|v| v.as_str())
         .or_else(|| {
             payload
-                .get("d3ftly")
+                .get("coderhelm")
                 .and_then(|d| d.get("repo_owner"))
                 .and_then(|v| v.as_str())
         })
@@ -53,7 +53,7 @@ pub async fn handle(
         .and_then(|v| v.as_str())
         .or_else(|| {
             payload
-                .get("d3ftly")
+                .get("coderhelm")
                 .and_then(|d| d.get("repo_name"))
                 .and_then(|v| v.as_str())
         })
@@ -66,7 +66,7 @@ pub async fn handle(
         .and_then(|v| v.as_u64())
         .or_else(|| {
             payload
-                .get("d3ftly")
+                .get("coderhelm")
                 .and_then(|d| d.get("installation_id"))
                 .and_then(|v| v.as_u64())
         });
@@ -76,7 +76,7 @@ pub async fn handle(
         .and_then(|v| v.as_str())
         .or_else(|| {
             payload
-                .get("d3ftly")
+                .get("coderhelm")
                 .and_then(|d| d.get("tenant_id"))
                 .and_then(|v| v.as_str())
         })

@@ -30,7 +30,7 @@ export class ApiStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
 
-    const prefix = `d3ftly-${props.stage}`;
+    const prefix = `coderhelm-${props.stage}`;
     const gatewayAssetPath =
       process.env.GATEWAY_ZIP ?? "../services/gateway/target/lambda/gateway";
 
@@ -69,7 +69,7 @@ export class ApiStack extends cdk.Stack {
     const secrets = secretsmanager.Secret.fromSecretNameV2(
       this,
       "Secrets",
-      `d3ftly/${props.stage}/secrets`
+      `coderhelm/${props.stage}/secrets`
     );
 
     // --- Gateway Lambda (Rust) ---
@@ -99,9 +99,9 @@ export class ApiStack extends cdk.Stack {
         CI_FIX_QUEUE_URL: this.ciFixQueue.queueUrl,
         FEEDBACK_QUEUE_URL: this.feedbackQueue.queueUrl,
         DLQ_URL: dlq.queueUrl,
-        SECRETS_NAME: `d3ftly/${props.stage}/secrets`,
-        SES_FROM_ADDRESS: "notifications@d3ftly.com",
-        SES_TEMPLATE_PREFIX: `d3ftly-${props.stage}`,
+        SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
+        SES_FROM_ADDRESS: "notifications@coderhelm.com",
+        SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
         RUST_LOG: "info",
       },
     });
@@ -124,7 +124,7 @@ export class ApiStack extends cdk.Stack {
       corsPreflight: {
         allowOrigins: [
           props.stage === "prod"
-            ? "https://app.d3ftly.com"
+            ? "https://app.coderhelm.com"
             : "http://localhost:3000",
         ],
         allowMethods: [
@@ -188,12 +188,12 @@ export class ApiStack extends cdk.Stack {
       value: httpApi.apiEndpoint,
     });
 
-    // --- Custom domain: api.d3ftly.com ---
+    // --- Custom domain: api.coderhelm.com ---
     if (props.stage === "prod") {
-      const apiDomain = "api.d3ftly.com";
+      const apiDomain = "api.coderhelm.com";
 
       const hostedZone = route53.HostedZone.fromLookup(this, "Zone", {
-        domainName: "d3ftly.com",
+        domainName: "coderhelm.com",
       });
 
       const certificate = new acm.Certificate(this, "ApiCertificate", {
