@@ -113,7 +113,7 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
     }
 
     // Report in units of 1K tokens (round up)
-    let overage_1k = (new_overage + 999) / 1000;
+    let overage_1k = new_overage.div_ceil(1000);
     let ts = chrono::Utc::now().timestamp().to_string();
     let qty = overage_1k.to_string();
 
