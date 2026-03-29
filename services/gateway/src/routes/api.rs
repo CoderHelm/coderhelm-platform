@@ -485,7 +485,37 @@ pub async fn update_repo(
             info!(repo = %repo, "Dispatched onboarding for newly enabled repo");
         }
 
-        // Also trigger infrastructure analysis for the tenant
+        // Trigger per-repo infrastructure analysis
+        let per_repo_msg = WorkerMessage::InfraAnalyze(InfraAnalyzeMessage {
+            tenant_id: claims.tenant_id.clone(),
+            triggered_by: claims.github_login.clone(),
+            repo: Some(repo.clone()),
+        });
+        if let Ok(body) = serde_json::to_string(&per_repo_msg) {
+            let now = chrono::Utc::now().to_rfc3339();
+            let sk = format!("INFRA#REPO#{repo}");
+            let _ = state
+                .dynamo
+                .put_item()
+                .table_name(&state.config.table_name)
+                .item("pk", attr_s(&claims.tenant_id))
+                .item("sk", attr_s(&sk))
+                .item("status", attr_s("pending"))
+                .item("has_infra", AttributeValue::Bool(false))
+                .item("updated_at", attr_s(&now))
+                .send()
+                .await;
+            let _ = state
+                .sqs
+                .send_message()
+                .queue_url(&state.config.ticket_queue_url)
+                .message_body(&body)
+                .send()
+                .await;
+            info!(repo = %repo, "Dispatched per-repo infra analysis");
+        }
+
+        // Also trigger tenant-wide infrastructure analysis
         let infra_msg = WorkerMessage::InfraAnalyze(InfraAnalyzeMessage {
             tenant_id: claims.tenant_id.clone(),
             triggered_by: claims.github_login.clone(),
@@ -511,7 +541,46 @@ pub async fn update_repo(
                 .message_body(&body)
                 .send()
                 .await;
-            info!(repo = %repo, "Dispatched infra analysis for tenant");
+            info!(repo = %repo, "Dispatched tenant-wide infra analysis");
+        }
+    } else {
+        // When disabling a repo, remove its per-repo infra and refresh tenant-wide
+        let sk = format!("INFRA#REPO#{repo}");
+        let _ = state
+            .dynamo
+            .delete_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&claims.tenant_id))
+            .key("sk", attr_s(&sk))
+            .send()
+            .await;
+
+        let infra_msg = WorkerMessage::InfraAnalyze(InfraAnalyzeMessage {
+            tenant_id: claims.tenant_id.clone(),
+            triggered_by: claims.github_login.clone(),
+            repo: None,
+        });
+        if let Ok(body) = serde_json::to_string(&infra_msg) {
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = state
+                .dynamo
+                .put_item()
+                .table_name(&state.config.table_name)
+                .item("pk", attr_s(&claims.tenant_id))
+                .item("sk", attr_s("INFRA#analysis"))
+                .item("status", attr_s("pending"))
+                .item("has_infra", AttributeValue::Bool(false))
+                .item("updated_at", attr_s(&now))
+                .send()
+                .await;
+            let _ = state
+                .sqs
+                .send_message()
+                .queue_url(&state.config.ticket_queue_url)
+                .message_body(&body)
+                .send()
+                .await;
+            info!(repo = %repo, "Dispatched infra refresh after repo disable");
         }
     }
 

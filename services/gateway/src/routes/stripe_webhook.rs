@@ -277,10 +277,12 @@ async fn handle_subscription_cancelled(
     let tenant_id = resolve_tenant(state, customer_id).await?;
 
     // current_period_end = when access expires
-    let period_end = subscription["current_period_end"].as_u64().unwrap_or(0);
-    let access_until = chrono::DateTime::from_timestamp(period_end as i64, 0)
+    let access_until = subscription["current_period_end"]
+        .as_u64()
+        .filter(|&ts| ts > 0)
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
         .map(|dt| dt.format("%B %d, %Y").to_string())
-        .unwrap_or_else(|| "immediately".to_string());
+        .unwrap_or_else(|| "the end of your current billing period".to_string());
 
     state
         .dynamo
@@ -290,9 +292,10 @@ async fn handle_subscription_cancelled(
         .key("sk", attr_s("BILLING"))
         .update_expression(
             "SET subscription_status = :status, cancelled_at = :t, \
-             access_until = :end, updated_at = :t",
+             access_until = :end, updated_at = :t, previous_status = :prev",
         )
-        .expression_attribute_values(":status", attr_s("cancelled"))
+        .expression_attribute_values(":status", attr_s("free"))
+        .expression_attribute_values(":prev", attr_s("cancelled"))
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
         .expression_attribute_values(":end", attr_s(&access_until))
         .send()

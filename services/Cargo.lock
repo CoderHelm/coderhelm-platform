@@ -1227,6 +1227,7 @@ name = "gateway"
 version = "0.1.0"
 dependencies = [
  "aws-config",
+ "aws-sdk-bedrockruntime",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
  "aws-sdk-secretsmanager",

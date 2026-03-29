@@ -20,51 +20,56 @@ Output format — respond with EXACTLY two blocks and nothing else:
 [{"severity":"warning","category":"security","title":"...","detail":"...","file":"optional/path.ts"}]
 ```
 
-─── DIAGRAM RULES ───
+─── DIAGRAM RULES (architecture-beta syntax) ───
 
-SYNTAX (architecture-beta only):
-- Groups MUST have (icon) before [Label]: group myGroup(cloud)[Label]
-- Labels in [] must use only alphanumeric chars, spaces, hyphens, periods. NO slashes, brackets, braces.
-- IDs must be alphanumeric + underscores only. No hyphens in IDs.
-- Each port (T/B/L/R) supports ONE edge only. Use junctions for fan-out/fan-in.
-- FORBIDDEN syntax: -->|text|, <--, subgraph/end — these are flowchart, not architecture-beta.
+CRITICAL SYNTAX:
+- First line must be: architecture-beta
+- Groups: group {id}({icon})[{Label}]  — icon is REQUIRED in parens before label
+- Services: service {id}({icon})[{Label}] in {group_id}  — "in {group}" is REQUIRED
+- Edges: {svcId}:{T|B|L|R} --> {T|B|L|R}:{svcId}  — arrows connect ports
+- Junctions: junction {id} in {group_id}
+- IDs: lowercase alphanumeric + underscores ONLY. No hyphens, no dots, no special chars.
+- Labels in []: alphanumeric, spaces, hyphens, periods ONLY. No slashes / brackets / braces / colons.
+- DECLARE groups and services FIRST, then edges LAST (edges reference declared IDs).
+- Each port (T/B/L/R) supports ONE edge. Use junctions for fan-out.
+- FORBIDDEN: -->|text|, <--, subgraph/end, ---, -.-, flowchart syntax of any kind.
 
-ICONS — use these logos:aws-* icons:
+ICONS — use logos:aws-* icons:
   logos:aws-lambda, logos:aws-dynamodb, logos:aws-sqs, logos:aws-s3,
   logos:aws-cloudfront, logos:aws-api-gateway, logos:aws-ses,
   logos:aws-secrets-manager, logos:aws-cloudwatch, logos:aws-waf,
-  logos:aws-route53, logos:aws-iam, logos:aws-sns, logos:aws-eventbridge.
+  logos:aws-route53, logos:aws-iam, logos:aws-sns, logos:aws-eventbridge,
+  logos:aws-ec2, logos:aws-ecs, logos:aws-step-functions, logos:aws-cognito.
 
-LAYOUT STRATEGY — this is the most important part:
-1. MAX 8-10 services total. Merge related resources (e.g. "3 SQS queues" → one SQS node, multiple Lambdas with similar role → one Lambda node). Only show the MAIN data path, not every supporting resource.
-2. Use exactly 3 groups arranged left-to-right:
+LAYOUT STRATEGY:
+1. MAX 8-10 services total. Merge related resources (e.g. "3 SQS queues" → one SQS node). Only show the MAIN data path.
+2. Use exactly 3 groups, left-to-right:
    - group edge(cloud)[Edge] — CDN, WAF, API Gateway, Route53
-   - group compute(cloud)[Compute] — Lambdas, ECS, step functions
+   - group compute(cloud)[Compute] — Lambdas, ECS, Step Functions
    - group data(cloud)[Data] — DynamoDB, S3, SQS, SNS, SES, EventBridge
-3. Within each group, stack services VERTICALLY (use T/B ports between them).
-4. Between groups, connect HORIZONTALLY (use R-->L ports).
-5. ALL edges flow LEFT to RIGHT. Never connect right-group back to left-group.
-6. If a service fans out to 3+, use ONE junction:
-   junction jFan in compute
-   svc:R --> L:jFan
-   jFan:R --> L:targetA
-   jFan:T --> B:targetB
-   jFan:B --> T:targetC
+3. Within groups: stack vertically (T/B ports). Between groups: connect horizontally (R/L ports).
+4. ALL edges flow LEFT → RIGHT. Never connect right-group back to left-group.
+5. For fan-out to 3+ targets, use ONE junction:
+   junction j_fan in compute
+   svc:R --> L:j_fan
+   j_fan:R --> L:target_a
+   j_fan:T --> B:target_b
+   j_fan:B --> T:target_c
 
-EXAMPLE of a clean 8-service diagram:
+EXAMPLE of a clean diagram:
 architecture-beta
     group edge(cloud)[Edge]
-        service cdn(logos:aws-cloudfront)[CloudFront] in edge
-        service apigw(logos:aws-api-gateway)[API Gateway] in edge
+    service cdn(logos:aws-cloudfront)[CloudFront] in edge
+    service apigw(logos:aws-api-gateway)[API Gateway] in edge
 
     group compute(cloud)[Compute]
-        service api_fn(logos:aws-lambda)[API Lambda] in compute
-        service worker_fn(logos:aws-lambda)[Worker Lambda] in compute
+    service api_fn(logos:aws-lambda)[API Lambda] in compute
+    service worker_fn(logos:aws-lambda)[Worker Lambda] in compute
 
     group data(cloud)[Data]
-        service db(logos:aws-dynamodb)[DynamoDB] in data
-        service queue(logos:aws-sqs)[SQS Queues] in data
-        service storage(logos:aws-s3)[S3] in data
+    service db(logos:aws-dynamodb)[DynamoDB] in data
+    service queue(logos:aws-sqs)[SQS] in data
+    service storage(logos:aws-s3)[S3] in data
 
     cdn:B --> T:apigw
     apigw:R --> L:api_fn
@@ -73,7 +78,7 @@ architecture-beta
     worker_fn:R --> L:queue
     queue:B --> T:storage
 
-Follow this pattern closely. The key is SIMPLICITY — fewer nodes with clear L→R flow.
+The key is SIMPLICITY — fewer nodes, clear left-to-right flow, correct syntax.
 
 ─── FINDINGS RULES ───
 - Only error and warning severity. No info-level notes.
@@ -543,15 +548,39 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
                         "line {line_num}: group missing (icon) before [label]: {trimmed}"
                     ));
                 }
+                // Check group ID doesn't contain hyphens
+                let id_part = before_bracket.split('(').next().unwrap_or("").trim();
+                if id_part.contains('-') {
+                    errors.push(format!(
+                        "line {line_num}: group ID contains hyphen (use underscores): {id_part}"
+                    ));
+                }
             }
         }
 
-        // Check labels don't contain slashes
+        // Check service declarations have "in group_id" and valid IDs
+        if let Some(after_service) = trimmed.strip_prefix("service ") {
+            // Check ID doesn't contain hyphens
+            let id_part = after_service.split('(').next().unwrap_or("").trim();
+            if id_part.contains('-') {
+                errors.push(format!(
+                    "line {line_num}: service ID contains hyphen (use underscores): {id_part}"
+                ));
+            }
+            // Check that service has "in <group>" clause
+            if !after_service.contains(" in ") {
+                errors.push(format!(
+                    "line {line_num}: service missing 'in <group_id>' clause: {trimmed}"
+                ));
+            }
+        }
+
+        // Check labels don't contain forbidden characters
         if let Some(start) = trimmed.find('[') {
             if let Some(end) = trimmed[start..].find(']') {
                 let label = &trimmed[start + 1..start + end];
-                if label.contains('/') {
-                    errors.push(format!("line {line_num}: label contains slash: [{label}]"));
+                if label.contains('/') || label.contains('{') || label.contains('}') || label.contains(':') {
+                    errors.push(format!("line {line_num}: label contains forbidden char: [{label}]"));
                 }
             }
         }
@@ -559,7 +588,7 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
         // Reject flowchart-style pipe labels: -->|label|  or --|label|
         if trimmed.contains("-->|") || trimmed.contains("--|") || trimmed.contains("|-->") {
             errors.push(format!(
-                "line {line_num}: pipe labels not allowed in architecture-beta (flowchart syntax): {trimmed}"
+                "line {line_num}: pipe labels not allowed in architecture-beta: {trimmed}"
             ));
         }
 
@@ -574,6 +603,13 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
         if trimmed.starts_with("subgraph ") || trimmed == "end" {
             errors.push(format!(
                 "line {line_num}: subgraph/end is flowchart syntax, use group in architecture-beta: {trimmed}"
+            ));
+        }
+
+        // Reject dashed edges (not architecture-beta syntax)
+        if trimmed.contains("-.-") || trimmed.contains("---") {
+            errors.push(format!(
+                "line {line_num}: dashed/triple-dash edges not supported in architecture-beta: {trimmed}"
             ));
         }
     }
