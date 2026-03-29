@@ -59,6 +59,7 @@ pub async fn create_plan(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
     let title = body["title"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
     let description = body["description"].as_str().unwrap_or("");
     let repo = body["repo"].as_str().unwrap_or("");
@@ -510,6 +511,7 @@ pub async fn approve_task(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
 ) -> Result<StatusCode, StatusCode> {
+    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
 
@@ -578,6 +580,7 @@ pub async fn execute_plan(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
     validate_plan_id(&plan_id)?;
 
     // Get plan + all tasks

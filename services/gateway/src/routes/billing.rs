@@ -905,6 +905,40 @@ pub async fn get_billing_customer(
     })))
 }
 
+/// Check if tenant has an active subscription. Returns Ok(()) if active, 402 if not.
+pub async fn require_active_subscription(
+    state: &AppState,
+    tenant_id: &str,
+) -> Result<(), StatusCode> {
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(tenant_id))
+        .key("sk", attr_s("BILLING"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch billing record: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let status = result
+        .item()
+        .and_then(|item| item.get("subscription_status"))
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("none");
+
+    match status {
+        "active" => Ok(()),
+        _ => {
+            warn!("Tenant {tenant_id} blocked: subscription_status={status}");
+            Err(StatusCode::PAYMENT_REQUIRED)
+        }
+    }
+}
+
 async fn get_stripe_customer_id(state: &AppState, tenant_id: &str) -> Result<String, StatusCode> {
     let result = state
         .dynamo
