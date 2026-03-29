@@ -20,6 +20,7 @@ pub struct AppState {
     pub sqs: aws_sdk_sqs::Client,
     pub ses: aws_sdk_sesv2::Client,
     pub s3: aws_sdk_s3::Client,
+    pub bedrock: aws_sdk_bedrockruntime::Client,
     pub http: reqwest::Client,
     pub secrets: models::Secrets,
     pub config: models::Config,
@@ -39,6 +40,7 @@ async fn main() -> Result<(), Error> {
     let sqs = aws_sdk_sqs::Client::new(&aws_config);
     let ses = aws_sdk_sesv2::Client::new(&aws_config);
     let s3 = aws_sdk_s3::Client::new(&aws_config);
+    let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
 
     // Load secrets from Secrets Manager
@@ -53,6 +55,7 @@ async fn main() -> Result<(), Error> {
         sqs,
         ses,
         s3,
+        bedrock,
         http: reqwest::Client::new(),
         secrets,
         config,
@@ -176,6 +179,7 @@ async fn main() -> Result<(), Error> {
             "/plans",
             get(routes::plans::list_plans).post(routes::plans::create_plan),
         )
+        .route("/plans/chat", post(routes::plans::plan_chat))
         .route(
             "/plans/:plan_id",
             get(routes::plans::get_plan)

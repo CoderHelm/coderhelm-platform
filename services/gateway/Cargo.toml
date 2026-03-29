@@ -24,6 +24,7 @@ aws-sdk-sqs = "1"
 aws-sdk-secretsmanager = "1"
 aws-sdk-sesv2 = "1"
 aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-bedrockruntime = "1"
 
 # Auth
 jsonwebtoken = "9"

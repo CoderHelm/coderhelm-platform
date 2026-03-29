@@ -36,6 +36,8 @@ impl Config {
 pub struct Secrets {
     pub github_app_id: String,
     pub github_private_key: String,
+    #[serde(default)]
+    pub stripe_secret_key: Option<String>,
 }
 
 impl Secrets {

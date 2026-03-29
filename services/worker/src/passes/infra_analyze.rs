@@ -6,65 +6,78 @@ use crate::WorkerState;
 
 /// System prompt for infra analysis.
 const SYSTEM: &str = r#"You are an expert AWS infrastructure reviewer.
-Given infrastructure-as-code (CDK, Terraform, Serverless Framework, SAM/CloudFormation, or Pulumi) extracted from a repository, you will:
+Given infrastructure-as-code extracted from a repository, you will:
 1. Generate a mermaid architecture-beta diagram of the infrastructure.
-2. List findings — only severity error or warning. Category: security, performance, cost, or reliability.
+2. List findings — only severity error or warning.
 
 Output format — respond with EXACTLY two blocks and nothing else:
 
 ```mermaid
-<mermaid architecture-beta diagram here>
+<diagram>
 ```
 
 ```json
-[
-  {"severity": "warning", "category": "security", "title": "...", "detail": "...", "file": "optional/path.ts"}
-]
+[{"severity":"warning","category":"security","title":"...","detail":"...","file":"optional/path.ts"}]
 ```
 
-Rules for the mermaid diagram:
-- Use architecture-beta syntax only.
-- Use logos:aws-* icons where available:
+─── DIAGRAM RULES ───
+
+SYNTAX (architecture-beta only):
+- Groups MUST have (icon) before [Label]: group myGroup(cloud)[Label]
+- Labels in [] must use only alphanumeric chars, spaces, hyphens, periods. NO slashes, brackets, braces.
+- IDs must be alphanumeric + underscores only. No hyphens in IDs.
+- Each port (T/B/L/R) supports ONE edge only. Use junctions for fan-out/fan-in.
+- FORBIDDEN syntax: -->|text|, <--, subgraph/end — these are flowchart, not architecture-beta.
+
+ICONS — use these logos:aws-* icons:
   logos:aws-lambda, logos:aws-dynamodb, logos:aws-sqs, logos:aws-s3,
   logos:aws-cloudfront, logos:aws-api-gateway, logos:aws-ses,
   logos:aws-secrets-manager, logos:aws-cloudwatch, logos:aws-waf,
   logos:aws-route53, logos:aws-iam, logos:aws-sns, logos:aws-eventbridge.
-- CRITICAL SYNTAX RULES (violating these causes parse errors):
-  * Groups MUST include (icon): group myGroup(cloud)[Label]. NEVER write group myGroup[Label] without (icon).
-  * Labels inside [] must NOT contain special characters: no slashes /, no brackets [], no braces {}.
-  * Use only alphanumeric, spaces, hyphens, and periods in labels.
-  * Service IDs and group IDs must be alphanumeric with underscores only. No hyphens in IDs.
-  * Each service port (T/B/L/R) can only have ONE edge. If you need multiple edges from a service, use a junction.
-  * NEVER use pipe labels like -->|text| or --|text|— that is flowchart syntax, NOT architecture-beta.
-  * NEVER use reverse arrows <--. Only use --> (forward arrow) or -- (no arrow). Swap service positions instead.
-  * NEVER use subgraph/end. Only use group.
-- Group services into logical tiers: edge, compute, data, async.
-- Keep it under 15 services — collapse related resources where needed.
-- Flow left to right: internet → CDN/WAF → API → compute → data.
-- MANDATORY: If a service has 3+ edges, you MUST use a junction. Never draw 3+ edges directly from one service.
-  Example — fan-out from Lambda to 3 targets:
-  junction jFan in computeGroup
-  lambda:R --> L:jFan
-  jFan:R --> L:targetA
-  jFan:T --> B:targetB
-  jFan:B --> T:targetC
-  Example — fan-in from 3 sources to one service:
-  junction jIn
-  srcA:R --> L:jIn
-  srcB:B --> T:jIn
-  srcC:T --> B:jIn
-  jIn:R --> L:target
-- Use MULTIPLE junctions when a service connects to 5+ others. Chain junctions: svc -> j1 -> j2, each junction fans to max 3 services.
-- Place junctions INSIDE the same group as the source service.
-- Avoid crossing edges. Place services so edges flow in the same direction.
-- Each edge uses exactly one direction pair: R-->L (left to right), B-->T (top to bottom), L-->R (right to left), or T-->B (bottom to top).
-- Do NOT create edges between services in different groups that would cross other groups. Route through junctions instead.
-- Arrange services in a clean grid. Services in the same group should align horizontally or vertically.
 
-Rules for findings:
-- Only output error and warning severity. Do NOT output info-level notes.
+LAYOUT STRATEGY — this is the most important part:
+1. MAX 8-10 services total. Merge related resources (e.g. "3 SQS queues" → one SQS node, multiple Lambdas with similar role → one Lambda node). Only show the MAIN data path, not every supporting resource.
+2. Use exactly 3 groups arranged left-to-right:
+   - group edge(cloud)[Edge] — CDN, WAF, API Gateway, Route53
+   - group compute(cloud)[Compute] — Lambdas, ECS, step functions
+   - group data(cloud)[Data] — DynamoDB, S3, SQS, SNS, SES, EventBridge
+3. Within each group, stack services VERTICALLY (use T/B ports between them).
+4. Between groups, connect HORIZONTALLY (use R-->L ports).
+5. ALL edges flow LEFT to RIGHT. Never connect right-group back to left-group.
+6. If a service fans out to 3+, use ONE junction:
+   junction jFan in compute
+   svc:R --> L:jFan
+   jFan:R --> L:targetA
+   jFan:T --> B:targetB
+   jFan:B --> T:targetC
+
+EXAMPLE of a clean 8-service diagram:
+architecture-beta
+    group edge(cloud)[Edge]
+        service cdn(logos:aws-cloudfront)[CloudFront] in edge
+        service apigw(logos:aws-api-gateway)[API Gateway] in edge
+
+    group compute(cloud)[Compute]
+        service api_fn(logos:aws-lambda)[API Lambda] in compute
+        service worker_fn(logos:aws-lambda)[Worker Lambda] in compute
+
+    group data(cloud)[Data]
+        service db(logos:aws-dynamodb)[DynamoDB] in data
+        service queue(logos:aws-sqs)[SQS Queues] in data
+        service storage(logos:aws-s3)[S3] in data
+
+    cdn:B --> T:apigw
+    apigw:R --> L:api_fn
+    api_fn:B --> T:worker_fn
+    api_fn:R --> L:db
+    worker_fn:R --> L:queue
+    queue:B --> T:storage
+
+Follow this pattern closely. The key is SIMPLICITY — fewer nodes with clear L→R flow.
+
+─── FINDINGS RULES ───
+- Only error and warning severity. No info-level notes.
 - Focus on actionable security risks, reliability gaps, or cost issues.
-- Omit general best-practice suggestions.
 "#;
 
 pub async fn run(
@@ -434,7 +447,7 @@ async fn call_bedrock_retry(
         "Analyze this infrastructure code and generate the diagram and findings:\n\n{code_context}"
     );
     let fix_prompt = format!(
-        "Your previous diagram had syntax errors:\n{errors}\n\nHere was the broken diagram:\n```mermaid\n{bad_diagram}\n```\n\nFix ALL the syntax errors and regenerate. Remember: groups MUST have (icon) before [label], labels must not contain slashes, NO pipe labels (-->|text|), NO reverse arrows (<--), NO subgraph/end (use group instead), and services with 3+ connections need junctions."
+        "Your previous diagram had syntax errors:\n{errors}\n\nHere was the broken diagram:\n```mermaid\n{bad_diagram}\n```\n\nFix ALL errors and regenerate. Rules: groups need (icon) before [label], no slashes in labels, NO -->|text| or <-- or subgraph. MAX 8-10 services in 3 groups (edge, compute, data) flowing left to right. Use junctions for 3+ edges from one port."
     );
 
     let messages = vec![
