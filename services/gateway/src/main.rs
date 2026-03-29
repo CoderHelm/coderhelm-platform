@@ -1,7 +1,7 @@
 use axum::{
     http::header,
     middleware as axum_middleware,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Router,
 };
 use lambda_http::{run, Error};
@@ -151,6 +151,19 @@ async fn main() -> Result<(), Error> {
             "/billing/payment-method",
             post(routes::billing::create_setup_intent),
         )
+        .route(
+            "/billing/payment-methods",
+            get(routes::billing::list_payment_methods),
+        )
+        .route(
+            "/billing/payment-methods/:pm_id",
+            delete(routes::billing::delete_payment_method),
+        )
+        .route(
+            "/billing/customer",
+            get(routes::billing::get_billing_customer),
+        )
+        .route("/billing/email", put(routes::billing::update_billing_email))
         .route("/billing/invoices", get(routes::billing::list_invoices))
         .route(
             "/billing/invoices/:invoice_id/pdf",
