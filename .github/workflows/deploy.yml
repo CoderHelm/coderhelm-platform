@@ -76,7 +76,7 @@ jobs:
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::654654210434:role/d3ftly-github-deploy
+          role-to-assume: arn:aws:iam::654654210434:role/coderhelm-github-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Stripe setup (idempotent)

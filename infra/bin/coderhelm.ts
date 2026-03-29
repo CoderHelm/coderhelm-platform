@@ -17,7 +17,7 @@ const env = {
 };
 
 const stage = app.node.tryGetContext("stage") ?? "prod";
-const prefix = `d3ftly-${stage}`;
+const prefix = `coderhelm-${stage}`;
 
 // --- Core Infrastructure ---
 

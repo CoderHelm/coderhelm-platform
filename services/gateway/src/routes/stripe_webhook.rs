@@ -184,7 +184,7 @@ async fn handle_payment_succeeded(
 
     let plan_name = invoice["lines"]["data"][0]["description"]
         .as_str()
-        .unwrap_or("d3ftly Pro");
+        .unwrap_or("Coderhelm Pro");
 
     // Send payment receipt email
     send_billing_email(
@@ -197,7 +197,7 @@ async fn handle_payment_succeeded(
             "date": now.format("%B %d, %Y").to_string(),
             "plan_name": plan_name,
             "card_last4": card_last4,
-            "invoice_url": format!("https://app.d3ftly.com/dashboard/billing/invoices/{}", invoice_id),
+            "invoice_url": format!("https://app.coderhelm.com/dashboard/billing/invoices/{}", invoice_id),
         }),
     )
     .await;
@@ -362,7 +362,7 @@ async fn handle_invoice_finalized(
     let period = format!("{} — {}", fmt_date(period_start), fmt_date(period_end));
     let plan_name = invoice["lines"]["data"][0]["description"]
         .as_str()
-        .unwrap_or("d3ftly Pro");
+        .unwrap_or("Coderhelm Pro");
 
     // Store invoice record
     state
@@ -446,7 +446,7 @@ async fn handle_invoice_finalized(
             "plan_name": plan_name,
             "total_runs": total_runs,
             "usage_cost": format!("{:.2}", usage_cost),
-            "invoice_url": format!("https://app.d3ftly.com/dashboard/billing/invoices/{}", invoice_id),
+            "invoice_url": format!("https://app.coderhelm.com/dashboard/billing/invoices/{}", invoice_id),
         }),
     )
     .await;

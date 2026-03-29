@@ -21,7 +21,7 @@ pub struct CallbackParams {
 pub async fn login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let client_id = &state.secrets.github_client_id;
     let redirect_uri = if state.config.stage == "prod" {
-        "https://api.d3ftly.com/auth/callback"
+        "https://api.coderhelm.com/auth/callback"
     } else {
         "http://localhost:3000/auth/callback"
     };
@@ -66,7 +66,7 @@ pub async fn callback(
     let user_resp = client
         .get("https://api.github.com/user")
         .header("Authorization", format!("Bearer {access_token}"))
-        .header("User-Agent", "d3ftly")
+        .header("User-Agent", "Coderhelm")
         .send()
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -82,7 +82,7 @@ pub async fn callback(
     let installs_resp = client
         .get("https://api.github.com/user/installations")
         .header("Authorization", format!("Bearer {access_token}"))
-        .header("User-Agent", "d3ftly")
+        .header("User-Agent", "Coderhelm")
         .send()
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -92,16 +92,16 @@ pub async fn callback(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-    // Find the first d3ftly installation
+    // Find the first Coderhelm installation
     let installation_id = installs["installations"]
         .as_array()
         .and_then(|arr| {
             arr.iter()
-                .find(|i| i["app_slug"].as_str() == Some("d3ftly-agent"))
+                .find(|i| i["app_slug"].as_str() == Some("coderhelm-agent"))
                 .and_then(|i| i["id"].as_u64())
         })
         .ok_or_else(|| {
-            error!("User {github_login} has no d3ftly installation");
+            error!("User {github_login} has no Coderhelm installation");
             StatusCode::FORBIDDEN
         })?;
 
@@ -145,13 +145,14 @@ pub async fn callback(
 
     // Set cookie and redirect to dashboard
     let dashboard_url = if state.config.stage == "prod" {
-        "https://app.d3ftly.com/dashboard"
+        "https://app.coderhelm.com/dashboard"
     } else {
         "http://localhost:3000/dashboard"
     };
 
-    let cookie =
-        format!("d3ftly_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400");
+    let cookie = format!(
+        "coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+    );
 
     Ok((
         [
@@ -165,7 +166,7 @@ pub async fn callback(
 
 /// Logout — clear session cookie.
 pub async fn logout() -> impl IntoResponse {
-    let cookie = "d3ftly_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
+    let cookie = "coderhelm_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
     ([(header::SET_COOKIE, cookie.to_string())], StatusCode::OK)
 }
 

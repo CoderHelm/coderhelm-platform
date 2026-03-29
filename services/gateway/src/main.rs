@@ -43,7 +43,7 @@ async fn main() -> Result<(), Error> {
 
     // Load secrets from Secrets Manager
     let secrets_name =
-        std::env::var("SECRETS_NAME").unwrap_or_else(|_| "d3ftly/prod/secrets".to_string());
+        std::env::var("SECRETS_NAME").unwrap_or_else(|_| "coderhelm/prod/secrets".to_string());
     let secrets = models::Secrets::load(&sm, &secrets_name).await?;
 
     let config = models::Config::from_env();

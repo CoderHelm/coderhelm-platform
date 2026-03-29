@@ -26,14 +26,14 @@ export class WorkerStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: WorkerStackProps) {
     super(scope, id, props);
 
-    const prefix = `d3ftly-${props.stage}`;
+    const prefix = `coderhelm-${props.stage}`;
     const workerAssetPath =
       process.env.WORKER_ZIP ?? "../services/worker/target/lambda/worker";
 
     const secrets = secretsmanager.Secret.fromSecretNameV2(
       this,
       "Secrets",
-      `d3ftly/${props.stage}/secrets`
+      `coderhelm/${props.stage}/secrets`
     );
 
     // --- Worker Lambda (Rust) ---
@@ -59,10 +59,10 @@ export class WorkerStack extends cdk.Stack {
         RUNS_TABLE_NAME: props.runsTable.tableName,
         ANALYTICS_TABLE_NAME: props.analyticsTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
-        SECRETS_NAME: `d3ftly/${props.stage}/secrets`,
+        SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         MODEL_ID: process.env.MODEL_ID || "us.anthropic.claude-opus-4-6-v1",
-        SES_FROM_ADDRESS: "notifications@d3ftly.com",
-        SES_TEMPLATE_PREFIX: `d3ftly-${props.stage}`,
+        SES_FROM_ADDRESS: "notifications@coderhelm.com",
+        SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
         RUST_LOG: "info",
       },
     });

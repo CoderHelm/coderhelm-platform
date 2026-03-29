@@ -87,7 +87,7 @@ async fn run_passes(
                 &msg.repo_name,
                 msg.issue_number,
                 &format!(
-                    "🔄 **d3ftly is working on this**\n\n| Phase | Status |\n|-------|--------|\n| Triage | 🔄 In progress |\n| Plan | ⏳ Pending |\n| Implement | ⏳ Pending |\n| Review | ⏳ Pending |\n| PR | ⏳ Pending |\n\n[View run →](https://app.d3ftly.com/dashboard/runs/{})",
+                    "🔄 **Coderhelm is working on this**\n\n| Phase | Status |\n|-------|--------|\n| Triage | 🔄 In progress |\n| Plan | ⏳ Pending |\n| Implement | ⏳ Pending |\n| Review | ⏳ Pending |\n| PR | ⏳ Pending |\n\n[View run →](https://app.coderhelm.com/dashboard/runs/{})",
                     run_id,
                 ),
             )
@@ -106,7 +106,7 @@ async fn run_passes(
 
     // --- Pass 3: Implement ---
     update_pass(state, &msg.tenant_id, run_id, "implement").await?;
-    let branch_name = format!("d3ftly/{}", msg.ticket_id.to_lowercase());
+    let branch_name = format!("coderhelm/{}", msg.ticket_id.to_lowercase());
     let impl_result = implement::run(
         state,
         msg,
@@ -163,7 +163,7 @@ async fn run_passes(
                 &msg.repo_name,
                 msg.issue_number,
                 &format!(
-                    "✅ **d3ftly completed this ticket**\n\n**PR**: {}\n**Files**: {} modified\n**Cost**: ${:.2}\n\n[View run →](https://app.d3ftly.com/dashboard/runs/{})",
+                    "✅ **Coderhelm completed this ticket**\n\n**PR**: {}\n**Files**: {} modified\n**Cost**: ${:.2}\n\n[View run →](https://app.coderhelm.com/dashboard/runs/{})",
                     pr_result.pr_url,
                     impl_result.files_modified.len(),
                     usage.estimated_cost(),

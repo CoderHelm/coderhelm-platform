@@ -1,4 +1,4 @@
-# d3ftly Setup Guide
+# coderhelm Setup Guide
 
 ## Prerequisites
 
@@ -9,7 +9,7 @@
 
 ## AWS Secrets Manager
 
-Create a secret named `d3ftly/<stage>/secrets` with this JSON:
+Create a secret named `coderhelm/<stage>/secrets` with this JSON:
 
 ```json
 {
@@ -43,8 +43,8 @@ Or use the GitHub Actions workflow — push to `main` with `CI:DEPLOY_PROD` in t
 ## GitHub App Registration
 
 1. Go to https://github.com/settings/apps/new
-2. Homepage URL: `https://d3ftly.com`
-3. Webhook URL: `https://api.d3ftly.com/webhooks/github`
+2. Homepage URL: `https://coderhelm.com`
+3. Webhook URL: `https://api.coderhelm.com/webhooks/github`
 4. Permissions: Contents (RW), Issues (RW), Pull requests (RW), Checks (R), Metadata (R)
 5. Events: Issues, Issue comment, Pull request review, Check run, Installation
 6. Generate a private key and store in Secrets Manager

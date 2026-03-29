@@ -13,27 +13,27 @@ exports.handler = async (event, context) => {
   }
 
   // Load config from Forge storage (set via admin page)
-  const config = await storage.get("d3ftly-config");
+  const config = await storage.get("coderhelm-config");
   if (!config || !config.installationId) {
-    console.log(`Skipping ${issue.key} — d3ftly not configured. Go to Apps > d3ftly Settings.`);
+    console.log(`Skipping ${issue.key} — coderhelm not configured. Go to Apps > coderhelm Settings.`);
     return;
   }
 
-  // Check for d3ftly label: d3ftly:owner/repo (explicit) or d3ftly (auto-resolve)
+  // Check for coderhelm label: coderhelm:owner/repo (explicit) or coderhelm (auto-resolve)
   const labels = fields.labels || [];
-  const repoLabel = labels.find((l) => l.startsWith("d3ftly:"));
-  const bareLabel = labels.some((l) => l === "d3ftly");
+  const repoLabel = labels.find((l) => l.startsWith("coderhelm:"));
+  const bareLabel = labels.some((l) => l === "coderhelm");
 
   let repoOwner, repoName;
 
   if (repoLabel) {
-    [repoOwner, repoName] = repoLabel.replace("d3ftly:", "").split("/");
+    [repoOwner, repoName] = repoLabel.replace("coderhelm:", "").split("/");
     if (!repoOwner || !repoName) {
       console.log(`Skipping ${issue.key} — invalid label: ${repoLabel}`);
       return;
     }
   } else if (!bareLabel) {
-    console.log(`Skipping ${issue.key} — no d3ftly label`);
+    console.log(`Skipping ${issue.key} — no coderhelm label`);
     return;
   }
 
@@ -51,7 +51,7 @@ exports.handler = async (event, context) => {
       },
     },
     user: { displayName: assignee.displayName || "jira" },
-    d3ftly: {
+    coderhelm: {
       repo_owner: repoOwner || undefined,
       repo_name: repoName || undefined,
       installation_id: parseInt(config.installationId, 10),
@@ -59,7 +59,7 @@ exports.handler = async (event, context) => {
     },
   };
 
-  const response = await fetch("https://api.d3ftly.com/webhooks/jira", {
+  const response = await fetch("https://api.coderhelm.com/webhooks/jira", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),

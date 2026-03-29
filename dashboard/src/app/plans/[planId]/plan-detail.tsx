@@ -398,7 +398,7 @@ export default function PlanDetailPage() {
       {/* Execute hint */}
       {draftCount > 0 && plan.status === "draft" && (
         <p className="text-xs text-zinc-600 mt-6">
-          Approve the tasks you want d3ftly to work on, then click Execute to create GitHub issues and start the runs in order.
+          Approve the tasks you want coderhelm to work on, then click Execute to create GitHub issues and start the runs in order.
         </p>
       )}
     </div>

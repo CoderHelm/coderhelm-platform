@@ -1,16 +1,16 @@
 modules:
   trigger:
-    - key: d3ftly-jira-trigger
+    - key: coderhelm-jira-trigger
       function: jiraHandler
       events:
         - avi:jira:assigned:issue
         - avi:jira:updated:issue
   jira:adminPage:
-    - key: d3ftly-admin-page
+    - key: coderhelm-admin-page
       resource: adminPage
       resolver:
         function: adminResolver
-      title: d3ftly Settings
+      title: Coderhelm Settings
   function:
     - key: jiraHandler
       handler: index.handler
@@ -26,16 +26,15 @@ permissions:
   external:
     fetch:
       backend:
-        - https://api.d3ftly.com
+        - https://api.coderhelm.com
 app:
-  name: d3ftly
+  name: Coderhelm
   description: >
-    AI coding agent that turns Jira tickets into pull requests.
-    Assign an issue — d3ftly creates a branch, implements the change,
-    runs your CI, and opens a draft PR. Self-reviews every change
-    before you see it.
+    AI coding agent that turns Jira tickets into pull requests. Assign an issue
+    — Coderhelm creates a branch, implements the change, runs your CI, and opens
+    a draft PR. Self-reviews every change before you see it.
   runtime:
     name: nodejs24.x
     memoryMB: 256
     architecture: arm64
-  id: ari:cloud:ecosystem::app/0f707126-f6c4-4cae-9332-d736617d4d53
+  id: ari:cloud:ecosystem::app/de730821-2955-4d78-836e-55b6e7c23c88

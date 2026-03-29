@@ -23,7 +23,8 @@ pub async fn require_auth(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let token = extract_cookie(cookie_header, "d3ftly_session").ok_or(StatusCode::UNAUTHORIZED)?;
+    let token =
+        extract_cookie(cookie_header, "coderhelm_session").ok_or(StatusCode::UNAUTHORIZED)?;
 
     let claims = jwt::validate_token(token, &state.secrets.jwt_secret)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
@@ -47,12 +48,12 @@ mod tests {
 
     #[test]
     fn test_extract_cookie() {
-        let header = "other=abc; d3ftly_session=xyz123; another=def";
-        assert_eq!(extract_cookie(header, "d3ftly_session"), Some("xyz123"));
+        let header = "other=abc; coderhelm_session=xyz123; another=def";
+        assert_eq!(extract_cookie(header, "coderhelm_session"), Some("xyz123"));
     }
 
     #[test]
     fn test_extract_cookie_missing() {
-        assert_eq!(extract_cookie("other=abc", "d3ftly_session"), None);
+        assert_eq!(extract_cookie("other=abc", "coderhelm_session"), None);
     }
 }

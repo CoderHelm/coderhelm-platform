@@ -70,9 +70,12 @@ pub async fn run(
                 )
                 .await?;
 
-                // Label the issue with "d3ftly" to trigger the ticket pipeline
-                if let Err(e) = github.add_label(owner, repo, issue_number, "d3ftly").await {
-                    error!(task_id, issue_number, error = %e, "Failed to add d3ftly label — issue created but won't auto-run");
+                // Label the issue with "coderhelm" to trigger the ticket pipeline
+                if let Err(e) = github
+                    .add_label(owner, repo, issue_number, "coderhelm")
+                    .await
+                {
+                    error!(task_id, issue_number, error = %e, "Failed to add coderhelm label — issue created but won't auto-run");
                 }
 
                 info!(task_id, issue_number, "Created GitHub issue for task");

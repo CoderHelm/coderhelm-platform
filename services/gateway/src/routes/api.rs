@@ -252,7 +252,7 @@ pub async fn get_jira_integration_check(
         "jira_events_seen": jira_seen,
         "installation_id": installation_id,
         "tenant_id": claims.tenant_id,
-        "webhook_url": "https://api.d3ftly.com/webhooks/jira",
+        "webhook_url": "https://api.coderhelm.com/webhooks/jira",
         "checklist": [
             "Generate a webhook secret below",
             "Create a Jira Automation rule with a Send web request action",
@@ -345,18 +345,18 @@ pub async fn validate_jira_integration_payload(
             .map(str::to_string)
     };
 
-    let repo_owner = top("repo_owner").or_else(|| nested("d3ftly", "repo_owner"));
-    let repo_name = top("repo_name").or_else(|| nested("d3ftly", "repo_name"));
+    let repo_owner = top("repo_owner").or_else(|| nested("coderhelm", "repo_owner"));
+    let repo_name = top("repo_name").or_else(|| nested("coderhelm", "repo_name"));
 
     let installation_id = body
         .get("installation_id")
         .and_then(|v| v.as_u64())
         .or_else(|| {
-            body.get("d3ftly")
+            body.get("coderhelm")
                 .and_then(|v| v.get("installation_id"))
                 .and_then(|v| v.as_u64())
         });
-    let tenant_id = top("tenant_id").or_else(|| nested("d3ftly", "tenant_id"));
+    let tenant_id = top("tenant_id").or_else(|| nested("coderhelm", "tenant_id"));
 
     let issue_key = body
         .get("issue")
@@ -385,10 +385,10 @@ pub async fn validate_jira_integration_payload(
 
     let mut missing = Vec::new();
     if repo_owner.is_none() {
-        missing.push("repo_owner (or d3ftly.repo_owner)");
+        missing.push("repo_owner (or coderhelm.repo_owner)");
     }
     if repo_name.is_none() {
-        missing.push("repo_name (or d3ftly.repo_name)");
+        missing.push("repo_name (or coderhelm.repo_name)");
     }
     if installation_id.is_none() && tenant_id.is_none() {
         missing.push("installation_id (or tenant_id)");

@@ -20,8 +20,8 @@ export class DatabaseStack extends cdk.Stack {
 
     // KMS key for DynamoDB encryption
     this.encryptionKey = new kms.Key(this, "TableKey", {
-      alias: `d3ftly-${props.stage}-dynamo`,
-      description: "d3ftly DynamoDB encryption key",
+      alias: `coderhelm-${props.stage}-dynamo`,
+      description: "Coderhelm DynamoDB encryption key",
       enableKeyRotation: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
@@ -31,7 +31,7 @@ export class DatabaseStack extends cdk.Stack {
     // Low-volume config data — single-table design
     // ──────────────────────────────────────────────
     this.table = new dynamodb.TableV2(this, "Table", {
-      tableName: `d3ftly-${props.stage}`,
+      tableName: `coderhelm-${props.stage}`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -68,7 +68,7 @@ export class DatabaseStack extends cdk.Stack {
     // Designed for millions of records per tenant
     // ──────────────────────────────────────────────
     this.runsTable = new dynamodb.TableV2(this, "RunsTable", {
-      tableName: `d3ftly-${props.stage}-runs`,
+      tableName: `coderhelm-${props.stage}-runs`,
       partitionKey: {
         name: "tenant_id",
         type: dynamodb.AttributeType.STRING,
@@ -114,7 +114,7 @@ export class DatabaseStack extends cdk.Stack {
     // Atomic counters — O(1) reads for dashboard stats
     // ──────────────────────────────────────────────
     this.analyticsTable = new dynamodb.TableV2(this, "AnalyticsTable", {
-      tableName: `d3ftly-${props.stage}-analytics`,
+      tableName: `coderhelm-${props.stage}-analytics`,
       partitionKey: {
         name: "tenant_id",
         type: dynamodb.AttributeType.STRING,

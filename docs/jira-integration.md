@@ -3,7 +3,7 @@
 This is the fastest setup pattern used by most teams:
 
 1. Keep Jira as the source of work.
-2. Use Jira Automation (or Jira webhook) to POST issue events to d3ftly.
+2. Use Jira Automation (or Jira webhook) to POST issue events to coderhelm.
 3. Include minimal mapping fields in the JSON body (`repo_owner`, `repo_name`, and `installation_id` or `tenant_id`).
 4. Validate payload shape with the integration check endpoint before enabling at scale.
 
@@ -19,10 +19,10 @@ This avoids building a full Atlassian app first. Teams can ship with a single Ji
 
 - Trigger: Issue Created + Issue Updated
 - Action: Send web request (JSON body included)
-- URL: your d3ftly webhook URL
+- URL: your coderhelm webhook URL
 - Secret: set once and verify with `X-Hub-Signature` headers
 
-d3ftly acknowledges quickly and processes asynchronously, which aligns with Jira webhook guidance for reliability and retries.
+coderhelm acknowledges quickly and processes asynchronously, which aligns with Jira webhook guidance for reliability and retries.
 
 ## Sample Automation Body
 
