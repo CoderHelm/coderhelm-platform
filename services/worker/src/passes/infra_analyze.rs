@@ -514,10 +514,9 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
         let line_num = i + 1;
 
         // Check group declarations have (icon) before [label]
-        if trimmed.starts_with("group ") {
+        if let Some(after_group) = trimmed.strip_prefix("group ") {
             // Valid: group id(icon)[Label]  or  group id(icon)[Label] in parent
             // Invalid: group id[Label]
-            let after_group = &trimmed["group ".len()..];
             if let Some(bracket_pos) = after_group.find('[') {
                 let before_bracket = &after_group[..bracket_pos];
                 if !before_bracket.contains('(') {

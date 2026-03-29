@@ -89,13 +89,24 @@ pub async fn run(
         .unwrap_or_default();
 
     if !enabled_repos.is_empty() {
-        let repo_list: Vec<String> = enabled_repos.iter().map(|r| format!("- **{r}**")).collect();
+        // Pull a one-line summary from each repo's AGENTS.md
+        let mut repo_entries: Vec<String> = Vec::new();
+        for repo_name in &enabled_repos {
+            let summary =
+                load_instructions(state, &msg.tenant_id, &format!("AGENTS#REPO#{repo_name}")).await;
+            let desc = extract_first_sentence(&summary);
+            if desc.is_empty() {
+                repo_entries.push(format!("- **{repo_name}**"));
+            } else {
+                repo_entries.push(format!("- **{repo_name}** — {desc}"));
+            }
+        }
         let global_content = format!(
             "# Organization Agent Context\n\n\
              This organization has {} repositories configured with Coderhelm:\n\n\
              {}\n",
             enabled_repos.len(),
-            repo_list.join("\n")
+            repo_entries.join("\n")
         );
         if let Err(e) = state
             .dynamo
@@ -441,4 +452,25 @@ async fn set_onboard_status(
     if let Err(e) = update.send().await {
         warn!(error = %e, repo = %repo, "Failed to update onboard status");
     }
+}
+
+/// Extract the first meaningful sentence from an AGENTS.md content.
+/// Skips markdown headings and blank lines, returns the first non-empty line.
+fn extract_first_sentence(content: &str) -> String {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // Take first sentence (up to period) or the whole line if short enough
+        let sentence = if let Some(dot) = trimmed.find(". ") {
+            &trimmed[..=dot]
+        } else if trimmed.len() > 120 {
+            &trimmed[..120]
+        } else {
+            trimmed
+        };
+        return sentence.to_string();
+    }
+    String::new()
 }
