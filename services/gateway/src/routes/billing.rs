@@ -693,6 +693,219 @@ pub async fn create_setup_intent(
     Ok(Json(json!({ "client_secret": client_secret })))
 }
 
+/// GET /api/billing/payment-methods — list payment methods for this customer.
+pub async fn list_payment_methods(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
+        error!("Stripe secret key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+
+    let response = state
+        .http
+        .get(format!(
+            "https://api.stripe.com/v1/customers/{customer_id}/payment_methods"
+        ))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Stripe list payment methods failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let body: Value = response.json().await.map_err(|e| {
+        error!("Failed to parse Stripe response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let methods: Vec<Value> = body["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|pm| {
+                    let pm_type = pm["type"].as_str().unwrap_or("unknown");
+                    let mut result = json!({
+                        "id": pm["id"].as_str(),
+                        "type": pm_type,
+                    });
+                    if pm_type == "card" {
+                        result["card"] = json!({
+                            "brand": pm["card"]["brand"].as_str(),
+                            "last4": pm["card"]["last4"].as_str(),
+                            "exp_month": pm["card"]["exp_month"].as_u64(),
+                            "exp_year": pm["card"]["exp_year"].as_u64(),
+                        });
+                    } else if pm_type == "us_bank_account" {
+                        result["us_bank_account"] = json!({
+                            "bank_name": pm["us_bank_account"]["bank_name"].as_str(),
+                            "last4": pm["us_bank_account"]["last4"].as_str(),
+                            "account_type": pm["us_bank_account"]["account_type"].as_str(),
+                        });
+                    }
+                    result
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Json(json!({ "payment_methods": methods })))
+}
+
+/// DELETE /api/billing/payment-methods/:pm_id — detach a payment method from the customer.
+pub async fn delete_payment_method(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(pm_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
+        error!("Stripe secret key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    // Verify the payment method belongs to this customer
+    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+
+    let pm_response = state
+        .http
+        .get(format!("https://api.stripe.com/v1/payment_methods/{pm_id}"))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Stripe get payment method failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let pm_body: Value = pm_response.json().await.map_err(|e| {
+        error!("Failed to parse Stripe response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let pm_customer = pm_body["customer"].as_str().unwrap_or("");
+    if pm_customer != customer_id {
+        warn!(
+            "Payment method {pm_id} does not belong to customer {customer_id} (belongs to {pm_customer})"
+        );
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Detach the payment method
+    let response = state
+        .http
+        .post(format!(
+            "https://api.stripe.com/v1/payment_methods/{pm_id}/detach"
+        ))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Stripe detach payment method failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let body: Value = response.json().await.map_err(|e| {
+        error!("Failed to parse Stripe response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    if body["error"].is_object() {
+        error!(
+            "Stripe error detaching payment method: {}",
+            body["error"]["message"]
+        );
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    Ok(Json(json!({ "status": "detached" })))
+}
+
+/// PUT /api/billing/email — update the billing email on the Stripe customer.
+pub async fn update_billing_email(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let email = body["email"]
+        .as_str()
+        .filter(|s| !s.is_empty() && s.contains('@'))
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
+        error!("Stripe secret key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+
+    let response = state
+        .http
+        .post(format!("https://api.stripe.com/v1/customers/{customer_id}"))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .form(&[("email", email)])
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Stripe update customer email failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let resp_body: Value = response.json().await.map_err(|e| {
+        error!("Failed to parse Stripe response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    if resp_body["error"].is_object() {
+        error!(
+            "Stripe error updating email: {}",
+            resp_body["error"]["message"]
+        );
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    Ok(Json(
+        json!({ "email": resp_body["email"].as_str().unwrap_or(email) }),
+    ))
+}
+
+/// GET /api/billing/customer — get Stripe customer details (email, name).
+pub async fn get_billing_customer(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
+        error!("Stripe secret key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+
+    let response = state
+        .http
+        .get(format!("https://api.stripe.com/v1/customers/{customer_id}"))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Stripe get customer failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let body: Value = response.json().await.map_err(|e| {
+        error!("Failed to parse Stripe response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    Ok(Json(json!({
+        "email": body["email"].as_str(),
+        "name": body["name"].as_str(),
+    })))
+}
+
 async fn get_stripe_customer_id(state: &AppState, tenant_id: &str) -> Result<String, StatusCode> {
     let result = state
         .dynamo
