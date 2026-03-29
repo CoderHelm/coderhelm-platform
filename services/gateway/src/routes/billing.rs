@@ -339,6 +339,8 @@ pub async fn create_subscription(
             "payment_settings[save_default_payment_method]",
             "on_subscription",
         ),
+        ("payment_method_types[]", "card"),
+        ("payment_method_types[]", "us_bank_account"),
         ("expand[]", "latest_invoice.payment_intent"),
         ("metadata[tenant_id]", &claims.tenant_id),
     ];
@@ -668,6 +670,7 @@ pub async fn create_setup_intent(
         .form(&[
             ("customer", customer_id.as_str()),
             ("payment_method_types[]", "card"),
+            ("payment_method_types[]", "us_bank_account"),
             ("usage", "off_session"),
         ])
         .send()
