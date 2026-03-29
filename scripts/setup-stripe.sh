@@ -153,7 +153,7 @@ TOKENS_METER_ID=$(stripe_get "https://api.stripe.com/v1/billing/meters?limit=100
 import sys, json
 data = json.load(sys.stdin)
 for m in data.get('data', []):
-    if m.get('event_name') == 'coderhelm_tokens_overage' and m.get('status') == 'active':
+    if m.get('event_name') == 'coderhelm_token_overage' and m.get('status') == 'active':
         print(m['id'])
         break
 else:
@@ -165,7 +165,7 @@ if [[ -n "$TOKENS_METER_ID" ]]; then
 else
   TOKENS_METER=$(stripe_post "https://api.stripe.com/v1/billing/meters" \
     -d "display_name=Token Overages (per 1K tokens)" \
-    -d "event_name=coderhelm_tokens_overage" \
+    -d "event_name=coderhelm_token_overage" \
     -d "default_aggregation[formula]=sum")
   TOKENS_METER_ID=$(printf '%s\n' "$TOKENS_METER" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
   echo "Created tokens meter: $TOKENS_METER_ID"
@@ -226,6 +226,29 @@ PORTAL_ID=$(printf '%s\n' "$PORTAL_JSON" | python3 -c \
   "import sys,json; d=json.load(sys.stdin); print(d.get('id') or 'warning: ' + d.get('error',{}).get('message','unknown'))" \
   2>/dev/null || echo "(skipped)")
 echo "Portal: ${PORTAL_ID}"
+
+echo ""
+echo "=== 6. Updating Secrets Manager with price IDs ==="
+python3 << PYEOF
+import json, subprocess, sys
+
+raw = subprocess.check_output([
+    "aws", "secretsmanager", "get-secret-value",
+    "--secret-id", "${SECRET_NAME}",
+    "--query", "SecretString", "--output", "text"
+])
+secrets = json.loads(raw)
+secrets["stripe_price_id"] = "${PRICE_ID}"
+secrets["stripe_overage_price_id"] = "${TOKENS_PRICE_ID}"
+
+subprocess.check_call([
+    "aws", "secretsmanager", "put-secret-value",
+    "--secret-id", "${SECRET_NAME}",
+    "--secret-string", json.dumps(secrets)
+])
+print("Updated secrets: stripe_price_id={}, stripe_overage_price_id={}".format(
+    secrets["stripe_price_id"], secrets["stripe_overage_price_id"]))
+PYEOF
 
 echo ""
 echo "=== DONE ==="

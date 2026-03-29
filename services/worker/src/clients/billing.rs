@@ -75,10 +75,7 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
             "tenant_id",
             aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
         )
-        .key(
-            "period",
-            aws_sdk_dynamodb::types::AttributeValue::S(month),
-        )
+        .key("period", aws_sdk_dynamodb::types::AttributeValue::S(month))
         .send()
         .await
         .ok()

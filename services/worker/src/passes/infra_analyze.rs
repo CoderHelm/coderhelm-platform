@@ -579,8 +579,14 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
         if let Some(start) = trimmed.find('[') {
             if let Some(end) = trimmed[start..].find(']') {
                 let label = &trimmed[start + 1..start + end];
-                if label.contains('/') || label.contains('{') || label.contains('}') || label.contains(':') {
-                    errors.push(format!("line {line_num}: label contains forbidden char: [{label}]"));
+                if label.contains('/')
+                    || label.contains('{')
+                    || label.contains('}')
+                    || label.contains(':')
+                {
+                    errors.push(format!(
+                        "line {line_num}: label contains forbidden char: [{label}]"
+                    ));
                 }
             }
         }

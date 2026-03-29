@@ -800,9 +800,7 @@ pub async fn plan_chat(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    let messages_input = body["messages"]
-        .as_array()
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    let messages_input = body["messages"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
 
     if messages_input.is_empty() || messages_input.len() > 20 {
         return Err(StatusCode::BAD_REQUEST);
@@ -826,9 +824,7 @@ pub async fn plan_chat(
     let system_prompt = if org_context.is_empty() {
         PLAN_CHAT_SYSTEM.to_string()
     } else {
-        format!(
-            "{PLAN_CHAT_SYSTEM}\n\nThe user's organization context:\n{org_context}"
-        )
+        format!("{PLAN_CHAT_SYSTEM}\n\nThe user's organization context:\n{org_context}")
     };
 
     // Convert messages to Bedrock format

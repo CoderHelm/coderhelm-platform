@@ -1017,7 +1017,7 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 }
 
 /// Report metered usage to Stripe via Billing Meter Events.
-/// `event_name` maps to the meter: "coderhelm_plans_overage" or "coderhelm_tokens_overage".
+/// `event_name` maps to the meter: "coderhelm_plans_overage" or "coderhelm_token_overage".
 /// `quantity` is the number of units OVER the included limit (only overages).
 pub async fn report_stripe_usage(
     state: &AppState,
