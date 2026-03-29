@@ -335,7 +335,10 @@ pub async fn create_subscription(
         ("customer", &customer_id),
         ("items[0][price]", price_id),
         ("payment_behavior", "default_incomplete"),
-        ("payment_settings[save_default_payment_method]", "on_subscription"),
+        (
+            "payment_settings[save_default_payment_method]",
+            "on_subscription",
+        ),
         ("expand[]", "latest_invoice.payment_intent"),
         ("metadata[tenant_id]", &claims.tenant_id),
     ];

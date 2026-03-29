@@ -89,10 +89,7 @@ pub async fn run(
         .unwrap_or_default();
 
     if !enabled_repos.is_empty() {
-        let repo_list: Vec<String> = enabled_repos
-            .iter()
-            .map(|r| format!("- **{r}**"))
-            .collect();
+        let repo_list: Vec<String> = enabled_repos.iter().map(|r| format!("- **{r}**")).collect();
         let global_content = format!(
             "# Organization Agent Context\n\n\
              This organization has {} repositories configured with d3ftly:\n\n\
