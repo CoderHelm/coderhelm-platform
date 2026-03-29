@@ -128,6 +128,7 @@ pub async fn get_billing(
 
     Ok(Json(json!({
         "subscription_status": subscription_status,
+        "previous_status": item.and_then(|i| i.get("previous_status")).and_then(|v| v.as_s().ok()),
         "plan_id": item.and_then(|i| i.get("plan_id")).and_then(|v| v.as_s().ok()),
         "has_payment_method": !stripe_customer_id.is_empty(),
         "stripe_publishable_key": state.secrets.stripe_publishable_key.as_deref().unwrap_or(""),
@@ -981,7 +982,7 @@ pub async fn require_active_subscription(
         .unwrap_or("none");
 
     match status {
-        "active" => Ok(()),
+        "active" | "free" => Ok(()),
         _ => {
             warn!("Tenant {tenant_id} blocked: subscription_status={status}");
             Err(StatusCode::PAYMENT_REQUIRED)
