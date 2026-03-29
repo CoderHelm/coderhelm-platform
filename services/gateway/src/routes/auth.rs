@@ -97,7 +97,7 @@ pub async fn callback(
         .as_array()
         .and_then(|arr| {
             arr.iter()
-                .find(|i| i["app_slug"].as_str() == Some("coderhelm-agent"))
+                .find(|i| i["app_slug"].as_str() == Some("coderhelm"))
                 .and_then(|i| i["id"].as_u64())
         })
         .ok_or_else(|| {
