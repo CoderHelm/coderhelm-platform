@@ -172,7 +172,8 @@ else
 fi
 
 # Find or create the metered price backed by the meter
-# Priced at $0.05 per 1K tokens ($50 per 1M tokens)
+# TODO: restore to unit_amount=5 ($0.05/1K tokens) after overage testing
+# Priced at $10 per 1K tokens (TEST — normally $0.05)
 TOKENS_PRICE_ID=$(stripe_get "https://api.stripe.com/v1/prices?product=${PRODUCT_ID}&active=true&limit=50" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
@@ -189,7 +190,7 @@ if [[ -n "$TOKENS_PRICE_ID" ]]; then
 else
   TOKENS_PRICE=$(stripe_post "https://api.stripe.com/v1/prices" \
     -d "product=${PRODUCT_ID}" \
-    -d "unit_amount=5" \
+    -d "unit_amount=1000" \
     -d "currency=usd" \
     -d "recurring[interval]=month" \
     -d "recurring[usage_type]=metered" \

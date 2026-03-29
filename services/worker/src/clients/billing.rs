@@ -3,7 +3,7 @@ use tracing::warn;
 use crate::WorkerState;
 
 /// Included tokens in the Pro plan (5M in+out).
-const INCLUDED_TOKENS: u64 = 5_000_000;
+const INCLUDED_TOKENS: u64 = 100; // TODO: restore to 5_000_000 after overage testing
 
 /// Report token overage to Stripe via Billing Meter Events.
 /// Checks current month's cumulative usage against the included limit,

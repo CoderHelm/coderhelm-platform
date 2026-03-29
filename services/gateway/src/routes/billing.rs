@@ -7,7 +7,7 @@ use crate::models::Claims;
 use crate::AppState;
 
 // ─── Usage limits (included in Pro) ─────────────────────────────────
-pub const INCLUDED_TOKENS: u64 = 5_000_000; // 5M tokens (in+out)
+pub const INCLUDED_TOKENS: u64 = 100; // TODO: restore to 5_000_000 after overage testing // 5M tokens (in+out)
 pub const FREE_TIER_TOKENS: u64 = 500_000; // 500K tokens for free tier
 pub const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 5; // $0.05 per 1K tokens ($50/1M)
 
