@@ -112,7 +112,7 @@ export class EmailStack extends cdk.Stack {
       resources: ["*"],
       conditions: {
         StringEquals: {
-          "ses:FromAddress": `notifications@coderhelm.com`,
+          "ses:FromAddress": `noreply@coderhelm.com`,
         },
       },
     });

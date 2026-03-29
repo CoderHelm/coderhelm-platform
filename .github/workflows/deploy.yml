@@ -91,4 +91,4 @@ jobs:
           WORKER_ZIP: ${{ github.workspace }}/artifacts/worker.zip
           CDK_DEFAULT_ACCOUNT: "REDACTED_AWS_ACCOUNT_ID"
           CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
-          MODEL_ID: us.anthropic.claude-opus-4-6-20250610-v1:0
+          MODEL_ID: us.anthropic.claude-opus-4-6-v1

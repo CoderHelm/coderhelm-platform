@@ -26,7 +26,7 @@ Create a secret named `coderhelm/<stage>/secrets` with this JSON:
 
 | Variable    | Where    | Description                              |
 |------------|---------|------------------------------------------|
-| `MODEL_ID` | Worker   | Bedrock model ID (e.g. `us.anthropic.claude-opus-4-6-20250610-v1:0`) |
+| `MODEL_ID` | Worker   | Bedrock model ID (e.g. `us.anthropic.claude-opus-4-6-v1`) |
 | `STAGE`    | Both     | `dev` or `prod`                          |
 
 Set `MODEL_ID` before deploying — there is no default.
