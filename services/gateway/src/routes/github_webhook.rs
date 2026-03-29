@@ -712,16 +712,16 @@ async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
             .unwrap_or(0);
 
         if max_budget_cents > 0 {
-            // Calculate current spend: base $199 + token overages
+            // Calculate current overage spend (excludes base subscription)
             let overage_tokens = total_tokens.saturating_sub(INCLUDED_TOKENS);
             let overage_1k = overage_tokens / 1000;
-            let current_spend = 19900 + overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
-            if current_spend >= max_budget_cents {
+            let overage_spend = overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
+            if overage_spend >= max_budget_cents {
                 return Some(format!(
-                    "Monthly budget cap of **${:.2}** reached (current spend: **${:.2}**). \
+                    "Monthly overage budget of **${:.2}** reached (current overage: **${:.2}**). \
                      Adjust your budget in [Settings](https://app.coderhelm.com/settings/budget).",
                     max_budget_cents as f64 / 100.0,
-                    current_spend as f64 / 100.0,
+                    overage_spend as f64 / 100.0,
                 ));
             }
         }
