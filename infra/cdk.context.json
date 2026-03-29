@@ -1,6 +1,6 @@
 {
   "hosted-zone:account=REDACTED_AWS_ACCOUNT_ID:domainName=coderhelm.com:region=us-east-1": {
-    "Id": "/hostedzone/Z04548353MTT13HZWFOY2",
+    "Id": "/hostedzone/REDACTED_ZONE_ID",
     "Name": "coderhelm.com."
   }
 }
