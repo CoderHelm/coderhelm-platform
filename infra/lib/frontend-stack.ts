@@ -134,19 +134,20 @@ function handler(event) {
       webAclId: props.webAclArn,
       domainNames: [domainName],
       certificate,
-      // Custom error responses: serve branded error pages
+      // Custom error responses: SPA routing + branded error pages
       errorResponses: [
         {
+          // S3 returns 403 for missing objects → serve SPA index for client-side routing
           httpStatus: 403,
-          responseHttpStatus: 403,
-          responsePagePath: "/errors/403.html",
-          ttl: cdk.Duration.minutes(5),
+          responseHttpStatus: 200,
+          responsePagePath: "/index.html",
+          ttl: cdk.Duration.seconds(0),
         },
         {
           httpStatus: 404,
-          responseHttpStatus: 404,
-          responsePagePath: "/errors/404.html",
-          ttl: cdk.Duration.minutes(5),
+          responseHttpStatus: 200,
+          responsePagePath: "/index.html",
+          ttl: cdk.Duration.seconds(0),
         },
         {
           httpStatus: 500,
