@@ -145,11 +145,7 @@ pub async fn run(
         .key("sk", AttributeValue::S("WELCOME_SENT".to_string()))
         .send()
         .await;
-    let already_sent = welcome_check
-        .as_ref()
-        .ok()
-        .and_then(|r| r.item())
-        .is_some();
+    let already_sent = welcome_check.as_ref().ok().and_then(|r| r.item()).is_some();
 
     if !already_sent {
         let org = msg
