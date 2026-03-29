@@ -100,7 +100,7 @@ export class ApiStack extends cdk.Stack {
         FEEDBACK_QUEUE_URL: this.feedbackQueue.queueUrl,
         DLQ_URL: dlq.queueUrl,
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
-        SES_FROM_ADDRESS: "notifications@coderhelm.com",
+        SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
         RUST_LOG: "info",
       },

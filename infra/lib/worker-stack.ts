@@ -61,7 +61,7 @@ export class WorkerStack extends cdk.Stack {
         BUCKET_NAME: props.bucket.bucketName,
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         MODEL_ID: process.env.MODEL_ID || "us.anthropic.claude-opus-4-6-v1",
-        SES_FROM_ADDRESS: "notifications@coderhelm.com",
+        SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
         RUST_LOG: "info",
       },
