@@ -1118,6 +1118,7 @@ pub async fn regenerate_repo(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
 
