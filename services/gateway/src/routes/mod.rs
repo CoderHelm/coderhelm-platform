@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod banners;
 pub mod billing;
 pub mod github_webhook;
 pub mod infrastructure;
