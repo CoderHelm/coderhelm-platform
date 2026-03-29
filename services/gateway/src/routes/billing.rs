@@ -201,24 +201,21 @@ pub async fn create_portal_session(
 pub async fn create_subscription(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
     let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
         error!("Stripe secret key not configured");
         StatusCode::SERVICE_UNAVAILABLE
     })?;
 
-    let price_id = body["price_id"]
-        .as_str()
+    // Use server-side price ID only — never trust client-provided price IDs
+    let price_id = state
+        .secrets
+        .stripe_price_id
+        .as_deref()
         .filter(|s| !s.is_empty())
-        .or(state
-            .secrets
-            .stripe_price_id
-            .as_deref()
-            .filter(|s| !s.is_empty()))
         .ok_or_else(|| {
-            error!("No stripe_price_id provided in request body or secrets");
-            StatusCode::BAD_REQUEST
+            error!("stripe_price_id not configured in secrets");
+            StatusCode::SERVICE_UNAVAILABLE
         })?;
 
     // Check if already has an active subscription
