@@ -27,6 +27,12 @@ pub async fn orchestrate_ticket(
 
     info!(run_id, ticket_id = %msg.ticket_id, "Orchestration started");
 
+    // Block processing if subscription is past_due (unpaid invoices)
+    if !is_subscription_allowed(state, &msg.tenant_id).await {
+        warn!(run_id, tenant_id = %msg.tenant_id, "Skipping ticket: subscription not active");
+        return Ok(());
+    }
+
     // Create run record
     create_run_record(state, &msg, &run_id).await?;
 
@@ -515,4 +521,26 @@ async fn load_content(state: &WorkerState, tenant_id: &str, sk: &str) -> String 
             String::new()
         }
     }
+}
+
+/// Check if tenant subscription allows processing (active or free).
+async fn is_subscription_allowed(state: &WorkerState, tenant_id: &str) -> bool {
+    let status = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("sk", AttributeValue::S("BILLING".to_string()))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .and_then(|item| {
+            item.get("subscription_status")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+        })
+        .unwrap_or_default();
+
+    matches!(status.as_str(), "active" | "free")
 }
