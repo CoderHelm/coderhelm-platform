@@ -150,6 +150,12 @@ async fn get_tenant(
     let repos: Vec<String> = repos_result
         .items()
         .iter()
+        .filter(|item| {
+            item.get("enabled")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(false)
+        })
         .filter_map(|item| item.get("repo_name").and_then(|v| v.as_s().ok()).cloned())
         .collect();
 
