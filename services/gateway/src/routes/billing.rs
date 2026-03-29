@@ -421,9 +421,7 @@ async fn cancel_incomplete_subscriptions(state: &AppState, stripe_key: &str, cus
                     warn!("Cancelling stale {status} subscription {sub_id} for customer {customer_id}");
                     let _ = state
                         .http
-                        .delete(format!(
-                            "https://api.stripe.com/v1/subscriptions/{sub_id}"
-                        ))
+                        .delete(format!("https://api.stripe.com/v1/subscriptions/{sub_id}"))
                         .header("Authorization", format!("Bearer {stripe_key}"))
                         .send()
                         .await;
