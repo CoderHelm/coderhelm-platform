@@ -26,7 +26,7 @@ impl Config {
                 .unwrap_or_else(|_| "coderhelm/prod/secrets".to_string()),
             model_id: std::env::var("MODEL_ID").expect("MODEL_ID required"),
             light_model_id: std::env::var("LIGHT_MODEL_ID")
-                .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-6-v1".to_string()),
+                .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-6".to_string()),
             ses_from_address: std::env::var("SES_FROM_ADDRESS")
                 .unwrap_or_else(|_| "notifications@coderhelm.com".to_string()),
             ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")
