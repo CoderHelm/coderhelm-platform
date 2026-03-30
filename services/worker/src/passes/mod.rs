@@ -93,7 +93,7 @@ async fn run_passes(
                 &msg.repo_name,
                 msg.issue_number,
                 &format!(
-                    "🔄 **Coderhelm is working on this**\n\n| Phase | Status |\n|-------|--------|\n| Triage | 🔄 In progress |\n| Plan | ⏳ Pending |\n| Implement | ⏳ Pending |\n| Review | ⏳ Pending |\n| PR | ⏳ Pending |\n\n[View run →](https://app.coderhelm.com/dashboard/runs/{})",
+                    "🔄 **Coderhelm is working on this**\n\n| Phase | Status |\n|-------|--------|\n| Triage | 🔄 In progress |\n| Plan | ⏳ Pending |\n| Implement | ⏳ Pending |\n| Review | ⏳ Pending |\n| PR | ⏳ Pending |\n\n[View run →](https://app.coderhelm.com/runs/detail?id={})",
                     run_id,
                 ),
             )
@@ -210,7 +210,7 @@ async fn run_passes(
                 &msg.repo_name,
                 msg.issue_number,
                 &format!(
-                    "✅ **Coderhelm completed this ticket**\n\n**PR**: {}\n**Files**: {} modified\n\n[View run →](https://app.coderhelm.com/dashboard/runs/{})",
+                    "✅ **Coderhelm completed this ticket**\n\n**PR**: {}\n**Files**: {} modified\n\n[View run →](https://app.coderhelm.com/runs/detail?id={})",
                     pr_result.pr_url,
                     impl_result.files_modified.len(),
                     run_id,
@@ -253,6 +253,8 @@ async fn create_run_record(
         .item("ticket_id", attr_s(&msg.ticket_id))
         .item("title", attr_s(&msg.title))
         .item("repo", attr_s(&repo))
+        .item("installation_id", attr_n(msg.installation_id))
+        .item("issue_number", attr_n(msg.issue_number))
         .item("tokens_in", attr_n(0))
         .item("tokens_out", attr_n(0))
         .item("cost_usd", attr_n(0))

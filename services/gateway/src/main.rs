@@ -69,6 +69,7 @@ async fn main() -> Result<(), Error> {
         .route("/runs", get(routes::api::list_runs))
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/runs/:run_id/openspec", get(routes::api::get_run_openspec))
+        .route("/runs/:run_id/retry", post(routes::api::retry_run))
         .route("/repos", get(routes::api::list_repos))
         .route(
             "/repos/:owner/:name",
