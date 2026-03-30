@@ -7,7 +7,7 @@ use crate::models::Claims;
 use crate::AppState;
 
 // ─── Usage limits (included in Pro) ─────────────────────────────────
-pub const INCLUDED_TOKENS: u64 = 100; // TODO: restore to 5_000_000 after overage testing // 5M tokens (in+out)
+pub const INCLUDED_TOKENS: u64 = 5_000_000; // 5M tokens (in+out) included in Pro
 pub const FREE_TIER_TOKENS: u64 = 500_000; // 500K tokens for free tier
 pub const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 5; // $0.05 per 1K tokens ($50/1M)
 
@@ -125,7 +125,32 @@ pub async fn get_billing(
 
     let tokens_overage = current_tokens.saturating_sub(INCLUDED_TOKENS);
     let tokens_overage_1k = tokens_overage / 1000;
-    let estimated_overage_cents = tokens_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
+    let raw_overage_cents = tokens_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
+
+    // Read budget cap and apply it to the displayed estimate
+    let budget = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("SETTINGS#BUDGET"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned());
+
+    let max_budget_cents: u64 = budget
+        .as_ref()
+        .and_then(|i| i.get("max_budget_cents"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let estimated_overage_cents = if max_budget_cents > 0 {
+        raw_overage_cents.min(max_budget_cents)
+    } else {
+        raw_overage_cents
+    };
 
     Ok(Json(json!({
         "subscription_status": subscription_status,

@@ -71,6 +71,8 @@ pub async fn list_runs(
                 "repo": item.get("repo").and_then(|v| v.as_s().ok()),
                 "pr_url": item.get("pr_url").and_then(|v| v.as_s().ok()),
                 "cost_usd": item.get("cost_usd").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<f64>().ok()),
+                "tokens_in": item.get("tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
+                "tokens_out": item.get("tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
                 "duration_s": item.get("duration_s").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
                 "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
             })

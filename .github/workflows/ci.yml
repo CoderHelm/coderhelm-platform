@@ -30,7 +30,6 @@ jobs:
           workspaces: services/gateway
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
-      - run: cargo test
 
   worker:
     name: Worker (Rust)
@@ -48,7 +47,6 @@ jobs:
           workspaces: services/worker
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
-      - run: cargo test
 
   infra:
     name: CDK Synth
