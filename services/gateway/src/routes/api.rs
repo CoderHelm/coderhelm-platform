@@ -222,11 +222,19 @@ pub async fn retry_run(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    let installation_id = item
+    // Prefer stored installation_id; fall back to extracting from tenant_id (TENANT#<id>)
+    let mut installation_id = item
         .get("installation_id")
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0);
+    if installation_id == 0 {
+        installation_id = claims
+            .tenant_id
+            .strip_prefix("TENANT#")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+    }
     let issue_number = item
         .get("issue_number")
         .and_then(|v| v.as_n().ok())
@@ -234,7 +242,7 @@ pub async fn retry_run(
         .unwrap_or(0);
 
     if installation_id == 0 {
-        error!("Cannot retry run {run_id}: missing installation_id (run predates retry support)");
+        error!("Cannot retry run {run_id}: unable to determine installation_id");
         return Err(StatusCode::BAD_REQUEST);
     }
 
