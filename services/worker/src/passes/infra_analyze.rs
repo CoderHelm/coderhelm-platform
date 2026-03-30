@@ -727,7 +727,12 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
 
         // Parse edge lines to track port usage and check inter-group directions
         // Format: svcId:PORT --> PORT:svcId  or  svcId:PORT -- PORT:svcId
-        if trimmed.contains("--") && !trimmed.starts_with("group ") && !trimmed.starts_with("service ") && !trimmed.starts_with("junction ") && !trimmed.starts_with("subgraph ") {
+        if trimmed.contains("--")
+            && !trimmed.starts_with("group ")
+            && !trimmed.starts_with("service ")
+            && !trimmed.starts_with("junction ")
+            && !trimmed.starts_with("subgraph ")
+        {
             // Try to parse: left:PORT ... PORT:right
             let parts: Vec<&str> = if trimmed.contains("-->") {
                 trimmed.splitn(2, "-->").collect()
@@ -745,7 +750,9 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
                     let svc_id = svc_raw.replace("{group}", "");
                     let port = lhs[colon + 1..].trim().to_uppercase();
                     if ["T", "B", "L", "R"].contains(&port.as_str()) {
-                        *port_usage.entry((svc_id.clone(), port.clone())).or_insert(0) += 1;
+                        *port_usage
+                            .entry((svc_id.clone(), port.clone()))
+                            .or_insert(0) += 1;
                     }
                     // Check inter-group T/B
                     if let Some(rhs_colon) = rhs.find(':') {
@@ -753,14 +760,17 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
                         let rhs_svc_raw = &rhs[rhs_colon + 1..];
                         let rhs_svc_id = rhs_svc_raw.trim().replace("{group}", "");
                         if ["T", "B", "L", "R"].contains(&rhs_port.as_str()) {
-                            *port_usage.entry((rhs_svc_id.clone(), rhs_port.clone())).or_insert(0) += 1;
+                            *port_usage
+                                .entry((rhs_svc_id.clone(), rhs_port.clone()))
+                                .or_insert(0) += 1;
                         }
                         let lhs_group = service_groups.get(&svc_id);
                         let rhs_group = service_groups.get(&rhs_svc_id);
                         if let (Some(lg), Some(rg)) = (lhs_group, rhs_group) {
                             if lg != rg {
                                 // Inter-group edge — warn if using T or B
-                                if port == "T" || port == "B" || rhs_port == "T" || rhs_port == "B" {
+                                if port == "T" || port == "B" || rhs_port == "T" || rhs_port == "B"
+                                {
                                     errors.push(format!(
                                         "line {line_num}: inter-group edge uses T/B port (causes diagonal lines), use R-->L instead: {trimmed}"
                                     ));
