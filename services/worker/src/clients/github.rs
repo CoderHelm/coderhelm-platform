@@ -594,18 +594,6 @@ impl GitHubClient {
         Ok(resp.text().await?)
     }
 
-    /// Check if a path exists in the repo.
-    pub async fn check_path_exists(
-        &self,
-        owner: &str,
-        repo: &str,
-        path: &str,
-        git_ref: &str,
-    ) -> bool {
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
-        self.get(&url).await.is_ok()
-    }
-
     /// List pull requests (state: "open", "closed", "all").
     pub async fn list_pull_requests(
         &self,
