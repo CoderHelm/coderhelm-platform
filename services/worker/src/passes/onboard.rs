@@ -89,33 +89,35 @@ pub async fn run(
         .unwrap_or_default();
 
     if !enabled_repos.is_empty() {
-        // Pull a structured summary from each repo's AGENTS.md
-        let mut repo_entries: Vec<String> = Vec::new();
+        // Pull each repo's AGENTS.md for context
+        let mut repo_summaries: Vec<String> = Vec::new();
         for repo_name in &enabled_repos {
             let agents_md =
                 load_instructions(state, &msg.tenant_id, &format!("AGENTS#REPO#{repo_name}")).await;
-            let desc = extract_first_sentence(&agents_md);
-            let tech = extract_tech_stack(&agents_md);
-            let role = detect_repo_role(&agents_md);
-            let mut entry = format!("- **{repo_name}**");
-            if !role.is_empty() {
-                entry.push_str(&format!(" ({role})"));
+            if !agents_md.is_empty() {
+                // Take first ~500 chars (overview + tech stack, not full file)
+                let summary = if agents_md.len() > 500 {
+                    format!("{}...", &agents_md[..500])
+                } else {
+                    agents_md
+                };
+                repo_summaries.push(format!("### {repo_name}\n{summary}"));
             }
-            if !desc.is_empty() {
-                entry.push_str(&format!(" — {desc}"));
-            }
-            if !tech.is_empty() {
-                entry.push_str(&format!("\n  Tech: {tech}"));
-            }
-            repo_entries.push(entry);
         }
-        let global_content = format!(
-            "# Organization Agent Context\n\n\
-             This organization has {} repositories configured with Coderhelm:\n\n\
-             {}\n",
-            enabled_repos.len(),
-            repo_entries.join("\n")
-        );
+
+        // Use Bedrock to generate a proper org-level summary
+        let global_content = if !repo_summaries.is_empty() {
+            match generate_global_context(state, &enabled_repos, &repo_summaries).await {
+                Ok(content) => content,
+                Err(e) => {
+                    warn!(error = %e, "Failed to generate global context via Bedrock, using fallback");
+                    fallback_global_context(&enabled_repos)
+                }
+            }
+        } else {
+            fallback_global_context(&enabled_repos)
+        };
+
         if let Err(e) = state
             .dynamo
             .put_item()
@@ -240,7 +242,11 @@ async fn onboard_repo(
     let mut system = String::from(
         "You are an expert at analyzing code repositories. \
          Given a repo's file tree and key config files, generate a concise AGENTS.md file that describes:\n\
-         1. Project overview (1-2 sentences). Describe what THIS SPECIFIC REPO does — its role and responsibility — not the overall product or organization.\n\
+         1. Project overview (1-2 sentences). CRITICAL: Describe what THIS SPECIFIC REPO does — its unique role, what it deploys, what it serves. \
+            Do NOT describe the overall product/organization. \
+            BAD: 'Coderhelm is an AI coding platform...' \
+            GOOD: 'Next.js dashboard that provides billing, repo management, and infrastructure visualization for the Coderhelm platform.' \
+            GOOD: 'Rust Lambda backend (gateway + worker) that processes GitHub webhooks, runs AI agents, and manages billing via Stripe.'\n\
          2. Tech stack and key dependencies\n\
          3. Directory structure with brief descriptions\n\
          4. Build and test commands\n\
@@ -433,6 +439,66 @@ async fn generate_voice_md(
     Ok(())
 }
 
+/// Use Bedrock to generate a meaningful org-level context that explains how repos relate.
+async fn generate_global_context(
+    state: &WorkerState,
+    repo_names: &[String],
+    repo_summaries: &[String],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let system = "You generate a concise Organization Agent Context document. \
+                  Given summaries of each repository, produce a markdown document that:\n\
+                  1. Starts with '# Organization Agent Context'\n\
+                  2. Has a 2-3 sentence overview of what this organization builds\n\
+                  3. Lists each repo with:\n\
+                     - Its UNIQUE role (e.g. 'Next.js dashboard', 'Rust API + worker backend', 'CDK infrastructure')\n\
+                     - ONE sentence describing what it does that the OTHER repos don't\n\
+                     - Key tech (compact, e.g. 'Rust, CDK, DynamoDB')\n\
+                  4. Ends with a 'Cross-repo conventions' section noting shared patterns (monorepo? shared infra? same CI?)\n\n\
+                  CRITICAL: Each repo description must be UNIQUE and DIFFERENTIATED. Never describe two repos the same way. \
+                  Focus on what makes each repo distinct from the others.\n\
+                  Keep the entire document under 40 lines. Output markdown only, no code fences.";
+
+    let prompt = format!(
+        "Generate an Organization Agent Context for {} repositories:\n\n{}",
+        repo_names.len(),
+        repo_summaries.join("\n\n")
+    );
+
+    let messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
+        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
+        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
+        .build()
+        .map_err(|e| format!("Failed to build message: {e}"))?];
+
+    let response = state
+        .bedrock
+        .converse()
+        .model_id(&state.config.model_id)
+        .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
+            system.to_string(),
+        ))
+        .set_messages(Some(messages))
+        .send()
+        .await?;
+
+    extract_text_from_response(&response)
+}
+
+/// Fallback when Bedrock call fails — simple list without AI enrichment.
+fn fallback_global_context(repo_names: &[String]) -> String {
+    let entries: Vec<String> = repo_names
+        .iter()
+        .map(|name| format!("- **{name}**"))
+        .collect();
+    format!(
+        "# Organization Agent Context\n\n\
+         This organization has {} repositories configured with Coderhelm:\n\n\
+         {}\n",
+        repo_names.len(),
+        entries.join("\n")
+    )
+}
+
 async fn load_instructions(state: &WorkerState, tenant_id: &str, sk: &str) -> String {
     match state
         .dynamo
@@ -485,109 +551,4 @@ async fn set_onboard_status(
     if let Err(e) = update.send().await {
         warn!(error = %e, repo = %repo, "Failed to update onboard status");
     }
-}
-
-/// Extract the first meaningful sentence from an AGENTS.md content.
-/// Skips markdown headings and blank lines, returns the first non-empty line.
-fn extract_first_sentence(content: &str) -> String {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        // Take first sentence (up to period) or the whole line if short enough
-        let sentence = if let Some(dot) = trimmed.find(". ") {
-            &trimmed[..=dot]
-        } else if trimmed.len() > 120 {
-            &trimmed[..120]
-        } else {
-            trimmed
-        };
-        return sentence.to_string();
-    }
-    String::new()
-}
-
-/// Extract tech stack keywords from AGENTS.md content.
-/// Looks for a "Tech Stack" or "Dependencies" section and grabs key technologies.
-fn extract_tech_stack(content: &str) -> String {
-    let lower = content.to_lowercase();
-    let mut techs: Vec<&str> = Vec::new();
-
-    // Detect languages and frameworks by scanning for keywords
-    let patterns: &[(&str, &str)] = &[
-        ("rust", "Rust"),
-        ("typescript", "TypeScript"),
-        ("next.js", "Next.js"),
-        ("nextjs", "Next.js"),
-        ("react", "React"),
-        ("python", "Python"),
-        ("node.js", "Node.js"),
-        ("express", "Express"),
-        ("go ", "Go"),
-        ("golang", "Go"),
-        ("terraform", "Terraform"),
-        ("cdk", "CDK"),
-        ("dynamodb", "DynamoDB"),
-        ("postgresql", "PostgreSQL"),
-        ("mongodb", "MongoDB"),
-        ("redis", "Redis"),
-        ("docker", "Docker"),
-        ("graphql", "GraphQL"),
-        ("tailwind", "Tailwind"),
-        ("swift", "Swift"),
-        ("kotlin", "Kotlin"),
-        ("flutter", "Flutter"),
-        ("expo", "Expo"),
-        ("react native", "React Native"),
-    ];
-
-    for (pattern, label) in patterns {
-        if lower.contains(pattern) && !techs.contains(label) {
-            techs.push(label);
-        }
-    }
-
-    if techs.len() > 6 {
-        techs.truncate(6);
-    }
-    techs.join(", ")
-}
-
-/// Detect the role of a repo (frontend, backend, infrastructure, etc.) from AGENTS.md.
-fn detect_repo_role(content: &str) -> String {
-    let lower = content.to_lowercase();
-    let mut roles: Vec<&str> = Vec::new();
-
-    if lower.contains("frontend")
-        || lower.contains("dashboard")
-        || lower.contains("next.js")
-        || lower.contains("react")
-        || lower.contains("ui component")
-    {
-        roles.push("frontend");
-    }
-    if lower.contains("backend")
-        || lower.contains("api gateway")
-        || lower.contains("lambda handler")
-        || lower.contains("rest api")
-        || lower.contains("server")
-    {
-        roles.push("backend");
-    }
-    if lower.contains("infrastructure")
-        || lower.contains("cdk")
-        || lower.contains("terraform")
-        || lower.contains("cloudformation")
-    {
-        roles.push("infrastructure");
-    }
-    if lower.contains("mobile") || lower.contains("ios") || lower.contains("android") {
-        roles.push("mobile");
-    }
-    if lower.contains("worker") || lower.contains("queue consumer") || lower.contains("sqs") {
-        roles.push("worker");
-    }
-
-    roles.join(", ")
 }
