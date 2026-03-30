@@ -12,6 +12,7 @@ infra/**/*.d.ts
 # Environment
 .env
 .env.*
+!.env.example
 
 # OS
 .DS_Store
@@ -23,6 +24,6 @@ Thumbs.db
 *.swp
 *.swo
 infra/dist/
-d3ftly-jira/node_modules/
-d3ftly-jira/resources/admin/node_modules/
-d3ftly-jira/resources/admin/build/
+coderhelm-jira/node_modules/
+coderhelm-jira/resources/admin/node_modules/
+coderhelm-jira/resources/admin/build/
