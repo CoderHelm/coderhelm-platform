@@ -897,6 +897,8 @@ fn plan_from_item(
         "repo": item.get("repo").and_then(|v| v.as_s().ok()),
         "status": item.get("status").and_then(|v| v.as_s().ok()),
         "task_count": item.get("task_count").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
+        "tokens_in": item.get("total_tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
+        "tokens_out": item.get("total_tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
         "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
         "executed_at": item.get("executed_at").and_then(|v| v.as_s().ok()),
