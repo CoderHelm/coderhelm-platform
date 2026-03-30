@@ -10,8 +10,8 @@ use tracing::{error, info, warn};
 use super::billing::{FREE_TIER_TOKENS, INCLUDED_TOKENS, OVERAGE_PER_1K_TOKENS_CENTS};
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
-    CiFixMessage, FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo, TicketMessage,
-    TicketSource, WorkerMessage,
+    CiFixMessage, FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo, ReviewComment,
+    TicketMessage, TicketSource, WorkerMessage,
 };
 use crate::AppState;
 
@@ -285,6 +285,12 @@ async fn handle_pr_review(
         return Ok(StatusCode::OK);
     }
 
+    // Only act on "changes_requested" reviews
+    let review_state = payload["review"]["state"].as_str().unwrap_or("");
+    if review_state != "changes_requested" {
+        return Ok(StatusCode::OK);
+    }
+
     // Only process reviews on our PRs
     let pr_user = payload["pull_request"]["user"]["login"]
         .as_str()
@@ -295,17 +301,28 @@ async fn handle_pr_review(
 
     let tenant_id = format!("TENANT#{installation_id}");
     let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
 
+    let run_id = lookup_run_by_pr(state, &tenant_id, owner, name, pr_number).await;
+    if run_id.is_empty() {
+        warn!(pr_number, "No run found for PR — skipping feedback");
+        return Ok(StatusCode::OK);
+    }
+
+    // The review body is the top-level comment; individual line comments
+    // will be fetched by the worker using the review_id via GitHub API.
     let message = WorkerMessage::Feedback(FeedbackMessage {
         tenant_id,
         installation_id,
-        run_id: String::new(), // TODO: look up from DynamoDB by PR number
-        repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
-        repo_name: repo["name"].as_str().unwrap_or("").to_string(),
-        pr_number: payload["pull_request"]["number"].as_u64().unwrap_or(0),
+        run_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
         review_id: payload["review"]["id"].as_u64().unwrap_or(0),
         review_body: payload["review"]["body"].as_str().unwrap_or("").to_string(),
-        comments: vec![], // TODO: fetch review comments via API
+        comments: vec![],
     });
 
     send_to_queue(state, &state.config.feedback_queue_url, &message).await
@@ -536,18 +553,34 @@ async fn handle_pr_review_comment(
 
     let tenant_id = format!("TENANT#{installation_id}");
     let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
     let comment = &payload["comment"];
+    let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
+
+    let run_id = lookup_run_by_pr(state, &tenant_id, owner, name, pr_number).await;
+    if run_id.is_empty() {
+        warn!(pr_number, "No run found for PR — skipping review comment");
+        return Ok(StatusCode::OK);
+    }
+
+    // Extract the inline comment with file path and line
+    let review_comment = ReviewComment {
+        path: comment["path"].as_str().unwrap_or("").to_string(),
+        line: comment["line"].as_u64(),
+        body: comment["body"].as_str().unwrap_or("").to_string(),
+    };
 
     let message = WorkerMessage::Feedback(FeedbackMessage {
         tenant_id,
         installation_id,
-        run_id: String::new(),
-        repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
-        repo_name: repo["name"].as_str().unwrap_or("").to_string(),
-        pr_number: payload["pull_request"]["number"].as_u64().unwrap_or(0),
+        run_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
         review_id: comment["pull_request_review_id"].as_u64().unwrap_or(0),
         review_body: comment["body"].as_str().unwrap_or("").to_string(),
-        comments: vec![],
+        comments: vec![review_comment],
     });
 
     send_to_queue(state, &state.config.feedback_queue_url, &message).await
@@ -707,6 +740,42 @@ async fn send_to_queue(
 
     info!("Dispatched to SQS");
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Look up run_id from the runs table by PR number using the repo-index GSI.
+async fn lookup_run_by_pr(
+    state: &AppState,
+    tenant_id: &str,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+) -> String {
+    let tenant_repo = format!("{tenant_id}#{owner}/{name}");
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .index_name("repo-index")
+        .key_condition_expression("tenant_repo = :tr")
+        .filter_expression("pr_number = :pn")
+        .expression_attribute_values(":tr", attr_s(&tenant_repo))
+        .expression_attribute_values(":pn", attr_n(pr_number))
+        .scan_index_forward(false)
+        .limit(1)
+        .send()
+        .await;
+
+    match result {
+        Ok(r) => r
+            .items()
+            .first()
+            .and_then(|item| item.get("run_id").and_then(|v| v.as_s().ok()).cloned())
+            .unwrap_or_default(),
+        Err(e) => {
+            error!("Failed to query run by PR number: {e}");
+            String::new()
+        }
+    }
 }
 
 // DynamoDB attribute helpers

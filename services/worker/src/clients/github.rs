@@ -530,7 +530,6 @@ impl GitHubClient {
     }
 
     /// Get review comments on a PR.
-    #[allow(dead_code)]
     pub async fn get_review_comments(
         &self,
         owner: &str,

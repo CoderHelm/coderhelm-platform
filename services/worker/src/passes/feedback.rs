@@ -3,7 +3,7 @@ use tracing::info;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::clients::github::GitHubClient;
-use crate::models::{FeedbackMessage, TokenUsage};
+use crate::models::{FeedbackMessage, ReviewComment, TokenUsage};
 use crate::WorkerState;
 
 pub async fn run(
@@ -19,7 +19,14 @@ pub async fn run(
         &state.http,
     )?;
 
-    let formatted = format_review_comments(&msg);
+    // If the gateway didn't send inline comments (PR review submitted event),
+    // fetch them from the GitHub API using the review_id.
+    let comments = if msg.comments.is_empty() && msg.review_id > 0 {
+        fetch_review_comments(&github, &msg).await
+    } else {
+        msg.comments.clone()
+    };
+    let formatted = format_review_comments(&msg.review_body, &comments);
 
     let system = format!(
         "You are a feedback agent for the {owner}/{repo} repository. \
@@ -151,26 +158,56 @@ async fn get_pr_branch(
     Ok(branch.clone())
 }
 
-fn format_review_comments(msg: &FeedbackMessage) -> String {
-    if msg.comments.is_empty() {
+fn format_review_comments(review_body: &str, comments: &[ReviewComment]) -> String {
+    let mut parts = Vec::new();
+
+    if !review_body.is_empty() {
+        parts.push(format!("### Review Summary\n{review_body}\n"));
+    }
+
+    if comments.is_empty() && review_body.is_empty() {
         return "(no comments)".to_string();
     }
 
-    msg.comments
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let line_info = c.line.map(|l| format!(" line {l}")).unwrap_or_default();
-            format!(
-                "### Comment #{} \nFile: `{}`{}\n{}\n",
-                i + 1,
-                c.path,
-                line_info,
-                c.body,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    for (i, c) in comments.iter().enumerate() {
+        let line_info = c.line.map(|l| format!(" line {l}")).unwrap_or_default();
+        parts.push(format!(
+            "### Comment #{} \nFile: `{}`{}\n{}\n",
+            i + 1,
+            c.path,
+            line_info,
+            c.body,
+        ));
+    }
+
+    parts.join("\n")
+}
+
+/// Fetch review comments from GitHub API for a given review.
+async fn fetch_review_comments(github: &GitHubClient, msg: &FeedbackMessage) -> Vec<ReviewComment> {
+    match github
+        .get_review_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    {
+        Ok(api_comments) => api_comments
+            .iter()
+            .filter(|c| {
+                c.get("pull_request_review_id")
+                    .and_then(|v| v.as_u64())
+                    .map(|id| id == msg.review_id)
+                    .unwrap_or(false)
+            })
+            .map(|c| ReviewComment {
+                path: c["path"].as_str().unwrap_or("").to_string(),
+                line: c["line"].as_u64(),
+                body: c["body"].as_str().unwrap_or("").to_string(),
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("Failed to fetch review comments: {e}");
+            vec![]
+        }
+    }
 }
 
 fn feedback_tools() -> Vec<ToolDefinition> {
