@@ -308,15 +308,23 @@ async fn update_pass(
     pass: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
+    let entry = aws_sdk_dynamodb::types::AttributeValue::M(std::collections::HashMap::from([
+        ("pass".to_string(), attr_s(pass)),
+        ("started_at".to_string(), attr_s(&now)),
+    ]));
     state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key("tenant_id", attr_s(tenant_id))
         .key("run_id", attr_s(run_id))
-        .update_expression("SET current_pass = :p, updated_at = :t")
+        .update_expression(
+            "SET current_pass = :p, updated_at = :t, pass_history = list_append(if_not_exists(pass_history, :empty), :entry)",
+        )
         .expression_attribute_values(":p", attr_s(pass))
         .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":entry", aws_sdk_dynamodb::types::AttributeValue::L(vec![entry]))
+        .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]))
         .send()
         .await?;
     Ok(())

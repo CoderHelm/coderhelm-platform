@@ -123,6 +123,15 @@ pub async fn get_run(
         "error": item.get("error_message").and_then(|v| v.as_s().ok()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
         "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
+        "pass_history": item.get("pass_history").and_then(|v| v.as_l().ok()).map(|list| {
+            list.iter().filter_map(|entry| {
+                let m = entry.as_m().ok()?;
+                Some(json!({
+                    "pass": m.get("pass").and_then(|v| v.as_s().ok()),
+                    "started_at": m.get("started_at").and_then(|v| v.as_s().ok()),
+                }))
+            }).collect::<Vec<_>>()
+        }),
     })))
 }
 
