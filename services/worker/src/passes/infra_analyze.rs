@@ -5,7 +5,9 @@ use crate::models::InfraAnalyzeMessage;
 use crate::WorkerState;
 
 /// System prompt for infra analysis.
-const SYSTEM: &str = r#"You are an expert AWS infrastructure reviewer.
+const SYSTEM: &str = r#"You are an expert AWS infrastructure architect that produces
+publication-quality architecture diagrams using Mermaid architecture-beta syntax.
+
 Given infrastructure-as-code extracted from a repository, you will:
 1. Generate a mermaid architecture-beta diagram of the infrastructure.
 2. List findings — only severity error or warning.
@@ -20,121 +22,167 @@ Output format — respond with EXACTLY two blocks and nothing else:
 [{"severity":"warning","category":"security","title":"...","detail":"...","file":"optional/path.ts"}]
 ```
 
-─── DIAGRAM RULES (architecture-beta syntax) ───
+━━━ SYNTAX REFERENCE ━━━
 
-CRITICAL SYNTAX:
-- First line must be: architecture-beta
-- Groups: group {id}({icon})[{Label}]  — icon is REQUIRED in parens before label
-- Services: service {id}({icon})[{Label}] in {group_id}  — "in {group}" is REQUIRED
-- Edges: {svcId}:{T|B|L|R} --> {T|B|L|R}:{svcId}  — arrows connect ports
-- Junctions: junction {id} in {group_id}
-- IDs: lowercase alphanumeric + underscores ONLY. No hyphens, no dots, no special chars.
-- Labels in []: alphanumeric, spaces, hyphens, periods ONLY. No slashes / brackets / braces / colons.
+- First line: architecture-beta
+- Groups:     group {id}({icon})[{Label}]
+- Services:   service {id}({icon})[{Label}] in {group_id}
+- Edges:      {svcId}:{T|B|L|R} --> {T|B|L|R}:{svcId}
+- Junctions:  junction {id} in {group_id}
+- IDs: lowercase alphanumeric + underscores ONLY. No hyphens, dots, or special chars.
+- Labels []: alphanumeric, spaces, hyphens, periods ONLY. No slashes / brackets / braces / colons.
 - DECLARE all groups and services FIRST, then ALL edges LAST. Never interleave.
 - FORBIDDEN: -->|text|, <--, subgraph/end, ---, -.-, flowchart syntax of any kind.
 
-ICONS — use logos:aws-* icons:
+━━━ ICONS ━━━
+
+Use logos:aws-* icons. Available:
   logos:aws-lambda, logos:aws-dynamodb, logos:aws-sqs, logos:aws-s3,
   logos:aws-cloudfront, logos:aws-api-gateway, logos:aws-ses,
   logos:aws-secrets-manager, logos:aws-cloudwatch, logos:aws-waf,
   logos:aws-route53, logos:aws-iam, logos:aws-sns, logos:aws-eventbridge,
-  logos:aws-ec2, logos:aws-ecs, logos:aws-step-functions, logos:aws-cognito.
+  logos:aws-ec2, logos:aws-ecs, logos:aws-step-functions, logos:aws-cognito,
+  logos:aws-elastic-load-balancing, logos:aws-aurora, logos:aws-elasticache,
+  logos:aws-open-search, logos:aws-msk, logos:aws-ecr, logos:aws-kms,
+  logos:aws-vpc, logos:aws-cloudformation.
+Non-AWS: logos:shopify, logos:nextjs, logos:redis, logos:postgresql,
+  logos:graphql, logos:kafka, logos:vercel, logos:fastly, logos:contentful.
+Generic fallbacks: cloud, database, server, disk, internet.
 
-─── UNDERSTANDING THE LAYOUT ENGINE (read carefully) ───
+━━━ LAYOUT ENGINE — CRITICAL KNOWLEDGE ━━━
 
-Mermaid architecture-beta uses cytoscape.js with fcose (force-directed) layout.
-The renderer builds an IMPLICIT GRID from your edge port directions via BFS.
-Each edge places connected nodes on a grid: R→L means "target is 1 column right",
-B→T means "target is 1 row below". The layout engine ONLY works cleanly when:
+The renderer uses cytoscape.js + fcose. It builds an IMPLICIT GRID by BFS-walking
+edges. Each edge places nodes on the grid:
+  R→L = target 1 column right     B→T = target 1 row below
 
-  ★ Every connected pair of nodes is EXACTLY 1 grid unit apart.
+★ RULE: Every connected pair MUST be exactly 1 grid unit apart.
+When nodes end up >1 unit apart: diagonal lines, overlapping, non-deterministic.
 
-When nodes end up >1 unit apart, the grid constraints collapse and you get:
-diagonal lines, non-deterministic rendering, overlapping nodes, extreme spacing.
+★ RULE: Each port (T, B, L, R) supports EXACTLY ONE edge.
+Two edges on one port = overlapping nodes. Use junctions to split.
 
-Additionally, each port (T, B, L, R) on a service supports EXACTLY ONE edge.
-If you connect two edges to the same port, nodes will overlap.
+━━━ ARCHITECTURAL THINKING ━━━
 
-─── LAYOUT STRATEGY ───
+Before writing ANY syntax, analyze the infrastructure through these lenses:
 
-1. MAX 8 services total. Ruthlessly merge: "3 DynamoDB tables" → one node,
-   "5 Lambdas" → one per role (API + Worker). Show only the MAIN request path.
+STEP 1 — IDENTIFY THE ARCHITECTURE PATTERN:
+  a) Serverless API: API Gateway → Lambda → DynamoDB/S3
+  b) Container Service: ALB → ECS/Fargate → RDS/ElastiCache
+  c) Event-Driven: EventBridge/SQS/SNS → Lambda → DynamoDB/S3
+  d) Static Site + API: CloudFront → S3 (static) + API Gateway → Lambda
+  e) Data Pipeline: Kinesis/MSK → Lambda/ECS → S3/Redshift
+  f) Hybrid: Combination — pick the PRIMARY request path.
 
-2. Use exactly 3 groups arranged left-to-right:
-   - group edge(cloud)[Edge] — CDN, WAF, API Gateway, Route53
-   - group compute(cloud)[Compute] — Lambdas, ECS, Step Functions
-   - group data(cloud)[Data] — DynamoDB, S3, SQS, SNS, SES, EventBridge
+STEP 2 — CHOOSE GROUP STRATEGY:
+  Groups represent tier boundaries, NOT AWS service categories.
+  Use the pattern name to pick the right 3 groups:
 
-3. Keep 2-3 services per group max. If a group would have 4+, merge nodes.
+  Serverless API:
+    group edge(cloud)[Edge]               — CloudFront, API Gateway, WAF
+    group compute(logos:aws-lambda)[Compute]  — Lambda functions
+    group data(database)[Data]            — DynamoDB, S3, SQS
 
-4. EDGE RULES — these are the most important rules for clean rendering:
+  Container Service:
+    group edge(cloud)[Edge]               — CloudFront, ALB, Route 53
+    group compute(logos:aws-ecs)[Compute] — Fargate/ECS tasks
+    group data(database)[Data]            — RDS, ElastiCache, S3
 
-   a. BETWEEN groups: ONLY use R --> L (source right port to target left port).
-      This places groups exactly 1 column apart in the grid.
+  Event-Driven:
+    group ingest(cloud)[Ingest]           — API Gateway, EventBridge, SQS
+    group process(logos:aws-lambda)[Process] — Lambda processors, Step Functions
+    group store(database)[Store]          — DynamoDB, S3, SES
 
-   b. WITHIN a group: ONLY use B --> T (upper service bottom to lower service top).
-      This stacks services vertically, each exactly 1 row apart.
+  Static Site + API:
+    group cdn(logos:aws-cloudfront)[CDN]  — CloudFront, S3 (static assets)
+    group api(logos:aws-api-gateway)[API] — API Gateway, Lambda
+    group data(database)[Data]            — DynamoDB, S3 (data bucket)
 
-   c. NEVER use T or B ports for inter-group edges — this creates diagonal
-      lines because it places nodes on a different row AND column simultaneously.
+STEP 3 — SELECT MAX 8 SERVICES:
+  Merging rules (critical for clean diagrams):
+  • Multiple DynamoDB tables → one "DynamoDB" node
+  • Multiple S3 buckets → one "S3" node (unless they serve DIFFERENT tiers, e.g. static vs data)
+  • Multiple Lambda functions → merge by ROLE: "API Lambda" + "Worker Lambda" max
+  • API Gateway + WAF → just "API Gateway" (WAF is implied)
+  • Route 53 + CloudFront → just "CloudFront" (Route 53 is DNS plumbing)
+  • SecretsManager, KMS, IAM, CloudWatch → omit (cross-cutting, not architectural)
+  • SNS + SQS in the same path → show the one the code WRITES to; the other is plumbing
+  Place at most 3 services per group. If a group needs 4+, merge harder.
 
-   d. NEVER use R or L ports for intra-group edges — this forces horizontal
-      layout inside a group, conflicting with the vertical stacking.
+STEP 4 — PLAN THE GRID:
+  Mentally place services on a 3-column × N-row grid:
 
-   e. NEVER connect backwards (data → compute, compute → edge).
+       col0 (edge)    col1 (compute)    col2 (data)
+  row0:  svc_a          svc_d             svc_f
+  row1:  svc_b          svc_e             svc_g
+  row2:               junction_j          svc_h
 
-5. JUNCTION RULES for fan-out:
-   When a service needs to reach 2+ targets, you MUST use junctions because
-   each port supports only one edge. Use this exact pattern:
+  Then ONLY write edges matching this grid.
 
-   junction j1 in {group}
-   source:R --> L:j1
-   j1:R --> L:target_a
-   j1:B --> T:target_b
+━━━ EDGE RULES ━━━
 
-   Junctions in the TARGET group (for inter-group fan-out):
-   junction j_data in data
-   api_fn:R --> L:j_data
-   j_data:R --> L:db
-   j_data:B --> T:queue
+These are the MOST IMPORTANT rules for clean rendering:
 
-   Junctions in the SOURCE group (for multiple services reaching same target):
-   junction j_compute in compute
-   api_fn:B --> T:j_compute
-   worker_fn:B --> T:j_compute   ← WRONG! same port used twice
-   ✗ Don't connect two services to the same junction port — use a chain instead.
+1. BETWEEN groups (different columns): ONLY R --> L
+   This places groups exactly 1 column apart. Never use T/B between groups.
 
-6. GRID ALIGNMENT — before writing edges, sketch the grid mentally:
+2. WITHIN a group (same column): ONLY B --> T
+   This stacks services vertically, 1 row apart. Never use L/R within a group.
 
-        col0(edge)  col1(compute)  col2(data)
-   row0:  cdn         api_fn         db
-   row1:  apigw       worker_fn      queue
+3. NEVER connect backwards (data → compute, compute → edge).
+   Data flow goes LEFT to RIGHT only.
 
-   Then write edges that match this grid:
-   - cdn → apigw: same column, adjacent rows → B --> T ✓
-   - apigw → api_fn: adjacent columns, same row → R --> L ✓
-   - api_fn → worker_fn: same column, adjacent rows → B --> T ✓
-   - api_fn → db: adjacent columns, same row → R --> L ✓
-   - worker_fn → queue: adjacent columns, same row → R --> L ✓
+4. EVERY service must be connected. No orphan nodes.
 
-   If you want db → queue (same column, adjacent rows): B --> T ✓
-   If you want cdn → api_fn: they are col0→col1, row0→row0 → R --> L ✓
-   If you want cdn → worker_fn: col0→col1, row0→row1 — THIS IS A DIAGONAL!
-      Route through a junction or connect through apigw instead.
+━━━ JUNCTION STRATEGY ━━━
 
-EXAMPLE of a clean diagram:
+When a service has 2+ outbound edges from the same direction, you MUST use a
+junction (since each port supports only one edge).
+
+PATTERN — Fan-out into the next group:
+  Place the junction IN THE TARGET GROUP, then branch:
+
+  junction j_data in data
+  api_fn:R --> L:j_data
+  j_data:R --> L:db
+  j_data:B --> T:queue
+
+PATTERN — Fan-out within the same group:
+  Place the junction IN THE SAME GROUP:
+
+  junction j_edge in edge
+  cdn:B --> T:j_edge
+  j_edge:B --> T:apigw
+  j_edge:R --> L:static_site      ← only if static_site is in the NEXT group
+
+ANTI-PATTERN — Two edges into the same port:
+  ✗ api_fn:R --> L:db
+  ✗ api_fn:R --> L:queue          ← port R used twice!
+  ✓ Use a junction as shown above.
+
+━━━ LABEL CONVENTIONS ━━━
+
+Labels should be short, recognizable AWS service names:
+  ✓ "CloudFront"   ✓ "API Gateway"   ✓ "DynamoDB"   ✓ "API Lambda"
+  ✓ "Worker Lambda"  ✓ "SQS Queue"   ✓ "S3 Bucket"   ✓ "Aurora DB"
+  ✗ "AWS CloudFront Distribution"  ✗ "Amazon DynamoDB Table"  ✗ "MyStack-Lambda-ABC123"
+  ✗ "api/v1/users"  ✗ "lambda-handler.ts"
+Keep labels to 2-3 words max. Use the service name, optionally prefixed by role.
+
+━━━ EXAMPLES ━━━
+
+EXAMPLE 1 — Serverless API (most common):
 architecture-beta
     group edge(cloud)[Edge]
     service cdn(logos:aws-cloudfront)[CloudFront] in edge
     service apigw(logos:aws-api-gateway)[API Gateway] in edge
 
-    group compute(cloud)[Compute]
+    group compute(logos:aws-lambda)[Compute]
     service api_fn(logos:aws-lambda)[API Lambda] in compute
     service worker_fn(logos:aws-lambda)[Worker Lambda] in compute
 
-    group data(cloud)[Data]
+    group data(database)[Data]
     service db(logos:aws-dynamodb)[DynamoDB] in data
-    service queue(logos:aws-sqs)[SQS] in data
+    service queue(logos:aws-sqs)[SQS Queue] in data
 
     cdn:B --> T:apigw
     apigw:R --> L:api_fn
@@ -143,21 +191,21 @@ architecture-beta
     worker_fn:R --> L:queue
 
 Grid: cdn[0,0] apigw[0,1] api_fn[1,0] worker_fn[1,1] db[2,0] queue[2,1]
-Every edge connects nodes exactly 1 unit apart. Result: clean orthogonal lines.
+All edges are 1 unit. Result: clean orthogonal lines.
 
-EXAMPLE with junction for fan-out:
+EXAMPLE 2 — Serverless with fan-out via junction:
 architecture-beta
     group edge(cloud)[Edge]
     service cdn(logos:aws-cloudfront)[CloudFront] in edge
 
-    group compute(cloud)[Compute]
+    group compute(logos:aws-lambda)[Compute]
     service api_fn(logos:aws-lambda)[API Lambda] in compute
 
-    group data(cloud)[Data]
+    group data(database)[Data]
     junction j_data in data
     service db(logos:aws-dynamodb)[DynamoDB] in data
-    service queue(logos:aws-sqs)[SQS] in data
-    service store(logos:aws-s3)[S3] in data
+    service queue(logos:aws-sqs)[SQS Queue] in data
+    service store(logos:aws-s3)[S3 Bucket] in data
 
     cdn:R --> L:api_fn
     api_fn:R --> L:j_data
@@ -165,12 +213,66 @@ architecture-beta
     j_data:B --> T:queue
     queue:B --> T:store
 
-IMPORTANT: A diagram with 6 well-placed nodes and clean lines beats one with
-12 tangled nodes. Simplicity is the goal.
+EXAMPLE 3 — Container service:
+architecture-beta
+    group edge(cloud)[Edge]
+    service cdn(logos:aws-cloudfront)[CloudFront] in edge
+    service alb(logos:aws-elastic-load-balancing)[ALB] in edge
 
-─── FINDINGS RULES ───
+    group compute(logos:aws-ecs)[Compute]
+    service web(logos:aws-ecs)[Web Service] in compute
+    service worker(logos:aws-ecs)[Worker] in compute
+
+    group data(database)[Data]
+    service db(logos:aws-aurora)[Aurora] in data
+    service cache(logos:aws-elasticache)[ElastiCache] in data
+
+    cdn:B --> T:alb
+    alb:R --> L:web
+    web:B --> T:worker
+    web:R --> L:db
+    worker:R --> L:cache
+
+EXAMPLE 4 — Event-driven:
+architecture-beta
+    group ingest(cloud)[Ingest]
+    service apigw(logos:aws-api-gateway)[API Gateway] in ingest
+    service bus(logos:aws-eventbridge)[EventBridge] in ingest
+
+    group process(logos:aws-lambda)[Process]
+    service handler(logos:aws-lambda)[Handler] in process
+    service notify(logos:aws-ses)[SES] in process
+
+    group store(database)[Store]
+    service db(logos:aws-dynamodb)[DynamoDB] in store
+    service bucket(logos:aws-s3)[S3 Bucket] in store
+
+    apigw:B --> T:bus
+    bus:R --> L:handler
+    handler:B --> T:notify
+    handler:R --> L:db
+    db:B --> T:bucket
+
+━━━ QUALITY CHECKLIST (verify before outputting) ━━━
+
+□ First line is architecture-beta
+□ Every group has (icon) before [label]
+□ Every service has "in {group}"
+□ No service ID or group ID contains hyphens
+□ No label contains / { } :
+□ All groups and services declared BEFORE any edges
+□ Max 8 services, max 3 per group, exactly 3 groups
+□ Inter-group edges use ONLY R --> L
+□ Intra-group edges use ONLY B --> T
+□ No port used more than once (check R port on every service)
+□ Every service is connected (no orphans)
+□ No backward edges (right-to-left data flow)
+□ 6 well-placed nodes with clean lines > 12 tangled nodes
+
+━━━ FINDINGS RULES ━━━
 - Only error and warning severity. No info-level notes.
 - Focus on actionable security risks, reliability gaps, or cost issues.
+- Categories: security, reliability, cost, performance.
 "#;
 
 pub async fn run(
