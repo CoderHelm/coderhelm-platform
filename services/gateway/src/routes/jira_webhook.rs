@@ -35,7 +35,7 @@ pub async fn handle(
 
     let issue = payload.get("issue").ok_or(StatusCode::BAD_REQUEST)?;
 
-    // Required repo mapping (from automation payload or custom fields).
+    // Repo mapping — now optional. When absent, triage will auto-pick the repo.
     let repo_owner = payload
         .get("repo_owner")
         .and_then(|v| v.as_str())
@@ -45,7 +45,7 @@ pub async fn handle(
                 .and_then(|d| d.get("repo_owner"))
                 .and_then(|v| v.as_str())
         })
-        .ok_or(StatusCode::BAD_REQUEST)?
+        .unwrap_or("")
         .to_string();
 
     let repo_name = payload
@@ -57,7 +57,7 @@ pub async fn handle(
                 .and_then(|d| d.get("repo_name"))
                 .and_then(|v| v.as_str())
         })
-        .ok_or(StatusCode::BAD_REQUEST)?
+        .unwrap_or("")
         .to_string();
 
     // Tenant/install resolution: installation_id (preferred) or tenant_id.
@@ -140,6 +140,88 @@ pub async fn handle(
             warn!("Invalid Jira webhook signature");
             return Err(StatusCode::UNAUTHORIZED);
         }
+    }
+
+    // ── Project + label filtering ────────────────────────────────────────────
+    let jira_config = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.clone()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("JIRA#config".to_string()),
+        )
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item);
+
+    // Check trigger label
+    let trigger_label = jira_config
+        .as_ref()
+        .and_then(|item| item.get("trigger_label").and_then(|v| v.as_s().ok()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "coderhelm".to_string());
+
+    let issue_labels: Vec<&str> = issue
+        .get("fields")
+        .and_then(|f| f.get("labels"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let has_label = issue_labels
+        .iter()
+        .any(|l| *l == trigger_label || l.starts_with(&format!("{trigger_label}:")));
+
+    if !has_label {
+        info!(ticket_key = %issue.get("key").and_then(|v| v.as_str()).unwrap_or("?"), label = %trigger_label, "Skipping — trigger label not present");
+        return Ok(StatusCode::OK);
+    }
+
+    // Check project is enabled (if any projects are configured)
+    let project_key = issue
+        .get("fields")
+        .and_then(|f| f.get("project"))
+        .and_then(|p| p.get("key"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if !project_key.is_empty() {
+        let project_item = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.table_name)
+            .key(
+                "pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.clone()),
+            )
+            .key(
+                "sk",
+                aws_sdk_dynamodb::types::AttributeValue::S(format!("JIRA#PROJECT#{project_key}")),
+            )
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item);
+
+        // If the project item exists and is disabled, skip
+        if let Some(ref item) = project_item {
+            let enabled = item
+                .get("enabled")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(false);
+            if !enabled {
+                info!(project_key, "Skipping — Jira project not enabled");
+                return Ok(StatusCode::OK);
+            }
+        }
+        // If no project item exists at all, allow (no project filtering configured)
     }
 
     let title = issue

@@ -361,7 +361,7 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
 }
 
 /// Fetch enabled repos for a tenant from DynamoDB.
-async fn fetch_tenant_repos(state: &WorkerState, tenant_id: &str) -> Vec<String> {
+pub async fn fetch_tenant_repos(state: &WorkerState, tenant_id: &str) -> Vec<String> {
     let result = state
         .dynamo
         .query()

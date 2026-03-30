@@ -89,6 +89,18 @@ async fn main() -> Result<(), Error> {
             "/integrations/jira/secret",
             post(routes::api::generate_jira_secret).delete(routes::api::delete_jira_secret),
         )
+        .route(
+            "/integrations/jira/config",
+            get(routes::api::get_jira_config).put(routes::api::update_jira_config),
+        )
+        .route(
+            "/integrations/jira/projects",
+            put(routes::api::update_jira_projects),
+        )
+        .route(
+            "/integrations/jira/projects/fetch",
+            get(routes::api::fetch_jira_projects),
+        )
         .route("/stats", get(routes::api::get_stats))
         .route("/stats/history", get(routes::api::get_stats_history))
         .route(

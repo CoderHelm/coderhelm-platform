@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::models::{
     Claims, FeedbackMessage, InfraAnalyzeMessage, NotificationPrefs, OnboardMessage, OnboardRepo,
@@ -646,6 +646,233 @@ pub async fn load_jira_secret(state: &AppState, tenant_id: &str) -> Option<Strin
         .ok()
         .and_then(|r| r.item)
         .and_then(|item| item.get("secret").and_then(|v| v.as_s().ok()).cloned())
+}
+
+/// GET /api/integrations/jira/config — get Jira config (trigger URLs, default project, label, projects).
+pub async fn get_jira_config(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    // Load JIRA#config item
+    let config_item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("JIRA#config"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to load Jira config: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item;
+
+    let get_str = |item: &std::collections::HashMap<String, AttributeValue>, key: &str| {
+        item.get(key)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    let (default_project, trigger_label, list_projects_url, create_ticket_url) =
+        if let Some(ref item) = config_item {
+            (
+                get_str(item, "default_project"),
+                get_str(item, "trigger_label"),
+                get_str(item, "list_projects_url"),
+                get_str(item, "create_ticket_url"),
+            )
+        } else {
+            (String::new(), String::new(), String::new(), String::new())
+        };
+
+    // Load enabled projects (JIRA#PROJECT#<key> items)
+    let projects_result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":prefix", attr_s("JIRA#PROJECT#"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query Jira projects: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let projects: Vec<Value> = projects_result
+        .items()
+        .iter()
+        .filter_map(|item| {
+            let sk = item.get("sk")?.as_s().ok()?;
+            let key = sk.strip_prefix("JIRA#PROJECT#")?;
+            let name = item
+                .get("project_name")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.as_str())
+                .unwrap_or(key);
+            let enabled = item
+                .get("enabled")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(false);
+            Some(json!({ "key": key, "name": name, "enabled": enabled }))
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "default_project": default_project,
+        "trigger_label": trigger_label,
+        "list_projects_url": list_projects_url,
+        "create_ticket_url": create_ticket_url,
+        "projects": projects,
+    })))
+}
+
+/// PUT /api/integrations/jira/config — update Jira config.
+pub async fn update_jira_config(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let mut update_expr = vec!["updated_at = :ua".to_string()];
+    let mut attr_vals: Vec<(String, AttributeValue)> = vec![(":ua".to_string(), attr_s(&now))];
+
+    for (field, key) in [
+        ("default_project", "default_project"),
+        ("trigger_label", "trigger_label"),
+        ("list_projects_url", "list_projects_url"),
+        ("create_ticket_url", "create_ticket_url"),
+    ] {
+        if let Some(val) = body.get(field).and_then(|v| v.as_str()) {
+            update_expr.push(format!("{key} = :{key}"));
+            attr_vals.push((format!(":{key}"), attr_s(val)));
+        }
+    }
+
+    let mut update = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("JIRA#config"))
+        .update_expression(format!("SET {}", update_expr.join(", ")));
+
+    for (k, v) in attr_vals {
+        update = update.expression_attribute_values(k, v);
+    }
+
+    update.send().await.map_err(|e| {
+        error!("Failed to update Jira config: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    info!(tenant_id = %claims.tenant_id, "Updated Jira config");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PUT /api/integrations/jira/projects — save enabled/disabled project list.
+pub async fn update_jira_projects(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    let projects = body
+        .get("projects")
+        .and_then(|v| v.as_array())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    for proj in projects {
+        let key = proj
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        let name = proj.get("name").and_then(|v| v.as_str()).unwrap_or(key);
+        let enabled = proj
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.table_name)
+            .item("pk", attr_s(&claims.tenant_id))
+            .item("sk", attr_s(&format!("JIRA#PROJECT#{key}")))
+            .item("project_name", attr_s(name))
+            .item("enabled", AttributeValue::Bool(enabled))
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to save Jira project {key}: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    info!(tenant_id = %claims.tenant_id, count = projects.len(), "Updated Jira projects");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/integrations/jira/projects/fetch — proxy call to Forge web trigger to list projects.
+pub async fn fetch_jira_projects(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    // Load the list-projects URL from Jira config
+    let config_item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("JIRA#config"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to load Jira config: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let url = config_item
+        .get("list_projects_url")
+        .and_then(|v| v.as_s().ok())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            warn!(tenant_id = %claims.tenant_id, "No list_projects_url configured");
+            StatusCode::NOT_FOUND
+        })?;
+
+    let resp = state
+        .http
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to call Forge list-projects: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    if !resp.status().is_success() {
+        error!(
+            status = resp.status().as_u16(),
+            "Forge list-projects returned error"
+        );
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let body: Value = resp.json().await.map_err(|e| {
+        error!("Failed to parse Forge list-projects response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    Ok(Json(body))
 }
 
 /// POST /api/integrations/jira/check — validate a candidate Jira payload before wiring automation.

@@ -1,5 +1,7 @@
-const { fetch } = require("@forge/api");
-const { storage } = require("@forge/api");
+const api = require("@forge/api");
+const { fetch } = api;
+const { storage } = api;
+const { route } = api;
 
 exports.handler = async (event, context) => {
   const issue = event.issue || {};
@@ -66,4 +68,83 @@ exports.handler = async (event, context) => {
   });
 
   console.log(`Forwarded ${issue.key} → ${repoOwner}/${repoName} (${response.status})`);
+};
+
+// ── Web trigger: list Jira projects ──────────────────────────────────────────
+exports.listProjectsHandler = async (request) => {
+  try {
+    const res = await api.asApp().requestJira(route`/rest/api/3/project?expand=lead`);
+    if (!res.ok) {
+      return { statusCode: res.status, body: JSON.stringify({ error: "Failed to fetch projects" }) };
+    }
+    const projects = await res.json();
+    const simplified = projects.map((p) => ({
+      key: p.key,
+      name: p.name,
+      lead: p.lead?.displayName || null,
+      style: p.style || "classic",
+    }));
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": ["application/json"] },
+      body: JSON.stringify({ projects: simplified }),
+    };
+  } catch (e) {
+    console.error("listProjects error:", e);
+    return { statusCode: 500, body: JSON.stringify({ error: e.message }) };
+  }
+};
+
+// ── Web trigger: create a Jira ticket ────────────────────────────────────────
+exports.createTicketHandler = async (request) => {
+  try {
+    const body = JSON.parse(request.body || "{}");
+    const { projectKey, summary, description, labels } = body;
+
+    if (!projectKey || !summary) {
+      return { statusCode: 400, body: JSON.stringify({ error: "projectKey and summary required" }) };
+    }
+
+    const issueBody = {
+      fields: {
+        project: { key: projectKey },
+        summary,
+        issuetype: { name: "Task" },
+      },
+    };
+
+    if (description) {
+      issueBody.fields.description = {
+        type: "doc",
+        version: 1,
+        content: [{ type: "paragraph", content: [{ type: "text", text: description }] }],
+      };
+    }
+
+    if (labels && labels.length > 0) {
+      issueBody.fields.labels = labels;
+    }
+
+    const res = await api.asApp().requestJira(route`/rest/api/3/issue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(issueBody),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      console.error("createTicket failed:", res.status, err);
+      return { statusCode: res.status, body: JSON.stringify({ error: "Failed to create ticket", details: err }) };
+    }
+
+    const created = await res.json();
+    return {
+      statusCode: 201,
+      headers: { "Content-Type": ["application/json"] },
+      body: JSON.stringify({ key: created.key, id: created.id, self: created.self }),
+    };
+  } catch (e) {
+    console.error("createTicket error:", e);
+    return { statusCode: 500, body: JSON.stringify({ error: e.message }) };
+  }
 };
