@@ -323,7 +323,7 @@ async fn complete_run(
             "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
              tokens_in = :ti, tokens_out = :to, cost_usd = :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
-             status_run_id = :sri",
+             status_run_id = :sri, files_modified = :fm",
         )
         .expression_attribute_names("#status", "status")
         .expression_attribute_values(":s", attr_s("completed"))
@@ -337,6 +337,16 @@ async fn complete_run(
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
         .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
+        .expression_attribute_values(
+            ":fm",
+            AttributeValue::L(
+                impl_result
+                    .files_modified
+                    .iter()
+                    .map(|f| attr_s(f))
+                    .collect(),
+            ),
+        )
         .send()
         .await?;
 
