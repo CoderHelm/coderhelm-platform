@@ -64,6 +64,16 @@ pub async fn orchestrate_ticket(
         return Ok(());
     }
 
+    // Dedup: skip if another run for this ticket is already in progress
+    if is_ticket_already_running(state, &msg).await {
+        warn!(
+            run_id,
+            ticket_id = %msg.ticket_id,
+            "Skipping duplicate: another run for this ticket is already active"
+        );
+        return Ok(());
+    }
+
     // Create run record
     create_run_record(state, &msg, &run_id).await?;
 
@@ -517,7 +527,7 @@ async fn fail_run(
         .send()
         .await;
 
-    // Update analytics counters
+    // Update analytics counters (include tokens so billing stays accurate)
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     for period in &[month.as_str(), "ALL_TIME"] {
         let _ = state
@@ -526,9 +536,17 @@ async fn fail_run(
             .table_name(&state.config.analytics_table_name)
             .key("tenant_id", attr_s(&msg.tenant_id))
             .key("period", attr_s(period))
-            .update_expression("ADD failed :one, total_cost_usd :cost")
+            .update_expression(
+                "ADD failed :one, total_cost_usd :cost, \
+                 total_tokens_in :ti, total_tokens_out :to, \
+                 cache_read_tokens :cr, cache_write_tokens :cw",
+            )
             .expression_attribute_values(":one", attr_n(1))
             .expression_attribute_values(":cost", attr_n(format!("{:.4}", cost)))
+            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+            .expression_attribute_values(":to", attr_n(usage.output_tokens))
+            .expression_attribute_values(":cr", attr_n(usage.cache_read_tokens))
+            .expression_attribute_values(":cw", attr_n(usage.cache_write_tokens))
             .send()
             .await;
     }
@@ -556,6 +574,32 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 
 fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
+}
+
+/// Check if there is already an active (running) run for this ticket.
+/// Prevents duplicate processing from SQS re-deliveries after Lambda timeouts.
+async fn is_ticket_already_running(state: &WorkerState, msg: &TicketMessage) -> bool {
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .index_name("status-index")
+        .key_condition_expression("tenant_id = :tid AND begins_with(status_run_id, :prefix)")
+        .filter_expression("ticket_id = :ticket")
+        .expression_attribute_values(":tid", attr_s(&msg.tenant_id))
+        .expression_attribute_values(":prefix", attr_s("running#"))
+        .expression_attribute_values(":ticket", attr_s(&msg.ticket_id))
+        .limit(1)
+        .send()
+        .await;
+
+    match result {
+        Ok(out) => !out.items().is_empty(),
+        Err(e) => {
+            warn!("Dedup check failed, proceeding: {e}");
+            false
+        }
+    }
 }
 
 /// Load must-rules (global + repo-specific) from DynamoDB and merge them.

@@ -193,6 +193,12 @@ fn all_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Paths the bot must never write to (require elevated GitHub App permissions).
+fn is_protected_path(path: &str) -> bool {
+    let normalized = path.trim_start_matches('/');
+    normalized.starts_with(".github/workflows/") || normalized.starts_with(".github/actions/")
+}
+
 struct WriteToolExecutor<'a> {
     github: &'a GitHubClient,
     owner: String,
@@ -292,6 +298,12 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
+                if is_protected_path(path) {
+                    return Ok(json!(format!(
+                        "Cannot modify {path}: CI/CD workflow files are protected. \
+                         Skip this file and continue with other changes."
+                    )));
+                }
                 let content = input
                     .get("content")
                     .and_then(|v| v.as_str())
@@ -325,11 +337,16 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .and_then(|v| v.as_array())
                     .ok_or("Missing files")?;
                 let mut ops = Vec::new();
+                let mut skipped = Vec::new();
                 for f in files_arr {
                     let path = f
                         .get("path")
                         .and_then(|v| v.as_str())
                         .ok_or("Missing file path")?;
+                    if is_protected_path(path) {
+                        skipped.push(path.to_string());
+                        continue;
+                    }
                     let action = f.get("action").and_then(|v| v.as_str()).unwrap_or("write");
                     if action == "delete" {
                         ops.push(FileOp::Delete {
@@ -344,15 +361,24 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     }
                     self.files_modified.lock().unwrap().insert(path.to_string());
                 }
+                if ops.is_empty() {
+                    return Ok(json!(format!(
+                        "All files skipped (protected CI/CD paths): {}",
+                        skipped.join(", ")
+                    )));
+                }
                 let sha = self
                     .github
                     .batch_write(&self.owner, &self.repo, &self.branch, message, &ops)
                     .await?;
-                Ok(json!(format!(
-                    "Batch commit {} — {} files",
-                    &sha[..8],
-                    ops.len()
-                )))
+                let mut result = format!("Batch commit {} — {} files", &sha[..8], ops.len());
+                if !skipped.is_empty() {
+                    result.push_str(&format!(
+                        ". Skipped protected files: {}",
+                        skipped.join(", ")
+                    ));
+                }
+                Ok(json!(result))
             }
             "get_diff" => {
                 let diff = self
