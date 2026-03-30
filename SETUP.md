@@ -1,5 +1,7 @@
 # coderhelm Setup Guide
 
+> **See also:** The [README deployment section](README.md#cdk-bootstrap--deploy) for complete CDK deployment instructions, CI/CD pipeline details, and IAM permission requirements.
+
 ## Prerequisites
 
 - **Rust** 1.80+ (`rustup update stable`)
@@ -18,9 +20,14 @@ Create a secret named `coderhelm/<stage>/secrets` with this JSON:
   "github_webhook_secret": "<webhook-secret>",
   "github_client_id": "<oauth-client-id>",
   "github_client_secret": "<oauth-client-secret>",
-  "jwt_secret": "<random-256-bit-hex>"
+  "jwt_secret": "<random-256-bit-hex>",
+  "stripe_secret_key": "<sk_live_or_sk_test_...>",
+  "stripe_price_id": "<price_...>",
+  "stripe_overage_price_id": "<price_...>"
 }
 ```
+
+> The `stripe_price_id` and `stripe_overage_price_id` keys are written automatically by `scripts/setup-stripe.sh`. You must manually add `stripe_secret_key` before running the script.
 
 ## Environment Variables
 
