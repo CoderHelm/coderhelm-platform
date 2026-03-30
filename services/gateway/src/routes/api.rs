@@ -587,15 +587,9 @@ pub async fn get_jira_integration_check(
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let tenant_short = claims
-        .tenant_id
-        .strip_prefix("TENANT#")
-        .unwrap_or(&claims.tenant_id);
-    let webhook_url = if let Some(ref s) = tenant_secret {
-        format!("https://api.coderhelm.com/webhooks/jira/{tenant_short}?secret={s}")
-    } else {
-        format!("https://api.coderhelm.com/webhooks/jira/{tenant_short}")
-    };
+    let webhook_url = tenant_secret
+        .as_ref()
+        .map(|token| format!("https://api.coderhelm.com/webhooks/jira/{token}"));
 
     Ok(Json(json!({
         "ready": ready,
@@ -614,43 +608,110 @@ pub async fn get_jira_integration_check(
     })))
 }
 
-/// POST /api/integrations/jira/secret — generate a JIRA webhook secret for this tenant.
+/// POST /api/integrations/jira/secret — generate a Jira webhook token for this tenant.
+/// Creates an opaque token and a reverse-lookup item so the webhook handler can resolve tenant from token.
 pub async fn generate_jira_secret(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
     use rand::Rng;
-    let secret: String = rand::rng()
+    let token: String = rand::rng()
         .sample_iter(&rand::distr::Alphanumeric)
         .take(40)
         .map(char::from)
         .collect();
 
     let now = chrono::Utc::now().to_rfc3339();
+
+    // Delete old reverse-lookup if a previous token exists
+    let old_token = load_jira_secret(&state, &claims.tenant_id).await;
+    if let Some(old) = old_token {
+        let old_key = format!("JIRA_TOKEN#{old}");
+        let _ = state
+            .dynamo
+            .delete_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&old_key))
+            .key("sk", attr_s(&old_key))
+            .send()
+            .await;
+    }
+
+    // Load installation_id for the reverse-lookup item
+    let install_id = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("META"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .and_then(|item| {
+            item.get("github_install_id")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+
+    // Store token on tenant record
     state
         .dynamo
         .put_item()
         .table_name(&state.config.table_name)
         .item("pk", attr_s(&claims.tenant_id))
         .item("sk", attr_s("JIRA_SECRET"))
-        .item("secret", attr_s(&secret))
+        .item("secret", attr_s(&token))
         .item("created_at", attr_s(&now))
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to store JIRA secret: {e}");
+            error!("Failed to store JIRA token: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(tenant_id = %claims.tenant_id, "Generated JIRA webhook secret");
-    Ok(Json(json!({ "secret": secret })))
+    // Store reverse-lookup: token → tenant
+    let token_key = format!("JIRA_TOKEN#{token}");
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.table_name)
+        .item("pk", attr_s(&token_key))
+        .item("sk", attr_s(&token_key))
+        .item("tenant_id", attr_s(&claims.tenant_id))
+        .item("installation_id", AttributeValue::N(install_id.to_string()))
+        .item("created_at", attr_s(&now))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to store JIRA token lookup: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(tenant_id = %claims.tenant_id, "Generated Jira webhook token");
+    Ok(Json(json!({ "secret": token })))
 }
 
-/// DELETE /api/integrations/jira/secret — remove the JIRA webhook secret.
+/// DELETE /api/integrations/jira/secret — remove the Jira webhook token.
 pub async fn delete_jira_secret(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, StatusCode> {
+    // Delete reverse-lookup first
+    let old_token = load_jira_secret(&state, &claims.tenant_id).await;
+    if let Some(old) = old_token {
+        let old_key = format!("JIRA_TOKEN#{old}");
+        let _ = state
+            .dynamo
+            .delete_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&old_key))
+            .key("sk", attr_s(&old_key))
+            .send()
+            .await;
+    }
+
     state
         .dynamo
         .delete_item()
@@ -660,11 +721,11 @@ pub async fn delete_jira_secret(
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to delete JIRA secret: {e}");
+            error!("Failed to delete JIRA token: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(tenant_id = %claims.tenant_id, "Deleted JIRA webhook secret");
+    info!(tenant_id = %claims.tenant_id, "Deleted Jira webhook token");
     Ok(StatusCode::NO_CONTENT)
 }
 

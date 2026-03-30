@@ -7,90 +7,54 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::auth::verify::verify_jira_signature;
 use crate::models::{TicketMessage, TicketSource, WorkerMessage};
 use crate::AppState;
 
-/// Jira webhook handler — per-tenant URL: `/webhooks/jira/:tenant_id?secret=<token>`
+fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
+    aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
+}
+
+/// Jira webhook handler — `/webhooks/jira/:token`
 ///
-/// Tenant is resolved from the URL path. Authentication is mandatory via either:
-/// - `?secret=<token>` query parameter (for native Jira webhooks), or
-/// - `x-hub-signature-256` HMAC header (for Jira Automation rules).
+/// The token is an opaque random string that maps to a tenant.
+/// No additional auth needed — the URL IS the credential.
 pub async fn handle(
     State(state): State<Arc<AppState>>,
-    axum::extract::Path(path_tenant): axum::extract::Path<String>,
-    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
-    headers: HeaderMap,
+    axum::extract::Path(token): axum::extract::Path<String>,
+    _headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    let tenant_id = if path_tenant.starts_with("TENANT%23") || path_tenant.starts_with("TENANT#") {
-        path_tenant.replace("%23", "#")
-    } else {
-        format!("TENANT#{path_tenant}")
-    };
-
-    // Resolve tenant
-    let meta = state
+    // Look up tenant by webhook token
+    let token_key = format!("JIRA_TOKEN#{token}");
+    let token_item = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key(
-            "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.clone()),
-        )
-        .key(
-            "sk",
-            aws_sdk_dynamodb::types::AttributeValue::S("META".to_string()),
-        )
+        .key("pk", attr_s(&token_key))
+        .key("sk", attr_s(&token_key))
         .send()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| {
+            error!("Failed to look up Jira webhook token: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .item
         .ok_or_else(|| {
-            warn!("Jira webhook: tenant not found: {tenant_id}");
-            StatusCode::NOT_FOUND
+            warn!("Jira webhook: invalid token");
+            StatusCode::UNAUTHORIZED
         })?;
 
-    let installation_id = meta
-        .get("github_install_id")
+    let tenant_id = token_item
+        .get("tenant_id")
+        .and_then(|v| v.as_s().ok())
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
+        .to_string();
+
+    let installation_id = token_item
+        .get("installation_id")
         .and_then(|v| v.as_n().ok())
         .and_then(|s| s.parse::<u64>().ok())
-        .ok_or(StatusCode::BAD_REQUEST)?;
-
-    // Load secret — mandatory
-    let tenant_secret = super::api::load_jira_secret(&state, &tenant_id).await;
-    let effective_secret = tenant_secret
-        .as_deref()
-        .or(state.secrets.jira_webhook_secret.as_deref());
-
-    let stored_secret = effective_secret.ok_or_else(|| {
-        warn!("Jira webhook rejected: no secret configured for {tenant_id}");
-        StatusCode::UNAUTHORIZED
-    })?;
-
-    // Authenticate: URL secret param (native Jira webhooks) or HMAC header (Automation)
-    let url_secret = query.get("secret").map(|s| s.as_str());
-    let hmac_header = headers
-        .get("x-hub-signature-256")
-        .or_else(|| headers.get("x-hub-signature"))
-        .and_then(|v| v.to_str().ok());
-
-    let authenticated = if let Some(provided_secret) = url_secret {
-        use subtle::ConstantTimeEq;
-        provided_secret
-            .as_bytes()
-            .ct_eq(stored_secret.as_bytes())
-            .into()
-    } else if let Some(signature) = hmac_header {
-        verify_jira_signature(stored_secret, &body, signature)
-    } else {
-        false
-    };
-
-    if !authenticated {
-        warn!("Jira webhook auth failed for {tenant_id}");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Parse payload
     let payload: Value = serde_json::from_slice(&body).map_err(|e| {
@@ -98,7 +62,7 @@ pub async fn handle(
         StatusCode::BAD_REQUEST
     })?;
 
-    let event_type = payload
+    let _event_type = payload
         .get("webhookEvent")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
@@ -250,8 +214,8 @@ pub async fn handle(
         .to_string();
 
     info!(
-        event_type,
-        tenant_id, installation_id, ticket_key, repo_owner, repo_name, "Jira webhook received"
+        tenant_id,
+        installation_id, ticket_key, repo_owner, repo_name, "Jira webhook received"
     );
 
     let message = WorkerMessage::Ticket(TicketMessage {
