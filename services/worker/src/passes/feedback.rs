@@ -26,13 +26,26 @@ pub async fn run(
     } else {
         msg.comments.clone()
     };
+
+    // Filter out comments the bot already replied to
+    let comments = filter_unanswered(&github, &msg, comments).await;
+    if comments.is_empty() && msg.review_body.is_empty() {
+        info!(run_id = %msg.run_id, "All comments already answered — skipping feedback");
+        return Ok(());
+    }
+
     let formatted = format_review_comments(&msg.review_body, &comments);
 
     let system = format!(
         "You are a feedback agent for the {owner}/{repo} repository. \
          You respond to reviewer comments on pull requests. \
          If a comment asks a question, answer it clearly. \
-         If a comment requests a code change, implement it precisely.",
+         If a comment requests a code change, implement it precisely. \
+         Your final output will be posted directly as a GitHub comment — \
+         write it as a natural reply to the reviewer. \
+         Never include meta-commentary like 'Response to Review Comments', \
+         'Comment #1', 'Now I have the full context', or any internal reasoning. \
+         Just answer directly as if you are talking to the reviewer.",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
@@ -48,9 +61,12 @@ For each comment, decide whether it is:
 - **A question** (e.g. "why did you do X?", "what does this do?", "could this cause Y?") — answer it with a clear, concise explanation. Read the relevant code first if needed.
 - **A change request** (e.g. "use X instead", "add error handling", "this should be Y") — read the relevant file, fix the code, and push the change.
 
-After processing all comments, output a response with:
-1. Answers to any questions
-2. A summary of any code changes you made
+Your output will be posted directly as a GitHub comment. Write a natural, conversational reply — as if you are talking to the reviewer. Do NOT include:
+- Headings like "Response to Review Comments" or "Comment #1"
+- Meta-commentary like "Now I have the full context" or "Let me explain"
+- Numbered comment references — just answer naturally
+
+If there are multiple comments, address each one in order with a brief separator (like a blank line) but no numbered headers.
 
 Rules:
 - Address every comment. Don't skip any.
@@ -238,6 +254,59 @@ async fn fetch_review_comments(github: &GitHubClient, msg: &FeedbackMessage) -> 
             vec![]
         }
     }
+}
+
+/// Filter out comments that the bot has already replied to.
+async fn filter_unanswered(
+    github: &GitHubClient,
+    msg: &FeedbackMessage,
+    comments: Vec<ReviewComment>,
+) -> Vec<ReviewComment> {
+    if comments.is_empty() {
+        return comments;
+    }
+
+    // Fetch all PR comments to check for existing bot replies
+    let all_comments = match github
+        .get_review_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    {
+        Ok(c) => c,
+        Err(_) => return comments, // can't check — process all
+    };
+
+    // Collect comment IDs that the bot already replied to
+    let answered_ids: std::collections::HashSet<u64> = all_comments
+        .iter()
+        .filter(|c| {
+            c["user"]["login"]
+                .as_str()
+                .map(|l| l.contains("coderhelm"))
+                .unwrap_or(false)
+        })
+        .filter_map(|c| c["in_reply_to_id"].as_u64())
+        .collect();
+
+    let before = comments.len();
+    let filtered: Vec<ReviewComment> = comments
+        .into_iter()
+        .filter(|c| {
+            c.comment_id
+                .map(|id| !answered_ids.contains(&id))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if filtered.len() < before {
+        info!(
+            run_id = %msg.run_id,
+            skipped = before - filtered.len(),
+            remaining = filtered.len(),
+            "Skipped already-answered comments"
+        );
+    }
+
+    filtered
 }
 
 fn feedback_tools() -> Vec<ToolDefinition> {

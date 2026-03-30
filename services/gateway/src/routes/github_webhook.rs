@@ -301,6 +301,14 @@ async fn handle_pr_review(
         return Ok(StatusCode::OK);
     }
 
+    // Ignore reviews submitted by the bot itself
+    let reviewer = payload["review"]["user"]["login"]
+        .as_str()
+        .unwrap_or("");
+    if reviewer.contains("coderhelm") {
+        return Ok(StatusCode::OK);
+    }
+
     let tenant_id = format!("TENANT#{installation_id}");
     let repo = &payload["repository"];
     let owner = repo["owner"]["login"].as_str().unwrap_or("");
@@ -550,6 +558,14 @@ async fn handle_pr_review_comment(
         .as_str()
         .unwrap_or("");
     if !pr_user.contains("coderhelm") {
+        return Ok(StatusCode::OK);
+    }
+
+    // Ignore our own comments to prevent infinite loops
+    let comment_user = payload["comment"]["user"]["login"]
+        .as_str()
+        .unwrap_or("");
+    if comment_user.contains("coderhelm") {
         return Ok(StatusCode::OK);
     }
 
