@@ -4,7 +4,7 @@ use aws_sdk_bedrockruntime::types::{
 };
 use aws_smithy_types::Document;
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::models::TokenUsage;
 use crate::WorkerState;
@@ -106,7 +106,11 @@ pub async fn converse(
             request = request.tool_config(tool_config.clone());
         }
 
-        let response = request.send().await?;
+        let response = request.send().await.map_err(|e| {
+            let msg = format!("Bedrock converse error (model={model_id}): {e:#}");
+            error!("{msg}");
+            msg
+        })?;
 
         // Track token usage (including cache metrics)
         if let Some(u) = response.usage() {

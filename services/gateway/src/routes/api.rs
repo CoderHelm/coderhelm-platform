@@ -119,10 +119,68 @@ pub async fn get_run(
         "cost_usd": item.get("cost_usd").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<f64>().ok()),
         "files_modified": item.get("files_modified").and_then(|v| v.as_l().ok()).map(|list| list.iter().filter_map(|v| v.as_s().ok().map(|s| s.as_str())).collect::<Vec<_>>()),
         "duration_s": item.get("duration_s").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-        "error": item.get("error").and_then(|v| v.as_s().ok()),
+        "error": item.get("error_message").and_then(|v| v.as_s().ok()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
         "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
     })))
+}
+
+/// GET /api/runs/:run_id/openspec — fetch the four openspec files from S3.
+pub async fn get_run_openspec(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    // First verify the run belongs to this tenant
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("run_id", attr_s(&run_id))
+        .projection_expression("ticket_id")
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch run for openspec: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
+    let ticket_id = item
+        .get("ticket_id")
+        .and_then(|v| v.as_s().ok())
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let prefix = format!(
+        "tenants/{}/runs/{}/openspec",
+        claims.tenant_id,
+        ticket_id.to_lowercase()
+    );
+
+    let mut files = serde_json::Map::new();
+    for name in &["proposal.md", "design.md", "tasks.md", "spec.md"] {
+        let key = format!("{prefix}/{name}");
+        match state
+            .s3
+            .get_object()
+            .bucket(&state.config.bucket_name)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(output) => {
+                if let Ok(bytes) = output.body.collect().await {
+                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                        files.insert(name.replace(".md", ""), Value::String(text));
+                    }
+                }
+            }
+            Err(_) => {} // File doesn't exist — skip
+        }
+    }
+
+    Ok(Json(Value::Object(files)))
 }
 
 /// GET /api/repos — list repos configured for this tenant.
