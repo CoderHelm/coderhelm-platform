@@ -1490,7 +1490,7 @@ pub async fn get_workflow_settings(
         .and_then(|i| i.get("commit_openspec"))
         .and_then(|v| v.as_bool().ok())
         .copied()
-        .unwrap_or(true); // default: on
+        .unwrap_or(false); // default: off
 
     Ok(Json(json!({ "commit_openspec": commit_openspec })))
 }
