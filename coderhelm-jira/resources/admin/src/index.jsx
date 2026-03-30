@@ -19,8 +19,14 @@ function App() {
   const save = async () => {
     setStatus("Saving…");
     const result = await invoke("saveConfig", { installationId, tenantId });
-    setStatus(result.success ? "Saved" : `Error: ${result.error}`);
-    setTimeout(() => setStatus(""), 3000);
+    if (!result.success) {
+      setStatus(`Error: ${result.error}`);
+    } else if (result.urlsRegistered) {
+      setStatus("Saved — trigger URLs registered with Coderhelm");
+    } else {
+      setStatus(`Saved — URL registration failed: ${result.urlError || "unknown"}`);
+    }
+    setTimeout(() => setStatus(""), 5000);
   };
 
   if (loading) return <p style={styles.loading}>Loading…</p>;
