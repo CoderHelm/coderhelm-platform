@@ -50,6 +50,7 @@ pub async fn handle(
     match event_type {
         "issues" => handle_issue_event(&state, &payload, installation_id).await,
         "issue_comment" => handle_issue_comment(&state, &payload, installation_id).await,
+        "pull_request" => handle_pull_request(&state, &payload, installation_id).await,
         "pull_request_review" => handle_pr_review(&state, &payload, installation_id).await,
         "pull_request_review_comment" | "pull_request_review_thread" => {
             handle_pr_review_comment(&state, &payload, installation_id).await
@@ -188,6 +189,90 @@ async fn handle_issue_comment(
     }
 
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
+}
+
+/// Track PR merges for Coderhelm branches — updates run status to "merged".
+async fn handle_pull_request(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+) -> Result<StatusCode, StatusCode> {
+    let action = payload["action"].as_str().unwrap_or("");
+    let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
+
+    if action != "closed" || !merged {
+        return Ok(StatusCode::OK);
+    }
+
+    // Only track our PRs
+    let pr_user = payload["pull_request"]["user"]["login"]
+        .as_str()
+        .unwrap_or("");
+    if !pr_user.contains("coderhelm") {
+        return Ok(StatusCode::OK);
+    }
+
+    let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
+    if pr_number == 0 {
+        return Ok(StatusCode::OK);
+    }
+
+    let tenant_id = format!("TENANT#{installation_id}");
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let tenant_repo = format!("{tenant_id}#{owner}/{name}");
+
+    // Query repo-index GSI to find the run with this PR number
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .index_name("repo-index")
+        .key_condition_expression("tenant_repo = :tr")
+        .filter_expression("pr_number = :pn")
+        .expression_attribute_values(":tr", attr_s(&tenant_repo))
+        .expression_attribute_values(":pn", attr_n(pr_number))
+        .scan_index_forward(false)
+        .limit(1)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query run for merged PR: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if let Some(item) = result.items().first() {
+        let run_id = item
+            .get("run_id")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default();
+
+        if !run_id.is_empty() {
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key("tenant_id", attr_s(&tenant_id))
+                .key("run_id", attr_s(&run_id))
+                .update_expression("SET #status = :s, status_run_id = :sri, updated_at = :t")
+                .expression_attribute_names("#status", "status")
+                .expression_attribute_values(":s", attr_s("merged"))
+                .expression_attribute_values(":sri", attr_s(&format!("merged#{run_id}")))
+                .expression_attribute_values(":t", attr_s(&now))
+                .send()
+                .await;
+
+            info!(
+                tenant_id,
+                run_id, pr_number, "PR merged — run status updated"
+            );
+        }
+    }
+
+    Ok(StatusCode::OK)
 }
 
 async fn handle_pr_review(

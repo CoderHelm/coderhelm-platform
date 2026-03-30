@@ -28,6 +28,24 @@ pub async fn run(
         &state.http,
     )?;
 
+    // Ensure the "coderhelm" label exists in each repo we'll use
+    let mut ensured_repos = std::collections::HashSet::new();
+    for task_id in &msg.tasks {
+        if let Ok(Some(task)) = get_task(state, &msg.tenant_id, &msg.plan_id, task_id).await {
+            let r = task
+                .repo
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .unwrap_or(&plan_repo);
+            if !r.is_empty() && ensured_repos.insert(r.to_string()) {
+                let (owner, repo) = split_repo(r);
+                if let Err(e) = github.ensure_label(owner, repo, "coderhelm").await {
+                    error!(repo = r, error = %e, "Failed to ensure coderhelm label");
+                }
+            }
+        }
+    }
+
     // Execute tasks in order
     for task_id in &msg.tasks {
         let task = get_task(state, &msg.tenant_id, &msg.plan_id, task_id).await?;
@@ -59,7 +77,17 @@ pub async fn run(
             .await
         {
             Ok((issue_number, issue_url)) => {
-                // Update task with issue info and mark done
+                // Label the issue FIRST to trigger the ticket pipeline
+                if let Err(e) = github
+                    .add_label(owner, repo, issue_number, "coderhelm")
+                    .await
+                {
+                    error!(task_id, issue_number, error = %e, "Failed to add coderhelm label — issue won't auto-run");
+                    set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                    continue;
+                }
+
+                // Only mark done after label is confirmed
                 update_task_with_issue(
                     state,
                     &msg.tenant_id,
@@ -69,14 +97,6 @@ pub async fn run(
                     &issue_url,
                 )
                 .await?;
-
-                // Label the issue with "coderhelm" to trigger the ticket pipeline
-                if let Err(e) = github
-                    .add_label(owner, repo, issue_number, "coderhelm")
-                    .await
-                {
-                    error!(task_id, issue_number, error = %e, "Failed to add coderhelm label — issue created but won't auto-run");
-                }
 
                 info!(task_id, issue_number, "Created GitHub issue for task");
             }
