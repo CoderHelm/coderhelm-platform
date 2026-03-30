@@ -660,6 +660,82 @@ pub async fn load_jira_secret(state: &AppState, tenant_id: &str) -> Option<Strin
         .and_then(|item| item.get("secret").and_then(|v| v.as_s().ok()).cloned())
 }
 
+/// POST /integrations/jira/forge-register — called by the Forge admin page to register trigger URLs.
+/// Public endpoint, verified by matching installation_id against the tenant's META record.
+pub async fn forge_register_urls(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    let tenant_id = body
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let installation_id = body
+        .get("installation_id")
+        .and_then(|v| v.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let list_projects_url = body
+        .get("list_projects_url")
+        .and_then(|v| v.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let create_ticket_url = body
+        .get("create_ticket_url")
+        .and_then(|v| v.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    // Verify tenant exists and installation_id matches
+    let meta = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(tenant_id))
+        .key("sk", attr_s("META"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("forge-register: failed to query tenant META: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item
+        .ok_or_else(|| {
+            warn!("forge-register: tenant not found: {tenant_id}");
+            StatusCode::NOT_FOUND
+        })?;
+
+    let stored_id = meta
+        .get("github_install_id")
+        .and_then(|v| v.as_n().ok())
+        .map_or("", |v| v.as_str());
+    if stored_id != installation_id {
+        warn!("forge-register: installation_id mismatch for {tenant_id}");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Save trigger URLs to JIRA#config
+    let now = chrono::Utc::now().to_rfc3339();
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(tenant_id))
+        .key("sk", attr_s("JIRA#config"))
+        .update_expression(
+            "SET list_projects_url = :lpu, create_ticket_url = :ctu, updated_at = :ua",
+        )
+        .expression_attribute_values(":lpu", attr_s(list_projects_url))
+        .expression_attribute_values(":ctu", attr_s(create_ticket_url))
+        .expression_attribute_values(":ua", attr_s(&now))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("forge-register: failed to save URLs: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(tenant_id, "Forge trigger URLs registered");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// GET /api/integrations/jira/config — get Jira config (trigger URLs, default project, label, projects).
 pub async fn get_jira_config(
     State(state): State<Arc<AppState>>,

@@ -1,6 +1,8 @@
-const { storage } = require("@forge/api");
+const { storage, fetch: forgeFetch } = require("@forge/api");
 const { webTrigger } = require("@forge/api");
 const Resolver = require("@forge/resolver").default;
+
+const GATEWAY_URL = "https://api.coderhelm.com";
 
 const resolver = new Resolver();
 
@@ -15,7 +17,29 @@ resolver.define("saveConfig", async ({ payload }) => {
     return { success: false, error: "Installation ID is required" };
   }
   await storage.set("coderhelm-config", { installationId, tenantId: tenantId || "" });
-  return { success: true };
+
+  // Auto-register web trigger URLs with the Coderhelm gateway
+  try {
+    const listProjectsUrl = await webTrigger.getUrl("list-projects-trigger");
+    const createTicketUrl = await webTrigger.getUrl("create-ticket-trigger");
+    const tid = tenantId || `TENANT#${installationId}`;
+    const res = await forgeFetch(`${GATEWAY_URL}/integrations/jira/forge-register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tenant_id: tid,
+        installation_id: installationId,
+        list_projects_url: listProjectsUrl,
+        create_ticket_url: createTicketUrl,
+      }),
+    });
+    if (!res.ok) {
+      return { success: true, urlsRegistered: false, urlError: `Gateway returned ${res.status}` };
+    }
+    return { success: true, urlsRegistered: true };
+  } catch (e) {
+    return { success: true, urlsRegistered: false, urlError: String(e) };
+  }
 });
 
 resolver.define("getWebTriggerUrls", async () => {
