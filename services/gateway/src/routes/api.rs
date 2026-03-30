@@ -587,6 +587,16 @@ pub async fn get_jira_integration_check(
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0);
 
+    let tenant_short = claims
+        .tenant_id
+        .strip_prefix("TENANT#")
+        .unwrap_or(&claims.tenant_id);
+    let webhook_url = if let Some(ref s) = tenant_secret {
+        format!("https://api.coderhelm.com/webhooks/jira/{tenant_short}?secret={s}")
+    } else {
+        format!("https://api.coderhelm.com/webhooks/jira/{tenant_short}")
+    };
+
     Ok(Json(json!({
         "ready": ready,
         "secret_configured": secret_configured,
@@ -600,14 +610,7 @@ pub async fn get_jira_integration_check(
         "jira_event_count": jira_runs.len(),
         "installation_id": installation_id,
         "tenant_id": claims.tenant_id,
-        "webhook_url": format!("https://api.coderhelm.com/webhooks/jira/{}", claims.tenant_id.strip_prefix("TENANT#").unwrap_or(&claims.tenant_id)),
-        "checklist": [
-            "Generate a webhook secret below",
-            "Create a Jira Automation rule with a Send web request action",
-            "Paste the webhook URL and payload template",
-            "Add the secret as x-hub-signature-256 header in Jira",
-            "Create a test issue to verify"
-        ],
+        "webhook_url": webhook_url,
     })))
 }
 

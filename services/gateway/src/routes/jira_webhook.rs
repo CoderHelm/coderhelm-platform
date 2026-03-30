@@ -11,10 +11,15 @@ use crate::auth::verify::verify_jira_signature;
 use crate::models::{TicketMessage, TicketSource, WorkerMessage};
 use crate::AppState;
 
-/// Jira webhook handler — per-tenant URL: `/webhooks/jira/:tenant_id`
-pub async fn handle_with_tenant(
+/// Jira webhook handler — per-tenant URL: `/webhooks/jira/:tenant_id?secret=<token>`
+///
+/// Tenant is resolved from the URL path. Authentication is mandatory via either:
+/// - `?secret=<token>` query parameter (for native Jira webhooks), or
+/// - `x-hub-signature-256` HMAC header (for Jira Automation rules).
+pub async fn handle(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(path_tenant): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
@@ -23,25 +28,71 @@ pub async fn handle_with_tenant(
     } else {
         format!("TENANT#{path_tenant}")
     };
-    handle_inner(state, headers, body, Some(tenant_id)).await
-}
 
-/// Jira webhook handler — legacy shared URL (fallback).
-pub async fn handle(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<StatusCode, StatusCode> {
-    handle_inner(state, headers, body, None).await
-}
+    // Resolve tenant
+    let meta = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.clone()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("META".to_string()),
+        )
+        .send()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .item
+        .ok_or_else(|| {
+            warn!("Jira webhook: tenant not found: {tenant_id}");
+            StatusCode::NOT_FOUND
+        })?;
 
-async fn handle_inner(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-    path_tenant_id: Option<String>,
-) -> Result<StatusCode, StatusCode> {
-    // Parse payload first so we can resolve tenant for per-tenant secret lookup.
+    let installation_id = meta
+        .get("github_install_id")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    // Load secret — mandatory
+    let tenant_secret = super::api::load_jira_secret(&state, &tenant_id).await;
+    let effective_secret = tenant_secret
+        .as_deref()
+        .or(state.secrets.jira_webhook_secret.as_deref());
+
+    let stored_secret = effective_secret.ok_or_else(|| {
+        warn!("Jira webhook rejected: no secret configured for {tenant_id}");
+        StatusCode::UNAUTHORIZED
+    })?;
+
+    // Authenticate: URL secret param (native Jira webhooks) or HMAC header (Automation)
+    let url_secret = query.get("secret").map(|s| s.as_str());
+    let hmac_header = headers
+        .get("x-hub-signature-256")
+        .or_else(|| headers.get("x-hub-signature"))
+        .and_then(|v| v.to_str().ok());
+
+    let authenticated = if let Some(provided_secret) = url_secret {
+        use subtle::ConstantTimeEq;
+        provided_secret
+            .as_bytes()
+            .ct_eq(stored_secret.as_bytes())
+            .into()
+    } else if let Some(signature) = hmac_header {
+        verify_jira_signature(stored_secret, &body, signature)
+    } else {
+        false
+    };
+
+    if !authenticated {
+        warn!("Jira webhook auth failed for {tenant_id}");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Parse payload
     let payload: Value = serde_json::from_slice(&body).map_err(|e| {
         error!("Failed to parse Jira webhook body: {e}");
         StatusCode::BAD_REQUEST
@@ -78,120 +129,6 @@ async fn handle_inner(
         })
         .unwrap_or("")
         .to_string();
-
-    // Tenant/install resolution: installation_id (preferred) or tenant_id.
-    let installation_id_from_payload = payload
-        .get("installation_id")
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            payload
-                .get("coderhelm")
-                .and_then(|d| d.get("installation_id"))
-                .and_then(|v| v.as_u64())
-        });
-
-    let tenant_id_from_payload = payload
-        .get("tenant_id")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            payload
-                .get("coderhelm")
-                .and_then(|d| d.get("tenant_id"))
-                .and_then(|v| v.as_str())
-        })
-        .map(|s| {
-            if s.starts_with("TENANT#") {
-                s.to_string()
-            } else {
-                format!("TENANT#{s}")
-            }
-        });
-
-    let (tenant_id, installation_id) = if let Some(tid) = path_tenant_id {
-        // Tenant resolved from URL path — look up installation_id from META
-        let item = state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.table_name)
-            .key(
-                "pk",
-                aws_sdk_dynamodb::types::AttributeValue::S(tid.clone()),
-            )
-            .key(
-                "sk",
-                aws_sdk_dynamodb::types::AttributeValue::S("META".to_string()),
-            )
-            .send()
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .item
-            .ok_or_else(|| {
-                warn!("Jira webhook: tenant not found from path: {tid}");
-                StatusCode::NOT_FOUND
-            })?;
-
-        let install_id = item
-            .get("github_install_id")
-            .and_then(|v| v.as_n().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or(StatusCode::BAD_REQUEST)?;
-
-        (tid, install_id)
-    } else {
-        // Legacy: resolve tenant from payload fields
-        match (tenant_id_from_payload, installation_id_from_payload) {
-            (Some(tenant_id), Some(installation_id)) => (tenant_id, installation_id),
-            (None, Some(installation_id)) => (format!("TENANT#{installation_id}"), installation_id),
-            (Some(tenant_id), None) => {
-                // Resolve install id from tenant metadata.
-                let item = state
-                    .dynamo
-                    .get_item()
-                    .table_name(&state.config.table_name)
-                    .key(
-                        "pk",
-                        aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.clone()),
-                    )
-                    .key(
-                        "sk",
-                        aws_sdk_dynamodb::types::AttributeValue::S("META".to_string()),
-                    )
-                    .send()
-                    .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                    .item
-                    .ok_or(StatusCode::BAD_REQUEST)?;
-
-                let install_id = item
-                    .get("github_install_id")
-                    .and_then(|v| v.as_n().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .ok_or(StatusCode::BAD_REQUEST)?;
-
-                (tenant_id, install_id)
-            }
-            (None, None) => return Err(StatusCode::BAD_REQUEST),
-        }
-    };
-
-    // Verify signature: per-tenant secret (DynamoDB) > global secret (Secrets Manager) > skip.
-    let tenant_secret = super::api::load_jira_secret(&state, &tenant_id).await;
-    let effective_secret = tenant_secret
-        .as_deref()
-        .or(state.secrets.jira_webhook_secret.as_deref());
-
-    if let Some(secret) = effective_secret {
-        let signature = headers
-            .get("x-hub-signature-256")
-            .or_else(|| headers.get("x-hub-signature"))
-            .and_then(|v| v.to_str().ok())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-
-        if !verify_jira_signature(secret, &body, signature) {
-            warn!("Invalid Jira webhook signature");
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-    }
 
     // ── Project + label filtering ────────────────────────────────────────────
     let jira_config = state
