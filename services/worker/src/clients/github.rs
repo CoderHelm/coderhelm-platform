@@ -327,15 +327,33 @@ impl GitHubClient {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let sha = self.get_ref(owner, repo, from_ref).await?;
         let url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs");
-        let data = self
-            .post(
-                &url,
-                &serde_json::json!({
-                    "ref": format!("refs/heads/{branch}"),
-                    "sha": sha,
-                }),
-            )
-            .await?;
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.post(&url).json(&serde_json::json!({
+            "ref": format!("refs/heads/{branch}"),
+            "sha": sha,
+        }));
+        for (k, v) in &headers {
+            req = req.header(k.clone(), v.clone());
+        }
+        let resp = req.send().await?;
+
+        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            // Branch already exists — reset it to the target ref
+            let update_url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
+            let data = self
+                .patch(
+                    &update_url,
+                    &serde_json::json!({ "sha": sha, "force": true }),
+                )
+                .await?;
+            let new_sha = data
+                .pointer("/object/sha")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing sha in update ref response")?;
+            return Ok(new_sha.to_string());
+        }
+
+        let data: serde_json::Value = resp.error_for_status()?.json().await?;
         let new_sha = data
             .pointer("/object/sha")
             .and_then(|v| v.as_str())
