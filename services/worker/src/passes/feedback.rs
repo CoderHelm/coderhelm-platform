@@ -36,6 +36,26 @@ pub async fn run(
 
     let formatted = format_review_comments(&msg.review_body, &comments);
 
+    // Load voice instructions (repo-specific falls back to global)
+    let voice = {
+        let repo_voice = super::load_content(
+            state,
+            &msg.tenant_id,
+            &format!("VOICE#REPO#{}/{}", msg.repo_owner, msg.repo_name),
+        )
+        .await;
+        if repo_voice.is_empty() {
+            super::load_content(state, &msg.tenant_id, "VOICE#GLOBAL").await
+        } else {
+            repo_voice
+        }
+    };
+    let voice_block = if voice.is_empty() {
+        String::new()
+    } else {
+        format!(" Match the team's voice and tone as described below:\n{voice}")
+    };
+
     let system = format!(
         "You are a feedback agent for the {owner}/{repo} repository. \
          You respond to reviewer comments on pull requests. \
@@ -45,7 +65,7 @@ pub async fn run(
          write it as a natural reply to the reviewer. \
          Never include meta-commentary like 'Response to Review Comments', \
          'Comment #1', 'Now I have the full context', or any internal reasoning. \
-         Just answer directly as if you are talking to the reviewer.",
+         Just answer directly as if you are talking to the reviewer.{voice_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );

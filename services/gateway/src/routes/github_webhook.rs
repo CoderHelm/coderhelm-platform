@@ -302,9 +302,7 @@ async fn handle_pr_review(
     }
 
     // Ignore reviews submitted by the bot itself
-    let reviewer = payload["review"]["user"]["login"]
-        .as_str()
-        .unwrap_or("");
+    let reviewer = payload["review"]["user"]["login"].as_str().unwrap_or("");
     if reviewer.contains("coderhelm") {
         return Ok(StatusCode::OK);
     }
@@ -562,9 +560,7 @@ async fn handle_pr_review_comment(
     }
 
     // Ignore our own comments to prevent infinite loops
-    let comment_user = payload["comment"]["user"]["login"]
-        .as_str()
-        .unwrap_or("");
+    let comment_user = payload["comment"]["user"]["login"].as_str().unwrap_or("");
     if comment_user.contains("coderhelm") {
         return Ok(StatusCode::OK);
     }
