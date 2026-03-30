@@ -101,6 +101,10 @@ async fn main() -> Result<(), Error> {
             "/integrations/jira/projects/fetch",
             get(routes::api::fetch_jira_projects),
         )
+        .route(
+            "/integrations/jira/events",
+            get(routes::api::get_jira_events),
+        )
         .route("/stats", get(routes::api::get_stats))
         .route("/stats/history", get(routes::api::get_stats_history))
         .route(

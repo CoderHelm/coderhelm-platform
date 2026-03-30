@@ -589,7 +589,12 @@ pub async fn get_jira_integration_check(
 
     let webhook_url = tenant_secret
         .as_ref()
-        .map(|token| format!("https://api.coderhelm.com/webhooks/jira/{token}"));
+        .map(|(token, _)| format!("https://api.coderhelm.com/webhooks/jira/{token}"));
+
+    let webhook_secret = tenant_secret
+        .as_ref()
+        .map(|(_, ws)| ws.clone())
+        .filter(|s| !s.is_empty());
 
     Ok(Json(json!({
         "ready": ready,
@@ -605,39 +610,46 @@ pub async fn get_jira_integration_check(
         "installation_id": installation_id,
         "tenant_id": claims.tenant_id,
         "webhook_url": webhook_url,
+        "webhook_secret": webhook_secret,
     })))
 }
 
-/// POST /api/integrations/jira/secret — generate a Jira webhook token for this tenant.
-/// Creates an opaque token and a reverse-lookup item so the webhook handler can resolve tenant from token.
+/// POST /api/integrations/jira/secret — generate a Jira webhook token + signing secret.
+/// Creates an opaque URL token (stored in jira-tokens table) and a separate HMAC
+/// signing secret the user pastes into Jira's webhook config for signature verification.
 pub async fn generate_jira_secret(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
     use rand::Rng;
+
     let token: String = rand::rng()
         .sample_iter(&rand::distr::Alphanumeric)
         .take(40)
         .map(char::from)
         .collect();
 
+    let webhook_secret: String = rand::rng()
+        .sample_iter(&rand::distr::Alphanumeric)
+        .take(64)
+        .map(char::from)
+        .collect();
+
     let now = chrono::Utc::now().to_rfc3339();
 
-    // Delete old reverse-lookup if a previous token exists
-    let old_token = load_jira_secret(&state, &claims.tenant_id).await;
-    if let Some(old) = old_token {
-        let old_key = format!("JIRA_TOKEN#{old}");
+    // Delete old token from jira-tokens table if one exists
+    let old = load_jira_secret(&state, &claims.tenant_id).await;
+    if let Some(old_token) = old.as_ref().map(|(t, _)| t) {
         let _ = state
             .dynamo
             .delete_item()
-            .table_name(&state.config.table_name)
-            .key("pk", attr_s(&old_key))
-            .key("sk", attr_s(&old_key))
+            .table_name(&state.config.jira_tokens_table_name)
+            .key("token", attr_s(old_token))
             .send()
             .await;
     }
 
-    // Load installation_id for the reverse-lookup item
+    // Load installation_id
     let install_id = state
         .dynamo
         .get_item()
@@ -655,7 +667,7 @@ pub async fn generate_jira_secret(
         })
         .unwrap_or(0);
 
-    // Store token on tenant record
+    // Store token + webhook_secret on tenant record (main table)
     state
         .dynamo
         .put_item()
@@ -663,6 +675,7 @@ pub async fn generate_jira_secret(
         .item("pk", attr_s(&claims.tenant_id))
         .item("sk", attr_s("JIRA_SECRET"))
         .item("secret", attr_s(&token))
+        .item("webhook_secret", attr_s(&webhook_secret))
         .item("created_at", attr_s(&now))
         .send()
         .await
@@ -671,26 +684,45 @@ pub async fn generate_jira_secret(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Store reverse-lookup: token → tenant
-    let token_key = format!("JIRA_TOKEN#{token}");
-    state
+    // Store token → tenant mapping in jira-tokens table (with conditional write)
+    let put_result = state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
-        .item("pk", attr_s(&token_key))
-        .item("sk", attr_s(&token_key))
+        .table_name(&state.config.jira_tokens_table_name)
+        .item("token", attr_s(&token))
         .item("tenant_id", attr_s(&claims.tenant_id))
         .item("installation_id", AttributeValue::N(install_id.to_string()))
+        .item("webhook_secret", attr_s(&webhook_secret))
         .item("created_at", attr_s(&now))
+        .condition_expression("attribute_not_exists(#t)")
+        .expression_attribute_names("#t", "token")
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to store JIRA token lookup: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .await;
 
-    info!(tenant_id = %claims.tenant_id, "Generated Jira webhook token");
-    Ok(Json(json!({ "secret": token })))
+    if let Err(e) = put_result {
+        if e.as_service_error()
+            .map(|se| se.is_conditional_check_failed_exception())
+            .unwrap_or(false)
+        {
+            error!("JIRA token collision detected — client should retry");
+            let _ = state
+                .dynamo
+                .delete_item()
+                .table_name(&state.config.table_name)
+                .key("pk", attr_s(&claims.tenant_id))
+                .key("sk", attr_s("JIRA_SECRET"))
+                .send()
+                .await;
+            return Err(StatusCode::CONFLICT);
+        }
+        error!("Failed to store JIRA token lookup: {e}");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    info!(tenant_id = %claims.tenant_id, "Generated Jira webhook token + signing secret");
+    Ok(Json(
+        json!({ "token": token, "webhook_secret": webhook_secret }),
+    ))
 }
 
 /// DELETE /api/integrations/jira/secret — remove the Jira webhook token.
@@ -698,16 +730,14 @@ pub async fn delete_jira_secret(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, StatusCode> {
-    // Delete reverse-lookup first
-    let old_token = load_jira_secret(&state, &claims.tenant_id).await;
-    if let Some(old) = old_token {
-        let old_key = format!("JIRA_TOKEN#{old}");
+    // Delete token from jira-tokens table first
+    let old = load_jira_secret(&state, &claims.tenant_id).await;
+    if let Some((old_token, _)) = old {
         let _ = state
             .dynamo
             .delete_item()
-            .table_name(&state.config.table_name)
-            .key("pk", attr_s(&old_key))
-            .key("sk", attr_s(&old_key))
+            .table_name(&state.config.jira_tokens_table_name)
+            .key("token", attr_s(&old_token))
             .send()
             .await;
     }
@@ -729,9 +759,10 @@ pub async fn delete_jira_secret(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Load per-tenant JIRA secret from DynamoDB.
-pub async fn load_jira_secret(state: &AppState, tenant_id: &str) -> Option<String> {
-    state
+/// Load per-tenant JIRA token and webhook secret from DynamoDB.
+/// Returns (token, webhook_secret) if configured.
+pub async fn load_jira_secret(state: &AppState, tenant_id: &str) -> Option<(String, String)> {
+    let item = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
@@ -740,8 +771,32 @@ pub async fn load_jira_secret(state: &AppState, tenant_id: &str) -> Option<Strin
         .send()
         .await
         .ok()
-        .and_then(|r| r.item)
-        .and_then(|item| item.get("secret").and_then(|v| v.as_s().ok()).cloned())
+        .and_then(|r| r.item)?;
+    let token = item.get("secret").and_then(|v| v.as_s().ok()).cloned()?;
+    let webhook_secret = item
+        .get("webhook_secret")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    Some((token, webhook_secret))
+}
+
+/// GET /api/integrations/jira/events — list recent Jira webhook events for the Events tab.
+pub async fn get_jira_events(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, StatusCode> {
+    let limit: i32 = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+        .min(100);
+
+    let events =
+        crate::routes::jira_webhook::list_jira_events(&state, &claims.tenant_id, limit).await?;
+
+    Ok(Json(json!({ "events": events })))
 }
 
 /// POST /integrations/jira/forge-register — called by the Forge admin page to register trigger URLs.

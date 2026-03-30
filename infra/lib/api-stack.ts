@@ -20,6 +20,8 @@ interface ApiStackProps extends cdk.StackProps {
   analyticsTable: dynamodb.TableV2;
   eventsTable: dynamodb.TableV2;
   usersTable: dynamodb.TableV2;
+  jiraTokensTable: dynamodb.TableV2;
+  jiraEventsTable: dynamodb.TableV2;
   bucket: s3.Bucket;
 }
 
@@ -98,6 +100,8 @@ export class ApiStack extends cdk.Stack {
         ANALYTICS_TABLE_NAME: props.analyticsTable.tableName,
         EVENTS_TABLE_NAME: props.eventsTable.tableName,
         USERS_TABLE_NAME: props.usersTable.tableName,
+        JIRA_TOKENS_TABLE_NAME: props.jiraTokensTable.tableName,
+        JIRA_EVENTS_TABLE_NAME: props.jiraEventsTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
         TICKET_QUEUE_URL: this.ticketQueue.queueUrl,
         CI_FIX_QUEUE_URL: this.ciFixQueue.queueUrl,
@@ -117,6 +121,8 @@ export class ApiStack extends cdk.Stack {
     props.analyticsTable.grantReadData(this.gatewayFunction);
     props.eventsTable.grantReadWriteData(this.gatewayFunction);
     props.usersTable.grantReadWriteData(this.gatewayFunction);
+    props.jiraTokensTable.grantReadWriteData(this.gatewayFunction);
+    props.jiraEventsTable.grantReadWriteData(this.gatewayFunction);
     props.bucket.grantRead(this.gatewayFunction);
     this.ticketQueue.grantSendMessages(this.gatewayFunction);
     this.ciFixQueue.grantSendMessages(this.gatewayFunction);
