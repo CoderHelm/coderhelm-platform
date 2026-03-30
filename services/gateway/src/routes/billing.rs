@@ -309,19 +309,7 @@ pub async fn create_subscription(
         .and_then(|v| v.as_s().ok())
         .filter(|s| !s.is_empty())
     {
-        Some(cid) => {
-            // Update email on existing customer if we have one
-            if !user_email.is_empty() {
-                let _ = state
-                    .http
-                    .post(format!("https://api.stripe.com/v1/customers/{cid}"))
-                    .header("Authorization", format!("Bearer {stripe_key}"))
-                    .form(&[("email", user_email.as_str())])
-                    .send()
-                    .await;
-            }
-            cid.to_string()
-        }
+        Some(cid) => cid.to_string(),
         None => create_stripe_customer(&state, stripe_key, &claims.tenant_id, &user_email).await?,
     };
 
@@ -774,7 +762,6 @@ pub async fn create_setup_intent(
         .form(&[
             ("customer", customer_id.as_str()),
             ("payment_method_types[]", "card"),
-            ("payment_method_types[]", "us_bank_account"),
             ("usage", "off_session"),
         ])
         .send()
