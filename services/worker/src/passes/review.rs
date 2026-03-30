@@ -60,7 +60,7 @@ Output a brief summary of what you reviewed and any fixes applied."#,
 
     let response = llm::converse(
         state,
-        &state.config.light_model_id,
+        &state.config.model_id,
         &system,
         &mut messages,
         &tools,
@@ -96,11 +96,22 @@ fn review_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description": "File path relative to repo root"},
                     "start_line": {"type": "integer", "description": "First line (1-indexed)"},
                     "end_line": {"type": "integer", "description": "Last line (inclusive)"}
                 },
                 "required": ["path", "start_line", "end_line"]
+            }),
+        },
+        ToolDefinition {
+            name: "list_directory".to_string(),
+            description: "List contents of a directory.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path relative to repo root"}
+                },
+                "required": ["path"]
             }),
         },
         ToolDefinition {
@@ -226,6 +237,30 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                     .read_file_lines(self.owner, self.repo, path, self.branch, start, end)
                     .await?;
                 Ok(json!(content))
+            }
+            "list_directory" => {
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tree = self
+                    .github
+                    .get_tree(self.owner, self.repo, self.branch)
+                    .await?;
+                let entries: Vec<&str> = tree
+                    .iter()
+                    .filter(|e| {
+                        let p = e.path.as_str();
+                        if path.is_empty() {
+                            !p.contains('/')
+                        } else {
+                            p.starts_with(&format!("{path}/"))
+                                && !p[path.len() + 1..].contains('/')
+                        }
+                    })
+                    .map(|e| e.path.as_str())
+                    .collect();
+                Ok(json!(entries))
             }
             "search_code" => {
                 let query = input
