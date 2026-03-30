@@ -600,7 +600,7 @@ pub async fn get_jira_integration_check(
         "jira_event_count": jira_runs.len(),
         "installation_id": installation_id,
         "tenant_id": claims.tenant_id,
-        "webhook_url": "https://api.coderhelm.com/webhooks/jira",
+        "webhook_url": format!("https://api.coderhelm.com/webhooks/jira/{}", claims.tenant_id.strip_prefix("TENANT#").unwrap_or(&claims.tenant_id)),
         "checklist": [
             "Generate a webhook secret below",
             "Create a Jira Automation rule with a Send web request action",
