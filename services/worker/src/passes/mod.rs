@@ -5,6 +5,37 @@ use crate::WorkerState;
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{error, info, warn};
 
+/// Strip internal model IDs, Bedrock details, and service names from error messages
+/// so they are safe to display to users.
+fn sanitize_error(msg: &str) -> String {
+    let mut s = msg.to_string();
+    // Remove (model=us.anthropic.claude-...) patterns
+    while let Some(start) = s.find("(model=") {
+        if let Some(end) = s[start..].find(')') {
+            s.replace_range(start..start + end + 1, "");
+        } else {
+            break;
+        }
+    }
+    // Remove model IDs
+    let patterns = [
+        "us.anthropic.claude-opus-4-6-v1",
+        "us.anthropic.claude-sonnet-4-6",
+        "us.anthropic.claude-sonnet-4-20250514",
+    ];
+    for p in &patterns {
+        s = s.replace(p, "");
+    }
+    s = s
+        .replace(
+            "Bedrock converse error",
+            "An error occurred during processing",
+        )
+        .replace("service error", "service temporarily unavailable");
+    // Collapse extra whitespace
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub mod ci_fix;
 pub mod feedback;
 mod implement;
@@ -44,7 +75,8 @@ pub async fn orchestrate_ticket(
         Err(e) => {
             error!(run_id, error = %e, "Orchestration failed");
             let duration = start.elapsed().as_secs();
-            fail_run(state, &msg, &run_id, &e.to_string(), &usage, duration).await;
+            let sanitized = sanitize_error(&e.to_string());
+            fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
             return Err(e);
         }
     }
