@@ -229,7 +229,44 @@ PORTAL_ID=$(printf '%s\n' "$PORTAL_JSON" | python3 -c \
 echo "Portal: ${PORTAL_ID}"
 
 echo ""
-echo "=== 6. Updating Secrets Manager with price IDs ==="
+echo "=== 6. Ensuring Webhook endpoint has all required events ==="
+WEBHOOK_URL="https://api.coderhelm.com/webhooks/stripe"
+REQUIRED_EVENTS=(
+  checkout.session.completed
+  customer.subscription.updated
+  customer.subscription.deleted
+  invoice.payment_succeeded
+  invoice.payment_failed
+  invoice.finalized
+)
+
+# Find existing webhook for our URL
+WEBHOOK_ID=$(stripe_get "https://api.stripe.com/v1/webhook_endpoints?limit=20" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for w in data.get('data', []):
+    if w.get('url') == '${WEBHOOK_URL}':
+        print(w['id'])
+        break
+else:
+    print('')
+")
+
+EVENT_ARGS=""
+for i in "${!REQUIRED_EVENTS[@]}"; do
+  EVENT_ARGS="${EVENT_ARGS} -d enabled_events[${i}]=${REQUIRED_EVENTS[$i]}"
+done
+
+if [[ -n "$WEBHOOK_ID" ]]; then
+  echo "Updating existing webhook: $WEBHOOK_ID"
+  stripe_post "https://api.stripe.com/v1/webhook_endpoints/${WEBHOOK_ID}" ${EVENT_ARGS} > /dev/null
+else
+  echo "No webhook found for ${WEBHOOK_URL} — skipping (create manually in Stripe dashboard)"
+fi
+echo "Webhook events: ${REQUIRED_EVENTS[*]}"
+
+echo ""
+echo "=== 7. Updating Secrets Manager with price IDs ==="
 python3 << PYEOF
 import json, subprocess, sys
 
