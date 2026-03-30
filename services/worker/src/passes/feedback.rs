@@ -19,17 +19,6 @@ pub async fn run(
         &state.http,
     )?;
 
-    // Fetch the PR to find the branch
-    let _pr_data = github
-        .get_diff(
-            &msg.repo_owner,
-            &msg.repo_name,
-            "main",
-            &format!("pull/{}/head", msg.pr_number),
-        )
-        .await;
-
-    // Format review comments
     let formatted = format_review_comments(&msg);
 
     let system = format!(
@@ -93,11 +82,6 @@ Rules:
         &response[..response.len().min(200)]
     );
 
-    // Reply to each top-level review comment
-    for _comment in &msg.comments {
-        // We don't have comment IDs in our FeedbackMessage yet,
-        // so we post a single comment on the PR
-    }
     github
         .create_issue_comment(
             &msg.repo_owner,

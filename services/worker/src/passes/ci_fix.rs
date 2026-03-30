@@ -140,6 +140,11 @@ Rules:
 fn ci_fix_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
+            name: "get_diff".to_string(),
+            description: "Compare the current branch to main.".to_string(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDefinition {
             name: "read_file".to_string(),
             description: "Read a file. Prefer read_file_lines for targeted reads.".to_string(),
             input_schema: json!({
@@ -234,6 +239,34 @@ impl<'a> ToolExecutor for CiFixToolExecutor<'a> {
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         match name {
+            "get_diff" => {
+                let diff = self
+                    .github
+                    .get_diff(self.owner, self.repo, "main", self.branch)
+                    .await?;
+                let files = diff.get("files").and_then(|v| v.as_array());
+                if let Some(files) = files {
+                    let mut lines = Vec::new();
+                    for f in files {
+                        let filename = f.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+                        let status = f.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        let adds = f.get("additions").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let dels = f.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0);
+                        lines.push(format!("{filename} ({status}, +{adds}/-{dels})"));
+                        if let Some(patch) = f.get("patch").and_then(|v| v.as_str()) {
+                            let truncated = if patch.len() > 2000 {
+                                format!("{}... (truncated)", &patch[..2000])
+                            } else {
+                                patch.to_string()
+                            };
+                            lines.push(truncated);
+                        }
+                    }
+                    Ok(json!(lines.join("\n")))
+                } else {
+                    Ok(json!("No changes compared to main."))
+                }
+            }
             "read_tree" => {
                 let tree = self
                     .github
