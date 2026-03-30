@@ -4,7 +4,8 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::models::{
-    Claims, InfraAnalyzeMessage, NotificationPrefs, OnboardMessage, OnboardRepo, WorkerMessage,
+    Claims, InfraAnalyzeMessage, NotificationPrefs, OnboardMessage, OnboardRepo, TicketMessage,
+    TicketSource, WorkerMessage,
 };
 use crate::AppState;
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -181,6 +182,117 @@ pub async fn get_run_openspec(
     }
 
     Ok(Json(Value::Object(files)))
+}
+
+/// POST /api/runs/:run_id/retry — re-enqueue a failed run to the ticket queue.
+pub async fn retry_run(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    // Fetch the failed run
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("run_id", attr_s(&run_id))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch run for retry: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
+
+    let status = item
+        .get("status")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    if status != "failed" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let repo = item
+        .get("repo")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let parts: Vec<&str> = repo.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let installation_id = item
+        .get("installation_id")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let issue_number = item
+        .get("issue_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    if installation_id == 0 {
+        error!("Cannot retry run {run_id}: missing installation_id (run predates retry support)");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let ticket_source = item
+        .get("ticket_source")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("github");
+    let source = match ticket_source {
+        "jira" => TicketSource::Jira,
+        _ => TicketSource::Github,
+    };
+
+    let message = WorkerMessage::Ticket(TicketMessage {
+        tenant_id: claims.tenant_id.clone(),
+        installation_id,
+        source,
+        ticket_id: item
+            .get("ticket_id")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        title: item
+            .get("title")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        body: String::new(), // body is re-fetched from GitHub by the worker
+        repo_owner: parts[0].to_string(),
+        repo_name: parts[1].to_string(),
+        issue_number,
+        sender: claims.github_login.clone(),
+    });
+
+    let body = serde_json::to_string(&message).map_err(|e| {
+        error!("Failed to serialize retry message: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to enqueue retry: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(run_id, "Run retried — dispatched to SQS");
+    Ok(Json(json!({ "status": "retrying" })))
 }
 
 /// GET /api/repos — list repos configured for this tenant.
