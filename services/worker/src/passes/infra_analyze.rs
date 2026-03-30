@@ -31,7 +31,6 @@ CRITICAL SYNTAX:
 - IDs: lowercase alphanumeric + underscores ONLY. No hyphens, no dots, no special chars.
 - Labels in []: alphanumeric, spaces, hyphens, periods ONLY. No slashes / brackets / braces / colons.
 - DECLARE all groups and services FIRST, then ALL edges LAST. Never interleave.
-- Each port (T/B/L/R) supports ONE edge. Use junctions for fan-out.
 - FORBIDDEN: -->|text|, <--, subgraph/end, ---, -.-, flowchart syntax of any kind.
 
 ICONS — use logos:aws-* icons:
@@ -41,28 +40,87 @@ ICONS — use logos:aws-* icons:
   logos:aws-route53, logos:aws-iam, logos:aws-sns, logos:aws-eventbridge,
   logos:aws-ec2, logos:aws-ecs, logos:aws-step-functions, logos:aws-cognito.
 
-LAYOUT STRATEGY — this is the most important section:
-1. MAX 8-10 services total. Ruthlessly merge: "3 DynamoDB tables" → one node, "5 Lambdas" → group by role (API + Worker). Only show the MAIN request path.
+─── UNDERSTANDING THE LAYOUT ENGINE (read carefully) ───
+
+Mermaid architecture-beta uses cytoscape.js with fcose (force-directed) layout.
+The renderer builds an IMPLICIT GRID from your edge port directions via BFS.
+Each edge places connected nodes on a grid: R→L means "target is 1 column right",
+B→T means "target is 1 row below". The layout engine ONLY works cleanly when:
+
+  ★ Every connected pair of nodes is EXACTLY 1 grid unit apart.
+
+When nodes end up >1 unit apart, the grid constraints collapse and you get:
+diagonal lines, non-deterministic rendering, overlapping nodes, extreme spacing.
+
+Additionally, each port (T, B, L, R) on a service supports EXACTLY ONE edge.
+If you connect two edges to the same port, nodes will overlap.
+
+─── LAYOUT STRATEGY ───
+
+1. MAX 8 services total. Ruthlessly merge: "3 DynamoDB tables" → one node,
+   "5 Lambdas" → one per role (API + Worker). Show only the MAIN request path.
+
 2. Use exactly 3 groups arranged left-to-right:
    - group edge(cloud)[Edge] — CDN, WAF, API Gateway, Route53
    - group compute(cloud)[Compute] — Lambdas, ECS, Step Functions
    - group data(cloud)[Data] — DynamoDB, S3, SQS, SNS, SES, EventBridge
-3. CRITICAL EDGE RULES — these determine whether the diagram looks clean or chaotic:
-   a. BETWEEN groups: always use R --> L (right port of source to left port of target). This keeps horizontal flow clean.
-   b. WITHIN a group: always use B --> T (bottom of upper service to top of lower service). This creates clean vertical stacks.
-   c. NEVER connect across groups using T or B ports — this creates ugly diagonal lines.
-   d. NEVER connect backwards (data group back to compute group).
-4. For fan-out to 3+ targets from one service, use ONE junction:
-   junction j_fan in compute
-   svc:R --> L:j_fan
-   j_fan:R --> L:target_a
-   j_fan:T --> B:target_b
-   j_fan:B --> T:target_c
-5. Keep services in each group to 2-4 max. If a group would have 5+, merge nodes.
-6. Order services in each group so the main request path flows top-to-bottom.
 
-BEFORE writing edges, mentally trace the request path: User → Edge → Compute → Data.
-Write edges in that order. Every edge should go LEFT-TO-RIGHT or TOP-TO-BOTTOM within a group. No exceptions.
+3. Keep 2-3 services per group max. If a group would have 4+, merge nodes.
+
+4. EDGE RULES — these are the most important rules for clean rendering:
+
+   a. BETWEEN groups: ONLY use R --> L (source right port to target left port).
+      This places groups exactly 1 column apart in the grid.
+
+   b. WITHIN a group: ONLY use B --> T (upper service bottom to lower service top).
+      This stacks services vertically, each exactly 1 row apart.
+
+   c. NEVER use T or B ports for inter-group edges — this creates diagonal
+      lines because it places nodes on a different row AND column simultaneously.
+
+   d. NEVER use R or L ports for intra-group edges — this forces horizontal
+      layout inside a group, conflicting with the vertical stacking.
+
+   e. NEVER connect backwards (data → compute, compute → edge).
+
+5. JUNCTION RULES for fan-out:
+   When a service needs to reach 2+ targets, you MUST use junctions because
+   each port supports only one edge. Use this exact pattern:
+
+   junction j1 in {group}
+   source:R --> L:j1
+   j1:R --> L:target_a
+   j1:B --> T:target_b
+
+   Junctions in the TARGET group (for inter-group fan-out):
+   junction j_data in data
+   api_fn:R --> L:j_data
+   j_data:R --> L:db
+   j_data:B --> T:queue
+
+   Junctions in the SOURCE group (for multiple services reaching same target):
+   junction j_compute in compute
+   api_fn:B --> T:j_compute
+   worker_fn:B --> T:j_compute   ← WRONG! same port used twice
+   ✗ Don't connect two services to the same junction port — use a chain instead.
+
+6. GRID ALIGNMENT — before writing edges, sketch the grid mentally:
+
+        col0(edge)  col1(compute)  col2(data)
+   row0:  cdn         api_fn         db
+   row1:  apigw       worker_fn      queue
+
+   Then write edges that match this grid:
+   - cdn → apigw: same column, adjacent rows → B --> T ✓
+   - apigw → api_fn: adjacent columns, same row → R --> L ✓
+   - api_fn → worker_fn: same column, adjacent rows → B --> T ✓
+   - api_fn → db: adjacent columns, same row → R --> L ✓
+   - worker_fn → queue: adjacent columns, same row → R --> L ✓
+
+   If you want db → queue (same column, adjacent rows): B --> T ✓
+   If you want cdn → api_fn: they are col0→col1, row0→row0 → R --> L ✓
+   If you want cdn → worker_fn: col0→col1, row0→row1 — THIS IS A DIAGONAL!
+      Route through a junction or connect through apigw instead.
 
 EXAMPLE of a clean diagram:
 architecture-beta
@@ -77,16 +135,38 @@ architecture-beta
     group data(cloud)[Data]
     service db(logos:aws-dynamodb)[DynamoDB] in data
     service queue(logos:aws-sqs)[SQS] in data
-    service storage(logos:aws-s3)[S3] in data
 
     cdn:B --> T:apigw
     apigw:R --> L:api_fn
     api_fn:B --> T:worker_fn
     api_fn:R --> L:db
     worker_fn:R --> L:queue
-    queue:B --> T:storage
 
-The key is SIMPLICITY — fewer nodes, clean left-to-right flow, correct syntax. A diagram with 7 well-placed nodes beats one with 15 tangled nodes.
+Grid: cdn[0,0] apigw[0,1] api_fn[1,0] worker_fn[1,1] db[2,0] queue[2,1]
+Every edge connects nodes exactly 1 unit apart. Result: clean orthogonal lines.
+
+EXAMPLE with junction for fan-out:
+architecture-beta
+    group edge(cloud)[Edge]
+    service cdn(logos:aws-cloudfront)[CloudFront] in edge
+
+    group compute(cloud)[Compute]
+    service api_fn(logos:aws-lambda)[API Lambda] in compute
+
+    group data(cloud)[Data]
+    junction j_data in data
+    service db(logos:aws-dynamodb)[DynamoDB] in data
+    service queue(logos:aws-sqs)[SQS] in data
+    service store(logos:aws-s3)[S3] in data
+
+    cdn:R --> L:api_fn
+    api_fn:R --> L:j_data
+    j_data:R --> L:db
+    j_data:B --> T:queue
+    queue:B --> T:store
+
+IMPORTANT: A diagram with 6 well-placed nodes and clean lines beats one with
+12 tangled nodes. Simplicity is the goal.
 
 ─── FINDINGS RULES ───
 - Only error and warning severity. No info-level notes.
@@ -537,6 +617,12 @@ fn extract_block(text: &str, lang: &str) -> Option<String> {
 /// Returns Ok(()) if valid, Err with description of problems if not.
 fn validate_diagram(diagram: &str) -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
+    // Track which group each service belongs to
+    let mut service_groups: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    // Track port usage: (service_id, port) -> count
+    let mut port_usage: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
 
     for (i, line) in diagram.lines().enumerate() {
         let trimmed = line.trim();
@@ -575,11 +661,23 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
                     "line {line_num}: service ID contains hyphen (use underscores): {id_part}"
                 ));
             }
-            // Check that service has "in <group>" clause
-            if !after_service.contains(" in ") {
+            // Check that service has "in <group>" clause and track the group
+            if let Some(in_pos) = after_service.rfind(" in ") {
+                let group_id = after_service[in_pos + 4..].trim().to_string();
+                service_groups.insert(id_part.to_string(), group_id);
+            } else {
                 errors.push(format!(
                     "line {line_num}: service missing 'in <group_id>' clause: {trimmed}"
                 ));
+            }
+        }
+
+        // Track junction groups
+        if let Some(after_junction) = trimmed.strip_prefix("junction ") {
+            if let Some(in_pos) = after_junction.rfind(" in ") {
+                let id_part = after_junction[..in_pos].trim();
+                let group_id = after_junction[in_pos + 4..].trim();
+                service_groups.insert(id_part.to_string(), group_id.to_string());
             }
         }
 
@@ -624,6 +722,62 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
         if trimmed.contains("-.-") || trimmed.contains("---") {
             errors.push(format!(
                 "line {line_num}: dashed/triple-dash edges not supported in architecture-beta: {trimmed}"
+            ));
+        }
+
+        // Parse edge lines to track port usage and check inter-group directions
+        // Format: svcId:PORT --> PORT:svcId  or  svcId:PORT -- PORT:svcId
+        if trimmed.contains("--") && !trimmed.starts_with("group ") && !trimmed.starts_with("service ") && !trimmed.starts_with("junction ") && !trimmed.starts_with("subgraph ") {
+            // Try to parse: left:PORT ... PORT:right
+            let parts: Vec<&str> = if trimmed.contains("-->") {
+                trimmed.splitn(2, "-->").collect()
+            } else if trimmed.contains("--") {
+                trimmed.splitn(2, "--").collect()
+            } else {
+                vec![]
+            };
+            if parts.len() == 2 {
+                let lhs = parts[0].trim().trim_end_matches('>').trim();
+                let rhs = parts[1].trim().trim_start_matches('>').trim();
+                // Parse left side: svcId{group}?:PORT
+                if let Some(colon) = lhs.rfind(':') {
+                    let svc_raw = &lhs[..colon];
+                    let svc_id = svc_raw.replace("{group}", "");
+                    let port = lhs[colon + 1..].trim().to_uppercase();
+                    if ["T", "B", "L", "R"].contains(&port.as_str()) {
+                        *port_usage.entry((svc_id.clone(), port.clone())).or_insert(0) += 1;
+                    }
+                    // Check inter-group T/B
+                    if let Some(rhs_colon) = rhs.find(':') {
+                        let rhs_port = rhs[..rhs_colon].trim().to_uppercase();
+                        let rhs_svc_raw = &rhs[rhs_colon + 1..];
+                        let rhs_svc_id = rhs_svc_raw.trim().replace("{group}", "");
+                        if ["T", "B", "L", "R"].contains(&rhs_port.as_str()) {
+                            *port_usage.entry((rhs_svc_id.clone(), rhs_port.clone())).or_insert(0) += 1;
+                        }
+                        let lhs_group = service_groups.get(&svc_id);
+                        let rhs_group = service_groups.get(&rhs_svc_id);
+                        if let (Some(lg), Some(rg)) = (lhs_group, rhs_group) {
+                            if lg != rg {
+                                // Inter-group edge — warn if using T or B
+                                if port == "T" || port == "B" || rhs_port == "T" || rhs_port == "B" {
+                                    errors.push(format!(
+                                        "line {line_num}: inter-group edge uses T/B port (causes diagonal lines), use R-->L instead: {trimmed}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for duplicate port usage (same port on same service used >1 time)
+    for ((svc_id, port), count) in &port_usage {
+        if *count > 1 {
+            errors.push(format!(
+                "service '{svc_id}' port {port} used {count} times (max 1 per port, use junctions)"
             ));
         }
     }
