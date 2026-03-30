@@ -610,7 +610,7 @@ pub fn truncate_tree(paths: &[&str]) -> String {
 }
 
 /// Load a text content field from single-table DynamoDB (voice, agents, etc.).
-async fn load_content(state: &WorkerState, tenant_id: &str, sk: &str) -> String {
+pub(crate) async fn load_content(state: &WorkerState, tenant_id: &str, sk: &str) -> String {
     match state
         .dynamo
         .get_item()
