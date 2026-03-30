@@ -1,6 +1,5 @@
 use serde_json::json;
 use std::collections::HashSet;
-use tracing::info;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::clients::github::{FileOp, GitHubClient};
@@ -21,12 +20,6 @@ pub async fn run(
     rules: &[String],
     usage: &mut TokenUsage,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
-    // Create the working branch from main
-    github
-        .create_branch(&msg.repo_owner, &msg.repo_name, branch, "main")
-        .await?;
-    info!(branch, "Created working branch");
-
     let rules_block = super::format_rules_block(rules);
     let system = format!(
         "You are an implementation agent for the {owner}/{repo} repository. \
@@ -44,17 +37,22 @@ pub async fn run(
 ## Design
 {design}
 
+## Acceptance Criteria
+{spec}
+
 ## Instructions
 - Implement each unchecked task (`- [ ]`) one at a time, in order.
 - For each task: read the relevant files, understand the pattern, write the code.
 - Use `batch_write` for atomic multi-file changes when a task touches multiple files.
 - Follow existing code patterns exactly (imports, naming, structure, test style).
+- Ensure the implementation satisfies all acceptance criteria listed above.
 - After implementing all tasks, output a summary of what was done.
 - Only implement the listed tasks. Do not add extras."#,
         number = msg.issue_number,
         title = msg.title,
         tasks = plan.tasks,
         design = plan.design,
+        spec = plan.spec,
     );
 
     let tools = all_tools();

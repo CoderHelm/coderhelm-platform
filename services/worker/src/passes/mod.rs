@@ -113,6 +113,44 @@ async fn run_passes(
     // --- Pass 3: Implement ---
     update_pass(state, &msg.tenant_id, run_id, "implement").await?;
     let branch_name = format!("coderhelm/{}", msg.ticket_id.to_lowercase());
+
+    // Create working branch first
+    github
+        .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, "main")
+        .await?;
+    info!(run_id, branch = %branch_name, "Created working branch");
+
+    // Commit openspec to the repo branch so it's tracked alongside the code
+    let ticket_slug = msg.ticket_id.to_lowercase();
+    let spec_files: Vec<crate::clients::github::FileOp> = [
+        ("proposal.md", &plan_result.proposal),
+        ("design.md", &plan_result.design),
+        ("tasks.md", &plan_result.tasks),
+        ("spec.md", &plan_result.spec),
+    ]
+    .iter()
+    .filter(|(_, content)| !content.is_empty())
+    .map(|(name, content)| crate::clients::github::FileOp::Write {
+        path: format!("openspec/specs/{ticket_slug}/{name}"),
+        content: content.to_string(),
+    })
+    .collect();
+
+    if !spec_files.is_empty() {
+        if let Err(e) = github
+            .batch_write(
+                &msg.repo_owner,
+                &msg.repo_name,
+                &branch_name,
+                &format!("Add openspec for {}", msg.ticket_id),
+                &spec_files,
+            )
+            .await
+        {
+            warn!(run_id, error = %e, "Failed to commit openspec to branch");
+        }
+    }
+
     let impl_result = implement::run(
         state,
         msg,
