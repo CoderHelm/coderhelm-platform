@@ -191,9 +191,15 @@ async fn mark_pr_ready(
         msg.installation_id,
         &state.http,
     )?;
-    github
-        .mark_pr_ready(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+    // Fetch the PR to get its GraphQL node_id (REST PATCH {"draft":false} doesn't work)
+    let pr = github
+        .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await?;
+    let node_id = pr
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .ok_or("PR missing node_id")?;
+    github.mark_pr_ready(node_id).await?;
     info!(
         pr_number = msg.pr_number,
         repo = %format!("{}/{}", msg.repo_owner, msg.repo_name),
