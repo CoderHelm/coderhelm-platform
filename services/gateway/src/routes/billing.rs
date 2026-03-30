@@ -114,6 +114,7 @@ pub async fn get_billing(
         .iter()
         .map(|item| {
             json!({
+                "invoice_id": item.get("stripe_invoice_id").and_then(|v| v.as_s().ok()),
                 "invoice_number": item.get("invoice_number").and_then(|v| v.as_s().ok()),
                 "amount_cents": item.get("amount_cents").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
                 "status": item.get("status").and_then(|v| v.as_s().ok()),

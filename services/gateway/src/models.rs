@@ -38,7 +38,7 @@ impl Config {
             ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")
                 .unwrap_or_else(|_| "coderhelm-prod".to_string()),
             model_id: std::env::var("MODEL_ID")
-                .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-20250514".to_string()),
+                .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-6".to_string()),
         }
     }
 }

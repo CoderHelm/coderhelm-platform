@@ -240,7 +240,7 @@ async fn onboard_repo(
     let mut system = String::from(
         "You are an expert at analyzing code repositories. \
          Given a repo's file tree and key config files, generate a concise AGENTS.md file that describes:\n\
-         1. Project overview (1-2 sentences)\n\
+         1. Project overview (1-2 sentences). Describe what THIS SPECIFIC REPO does — its role and responsibility — not the overall product or organization.\n\
          2. Tech stack and key dependencies\n\
          3. Directory structure with brief descriptions\n\
          4. Build and test commands\n\
