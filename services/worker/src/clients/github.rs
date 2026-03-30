@@ -510,6 +510,17 @@ impl GitHubClient {
 
     // ─── Pull requests ─────────────────────────────────────────
 
+    /// Get a single pull request.
+    pub async fn get_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}");
+        self.get(&url).await
+    }
+
     /// Create a pull request.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_pull_request(
@@ -536,15 +547,19 @@ impl GitHubClient {
         .await
     }
 
-    /// Mark a draft PR as ready for review.
+    /// Mark a draft PR as ready for review using the GraphQL API.
+    /// The REST `PATCH {"draft": false}` does NOT work — GitHub requires the
+    /// `markPullRequestAsReady` GraphQL mutation.
     pub async fn mark_pr_ready(
         &self,
-        owner: &str,
-        repo: &str,
-        pr_number: u64,
+        node_id: &str,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}");
-        self.patch(&url, &serde_json::json!({"draft": false})).await
+        let query = serde_json::json!({
+            "query": "mutation($id: ID!) { markPullRequestAsReady(input: { pullRequestId: $id }) { pullRequest { isDraft } } }",
+            "variables": { "id": node_id }
+        });
+        let url = "https://api.github.com/graphql";
+        self.post(url, &query).await
     }
 
     /// Get review comments on a PR.

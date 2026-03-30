@@ -133,18 +133,26 @@ Return ONLY the markdown body text."#,
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let node_id = pr_data
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     info!(pr_number, pr_url = %pr_url, "Draft PR created");
 
     // Wait briefly for GitHub to register the PR, then mark ready for review.
-    // The internal review pass already validated the code, so no need to keep in draft.
+    // Uses GraphQL markPullRequestAsReady — REST PATCH {"draft": false} doesn't work.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    match github
-        .mark_pr_ready(&msg.repo_owner, &msg.repo_name, pr_number)
-        .await
-    {
-        Ok(_) => info!(pr_number, "PR marked ready for review"),
-        Err(e) => tracing::warn!(pr_number, error = %e, "Failed to mark PR ready — left as draft"),
+    if !node_id.is_empty() {
+        match github.mark_pr_ready(&node_id).await {
+            Ok(_) => info!(pr_number, "PR marked ready for review"),
+            Err(e) => {
+                tracing::warn!(pr_number, error = %e, "Failed to mark PR ready — left as draft")
+            }
+        }
+    } else {
+        tracing::warn!(pr_number, "No node_id returned — cannot mark PR ready");
     }
 
     Ok(PrResult {
