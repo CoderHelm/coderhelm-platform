@@ -114,17 +114,21 @@ For each comment, decide whether it is:
 - **A question** (e.g. "why did you do X?", "what does this do?", "could this cause Y?") — answer it with a clear, concise explanation. Read the relevant code first if needed.
 - **A change request** (e.g. "use X instead", "add error handling", "this should be Y") — read the relevant file, fix the code, and push the change.
 
-Your output will be posted directly as a GitHub comment. Write a natural, conversational reply — as if you are talking to the reviewer. Do NOT include:
+Your output will be posted directly as GitHub comments — one reply per review comment thread. Write natural, conversational replies as if you are talking to the reviewer. Do NOT include:
 - Headings like "Response to Review Comments" or "Comment #1"
 - Meta-commentary like "Now I have the full context" or "Let me explain"
 - Numbered comment references — just answer naturally
 
-If there are multiple comments, address each one in order with a brief separator (like a blank line) but no numbered headers.
+If there are multiple comments, write a separate reply for each one in the same order they appear above. \
+Separate each reply with exactly this marker on its own line:
+---SPLIT---
+Each section will be posted as a separate reply to the corresponding comment thread.
 
 Rules:
 - Address every comment. Don't skip any.
 - For code changes, follow the reviewer's suggestions exactly unless they conflict with the codebase conventions.
 - Don't make unrelated changes beyond what the reviewer asked for.
+- When you make a code change (create, edit, or delete a file), briefly confirm what you did (e.g. "Done — deleted `SETUP.md`." or "Updated — added error handling to `handler.rs`.").
 - If the reviewer asks about the spec, design, or proposal, check for openspec files under `openspec/` and update them if needed.
 - Keep answers concise but helpful."#,
         pr_number = msg.pr_number,
@@ -165,27 +169,58 @@ Rules:
         &response[..response.len().min(200)]
     );
 
-    // Reply to each review comment in-thread, or fall back to a top-level PR comment
-    let reply = if response.len() > 65000 {
-        format!("{}\n\n*(truncated)*", &response[..65000])
+    // Reply to each review comment in its own thread.
+    // Split the response by ---SPLIT--- markers to get per-comment replies.
+    let sections: Vec<&str> = response
+        .split("---SPLIT---")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let comments_with_id: Vec<&ReviewComment> =
+        comments.iter().filter(|c| c.comment_id.is_some()).collect();
+
+    if sections.len() == comments_with_id.len() {
+        // Matched — post each section to its corresponding comment thread
+        for (section, comment) in sections.iter().zip(comments_with_id.iter()) {
+            let reply = if section.len() > 65000 {
+                format!("{}\n\n*(truncated)*", &section[..65000])
+            } else {
+                section.to_string()
+            };
+            github
+                .reply_to_review_comment(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.pr_number,
+                    comment.comment_id.unwrap(),
+                    &reply,
+                )
+                .await?;
+        }
     } else {
-        response.clone()
-    };
-    let first_comment_id = comments.iter().find_map(|c| c.comment_id);
-    if let Some(comment_id) = first_comment_id {
-        github
-            .reply_to_review_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.pr_number,
-                comment_id,
-                &reply,
-            )
-            .await?;
-    } else {
-        github
-            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
-            .await?;
+        // Fallback — post full response to first comment thread or as top-level comment
+        let reply = if response.len() > 65000 {
+            format!("{}\n\n*(truncated)*", &response[..65000])
+        } else {
+            response.clone()
+        };
+        let first_comment_id = comments.iter().find_map(|c| c.comment_id);
+        if let Some(comment_id) = first_comment_id {
+            github
+                .reply_to_review_comment(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.pr_number,
+                    comment_id,
+                    &reply,
+                )
+                .await?;
+        } else {
+            github
+                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
+                .await?;
+        }
     }
 
     // Update run record in runs table (including status_run_id for GSI)
