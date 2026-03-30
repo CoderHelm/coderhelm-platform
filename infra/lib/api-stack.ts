@@ -102,7 +102,7 @@ export class ApiStack extends cdk.Stack {
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
-        MODEL_ID: "us.anthropic.claude-sonnet-4-20250514",
+        MODEL_ID: "us.anthropic.claude-sonnet-4-6",
         RUST_LOG: "info",
       },
     });

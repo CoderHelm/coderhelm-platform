@@ -30,7 +30,7 @@ CRITICAL SYNTAX:
 - Junctions: junction {id} in {group_id}
 - IDs: lowercase alphanumeric + underscores ONLY. No hyphens, no dots, no special chars.
 - Labels in []: alphanumeric, spaces, hyphens, periods ONLY. No slashes / brackets / braces / colons.
-- DECLARE groups and services FIRST, then edges LAST (edges reference declared IDs).
+- DECLARE all groups and services FIRST, then ALL edges LAST. Never interleave.
 - Each port (T/B/L/R) supports ONE edge. Use junctions for fan-out.
 - FORBIDDEN: -->|text|, <--, subgraph/end, ---, -.-, flowchart syntax of any kind.
 
@@ -41,20 +41,28 @@ ICONS — use logos:aws-* icons:
   logos:aws-route53, logos:aws-iam, logos:aws-sns, logos:aws-eventbridge,
   logos:aws-ec2, logos:aws-ecs, logos:aws-step-functions, logos:aws-cognito.
 
-LAYOUT STRATEGY:
-1. MAX 8-10 services total. Merge related resources (e.g. "3 SQS queues" → one SQS node). Only show the MAIN data path.
-2. Use exactly 3 groups, left-to-right:
+LAYOUT STRATEGY — this is the most important section:
+1. MAX 8-10 services total. Ruthlessly merge: "3 DynamoDB tables" → one node, "5 Lambdas" → group by role (API + Worker). Only show the MAIN request path.
+2. Use exactly 3 groups arranged left-to-right:
    - group edge(cloud)[Edge] — CDN, WAF, API Gateway, Route53
    - group compute(cloud)[Compute] — Lambdas, ECS, Step Functions
    - group data(cloud)[Data] — DynamoDB, S3, SQS, SNS, SES, EventBridge
-3. Within groups: stack vertically (T/B ports). Between groups: connect horizontally (R/L ports).
-4. ALL edges flow LEFT → RIGHT. Never connect right-group back to left-group.
-5. For fan-out to 3+ targets, use ONE junction:
+3. CRITICAL EDGE RULES — these determine whether the diagram looks clean or chaotic:
+   a. BETWEEN groups: always use R --> L (right port of source to left port of target). This keeps horizontal flow clean.
+   b. WITHIN a group: always use B --> T (bottom of upper service to top of lower service). This creates clean vertical stacks.
+   c. NEVER connect across groups using T or B ports — this creates ugly diagonal lines.
+   d. NEVER connect backwards (data group back to compute group).
+4. For fan-out to 3+ targets from one service, use ONE junction:
    junction j_fan in compute
    svc:R --> L:j_fan
    j_fan:R --> L:target_a
    j_fan:T --> B:target_b
    j_fan:B --> T:target_c
+5. Keep services in each group to 2-4 max. If a group would have 5+, merge nodes.
+6. Order services in each group so the main request path flows top-to-bottom.
+
+BEFORE writing edges, mentally trace the request path: User → Edge → Compute → Data.
+Write edges in that order. Every edge should go LEFT-TO-RIGHT or TOP-TO-BOTTOM within a group. No exceptions.
 
 EXAMPLE of a clean diagram:
 architecture-beta
@@ -78,7 +86,7 @@ architecture-beta
     worker_fn:R --> L:queue
     queue:B --> T:storage
 
-The key is SIMPLICITY — fewer nodes, clear left-to-right flow, correct syntax.
+The key is SIMPLICITY — fewer nodes, clean left-to-right flow, correct syntax. A diagram with 7 well-placed nodes beats one with 15 tangled nodes.
 
 ─── FINDINGS RULES ───
 - Only error and warning severity. No info-level notes.
