@@ -724,8 +724,7 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
     let mut port_usage: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
     // Track all declared node IDs (services + junctions)
-    let mut declared_nodes: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut declared_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Track edge endpoints for dangling-node check: (line_num, svc_id)
     let mut edge_endpoints: Vec<(usize, String)> = Vec::new();
 
