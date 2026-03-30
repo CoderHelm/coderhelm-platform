@@ -39,6 +39,8 @@ const api = new ApiStack(app, `${prefix}-api`, {
   table: database.table,
   runsTable: database.runsTable,
   analyticsTable: database.analyticsTable,
+  eventsTable: database.eventsTable,
+  usersTable: database.usersTable,
   bucket: storage.bucket,
 });
 
@@ -48,6 +50,7 @@ const worker = new WorkerStack(app, `${prefix}-worker`, {
   table: database.table,
   runsTable: database.runsTable,
   analyticsTable: database.analyticsTable,
+  usersTable: database.usersTable,
   bucket: storage.bucket,
   ticketQueue: api.ticketQueue,
   ciFixQueue: api.ciFixQueue,

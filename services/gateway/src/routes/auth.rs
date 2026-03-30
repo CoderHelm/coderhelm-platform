@@ -113,7 +113,7 @@ pub async fn callback(
     let _ = state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.users_table_name)
         .item("pk", attr_s(&tenant_id))
         .item("sk", attr_s(&user_id))
         .item("github_id", attr_n(github_id))

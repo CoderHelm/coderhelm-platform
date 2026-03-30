@@ -89,7 +89,7 @@ pub async fn send_notification(
     let users = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.users_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(
             ":pk",
