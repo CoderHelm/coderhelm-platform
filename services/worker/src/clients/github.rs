@@ -252,7 +252,7 @@ impl GitHubClient {
         let headers = self.auth_headers().await?;
         let mut req = self.http.get(&url);
         for (k, v) in &headers {
-            if k == &reqwest::header::ACCEPT {
+            if k == reqwest::header::ACCEPT {
                 req = req.header(k, "application/vnd.github.text-match+json");
             } else {
                 req = req.header(k, v);
