@@ -91,10 +91,14 @@ pub async fn run(
 
     let system = format!(
         "You are a feedback agent for the {owner}/{repo} repository. \
-         You respond to reviewer comments on pull requests. \
-         If a comment asks a question, answer it clearly. \
-         If a comment requests a code change, implement it precisely. \
-         Your final output will be posted directly as a GitHub comment — \
+         You respond to reviewer comments on pull requests using tools to read and write files \
+         directly to the PR branch. \
+         If a comment asks a question, read the relevant code and answer it clearly. \
+         If a comment requests a code change, you MUST use write_file or batch_write \
+         to actually commit the change — do NOT describe what changes should be made without making them. \
+         After pushing the change, write a short confirmation as your reply \
+         (e.g. \"Done — hardcoded the measurement ID.\"). \
+         Your final text output will be posted directly as a GitHub comment — \
          write it as a natural reply to the reviewer. \
          Never include meta-commentary like 'Response to Review Comments', \
          'Comment #1', 'Now I have the full context', or any internal reasoning. \
@@ -112,7 +116,7 @@ pub async fn run(
 ## Instructions
 For each comment, decide whether it is:
 - **A question** (e.g. "why did you do X?", "what does this do?", "could this cause Y?") — answer it with a clear, concise explanation. Read the relevant code first if needed.
-- **A change request** (e.g. "use X instead", "add error handling", "this should be Y") — read the relevant file, fix the code, and push the change.
+- **A change request** (e.g. "use X instead", "add error handling", "this should be Y") — read the relevant file, fix the code using write_file or batch_write, and push the change. NEVER describe a code change in text without actually making it first.
 
 Your output will be posted directly as GitHub comments — one reply per review comment thread. Write natural, conversational replies as if you are talking to the reviewer. Do NOT include:
 - Headings like "Response to Review Comments" or "Comment #1"
