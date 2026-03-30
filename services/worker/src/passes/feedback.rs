@@ -21,8 +21,12 @@ pub async fn run(
 
     // If the gateway didn't send inline comments (PR review submitted event),
     // fetch them from the GitHub API using the review_id.
+    // When review_id == 0 (re-review), fetch ALL non-bot comments and let
+    // filter_unanswered determine which still need a reply.
     let comments = if msg.comments.is_empty() && msg.review_id > 0 {
         fetch_review_comments(&github, &msg).await
+    } else if msg.comments.is_empty() && msg.review_id == 0 {
+        fetch_all_human_comments(&github, &msg).await
     } else {
         msg.comments.clone()
     };
@@ -31,6 +35,35 @@ pub async fn run(
     let comments = filter_unanswered(&github, &msg, comments).await;
     if comments.is_empty() && msg.review_body.is_empty() {
         info!(run_id = %msg.run_id, "All comments already answered — skipping feedback");
+
+        // Reset status back to completed so the run doesn't stay stuck at "running"
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key(
+                "tenant_id",
+                aws_sdk_dynamodb::types::AttributeValue::S(msg.tenant_id.clone()),
+            )
+            .key(
+                "run_id",
+                aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
+            )
+            .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t")
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_values(
+                ":s",
+                aws_sdk_dynamodb::types::AttributeValue::S("completed".to_string()),
+            )
+            .expression_attribute_values(
+                ":sri",
+                aws_sdk_dynamodb::types::AttributeValue::S(format!("completed#{}", msg.run_id)),
+            )
+            .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
+            .send()
+            .await;
+
         return Ok(());
     }
 
@@ -309,6 +342,40 @@ async fn fetch_review_comments(github: &GitHubClient, msg: &FeedbackMessage) -> 
             .collect(),
         Err(e) => {
             tracing::warn!("Failed to fetch review comments: {e}");
+            vec![]
+        }
+    }
+}
+
+/// Fetch ALL non-bot review comments from a PR (used by re-review path).
+/// Returns every human-authored comment; filter_unanswered will then remove
+/// ones the bot has already replied to.
+async fn fetch_all_human_comments(
+    github: &GitHubClient,
+    msg: &FeedbackMessage,
+) -> Vec<ReviewComment> {
+    match github
+        .get_review_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    {
+        Ok(api_comments) => api_comments
+            .iter()
+            .filter(|c| {
+                // Skip bot-authored comments
+                !c["user"]["login"]
+                    .as_str()
+                    .map(|l| l.contains("coderhelm"))
+                    .unwrap_or(false)
+            })
+            .map(|c| ReviewComment {
+                path: c["path"].as_str().unwrap_or("").to_string(),
+                line: c["line"].as_u64(),
+                body: c["body"].as_str().unwrap_or("").to_string(),
+                comment_id: c["id"].as_u64(),
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("Failed to fetch all human comments: {e}");
             vec![]
         }
     }
