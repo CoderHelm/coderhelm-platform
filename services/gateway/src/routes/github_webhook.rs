@@ -10,8 +10,8 @@ use tracing::{error, info, warn};
 use super::billing::{FREE_TIER_TOKENS, INCLUDED_TOKENS, OVERAGE_PER_1K_TOKENS_CENTS};
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
-    CiFixMessage, FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo, ReviewComment,
-    TicketMessage, TicketSource, WorkerMessage,
+    CiFixMessage, FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo, TicketMessage,
+    TicketSource, WorkerMessage,
 };
 use crate::AppState;
 
@@ -52,8 +52,14 @@ pub async fn handle(
         "issue_comment" => handle_issue_comment(&state, &payload, installation_id).await,
         "pull_request" => handle_pull_request(&state, &payload, installation_id).await,
         "pull_request_review" => handle_pr_review(&state, &payload, installation_id).await,
+        // Review-comment events are handled by handle_pr_review (fetches comments by review_id)
+        // to avoid duplicate SQS dispatches when a review is submitted with inline comments.
         "pull_request_review_comment" | "pull_request_review_thread" => {
-            handle_pr_review_comment(&state, &payload, installation_id).await
+            info!(
+                event_type,
+                "Review comment event — handled via pull_request_review"
+            );
+            Ok(StatusCode::OK)
         }
         "check_run" => handle_check_run(&state, &payload, installation_id).await,
         "check_suite" => handle_check_suite(&state, &payload, installation_id).await,
@@ -62,8 +68,9 @@ pub async fn handle(
             handle_installation_repos(&state, &payload, installation_id).await
         }
         "repository" => handle_repository_event(&state, &payload, installation_id).await,
+        "workflow_run" => handle_workflow_run(&state, &payload, installation_id).await,
         // Log-only events — acknowledge but no action needed
-        "workflow_dispatch" | "workflow_job" | "workflow_run" => {
+        "workflow_dispatch" | "workflow_job" => {
             info!(event_type, "Workflow event received — logged");
             Ok(StatusCode::OK)
         }
@@ -287,9 +294,10 @@ async fn handle_pr_review(
         return Ok(StatusCode::OK);
     }
 
-    // Only act on "changes_requested" reviews
+    // Act on "changes_requested" or "commented" reviews (covers both formal
+    // change-request reviews and standalone single-line comments / thread replies)
     let review_state = payload["review"]["state"].as_str().unwrap_or("");
-    if review_state != "changes_requested" {
+    if review_state != "changes_requested" && review_state != "commented" {
         return Ok(StatusCode::OK);
     }
 
@@ -539,68 +547,6 @@ async fn handle_installation_repos(
     send_to_queue(state, &state.config.ticket_queue_url, &onboard).await
 }
 
-/// Handle inline PR review comments and review threads.
-/// These fire when someone leaves a line-level comment on our PR.
-async fn handle_pr_review_comment(
-    state: &AppState,
-    payload: &Value,
-    installation_id: u64,
-) -> Result<StatusCode, StatusCode> {
-    let action = payload["action"].as_str().unwrap_or("");
-    if action != "created" {
-        return Ok(StatusCode::OK);
-    }
-
-    // Only process comments on our PRs
-    let pr_user = payload["pull_request"]["user"]["login"]
-        .as_str()
-        .unwrap_or("");
-    if !pr_user.contains("coderhelm") {
-        return Ok(StatusCode::OK);
-    }
-
-    // Ignore our own comments to prevent infinite loops
-    let comment_user = payload["comment"]["user"]["login"].as_str().unwrap_or("");
-    if comment_user.contains("coderhelm") {
-        return Ok(StatusCode::OK);
-    }
-
-    let tenant_id = format!("TENANT#{installation_id}");
-    let repo = &payload["repository"];
-    let owner = repo["owner"]["login"].as_str().unwrap_or("");
-    let name = repo["name"].as_str().unwrap_or("");
-    let comment = &payload["comment"];
-    let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
-
-    let run_id = lookup_run_by_pr(state, &tenant_id, owner, name, pr_number).await;
-    if run_id.is_empty() {
-        warn!(pr_number, "No run found for PR — skipping review comment");
-        return Ok(StatusCode::OK);
-    }
-
-    // Extract the inline comment with file path and line
-    let review_comment = ReviewComment {
-        path: comment["path"].as_str().unwrap_or("").to_string(),
-        line: comment["line"].as_u64(),
-        body: comment["body"].as_str().unwrap_or("").to_string(),
-        comment_id: comment["id"].as_u64(),
-    };
-
-    let message = WorkerMessage::Feedback(FeedbackMessage {
-        tenant_id,
-        installation_id,
-        run_id,
-        repo_owner: owner.to_string(),
-        repo_name: name.to_string(),
-        pr_number,
-        review_id: comment["pull_request_review_id"].as_u64().unwrap_or(0),
-        review_body: comment["body"].as_str().unwrap_or("").to_string(),
-        comments: vec![review_comment],
-    });
-
-    send_to_queue(state, &state.config.feedback_queue_url, &message).await
-}
-
 /// Handle check_suite events — mark PR ready on success, log failures.
 async fn handle_check_suite(
     state: &AppState,
@@ -650,6 +596,57 @@ async fn handle_check_suite(
                 "Check suite failed on coderhelm branch — delegating to check_run handler"
             );
             // The individual check_run events will handle CI fixes
+            Ok(StatusCode::OK)
+        }
+        _ => Ok(StatusCode::OK),
+    }
+}
+
+/// Handle workflow_run events — mark PR ready when CI passes on coderhelm branches.
+async fn handle_workflow_run(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+) -> Result<StatusCode, StatusCode> {
+    let action = payload["action"].as_str().unwrap_or("");
+    if action != "completed" {
+        return Ok(StatusCode::OK);
+    }
+
+    let wf = &payload["workflow_run"];
+    let branch = wf["head_branch"].as_str().unwrap_or("");
+    if !branch.starts_with("coderhelm/") {
+        return Ok(StatusCode::OK);
+    }
+
+    let conclusion = wf["conclusion"].as_str().unwrap_or("");
+    let repo = &payload["repository"];
+
+    match conclusion {
+        "success" => {
+            let prs = wf["pull_requests"].as_array().cloned().unwrap_or_default();
+            for pr in &prs {
+                let pr_number = pr["number"].as_u64().unwrap_or(0);
+                if pr_number == 0 {
+                    continue;
+                }
+                info!(branch, pr_number, "CI passed — marking PR ready");
+                let message = WorkerMessage::MarkReady(MarkReadyMessage {
+                    tenant_id: format!("TENANT#{installation_id}"),
+                    installation_id,
+                    repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
+                    repo_name: repo["name"].as_str().unwrap_or("").to_string(),
+                    pr_number,
+                });
+                let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+            }
+            Ok(StatusCode::OK)
+        }
+        "failure" => {
+            info!(
+                branch,
+                "Workflow failed on coderhelm branch — check_run handler will process"
+            );
             Ok(StatusCode::OK)
         }
         _ => Ok(StatusCode::OK),
