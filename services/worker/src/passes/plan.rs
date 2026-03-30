@@ -42,7 +42,9 @@ understand the existing patterns. Then generate four openspec files:
 
 1. **proposal.md** — Problem statement, proposed approach, scope boundaries, risks
 2. **design.md** — Technical design: which files to modify/create, patterns to follow, data flow
-3. **tasks.md** — Step-by-step implementation checklist. Each task is `- [ ] description`. Tasks should be atomic and ordered.
+3. **tasks.md** — Step-by-step implementation checklist. Each task is `- [ ] description`. Tasks should be atomic and ordered. \
+Only include tasks that can be accomplished by writing code (creating files, editing files, updating config). \
+Do NOT include manual verification tasks, post-deploy checks, browser testing, or anything requiring human interaction.
 4. **spec.md** — Acceptance criteria as Given/When/Then scenarios
 
 After researching, output the four files using this exact format:
