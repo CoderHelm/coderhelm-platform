@@ -1,0 +1,21 @@
+# Tasks: Write README for coderhelm-platform
+
+- [ ] Read existing `README.md` content to confirm current stub state before overwriting
+- [ ] Draft the document title, tagline, and CI badge pointing to `.github/workflows/ci.yml`
+- [ ] Write the **What is CoderHelm?** section: product description and high-level value proposition
+- [ ] Write the **Architecture Overview** introduction paragraph
+- [ ] Write the **Repository Layout** subsection: directory tree with one-line descriptions for each top-level path
+- [ ] Write the **Infrastructure Stacks** subsection: table of CDK stacks (database, storage, api, worker, email, billing, monitoring, frontend) with descriptions
+- [ ] Write the **Services** subsection covering the **Gateway** (Rust/Axum, Lambda, HTTP API, webhooks, auth routes, REST API)
+- [ ] Write the **Services** subsection covering the **Worker** (Rust async Lambda, SQS event sources, Bedrock, 15-minute timeout)
+- [ ] Write the **Agent Pipeline** subsection: numbered list of the five passes (Triage, Plan, Implement, Review, PR) with one-sentence descriptions each
+- [ ] Write the **Integrations → GitHub App** subsection: webhook URL, OAuth flow, required permissions and events (summarise from `SETUP.md` GitHub App Registration section)
+- [ ] Write the **Integrations → Jira** subsection: one-paragraph summary of the webhook approach with a link to `docs/jira-integration.md`
+- [ ] Write the **Getting Started → Prerequisites** subsection: Rust 1.80+, Node.js 22+, AWS CDK v2, AWS CLI, with a pointer to `SETUP.md` for full detail
+- [ ] Write the **Getting Started → Quick Deploy** subsection: the `MODEL_ID="..." cdk deploy --all` one-liner and pointer to `SETUP.md`
+- [ ] Write the **CI / CD** section: describe what `ci.yml` checks (fmt, clippy, CDK synth) and what `deploy.yml` does (zigbuild, CDK deploy on `main`)
+- [ ] Write the **Links** section: table linking to `SETUP.md`, `docs/jira-integration.md`, `app.coderhelm.com`, `api.coderhelm.com`
+- [ ] Review the full draft for accuracy against the codebase (pass names, stack names, route paths, env var names)
+- [ ] Ensure no sensitive values are introduced beyond what already exists in the repository
+- [ ] Replace the contents of `README.md` with the finalised draft
+- [ ] Verify the Markdown renders correctly (headings, tables, code blocks, badge image)
