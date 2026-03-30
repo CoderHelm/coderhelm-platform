@@ -432,7 +432,7 @@ async fn handle_installation(
                 let _ = state
                     .dynamo
                     .put_item()
-                    .table_name(&state.config.table_name)
+                    .table_name(&state.config.repos_table_name)
                     .item("pk", attr_s(&tenant_id))
                     .item("sk", attr_s(&format!("REPO#{full}")))
                     .item("repo_name", attr_s(&full))
@@ -524,7 +524,7 @@ async fn handle_installation_repos(
         let _ = state
             .dynamo
             .put_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.repos_table_name)
             .item("pk", attr_s(&tenant_id))
             .item("sk", attr_s(&format!("REPO#{full}")))
             .item("repo_name", attr_s(&full))
@@ -675,7 +675,7 @@ async fn handle_repository_event(
                 let _ = state
                     .dynamo
                     .update_item()
-                    .table_name(&state.config.table_name)
+                    .table_name(&state.config.repos_table_name)
                     .key("pk", attr_s(&tenant_id))
                     .key("sk", attr_s(&format!("REPO#{}", parts[1])))
                     .update_expression("SET #status = :s, updated_at = :t")
@@ -833,7 +833,7 @@ async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
     let billing = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.billing_table_name)
         .key("pk", attr_s(tenant_id))
         .key("sk", attr_s("BILLING"))
         .send()
@@ -863,7 +863,7 @@ async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
         let budget = state
             .dynamo
             .get_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.settings_table_name)
             .key("pk", attr_s(tenant_id))
             .key("sk", attr_s("SETTINGS#BUDGET"))
             .send()

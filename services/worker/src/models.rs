@@ -6,6 +6,12 @@ pub struct Config {
     pub runs_table_name: String,
     pub analytics_table_name: String,
     pub users_table_name: String,
+    pub plans_table_name: String,
+    pub jira_config_table_name: String,
+    pub repos_table_name: String,
+    pub settings_table_name: String,
+    pub infra_table_name: String,
+    pub billing_table_name: String,
     pub bucket_name: String,
     pub secrets_name: String,
     pub model_id: String,
@@ -23,6 +29,15 @@ impl Config {
             analytics_table_name: std::env::var("ANALYTICS_TABLE_NAME")
                 .expect("ANALYTICS_TABLE_NAME required"),
             users_table_name: std::env::var("USERS_TABLE_NAME").expect("USERS_TABLE_NAME required"),
+            plans_table_name: std::env::var("PLANS_TABLE_NAME").expect("PLANS_TABLE_NAME required"),
+            jira_config_table_name: std::env::var("JIRA_CONFIG_TABLE_NAME")
+                .expect("JIRA_CONFIG_TABLE_NAME required"),
+            repos_table_name: std::env::var("REPOS_TABLE_NAME").expect("REPOS_TABLE_NAME required"),
+            settings_table_name: std::env::var("SETTINGS_TABLE_NAME")
+                .expect("SETTINGS_TABLE_NAME required"),
+            infra_table_name: std::env::var("INFRA_TABLE_NAME").expect("INFRA_TABLE_NAME required"),
+            billing_table_name: std::env::var("BILLING_TABLE_NAME")
+                .expect("BILLING_TABLE_NAME required"),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
             secrets_name: std::env::var("SECRETS_NAME")
                 .unwrap_or_else(|_| "coderhelm/prod/secrets".to_string()),

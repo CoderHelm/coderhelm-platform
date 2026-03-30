@@ -67,7 +67,7 @@ pub async fn run(
     let enabled_repos = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.repos_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", AttributeValue::S(msg.tenant_id.clone()))
         .expression_attribute_values(":prefix", AttributeValue::S("REPO#".to_string()))
@@ -121,7 +121,7 @@ pub async fn run(
         if let Err(e) = state
             .dynamo
             .put_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.settings_table_name)
             .item("pk", AttributeValue::S(msg.tenant_id.clone()))
             .item("sk", AttributeValue::S("AGENTS#GLOBAL".to_string()))
             .item("content", AttributeValue::S(global_content))
@@ -297,7 +297,7 @@ async fn onboard_repo(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .item("pk", AttributeValue::S(tenant_id.to_string()))
         .item("sk", AttributeValue::S(agents_sk))
         .item("content", AttributeValue::S(agents_md))
@@ -420,7 +420,7 @@ async fn generate_voice_md(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .item("pk", AttributeValue::S(tenant_id.to_string()))
         .item("sk", AttributeValue::S(voice_sk))
         .item("content", AttributeValue::S(voice_md))
@@ -498,7 +498,7 @@ async fn load_instructions(state: &WorkerState, tenant_id: &str, sk: &str) -> St
     match state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key("sk", AttributeValue::S(sk.to_string()))
         .send()
@@ -528,7 +528,7 @@ async fn set_onboard_status(
     let mut update = state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.repos_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key("sk", AttributeValue::S(format!("REPO#{repo}")))
         .update_expression(if error_msg.is_some() {

@@ -350,7 +350,7 @@ pub async fn run(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.infra_table_name)
         .item("pk", AttributeValue::S(msg.tenant_id.clone()))
         .item("sk", AttributeValue::S(sk.clone()))
         .item("status", AttributeValue::S("ready".to_string()))
@@ -403,7 +403,7 @@ async fn get_tenant(
     let repos_result = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.infra_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", AttributeValue::S(tenant_id.to_string()))
         .expression_attribute_values(":prefix", AttributeValue::S("REPO#".to_string()))
@@ -925,7 +925,7 @@ async fn store_no_infra(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.infra_table_name)
         .item("pk", AttributeValue::S(tenant_id.to_string()))
         .item("sk", AttributeValue::S(sk.to_string()))
         .item("status", AttributeValue::S("no_infra".to_string()))

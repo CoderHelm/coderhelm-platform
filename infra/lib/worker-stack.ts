@@ -15,6 +15,12 @@ interface WorkerStackProps extends cdk.StackProps {
   runsTable: dynamodb.TableV2;
   analyticsTable: dynamodb.TableV2;
   usersTable: dynamodb.TableV2;
+  plansTable: dynamodb.TableV2;
+  jiraConfigTable: dynamodb.TableV2;
+  reposTable: dynamodb.TableV2;
+  settingsTable: dynamodb.TableV2;
+  infraTable: dynamodb.TableV2;
+  billingTable: dynamodb.TableV2;
   bucket: s3.Bucket;
   ticketQueue: sqs.Queue;
   ciFixQueue: sqs.Queue;
@@ -60,6 +66,12 @@ export class WorkerStack extends cdk.Stack {
         RUNS_TABLE_NAME: props.runsTable.tableName,
         ANALYTICS_TABLE_NAME: props.analyticsTable.tableName,
         USERS_TABLE_NAME: props.usersTable.tableName,
+        PLANS_TABLE_NAME: props.plansTable.tableName,
+        JIRA_CONFIG_TABLE_NAME: props.jiraConfigTable.tableName,
+        REPOS_TABLE_NAME: props.reposTable.tableName,
+        SETTINGS_TABLE_NAME: props.settingsTable.tableName,
+        INFRA_TABLE_NAME: props.infraTable.tableName,
+        BILLING_TABLE_NAME: props.billingTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         MODEL_ID: process.env.MODEL_ID || "us.anthropic.claude-opus-4-6-v1",
@@ -75,6 +87,12 @@ export class WorkerStack extends cdk.Stack {
     props.runsTable.grantReadWriteData(this.workerFunction);
     props.analyticsTable.grantReadWriteData(this.workerFunction);
     props.usersTable.grantReadData(this.workerFunction);
+    props.plansTable.grantReadWriteData(this.workerFunction);
+    props.jiraConfigTable.grantReadData(this.workerFunction);
+    props.reposTable.grantReadWriteData(this.workerFunction);
+    props.settingsTable.grantReadData(this.workerFunction);
+    props.infraTable.grantReadWriteData(this.workerFunction);
+    props.billingTable.grantReadWriteData(this.workerFunction);
     props.bucket.grantReadWrite(this.workerFunction);
     secrets.grantRead(this.workerFunction);
 
