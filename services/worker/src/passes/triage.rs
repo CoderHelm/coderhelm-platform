@@ -96,3 +96,74 @@ impl llm::ToolExecutor for NoOpExecutor {
         Err(format!("No tools available in triage pass (called: {name})").into())
     }
 }
+
+/// Select the best repo for a Jira ticket when no explicit repo mapping is provided.
+pub async fn select_repo(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    repos: &[String],
+    usage: &mut TokenUsage,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let system = "You are a repo-selection agent. Given a Jira ticket and a list of repositories, \
+                  pick the single best repository for this work. Return ONLY the repo in owner/name format.";
+
+    let repo_list = repos
+        .iter()
+        .map(|r| format!("- {r}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!(
+        r#"Pick the best repository for this Jira ticket.
+
+## Ticket
+Key: {ticket_id}
+Title: {title}
+
+Description:
+{body}
+
+## Available repositories
+{repo_list}
+
+Return ONLY the repository in `owner/name` format. No explanation."#,
+        ticket_id = msg.ticket_id,
+        title = msg.title,
+        body = msg.body,
+    );
+
+    let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
+        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
+        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
+        .build()?];
+
+    let response = llm::converse(
+        state,
+        &state.config.light_model_id,
+        system,
+        &mut messages,
+        &[],
+        &NoOpExecutor,
+        usage,
+    )
+    .await?;
+
+    let selected = response.trim().trim_matches('`').trim().to_string();
+
+    // Validate the selection is in our list
+    if repos.contains(&selected) {
+        info!(repo = %selected, "Repo selected for Jira ticket");
+        Ok(selected)
+    } else {
+        // Fuzzy match — LLM might format slightly differently
+        for repo in repos {
+            if repo.eq_ignore_ascii_case(&selected) {
+                info!(repo = %repo, "Repo selected (case-insensitive match)");
+                return Ok(repo.clone());
+            }
+        }
+        // Fall back to first repo
+        info!(selected = %selected, fallback = %repos[0], "LLM pick not in list, falling back");
+        Ok(repos[0].clone())
+    }
+}

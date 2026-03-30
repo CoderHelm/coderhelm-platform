@@ -5,6 +5,11 @@ modules:
       events:
         - avi:jira:assigned:issue
         - avi:jira:updated:issue
+  webtrigger:
+    - key: list-projects-trigger
+      function: listProjectsHandler
+    - key: create-ticket-trigger
+      function: createTicketHandler
   jira:adminPage:
     - key: coderhelm-admin-page
       resource: adminPage
@@ -16,12 +21,17 @@ modules:
       handler: index.handler
     - key: adminResolver
       handler: admin.resolver
+    - key: listProjectsHandler
+      handler: index.listProjectsHandler
+    - key: createTicketHandler
+      handler: index.createTicketHandler
 resources:
   - key: adminPage
     path: resources/admin/build
 permissions:
   scopes:
     - read:jira-work
+    - write:jira-work
     - storage:app
   external:
     fetch:

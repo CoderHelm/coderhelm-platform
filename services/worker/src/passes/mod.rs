@@ -50,7 +50,7 @@ mod triage;
 /// Main orchestration: run all passes for a new ticket.
 pub async fn orchestrate_ticket(
     state: &WorkerState,
-    msg: TicketMessage,
+    mut msg: TicketMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let run_id = ulid::Ulid::new().to_string();
     let mut usage = TokenUsage::default();
@@ -77,7 +77,7 @@ pub async fn orchestrate_ticket(
     // Create run record
     create_run_record(state, &msg, &run_id).await?;
 
-    match run_passes(state, &msg, &run_id, &mut usage, &start).await {
+    match run_passes(state, &mut msg, &run_id, &mut usage, &start).await {
         Ok(_) => {
             let duration = start.elapsed().as_secs();
             info!(run_id, duration, "Orchestration complete");
@@ -96,7 +96,7 @@ pub async fn orchestrate_ticket(
 
 async fn run_passes(
     state: &WorkerState,
-    msg: &TicketMessage,
+    msg: &mut TicketMessage,
     run_id: &str,
     usage: &mut TokenUsage,
     start: &std::time::Instant,
@@ -140,6 +140,32 @@ async fn run_passes(
                 ),
             )
             .await?;
+    }
+
+    // --- Auto-resolve repo for Jira tickets with bare "coderhelm" label ---
+    if msg.repo_owner.is_empty() || msg.repo_name.is_empty() {
+        if matches!(msg.source, TicketSource::Jira) {
+            let repos = plan::fetch_tenant_repos(state, &msg.tenant_id).await;
+            if repos.is_empty() {
+                return Err("No enabled repos found for tenant — cannot auto-pick repo".into());
+            }
+            if repos.len() == 1 {
+                // Single repo — no need to triage
+                let (owner, name) = repos[0].split_once('/').unwrap_or(("", ""));
+                msg.repo_owner = owner.to_string();
+                msg.repo_name = name.to_string();
+                info!(run_id, repo = %repos[0], "Auto-selected single repo");
+            } else {
+                // Multiple repos — ask triage to pick
+                let selected = triage::select_repo(state, msg, &repos, usage).await?;
+                let (owner, name) = selected.split_once('/').unwrap_or(("", ""));
+                msg.repo_owner = owner.to_string();
+                msg.repo_name = name.to_string();
+                info!(run_id, repo = %selected, "Triage selected repo");
+            }
+        } else {
+            return Err("repo_owner and repo_name are required for GitHub tickets".into());
+        }
     }
 
     // --- Pass 1: Triage ---
