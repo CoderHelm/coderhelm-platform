@@ -11,16 +11,35 @@ use crate::auth::verify::verify_jira_signature;
 use crate::models::{TicketMessage, TicketSource, WorkerMessage};
 use crate::AppState;
 
-/// Jira webhook handler.
-///
-/// Easiest integration path:
-/// - Configure Jira Automation/Webhook to POST issue events to `/webhooks/jira`
-/// - Include either `installation_id` or `tenant_id`, plus `repo_owner` + `repo_name`
-/// - Optional HMAC header: `x-hub-signature-256: sha256=<hex>` when secret is configured
+/// Jira webhook handler — per-tenant URL: `/webhooks/jira/:tenant_id`
+pub async fn handle_with_tenant(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(path_tenant): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, StatusCode> {
+    let tenant_id = if path_tenant.starts_with("TENANT%23") || path_tenant.starts_with("TENANT#") {
+        path_tenant.replace("%23", "#")
+    } else {
+        format!("TENANT#{path_tenant}")
+    };
+    handle_inner(state, headers, body, Some(tenant_id)).await
+}
+
+/// Jira webhook handler — legacy shared URL (fallback).
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
+) -> Result<StatusCode, StatusCode> {
+    handle_inner(state, headers, body, None).await
+}
+
+async fn handle_inner(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+    path_tenant_id: Option<String>,
 ) -> Result<StatusCode, StatusCode> {
     // Parse payload first so we can resolve tenant for per-tenant secret lookup.
     let payload: Value = serde_json::from_slice(&body).map_err(|e| {
@@ -88,39 +107,71 @@ pub async fn handle(
             }
         });
 
-    let (tenant_id, installation_id) = match (tenant_id_from_payload, installation_id_from_payload)
-    {
-        (Some(tenant_id), Some(installation_id)) => (tenant_id, installation_id),
-        (None, Some(installation_id)) => (format!("TENANT#{installation_id}"), installation_id),
-        (Some(tenant_id), None) => {
-            // Resolve install id from tenant metadata.
-            let item = state
-                .dynamo
-                .get_item()
-                .table_name(&state.config.table_name)
-                .key(
-                    "pk",
-                    aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.clone()),
-                )
-                .key(
-                    "sk",
-                    aws_sdk_dynamodb::types::AttributeValue::S("META".to_string()),
-                )
-                .send()
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .item
-                .ok_or(StatusCode::BAD_REQUEST)?;
+    let (tenant_id, installation_id) = if let Some(tid) = path_tenant_id {
+        // Tenant resolved from URL path — look up installation_id from META
+        let item = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.table_name)
+            .key(
+                "pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(tid.clone()),
+            )
+            .key(
+                "sk",
+                aws_sdk_dynamodb::types::AttributeValue::S("META".to_string()),
+            )
+            .send()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .item
+            .ok_or_else(|| {
+                warn!("Jira webhook: tenant not found from path: {tid}");
+                StatusCode::NOT_FOUND
+            })?;
 
-            let install_id = item
-                .get("github_install_id")
-                .and_then(|v| v.as_n().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .ok_or(StatusCode::BAD_REQUEST)?;
+        let install_id = item
+            .get("github_install_id")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(StatusCode::BAD_REQUEST)?;
 
-            (tenant_id, install_id)
+        (tid, install_id)
+    } else {
+        // Legacy: resolve tenant from payload fields
+        match (tenant_id_from_payload, installation_id_from_payload) {
+            (Some(tenant_id), Some(installation_id)) => (tenant_id, installation_id),
+            (None, Some(installation_id)) => (format!("TENANT#{installation_id}"), installation_id),
+            (Some(tenant_id), None) => {
+                // Resolve install id from tenant metadata.
+                let item = state
+                    .dynamo
+                    .get_item()
+                    .table_name(&state.config.table_name)
+                    .key(
+                        "pk",
+                        aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.clone()),
+                    )
+                    .key(
+                        "sk",
+                        aws_sdk_dynamodb::types::AttributeValue::S("META".to_string()),
+                    )
+                    .send()
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                    .item
+                    .ok_or(StatusCode::BAD_REQUEST)?;
+
+                let install_id = item
+                    .get("github_install_id")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or(StatusCode::BAD_REQUEST)?;
+
+                (tenant_id, install_id)
+            }
+            (None, None) => return Err(StatusCode::BAD_REQUEST),
         }
-        (None, None) => return Err(StatusCode::BAD_REQUEST),
     };
 
     // Verify signature: per-tenant secret (DynamoDB) > global secret (Secrets Manager) > skip.

@@ -250,6 +250,10 @@ async fn main() -> Result<(), Error> {
         .route("/webhooks/github", post(routes::github_webhook::handle))
         .route("/webhooks/jira", post(routes::jira_webhook::handle))
         .route(
+            "/webhooks/jira/:tenant_id",
+            post(routes::jira_webhook::handle_with_tenant),
+        )
+        .route(
             "/integrations/jira/forge-register",
             post(routes::api::forge_register_urls),
         )
