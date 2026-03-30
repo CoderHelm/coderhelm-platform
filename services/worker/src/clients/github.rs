@@ -543,7 +543,6 @@ impl GitHubClient {
     }
 
     /// Reply to a review comment thread.
-    #[allow(dead_code)]
     pub async fn reply_to_review_comment(
         &self,
         owner: &str,

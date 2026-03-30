@@ -154,6 +154,8 @@ pub struct ReviewComment {
     pub path: String,
     pub line: Option<u64>,
     pub body: String,
+    #[serde(default)]
+    pub comment_id: Option<u64>,
 }
 
 /// Token usage tracking with prompt cache metrics.

@@ -571,6 +571,7 @@ async fn handle_pr_review_comment(
         path: comment["path"].as_str().unwrap_or("").to_string(),
         line: comment["line"].as_u64(),
         body: comment["body"].as_str().unwrap_or("").to_string(),
+        comment_id: comment["id"].as_u64(),
     };
 
     let message = WorkerMessage::Feedback(FeedbackMessage {

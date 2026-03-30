@@ -95,15 +95,28 @@ Rules:
         &response[..response.len().min(200)]
     );
 
-    // Post the agent's response as a PR comment so the reviewer sees answers
+    // Reply to each review comment in-thread, or fall back to a top-level PR comment
     let reply = if response.len() > 65000 {
         format!("{}\n\n*(truncated)*", &response[..65000])
     } else {
         response.clone()
     };
-    github
-        .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
-        .await?;
+    let first_comment_id = comments.iter().find_map(|c| c.comment_id);
+    if let Some(comment_id) = first_comment_id {
+        github
+            .reply_to_review_comment(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                comment_id,
+                &reply,
+            )
+            .await?;
+    } else {
+        github
+            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
+            .await?;
+    }
 
     // Update run record in runs table
     let now = chrono::Utc::now().to_rfc3339();
@@ -120,8 +133,9 @@ Rules:
             aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
         )
         .update_expression(
-            "SET tokens_in = tokens_in + :ti, tokens_out = tokens_out + :to, updated_at = :t",
+            "SET tokens_in = tokens_in + :ti, tokens_out = tokens_out + :to, updated_at = :t, #s = :s, current_pass = :p",
         )
+        .expression_attribute_names("#s", "status")
         .expression_attribute_values(
             ":ti",
             aws_sdk_dynamodb::types::AttributeValue::N(usage.input_tokens.to_string()),
@@ -131,6 +145,14 @@ Rules:
             aws_sdk_dynamodb::types::AttributeValue::N(usage.output_tokens.to_string()),
         )
         .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
+        .expression_attribute_values(
+            ":s",
+            aws_sdk_dynamodb::types::AttributeValue::S("completed".to_string()),
+        )
+        .expression_attribute_values(
+            ":p",
+            aws_sdk_dynamodb::types::AttributeValue::S("feedback".to_string()),
+        )
         .send()
         .await?;
 
@@ -208,6 +230,7 @@ async fn fetch_review_comments(github: &GitHubClient, msg: &FeedbackMessage) -> 
                 path: c["path"].as_str().unwrap_or("").to_string(),
                 line: c["line"].as_u64(),
                 body: c["body"].as_str().unwrap_or("").to_string(),
+                comment_id: c["id"].as_u64(),
             })
             .collect(),
         Err(e) => {
