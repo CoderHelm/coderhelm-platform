@@ -14,12 +14,19 @@ fn attr_n(val: impl ToString) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
 }
 
-/// GET /api/plans — list all plans for the tenant.
+/// GET /api/plans — list plans for the tenant (paginated).
 pub async fn list_plans(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, StatusCode> {
-    let result = state
+    let limit: i32 = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+        .min(100);
+
+    let mut query = state
         .dynamo
         .query()
         .table_name(&state.config.table_name)
@@ -28,18 +35,26 @@ pub async fn list_plans(
         .expression_attribute_values(":prefix", attr_s("PLAN#"))
         .filter_expression("attribute_exists(plan_id)")
         .scan_index_forward(false)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to query plans: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .limit(limit);
+
+    // Resume from cursor
+    if let Some(cursor) = params.get("cursor").filter(|c| !c.is_empty()) {
+        let lek = std::collections::HashMap::from([
+            ("pk".to_string(), attr_s(&claims.tenant_id)),
+            ("sk".to_string(), attr_s(cursor)),
+        ]);
+        query = query.set_exclusive_start_key(Some(lek));
+    }
+
+    let result = query.send().await.map_err(|e| {
+        error!("Failed to query plans: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let plans: Vec<Value> = result
         .items()
         .iter()
         .filter(|item| {
-            // Only plan items (not task items which have task_id)
             let sk = item
                 .get("sk")
                 .and_then(|v| v.as_s().ok())
@@ -50,7 +65,16 @@ pub async fn list_plans(
         .map(plan_from_item)
         .collect();
 
-    Ok(Json(json!({ "plans": plans })))
+    let next_cursor = result
+        .last_evaluated_key()
+        .and_then(|k| k.get("sk"))
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.to_string());
+
+    Ok(Json(json!({
+        "plans": plans,
+        "next_cursor": next_cursor,
+    })))
 }
 
 /// POST /api/plans — create a new plan.
@@ -574,6 +598,152 @@ pub async fn reject_task(
     Ok(StatusCode::OK)
 }
 
+/// POST /api/plans/:plan_id/approve-and-execute — approve all draft tasks and execute.
+pub async fn approve_all_and_execute(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(plan_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
+    validate_plan_id(&plan_id)?;
+
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":prefix", attr_s(&format!("PLAN#{plan_id}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query plan: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut task_ids: Vec<(String, u64)> = Vec::new();
+
+    for item in result.items() {
+        let sk = item
+            .get("sk")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if !sk.contains("#TASK#") {
+            continue;
+        }
+        let status = item
+            .get("status")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let tid = item
+            .get("task_id")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default();
+        let order = item
+            .get("task_order")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0u64);
+
+        // Approve draft tasks, include already-approved tasks
+        if status == "draft" {
+            let task_sk = format!("PLAN#{plan_id}#TASK#{tid}");
+            state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.table_name)
+                .key("pk", attr_s(&claims.tenant_id))
+                .key("sk", attr_s(&task_sk))
+                .update_expression("SET #st = :s, approved_at = :now, approved_by = :by")
+                .expression_attribute_names("#st", "status")
+                .expression_attribute_values(":s", attr_s("approved"))
+                .expression_attribute_values(":now", attr_s(&now))
+                .expression_attribute_values(":by", attr_s(&claims.github_login))
+                .send()
+                .await
+                .ok();
+            task_ids.push((tid, order));
+        } else if status == "approved" {
+            task_ids.push((tid, order));
+        }
+    }
+
+    if task_ids.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    task_ids.sort_by_key(|t| t.1);
+
+    // Mark plan as executing
+    let plan_sk = format!("PLAN#{plan_id}");
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s(&plan_sk))
+        .update_expression("SET #st = :s, executed_at = :now, executed_by = :by, updated_at = :now")
+        .expression_attribute_names("#st", "status")
+        .expression_attribute_values(":s", attr_s("executing"))
+        .expression_attribute_values(":now", attr_s(&now))
+        .expression_attribute_values(":by", attr_s(&claims.github_login))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to update plan status: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Send SQS message
+    let plan_msg = WorkerMessage::PlanExecute(PlanExecuteMessage {
+        tenant_id: claims.tenant_id.clone(),
+        plan_id: plan_id.clone(),
+        triggered_by: claims.github_login.clone(),
+        tasks: task_ids.iter().map(|(tid, _)| tid.clone()).collect(),
+    });
+
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(serde_json::to_string(&plan_msg).map_err(|e| {
+            error!("Failed to serialize plan message: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to send plan execute message: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Mark tasks as queued
+    for (task_id, _) in &task_ids {
+        let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&claims.tenant_id))
+            .key("sk", attr_s(&task_sk))
+            .update_expression("SET #st = :s")
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":s", attr_s("queued"))
+            .send()
+            .await
+            .ok();
+    }
+
+    Ok(Json(json!({
+        "status": "executing",
+        "tasks_queued": task_ids.len(),
+    })))
+}
+
 /// POST /api/plans/:plan_id/execute — execute the plan (creates issues, queues tasks).
 pub async fn execute_plan(
     State(state): State<Arc<AppState>>,
@@ -790,9 +960,15 @@ Rules:
 - Order matters — Coderhelm works on them sequentially
 - Each task title should be a GitHub issue title (imperative, max 60 chars)
 - Acceptance criteria should be machine-verifiable where possible
-- 3-10 tasks is ideal
+- 2-5 tasks is ideal. Fewer, bigger tasks are better than many small ones.
+- Combine related work (e.g. code changes + README update + tests) into a single task
+- Only split into separate tasks when there are truly independent streams of work
 - If the user mentions a specific repo, USE IT — don't ask again
-- Be direct and action-oriented, not verbose"#;
+- Be direct and action-oriented, not verbose
+
+Note: Each task will go through Coderhelm's full pipeline: OpenSpec generation
+(proposal, design, tasks, spec documents), then implementation. Plan accordingly —
+each task becomes a full engineering effort with its own spec and PR."#;
 
 /// POST /api/plans/chat — AI-powered plan generation chat.
 pub async fn plan_chat(
@@ -882,5 +1058,35 @@ pub async fn plan_chat(
         _ => String::new(),
     };
 
+    // Track token usage for plan chat
+    if let Some(usage) = response.usage() {
+        let input_tokens = usage.input_tokens() as u64;
+        let output_tokens = usage.output_tokens() as u64;
+        track_chat_tokens(&state, &claims.tenant_id, input_tokens, output_tokens).await;
+    }
+
     Ok(Json(json!({ "content": text })))
+}
+
+/// Track plan chat token usage in analytics.
+async fn track_chat_tokens(
+    state: &AppState,
+    tenant_id: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) {
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    for period in &[month.as_str(), "ALL_TIME"] {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.analytics_table_name)
+            .key("tenant_id", attr_s(tenant_id))
+            .key("period", attr_s(period))
+            .update_expression("ADD total_tokens_in :tin, total_tokens_out :tout")
+            .expression_attribute_values(":tin", attr_n(input_tokens))
+            .expression_attribute_values(":tout", attr_n(output_tokens))
+            .send()
+            .await;
+    }
 }

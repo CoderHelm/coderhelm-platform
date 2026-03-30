@@ -201,6 +201,10 @@ async fn main() -> Result<(), Error> {
         )
         .route("/plans/:plan_id/execute", post(routes::plans::execute_plan))
         .route(
+            "/plans/:plan_id/approve-and-execute",
+            post(routes::plans::approve_all_and_execute),
+        )
+        .route(
             "/infrastructure",
             get(routes::infrastructure::get_infrastructure),
         )
