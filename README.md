@@ -86,8 +86,6 @@ CoderHelm connects to GitHub as a [GitHub App](https://docs.github.com/en/apps).
 - **Required permissions**: Contents (Read & Write), Issues (Read & Write), Pull requests (Read & Write), Checks (Read), Metadata (Read)
 - **Event subscriptions**: Issues, Issue comment, Pull request review, Check run, Installation
 
-See [SETUP.md](SETUP.md) § *GitHub App Registration* for step-by-step registration instructions.
-
 ### Jira
 
 CoderHelm accepts Jira events via a lightweight webhook approach — no full Atlassian app installation required. Configure a Jira Automation rule to `POST` issue-created and issue-updated events to the `/webhooks/jira` endpoint. Payloads include `repo_owner`, `repo_name`, and `installation_id` to map Jira tickets to GitHub repositories.
@@ -107,7 +105,47 @@ See [docs/jira-integration.md](docs/jira-integration.md) for the full setup guid
 | AWS CDK | v2 | `npm install -g aws-cdk` |
 | AWS CLI | latest | [aws.amazon.com/cli](https://aws.amazon.com/cli/) |
 
-See [SETUP.md](SETUP.md) for complete prerequisites, secrets configuration, and environment variable reference.
+### Local Development
+
+**Services (Rust)**
+
+Both services are Lambda functions — run them locally with `cargo lambda watch` (requires [cargo-lambda](https://www.cargo-lambda.info/)):
+
+```bash
+# gateway
+cd services/gateway
+cargo lambda watch
+
+# worker
+cd services/worker
+cargo lambda watch
+```
+
+**Infra (CDK)**
+
+```bash
+cd infra
+npm install
+npx cdk synth   # validates all stacks without deploying
+```
+
+**Jira Forge app**
+
+```bash
+cd coderhelm-jira
+npm install
+forge deploy    # deploys to your Forge dev environment
+forge tunnel    # proxies requests to localhost for development
+```
+
+**Required env vars** — set these before running services locally:
+
+| Variable | Description |
+|----------|-------------|
+| `MODEL_ID` | Bedrock model ID (e.g. `us.anthropic.claude-opus-4-6-v1`) |
+| `STAGE` | `dev` or `prod` |
+
+Secrets (GitHub App credentials, JWT secret) are loaded from AWS Secrets Manager at `coderhelm/<stage>/secrets` — ensure local AWS credentials have access to that secret.
 
 ### Quick Deploy
 
@@ -116,8 +154,6 @@ MODEL_ID="us.anthropic.claude-opus-4-6-v1" cdk deploy --all
 ```
 
 This builds and deploys all eight CDK stacks. `MODEL_ID` is required — there is no default.
-
-For full deployment instructions including AWS Secrets Manager setup and GitHub App registration, see [SETUP.md](SETUP.md).
 
 ---
 
@@ -146,7 +182,6 @@ Runs on push to `main`:
 
 | Resource | URL |
 |----------|-----|
-| Setup Guide | [SETUP.md](SETUP.md) |
 | Jira Integration | [docs/jira-integration.md](docs/jira-integration.md) |
 | Dashboard | [app.coderhelm.com](https://app.coderhelm.com) |
 | API | [api.coderhelm.com](https://api.coderhelm.com) |
