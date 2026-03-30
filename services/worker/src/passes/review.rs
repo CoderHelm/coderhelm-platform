@@ -239,10 +239,7 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                 Ok(json!(content))
             }
             "list_directory" => {
-                let path = input
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 let tree = self
                     .github
                     .get_tree(self.owner, self.repo, self.branch)
@@ -254,8 +251,7 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                         if path.is_empty() {
                             !p.contains('/')
                         } else {
-                            p.starts_with(&format!("{path}/"))
-                                && !p[path.len() + 1..].contains('/')
+                            p.starts_with(&format!("{path}/")) && !p[path.len() + 1..].contains('/')
                         }
                     })
                     .map(|e| e.path.as_str())
