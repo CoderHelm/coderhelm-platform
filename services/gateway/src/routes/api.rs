@@ -1,3 +1,4 @@
+use axum::extract::Query;
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -40,11 +41,19 @@ pub async fn me(
     })))
 }
 
+#[derive(serde::Deserialize)]
+pub struct RunsQuery {
+    source: Option<String>,
+    limit: Option<i32>,
+}
+
 /// GET /api/runs — list runs for the tenant (from runs table).
 pub async fn list_runs(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
+    Query(params): Query<RunsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    let query_limit = params.limit.unwrap_or(50).min(100);
     let result = state
         .dynamo
         .query()
@@ -52,7 +61,7 @@ pub async fn list_runs(
         .key_condition_expression("tenant_id = :tid")
         .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
         .scan_index_forward(false) // newest first (ULID sorts lexicographically)
-        .limit(50)
+        .limit(query_limit)
         .send()
         .await
         .map_err(|e| {
@@ -70,10 +79,21 @@ pub async fn list_runs(
                 .map(|s| s.as_str() != "archived")
                 .unwrap_or(true)
         })
+        .filter(|item| {
+            if let Some(ref source) = params.source {
+                item.get("ticket_source")
+                    .and_then(|v| v.as_s().ok())
+                    .map(|s| s == source)
+                    .unwrap_or(false)
+            } else {
+                true
+            }
+        })
         .map(|item| {
             json!({
                 "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
                 "status": item.get("status").and_then(|v| v.as_s().ok()),
+                "ticket_source": item.get("ticket_source").and_then(|v| v.as_s().ok()),
                 "ticket_id": item.get("ticket_id").and_then(|v| v.as_s().ok()),
                 "title": item.get("title").and_then(|v| v.as_s().ok()),
                 "repo": item.get("repo").and_then(|v| v.as_s().ok()),
