@@ -77,8 +77,46 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
             }
             models::WorkerMessage::Feedback(msg) => {
                 info!(tenant_id = %msg.tenant_id, run_id = %msg.run_id, "Processing feedback");
+                let tenant_id = msg.tenant_id.clone();
+                let run_id = msg.run_id.clone();
                 if let Err(e) = passes::feedback::run(&state, msg).await {
                     error!("Feedback run failed: {e}");
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let _ = state
+                        .dynamo
+                        .update_item()
+                        .table_name(&state.config.runs_table_name)
+                        .key(
+                            "tenant_id",
+                            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id),
+                        )
+                        .key(
+                            "run_id",
+                            aws_sdk_dynamodb::types::AttributeValue::S(run_id.clone()),
+                        )
+                        .update_expression(
+                            "SET #s = :s, #e = :e, status_run_id = :sri, updated_at = :t",
+                        )
+                        .expression_attribute_names("#s", "status")
+                        .expression_attribute_names("#e", "error")
+                        .expression_attribute_values(
+                            ":s",
+                            aws_sdk_dynamodb::types::AttributeValue::S("failed".to_string()),
+                        )
+                        .expression_attribute_values(
+                            ":e",
+                            aws_sdk_dynamodb::types::AttributeValue::S(format!("{e}")),
+                        )
+                        .expression_attribute_values(
+                            ":sri",
+                            aws_sdk_dynamodb::types::AttributeValue::S(format!("failed#{run_id}")),
+                        )
+                        .expression_attribute_values(
+                            ":t",
+                            aws_sdk_dynamodb::types::AttributeValue::S(now),
+                        )
+                        .send()
+                        .await;
                 }
             }
             models::WorkerMessage::Onboard(msg) => {
