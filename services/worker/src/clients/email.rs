@@ -17,7 +17,7 @@ pub enum EmailEvent {
         pr_url: String,
         files_modified: usize,
         duration: String,
-        cost: String,
+        tokens: String,
     },
     RunFailed {
         run_id: String,
@@ -50,7 +50,7 @@ pub async fn send_notification(
             pr_url,
             files_modified,
             duration,
-            cost,
+            tokens,
         } => (
             "run-complete",
             "email_run_complete",
@@ -61,7 +61,7 @@ pub async fn send_notification(
                 "pr_url": pr_url,
                 "files_modified": files_modified,
                 "duration": duration,
-                "cost": cost,
+                "tokens": tokens,
             })
             .to_string(),
         ),

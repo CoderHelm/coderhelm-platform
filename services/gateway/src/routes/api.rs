@@ -162,7 +162,7 @@ pub async fn get_run_openspec(
     let mut files = serde_json::Map::new();
     for name in &["proposal.md", "design.md", "tasks.md", "spec.md"] {
         let key = format!("{prefix}/{name}");
-        match state
+        if let Ok(output) = state
             .s3
             .get_object()
             .bucket(&state.config.bucket_name)
@@ -170,14 +170,11 @@ pub async fn get_run_openspec(
             .send()
             .await
         {
-            Ok(output) => {
-                if let Ok(bytes) = output.body.collect().await {
-                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                        files.insert(name.replace(".md", ""), Value::String(text));
-                    }
+            if let Ok(bytes) = output.body.collect().await {
+                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                    files.insert(name.replace(".md", ""), Value::String(text));
                 }
             }
-            Err(_) => {} // File doesn't exist — skip
         }
     }
 

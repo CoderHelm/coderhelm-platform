@@ -274,24 +274,21 @@ async fn onboard_repo(
         .build()
         .map_err(|e| format!("Failed to build message: {e}"))?];
 
-    let response = state
-        .bedrock
-        .converse()
-        .model_id(&state.config.model_id)
-        .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
-            system,
-        ))
-        .system(
+    let response = crate::agent::llm::converse_with_retry(
+        &state.bedrock,
+        &state.config.model_id,
+        vec![
+            aws_sdk_bedrockruntime::types::SystemContentBlock::Text(system),
             aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
                 aws_sdk_bedrockruntime::types::CachePointBlock::builder()
                     .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
                     .build()
                     .unwrap(),
             ),
-        )
-        .set_messages(Some(messages))
-        .send()
-        .await?;
+        ],
+        messages,
+    )
+    .await?;
 
     let agents_md = extract_text_from_response(&response)?;
 
@@ -406,16 +403,15 @@ async fn generate_voice_md(
         .build()
         .map_err(|e| format!("Failed to build message: {e}"))?];
 
-    let response = state
-        .bedrock
-        .converse()
-        .model_id(&state.config.model_id)
-        .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
+    let response = crate::agent::llm::converse_with_retry(
+        &state.bedrock,
+        &state.config.model_id,
+        vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
             system.to_string(),
-        ))
-        .set_messages(Some(messages))
-        .send()
-        .await?;
+        )],
+        messages,
+    )
+    .await?;
 
     let voice_md = extract_text_from_response(&response)?;
 
@@ -470,16 +466,15 @@ async fn generate_global_context(
         .build()
         .map_err(|e| format!("Failed to build message: {e}"))?];
 
-    let response = state
-        .bedrock
-        .converse()
-        .model_id(&state.config.model_id)
-        .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
+    let response = crate::agent::llm::converse_with_retry(
+        &state.bedrock,
+        &state.config.model_id,
+        vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
             system.to_string(),
-        ))
-        .set_messages(Some(messages))
-        .send()
-        .await?;
+        )],
+        messages,
+    )
+    .await?;
 
     extract_text_from_response(&response)
 }

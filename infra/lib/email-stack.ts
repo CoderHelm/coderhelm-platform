@@ -181,7 +181,7 @@ const RUN_COMPLETE_HTML = EMAIL_WRAPPER(`
     <tr><td style="color:#888;padding:4px 0;font-size:14px">PR</td><td style="color:#fff;padding:4px 0;font-size:14px"><a href="{{pr_url}}" style="color:#60a5fa">{{pr_url}}</a></td></tr>
     <tr><td style="color:#888;padding:4px 0;font-size:14px">Files</td><td style="color:#fff;padding:4px 0;font-size:14px">{{files_modified}} modified</td></tr>
     <tr><td style="color:#888;padding:4px 0;font-size:14px">Duration</td><td style="color:#fff;padding:4px 0;font-size:14px">{{duration}}</td></tr>
-    <tr><td style="color:#888;padding:4px 0;font-size:14px">Cost</td><td style="color:#fff;padding:4px 0;font-size:14px">\${{cost}}</td></tr>
+    <tr><td style="color:#888;padding:4px 0;font-size:14px">Tokens</td><td style="color:#fff;padding:4px 0;font-size:14px">{{tokens}}</td></tr>
   </table>
   <a href="https://app.coderhelm.com" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">View Run</a>
 `);
@@ -191,7 +191,7 @@ Repo: {{repo}}
 PR: {{pr_url}}
 Files: {{files_modified}} modified
 Duration: {{duration}}
-Cost: \${{cost}}
+Tokens: {{tokens}}
 
 View run: https://app.coderhelm.com`;
 

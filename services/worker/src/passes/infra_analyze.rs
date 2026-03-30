@@ -602,16 +602,15 @@ async fn call_bedrock(
         .build()
         .map_err(|e| format!("Failed to build message: {e}"))?];
 
-    let response = state
-        .bedrock
-        .converse()
-        .model_id(&state.config.model_id)
-        .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
+    let response = crate::agent::llm::converse_with_retry(
+        &state.bedrock,
+        &state.config.model_id,
+        vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
             SYSTEM.to_string(),
-        ))
-        .set_messages(Some(messages))
-        .send()
-        .await?;
+        )],
+        messages,
+    )
+    .await?;
 
     let text = match response.output() {
         Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg
@@ -667,16 +666,15 @@ async fn call_bedrock_retry(
             .map_err(|e| format!("Failed to build message: {e}"))?,
     ];
 
-    let response = state
-        .bedrock
-        .converse()
-        .model_id(&state.config.model_id)
-        .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
+    let response = crate::agent::llm::converse_with_retry(
+        &state.bedrock,
+        &state.config.model_id,
+        vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
             SYSTEM.to_string(),
-        ))
-        .set_messages(Some(messages))
-        .send()
-        .await?;
+        )],
+        messages,
+    )
+    .await?;
 
     let text = match response.output() {
         Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg

@@ -170,6 +170,26 @@ async fn run_passes(
         "Implement complete"
     );
 
+    // Mark all tasks as done in S3 openspec so retries/dashboard see progress
+    let tasks_key = format!(
+        "tenants/{}/runs/{}/openspec/tasks.md",
+        msg.tenant_id,
+        msg.ticket_id.to_lowercase()
+    );
+    let checked = plan_result.tasks.replace("- [ ]", "- [x]");
+    if let Err(e) = state
+        .s3
+        .put_object()
+        .bucket(&state.config.bucket_name)
+        .key(&tasks_key)
+        .body(checked.as_bytes().to_vec().into())
+        .content_type("text/markdown")
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Failed to update tasks.md with checked items");
+    }
+
     // --- Pass 4: Review ---
     update_pass(state, &msg.tenant_id, run_id, "review").await?;
     review::run(state, msg, &github, &branch_name, &rules, usage).await?;
@@ -394,6 +414,13 @@ async fn complete_run(
 
     // Send run-complete notification
     let duration_str = format!("{}m {}s", duration / 60, duration % 60);
+    let tokens_str = if total_tokens >= 1_000_000 {
+        format!("{:.1}M", total_tokens as f64 / 1_000_000.0)
+    } else if total_tokens >= 1_000 {
+        format!("{:.1}k", total_tokens as f64 / 1_000.0)
+    } else {
+        total_tokens.to_string()
+    };
     if let Err(e) = email::send_notification(
         state,
         &msg.tenant_id,
@@ -404,7 +431,7 @@ async fn complete_run(
             pr_url: pr.pr_url.clone(),
             files_modified: impl_result.files_modified.len(),
             duration: duration_str,
-            cost: format!("{:.2}", cost),
+            tokens: tokens_str,
         },
     )
     .await

@@ -9,6 +9,45 @@ use tracing::{error, info, warn};
 use crate::models::TokenUsage;
 use crate::WorkerState;
 
+/// Send a simple (non-agentic) Bedrock converse request with retry on transient errors.
+/// Used by onboard, infra_analyze, and other one-shot Bedrock calls.
+pub async fn converse_with_retry(
+    bedrock: &aws_sdk_bedrockruntime::Client,
+    model_id: &str,
+    system: Vec<SystemContentBlock>,
+    messages: Vec<Message>,
+) -> Result<aws_sdk_bedrockruntime::operation::converse::ConverseOutput, Box<dyn std::error::Error + Send + Sync>> {
+    for attempt in 0..3u32 {
+        let mut req = bedrock.converse().model_id(model_id);
+        for s in &system {
+            req = req.system(s.clone());
+        }
+        req = req.set_messages(Some(messages.clone()));
+        match req.send().await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                let err_str = format!("{e:#}");
+                let transient = err_str.contains("ThrottlingException")
+                    || err_str.contains("ServiceUnavailable")
+                    || err_str.contains("InternalServer")
+                    || err_str.contains("service error");
+                if attempt < 2 && transient {
+                    let delay_secs = 2u64.pow(attempt + 1);
+                    warn!(
+                        model_id,
+                        attempt = attempt + 1,
+                        "Bedrock transient error, retrying in {delay_secs}s: {err_str}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    continue;
+                }
+                return Err(format!("Bedrock converse error (model={model_id}): {e:#}").into());
+            }
+        }
+    }
+    unreachable!()
+}
+
 fn json_to_document(val: &Value) -> Document {
     match val {
         Value::Null => Document::Null,
@@ -77,40 +116,50 @@ pub async fn converse(
                 "[Turn limit reached — stopping to avoid excessive token usage]".to_string(),
             );
         }
-        let mut request = state
-            .bedrock
-            .converse()
-            .model_id(model_id)
-            // System prompt text
-            .system(SystemContentBlock::Text(system_prompt.to_string()))
-            // Cache point after system: caches system prompt + tool config prefix.
-            .system(SystemContentBlock::CachePoint(cache_point.clone()));
+        // Send with automatic retry for transient Bedrock errors (5xx, throttling).
+        let response = 'send: {
+            for attempt in 0..3u32 {
+                let mut req = state
+                    .bedrock
+                    .converse()
+                    .model_id(model_id)
+                    .system(SystemContentBlock::Text(system_prompt.to_string()))
+                    .system(SystemContentBlock::CachePoint(cache_point.clone()));
 
-        // Add all messages. On turn 2+, insert a cache point at the end of the
-        // second-to-last message so Bedrock caches the conversation prefix and
-        // only processes the new tool results as fresh input tokens.
-        let msg_count = messages.len();
-        for (i, msg) in messages.iter().enumerate() {
-            request = request.messages(msg.clone());
-            // Place cache point on the last user message (tool results) before
-            // the most recent assistant reply, so the full prefix is cached.
-            if turns > 1 && msg_count >= 2 && i == msg_count - 2 {
-                // Bedrock supports cache points as content blocks within messages.
-                // However the Converse API only supports cache points in system blocks,
-                // not in individual messages — so we rely on the system-level cache.
-                // Future: if Bedrock adds message-level cache points, insert here.
+                for msg in messages.iter() {
+                    req = req.messages(msg.clone());
+                }
+
+                if !tools.is_empty() {
+                    req = req.tool_config(tool_config.clone());
+                }
+
+                match req.send().await {
+                    Ok(resp) => break 'send resp,
+                    Err(e) => {
+                        let err_str = format!("{e:#}");
+                        let transient = err_str.contains("ThrottlingException")
+                            || err_str.contains("ServiceUnavailable")
+                            || err_str.contains("InternalServer")
+                            || err_str.contains("service error");
+                        if attempt < 2 && transient {
+                            let delay_secs = 2u64.pow(attempt + 1);
+                            warn!(
+                                model_id,
+                                attempt = attempt + 1,
+                                "Bedrock transient error, retrying in {delay_secs}s: {err_str}"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                            continue;
+                        }
+                        let msg = format!("Bedrock converse error (model={model_id}): {e:#}");
+                        error!("{msg}");
+                        return Err(msg.into());
+                    }
+                }
             }
-        }
-
-        if !tools.is_empty() {
-            request = request.tool_config(tool_config.clone());
-        }
-
-        let response = request.send().await.map_err(|e| {
-            let msg = format!("Bedrock converse error (model={model_id}): {e:#}");
-            error!("{msg}");
-            msg
-        })?;
+            unreachable!()
+        };
 
         // Track token usage (including cache metrics)
         if let Some(u) = response.usage() {
