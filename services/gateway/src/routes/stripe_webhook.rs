@@ -136,11 +136,11 @@ async fn handle_payment_succeeded(
 
     let now = chrono::Utc::now();
 
-    // Record payment in main table
+    // Record payment in events table
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.events_table_name)
         .item("pk", attr_s(&tenant_id))
         .item("sk", attr_s(&format!("PAYMENT#{invoice_id}")))
         .item("invoice_number", attr_s(invoice_number))
@@ -423,7 +423,7 @@ async fn handle_invoice_finalized(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.events_table_name)
         .item("pk", attr_s(&tenant_id))
         .item("sk", attr_s(&format!("INVOICE#{invoice_id}")))
         .item("invoice_number", attr_s(invoice_number))
@@ -503,7 +503,7 @@ async fn resolve_tenant(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.events_table_name)
         .key("pk", attr_s(&format!("STRIPE#{customer_id}")))
         .key("sk", attr_s("MAPPING"))
         .send()
@@ -530,7 +530,7 @@ async fn send_billing_email(
     let users = match state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.users_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(tenant_id))
         .expression_attribute_values(":prefix", attr_s("USER#"))
@@ -585,7 +585,7 @@ async fn is_event_processed(state: &AppState, event_id: &str) -> bool {
     state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.events_table_name)
         .key("pk", attr_s("STRIPE_EVENTS"))
         .key("sk", attr_s(event_id))
         .projection_expression("pk")
@@ -602,7 +602,7 @@ async fn mark_event_processed(state: &AppState, event_id: &str) {
     let _ = state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.events_table_name)
         .item("pk", attr_s("STRIPE_EVENTS"))
         .item("sk", attr_s(event_id))
         .item("ttl", attr_n(ttl))

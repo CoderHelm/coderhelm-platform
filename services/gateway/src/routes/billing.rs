@@ -96,7 +96,7 @@ pub async fn get_billing(
     let payments = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.events_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
         .expression_attribute_values(":prefix", attr_s("PAYMENT#"))
@@ -293,7 +293,7 @@ pub async fn create_subscription(
     let user_email = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.users_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&claims.sub))
         .send()
@@ -334,7 +334,7 @@ pub async fn create_subscription(
     let _ = state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.events_table_name)
         .item("pk", attr_s(&format!("STRIPE#{customer_id}")))
         .item("sk", attr_s("MAPPING"))
         .item("tenant_id", attr_s(&claims.tenant_id))
@@ -524,7 +524,7 @@ pub async fn list_invoices(
     let result = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.events_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
         .expression_attribute_values(":prefix", attr_s("INVOICE#"))
@@ -566,7 +566,7 @@ pub async fn download_invoice_pdf(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.events_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&format!("INVOICE#{invoice_id}")))
         .send()

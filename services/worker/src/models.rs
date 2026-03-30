@@ -5,6 +5,7 @@ pub struct Config {
     pub table_name: String,
     pub runs_table_name: String,
     pub analytics_table_name: String,
+    pub users_table_name: String,
     pub bucket_name: String,
     pub secrets_name: String,
     pub model_id: String,
@@ -21,6 +22,7 @@ impl Config {
             runs_table_name: std::env::var("RUNS_TABLE_NAME").expect("RUNS_TABLE_NAME required"),
             analytics_table_name: std::env::var("ANALYTICS_TABLE_NAME")
                 .expect("ANALYTICS_TABLE_NAME required"),
+            users_table_name: std::env::var("USERS_TABLE_NAME").expect("USERS_TABLE_NAME required"),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
             secrets_name: std::env::var("SECRETS_NAME")
                 .unwrap_or_else(|_| "coderhelm/prod/secrets".to_string()),

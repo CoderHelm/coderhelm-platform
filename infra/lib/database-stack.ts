@@ -11,6 +11,8 @@ export class DatabaseStack extends cdk.Stack {
   public readonly table: dynamodb.TableV2;
   public readonly runsTable: dynamodb.TableV2;
   public readonly analyticsTable: dynamodb.TableV2;
+  public readonly eventsTable: dynamodb.TableV2;
+  public readonly usersTable: dynamodb.TableV2;
   public readonly encryptionKey: kms.Key;
 
   constructor(scope: Construct, id: string, props: DatabaseStackProps) {
@@ -133,6 +135,58 @@ export class DatabaseStack extends cdk.Stack {
         : cdk.RemovalPolicy.DESTROY,
     });
 
+    // ──────────────────────────────────────────────
+    // Events table: ephemeral Stripe data
+    // STRIPE_EVENTS idempotency, PAYMENT#, INVOICE#, STRIPE# mapping
+    // TTL auto-cleanup for transient records
+    // ──────────────────────────────────────────────
+    this.eventsTable = new dynamodb.TableV2(this, "EventsTable", {
+      tableName: `coderhelm-${props.stage}-events`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+      timeToLiveAttribute: "expires_at",
+    });
+
+    // ──────────────────────────────────────────────
+    // Users table: user records per tenant
+    // PK = tenant_id, SK = USER#<github_id>
+    // GSI1: reverse lookup by github_id → tenant
+    // ──────────────────────────────────────────────
+    this.usersTable = new dynamodb.TableV2(this, "UsersTable", {
+      tableName: `coderhelm-${props.stage}-users`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // GSI1: Look up user by github_id (for OAuth login tenant resolution)
+    this.usersTable.addGlobalSecondaryIndex({
+      indexName: "gsi1",
+      partitionKey: { name: "gsi1pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "gsi1sk", type: dynamodb.AttributeType.STRING },
+    });
+
     // Outputs
     new cdk.CfnOutput(this, "TableName", { value: this.table.tableName });
     new cdk.CfnOutput(this, "TableArn", { value: this.table.tableArn });
@@ -141,6 +195,12 @@ export class DatabaseStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, "AnalyticsTableName", {
       value: this.analyticsTable.tableName,
+    });
+    new cdk.CfnOutput(this, "EventsTableName", {
+      value: this.eventsTable.tableName,
+    });
+    new cdk.CfnOutput(this, "UsersTableName", {
+      value: this.usersTable.tableName,
     });
   }
 }
