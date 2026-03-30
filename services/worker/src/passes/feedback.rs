@@ -118,6 +118,8 @@ For each comment, decide whether it is:
 - **A question** (e.g. "why did you do X?", "what does this do?", "could this cause Y?") — answer it with a clear, concise explanation. Read the relevant code first if needed.
 - **A change request** (e.g. "use X instead", "add error handling", "this should be Y") — read the relevant file, fix the code using write_file or batch_write, and push the change. NEVER describe a code change in text without actually making it first.
 
+Some comments may be prefixed with `[username]:` — these are earlier messages in the same thread provided for context. Do not reply to context messages; only reply to the reviewer's latest comment in each thread. Use the context to understand what was discussed previously.
+
 Your output will be posted directly as GitHub comments — one reply per review comment thread. Write natural, conversational replies as if you are talking to the reviewer. Do NOT include:
 - Headings like "Response to Review Comments" or "Comment #1"
 - Meta-commentary like "Now I have the full context" or "Let me explain"
@@ -359,26 +361,76 @@ fn format_review_comments(review_body: &str, comments: &[ReviewComment]) -> Stri
 }
 
 /// Fetch review comments from GitHub API for a given review.
+/// Also collects prior thread context (earlier comments on the same file+line)
+/// so the LLM sees the full conversation, not just the latest comment.
 async fn fetch_review_comments(github: &GitHubClient, msg: &FeedbackMessage) -> Vec<ReviewComment> {
     match github
         .get_review_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await
     {
-        Ok(api_comments) => api_comments
-            .iter()
-            .filter(|c| {
-                c.get("pull_request_review_id")
-                    .and_then(|v| v.as_u64())
-                    .map(|id| id == msg.review_id)
-                    .unwrap_or(false)
-            })
-            .map(|c| ReviewComment {
-                path: c["path"].as_str().unwrap_or("").to_string(),
-                line: c["line"].as_u64(),
-                body: c["body"].as_str().unwrap_or("").to_string(),
-                comment_id: c["id"].as_u64(),
-            })
-            .collect(),
+        Ok(api_comments) => {
+            // Identify the new comments from this review
+            let review_comments: Vec<&serde_json::Value> = api_comments
+                .iter()
+                .filter(|c| {
+                    c.get("pull_request_review_id")
+                        .and_then(|v| v.as_u64())
+                        .map(|id| id == msg.review_id)
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            // Collect thread keys (path + line) for the new comments
+            let thread_keys: std::collections::HashSet<(String, Option<u64>)> = review_comments
+                .iter()
+                .map(|c| {
+                    let path = c["path"].as_str().unwrap_or("").to_string();
+                    let line = c["line"].as_u64();
+                    (path, line)
+                })
+                .collect();
+
+            // Collect new comment IDs to avoid duplicating them in context
+            let new_ids: std::collections::HashSet<u64> = review_comments
+                .iter()
+                .filter_map(|c| c["id"].as_u64())
+                .collect();
+
+            // Find earlier comments in the same threads (context)
+            let mut context: Vec<ReviewComment> = api_comments
+                .iter()
+                .filter(|c| {
+                    let path = c["path"].as_str().unwrap_or("").to_string();
+                    let line = c["line"].as_u64();
+                    let id = c["id"].as_u64().unwrap_or(0);
+                    thread_keys.contains(&(path, line)) && !new_ids.contains(&id)
+                })
+                .map(|c| {
+                    let author = c["user"]["login"].as_str().unwrap_or("unknown");
+                    let body = c["body"].as_str().unwrap_or("");
+                    ReviewComment {
+                        path: c["path"].as_str().unwrap_or("").to_string(),
+                        line: c["line"].as_u64(),
+                        body: format!("[{author}]: {body}"),
+                        comment_id: c["id"].as_u64(),
+                    }
+                })
+                .collect();
+
+            // Append the new review comments (these are the ones to address)
+            let mut new: Vec<ReviewComment> = review_comments
+                .iter()
+                .map(|c| ReviewComment {
+                    path: c["path"].as_str().unwrap_or("").to_string(),
+                    line: c["line"].as_u64(),
+                    body: c["body"].as_str().unwrap_or("").to_string(),
+                    comment_id: c["id"].as_u64(),
+                })
+                .collect();
+
+            context.append(&mut new);
+            context
+        }
         Err(e) => {
             tracing::warn!("Failed to fetch review comments: {e}");
             vec![]
