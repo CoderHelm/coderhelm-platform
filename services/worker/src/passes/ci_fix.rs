@@ -212,7 +212,7 @@ impl<'a> ToolExecutor for CiFixToolExecutor<'a> {
                     .filter(|e| e.entry_type == "blob")
                     .map(|e| e.path.as_str())
                     .collect();
-                Ok(json!(paths.join("\n")))
+                Ok(json!(super::truncate_tree(&paths)))
             }
             "read_file" => {
                 let path = input
@@ -223,7 +223,7 @@ impl<'a> ToolExecutor for CiFixToolExecutor<'a> {
                     .github
                     .read_file(self.owner, self.repo, path, self.branch)
                     .await?;
-                Ok(json!(content))
+                Ok(json!(super::truncate_content(&content, path)))
             }
             "write_file" => {
                 let path = input

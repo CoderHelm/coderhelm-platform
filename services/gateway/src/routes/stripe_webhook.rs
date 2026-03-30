@@ -469,22 +469,6 @@ async fn handle_invoice_finalized(
         .and_then(|n| n.parse::<f64>().ok())
         .unwrap_or(0.0);
 
-    let total_tokens_in: u64 = analytics
-        .as_ref()
-        .and_then(|i| i.get("total_tokens_in"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
-
-    let total_tokens_out: u64 = analytics
-        .as_ref()
-        .and_then(|i| i.get("total_tokens_out"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
-
-    let total_tokens = total_tokens_in + total_tokens_out;
-
     // NOTE: Overage meter events are reported incrementally per run by the worker.
     // No reporting here — invoice.finalized is too late to affect the current invoice.
 

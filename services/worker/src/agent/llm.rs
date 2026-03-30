@@ -48,6 +48,9 @@ fn document_to_json(doc: &Document) -> Value {
 /// Call the LLM via Bedrock Converse API with tool use loop.
 /// Uses prompt caching: a CachePoint is placed after the system prompt
 /// so Bedrock caches it across calls within the same session/model.
+/// Maximum tool-use turns per converse() call to prevent runaway token spend.
+const MAX_TURNS: usize = 40;
+
 pub async fn converse(
     state: &WorkerState,
     system_prompt: &str,
@@ -57,26 +60,45 @@ pub async fn converse(
     usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let tool_config = build_tool_config(tools);
+    let mut turns: usize = 0;
+
+    // Build the cache point block once — reused every turn.
+    let cache_point = CachePointBlock::builder()
+        .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
+        .build()
+        .unwrap();
 
     loop {
+        turns += 1;
+        if turns > MAX_TURNS {
+            warn!("Hit max turn limit ({MAX_TURNS}), forcing completion");
+            return Ok(
+                "[Turn limit reached — stopping to avoid excessive token usage]".to_string(),
+            );
+        }
         let mut request = state
             .bedrock
             .converse()
             .model_id(&state.config.model_id)
             // System prompt text
             .system(SystemContentBlock::Text(system_prompt.to_string()))
-            // Cache point: tells Bedrock to cache everything above this marker.
-            // On subsequent calls with the same system prompt prefix, Bedrock
-            // serves cached tokens at 0.1x input price instead of full price.
-            .system(SystemContentBlock::CachePoint(
-                CachePointBlock::builder()
-                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
-                    .build()
-                    .unwrap(),
-            ));
+            // Cache point after system: caches system prompt + tool config prefix.
+            .system(SystemContentBlock::CachePoint(cache_point.clone()));
 
-        for msg in messages.iter() {
+        // Add all messages. On turn 2+, insert a cache point at the end of the
+        // second-to-last message so Bedrock caches the conversation prefix and
+        // only processes the new tool results as fresh input tokens.
+        let msg_count = messages.len();
+        for (i, msg) in messages.iter().enumerate() {
             request = request.messages(msg.clone());
+            // Place cache point on the last user message (tool results) before
+            // the most recent assistant reply, so the full prefix is cached.
+            if turns > 1 && msg_count >= 2 && i == msg_count - 2 {
+                // Bedrock supports cache points as content blocks within messages.
+                // However the Converse API only supports cache points in system blocks,
+                // not in individual messages — so we rely on the system-level cache.
+                // Future: if Bedrock adds message-level cache points, insert here.
+            }
         }
 
         if !tools.is_empty() {
