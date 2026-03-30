@@ -18,7 +18,7 @@ pub async fn me(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.users_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&claims.sub))
         .send()
