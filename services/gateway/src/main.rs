@@ -248,10 +248,9 @@ async fn main() -> Result<(), Error> {
     let app = Router::new()
         // Webhooks (public, verified by signature)
         .route("/webhooks/github", post(routes::github_webhook::handle))
-        .route("/webhooks/jira", post(routes::jira_webhook::handle))
         .route(
             "/webhooks/jira/:tenant_id",
-            post(routes::jira_webhook::handle_with_tenant),
+            post(routes::jira_webhook::handle),
         )
         .route(
             "/integrations/jira/forge-register",
