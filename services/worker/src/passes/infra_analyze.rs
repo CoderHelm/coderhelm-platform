@@ -723,6 +723,11 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
     // Track port usage: (service_id, port) -> count
     let mut port_usage: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
+    // Track all declared node IDs (services + junctions)
+    let mut declared_nodes: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Track edge endpoints for dangling-node check: (line_num, svc_id)
+    let mut edge_endpoints: Vec<(usize, String)> = Vec::new();
 
     for (i, line) in diagram.lines().enumerate() {
         let trimmed = line.trim();
@@ -761,6 +766,7 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
                     "line {line_num}: service ID contains hyphen (use underscores): {id_part}"
                 ));
             }
+            declared_nodes.insert(id_part.to_string());
             // Check that service has "in <group>" clause and track the group
             if let Some(in_pos) = after_service.rfind(" in ") {
                 let group_id = after_service[in_pos + 4..].trim().to_string();
@@ -777,6 +783,7 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
             if let Some(in_pos) = after_junction.rfind(" in ") {
                 let id_part = after_junction[..in_pos].trim();
                 let group_id = after_junction[in_pos + 4..].trim();
+                declared_nodes.insert(id_part.to_string());
                 service_groups.insert(id_part.to_string(), group_id.to_string());
             }
         }
@@ -854,6 +861,7 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
                             .entry((svc_id.clone(), port.clone()))
                             .or_insert(0) += 1;
                     }
+                    edge_endpoints.push((line_num, svc_id.clone()));
                     // Check inter-group T/B
                     if let Some(rhs_colon) = rhs.find(':') {
                         let rhs_port = rhs[..rhs_colon].trim().to_uppercase();
@@ -864,6 +872,7 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
                                 .entry((rhs_svc_id.clone(), rhs_port.clone()))
                                 .or_insert(0) += 1;
                         }
+                        edge_endpoints.push((line_num, rhs_svc_id.clone()));
                         let lhs_group = service_groups.get(&svc_id);
                         let rhs_group = service_groups.get(&rhs_svc_id);
                         if let (Some(lg), Some(rg)) = (lhs_group, rhs_group) {
@@ -888,6 +897,15 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
         if *count > 1 {
             errors.push(format!(
                 "service '{svc_id}' port {port} used {count} times (max 1 per port, use junctions)"
+            ));
+        }
+    }
+
+    // Check for dangling edges (endpoints that reference undeclared services/junctions)
+    for (line_num, node_id) in &edge_endpoints {
+        if !declared_nodes.contains(node_id) {
+            errors.push(format!(
+                "line {line_num}: edge references undeclared node '{node_id}' (missing service/junction declaration)"
             ));
         }
     }
