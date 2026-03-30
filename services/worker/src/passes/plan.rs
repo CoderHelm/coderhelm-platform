@@ -21,9 +21,31 @@ pub async fn run(
     triage: &super::triage::TriageResult,
     usage: &mut TokenUsage,
 ) -> Result<PlanResult, Box<dyn std::error::Error + Send + Sync>> {
+    // Fetch all enabled repos for this tenant so the planner can explore cross-repo
+    let tenant_repos = fetch_tenant_repos(state, &msg.tenant_id).await;
+    let default_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let repos_list = if tenant_repos.is_empty() {
+        format!("- {default_repo} (this repo)")
+    } else {
+        tenant_repos
+            .iter()
+            .map(|r| {
+                if r == &default_repo {
+                    format!("- {r} (this repo — default)")
+                } else {
+                    format!("- {r}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     let system = format!(
         "You are a planning agent for the {owner}/{repo} repository. \
-         Research the codebase using the provided tools, then generate an implementation plan.",
+         Research the codebase using the provided tools, then generate an implementation plan.\n\n\
+         You have access to these repos:\n{repos_list}\n\n\
+         All tools default to {owner}/{repo} when the `repo` parameter is omitted. \
+         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
@@ -71,9 +93,9 @@ After researching, output the four files using this exact format:
     let tools = read_only_tools();
     let executor = ReadOnlyToolExecutor {
         github,
-        owner: &msg.repo_owner,
-        repo: &msg.repo_name,
-        branch: "main",
+        default_owner: &msg.repo_owner,
+        default_repo: &msg.repo_name,
+        allowed_repos: &tenant_repos,
     };
 
     let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
@@ -154,22 +176,26 @@ fn parse_openspec_files(response: &str) -> PlanResult {
 // ─── Read-only tools for plan pass ──────────────────────────
 
 fn read_only_tools() -> Vec<ToolDefinition> {
+    let repo_prop = json!({"type": "string", "description": "Repository as owner/name. Omit to use the default (issue) repo."});
     vec![
         ToolDefinition {
             name: "read_tree".to_string(),
             description: "Get the full recursive file tree. Call once, then use list_directory for subdirs.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "repo": repo_prop
+                }
             }),
         },
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a file from the repository. Large files are truncated to ~32KB. Prefer read_file_lines for targeted reads.".to_string(),
+            description: "Read a file from a repository. Large files are truncated to ~32KB. Prefer read_file_lines for targeted reads.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path relative to repo root"}
+                    "path": {"type": "string", "description": "File path relative to repo root"},
+                    "repo": repo_prop
                 },
                 "required": ["path"]
             }),
@@ -182,18 +208,20 @@ fn read_only_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "path": {"type": "string", "description": "File path relative to repo root"},
                     "start_line": {"type": "integer", "description": "First line to read (1-indexed)"},
-                    "end_line": {"type": "integer", "description": "Last line to read (inclusive)"}
+                    "end_line": {"type": "integer", "description": "Last line to read (inclusive)"},
+                    "repo": repo_prop
                 },
                 "required": ["path", "start_line", "end_line"]
             }),
         },
         ToolDefinition {
             name: "search_code".to_string(),
-            description: "Search for code in the repository by keyword or symbol. Returns matching file paths and text fragments. Use to find definitions instead of reading files.".to_string(),
+            description: "Search for code in a repository by keyword or symbol. Returns matching file paths and text fragments. Use to find definitions instead of reading files.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query (e.g. function name, type, import)"}
+                    "query": {"type": "string", "description": "Search query (e.g. function name, type, import)"},
+                    "repo": repo_prop
                 },
                 "required": ["query"]
             }),
@@ -204,7 +232,8 @@ fn read_only_tools() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Directory path relative to repo root"}
+                    "path": {"type": "string", "description": "Directory path relative to repo root"},
+                    "repo": repo_prop
                 },
                 "required": ["path"]
             }),
@@ -214,9 +243,37 @@ fn read_only_tools() -> Vec<ToolDefinition> {
 
 struct ReadOnlyToolExecutor<'a> {
     github: &'a GitHubClient,
-    owner: &'a str,
-    repo: &'a str,
-    branch: &'a str,
+    default_owner: &'a str,
+    default_repo: &'a str,
+    allowed_repos: &'a [String],
+}
+
+impl<'a> ReadOnlyToolExecutor<'a> {
+    /// Resolve owner/repo from the optional `repo` param in tool input.
+    /// Falls back to default (issue) repo. Returns an error if the repo isn't in the allowed list.
+    fn resolve_repo(
+        &self,
+        input: &serde_json::Value,
+    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+        let repo_param = input.get("repo").and_then(|v| v.as_str());
+        match repo_param {
+            Some(full) => {
+                let parts: Vec<&str> = full.splitn(2, '/').collect();
+                if parts.len() != 2 {
+                    return Err(format!("Invalid repo format: {full}. Use owner/name.").into());
+                }
+                // If we have an allowed list, check it; otherwise allow any (fallback for empty list)
+                if !self.allowed_repos.is_empty() && !self.allowed_repos.iter().any(|r| r == full) {
+                    return Err(format!("Repo {full} is not in the connected repos list.").into());
+                }
+                Ok((parts[0].to_string(), parts[1].to_string()))
+            }
+            None => Ok((
+                self.default_owner.to_string(),
+                self.default_repo.to_string(),
+            )),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -226,12 +283,11 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let (owner, repo) = self.resolve_repo(input)?;
+        let branch = "main";
         match name {
             "read_tree" => {
-                let tree = self
-                    .github
-                    .get_tree(self.owner, self.repo, self.branch)
-                    .await?;
+                let tree = self.github.get_tree(&owner, &repo, branch).await?;
                 let paths: Vec<&str> = tree
                     .iter()
                     .filter(|e| e.entry_type == "blob")
@@ -244,10 +300,7 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
-                let content = self
-                    .github
-                    .read_file(self.owner, self.repo, path, self.branch)
-                    .await?;
+                let content = self.github.read_file(&owner, &repo, path, branch).await?;
                 Ok(json!(super::truncate_content(&content, path)))
             }
             "read_file_lines" => {
@@ -265,7 +318,7 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
                     .unwrap_or(start as u64 + 100) as usize;
                 let content = self
                     .github
-                    .read_file_lines(self.owner, self.repo, path, self.branch, start, end)
+                    .read_file_lines(&owner, &repo, path, branch, start, end)
                     .await?;
                 Ok(json!(content))
             }
@@ -274,10 +327,7 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
                     .get("query")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing query")?;
-                let results = self
-                    .github
-                    .search_code(self.owner, self.repo, query)
-                    .await?;
+                let results = self.github.search_code(&owner, &repo, query).await?;
                 let lines: Vec<String> = results
                     .iter()
                     .map(|r| {
@@ -297,7 +347,7 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
                     .ok_or("Missing path")?;
                 let entries = self
                     .github
-                    .list_directory(self.owner, self.repo, path, self.branch)
+                    .list_directory(&owner, &repo, path, branch)
                     .await?;
                 let lines: Vec<String> = entries
                     .iter()
@@ -306,6 +356,43 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
                 Ok(json!(lines.join("\n")))
             }
             _ => Err(format!("Unknown tool: {name}").into()),
+        }
+    }
+}
+
+/// Fetch enabled repos for a tenant from DynamoDB.
+async fn fetch_tenant_repos(state: &WorkerState, tenant_id: &str) -> Vec<String> {
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(
+            ":pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+        )
+        .expression_attribute_values(
+            ":prefix",
+            aws_sdk_dynamodb::types::AttributeValue::S("REPO#".to_string()),
+        )
+        .send()
+        .await;
+
+    match result {
+        Ok(output) => output
+            .items()
+            .iter()
+            .filter(|item| {
+                item.get("enabled")
+                    .and_then(|v| v.as_bool().ok())
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .filter_map(|item| item.get("repo_name").and_then(|v| v.as_s().ok()).cloned())
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to fetch tenant repos for planner");
+            Vec::new()
         }
     }
 }
