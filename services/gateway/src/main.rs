@@ -132,6 +132,11 @@ async fn main() -> Result<(), Error> {
             "/settings/budget",
             get(routes::api::get_budget).put(routes::api::update_budget),
         )
+        // Workflow settings
+        .route(
+            "/settings/workflow",
+            get(routes::api::get_workflow_settings).put(routes::api::update_workflow_settings),
+        )
         // Billing endpoints
         .route("/billing", get(routes::billing::get_billing))
         .route(
