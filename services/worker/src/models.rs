@@ -158,6 +158,9 @@ pub struct ReviewComment {
     pub body: String,
     #[serde(default)]
     pub comment_id: Option<u64>,
+    /// When true, this comment is prior thread context — not a comment to reply to.
+    #[serde(default)]
+    pub is_context: bool,
 }
 
 /// Token usage tracking with prompt cache metrics.

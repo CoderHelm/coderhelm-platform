@@ -120,15 +120,19 @@ For each comment, decide whether it is:
 
 Some comments may be prefixed with `[username]:` — these are earlier messages in the same thread provided for context. Do not reply to context messages; only reply to the reviewer's latest comment in each thread. Use the context to understand what was discussed previously.
 
-Your output will be posted directly as GitHub comments — one reply per review comment thread. Write natural, conversational replies as if you are talking to the reviewer. Do NOT include:
+Your output will be posted directly as GitHub comments — one reply per review comment thread. Write concise, direct replies. Do NOT include:
 - Headings like "Response to Review Comments" or "Comment #1"
 - Meta-commentary like "Now I have the full context" or "Let me explain"
 - Numbered comment references — just answer naturally
+- Internal reasoning or deliberation — only post the final answer
 
-If there are multiple comments, write a separate reply for each one in the same order they appear above. \
+Use proper GitHub markdown in replies: backticks for code, triple-backtick blocks for multi-line code, and keep replies short (1-3 sentences for confirmations).
+
+If there are multiple NEW comments to reply to (not counting context messages), write a separate reply for each one in the same order they appear above. \
 Separate each reply with exactly this marker on its own line:
 ---SPLIT---
 Each section will be posted as a separate reply to the corresponding comment thread.
+If there is only one comment to reply to, do NOT include ---SPLIT--- at all.
 
 Rules:
 - Address every comment. Don't skip any.
@@ -183,12 +187,15 @@ Rules:
         .filter(|s| !s.is_empty())
         .collect();
 
-    let comments_with_id: Vec<&ReviewComment> =
-        comments.iter().filter(|c| c.comment_id.is_some()).collect();
+    // Only match against actionable (non-context) comments for reply posting
+    let actionable_comments: Vec<&ReviewComment> = comments
+        .iter()
+        .filter(|c| c.comment_id.is_some() && !c.is_context)
+        .collect();
 
-    if sections.len() == comments_with_id.len() {
+    if sections.len() == actionable_comments.len() {
         // Matched — post each section to its corresponding comment thread
-        for (section, comment) in sections.iter().zip(comments_with_id.iter()) {
+        for (section, comment) in sections.iter().zip(actionable_comments.iter()) {
             let reply = if section.len() > 65000 {
                 format!("{}\n\n*(truncated)*", &section[..65000])
             } else {
@@ -205,13 +212,17 @@ Rules:
                 .await?;
         }
     } else {
-        // Fallback — post full response to first comment thread or as top-level comment
-        let reply = if response.len() > 65000 {
-            format!("{}\n\n*(truncated)*", &response[..65000])
+        // Fallback — post first non-empty section (strip ---SPLIT--- markers)
+        let reply_text = sections
+            .first()
+            .map(|s| s.to_string())
+            .unwrap_or(response.clone());
+        let reply = if reply_text.len() > 65000 {
+            format!("{}\n\n*(truncated)*", &reply_text[..65000])
         } else {
-            response.clone()
+            reply_text
         };
-        let first_comment_id = comments.iter().find_map(|c| c.comment_id);
+        let first_comment_id = actionable_comments.first().and_then(|c| c.comment_id);
         if let Some(comment_id) = first_comment_id {
             github
                 .reply_to_review_comment(
@@ -436,6 +447,7 @@ async fn fetch_review_comments(github: &GitHubClient, msg: &FeedbackMessage) -> 
                         line: c["line"].as_u64(),
                         body: format!("[{author}]: {body}"),
                         comment_id: c["id"].as_u64(),
+                        is_context: true,
                     }
                 })
                 .collect();
@@ -448,6 +460,7 @@ async fn fetch_review_comments(github: &GitHubClient, msg: &FeedbackMessage) -> 
                     line: c["line"].as_u64(),
                     body: c["body"].as_str().unwrap_or("").to_string(),
                     comment_id: c["id"].as_u64(),
+                    is_context: false,
                 })
                 .collect();
 
@@ -486,6 +499,7 @@ async fn fetch_all_human_comments(
                 line: c["line"].as_u64(),
                 body: c["body"].as_str().unwrap_or("").to_string(),
                 comment_id: c["id"].as_u64(),
+                is_context: false,
             })
             .collect(),
         Err(e) => {
