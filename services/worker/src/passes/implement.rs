@@ -1,5 +1,6 @@
 use serde_json::json;
 use std::collections::HashSet;
+use tracing::warn;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::clients::github::{FileOp, GitHubClient};
@@ -56,12 +57,24 @@ pub async fn run(
     );
 
     let tools = all_tools();
+    let tasks_key = format!(
+        "tenants/{}/runs/{}/openspec/tasks.md",
+        msg.tenant_id,
+        msg.ticket_id.to_lowercase()
+    );
+    let task_tracker = TaskTracker::new(
+        &state.s3,
+        &state.config.bucket_name,
+        &tasks_key,
+        &plan.tasks,
+    );
     let executor = WriteToolExecutor {
         github,
         owner: msg.repo_owner.clone(),
         repo: msg.repo_name.clone(),
         branch: branch.to_string(),
         files_modified: std::sync::Mutex::new(HashSet::new()),
+        task_tracker: &task_tracker,
     };
 
     let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
@@ -193,6 +206,65 @@ fn all_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Tracks task completion in S3 by matching written file paths against checklist items.
+struct TaskTracker {
+    s3: aws_sdk_s3::Client,
+    bucket: String,
+    key: String,
+    tasks_md: std::sync::Mutex<String>,
+}
+
+impl TaskTracker {
+    fn new(s3: &aws_sdk_s3::Client, bucket: &str, key: &str, tasks_md: &str) -> Self {
+        Self {
+            s3: s3.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            tasks_md: std::sync::Mutex::new(tasks_md.to_string()),
+        }
+    }
+
+    /// Check off tasks whose descriptions mention any of the given file paths, then write to S3.
+    async fn mark_files_done(&self, paths: &[&str]) {
+        let updated = {
+            let mut md = self.tasks_md.lock().unwrap();
+            let mut changed = false;
+            let mut lines: Vec<String> = md.lines().map(|l| l.to_string()).collect();
+            for line in &mut lines {
+                if !line.contains("- [ ]") {
+                    continue;
+                }
+                let matches = paths.iter().any(|p| {
+                    let filename = p.rsplit('/').next().unwrap_or(p);
+                    line.contains(p) || line.contains(filename)
+                });
+                if matches {
+                    *line = line.replacen("- [ ]", "- [x]", 1);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+            let new_md = lines.join("\n");
+            *md = new_md.clone();
+            new_md
+        };
+        if let Err(e) = self
+            .s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .body(updated.as_bytes().to_vec().into())
+            .content_type("text/markdown")
+            .send()
+            .await
+        {
+            warn!(key = %self.key, error = %e, "Failed to update tasks.md incrementally");
+        }
+    }
+}
+
 /// Paths the bot must never write to (require elevated GitHub App permissions).
 fn is_protected_path(path: &str) -> bool {
     let normalized = path.trim_start_matches('/');
@@ -205,6 +277,7 @@ struct WriteToolExecutor<'a> {
     repo: String,
     branch: String,
     files_modified: std::sync::Mutex<HashSet<String>>,
+    task_tracker: &'a TaskTracker,
 }
 
 #[async_trait::async_trait]
@@ -325,6 +398,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     )
                     .await?;
                 self.files_modified.lock().unwrap().insert(path.to_string());
+                self.task_tracker.mark_files_done(&[path]).await;
                 Ok(json!(format!("Wrote {path}")))
             }
             "batch_write" => {
@@ -371,6 +445,14 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .github
                     .batch_write(&self.owner, &self.repo, &self.branch, message, &ops)
                     .await?;
+                let written_paths: Vec<&str> = ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        FileOp::Write { path, .. } => Some(path.as_str()),
+                        FileOp::Delete { .. } => None,
+                    })
+                    .collect();
+                self.task_tracker.mark_files_done(&written_paths).await;
                 let mut result = format!("Batch commit {} — {} files", &sha[..8], ops.len());
                 if !skipped.is_empty() {
                     result.push_str(&format!(
