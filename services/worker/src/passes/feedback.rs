@@ -92,6 +92,7 @@ Rules:
 - Address every comment. Don't skip any.
 - For code changes, follow the reviewer's suggestions exactly unless they conflict with the codebase conventions.
 - Don't make unrelated changes beyond what the reviewer asked for.
+- If the reviewer asks about the spec, design, or proposal, check for openspec files under `openspec/` and update them if needed.
 - Keep answers concise but helpful."#,
         pr_number = msg.pr_number,
         comments = formatted,
@@ -116,7 +117,7 @@ Rules:
 
     let response = llm::converse(
         state,
-        &state.config.model_id,
+        &state.config.light_model_id,
         &system,
         &mut messages,
         &tools,
@@ -154,7 +155,7 @@ Rules:
             .await?;
     }
 
-    // Update run record in runs table
+    // Update run record in runs table (including status_run_id for GSI)
     let now = chrono::Utc::now().to_rfc3339();
     state
         .dynamo
@@ -169,7 +170,8 @@ Rules:
             aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
         )
         .update_expression(
-            "SET tokens_in = tokens_in + :ti, tokens_out = tokens_out + :to, updated_at = :t, #s = :s, current_pass = :p",
+            "SET tokens_in = tokens_in + :ti, tokens_out = tokens_out + :to, \
+             updated_at = :t, #s = :s, current_pass = :p, status_run_id = :sri",
         )
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(
@@ -189,8 +191,44 @@ Rules:
             ":p",
             aws_sdk_dynamodb::types::AttributeValue::S("feedback".to_string()),
         )
+        .expression_attribute_values(
+            ":sri",
+            aws_sdk_dynamodb::types::AttributeValue::S(format!("completed#{}", msg.run_id)),
+        )
         .send()
         .await?;
+
+    // Update analytics counters (current month + all-time)
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    for period in &[month.as_str(), "ALL_TIME"] {
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.analytics_table_name)
+            .key(
+                "tenant_id",
+                aws_sdk_dynamodb::types::AttributeValue::S(msg.tenant_id.clone()),
+            )
+            .key(
+                "period",
+                aws_sdk_dynamodb::types::AttributeValue::S(period.to_string()),
+            )
+            .update_expression("ADD total_tokens_in :ti, total_tokens_out :to")
+            .expression_attribute_values(
+                ":ti",
+                aws_sdk_dynamodb::types::AttributeValue::N(usage.input_tokens.to_string()),
+            )
+            .expression_attribute_values(
+                ":to",
+                aws_sdk_dynamodb::types::AttributeValue::N(usage.output_tokens.to_string()),
+            )
+            .send()
+            .await?;
+    }
+
+    // Report token overage to Stripe
+    let total_tokens = usage.input_tokens + usage.output_tokens;
+    crate::clients::billing::report_token_overage(state, &msg.tenant_id, total_tokens).await;
 
     Ok(())
 }
