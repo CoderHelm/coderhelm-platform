@@ -22,6 +22,13 @@ interface ApiStackProps extends cdk.StackProps {
   usersTable: dynamodb.TableV2;
   jiraTokensTable: dynamodb.TableV2;
   jiraEventsTable: dynamodb.TableV2;
+  plansTable: dynamodb.TableV2;
+  jiraConfigTable: dynamodb.TableV2;
+  reposTable: dynamodb.TableV2;
+  settingsTable: dynamodb.TableV2;
+  infraTable: dynamodb.TableV2;
+  billingTable: dynamodb.TableV2;
+  bannersTable: dynamodb.TableV2;
   bucket: s3.Bucket;
 }
 
@@ -102,6 +109,13 @@ export class ApiStack extends cdk.Stack {
         USERS_TABLE_NAME: props.usersTable.tableName,
         JIRA_TOKENS_TABLE_NAME: props.jiraTokensTable.tableName,
         JIRA_EVENTS_TABLE_NAME: props.jiraEventsTable.tableName,
+        PLANS_TABLE_NAME: props.plansTable.tableName,
+        JIRA_CONFIG_TABLE_NAME: props.jiraConfigTable.tableName,
+        REPOS_TABLE_NAME: props.reposTable.tableName,
+        SETTINGS_TABLE_NAME: props.settingsTable.tableName,
+        INFRA_TABLE_NAME: props.infraTable.tableName,
+        BILLING_TABLE_NAME: props.billingTable.tableName,
+        BANNERS_TABLE_NAME: props.bannersTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
         TICKET_QUEUE_URL: this.ticketQueue.queueUrl,
         CI_FIX_QUEUE_URL: this.ciFixQueue.queueUrl,
@@ -123,6 +137,13 @@ export class ApiStack extends cdk.Stack {
     props.usersTable.grantReadWriteData(this.gatewayFunction);
     props.jiraTokensTable.grantReadWriteData(this.gatewayFunction);
     props.jiraEventsTable.grantReadWriteData(this.gatewayFunction);
+    props.plansTable.grantReadWriteData(this.gatewayFunction);
+    props.jiraConfigTable.grantReadWriteData(this.gatewayFunction);
+    props.reposTable.grantReadWriteData(this.gatewayFunction);
+    props.settingsTable.grantReadWriteData(this.gatewayFunction);
+    props.infraTable.grantReadWriteData(this.gatewayFunction);
+    props.billingTable.grantReadWriteData(this.gatewayFunction);
+    props.bannersTable.grantReadData(this.gatewayFunction);
     props.bucket.grantRead(this.gatewayFunction);
     this.ticketQueue.grantSendMessages(this.gatewayFunction);
     this.ciFixQueue.grantSendMessages(this.gatewayFunction);

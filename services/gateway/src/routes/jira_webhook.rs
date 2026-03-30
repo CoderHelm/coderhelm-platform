@@ -142,7 +142,7 @@ pub async fn handle(
     let jira_config = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.jira_config_table_name)
         .key(
             "pk",
             aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.clone()),
@@ -193,7 +193,7 @@ pub async fn handle(
         let project_item = state
             .dynamo
             .get_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.jira_config_table_name)
             .key(
                 "pk",
                 aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.clone()),

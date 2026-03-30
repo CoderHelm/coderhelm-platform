@@ -365,7 +365,7 @@ pub async fn fetch_tenant_repos(state: &WorkerState, tenant_id: &str) -> Vec<Str
     let result = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.repos_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(
             ":pk",

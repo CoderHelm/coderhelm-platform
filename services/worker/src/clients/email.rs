@@ -119,7 +119,7 @@ pub async fn send_notification(
             let prefs = state
                 .dynamo
                 .get_item()
-                .table_name(&state.config.table_name)
+                .table_name(&state.config.settings_table_name)
                 .key(
                     "pk",
                     aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),

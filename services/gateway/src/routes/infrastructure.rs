@@ -51,7 +51,7 @@ pub async fn get_infrastructure(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.infra_table_name)
         .key("pk", AttributeValue::S(claims.tenant_id.clone()))
         .key("sk", AttributeValue::S(sk))
         .send()
@@ -142,7 +142,7 @@ pub async fn refresh_infrastructure(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.infra_table_name)
         .item("pk", AttributeValue::S(claims.tenant_id.clone()))
         .item("sk", AttributeValue::S(sk))
         .item("status", AttributeValue::S("pending".to_string()))
@@ -194,7 +194,7 @@ pub async fn get_repo_infrastructure(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.infra_table_name)
         .key("pk", AttributeValue::S(claims.tenant_id.clone()))
         .key("sk", AttributeValue::S(sk))
         .send()
@@ -267,7 +267,7 @@ pub async fn refresh_repo_infrastructure(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.infra_table_name)
         .item("pk", AttributeValue::S(claims.tenant_id.clone()))
         .item("sk", AttributeValue::S(sk))
         .item("status", AttributeValue::S("pending".to_string()))

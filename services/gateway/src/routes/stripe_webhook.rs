@@ -162,7 +162,7 @@ async fn handle_payment_succeeded(
     let mut update = state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.billing_table_name)
         .key("pk", attr_s(&tenant_id))
         .key("sk", attr_s("BILLING"))
         .update_expression(&update_expr)
@@ -235,7 +235,7 @@ async fn handle_payment_failed(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.billing_table_name)
         .key("pk", attr_s(&tenant_id))
         .key("sk", attr_s("BILLING"))
         .update_expression(
@@ -285,7 +285,7 @@ async fn handle_subscription_cancelled(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.billing_table_name)
         .key("pk", attr_s(&tenant_id))
         .key("sk", attr_s("BILLING"))
         .update_expression(
@@ -340,7 +340,7 @@ async fn handle_subscription_updated(
         state
             .dynamo
             .update_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.billing_table_name)
             .key("pk", attr_s(&tenant_id))
             .key("sk", attr_s("BILLING"))
             .update_expression(
@@ -358,7 +358,7 @@ async fn handle_subscription_updated(
         state
             .dynamo
             .update_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.billing_table_name)
             .key("pk", attr_s(&tenant_id))
             .key("sk", attr_s("BILLING"))
             .update_expression(
@@ -374,7 +374,7 @@ async fn handle_subscription_updated(
         state
             .dynamo
             .update_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.billing_table_name)
             .key("pk", attr_s(&tenant_id))
             .key("sk", attr_s("BILLING"))
             .update_expression(

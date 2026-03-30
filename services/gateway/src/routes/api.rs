@@ -467,7 +467,7 @@ pub async fn list_repos(
     let result = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.repos_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
         .expression_attribute_values(":prefix", attr_s("REPO#"))
@@ -503,7 +503,7 @@ pub async fn get_jira_integration_check(
     let repos_result = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.repos_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
         .expression_attribute_values(":prefix", attr_s("REPO#"))
@@ -671,7 +671,7 @@ pub async fn generate_jira_secret(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.jira_config_table_name)
         .item("pk", attr_s(&claims.tenant_id))
         .item("sk", attr_s("JIRA_SECRET"))
         .item("secret", attr_s(&token))
@@ -708,7 +708,7 @@ pub async fn generate_jira_secret(
             let _ = state
                 .dynamo
                 .delete_item()
-                .table_name(&state.config.table_name)
+                .table_name(&state.config.jira_config_table_name)
                 .key("pk", attr_s(&claims.tenant_id))
                 .key("sk", attr_s("JIRA_SECRET"))
                 .send()
@@ -745,7 +745,7 @@ pub async fn delete_jira_secret(
     state
         .dynamo
         .delete_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.jira_config_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s("JIRA_SECRET"))
         .send()
@@ -765,7 +765,7 @@ pub async fn load_jira_secret(state: &AppState, tenant_id: &str) -> Option<(Stri
     let item = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.jira_config_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key("sk", AttributeValue::S("JIRA_SECRET".to_string()))
         .send()
@@ -855,7 +855,7 @@ pub async fn forge_register_urls(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.jira_config_table_name)
         .key("pk", attr_s(tenant_id))
         .key("sk", attr_s("JIRA#config"))
         .update_expression(
@@ -884,7 +884,7 @@ pub async fn get_jira_config(
     let config_item = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.jira_config_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s("JIRA#config"))
         .send()
@@ -918,7 +918,7 @@ pub async fn get_jira_config(
     let projects_result = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.jira_config_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
         .expression_attribute_values(":prefix", attr_s("JIRA#PROJECT#"))
@@ -984,7 +984,7 @@ pub async fn update_jira_config(
     let mut update = state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.jira_config_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s("JIRA#config"))
         .update_expression(format!("SET {}", update_expr.join(", ")));
@@ -1027,7 +1027,7 @@ pub async fn update_jira_projects(
         state
             .dynamo
             .put_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.jira_config_table_name)
             .item("pk", attr_s(&claims.tenant_id))
             .item("sk", attr_s(&format!("JIRA#PROJECT#{key}")))
             .item("project_name", attr_s(name))
@@ -1053,7 +1053,7 @@ pub async fn fetch_jira_projects(
     let config_item = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.jira_config_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s("JIRA#config"))
         .send()
@@ -1206,7 +1206,7 @@ pub async fn update_repo(
     let mut put = state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.repos_table_name)
         .item("pk", attr_s(&claims.tenant_id))
         .item("sk", attr_s(&format!("REPO#{repo}")))
         .item("repo_name", attr_s(&repo))
@@ -1267,7 +1267,7 @@ pub async fn update_repo(
             let _ = state
                 .dynamo
                 .put_item()
-                .table_name(&state.config.table_name)
+                .table_name(&state.config.infra_table_name)
                 .item("pk", attr_s(&claims.tenant_id))
                 .item("sk", attr_s(&sk))
                 .item("status", attr_s("pending"))
@@ -1296,7 +1296,7 @@ pub async fn update_repo(
             let _ = state
                 .dynamo
                 .put_item()
-                .table_name(&state.config.table_name)
+                .table_name(&state.config.infra_table_name)
                 .item("pk", attr_s(&claims.tenant_id))
                 .item("sk", attr_s("INFRA#analysis"))
                 .item("status", attr_s("pending"))
@@ -1319,7 +1319,7 @@ pub async fn update_repo(
         let _ = state
             .dynamo
             .delete_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.repos_table_name)
             .key("pk", attr_s(&claims.tenant_id))
             .key("sk", attr_s(&sk))
             .send()
@@ -1335,7 +1335,7 @@ pub async fn update_repo(
             let _ = state
                 .dynamo
                 .put_item()
-                .table_name(&state.config.table_name)
+                .table_name(&state.config.infra_table_name)
                 .item("pk", attr_s(&claims.tenant_id))
                 .item("sk", attr_s("INFRA#analysis"))
                 .item("status", attr_s("pending"))
@@ -1369,7 +1369,7 @@ pub async fn delete_repo(
     state
         .dynamo
         .delete_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.repos_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&format!("REPO#{repo}")))
         .send()
@@ -1539,7 +1539,7 @@ pub async fn get_notification_prefs(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&sk))
         .send()
@@ -1588,7 +1588,7 @@ pub async fn update_notification_prefs(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .item("pk", attr_s(&claims.tenant_id))
         .item("sk", attr_s(&sk))
         .item(
@@ -1693,7 +1693,7 @@ async fn get_instructions_inner(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(tenant_id))
         .key("sk", attr_s(sk))
         .send()
@@ -1726,7 +1726,7 @@ async fn update_instructions_inner(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .item("pk", attr_s(tenant_id))
         .item("sk", attr_s(sk))
         .item("content", attr_s(content))
@@ -1797,7 +1797,7 @@ async fn get_rules_inner(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(tenant_id))
         .key("sk", attr_s(sk))
         .send()
@@ -1841,7 +1841,7 @@ async fn update_rules_inner(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .item("pk", attr_s(tenant_id))
         .item("sk", attr_s(sk))
         .item(
@@ -2012,7 +2012,7 @@ pub async fn get_budget(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s("SETTINGS#BUDGET"))
         .send()
@@ -2043,7 +2043,7 @@ pub async fn update_budget(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .item("pk", attr_s(&claims.tenant_id))
         .item("sk", attr_s("SETTINGS#BUDGET"))
         .item(
@@ -2068,7 +2068,7 @@ pub async fn get_workflow_settings(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s("SETTINGS#WORKFLOW"))
         .send()
@@ -2099,7 +2099,7 @@ pub async fn update_workflow_settings(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .item("pk", attr_s(&claims.tenant_id))
         .item("sk", attr_s("SETTINGS#WORKFLOW"))
         .item(

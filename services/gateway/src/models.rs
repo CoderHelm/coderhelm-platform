@@ -10,6 +10,13 @@ pub struct Config {
     pub users_table_name: String,
     pub jira_tokens_table_name: String,
     pub jira_events_table_name: String,
+    pub plans_table_name: String,
+    pub jira_config_table_name: String,
+    pub repos_table_name: String,
+    pub settings_table_name: String,
+    pub infra_table_name: String,
+    pub billing_table_name: String,
+    pub banners_table_name: String,
     pub bucket_name: String,
     pub invoice_bucket_name: String,
     pub ticket_queue_url: String,
@@ -36,6 +43,17 @@ impl Config {
                 .expect("JIRA_TOKENS_TABLE_NAME required"),
             jira_events_table_name: std::env::var("JIRA_EVENTS_TABLE_NAME")
                 .expect("JIRA_EVENTS_TABLE_NAME required"),
+            plans_table_name: std::env::var("PLANS_TABLE_NAME").expect("PLANS_TABLE_NAME required"),
+            jira_config_table_name: std::env::var("JIRA_CONFIG_TABLE_NAME")
+                .expect("JIRA_CONFIG_TABLE_NAME required"),
+            repos_table_name: std::env::var("REPOS_TABLE_NAME").expect("REPOS_TABLE_NAME required"),
+            settings_table_name: std::env::var("SETTINGS_TABLE_NAME")
+                .expect("SETTINGS_TABLE_NAME required"),
+            infra_table_name: std::env::var("INFRA_TABLE_NAME").expect("INFRA_TABLE_NAME required"),
+            billing_table_name: std::env::var("BILLING_TABLE_NAME")
+                .expect("BILLING_TABLE_NAME required"),
+            banners_table_name: std::env::var("BANNERS_TABLE_NAME")
+                .expect("BANNERS_TABLE_NAME required"),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
             invoice_bucket_name: std::env::var("INVOICE_BUCKET_NAME")
                 .unwrap_or_else(|_| "coderhelm-prod-invoices".to_string()),

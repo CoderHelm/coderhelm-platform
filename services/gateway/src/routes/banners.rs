@@ -28,7 +28,7 @@ pub async fn list_banners(
     let global = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.banners_table_name)
         .key_condition_expression("pk = :pk")
         .filter_expression("active = :t")
         .expression_attribute_values(":pk", attr_s("BANNER#GLOBAL"))
@@ -44,7 +44,7 @@ pub async fn list_banners(
     let tenant = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.banners_table_name)
         .key_condition_expression("pk = :pk")
         .filter_expression("active = :t")
         .expression_attribute_values(":pk", attr_s(&format!("BANNER#{}", claims.tenant_id)))

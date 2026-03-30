@@ -147,7 +147,7 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     let _ = state
                         .dynamo
                         .put_item()
-                        .table_name(&state.config.table_name)
+                        .table_name(&state.config.infra_table_name)
                         .item("pk", aws_sdk_dynamodb::types::AttributeValue::S(tenant_id))
                         .item(
                             "sk",

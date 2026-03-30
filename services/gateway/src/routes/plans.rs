@@ -29,7 +29,7 @@ pub async fn list_plans(
     let mut query = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
         .expression_attribute_values(":prefix", attr_s("PLAN#"))
@@ -99,7 +99,7 @@ pub async fn create_plan(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .item("pk", attr_s(&claims.tenant_id))
         .item("sk", attr_s(&sk))
         .item("plan_id", attr_s(&plan_id))
@@ -130,7 +130,7 @@ pub async fn create_plan(
             let mut put = state
                 .dynamo
                 .put_item()
-                .table_name(&state.config.table_name)
+                .table_name(&state.config.plans_table_name)
                 .item("pk", attr_s(&claims.tenant_id))
                 .item("sk", attr_s(&task_sk))
                 .item("plan_id", attr_s(&plan_id))
@@ -156,7 +156,7 @@ pub async fn create_plan(
         state
             .dynamo
             .update_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.plans_table_name)
             .key("pk", attr_s(&claims.tenant_id))
             .key("sk", attr_s(&sk))
             .update_expression("SET task_count = :c")
@@ -200,7 +200,7 @@ pub async fn get_plan(
     let result = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
         .expression_attribute_values(":prefix", attr_s(&format!("PLAN#{plan_id}")))
@@ -274,7 +274,7 @@ pub async fn update_plan(
     let mut req = state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&sk))
         .update_expression(&update_expr)
@@ -309,7 +309,7 @@ pub async fn delete_plan(
     let result = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
         .expression_attribute_values(":prefix", attr_s(&format!("PLAN#{plan_id}")))
@@ -335,7 +335,7 @@ pub async fn delete_plan(
         state
             .dynamo
             .delete_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.plans_table_name)
             .key("pk", pk)
             .key("sk", sk)
             .send()
@@ -371,7 +371,7 @@ pub async fn add_task(
     let mut put = state
         .dynamo
         .put_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .item("pk", attr_s(&claims.tenant_id))
         .item("sk", attr_s(&task_sk))
         .item("plan_id", attr_s(&plan_id))
@@ -397,7 +397,7 @@ pub async fn add_task(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&plan_sk))
         .update_expression(
@@ -462,7 +462,7 @@ pub async fn update_task(
     let mut req = state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&task_sk))
         .update_expression(&update_expr)
@@ -498,7 +498,7 @@ pub async fn delete_task(
     state
         .dynamo
         .delete_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&task_sk))
         .send()
@@ -514,7 +514,7 @@ pub async fn delete_task(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&plan_sk))
         .update_expression(
@@ -545,7 +545,7 @@ pub async fn approve_task(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&task_sk))
         .update_expression("SET #st = :s, approved_at = :now, approved_by = :by")
@@ -579,7 +579,7 @@ pub async fn reject_task(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&task_sk))
         .update_expression("SET #st = :s, rejected_at = :now, rejected_by = :by")
@@ -610,7 +610,7 @@ pub async fn approve_all_and_execute(
     let result = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
         .expression_attribute_values(":prefix", attr_s(&format!("PLAN#{plan_id}")))
@@ -655,7 +655,7 @@ pub async fn approve_all_and_execute(
             state
                 .dynamo
                 .update_item()
-                .table_name(&state.config.table_name)
+                .table_name(&state.config.plans_table_name)
                 .key("pk", attr_s(&claims.tenant_id))
                 .key("sk", attr_s(&task_sk))
                 .update_expression("SET #st = :s, approved_at = :now, approved_by = :by")
@@ -683,7 +683,7 @@ pub async fn approve_all_and_execute(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&plan_sk))
         .update_expression("SET #st = :s, executed_at = :now, executed_by = :by, updated_at = :now")
@@ -727,7 +727,7 @@ pub async fn approve_all_and_execute(
         state
             .dynamo
             .update_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.plans_table_name)
             .key("pk", attr_s(&claims.tenant_id))
             .key("sk", attr_s(&task_sk))
             .update_expression("SET #st = :s")
@@ -757,7 +757,7 @@ pub async fn execute_plan(
     let result = state
         .dynamo
         .query()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
         .expression_attribute_values(":prefix", attr_s(&format!("PLAN#{plan_id}")))
@@ -814,7 +814,7 @@ pub async fn execute_plan(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&plan_sk))
         .update_expression("SET #st = :s, executed_at = :now, executed_by = :by, updated_at = :now")
@@ -861,7 +861,7 @@ pub async fn execute_plan(
         state
             .dynamo
             .update_item()
-            .table_name(&state.config.table_name)
+            .table_name(&state.config.plans_table_name)
             .key("pk", attr_s(&claims.tenant_id))
             .key("sk", attr_s(&task_sk))
             .update_expression("SET #st = :s")
@@ -988,7 +988,7 @@ pub async fn plan_chat(
     let org_context = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s("AGENTS#GLOBAL"))
         .send()

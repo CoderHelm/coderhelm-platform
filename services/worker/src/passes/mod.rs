@@ -657,7 +657,7 @@ async fn load_rule_list(state: &WorkerState, tenant_id: &str, sk: &str) -> Optio
     match state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key("sk", AttributeValue::S(sk.to_string()))
         .send()
@@ -724,7 +724,7 @@ pub(crate) async fn load_content(state: &WorkerState, tenant_id: &str, sk: &str)
     match state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key("sk", AttributeValue::S(sk.to_string()))
         .send()
@@ -748,7 +748,7 @@ async fn load_workflow_setting(state: &WorkerState, tenant_id: &str, key: &str) 
     match state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key("sk", AttributeValue::S("SETTINGS#WORKFLOW".to_string()))
         .send()
@@ -769,7 +769,7 @@ async fn is_subscription_allowed(state: &WorkerState, tenant_id: &str) -> bool {
     let status = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.billing_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key("sk", AttributeValue::S("BILLING".to_string()))
         .send()

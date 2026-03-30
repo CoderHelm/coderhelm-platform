@@ -187,7 +187,7 @@ pub async fn run(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", AttributeValue::S(msg.tenant_id.clone()))
         .key("sk", AttributeValue::S(format!("PLAN#{}", msg.plan_id)))
         .update_expression("SET #s = :s, executed_at = :ea, executed_by = :eb")
@@ -232,7 +232,7 @@ async fn get_plan_repo(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key("sk", AttributeValue::S(format!("PLAN#{plan_id}")))
         .send()
@@ -262,7 +262,7 @@ async fn get_task(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key(
             "sk",
@@ -295,7 +295,7 @@ async fn set_task_status(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key(
             "sk",
@@ -321,7 +321,7 @@ async fn update_task_with_issue(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key(
             "sk",
@@ -358,7 +358,7 @@ async fn load_jira_create_url(state: &WorkerState, tenant_id: &str) -> Option<St
     state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.jira_config_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key("sk", AttributeValue::S("JIRA#config".to_string()))
         .send()
@@ -377,7 +377,7 @@ async fn load_jira_default_project(state: &WorkerState, tenant_id: &str) -> Opti
     state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.jira_config_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key("sk", AttributeValue::S("JIRA#config".to_string()))
         .send()
@@ -404,7 +404,7 @@ async fn update_task_with_jira(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.plans_table_name)
         .key("pk", AttributeValue::S(tenant_id.to_string()))
         .key(
             "sk",

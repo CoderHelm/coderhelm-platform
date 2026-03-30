@@ -15,6 +15,13 @@ export class DatabaseStack extends cdk.Stack {
   public readonly usersTable: dynamodb.TableV2;
   public readonly jiraTokensTable: dynamodb.TableV2;
   public readonly jiraEventsTable: dynamodb.TableV2;
+  public readonly plansTable: dynamodb.TableV2;
+  public readonly jiraConfigTable: dynamodb.TableV2;
+  public readonly reposTable: dynamodb.TableV2;
+  public readonly settingsTable: dynamodb.TableV2;
+  public readonly infraTable: dynamodb.TableV2;
+  public readonly billingTable: dynamodb.TableV2;
+  public readonly bannersTable: dynamodb.TableV2;
   public readonly encryptionKey: kms.Key;
 
   constructor(scope: Construct, id: string, props: DatabaseStackProps) {
@@ -31,8 +38,7 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
-    // Main table: tenants, users, repos, instructions, notification prefs
-    // Low-volume config data — single-table design
+    // Main table: tenant identity only (META, TENANT, WELCOME_SENT)
     // ──────────────────────────────────────────────
     this.table = new dynamodb.TableV2(this, "Table", {
       tableName: `coderhelm-${props.stage}`,
@@ -235,6 +241,154 @@ export class DatabaseStack extends cdk.Stack {
       timeToLiveAttribute: "expires_at",
     });
 
+    // ──────────────────────────────────────────────
+    // Plans table: plans + tasks
+    // PK = tenant_id, SK = PLAN#<plan_id> or PLAN#<plan_id>#TASK#<task_id>
+    // ──────────────────────────────────────────────
+    this.plansTable = new dynamodb.TableV2(this, "PlansTable", {
+      tableName: `coderhelm-${props.stage}-plans`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // ──────────────────────────────────────────────
+    // Jira config table: JIRA_SECRET, JIRA#config, JIRA#PROJECT#<key>
+    // PK = tenant_id, SK = config key
+    // ──────────────────────────────────────────────
+    this.jiraConfigTable = new dynamodb.TableV2(this, "JiraConfigTable", {
+      tableName: `coderhelm-${props.stage}-jira-config`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // ──────────────────────────────────────────────
+    // Repos table: repository records
+    // PK = tenant_id, SK = REPO#<owner>/<repo>
+    // ──────────────────────────────────────────────
+    this.reposTable = new dynamodb.TableV2(this, "ReposTable", {
+      tableName: `coderhelm-${props.stage}-repos`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // ──────────────────────────────────────────────
+    // Settings table: instructions, rules, voice, agents, notifications, budget, workflow
+    // PK = tenant_id, SK = setting key
+    // ──────────────────────────────────────────────
+    this.settingsTable = new dynamodb.TableV2(this, "SettingsTable", {
+      tableName: `coderhelm-${props.stage}-settings`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // ──────────────────────────────────────────────
+    // Infra table: infrastructure analysis results
+    // PK = tenant_id, SK = INFRA#analysis or INFRA#REPO#<owner>/<repo>
+    // ──────────────────────────────────────────────
+    this.infraTable = new dynamodb.TableV2(this, "InfraTable", {
+      tableName: `coderhelm-${props.stage}-infra`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // ──────────────────────────────────────────────
+    // Billing table: subscription & payment data
+    // PK = tenant_id, SK = BILLING
+    // ──────────────────────────────────────────────
+    this.billingTable = new dynamodb.TableV2(this, "BillingTable", {
+      tableName: `coderhelm-${props.stage}-billing-data`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // ──────────────────────────────────────────────
+    // Banners table: dynamic UI banners
+    // PK = scope (BANNER#GLOBAL or BANNER#<tenant_id>), SK = banner_id
+    // ──────────────────────────────────────────────
+    this.bannersTable = new dynamodb.TableV2(this, "BannersTable", {
+      tableName: `coderhelm-${props.stage}-banners`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+      timeToLiveAttribute: "expires_at",
+    });
+
     // Outputs
     new cdk.CfnOutput(this, "TableName", { value: this.table.tableName });
     new cdk.CfnOutput(this, "TableArn", { value: this.table.tableArn });
@@ -255,6 +409,27 @@ export class DatabaseStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, "JiraEventsTableName", {
       value: this.jiraEventsTable.tableName,
+    });
+    new cdk.CfnOutput(this, "PlansTableName", {
+      value: this.plansTable.tableName,
+    });
+    new cdk.CfnOutput(this, "JiraConfigTableName", {
+      value: this.jiraConfigTable.tableName,
+    });
+    new cdk.CfnOutput(this, "ReposTableName", {
+      value: this.reposTable.tableName,
+    });
+    new cdk.CfnOutput(this, "SettingsTableName", {
+      value: this.settingsTable.tableName,
+    });
+    new cdk.CfnOutput(this, "InfraTableName", {
+      value: this.infraTable.tableName,
+    });
+    new cdk.CfnOutput(this, "BillingTableName", {
+      value: this.billingTable.tableName,
+    });
+    new cdk.CfnOutput(this, "BannersTableName", {
+      value: this.bannersTable.tableName,
     });
   }
 }
