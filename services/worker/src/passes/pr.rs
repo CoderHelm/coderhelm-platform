@@ -136,26 +136,22 @@ Return ONLY the markdown body text."#,
 
     info!(pr_number, pr_url = %pr_url, "Draft PR created");
 
-    // Check if repo has CI — if not, mark ready immediately
-    let has_ci = github
-        .check_path_exists(&msg.repo_owner, &msg.repo_name, ".github/workflows", "main")
-        .await;
-
-    let draft = if has_ci {
-        true
-    } else {
-        info!("No CI workflows found — marking PR ready");
-        github
-            .mark_pr_ready(&msg.repo_owner, &msg.repo_name, pr_number)
-            .await?;
-        false
-    };
+    // Wait briefly for GitHub to register the PR, then mark ready for review.
+    // The internal review pass already validated the code, so no need to keep in draft.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    match github
+        .mark_pr_ready(&msg.repo_owner, &msg.repo_name, pr_number)
+        .await
+    {
+        Ok(_) => info!(pr_number, "PR marked ready for review"),
+        Err(e) => tracing::warn!(pr_number, error = %e, "Failed to mark PR ready — left as draft"),
+    }
 
     Ok(PrResult {
         pr_number,
         pr_url,
         branch: branch.to_string(),
-        draft,
+        draft: false,
     })
 }
 
