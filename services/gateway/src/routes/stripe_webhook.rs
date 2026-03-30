@@ -325,20 +325,74 @@ async fn handle_subscription_updated(
         .as_str()
         .unwrap_or("");
 
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.table_name)
-        .key("pk", attr_s(&tenant_id))
-        .key("sk", attr_s("BILLING"))
-        .update_expression("SET subscription_status = :status, plan_id = :plan, updated_at = :t")
-        .expression_attribute_values(":status", attr_s(status))
-        .expression_attribute_values(":plan", attr_s(plan_id))
-        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
-        .send()
-        .await?;
+    let cancel_at_period_end = subscription["cancel_at_period_end"]
+        .as_bool()
+        .unwrap_or(false);
+    let now = chrono::Utc::now().to_rfc3339();
 
-    info!(tenant_id, status, plan_id, "Subscription updated");
+    if status == "active" && cancel_at_period_end {
+        // Cancelling at period end — record when access expires
+        let access_until = subscription["cancel_at"]
+            .as_u64()
+            .filter(|&ts| ts > 0)
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_default();
+
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&tenant_id))
+            .key("sk", attr_s("BILLING"))
+            .update_expression(
+                "SET subscription_status = :status, plan_id = :plan, \
+                 access_until = :end, updated_at = :t",
+            )
+            .expression_attribute_values(":status", attr_s(status))
+            .expression_attribute_values(":plan", attr_s(plan_id))
+            .expression_attribute_values(":end", attr_s(&access_until))
+            .expression_attribute_values(":t", attr_s(&now))
+            .send()
+            .await?;
+    } else if status == "active" {
+        // Reactivated or normal update — clear cancellation fields
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&tenant_id))
+            .key("sk", attr_s("BILLING"))
+            .update_expression(
+                "SET subscription_status = :status, plan_id = :plan, updated_at = :t \
+                 REMOVE access_until, cancelled_at",
+            )
+            .expression_attribute_values(":status", attr_s(status))
+            .expression_attribute_values(":plan", attr_s(plan_id))
+            .expression_attribute_values(":t", attr_s(&now))
+            .send()
+            .await?;
+    } else {
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&tenant_id))
+            .key("sk", attr_s("BILLING"))
+            .update_expression(
+                "SET subscription_status = :status, plan_id = :plan, updated_at = :t",
+            )
+            .expression_attribute_values(":status", attr_s(status))
+            .expression_attribute_values(":plan", attr_s(plan_id))
+            .expression_attribute_values(":t", attr_s(&now))
+            .send()
+            .await?;
+    }
+
+    info!(
+        tenant_id,
+        status, plan_id, cancel_at_period_end, "Subscription updated"
+    );
     Ok(())
 }
 

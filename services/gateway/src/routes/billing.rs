@@ -563,22 +563,50 @@ pub async fn download_invoice_pdf(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
-
-    // Stripe provides a hosted invoice PDF URL directly
-    let pdf_url = item
-        .get("stripe_pdf_url")
+    // Try DynamoDB first, fall back to Stripe API
+    let pdf_url = result
+        .item()
+        .and_then(|i| i.get("stripe_pdf_url"))
         .and_then(|v| v.as_s().ok())
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .filter(|u| !u.is_empty())
+        .map(|s| s.to_string());
 
-    if pdf_url.is_empty()
-        || !pdf_url.starts_with("https://pay.stripe.com/")
-            && !pdf_url.starts_with("https://invoice.stripe.com/")
-    {
-        return Err(StatusCode::NOT_FOUND);
+    if let Some(ref url) = pdf_url {
+        if url.starts_with("https://pay.stripe.com/")
+            || url.starts_with("https://invoice.stripe.com/")
+        {
+            return Ok(Json(json!({ "pdf_url": url })));
+        }
     }
 
-    Ok(Json(json!({ "pdf_url": pdf_url })))
+    // Fallback: fetch PDF URL from Stripe API directly
+    let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
+        error!("Stripe secret key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let resp = state
+        .http
+        .get(format!("https://api.stripe.com/v1/invoices/{invoice_id}"))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Stripe invoice fetch failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let body: Value = resp.json().await.map_err(|e| {
+        error!("Failed to parse Stripe invoice response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let stripe_pdf = body["invoice_pdf"]
+        .as_str()
+        .filter(|u| !u.is_empty())
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(json!({ "pdf_url": stripe_pdf })))
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
