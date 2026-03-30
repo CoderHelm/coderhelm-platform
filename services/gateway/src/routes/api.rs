@@ -63,6 +63,13 @@ pub async fn list_runs(
     let runs: Vec<Value> = result
         .items()
         .iter()
+        .filter(|item| {
+            // Exclude archived runs from the list
+            item.get("status")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.as_str() != "archived")
+                .unwrap_or(true)
+        })
         .map(|item| {
             json!({
                 "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
@@ -306,6 +313,23 @@ pub async fn retry_run(
         })?;
 
     info!(run_id, "Run retried — dispatched to SQS");
+
+    // Archive the old run so it doesn't clutter the runs list
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("run_id", attr_s(&run_id))
+        .update_expression("SET #s = :s, updated_at = :t, status_run_id = :sri")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", attr_s("archived"))
+        .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":sri", attr_s(&format!("archived#{run_id}")))
+        .send()
+        .await;
+
     Ok(Json(json!({ "status": "retrying" })))
 }
 
