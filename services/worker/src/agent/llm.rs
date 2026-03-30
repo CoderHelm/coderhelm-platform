@@ -16,7 +16,10 @@ pub async fn converse_with_retry(
     model_id: &str,
     system: Vec<SystemContentBlock>,
     messages: Vec<Message>,
-) -> Result<aws_sdk_bedrockruntime::operation::converse::ConverseOutput, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    aws_sdk_bedrockruntime::operation::converse::ConverseOutput,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     for attempt in 0..3u32 {
         let mut req = bedrock.converse().model_id(model_id);
         for s in &system {
