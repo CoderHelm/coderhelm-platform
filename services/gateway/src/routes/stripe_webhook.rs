@@ -9,8 +9,6 @@ use tracing::{error, info, warn};
 
 use crate::AppState;
 
-use super::billing::{report_stripe_usage, INCLUDED_TOKENS, OVERAGE_PER_1K_TOKENS_CENTS};
-
 /// Stripe webhook handler — processes payment events.
 /// Stripe automatically retries failed webhook deliveries with exponential backoff.
 pub async fn handle(
@@ -487,35 +485,8 @@ async fn handle_invoice_finalized(
 
     let total_tokens = total_tokens_in + total_tokens_out;
 
-    // Report metered overages to Stripe, capped at the user's budget
-    let tokens_overage_1k = total_tokens.saturating_sub(INCLUDED_TOKENS) / 1000;
-
-    let budget = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.table_name)
-        .key("pk", attr_s(&tenant_id))
-        .key("sk", attr_s("SETTINGS#BUDGET"))
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned());
-
-    let max_budget_cents: u64 = budget
-        .as_ref()
-        .and_then(|i| i.get("max_budget_cents"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
-
-    let capped_overage_1k = if max_budget_cents > 0 {
-        let max_overage_1k = max_budget_cents / OVERAGE_PER_1K_TOKENS_CENTS;
-        tokens_overage_1k.min(max_overage_1k)
-    } else {
-        tokens_overage_1k
-    };
-
-    report_stripe_usage(state, &tenant_id, "tokens_overage", capped_overage_1k).await;
+    // NOTE: Overage meter events are reported incrementally per run by the worker.
+    // No reporting here — invoice.finalized is too late to affect the current invoice.
 
     // Send invoice email
     send_billing_email(
