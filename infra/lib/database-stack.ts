@@ -13,6 +13,8 @@ export class DatabaseStack extends cdk.Stack {
   public readonly analyticsTable: dynamodb.TableV2;
   public readonly eventsTable: dynamodb.TableV2;
   public readonly usersTable: dynamodb.TableV2;
+  public readonly jiraTokensTable: dynamodb.TableV2;
+  public readonly jiraEventsTable: dynamodb.TableV2;
   public readonly encryptionKey: kms.Key;
 
   constructor(scope: Construct, id: string, props: DatabaseStackProps) {
@@ -187,6 +189,52 @@ export class DatabaseStack extends cdk.Stack {
       sortKey: { name: "gsi1sk", type: dynamodb.AttributeType.STRING },
     });
 
+    // ──────────────────────────────────────────────
+    // Jira tokens table: opaque webhook token → tenant mapping
+    // PK = token (the random 40-char string)
+    // ──────────────────────────────────────────────
+    this.jiraTokensTable = new dynamodb.TableV2(this, "JiraTokensTable", {
+      tableName: `coderhelm-${props.stage}-jira-tokens`,
+      partitionKey: { name: "token", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // ──────────────────────────────────────────────
+    // Jira events table: log every webhook event received
+    // PK = tenant_id, SK = event_id (ULID — time-ordered)
+    // TTL for auto-cleanup of old events
+    // ──────────────────────────────────────────────
+    this.jiraEventsTable = new dynamodb.TableV2(this, "JiraEventsTable", {
+      tableName: `coderhelm-${props.stage}-jira-events`,
+      partitionKey: {
+        name: "tenant_id",
+        type: dynamodb.AttributeType.STRING,
+      },
+      sortKey: { name: "event_id", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+      timeToLiveAttribute: "expires_at",
+    });
+
     // Outputs
     new cdk.CfnOutput(this, "TableName", { value: this.table.tableName });
     new cdk.CfnOutput(this, "TableArn", { value: this.table.tableArn });
@@ -201,6 +249,12 @@ export class DatabaseStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, "UsersTableName", {
       value: this.usersTable.tableName,
+    });
+    new cdk.CfnOutput(this, "JiraTokensTableName", {
+      value: this.jiraTokensTable.tableName,
+    });
+    new cdk.CfnOutput(this, "JiraEventsTableName", {
+      value: this.jiraEventsTable.tableName,
     });
   }
 }

@@ -41,6 +41,8 @@ const api = new ApiStack(app, `${prefix}-api`, {
   analyticsTable: database.analyticsTable,
   eventsTable: database.eventsTable,
   usersTable: database.usersTable,
+  jiraTokensTable: database.jiraTokensTable,
+  jiraEventsTable: database.jiraEventsTable,
   bucket: storage.bucket,
 });
 

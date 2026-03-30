@@ -8,6 +8,8 @@ pub struct Config {
     pub analytics_table_name: String,
     pub events_table_name: String,
     pub users_table_name: String,
+    pub jira_tokens_table_name: String,
+    pub jira_events_table_name: String,
     pub bucket_name: String,
     pub invoice_bucket_name: String,
     pub ticket_queue_url: String,
@@ -30,6 +32,10 @@ impl Config {
             events_table_name: std::env::var("EVENTS_TABLE_NAME")
                 .expect("EVENTS_TABLE_NAME required"),
             users_table_name: std::env::var("USERS_TABLE_NAME").expect("USERS_TABLE_NAME required"),
+            jira_tokens_table_name: std::env::var("JIRA_TOKENS_TABLE_NAME")
+                .expect("JIRA_TOKENS_TABLE_NAME required"),
+            jira_events_table_name: std::env::var("JIRA_EVENTS_TABLE_NAME")
+                .expect("JIRA_EVENTS_TABLE_NAME required"),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
             invoice_bucket_name: std::env::var("INVOICE_BUCKET_NAME")
                 .unwrap_or_else(|_| "coderhelm-prod-invoices".to_string()),
