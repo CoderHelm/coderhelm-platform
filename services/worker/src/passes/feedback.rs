@@ -245,7 +245,8 @@ Rules:
         )
         .update_expression(
             "SET tokens_in = tokens_in + :ti, tokens_out = tokens_out + :to, \
-             updated_at = :t, #s = :s, current_pass = :p, status_run_id = :sri",
+             updated_at = :t, #s = :s, current_pass = :p, status_run_id = :sri, \
+             pass_history = list_append(if_not_exists(pass_history, :empty), :entry)",
         )
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(
@@ -256,7 +257,10 @@ Rules:
             ":to",
             aws_sdk_dynamodb::types::AttributeValue::N(usage.output_tokens.to_string()),
         )
-        .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
+        .expression_attribute_values(
+            ":t",
+            aws_sdk_dynamodb::types::AttributeValue::S(now.clone()),
+        )
         .expression_attribute_values(
             ":s",
             aws_sdk_dynamodb::types::AttributeValue::S("completed".to_string()),
@@ -269,6 +273,25 @@ Rules:
             ":sri",
             aws_sdk_dynamodb::types::AttributeValue::S(format!("completed#{}", msg.run_id)),
         )
+        .expression_attribute_values(
+            ":entry",
+            aws_sdk_dynamodb::types::AttributeValue::L(vec![
+                aws_sdk_dynamodb::types::AttributeValue::M(
+                    [
+                        (
+                            "pass".to_string(),
+                            aws_sdk_dynamodb::types::AttributeValue::S("feedback".to_string()),
+                        ),
+                        (
+                            "started_at".to_string(),
+                            aws_sdk_dynamodb::types::AttributeValue::S(now),
+                        ),
+                    ]
+                    .into(),
+                ),
+            ]),
+        )
+        .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]))
         .send()
         .await?;
 
