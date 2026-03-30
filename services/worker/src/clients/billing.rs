@@ -3,7 +3,10 @@ use tracing::warn;
 use crate::WorkerState;
 
 /// Included tokens in the Pro plan (5M in+out).
-const INCLUDED_TOKENS: u64 = 100; // TODO: restore to 5_000_000 after overage testing
+const INCLUDED_TOKENS: u64 = 5_000_000;
+
+/// $0.05 per 1K overage tokens.
+const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 5;
 
 /// Report token overage to Stripe via Billing Meter Events.
 /// Checks current month's cumulative usage against the included limit,
@@ -102,6 +105,46 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
         return;
     }
 
+    // Check budget cap
+    let budget = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("SETTINGS#BUDGET".to_string()),
+        )
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned());
+
+    let max_budget_cents: u64 = budget
+        .as_ref()
+        .and_then(|i| i.get("max_budget_cents"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let current_overage = total_tokens.saturating_sub(INCLUDED_TOKENS);
+    let current_overage_1k = current_overage / 1000;
+    let current_overage_cents = current_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
+
+    // If budget cap is set and we've already reported up to the cap, stop
+    if max_budget_cents > 0 && current_overage_cents >= max_budget_cents {
+        // Check if we already exceeded the cap before this run
+        let prev_total = total_tokens.saturating_sub(tokens_used);
+        let prev_overage_1k = prev_total.saturating_sub(INCLUDED_TOKENS) / 1000;
+        let prev_overage_cents = prev_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
+        if prev_overage_cents >= max_budget_cents {
+            return; // Already at cap, nothing new to report
+        }
+    }
+
     // Calculate what overage was already reported vs. what's new from this run
     let prev_total = total_tokens.saturating_sub(tokens_used);
     let prev_overage = prev_total.saturating_sub(INCLUDED_TOKENS);
@@ -112,8 +155,18 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
         return;
     }
 
-    // Report in units of 1K tokens (round up)
-    let overage_1k = new_overage.div_ceil(1000);
+    // Cap at budget limit if set
+    let mut overage_1k = new_overage.div_ceil(1000);
+    if max_budget_cents > 0 {
+        let prev_overage_1k = prev_overage / 1000;
+        let prev_reported_cents = prev_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
+        let remaining_budget = max_budget_cents.saturating_sub(prev_reported_cents);
+        let max_reportable_1k = remaining_budget / OVERAGE_PER_1K_TOKENS_CENTS;
+        overage_1k = overage_1k.min(max_reportable_1k);
+        if overage_1k == 0 {
+            return;
+        }
+    }
     let ts = chrono::Utc::now().timestamp().to_string();
     let qty = overage_1k.to_string();
 
