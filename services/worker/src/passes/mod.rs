@@ -169,10 +169,9 @@ async fn run_passes(
                 &msg.repo_name,
                 msg.issue_number,
                 &format!(
-                    "✅ **Coderhelm completed this ticket**\n\n**PR**: {}\n**Files**: {} modified\n**Cost**: ${:.2}\n\n[View run →](https://app.coderhelm.com/dashboard/runs/{})",
+                    "✅ **Coderhelm completed this ticket**\n\n**PR**: {}\n**Files**: {} modified\n\n[View run →](https://app.coderhelm.com/dashboard/runs/{})",
                     pr_result.pr_url,
                     impl_result.files_modified.len(),
-                    usage.estimated_cost(),
                     run_id,
                 ),
             )

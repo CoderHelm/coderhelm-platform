@@ -571,6 +571,30 @@ impl GitHubClient {
         Ok((number, html_url))
     }
 
+    /// Ensure a label exists in the repo, creating it if missing.
+    pub async fn ensure_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        label: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/labels/{label}");
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.get(&url);
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        // Label doesn't exist — create it
+        let create_url = format!("{API_BASE}/repos/{owner}/{repo}/labels");
+        let payload = serde_json::json!({ "name": label, "color": "7B61FF", "description": "Managed by Coderhelm" });
+        self.post(&create_url, &payload).await?;
+        Ok(())
+    }
+
     /// Add a label to a GitHub issue.
     pub async fn add_label(
         &self,
