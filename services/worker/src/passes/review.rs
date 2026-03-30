@@ -173,7 +173,7 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                     .github
                     .read_file(self.owner, self.repo, path, self.branch)
                     .await?;
-                Ok(json!(content))
+                Ok(json!(super::truncate_content(&content, path)))
             }
             "write_file" => {
                 let path = input

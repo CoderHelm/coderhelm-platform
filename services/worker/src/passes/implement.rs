@@ -92,12 +92,12 @@ fn all_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_tree".to_string(),
-            description: "Get the full recursive file tree.".to_string(),
+            description: "Get the full recursive file tree. Returns all file paths. Call once, then use list_directory for subdirs.".to_string(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a file from the repository.".to_string(),
+            description: "Read a file from the repository. Large files are truncated to ~32KB. Prefer reading only files you need.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -188,7 +188,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .filter(|e| e.entry_type == "blob")
                     .map(|e| e.path.as_str())
                     .collect();
-                Ok(json!(paths.join("\n")))
+                Ok(json!(super::truncate_tree(&paths)))
             }
             "read_file" => {
                 let path = input
@@ -199,7 +199,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .github
                     .read_file(&self.owner, &self.repo, path, &self.branch)
                     .await?;
-                Ok(json!(content))
+                Ok(json!(super::truncate_content(&content, path)))
             }
             "list_directory" => {
                 let path = input

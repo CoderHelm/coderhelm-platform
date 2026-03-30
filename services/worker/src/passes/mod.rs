@@ -498,6 +498,37 @@ pub fn format_rules_block(rules: &[String]) -> String {
     block
 }
 
+/// Truncate file contents to limit token usage.
+/// Keeps first ~32KB (~8K tokens) and appends a truncation notice.
+pub fn truncate_content(content: &str, path: &str) -> String {
+    const MAX_BYTES: usize = 32_000;
+    if content.len() <= MAX_BYTES {
+        return content.to_string();
+    }
+    let cut = content[..MAX_BYTES].rfind('\n').unwrap_or(MAX_BYTES);
+    format!(
+        "{}\n\n... (truncated — {path} is {} bytes, showing first {cut} bytes)",
+        &content[..cut],
+        content.len(),
+    )
+}
+
+/// Truncate file tree output to limit token usage on large repos.
+/// Keeps first 2000 entries.
+pub fn truncate_tree(paths: &[&str]) -> String {
+    const MAX_ENTRIES: usize = 2000;
+    if paths.len() <= MAX_ENTRIES {
+        return paths.join("\n");
+    }
+    let mut out = paths[..MAX_ENTRIES].join("\n");
+    out.push_str(&format!(
+        "\n\n... ({} more files not shown, {} total)",
+        paths.len() - MAX_ENTRIES,
+        paths.len(),
+    ));
+    out
+}
+
 /// Load a text content field from single-table DynamoDB (voice, agents, etc.).
 async fn load_content(state: &WorkerState, tenant_id: &str, sk: &str) -> String {
     match state
