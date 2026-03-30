@@ -149,7 +149,7 @@ pub struct FeedbackMessage {
     pub comments: Vec<ReviewComment>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ReviewComment {
     pub path: String,
     pub line: Option<u64>,
