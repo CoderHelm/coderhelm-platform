@@ -649,8 +649,8 @@ async fn load_workflow_setting(state: &WorkerState, tenant_id: &str, key: &str) 
             .and_then(|item| item.get(key))
             .and_then(|v| v.as_bool().ok())
             .copied()
-            .unwrap_or(true),
-        Err(_) => true,
+            .unwrap_or(false),
+        Err(_) => false,
     }
 }
 
