@@ -213,6 +213,78 @@ impl GitHubClient {
         Ok(String::from_utf8(bytes)?)
     }
 
+    /// Read specific line range from a file (1-indexed, inclusive).
+    pub async fn read_file_lines(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let full = self.read_file(owner, repo, path, git_ref).await?;
+        let lines: Vec<&str> = full.lines().collect();
+        let start = start_line.saturating_sub(1).min(lines.len());
+        let end = end_line.min(lines.len());
+        let mut result = String::new();
+        for (i, line) in lines[start..end].iter().enumerate() {
+            result.push_str(&format!("{:>4} | {}\n", start + i + 1, line));
+        }
+        if end < lines.len() {
+            result.push_str(&format!("... ({} more lines)\n", lines.len() - end));
+        }
+        Ok(result)
+    }
+
+    /// Search code in a repository using GitHub Code Search API.
+    /// Returns up to 10 results with file path and matching text fragments.
+    pub async fn search_code(
+        &self,
+        owner: &str,
+        repo: &str,
+        query: &str,
+    ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        let raw_query = format!("{query} repo:{owner}/{repo}");
+        let encoded_query = urlencoding::encode(&raw_query);
+        let url = format!("{API_BASE}/search/code?q={encoded_query}&per_page=10");
+        // Use text-match+json accept header to get matching fragments
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.get(&url);
+        for (k, v) in &headers {
+            if k == &reqwest::header::ACCEPT {
+                req = req.header(k, "application/vnd.github.text-match+json");
+            } else {
+                req = req.header(k, v);
+            }
+        }
+        let resp = req.send().await?.error_for_status()?;
+        let data: serde_json::Value = resp.json().await?;
+        let items = data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let results: Vec<SearchResult> = items
+            .iter()
+            .filter_map(|item| {
+                let path = item.get("path")?.as_str()?.to_string();
+                let matches: Vec<String> = item
+                    .get("text_matches")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| m.get("fragment").and_then(|f| f.as_str()))
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(SearchResult { path, matches })
+            })
+            .collect();
+        Ok(results)
+    }
+
     /// List directory contents.
     pub async fn list_directory(
         &self,
@@ -634,4 +706,10 @@ pub struct DirEntry {
 pub enum FileOp {
     Write { path: String, content: String },
     Delete { path: String },
+}
+
+/// Code search result.
+pub struct SearchResult {
+    pub path: String,
+    pub matches: Vec<String>,
 }

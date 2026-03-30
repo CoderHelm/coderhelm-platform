@@ -82,8 +82,16 @@ Rules:
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let response =
-        llm::converse(state, &system, &mut messages, &tools, &executor, &mut usage).await?;
+    let response = llm::converse(
+        state,
+        &state.config.model_id,
+        &system,
+        &mut messages,
+        &tools,
+        &executor,
+        &mut usage,
+    )
+    .await?;
 
     info!(
         run_id = %msg.run_id,
@@ -133,13 +141,37 @@ fn ci_fix_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a file from the repository.".to_string(),
+            description: "Read a file. Prefer read_file_lines for targeted reads.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path relative to repo root"}
                 },
                 "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "read_file_lines".to_string(),
+            description: "Read specific lines from a file (1-indexed, inclusive).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"}
+                },
+                "required": ["path", "start_line", "end_line"]
+            }),
+        },
+        ToolDefinition {
+            name: "search_code".to_string(),
+            description: "Search for code in the repository by keyword. Returns matching file paths and fragments.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"]
             }),
         },
         ToolDefinition {
@@ -224,6 +256,46 @@ impl<'a> ToolExecutor for CiFixToolExecutor<'a> {
                     .read_file(self.owner, self.repo, path, self.branch)
                     .await?;
                 Ok(json!(super::truncate_content(&content, path)))
+            }
+            "read_file_lines" => {
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing path")?;
+                let start = input
+                    .get("start_line")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                let end = input
+                    .get("end_line")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(start as u64 + 100) as usize;
+                let content = self
+                    .github
+                    .read_file_lines(self.owner, self.repo, path, self.branch, start, end)
+                    .await?;
+                Ok(json!(content))
+            }
+            "search_code" => {
+                let query = input
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing query")?;
+                let results = self
+                    .github
+                    .search_code(self.owner, self.repo, query)
+                    .await?;
+                let lines: Vec<String> = results
+                    .iter()
+                    .map(|r| {
+                        if r.matches.is_empty() {
+                            r.path.clone()
+                        } else {
+                            format!("{}\n{}", r.path, r.matches.join("\n"))
+                        }
+                    })
+                    .collect();
+                Ok(json!(lines.join("\n---\n")))
             }
             "write_file" => {
                 let path = input

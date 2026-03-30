@@ -8,6 +8,7 @@ pub struct Config {
     pub bucket_name: String,
     pub secrets_name: String,
     pub model_id: String,
+    pub light_model_id: String,
     pub ses_from_address: String,
     pub ses_template_prefix: String,
 }
@@ -24,6 +25,8 @@ impl Config {
             secrets_name: std::env::var("SECRETS_NAME")
                 .unwrap_or_else(|_| "coderhelm/prod/secrets".to_string()),
             model_id: std::env::var("MODEL_ID").expect("MODEL_ID required"),
+            light_model_id: std::env::var("LIGHT_MODEL_ID")
+                .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-6-v1".to_string()),
             ses_from_address: std::env::var("SES_FROM_ADDRESS")
                 .unwrap_or_else(|_| "notifications@coderhelm.com".to_string()),
             ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")
@@ -170,12 +173,14 @@ impl TokenUsage {
         self.cache_write_tokens += cache_write;
     }
 
-    /// Estimated cost (adjust rates per your Bedrock model pricing).
-    /// Cache reads are billed at 0.1x input price.
-    /// Cache writes are billed at 1.25x input price.
+    /// Estimated cost using blended rates across Opus (implement) and Sonnet (other passes).
+    /// Actual Bedrock billing is model-specific; this is an approximation for display.
+    /// Blended: ~60% of input goes to Opus, ~40% to Sonnet (implement is the heaviest pass).
     pub fn estimated_cost(&self) -> f64 {
-        let input_rate = 15.0 / 1_000_000.0;
-        let output_rate = 75.0 / 1_000_000.0;
+        // Blended input rate: weighted average of Opus ($15/M) and Sonnet ($3/M)
+        let input_rate = 10.0 / 1_000_000.0;
+        // Blended output rate: weighted average of Opus ($75/M) and Sonnet ($15/M)
+        let output_rate = 50.0 / 1_000_000.0;
 
         let input_cost = self.input_tokens as f64 * input_rate;
         let output_cost = self.output_tokens as f64 * output_rate;
