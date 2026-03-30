@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::models::{
-    Claims, InfraAnalyzeMessage, NotificationPrefs, OnboardMessage, OnboardRepo, TicketMessage,
-    TicketSource, WorkerMessage,
+    Claims, FeedbackMessage, InfraAnalyzeMessage, NotificationPrefs, OnboardMessage, OnboardRepo,
+    TicketMessage, TicketSource, WorkerMessage,
 };
 use crate::AppState;
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -298,6 +298,112 @@ pub async fn retry_run(
 
     info!(run_id, "Run retried — dispatched to SQS");
     Ok(Json(json!({ "status": "retrying" })))
+}
+
+/// POST /api/runs/:run_id/re-review — re-enqueue feedback for a completed run.
+pub async fn re_review_run(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("run_id", attr_s(&run_id))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch run for re-review: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
+
+    let pr_number = item
+        .get("pr_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    if pr_number == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let repo = item
+        .get("repo")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let parts: Vec<&str> = repo.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let mut installation_id = item
+        .get("installation_id")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    if installation_id == 0 {
+        installation_id = claims
+            .tenant_id
+            .strip_prefix("TENANT#")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+    }
+    if installation_id == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let message = WorkerMessage::Feedback(FeedbackMessage {
+        tenant_id: claims.tenant_id.clone(),
+        installation_id,
+        run_id: run_id.clone(),
+        repo_owner: parts[0].to_string(),
+        repo_name: parts[1].to_string(),
+        pr_number,
+        review_id: 0,
+        review_body: String::new(),
+        comments: vec![],
+    });
+
+    let body = serde_json::to_string(&message).map_err(|e| {
+        error!("Failed to serialize re-review message: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.feedback_queue_url)
+        .message_body(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to enqueue re-review: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Reset status back to completed (clear any failed state)
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("run_id", attr_s(&run_id))
+        .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t, current_pass = :p")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", attr_s("running"))
+        .expression_attribute_values(":sri", attr_s(&format!("running#{run_id}")))
+        .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":p", attr_s("feedback"))
+        .send()
+        .await;
+
+    info!(run_id, pr_number, "Re-review dispatched to feedback queue");
+    Ok(Json(json!({ "status": "re-reviewing" })))
 }
 
 /// GET /api/repos — list repos configured for this tenant.
