@@ -30,27 +30,33 @@ pub async fn run(
 
     let system = format!(
         "You are a feedback agent for the {owner}/{repo} repository. \
-         Implement reviewer-requested changes precisely.",
+         You respond to reviewer comments on pull requests. \
+         If a comment asks a question, answer it clearly. \
+         If a comment requests a code change, implement it precisely.",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
 
     let prompt = format!(
-        r#"A reviewer requested changes on PR #{pr_number}.
+        r#"A reviewer left comments on PR #{pr_number}.
 
 ## Review Comments
 {comments}
 
 ## Instructions
-1. Read each review comment carefully.
-2. For each comment, read the relevant file, understand the issue, and fix it.
-3. Use `batch_write` for atomic multi-file changes when multiple comments affect related files.
-4. After implementing all fixes, output a summary of what you fixed.
+For each comment, decide whether it is:
+- **A question** (e.g. "why did you do X?", "what does this do?", "could this cause Y?") — answer it with a clear, concise explanation. Read the relevant code first if needed.
+- **A change request** (e.g. "use X instead", "add error handling", "this should be Y") — read the relevant file, fix the code, and push the change.
+
+After processing all comments, output a response with:
+1. Answers to any questions
+2. A summary of any code changes you made
 
 Rules:
 - Address every comment. Don't skip any.
-- Follow the reviewer's suggestions exactly unless they conflict with the codebase conventions.
-- Don't make unrelated changes beyond what the reviewer asked for."#,
+- For code changes, follow the reviewer's suggestions exactly unless they conflict with the codebase conventions.
+- Don't make unrelated changes beyond what the reviewer asked for.
+- Keep answers concise but helpful."#,
         pr_number = msg.pr_number,
         comments = formatted,
     );
@@ -89,13 +95,14 @@ Rules:
         &response[..response.len().min(200)]
     );
 
+    // Post the agent's response as a PR comment so the reviewer sees answers
+    let reply = if response.len() > 65000 {
+        format!("{}\n\n*(truncated)*", &response[..65000])
+    } else {
+        response.clone()
+    };
     github
-        .create_issue_comment(
-            &msg.repo_owner,
-            &msg.repo_name,
-            msg.pr_number,
-            "Addressed all review feedback in the latest push.",
-        )
+        .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
         .await?;
 
     // Update run record in runs table

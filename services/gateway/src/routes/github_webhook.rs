@@ -154,8 +154,10 @@ async fn handle_issue_comment(
 
     let body = payload["comment"]["body"].as_str().unwrap_or("");
 
-    // Trigger on `/coderhelm` slash command
-    if !body.starts_with("/coderhelm") {
+    // Trigger on `/coderhelm` slash command or @coderhelm mention
+    let is_slash = body.starts_with("/coderhelm");
+    let is_mention = body.contains("@coderhelm");
+    if !is_slash && !is_mention {
         return Ok(StatusCode::OK);
     }
 
