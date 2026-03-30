@@ -81,6 +81,7 @@ Return ONLY the markdown body text."#,
 
     let body_text = llm::converse(
         state,
+        &state.config.light_model_id,
         &system,
         &mut messages,
         &[],

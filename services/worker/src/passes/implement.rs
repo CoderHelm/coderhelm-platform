@@ -71,7 +71,16 @@ pub async fn run(
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    llm::converse(state, &system, &mut messages, &tools, &executor, usage).await?;
+    llm::converse(
+        state,
+        &state.config.model_id,
+        &system,
+        &mut messages,
+        &tools,
+        &executor,
+        usage,
+    )
+    .await?;
 
     let files = executor
         .files_modified
@@ -97,13 +106,37 @@ fn all_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a file from the repository. Large files are truncated to ~32KB. Prefer reading only files you need.".to_string(),
+            description: "Read a file from the repository. Large files are truncated to ~32KB. Prefer read_file_lines for targeted reads.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path relative to repo root"}
                 },
                 "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "read_file_lines".to_string(),
+            description: "Read specific lines from a file (1-indexed, inclusive). Use this instead of read_file when you know which lines you need — much cheaper.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to repo root"},
+                    "start_line": {"type": "integer", "description": "First line to read (1-indexed)"},
+                    "end_line": {"type": "integer", "description": "Last line to read (inclusive)"}
+                },
+                "required": ["path", "start_line", "end_line"]
+            }),
+        },
+        ToolDefinition {
+            name: "search_code".to_string(),
+            description: "Search for code in the repository by keyword or symbol name. Returns matching file paths and text fragments. Use this to find where functions, types, or patterns are defined instead of reading many files.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query (e.g. function name, error message, import path)"}
+                },
+                "required": ["query"]
             }),
         },
         ToolDefinition {
@@ -200,6 +233,46 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .read_file(&self.owner, &self.repo, path, &self.branch)
                     .await?;
                 Ok(json!(super::truncate_content(&content, path)))
+            }
+            "read_file_lines" => {
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing path")?;
+                let start = input
+                    .get("start_line")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                let end = input
+                    .get("end_line")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(start as u64 + 100) as usize;
+                let content = self
+                    .github
+                    .read_file_lines(&self.owner, &self.repo, path, &self.branch, start, end)
+                    .await?;
+                Ok(json!(content))
+            }
+            "search_code" => {
+                let query = input
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing query")?;
+                let results = self
+                    .github
+                    .search_code(&self.owner, &self.repo, query)
+                    .await?;
+                let lines: Vec<String> = results
+                    .iter()
+                    .map(|r| {
+                        if r.matches.is_empty() {
+                            r.path.clone()
+                        } else {
+                            format!("{}\n{}", r.path, r.matches.join("\n"))
+                        }
+                    })
+                    .collect();
+                Ok(json!(lines.join("\n---\n")))
             }
             "list_directory" => {
                 let path = input

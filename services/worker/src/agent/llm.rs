@@ -53,6 +53,7 @@ const MAX_TURNS: usize = 40;
 
 pub async fn converse(
     state: &WorkerState,
+    model_id: &str,
     system_prompt: &str,
     messages: &mut Vec<Message>,
     tools: &[ToolDefinition],
@@ -79,7 +80,7 @@ pub async fn converse(
         let mut request = state
             .bedrock
             .converse()
-            .model_id(&state.config.model_id)
+            .model_id(model_id)
             // System prompt text
             .system(SystemContentBlock::Text(system_prompt.to_string()))
             // Cache point after system: caches system prompt + tool config prefix.

@@ -58,7 +58,16 @@ Rules:
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let response = llm::converse(state, system, &mut messages, &[], &NoOpExecutor, usage).await?;
+    let response = llm::converse(
+        state,
+        &state.config.light_model_id,
+        system,
+        &mut messages,
+        &[],
+        &NoOpExecutor,
+        usage,
+    )
+    .await?;
 
     // Parse JSON from response (strip markdown fences if present)
     let raw = response.trim();
