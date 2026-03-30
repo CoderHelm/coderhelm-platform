@@ -7,7 +7,7 @@
 - **Rust** 1.80+ (`rustup update stable`)
 - **Node.js** 22+ (for CDK and dashboard)
 - **AWS CDK** v2 (`npm install -g aws-cdk`)
-- **AWS CLI** configured with credentials for account `654654210434`
+- **AWS CLI** configured with credentials for your target AWS account
 
 ## AWS Secrets Manager
 
