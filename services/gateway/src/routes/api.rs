@@ -526,12 +526,22 @@ pub async fn get_jira_integration_check(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let jira_seen = runs_result.items().iter().any(|item| {
-        item.get("ticket_source")
-            .and_then(|v| v.as_s().ok())
-            .map(|v| v == "jira")
-            .unwrap_or(false)
-    });
+    let jira_runs: Vec<_> = runs_result
+        .items()
+        .iter()
+        .filter(|item| {
+            item.get("ticket_source")
+                .and_then(|v| v.as_s().ok())
+                .map(|v| v == "jira")
+                .unwrap_or(false)
+        })
+        .collect();
+    let jira_seen = !jira_runs.is_empty();
+    let last_jira_event_at = jira_runs
+        .first()
+        .and_then(|item| item.get("created_at"))
+        .and_then(|v| v.as_s().ok())
+        .cloned();
 
     // Load per-tenant JIRA secret from DynamoDB
     let tenant_secret = load_jira_secret(&state, &claims.tenant_id).await;
@@ -566,6 +576,8 @@ pub async fn get_jira_integration_check(
         },
         "enabled_repos": enabled_repos,
         "jira_events_seen": jira_seen,
+        "last_jira_event_at": last_jira_event_at,
+        "jira_event_count": jira_runs.len(),
         "installation_id": installation_id,
         "tenant_id": claims.tenant_id,
         "webhook_url": "https://api.coderhelm.com/webhooks/jira",
