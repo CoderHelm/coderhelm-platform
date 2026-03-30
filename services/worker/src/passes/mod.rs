@@ -120,34 +120,37 @@ async fn run_passes(
         .await?;
     info!(run_id, branch = %branch_name, "Created working branch");
 
-    // Commit openspec to the repo branch so it's tracked alongside the code
-    let ticket_slug = msg.ticket_id.to_lowercase();
-    let spec_files: Vec<crate::clients::github::FileOp> = [
-        ("proposal.md", &plan_result.proposal),
-        ("design.md", &plan_result.design),
-        ("tasks.md", &plan_result.tasks),
-        ("spec.md", &plan_result.spec),
-    ]
-    .iter()
-    .filter(|(_, content)| !content.is_empty())
-    .map(|(name, content)| crate::clients::github::FileOp::Write {
-        path: format!("openspec/specs/{ticket_slug}/{name}"),
-        content: content.to_string(),
-    })
-    .collect();
+    // Commit openspec to the repo branch if enabled (default: on)
+    let commit_openspec = load_workflow_setting(state, &msg.tenant_id, "commit_openspec").await;
+    if commit_openspec {
+        let ticket_slug = msg.ticket_id.to_lowercase();
+        let spec_files: Vec<crate::clients::github::FileOp> = [
+            ("proposal.md", &plan_result.proposal),
+            ("design.md", &plan_result.design),
+            ("tasks.md", &plan_result.tasks),
+            ("spec.md", &plan_result.spec),
+        ]
+        .iter()
+        .filter(|(_, content)| !content.is_empty())
+        .map(|(name, content)| crate::clients::github::FileOp::Write {
+            path: format!("openspec/specs/{ticket_slug}/{name}"),
+            content: content.to_string(),
+        })
+        .collect();
 
-    if !spec_files.is_empty() {
-        if let Err(e) = github
-            .batch_write(
-                &msg.repo_owner,
-                &msg.repo_name,
-                &branch_name,
-                &format!("Add openspec for {}", msg.ticket_id),
-                &spec_files,
-            )
-            .await
-        {
-            warn!(run_id, error = %e, "Failed to commit openspec to branch");
+        if !spec_files.is_empty() {
+            if let Err(e) = github
+                .batch_write(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    &branch_name,
+                    &format!("Add openspec for {}", msg.ticket_id),
+                    &spec_files,
+                )
+                .await
+            {
+                warn!(run_id, error = %e, "Failed to commit openspec to branch");
+            }
         }
     }
 
@@ -588,6 +591,27 @@ async fn load_content(state: &WorkerState, tenant_id: &str, sk: &str) -> String 
             warn!(error = %e, "Failed to load content from {sk}");
             String::new()
         }
+    }
+}
+
+/// Load a boolean workflow setting from SETTINGS#WORKFLOW. Returns default (true) if not found.
+async fn load_workflow_setting(state: &WorkerState, tenant_id: &str, key: &str) -> bool {
+    match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("sk", AttributeValue::S("SETTINGS#WORKFLOW".to_string()))
+        .send()
+        .await
+    {
+        Ok(output) => output
+            .item()
+            .and_then(|item| item.get(key))
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(true),
+        Err(_) => true,
     }
 }
 
