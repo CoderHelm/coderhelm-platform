@@ -1,9 +1,11 @@
 use axum::extract::Query;
+use axum::response::IntoResponse;
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use crate::auth::jwt;
 use crate::models::{
     Claims, FeedbackMessage, InfraAnalyzeMessage, NotificationPrefs, OnboardMessage, OnboardRepo,
     TicketMessage, TicketSource, WorkerMessage,
@@ -31,6 +33,22 @@ pub async fn me(
 
     let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
 
+    // Load tenant status from META record
+    let tenant_status = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("META"))
+        .projection_expression("#s")
+        .expression_attribute_names("#s", "status")
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .and_then(|i| i.get("status").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_else(|| "active".to_string());
+
     Ok(Json(json!({
         "user_id": claims.sub,
         "tenant_id": claims.tenant_id,
@@ -38,7 +56,124 @@ pub async fn me(
         "email": item.get("email").and_then(|v| v.as_s().ok()),
         "avatar_url": item.get("avatar_url").and_then(|v| v.as_s().ok()),
         "role": item.get("role").and_then(|v| v.as_s().ok()),
+        "status": tenant_status,
     })))
+}
+
+/// GET /api/tenants — list all tenants the current user has access to.
+pub async fn list_tenants(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    // Extract github_id from user_id (USER#{github_id})
+    let github_id = claims
+        .sub
+        .strip_prefix("USER#")
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.users_table_name)
+        .index_name("gsi1")
+        .key_condition_expression("gsi1pk = :gk")
+        .expression_attribute_values(":gk", attr_s(&format!("GHUSER#{github_id}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query user tenants: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let tenant_ids: Vec<String> = result
+        .items()
+        .iter()
+        .filter_map(|item| item.get("gsi1sk").and_then(|v| v.as_s().ok()).cloned())
+        .collect();
+
+    // Load org name + status for each tenant
+    let mut tenants: Vec<Value> = Vec::new();
+    for tid in &tenant_ids {
+        let meta = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(tid))
+            .key("sk", attr_s("META"))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item);
+
+        let org = meta
+            .as_ref()
+            .and_then(|item| item.get("github_org"))
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        let status = meta
+            .as_ref()
+            .and_then(|item| item.get("status"))
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_else(|| "active".to_string());
+
+        tenants.push(json!({
+            "tenant_id": tid,
+            "org": org,
+            "status": status,
+            "current": *tid == claims.tenant_id,
+        }));
+    }
+
+    Ok(Json(json!({ "tenants": tenants })))
+}
+
+/// POST /api/tenants/switch — switch to a different tenant.
+pub async fn switch_tenant(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<axum::response::Response, StatusCode> {
+    let target_tenant = body["tenant_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+
+    // Verify user exists in target tenant via users table
+    let user_exists = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(target_tenant))
+        .key("sk", attr_s(&claims.sub))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .is_some();
+
+    if !user_exists {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Re-issue JWT with new tenant_id
+    let token = jwt::create_token(
+        &claims.sub,
+        target_tenant,
+        &claims.github_login,
+        &state.secrets.jwt_secret,
+        86400,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let cookie = format!(
+        "coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+    );
+
+    Ok((
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(json!({ "tenant_id": target_tenant })),
+    )
+        .into_response())
 }
 
 #[derive(serde::Deserialize)]
@@ -591,11 +726,6 @@ pub async fn get_jira_integration_check(
         .as_ref()
         .map(|(token, _)| format!("https://api.coderhelm.com/webhooks/jira/{token}"));
 
-    let webhook_secret = tenant_secret
-        .as_ref()
-        .map(|(_, ws)| ws.clone())
-        .filter(|s| !s.is_empty());
-
     Ok(Json(json!({
         "ready": ready,
         "secret_configured": secret_configured,
@@ -610,7 +740,6 @@ pub async fn get_jira_integration_check(
         "installation_id": installation_id,
         "tenant_id": claims.tenant_id,
         "webhook_url": webhook_url,
-        "webhook_secret": webhook_secret,
     })))
 }
 
@@ -2322,4 +2451,118 @@ pub async fn health(
         "checked_at": now.to_rfc3339(),
         "checks": checks,
     })))
+}
+
+/// POST /api/account/reset — wipe all tenant data across all tables.
+/// Keeps the TENANT META record so the account identity remains.
+pub async fn reset_account(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<StatusCode, StatusCode> {
+    info!(tenant_id = %claims.tenant_id, user = %claims.github_login, "Account reset requested");
+
+    let tid = &claims.tenant_id;
+
+    // Helper: delete all items with pk=tenant_id from a table
+    async fn wipe_table(
+        dynamo: &aws_sdk_dynamodb::Client,
+        table: &str,
+        tid: &str,
+    ) -> Result<(), StatusCode> {
+        let result = dynamo
+            .query()
+            .table_name(table)
+            .key_condition_expression("pk = :pk")
+            .expression_attribute_values(
+                ":pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(tid.to_string()),
+            )
+            .projection_expression("pk, sk")
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to query {table} for reset: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        for item in result.items() {
+            if let (Some(pk), Some(sk)) = (item.get("pk"), item.get("sk")) {
+                let _ = dynamo
+                    .delete_item()
+                    .table_name(table)
+                    .key("pk", pk.clone())
+                    .key("sk", sk.clone())
+                    .send()
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    // Delete jira token from jira-tokens table (keyed differently)
+    if let Some((old_token, _)) = load_jira_secret(&state, tid).await {
+        let _ = state
+            .dynamo
+            .delete_item()
+            .table_name(&state.config.jira_tokens_table_name)
+            .key("token", attr_s(&old_token))
+            .send()
+            .await;
+    }
+
+    // Wipe all domain tables
+    let tables = [
+        &state.config.plans_table_name,
+        &state.config.jira_config_table_name,
+        &state.config.repos_table_name,
+        &state.config.settings_table_name,
+        &state.config.infra_table_name,
+        &state.config.billing_table_name,
+        &state.config.jira_events_table_name,
+    ];
+
+    for table in &tables {
+        wipe_table(&state.dynamo, table, tid).await?;
+    }
+
+    // Wipe runs table (keyed by tenant_id, run_id)
+    let runs = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("tenant_id = :tid")
+        .expression_attribute_values(":tid", attr_s(tid))
+        .projection_expression("tenant_id, run_id")
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query runs for reset: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    for item in runs.items() {
+        if let (Some(pk), Some(sk)) = (item.get("tenant_id"), item.get("run_id")) {
+            let _ = state
+                .dynamo
+                .delete_item()
+                .table_name(&state.config.runs_table_name)
+                .key("tenant_id", pk.clone())
+                .key("run_id", sk.clone())
+                .send()
+                .await;
+        }
+    }
+
+    // Delete WELCOME_SENT from main table (keep META, TENANT)
+    let _ = state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(tid))
+        .key("sk", attr_s("WELCOME_SENT"))
+        .send()
+        .await;
+
+    info!(tenant_id = %claims.tenant_id, "Account data reset complete");
+    Ok(StatusCode::OK)
 }

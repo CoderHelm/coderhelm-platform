@@ -92,44 +92,53 @@ pub async fn callback(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-    // Find the first Coderhelm installation
-    let installation_id = installs["installations"]
+    // Find all Coderhelm installations the user has access to
+    let all_installations: Vec<(u64, String)> = installs["installations"]
         .as_array()
-        .and_then(|arr| {
-            arr.iter()
-                .find(|i| i["app_slug"].as_str() == Some("coderhelm"))
-                .and_then(|i| i["id"].as_u64())
+        .unwrap_or(&vec![])
+        .iter()
+        .filter(|i| i["app_slug"].as_str() == Some("coderhelm"))
+        .filter_map(|i| {
+            let id = i["id"].as_u64()?;
+            let org = i["account"]["login"].as_str().unwrap_or("unknown");
+            Some((id, org.to_string()))
         })
-        .ok_or_else(|| {
-            error!("User {github_login} has no Coderhelm installation");
-            StatusCode::FORBIDDEN
-        })?;
+        .collect();
 
+    if all_installations.is_empty() {
+        error!("User {github_login} has no Coderhelm installation");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let installation_id = all_installations[0].0;
     let tenant_id = format!("TENANT#{installation_id}");
     let user_id = format!("USER#{github_id}");
 
-    // Upsert user in DynamoDB
+    // Upsert user into ALL tenant user tables so they can switch later
     let now = chrono::Utc::now().to_rfc3339();
-    let _ = state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.users_table_name)
-        .item("pk", attr_s(&tenant_id))
-        .item("sk", attr_s(&user_id))
-        .item("github_id", attr_n(github_id))
-        .item("github_login", attr_s(github_login))
-        .item("email", attr_s(user["email"].as_str().unwrap_or("")))
-        .item(
-            "avatar_url",
-            attr_s(user["avatar_url"].as_str().unwrap_or("")),
-        )
-        .item("role", attr_s("member"))
-        .item("updated_at", attr_s(&now))
-        // GSI1: github_id → tenant lookup
-        .item("gsi1pk", attr_s(&format!("GHUSER#{github_id}")))
-        .item("gsi1sk", attr_s(&tenant_id))
-        .send()
-        .await;
+    for (inst_id, _org) in &all_installations {
+        let tid = format!("TENANT#{inst_id}");
+        let _ = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.users_table_name)
+            .item("pk", attr_s(&tid))
+            .item("sk", attr_s(&user_id))
+            .item("github_id", attr_n(github_id))
+            .item("github_login", attr_s(github_login))
+            .item("email", attr_s(user["email"].as_str().unwrap_or("")))
+            .item(
+                "avatar_url",
+                attr_s(user["avatar_url"].as_str().unwrap_or("")),
+            )
+            .item("role", attr_s("member"))
+            .item("updated_at", attr_s(&now))
+            // GSI1: github_id → tenant lookup
+            .item("gsi1pk", attr_s(&format!("GHUSER#{github_id}")))
+            .item("gsi1sk", attr_s(&tid))
+            .send()
+            .await;
+    }
 
     info!(github_login, installation_id, "User authenticated");
 
