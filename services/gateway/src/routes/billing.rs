@@ -123,7 +123,14 @@ pub async fn get_billing(
         })
         .collect();
 
-    let tokens_overage = current_tokens.saturating_sub(INCLUDED_TOKENS);
+    let is_pro = subscription_status == "active";
+    let token_limit = if is_pro {
+        INCLUDED_TOKENS
+    } else {
+        FREE_TIER_TOKENS
+    };
+
+    let tokens_overage = current_tokens.saturating_sub(token_limit);
     let tokens_overage_1k = tokens_overage / 1000;
     let raw_overage_cents = tokens_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
 
@@ -164,7 +171,7 @@ pub async fn get_billing(
         "access_until": item.and_then(|i| i.get("access_until")).and_then(|v| v.as_s().ok()),
         "cancelled_at": item.and_then(|i| i.get("cancelled_at")).and_then(|v| v.as_s().ok()),
         "limits": {
-            "tokens": INCLUDED_TOKENS,
+            "tokens": token_limit,
             "overage_per_1k_tokens_cents": OVERAGE_PER_1K_TOKENS_CENTS,
         },
         "current_period": {
