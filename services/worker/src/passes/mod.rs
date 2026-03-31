@@ -163,6 +163,25 @@ async fn run_passes(
                 msg.repo_name = name.to_string();
                 info!(run_id, repo = %selected, "Triage selected repo");
             }
+            // Update run record with resolved repo
+            let resolved_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key("tenant_id", attr_s(&msg.tenant_id))
+                .key("run_id", attr_s(run_id))
+                .update_expression("SET repo = :r, tenant_repo = :tr")
+                .expression_attribute_values(
+                    ":r",
+                    attr_s(&resolved_repo),
+                )
+                .expression_attribute_values(
+                    ":tr",
+                    attr_s(&format!("{}#{}", msg.tenant_id, resolved_repo)),
+                )
+                .send()
+                .await;
         } else {
             return Err("repo_owner and repo_name are required for GitHub tickets".into());
         }
