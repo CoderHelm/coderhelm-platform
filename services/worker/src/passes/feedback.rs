@@ -150,13 +150,11 @@ Rules:
     let branch = get_pr_branch(state, &msg).await?;
 
     let tools = feedback_tools();
-    let wrote_files = std::sync::atomic::AtomicBool::new(false);
     let executor = FeedbackToolExecutor {
         github: &github,
         owner: &msg.repo_owner,
         repo: &msg.repo_name,
         branch: &branch,
-        wrote_files: &wrote_files,
     };
 
     let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
@@ -242,8 +240,8 @@ Rules:
         }
     }
 
-    // Resolve review threads if the bot pushed code changes
-    if wrote_files.load(std::sync::atomic::Ordering::Relaxed) {
+    // Resolve review threads the bot replied to
+    {
         let node_ids: Vec<&str> = actionable_comments
             .iter()
             .filter_map(|c| c.node_id.as_deref())
@@ -262,7 +260,7 @@ Rules:
                     info!(
                         run_id = %msg.run_id,
                         resolved = resolved.len(),
-                        "Resolved review threads after code changes"
+                        "Resolved review threads after replying"
                     );
                 }
                 Err(e) => {
@@ -685,7 +683,6 @@ struct FeedbackToolExecutor<'a> {
     owner: &'a str,
     repo: &'a str,
     branch: &'a str,
-    wrote_files: &'a std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -784,8 +781,6 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                         sha,
                     )
                     .await?;
-                self.wrote_files
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(json!(format!("Wrote {path}")))
             }
             "batch_write" => {
@@ -820,8 +815,6 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .github
                     .batch_write(self.owner, self.repo, self.branch, message, &ops)
                     .await?;
-                self.wrote_files
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(json!(format!(
                     "Batch commit {} — {} files",
                     &sha[..8],
