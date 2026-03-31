@@ -186,9 +186,7 @@ pub async fn handle(
                 .or_else(|| a.get("name").and_then(|v| v.as_str()))
         })
         .unwrap_or("");
-    let is_assigned = assignee_name
-        .to_ascii_lowercase()
-        .contains("coderhelm");
+    let is_assigned = assignee_name.to_ascii_lowercase().contains("coderhelm");
 
     if !has_label && !is_assigned {
         let tk = issue.get("key").and_then(|v| v.as_str()).unwrap_or("?");
