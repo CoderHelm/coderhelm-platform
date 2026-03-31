@@ -29,10 +29,16 @@ async fn enforce_billing_cooldown(
         .table_name(&state.config.table_name)
         .item("pk", attr_s(tenant_id))
         .item("sk", attr_s(&key))
-        .item("expires_at", attr_s(&(now + chrono::Duration::seconds(BILLING_ACTION_COOLDOWN_SECS)).to_rfc3339()))
-        .item("ttl", aws_sdk_dynamodb::types::AttributeValue::N(
-            (now.timestamp() + BILLING_ACTION_COOLDOWN_SECS + 60).to_string(),
-        ))
+        .item(
+            "expires_at",
+            attr_s(&(now + chrono::Duration::seconds(BILLING_ACTION_COOLDOWN_SECS)).to_rfc3339()),
+        )
+        .item(
+            "ttl",
+            aws_sdk_dynamodb::types::AttributeValue::N(
+                (now.timestamp() + BILLING_ACTION_COOLDOWN_SECS + 60).to_string(),
+            ),
+        )
         .condition_expression("attribute_not_exists(pk) OR expires_at < :now")
         .expression_attribute_values(":now", attr_s(&now.to_rfc3339()))
         .send()
