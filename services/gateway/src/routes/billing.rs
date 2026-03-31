@@ -480,6 +480,13 @@ pub async fn create_subscription(
         ("metadata[tenant_id]", &claims.tenant_id),
     ];
 
+    // If customer has a saved default payment method, attach it so Stripe
+    // uses it automatically instead of showing a card form.
+    let default_pm = get_customer_default_pm(&state, stripe_key, &customer_id).await;
+    if let Some(ref pm_id) = default_pm {
+        form_params.push(("default_payment_method", pm_id));
+    }
+
     // Add metered overage price as second line item if configured
     let overage_price_id = state
         .secrets
@@ -627,6 +634,36 @@ async fn lookup_customer_id_for_tenant(state: &AppState, tenant_id: &str) -> Opt
         .and_then(|item| item.get("pk").and_then(|v| v.as_s().ok()))
         .and_then(|pk| pk.strip_prefix("STRIPE#"))
         .map(|cid| cid.to_string())
+}
+
+/// Get the customer's default payment method from Stripe.
+/// Returns the payment_method ID if one exists on the customer.
+async fn get_customer_default_pm(
+    state: &AppState,
+    stripe_key: &str,
+    customer_id: &str,
+) -> Option<String> {
+    let url = format!("https://api.stripe.com/v1/customers/{customer_id}");
+    let resp = state
+        .http
+        .get(&url)
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+        .ok()?;
+    let customer: Value = resp.json().await.ok()?;
+
+    // Check invoice_settings.default_payment_method first (most common),
+    // then fall back to default_source
+    customer["invoice_settings"]["default_payment_method"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            customer["default_source"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+        })
+        .map(|s| s.to_string())
 }
 
 /// Create a Stripe customer for a tenant.
