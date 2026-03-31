@@ -92,12 +92,14 @@ pub async fn callback(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-    // Find all Coderhelm installations the user has access to
+    // Filter by our GitHub App ID (numeric, from secrets) — more reliable than app_slug
+    let our_app_id: u64 = state.secrets.github_app_id.parse().unwrap_or(0);
+
     let all_installations: Vec<(u64, String)> = installs["installations"]
         .as_array()
         .unwrap_or(&vec![])
         .iter()
-        .filter(|i| i["app_slug"].as_str() == Some("coderhelm"))
+        .filter(|i| i["app_id"].as_u64() == Some(our_app_id))
         .filter_map(|i| {
             let id = i["id"].as_u64()?;
             let org = i["account"]["login"].as_str().unwrap_or("unknown");
@@ -106,7 +108,22 @@ pub async fn callback(
         .collect();
 
     if all_installations.is_empty() {
-        error!("User {github_login} has no Coderhelm installation");
+        // Log all app_ids and slugs for debugging
+        let found: Vec<String> = installs["installations"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|i| {
+                format!(
+                    "app_id={} slug={}",
+                    i["app_id"].as_u64().unwrap_or(0),
+                    i["app_slug"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        error!(
+            "User {github_login} has no Coderhelm installation (our_app_id={our_app_id}, found: {found:?})"
+        );
         return Err(StatusCode::FORBIDDEN);
     }
 
