@@ -45,6 +45,16 @@ function App() {
         Connect your Jira site to coderhelm so assigned issues become pull requests automatically.
       </p>
 
+      <div style={styles.setupBox}>
+        <p style={styles.setupText}>
+          <strong>Where to find these values:</strong> Go to{" "}
+          <a href="https://app.coderhelm.com/settings/jira" target="_blank" rel="noopener noreferrer" style={styles.link}>
+            app.coderhelm.com → Settings → Jira
+          </a>
+          . Your Installation ID and Tenant ID are shown in Step 2 with copy buttons.
+        </p>
+      </div>
+
       <div style={styles.card}>
         <label style={styles.label}>
           Installation ID
@@ -52,11 +62,11 @@ function App() {
             style={styles.input}
             value={installationId}
             onChange={(e) => setInstallationId(e.target.value)}
-            placeholder="e.g. 119699895"
+            placeholder="e.g. 120248482"
           />
         </label>
         <p style={styles.hint}>
-          Find this in your coderhelm dashboard under Settings → Jira.
+          Copy this from the coderhelm dashboard → Settings → Jira → Step 2.
         </p>
 
         <label style={styles.label}>
@@ -65,11 +75,11 @@ function App() {
             style={styles.input}
             value={tenantId}
             onChange={(e) => setTenantId(e.target.value)}
-            placeholder="e.g. TENANT#119699895"
+            placeholder="e.g. TENANT#120248482"
           />
         </label>
         <p style={styles.hint}>
-          Only needed if your tenant ID differs from your GitHub Installation ID.
+          Only needed if shown differently from Installation ID in the dashboard.
         </p>
 
         <button style={styles.button} onClick={save}>
@@ -97,6 +107,9 @@ const styles = {
   logo: { width: 28, height: 28 },
   title: { fontSize: 20, fontWeight: 700, margin: 0, color: "#172B4D" },
   subtitle: { fontSize: 14, color: "#626F86", marginBottom: 20, lineHeight: 1.5 },
+  setupBox: { background: "#DEEBFF", borderRadius: 8, padding: "12px 16px", marginBottom: 20, borderLeft: "4px solid #0052CC" },
+  setupText: { fontSize: 13, color: "#172B4D", margin: 0, lineHeight: 1.6 },
+  link: { color: "#0052CC", textDecoration: "underline" },
   card: { background: "#F7F8F9", borderRadius: 8, padding: 20, marginBottom: 24 },
   label: { display: "block", fontSize: 13, fontWeight: 600, color: "#172B4D", marginBottom: 4 },
   input: { display: "block", width: "100%", padding: "8px 10px", fontSize: 14, border: "1px solid #DFE1E6", borderRadius: 4, marginTop: 4, marginBottom: 4, boxSizing: "border-box" },
