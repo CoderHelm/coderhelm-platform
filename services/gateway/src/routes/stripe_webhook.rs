@@ -456,7 +456,10 @@ async fn handle_invoice_finalized(
     // Invoice email is NOT sent here — it's sent from handle_payment_succeeded
     // so users only receive the email once payment is confirmed.
 
-    info!(tenant_id, invoice_number, amount, "Invoice finalized (record stored, email deferred to payment)");
+    info!(
+        tenant_id,
+        invoice_number, amount, "Invoice finalized (record stored, email deferred to payment)"
+    );
     Ok(())
 }
 
