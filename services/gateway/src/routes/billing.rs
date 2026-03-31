@@ -354,6 +354,30 @@ pub async fn create_subscription(
     // (handles race conditions where DynamoDB status hasn't been updated yet)
     cancel_incomplete_subscriptions(&state, stripe_key, &customer_id).await;
 
+    // Fail-safe: check Stripe directly for any active subscription on this customer.
+    // This prevents double-charging if DynamoDB was incorrectly set to "free"
+    // (e.g. from a stale subscription.deleted webhook).
+    if has_active_stripe_subscription(&state, stripe_key, &customer_id).await {
+        warn!(
+            tenant_id = %claims.tenant_id,
+            customer_id,
+            "Blocked subscribe — customer already has an active Stripe subscription"
+        );
+        // Restore DynamoDB to active so the dashboard reflects reality
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&claims.tenant_id))
+            .key("sk", attr_s("BILLING"))
+            .update_expression("SET subscription_status = :s, updated_at = :t")
+            .expression_attribute_values(":s", attr_s("active"))
+            .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+            .send()
+            .await;
+        return Err(StatusCode::CONFLICT);
+    }
+
     let mut form_params: Vec<(&str, &str)> = vec![
         ("customer", &customer_id),
         ("items[0][price]", price_id),
@@ -464,6 +488,31 @@ async fn cancel_incomplete_subscriptions(state: &AppState, stripe_key: &str, cus
             }
         }
     }
+}
+
+/// Check if the Stripe customer already has an active subscription.
+/// Returns true if at least one active subscription exists — blocks duplicate creation.
+async fn has_active_stripe_subscription(
+    state: &AppState,
+    stripe_key: &str,
+    customer_id: &str,
+) -> bool {
+    let url = format!(
+        "https://api.stripe.com/v1/subscriptions?customer={customer_id}&status=active&limit=1"
+    );
+    let Ok(resp) = state
+        .http
+        .get(&url)
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    let Ok(body) = resp.json::<Value>().await else {
+        return false;
+    };
+    body["data"].as_array().is_some_and(|subs| !subs.is_empty())
 }
 
 /// Create a Stripe customer for a tenant.
