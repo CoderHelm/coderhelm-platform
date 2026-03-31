@@ -14,24 +14,15 @@ exports.handler = async (event, context) => {
     return;
   }
 
-  // Check for coderhelm label: coderhelm:owner/repo (explicit) or coderhelm (auto-resolve)
+  // Extract repo from explicit label if present (coderhelm:owner/repo)
   const labels = fields.labels || [];
   const repoLabel = labels.find((l) => l.startsWith("coderhelm:"));
-  const bareLabel = labels.some((l) => l === "coderhelm");
-
   let repoOwner, repoName;
-
   if (repoLabel) {
     [repoOwner, repoName] = repoLabel.replace("coderhelm:", "").split("/");
-    if (!repoOwner || !repoName) {
-      console.log(`Skipping ${issue.key} — invalid label: ${repoLabel}`);
-      return;
-    }
-  } else if (!bareLabel) {
-    console.log(`Skipping ${issue.key} — no coderhelm label`);
-    return;
   }
 
+  // Forward everything to the gateway — it handles label/assignee/project filtering
   const payload = {
     webhookEvent: event.eventType || "jira:issue_assigned",
     issue: {
@@ -60,7 +51,7 @@ exports.handler = async (event, context) => {
     body: JSON.stringify(payload),
   });
 
-  console.log(`Forwarded ${issue.key} → ${repoOwner}/${repoName} (${response.status})`);
+  console.log(`Forwarded ${issue.key} → gateway (${response.status})`);
 };
 
 // ── Web trigger: list Jira projects ──────────────────────────────────────────
