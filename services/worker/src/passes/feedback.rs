@@ -247,7 +247,10 @@ Rules:
             .filter_map(|c| c.node_id.as_deref())
             .collect();
         if !node_ids.is_empty() {
-            match github.get_review_thread_ids(&node_ids).await {
+            match github
+                .get_review_thread_ids(&msg.repo_owner, &msg.repo_name, msg.pr_number, &node_ids)
+                .await
+            {
                 Ok(thread_map) => {
                     let mut resolved = std::collections::HashSet::new();
                     for thread_id in thread_map.values() {

@@ -603,26 +603,70 @@ impl GitHubClient {
     }
 
     /// Get review thread IDs for specific comment node IDs.
-    /// Returns a map of comment_node_id -> thread_node_id.
+    /// Queries the PR's review threads, builds a comment→thread map,
+    /// and returns only entries matching the given comment_node_ids.
     pub async fn get_review_thread_ids(
         &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
         comment_node_ids: &[&str],
     ) -> Result<std::collections::HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>>
     {
+        let wanted: std::collections::HashSet<&str> = comment_node_ids.iter().copied().collect();
         let mut map = std::collections::HashMap::new();
-        for node_id in comment_node_ids {
-            let query = serde_json::json!({
-                "query": "query($id: ID!) { node(id: $id) { ... on PullRequestReviewComment { pullRequestReviewThread { id } } } }",
-                "variables": { "id": node_id }
-            });
-            let resp = self.post("https://api.github.com/graphql", &query).await?;
-            if let Some(thread_id) = resp
-                .pointer("/data/node/pullRequestReviewThread/id")
-                .and_then(|v| v.as_str())
-            {
-                map.insert(node_id.to_string(), thread_id.to_string());
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let after = cursor
+                .as_deref()
+                .map(|c| format!(", after: \"{}\"", c))
+                .unwrap_or_default();
+            let query_str = format!(
+                r#"query {{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {pr_number}) {{ reviewThreads(first: 50{after}) {{ pageInfo {{ hasNextPage endCursor }} nodes {{ id comments(first: 10) {{ nodes {{ id }} }} }} }} }} }} }}"#,
+            );
+            let resp = self
+                .post(
+                    "https://api.github.com/graphql",
+                    &serde_json::json!({"query": query_str}),
+                )
+                .await?;
+
+            let threads = resp
+                .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+                .and_then(|v| v.as_array());
+
+            if let Some(nodes) = threads {
+                for thread in nodes {
+                    let thread_id = thread["id"].as_str().unwrap_or("");
+                    if let Some(comments) =
+                        thread.pointer("/comments/nodes").and_then(|v| v.as_array())
+                    {
+                        for comment in comments {
+                            if let Some(cid) = comment["id"].as_str() {
+                                if wanted.contains(cid) {
+                                    map.insert(cid.to_string(), thread_id.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let has_next = resp
+                .pointer("/data/repository/pullRequest/reviewThreads/pageInfo/hasNextPage")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if has_next {
+                cursor = resp
+                    .pointer("/data/repository/pullRequest/reviewThreads/pageInfo/endCursor")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            } else {
+                break;
             }
         }
+
         Ok(map)
     }
 
