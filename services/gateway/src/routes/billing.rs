@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::models::Claims;
 use crate::AppState;
@@ -32,15 +32,90 @@ pub async fn get_billing(
 
     let item = billing.item();
 
-    let subscription_status = item
+    let mut subscription_status = item
         .and_then(|i| i.get("subscription_status"))
         .and_then(|v| v.as_s().ok())
-        .map_or("none", |v| v);
+        .map_or("none", |v| v)
+        .to_string();
 
-    let stripe_customer_id = item
+    // Resolve stripe_customer_id: prefer billing record, fall back to reverse mapping
+    let mut stripe_customer_id = item
         .and_then(|i| i.get("stripe_customer_id"))
         .and_then(|v| v.as_s().ok())
-        .map_or("", |v| v);
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    if stripe_customer_id.is_empty() {
+        // Try to restore from reverse mapping table
+        if let Some(cid) = lookup_customer_id_for_tenant(&state, &claims.tenant_id).await {
+            stripe_customer_id = cid.clone();
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.table_name)
+                .key("pk", attr_s(&claims.tenant_id))
+                .key("sk", attr_s("BILLING"))
+                .update_expression("SET stripe_customer_id = :cid, updated_at = :t")
+                .expression_attribute_values(":cid", attr_s(&cid))
+                .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+                .send()
+                .await;
+            info!(tenant_id = %claims.tenant_id, "Restored stripe_customer_id from reverse mapping");
+        }
+    }
+
+    // Reconcile with Stripe: if we have a customer, check their actual subscription status
+    if !stripe_customer_id.is_empty() {
+        if let Some(stripe_key) = state.secrets.stripe_secret_key.as_deref() {
+            let stripe_has_active =
+                has_active_stripe_subscription(&state, stripe_key, &stripe_customer_id).await;
+
+            let dynamo_says_active = subscription_status == "active";
+
+            if stripe_has_active && !dynamo_says_active {
+                // Stripe active, DynamoDB not → restore to active
+                warn!(
+                    tenant_id = %claims.tenant_id,
+                    dynamo_status = %subscription_status,
+                    "Reconcile: Stripe has active sub but DynamoDB disagrees — restoring to active"
+                );
+                let _ = state
+                    .dynamo
+                    .update_item()
+                    .table_name(&state.config.table_name)
+                    .key("pk", attr_s(&claims.tenant_id))
+                    .key("sk", attr_s("BILLING"))
+                    .update_expression("SET subscription_status = :s, updated_at = :t")
+                    .expression_attribute_values(":s", attr_s("active"))
+                    .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+                    .send()
+                    .await;
+                subscription_status = "active".to_string();
+            } else if !stripe_has_active && dynamo_says_active {
+                // Stripe NOT active, DynamoDB says active → downgrade to free
+                warn!(
+                    tenant_id = %claims.tenant_id,
+                    "Reconcile: DynamoDB says active but Stripe has no active sub — setting to free"
+                );
+                let _ = state
+                    .dynamo
+                    .update_item()
+                    .table_name(&state.config.table_name)
+                    .key("pk", attr_s(&claims.tenant_id))
+                    .key("sk", attr_s("BILLING"))
+                    .update_expression(
+                        "SET subscription_status = :s, updated_at = :t, previous_status = :prev",
+                    )
+                    .expression_attribute_values(":s", attr_s("free"))
+                    .expression_attribute_values(":prev", attr_s("active"))
+                    .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+                    .send()
+                    .await;
+                subscription_status = "free".to_string();
+            }
+        }
+    }
 
     // Get current month usage from analytics
     let month = chrono::Utc::now().format("%Y-%m").to_string();
@@ -310,14 +385,28 @@ pub async fn create_subscription(
         .and_then(|i| i.get("email").and_then(|v| v.as_s().ok()).cloned())
         .unwrap_or_default();
 
-    // Get or create Stripe customer (and ensure email is up to date)
+    // Get or create Stripe customer — check billing record, then reverse mapping, then create new
     let customer_id = match item
         .and_then(|i| i.get("stripe_customer_id"))
         .and_then(|v| v.as_s().ok())
         .filter(|s| !s.is_empty())
     {
         Some(cid) => cid.to_string(),
-        None => create_stripe_customer(&state, stripe_key, &claims.tenant_id, &user_email).await?,
+        None => {
+            // Try reverse mapping before creating a brand new customer
+            if let Some(existing_cid) =
+                lookup_customer_id_for_tenant(&state, &claims.tenant_id).await
+            {
+                info!(
+                    tenant_id = %claims.tenant_id,
+                    customer_id = %existing_cid,
+                    "Recovered Stripe customer from reverse mapping"
+                );
+                existing_cid
+            } else {
+                create_stripe_customer(&state, stripe_key, &claims.tenant_id, &user_email).await?
+            }
+        }
     };
 
     // Store customer + reverse mapping before checkout so webhooks can resolve tenant
@@ -513,6 +602,31 @@ async fn has_active_stripe_subscription(
         return false;
     };
     body["data"].as_array().is_some_and(|subs| !subs.is_empty())
+}
+
+/// Look up the Stripe customer ID for a tenant from the reverse mapping table.
+/// This recovers the customer ID even if the billing record lost it.
+async fn lookup_customer_id_for_tenant(state: &AppState, tenant_id: &str) -> Option<String> {
+    // Scan the events table for STRIPE#<cid> → MAPPING rows where tenant_id matches.
+    // There are very few MAPPING rows (one per customer) so this scan is cheap.
+    let result = state
+        .dynamo
+        .scan()
+        .table_name(&state.config.events_table_name)
+        .filter_expression("sk = :sk AND tenant_id = :tid")
+        .expression_attribute_values(":sk", attr_s("MAPPING"))
+        .expression_attribute_values(":tid", attr_s(tenant_id))
+        .limit(1)
+        .send()
+        .await
+        .ok()?;
+
+    result
+        .items()
+        .first()
+        .and_then(|item| item.get("pk").and_then(|v| v.as_s().ok()))
+        .and_then(|pk| pk.strip_prefix("STRIPE#"))
+        .map(|cid| cid.to_string())
 }
 
 /// Create a Stripe customer for a tenant.
