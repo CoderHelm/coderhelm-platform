@@ -4,8 +4,6 @@ Autonomous AI coding agent platform — webhook receiver, AI orchestration worke
 
 ## Architecture
 
-CoderHelm is a serverless event-driven system deployed entirely on AWS. Inbound events (GitHub and Jira webhooks, OAuth callbacks, Stripe billing events) are received by a Rust-based Gateway Lambda sitting behind API Gateway HTTP API. The gateway validates signatures, authenticates requests via JWT, and enqueues jobs onto one of three SQS queues (`tickets`, `ci-fix`, `feedback`). A second Rust-based Worker Lambda consumes those queues and runs a multi-pass AI orchestration pipeline against Amazon Bedrock (Claude Opus/Sonnet), reading and writing state across a set of DynamoDB tables and an S3 bucket, then pushes the result back to GitHub as a pull request or review comment. Infrastructure is defined as CDK v2 TypeScript stacks — `ApiStack` (Gateway Lambda + SQS + API Gateway), `WorkerStack` (Worker Lambda + Bedrock IAM), `DatabaseStack` (DynamoDB tables with KMS encryption), `StorageStack` (S3), `FrontendStack`, `BillingStack`, `EmailStack`, and `MonitoringStack` — all deployed from a single CDK app in `infra/`.
-
 ```
 services/gateway/   API Gateway Lambda — receives GitHub/Jira webhooks, handles OAuth & auth, enqueues jobs to SQS
 services/worker/    Worker Lambda — dequeues jobs from SQS, orchestrates AI passes via Bedrock, and opens GitHub PRs
