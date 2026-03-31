@@ -224,7 +224,7 @@ async fn process_jira_payload(
     if !has_label && !is_assigned {
         let tk = issue.get("key").and_then(|v| v.as_str()).unwrap_or("?");
         info!(ticket_key = %tk, label = %trigger_label, "Skipping — no trigger label or assignee match");
-        log_jira_event(&state, &tenant_id, event_type, tk, "", "filtered", None).await;
+        log_jira_event(state, tenant_id, event_type, tk, "", "filtered", None).await;
         return Ok(StatusCode::OK);
     }
 
@@ -264,7 +264,7 @@ async fn process_jira_payload(
             if !enabled {
                 info!(project_key, "Skipping — Jira project not enabled");
                 let tk = issue.get("key").and_then(|v| v.as_str()).unwrap_or("?");
-                log_jira_event(&state, &tenant_id, event_type, tk, "", "filtered", None).await;
+                log_jira_event(state, tenant_id, event_type, tk, "", "filtered", None).await;
                 return Ok(StatusCode::OK);
             }
         }
@@ -320,7 +320,7 @@ async fn process_jira_payload(
         .table_name(&state.config.runs_table_name)
         .key_condition_expression("tenant_id = :tid")
         .filter_expression("ticket_id = :ticket")
-        .expression_attribute_values(":tid", attr_s(&tenant_id))
+        .expression_attribute_values(":tid", attr_s(tenant_id))
         .expression_attribute_values(":ticket", attr_s(ticket_key))
         .limit(5)
         .send()
@@ -330,8 +330,8 @@ async fn process_jira_payload(
         if !result.items().is_empty() {
             info!(ticket_key, "Skipping — ticket already has a run");
             log_jira_event(
-                &state,
-                &tenant_id,
+                state,
+                tenant_id,
                 event_type,
                 ticket_key,
                 &title,
@@ -356,7 +356,7 @@ async fn process_jira_payload(
         sender,
     });
 
-    let result = send_to_queue(&state, &state.config.ticket_queue_url, &message).await;
+    let result = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
 
     let status_str = if result.is_ok() { "processed" } else { "error" };
     let repo_display = if repo_owner.is_empty() && repo_name.is_empty() {
@@ -365,8 +365,8 @@ async fn process_jira_payload(
         format!("{repo_owner}/{repo_name}")
     };
     log_jira_event(
-        &state,
-        &tenant_id,
+        state,
+        tenant_id,
         event_type,
         ticket_key,
         &title,
