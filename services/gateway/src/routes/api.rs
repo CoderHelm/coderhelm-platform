@@ -237,6 +237,7 @@ pub async fn list_runs(
                 "tokens_in": item.get("tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
                 "tokens_out": item.get("tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
                 "duration_s": item.get("duration_s").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
+                "current_pass": item.get("current_pass").and_then(|v| v.as_s().ok()),
                 "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
             })
         })
@@ -468,22 +469,6 @@ pub async fn retry_run(
         })?;
 
     info!(run_id, "Run retried — dispatched to SQS");
-
-    // Archive the old run so it doesn't clutter the runs list
-    let now = chrono::Utc::now().to_rfc3339();
-    let _ = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("tenant_id", attr_s(&claims.tenant_id))
-        .key("run_id", attr_s(&run_id))
-        .update_expression("SET #s = :s, updated_at = :t, status_run_id = :sri")
-        .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", attr_s("archived"))
-        .expression_attribute_values(":t", attr_s(&now))
-        .expression_attribute_values(":sri", attr_s(&format!("archived#{run_id}")))
-        .send()
-        .await;
 
     Ok(Json(json!({ "status": "retrying" })))
 }
