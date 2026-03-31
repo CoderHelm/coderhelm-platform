@@ -80,8 +80,4 @@ The secret must be a JSON object with the following keys:
 
 ## Deploy
 
-```bash
-MODEL_ID="your-model-id" cdk deploy --all
-```
-
-> **CI/CD:** Pushing to `main` automatically triggers `.github/workflows/deploy.yml`, which builds the Rust workspace, packages the Lambda artifacts, and runs `cdk deploy --all` in the target AWS account.
+Pushing to `main` automatically triggers `.github/workflows/deploy.yml`, which builds the Rust workspace, packages the Lambda artifacts, and runs `cdk deploy --all` in the target AWS account.
