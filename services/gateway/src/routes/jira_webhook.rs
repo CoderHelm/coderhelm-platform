@@ -170,9 +170,11 @@ pub async fn handle(
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
 
-    let has_label = issue_labels
-        .iter()
-        .any(|l| *l == trigger_label || l.starts_with(&format!("{trigger_label}:")));
+    let has_label = issue_labels.iter().any(|l| {
+        l.eq_ignore_ascii_case(&trigger_label)
+            || l.to_ascii_lowercase()
+                .starts_with(&format!("{}:", trigger_label.to_ascii_lowercase()))
+    });
 
     if !has_label {
         let tk = issue.get("key").and_then(|v| v.as_str()).unwrap_or("?");
