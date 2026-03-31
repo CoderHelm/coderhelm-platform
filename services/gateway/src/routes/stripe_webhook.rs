@@ -99,6 +99,9 @@ pub async fn handle(
             Ok(())
         }
 
+        // Refund processed
+        "charge.refunded" => handle_charge_refunded(&state, &event["data"]["object"]).await,
+
         _ => {
             info!(event_type, "Ignoring unhandled Stripe event");
             Ok(())
@@ -525,6 +528,90 @@ async fn handle_invoice_finalized(
         tenant_id,
         invoice_number, amount, "Invoice finalized (record stored, email deferred to payment)"
     );
+    Ok(())
+}
+
+async fn handle_charge_refunded(
+    state: &AppState,
+    charge: &Value,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let customer_id = charge["customer"].as_str().unwrap_or("");
+    let tenant_id = resolve_tenant(state, customer_id).await?;
+    let charge_id = charge["id"].as_str().unwrap_or("");
+    let invoice_id = charge["invoice"].as_str().unwrap_or("");
+    let amount_refunded_cents = charge["amount_refunded"].as_u64().unwrap_or(0);
+    let amount_refunded = format!("{:.2}", amount_refunded_cents as f64 / 100.0);
+
+    let now = chrono::Utc::now();
+
+    // Store refund record
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.events_table_name)
+        .item("pk", attr_s(&tenant_id))
+        .item("sk", attr_s(&format!("REFUND#{charge_id}")))
+        .item("amount_cents", attr_n(amount_refunded_cents))
+        .item("stripe_charge_id", attr_s(charge_id))
+        .item("stripe_invoice_id", attr_s(invoice_id))
+        .item("status", attr_s("refunded"))
+        .item("created_at", attr_s(&now.to_rfc3339()))
+        .send()
+        .await?;
+
+    // Update the corresponding invoice/payment record status if we have the invoice_id
+    if !invoice_id.is_empty() {
+        let amount_total = charge["amount"].as_u64().unwrap_or(0);
+        let new_status = if amount_refunded_cents >= amount_total {
+            "refunded"
+        } else {
+            "partially_refunded"
+        };
+
+        // Update invoice record
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.events_table_name)
+            .key("pk", attr_s(&tenant_id))
+            .key("sk", attr_s(&format!("INVOICE#{invoice_id}")))
+            .update_expression("SET #s = :s, refunded_at = :t, amount_refunded_cents = :r")
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_values(":s", attr_s(new_status))
+            .expression_attribute_values(":t", attr_s(&now.to_rfc3339()))
+            .expression_attribute_values(":r", attr_n(amount_refunded_cents))
+            .send()
+            .await;
+
+        // Update payment record
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.events_table_name)
+            .key("pk", attr_s(&tenant_id))
+            .key("sk", attr_s(&format!("PAYMENT#{invoice_id}")))
+            .update_expression("SET #s = :s, refunded_at = :t, amount_refunded_cents = :r")
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_values(":s", attr_s(new_status))
+            .expression_attribute_values(":t", attr_s(&now.to_rfc3339()))
+            .expression_attribute_values(":r", attr_n(amount_refunded_cents))
+            .send()
+            .await;
+    }
+
+    // Send refund notification email
+    send_billing_email(
+        state,
+        &tenant_id,
+        "refund-processed",
+        &serde_json::json!({
+            "amount": amount_refunded,
+            "date": now.format("%B %d, %Y").to_string(),
+        }),
+    )
+    .await;
+
+    info!(tenant_id, amount_refunded, charge_id, "Charge refunded");
     Ok(())
 }
 
