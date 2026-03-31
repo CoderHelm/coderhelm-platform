@@ -184,7 +184,7 @@ async fn handle_payment_succeeded(
         .as_str()
         .unwrap_or("Coderhelm Pro");
 
-    // Send payment receipt email
+    // Send combined payment receipt + invoice email
     send_billing_email(
         state,
         &tenant_id,
@@ -199,6 +199,20 @@ async fn handle_payment_succeeded(
         }),
     )
     .await;
+
+    // Update invoice record status to paid
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.events_table_name)
+        .key("pk", attr_s(&tenant_id))
+        .key("sk", attr_s(&format!("INVOICE#{invoice_id}")))
+        .update_expression("SET #s = :s, paid_at = :t")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", attr_s("paid"))
+        .expression_attribute_values(":t", attr_s(&now.to_rfc3339()))
+        .send()
+        .await;
 
     info!(tenant_id, amount, invoice_number, "Payment succeeded");
     Ok(())
@@ -415,9 +429,6 @@ async fn handle_invoice_finalized(
     };
 
     let period = format!("{} — {}", fmt_date(period_start), fmt_date(period_end));
-    let plan_name = invoice["lines"]["data"][0]["description"]
-        .as_str()
-        .unwrap_or("Coderhelm Pro");
 
     // Store invoice record
     state
@@ -439,57 +450,13 @@ async fn handle_invoice_finalized(
         .send()
         .await?;
 
-    // Get usage stats for the billing period
-    let month = chrono::DateTime::from_timestamp(period_start as i64, 0)
-        .map(|dt| dt.format("%Y-%m").to_string())
-        .unwrap_or_default();
-
-    let analytics = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.analytics_table_name)
-        .key("tenant_id", attr_s(&tenant_id))
-        .key("period", attr_s(&month))
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned());
-
-    let total_runs = analytics
-        .as_ref()
-        .and_then(|i| i.get("total_runs"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    let usage_cost = analytics
-        .as_ref()
-        .and_then(|i| i.get("total_cost_usd"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<f64>().ok())
-        .unwrap_or(0.0);
-
     // NOTE: Overage meter events are reported incrementally per run by the worker.
     // No reporting here — invoice.finalized is too late to affect the current invoice.
 
-    // Send invoice email
-    send_billing_email(
-        state,
-        &tenant_id,
-        "invoice-ready",
-        &serde_json::json!({
-            "invoice_number": invoice_number,
-            "amount": amount,
-            "period": period,
-            "plan_name": plan_name,
-            "total_runs": total_runs,
-            "usage_cost": format!("{:.2}", usage_cost),
-            "invoice_url": format!("https://app.coderhelm.com/dashboard/billing/invoices/{}", invoice_id),
-        }),
-    )
-    .await;
+    // Invoice email is NOT sent here — it's sent from handle_payment_succeeded
+    // so users only receive the email once payment is confirmed.
 
-    info!(tenant_id, invoice_number, amount, "Invoice finalized");
+    info!(tenant_id, invoice_number, amount, "Invoice finalized (record stored, email deferred to payment)");
     Ok(())
 }
 

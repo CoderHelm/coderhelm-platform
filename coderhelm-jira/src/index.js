@@ -5,7 +5,6 @@ const { route } = api;
 
 exports.handler = async (event, context) => {
   const issue = event.issue || {};
-  const fields = issue.fields || {};
 
   // Load config from Forge storage (set via admin page)
   const config = await storage.get("coderhelm-config");
@@ -14,8 +13,24 @@ exports.handler = async (event, context) => {
     return;
   }
 
+  // Forge event payloads only include issue id/key — fetch full issue via REST API
+  let fields = {};
+  if (issue.id) {
+    try {
+      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,project`);
+      if (res.ok) {
+        const full = await res.json();
+        fields = full.fields || {};
+      } else {
+        console.log(`Failed to fetch issue ${issue.key}: ${res.status}`);
+      }
+    } catch (e) {
+      console.log(`Error fetching issue ${issue.key}: ${e.message}`);
+    }
+  }
+
   // Extract repo from explicit label if present (coderhelm:owner/repo)
-  const labels = fields.labels || [];
+  const labels = (fields.labels || []).map((l) => (typeof l === "string" ? l : l.name || ""));
   const repoLabel = labels.find((l) => l.startsWith("coderhelm:"));
   let repoOwner, repoName;
   if (repoLabel) {
@@ -31,7 +46,7 @@ exports.handler = async (event, context) => {
       fields: {
         summary: fields.summary,
         description: fields.description,
-        labels: fields.labels,
+        labels: labels,
         assignee: fields.assignee,
         project: fields.project,
       },
