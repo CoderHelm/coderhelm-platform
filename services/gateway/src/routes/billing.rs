@@ -1026,6 +1026,28 @@ pub async fn list_payment_methods(
 
     let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
 
+    // Get customer to find default PM
+    let cust_resp = state
+        .http
+        .get(format!("https://api.stripe.com/v1/customers/{customer_id}"))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+        .ok();
+    let cust_body: Option<Value> = match cust_resp {
+        Some(r) => r.json().await.ok(),
+        None => None,
+    };
+    let default_pm = cust_body
+        .as_ref()
+        .and_then(|c| {
+            c["invoice_settings"]["default_payment_method"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+        })
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
     let response = state
         .http
         .get(format!(
@@ -1050,9 +1072,11 @@ pub async fn list_payment_methods(
             arr.iter()
                 .map(|pm| {
                     let pm_type = pm["type"].as_str().unwrap_or("unknown");
+                    let pm_id = pm["id"].as_str().unwrap_or("");
                     let mut result = json!({
-                        "id": pm["id"].as_str(),
+                        "id": pm_id,
                         "type": pm_type,
+                        "is_default": pm_id == default_pm,
                     });
                     if pm_type == "card" {
                         result["card"] = json!({
@@ -1074,7 +1098,91 @@ pub async fn list_payment_methods(
         })
         .unwrap_or_default();
 
-    Ok(Json(json!({ "payment_methods": methods })))
+    // Auto-set default: if exactly one method and no default is set, make it default
+    if methods.len() == 1 && default_pm.is_empty() {
+        if let Some(pm_id) = methods[0]["id"].as_str() {
+            let _ = state
+                .http
+                .post(format!("https://api.stripe.com/v1/customers/{customer_id}"))
+                .header("Authorization", format!("Bearer {stripe_key}"))
+                .form(&[("invoice_settings[default_payment_method]", pm_id)])
+                .send()
+                .await;
+            // Patch the response so UI sees it as default immediately
+            if let Some(first) = methods.first() {
+                let mut patched = methods.clone();
+                patched[0] = {
+                    let mut m = first.clone();
+                    m["is_default"] = json!(true);
+                    m
+                };
+                return Ok(Json(
+                    json!({ "payment_methods": patched, "default_payment_method": pm_id }),
+                ));
+            }
+        }
+    }
+
+    Ok(Json(
+        json!({ "payment_methods": methods, "default_payment_method": if default_pm.is_empty() { Value::Null } else { json!(default_pm) } }),
+    ))
+}
+
+/// PUT /api/billing/payment-methods/:pm_id/default — set a payment method as the default.
+pub async fn set_default_payment_method(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(pm_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
+        error!("Stripe secret key not configured");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+
+    // Verify the payment method belongs to this customer
+    let pm_response = state
+        .http
+        .get(format!("https://api.stripe.com/v1/payment_methods/{pm_id}"))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Stripe get payment method failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let pm_body: Value = pm_response.json().await.map_err(|e| {
+        error!("Failed to parse Stripe response: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let pm_customer = pm_body["customer"].as_str().unwrap_or("");
+    if pm_customer != customer_id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Update customer's default payment method
+    let response = state
+        .http
+        .post(format!("https://api.stripe.com/v1/customers/{customer_id}"))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .form(&[("invoice_settings[default_payment_method]", pm_id.as_str())])
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to set default payment method: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    if !response.status().is_success() {
+        error!("Stripe returned error setting default PM");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    info!(pm_id, "Default payment method updated");
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 /// DELETE /api/billing/payment-methods/:pm_id — detach a payment method from the customer.

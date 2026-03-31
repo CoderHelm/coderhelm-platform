@@ -190,6 +190,10 @@ async fn main() -> Result<(), Error> {
             delete(routes::billing::delete_payment_method),
         )
         .route(
+            "/billing/payment-methods/:pm_id/default",
+            put(routes::billing::set_default_payment_method),
+        )
+        .route(
             "/billing/customer",
             get(routes::billing::get_billing_customer),
         )
