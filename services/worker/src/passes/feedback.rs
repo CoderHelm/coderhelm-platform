@@ -150,11 +150,13 @@ Rules:
     let branch = get_pr_branch(state, &msg).await?;
 
     let tools = feedback_tools();
+    let wrote_files = std::sync::atomic::AtomicBool::new(false);
     let executor = FeedbackToolExecutor {
         github: &github,
         owner: &msg.repo_owner,
         repo: &msg.repo_name,
         branch: &branch,
+        wrote_files: &wrote_files,
     };
 
     let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
@@ -237,6 +239,36 @@ Rules:
             github
                 .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
                 .await?;
+        }
+    }
+
+    // Resolve review threads if the bot pushed code changes
+    if wrote_files.load(std::sync::atomic::Ordering::Relaxed) {
+        let node_ids: Vec<&str> = actionable_comments
+            .iter()
+            .filter_map(|c| c.node_id.as_deref())
+            .collect();
+        if !node_ids.is_empty() {
+            match github.get_review_thread_ids(&node_ids).await {
+                Ok(thread_map) => {
+                    let mut resolved = std::collections::HashSet::new();
+                    for thread_id in thread_map.values() {
+                        if resolved.insert(thread_id.clone()) {
+                            if let Err(e) = github.resolve_review_thread(thread_id).await {
+                                tracing::warn!(thread_id, error = %e, "Failed to resolve thread");
+                            }
+                        }
+                    }
+                    info!(
+                        run_id = %msg.run_id,
+                        resolved = resolved.len(),
+                        "Resolved review threads after code changes"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to fetch thread IDs for resolution");
+                }
+            }
         }
     }
 
@@ -447,6 +479,7 @@ async fn fetch_review_comments(github: &GitHubClient, msg: &FeedbackMessage) -> 
                         line: c["line"].as_u64(),
                         body: format!("[{author}]: {body}"),
                         comment_id: c["id"].as_u64(),
+                        node_id: c["node_id"].as_str().map(|s| s.to_string()),
                         is_context: true,
                     }
                 })
@@ -460,6 +493,7 @@ async fn fetch_review_comments(github: &GitHubClient, msg: &FeedbackMessage) -> 
                     line: c["line"].as_u64(),
                     body: c["body"].as_str().unwrap_or("").to_string(),
                     comment_id: c["id"].as_u64(),
+                    node_id: c["node_id"].as_str().map(|s| s.to_string()),
                     is_context: false,
                 })
                 .collect();
@@ -499,6 +533,7 @@ async fn fetch_all_human_comments(
                 line: c["line"].as_u64(),
                 body: c["body"].as_str().unwrap_or("").to_string(),
                 comment_id: c["id"].as_u64(),
+                node_id: c["node_id"].as_str().map(|s| s.to_string()),
                 is_context: false,
             })
             .collect(),
@@ -650,6 +685,7 @@ struct FeedbackToolExecutor<'a> {
     owner: &'a str,
     repo: &'a str,
     branch: &'a str,
+    wrote_files: &'a std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -748,6 +784,8 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                         sha,
                     )
                     .await?;
+                self.wrote_files
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(json!(format!("Wrote {path}")))
             }
             "batch_write" => {
@@ -782,6 +820,8 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .github
                     .batch_write(self.owner, self.repo, self.branch, message, &ops)
                     .await?;
+                self.wrote_files
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(json!(format!(
                     "Batch commit {} — {} files",
                     &sha[..8],
