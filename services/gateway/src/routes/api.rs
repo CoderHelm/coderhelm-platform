@@ -1583,7 +1583,7 @@ pub async fn update_repo(
         let _ = state
             .dynamo
             .delete_item()
-            .table_name(&state.config.repos_table_name)
+            .table_name(&state.config.infra_table_name)
             .key("pk", attr_s(&claims.tenant_id))
             .key("sk", attr_s(&sk))
             .send()
