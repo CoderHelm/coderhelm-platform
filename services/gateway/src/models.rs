@@ -26,6 +26,9 @@ pub struct Config {
     pub ses_from_address: String,
     pub ses_template_prefix: String,
     pub model_id: String,
+    pub cognito_user_pool_id: String,
+    pub cognito_client_id: String,
+    pub cognito_domain: String,
 }
 
 impl Config {
@@ -68,6 +71,12 @@ impl Config {
                 .unwrap_or_else(|_| "coderhelm-prod".to_string()),
             model_id: std::env::var("MODEL_ID")
                 .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-6".to_string()),
+            cognito_user_pool_id: std::env::var("COGNITO_USER_POOL_ID")
+                .expect("COGNITO_USER_POOL_ID required"),
+            cognito_client_id: std::env::var("COGNITO_CLIENT_ID")
+                .expect("COGNITO_CLIENT_ID required"),
+            cognito_domain: std::env::var("COGNITO_DOMAIN")
+                .expect("COGNITO_DOMAIN required"),
         }
     }
 }
@@ -213,11 +222,23 @@ pub struct ReviewComment {
 /// JWT claims for authenticated dashboard sessions.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Claims {
-    pub sub: String, // user_id
-    pub tenant_id: String,
-    pub github_login: String,
+    pub sub: String,       // user_id (USER#<cognito_sub> or USER#<github_id>)
+    pub tenant_id: String, // TENANT#<id>
+    pub email: String,
+    pub role: String, // owner, admin, member, viewer
+    #[serde(default)]
+    pub github_login: Option<String>,
     pub exp: u64,
     pub iat: u64,
+}
+
+impl Claims {
+    /// Display name: prefer github_login, fall back to email.
+    pub fn display_name(&self) -> String {
+        self.github_login
+            .clone()
+            .unwrap_or_else(|| self.email.clone())
+    }
 }
 
 /// DynamoDB item types.

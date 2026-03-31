@@ -21,6 +21,7 @@ pub struct AppState {
     pub ses: aws_sdk_sesv2::Client,
     pub s3: aws_sdk_s3::Client,
     pub bedrock: aws_sdk_bedrockruntime::Client,
+    pub cognito: aws_sdk_cognitoidentityprovider::Client,
     pub http: reqwest::Client,
     pub secrets: models::Secrets,
     pub config: models::Config,
@@ -41,6 +42,7 @@ async fn main() -> Result<(), Error> {
     let ses = aws_sdk_sesv2::Client::new(&aws_config);
     let s3 = aws_sdk_s3::Client::new(&aws_config);
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
+    let cognito = aws_sdk_cognitoidentityprovider::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
 
     // Load secrets from Secrets Manager
@@ -56,6 +58,7 @@ async fn main() -> Result<(), Error> {
         ses,
         s3,
         bedrock,
+        cognito,
         http: reqwest::Client::new(),
         secrets,
         config,
@@ -207,6 +210,24 @@ async fn main() -> Result<(), Error> {
         .route("/banners", get(routes::banners::list_banners))
         // Account management
         .route("/account/reset", post(routes::api::reset_account))
+        // User management
+        .route("/users", get(routes::users::list_users))
+        .route("/users/invite", post(routes::users::invite_user))
+        .route(
+            "/users/:user_id/role",
+            put(routes::users::update_role),
+        )
+        .route(
+            "/users/:user_id",
+            delete(routes::users::remove_user),
+        )
+        .route("/users/password", put(routes::users::change_password))
+        .route("/users/mfa/setup", post(routes::users::mfa_setup))
+        .route(
+            "/users/mfa/verify",
+            post(routes::users::mfa_verify_setup),
+        )
+        .route("/users/mfa", delete(routes::users::mfa_disable))
         // Plan endpoints
         .route(
             "/plans",
@@ -269,8 +290,25 @@ async fn main() -> Result<(), Error> {
         )
         .route("/webhooks/stripe", post(routes::stripe_webhook::handle))
         // Auth (public)
-        .route("/auth/login", get(routes::auth::login))
-        .route("/auth/callback", get(routes::auth::callback))
+        .route("/auth/signup", post(routes::auth::signup))
+        .route("/auth/login", post(routes::auth::login_email))
+        .route("/auth/verify-email", post(routes::auth::verify_email))
+        .route(
+            "/auth/forgot-password",
+            post(routes::auth::forgot_password),
+        )
+        .route("/auth/confirm-reset", post(routes::auth::confirm_reset))
+        .route("/auth/mfa/verify", post(routes::auth::mfa_verify))
+        .route("/auth/google", get(routes::auth::google_login))
+        .route(
+            "/auth/google/callback",
+            get(routes::auth::google_callback),
+        )
+        .route("/auth/github", get(routes::auth::github_login))
+        .route(
+            "/auth/github/callback",
+            get(routes::auth::github_callback),
+        )
         .route("/auth/logout", post(routes::auth::logout))
         // Nest protected routes under /api
         .nest("/api", api_routes)

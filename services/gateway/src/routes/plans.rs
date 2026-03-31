@@ -557,7 +557,7 @@ pub async fn approve_task(
         .expression_attribute_names("#st", "status")
         .expression_attribute_values(":s", attr_s("approved"))
         .expression_attribute_values(":now", attr_s(&now))
-        .expression_attribute_values(":by", attr_s(&claims.github_login))
+        .expression_attribute_values(":by", attr_s(&claims.display_name()))
         .condition_expression("attribute_exists(pk)")
         .send()
         .await
@@ -591,7 +591,7 @@ pub async fn reject_task(
         .expression_attribute_names("#st", "status")
         .expression_attribute_values(":s", attr_s("rejected"))
         .expression_attribute_values(":now", attr_s(&now))
-        .expression_attribute_values(":by", attr_s(&claims.github_login))
+        .expression_attribute_values(":by", attr_s(&claims.display_name()))
         .condition_expression("attribute_exists(pk)")
         .send()
         .await
@@ -667,7 +667,7 @@ pub async fn approve_all_and_execute(
                 .expression_attribute_names("#st", "status")
                 .expression_attribute_values(":s", attr_s("approved"))
                 .expression_attribute_values(":now", attr_s(&now))
-                .expression_attribute_values(":by", attr_s(&claims.github_login))
+                .expression_attribute_values(":by", attr_s(&claims.display_name()))
                 .send()
                 .await
                 .ok();
@@ -695,7 +695,7 @@ pub async fn approve_all_and_execute(
         .expression_attribute_names("#st", "status")
         .expression_attribute_values(":s", attr_s("executing"))
         .expression_attribute_values(":now", attr_s(&now))
-        .expression_attribute_values(":by", attr_s(&claims.github_login))
+        .expression_attribute_values(":by", attr_s(&claims.display_name()))
         .send()
         .await
         .map_err(|e| {
@@ -707,7 +707,7 @@ pub async fn approve_all_and_execute(
     let plan_msg = WorkerMessage::PlanExecute(PlanExecuteMessage {
         tenant_id: claims.tenant_id.clone(),
         plan_id: plan_id.clone(),
-        triggered_by: claims.github_login.clone(),
+        triggered_by: claims.display_name(),
         tasks: task_ids.iter().map(|(tid, _)| tid.clone()).collect(),
     });
 
@@ -826,7 +826,7 @@ pub async fn execute_plan(
         .expression_attribute_names("#st", "status")
         .expression_attribute_values(":s", attr_s("executing"))
         .expression_attribute_values(":now", attr_s(&now))
-        .expression_attribute_values(":by", attr_s(&claims.github_login))
+        .expression_attribute_values(":by", attr_s(&claims.display_name()))
         .send()
         .await
         .map_err(|e| {
@@ -838,7 +838,7 @@ pub async fn execute_plan(
     let plan_msg = WorkerMessage::PlanExecute(PlanExecuteMessage {
         tenant_id: claims.tenant_id.clone(),
         plan_id: plan_id.clone(),
-        triggered_by: claims.github_login.clone(),
+        triggered_by: claims.display_name(),
         tasks: approved_task_ids
             .iter()
             .map(|(tid, _)| tid.clone())

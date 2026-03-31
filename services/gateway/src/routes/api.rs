@@ -53,9 +53,9 @@ pub async fn me(
         "user_id": claims.sub,
         "tenant_id": claims.tenant_id,
         "github_login": claims.github_login,
-        "email": item.get("email").and_then(|v| v.as_s().ok()),
+        "email": claims.email,
         "avatar_url": item.get("avatar_url").and_then(|v| v.as_s().ok()),
-        "role": item.get("role").and_then(|v| v.as_s().ok()),
+        "role": claims.role,
         "status": tenant_status,
     })))
 }
@@ -159,7 +159,9 @@ pub async fn switch_tenant(
     let token = jwt::create_token(
         &claims.sub,
         target_tenant,
-        &claims.github_login,
+        &claims.email,
+        &claims.role,
+        claims.github_login.as_deref(),
         &state.secrets.jwt_secret,
         86400,
     )
@@ -456,7 +458,7 @@ pub async fn retry_run(
         repo_owner: parts[0].to_string(),
         repo_name: parts[1].to_string(),
         issue_number,
-        sender: claims.github_login.clone(),
+        sender: claims.github_login.clone().unwrap_or_else(|| claims.email.clone()),
     });
 
     let body = serde_json::to_string(&message).map_err(|e| {
@@ -1523,7 +1525,7 @@ pub async fn update_repo(
         // Trigger per-repo infrastructure analysis
         let per_repo_msg = WorkerMessage::InfraAnalyze(InfraAnalyzeMessage {
             tenant_id: claims.tenant_id.clone(),
-            triggered_by: claims.github_login.clone(),
+            triggered_by: claims.display_name(),
             repo: Some(repo.clone()),
         });
         if let Ok(body) = serde_json::to_string(&per_repo_msg) {
@@ -1553,7 +1555,7 @@ pub async fn update_repo(
         // Also trigger tenant-wide infrastructure analysis
         let infra_msg = WorkerMessage::InfraAnalyze(InfraAnalyzeMessage {
             tenant_id: claims.tenant_id.clone(),
-            triggered_by: claims.github_login.clone(),
+            triggered_by: claims.display_name(),
             repo: None,
         });
         if let Ok(body) = serde_json::to_string(&infra_msg) {
@@ -1592,7 +1594,7 @@ pub async fn update_repo(
 
         let infra_msg = WorkerMessage::InfraAnalyze(InfraAnalyzeMessage {
             tenant_id: claims.tenant_id.clone(),
-            triggered_by: claims.github_login.clone(),
+            triggered_by: claims.display_name(),
             repo: None,
         });
         if let Ok(body) = serde_json::to_string(&infra_msg) {
@@ -2632,7 +2634,7 @@ pub async fn reset_account(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, StatusCode> {
-    info!(tenant_id = %claims.tenant_id, user = %claims.github_login, "Account reset requested");
+    info!(tenant_id = %claims.tenant_id, user = %claims.email, "Account reset requested");
 
     let tid = &claims.tenant_id;
 
