@@ -616,14 +616,15 @@ pub async fn list_repos(
     let repos: Vec<Value> = result
         .items()
         .iter()
-        .map(|item| {
-            json!({
-                "name": item.get("repo_name").and_then(|v| v.as_s().ok()),
+        .filter_map(|item| {
+            let name = item.get("repo_name").and_then(|v| v.as_s().ok())?;
+            Some(json!({
+                "name": name,
                 "enabled": item.get("enabled").and_then(|v| v.as_bool().ok()),
                 "ticket_source": item.get("ticket_source").and_then(|v| v.as_s().ok()),
                 "onboard_status": item.get("onboard_status").and_then(|v| v.as_s().ok()),
                 "onboard_error": item.get("onboard_error").and_then(|v| v.as_s().ok()),
-            })
+            }))
         })
         .collect();
 
