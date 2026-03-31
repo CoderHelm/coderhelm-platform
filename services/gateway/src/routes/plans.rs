@@ -87,6 +87,10 @@ pub async fn create_plan(
     let title = body["title"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
     let description = body["description"].as_str().unwrap_or("");
     let repo = body["repo"].as_str().unwrap_or("");
+    let destination = match body["destination"].as_str() {
+        Some("jira") => "jira",
+        _ => "github",
+    };
 
     if title.is_empty() || title.len() > 500 {
         return Err(StatusCode::BAD_REQUEST);
@@ -106,6 +110,7 @@ pub async fn create_plan(
         .item("title", attr_s(title))
         .item("description", attr_s(description))
         .item("repo", attr_s(repo))
+        .item("destination", attr_s(destination))
         .item("status", attr_s("draft"))
         .item("task_count", attr_n(0))
         .item("created_at", attr_s(&now))
@@ -998,12 +1003,46 @@ pub async fn plan_chat(
         .and_then(|i| i.get("content").and_then(|v| v.as_s().ok()).cloned())
         .unwrap_or_default();
 
-    // Build system prompt with org context
-    let system_prompt = if org_context.is_empty() {
-        PLAN_CHAT_SYSTEM.to_string()
-    } else {
-        format!("{PLAN_CHAT_SYSTEM}\n\nThe user's organization context:\n{org_context}")
-    };
+    // Load the list of repos the user has connected
+    let repo_list: Vec<String> = state
+        .dynamo
+        .query()
+        .table_name(&state.config.repos_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":prefix", attr_s("REPO#"))
+        .send()
+        .await
+        .ok()
+        .map(|r| {
+            r.items()
+                .iter()
+                .filter(|item| {
+                    item.get("enabled")
+                        .and_then(|v| v.as_bool().ok())
+                        .copied()
+                        .unwrap_or(false)
+                })
+                .filter_map(|item| {
+                    item.get("repo_name")
+                        .and_then(|v| v.as_s().ok())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Build system prompt with org context and repo list
+    let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
+    if !org_context.is_empty() {
+        system_prompt.push_str(&format!("\n\nThe user's organization context:\n{org_context}"));
+    }
+    if !repo_list.is_empty() {
+        system_prompt.push_str(&format!(
+            "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}",
+            repo_list.iter().map(|r| format!("- {r}")).collect::<Vec<_>>().join("\n")
+        ));
+    }
 
     // Convert messages to Bedrock format
     let mut bedrock_messages = Vec::new();
