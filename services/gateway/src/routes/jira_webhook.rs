@@ -106,6 +106,16 @@ pub async fn handle(
         StatusCode::BAD_REQUEST
     })?;
 
+    process_jira_payload(&state, &tenant_id, installation_id, &payload).await
+}
+
+/// Shared payload processing for both token-based and Forge webhook paths.
+async fn process_jira_payload(
+    state: &AppState,
+    tenant_id: &str,
+    installation_id: u64,
+    payload: &Value,
+) -> Result<StatusCode, StatusCode> {
     let event_type = payload
         .get("webhookEvent")
         .and_then(|v| v.as_str())
@@ -145,7 +155,7 @@ pub async fn handle(
         .table_name(&state.config.jira_config_table_name)
         .key(
             "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.clone()),
+            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
         )
         .key(
             "sk",
@@ -233,7 +243,7 @@ pub async fn handle(
             .table_name(&state.config.jira_config_table_name)
             .key(
                 "pk",
-                aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.clone()),
+                aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
             )
             .key(
                 "sk",
@@ -334,7 +344,7 @@ pub async fn handle(
     }
 
     let message = WorkerMessage::Ticket(TicketMessage {
-        tenant_id: tenant_id.clone(),
+        tenant_id: tenant_id.to_string(),
         installation_id,
         source: TicketSource::Jira,
         ticket_id: ticket_key.to_string(),
@@ -366,6 +376,52 @@ pub async fn handle(
     .await;
 
     result
+}
+
+/// Forge app handler — `/webhooks/jira` (no token).
+///
+/// Authenticates via `coderhelm.installation_id` in the JSON body. The Forge
+/// app always includes this field because it reads it from Forge storage.
+pub async fn handle_forge(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<StatusCode, StatusCode> {
+    let payload: Value = serde_json::from_slice(&body).map_err(|e| {
+        error!("Failed to parse Forge Jira webhook body: {e}");
+        StatusCode::BAD_REQUEST
+    })?;
+
+    let installation_id = payload
+        .pointer("/coderhelm/installation_id")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            warn!("Forge Jira webhook: missing coderhelm.installation_id");
+            StatusCode::BAD_REQUEST
+        })?;
+
+    let tenant_id = format!("TENANT#{installation_id}");
+
+    // Verify this tenant actually exists by checking jira config
+    let config_exists = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.jira_config_table_name)
+        .key("pk", attr_s(&tenant_id))
+        .key("sk", attr_s("JIRA#config"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .is_some();
+
+    if !config_exists {
+        warn!(tenant_id, "Forge Jira webhook: tenant not configured");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    info!(tenant_id, installation_id, "Forge Jira webhook received");
+
+    process_jira_payload(&state, &tenant_id, installation_id, &payload).await
 }
 
 async fn send_to_queue(

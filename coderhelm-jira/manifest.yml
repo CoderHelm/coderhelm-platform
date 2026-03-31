@@ -3,6 +3,7 @@ modules:
     - key: coderhelm-jira-trigger
       function: jiraHandler
       events:
+        - avi:jira:created:issue
         - avi:jira:assigned:issue
         - avi:jira:updated:issue
   webtrigger:
