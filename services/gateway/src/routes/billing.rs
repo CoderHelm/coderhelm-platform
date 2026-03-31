@@ -547,6 +547,10 @@ pub async fn list_invoices(
     let invoices: Vec<Value> = result
         .items()
         .iter()
+        .filter(|item| {
+            let status = item.get("status").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or("");
+            status == "paid" || status == "partially_paid"
+        })
         .map(|item| {
             json!({
                 "invoice_id": item.get("stripe_invoice_id").and_then(|v| v.as_s().ok()),
