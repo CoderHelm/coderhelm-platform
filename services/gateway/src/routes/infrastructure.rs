@@ -158,7 +158,7 @@ pub async fn refresh_infrastructure(
     // Send SQS message to the tickets queue (worker handles infra_analyze type)
     let msg = WorkerMessage::InfraAnalyze(crate::models::InfraAnalyzeMessage {
         tenant_id: claims.tenant_id.clone(),
-        triggered_by: claims.github_login.clone(),
+        triggered_by: claims.display_name(),
         repo: None,
     });
 
@@ -282,7 +282,7 @@ pub async fn refresh_repo_infrastructure(
 
     let msg = WorkerMessage::InfraAnalyze(crate::models::InfraAnalyzeMessage {
         tenant_id: claims.tenant_id.clone(),
-        triggered_by: claims.github_login.clone(),
+        triggered_by: claims.display_name(),
         repo: Some(repo_full),
     });
 

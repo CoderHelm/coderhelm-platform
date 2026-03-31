@@ -195,6 +195,13 @@ export class DatabaseStack extends cdk.Stack {
       sortKey: { name: "gsi1sk", type: dynamodb.AttributeType.STRING },
     });
 
+    // GSI2: Look up user by email (for Cognito login tenant resolution)
+    this.usersTable.addGlobalSecondaryIndex({
+      indexName: "gsi2",
+      partitionKey: { name: "gsi2pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "gsi2sk", type: dynamodb.AttributeType.STRING },
+    });
+
     // ──────────────────────────────────────────────
     // Jira tokens table: opaque webhook token → tenant mapping
     // PK = token (the random 40-char string)

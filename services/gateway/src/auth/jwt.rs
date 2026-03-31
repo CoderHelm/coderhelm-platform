@@ -4,7 +4,9 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 pub fn create_token(
     user_id: &str,
     tenant_id: &str,
-    github_login: &str,
+    email: &str,
+    role: &str,
+    github_login: Option<&str>,
     secret: &str,
     ttl_secs: u64,
 ) -> Result<String, jsonwebtoken::errors::Error> {
@@ -12,7 +14,9 @@ pub fn create_token(
     let claims = Claims {
         sub: user_id.to_string(),
         tenant_id: tenant_id.to_string(),
-        github_login: github_login.to_string(),
+        email: email.to_string(),
+        role: role.to_string(),
+        github_login: github_login.map(|s| s.to_string()),
         iat: now,
         exp: now + ttl_secs,
     };
@@ -39,11 +43,22 @@ mod tests {
     #[test]
     fn test_roundtrip_jwt() {
         let secret = "test-jwt-secret-at-least-32-chars!";
-        let token = create_token("user-1", "tenant-1", "octocat", secret, 3600).unwrap();
+        let token = create_token(
+            "user-1",
+            "tenant-1",
+            "user@example.com",
+            "owner",
+            Some("octocat"),
+            secret,
+            3600,
+        )
+        .unwrap();
         let claims = validate_token(&token, secret).unwrap();
         assert_eq!(claims.sub, "user-1");
         assert_eq!(claims.tenant_id, "tenant-1");
-        assert_eq!(claims.github_login, "octocat");
+        assert_eq!(claims.email, "user@example.com");
+        assert_eq!(claims.role, "owner");
+        assert_eq!(claims.github_login.as_deref(), Some("octocat"));
     }
 
     #[test]

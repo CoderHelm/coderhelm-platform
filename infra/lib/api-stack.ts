@@ -11,6 +11,7 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
+import * as cognito from "aws-cdk-lib/aws-cognito";
 import { Construct } from "constructs";
 
 interface ApiStackProps extends cdk.StackProps {
@@ -44,6 +45,98 @@ export class ApiStack extends cdk.Stack {
     const prefix = `coderhelm-${props.stage}`;
     const gatewayAssetPath =
       process.env.GATEWAY_ZIP ?? "../services/gateway/target/lambda/gateway";
+
+    // --- Cognito User Pool ---
+
+    const userPool = new cognito.UserPool(this, "UserPool", {
+      userPoolName: `${prefix}-users`,
+      selfSignUpEnabled: true,
+      signInAliases: { email: true },
+      autoVerify: { email: true },
+      standardAttributes: {
+        email: { required: true, mutable: true },
+        fullname: { required: false, mutable: true },
+      },
+      passwordPolicy: {
+        minLength: 8,
+        requireUppercase: true,
+        requireLowercase: true,
+        requireDigits: true,
+        requireSymbols: false,
+      },
+      mfa: cognito.Mfa.OPTIONAL,
+      mfaSecondFactor: { sms: false, otp: true },
+      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      removalPolicy:
+        props.stage === "prod"
+          ? cdk.RemovalPolicy.RETAIN
+          : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Google identity provider (client ID/secret stored in Secrets Manager)
+    const googleProvider = new cognito.UserPoolIdentityProviderGoogle(
+      this,
+      "GoogleProvider",
+      {
+        userPool,
+        clientIdConfig: {
+          unsafePlainText: "PLACEHOLDER_GOOGLE_CLIENT_ID",
+        },
+        clientSecretConfig: {
+          unsafePlainText: "PLACEHOLDER_GOOGLE_CLIENT_SECRET",
+        },
+        scopes: ["openid", "email", "profile"],
+        attributeMapping: {
+          email: cognito.ProviderAttribute.GOOGLE_EMAIL,
+          fullname: cognito.ProviderAttribute.GOOGLE_NAME,
+          profilePicture: cognito.ProviderAttribute.GOOGLE_PICTURE,
+        },
+      }
+    );
+
+    const dashboardUrl =
+      props.stage === "prod"
+        ? "https://app.coderhelm.com"
+        : "http://localhost:3000";
+
+    const apiUrl =
+      props.stage === "prod"
+        ? "https://api.coderhelm.com"
+        : "http://localhost:3001";
+
+    const userPoolClient = new cognito.UserPoolClient(this, "UserPoolClient", {
+      userPool,
+      userPoolClientName: `${prefix}-dashboard`,
+      authFlows: {
+        userPassword: true,
+        userSrp: true,
+      },
+      oAuth: {
+        flows: { authorizationCodeGrant: true },
+        scopes: [
+          cognito.OAuthScope.OPENID,
+          cognito.OAuthScope.EMAIL,
+          cognito.OAuthScope.PROFILE,
+        ],
+        callbackUrls: [`${apiUrl}/auth/google/callback`],
+        logoutUrls: [dashboardUrl],
+      },
+      supportedIdentityProviders: [
+        cognito.UserPoolClientIdentityProvider.COGNITO,
+        cognito.UserPoolClientIdentityProvider.GOOGLE,
+      ],
+      generateSecret: true,
+    });
+
+    userPoolClient.node.addDependency(googleProvider);
+
+    // Cognito hosted UI domain
+    const userPoolDomain = userPool.addDomain("UserPoolDomain", {
+      cognitoDomain: {
+        domainPrefix:
+          props.stage === "prod" ? "coderhelm" : `coderhelm-${props.stage}`,
+      },
+    });
 
     // --- SQS Queues ---
 
@@ -125,6 +218,9 @@ export class ApiStack extends cdk.Stack {
         SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
         MODEL_ID: "us.anthropic.claude-sonnet-4-6",
+        COGNITO_USER_POOL_ID: userPool.userPoolId,
+        COGNITO_CLIENT_ID: userPoolClient.userPoolClientId,
+        COGNITO_DOMAIN: userPoolDomain.domainName,
         RUST_LOG: "info",
       },
     });
@@ -159,6 +255,32 @@ export class ApiStack extends cdk.Stack {
           `arn:aws:bedrock:*::foundation-model/*`,
           `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
         ],
+      })
+    );
+
+    // Cognito access for auth flows
+    this.gatewayFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "cognito-idp:SignUp",
+          "cognito-idp:ConfirmSignUp",
+          "cognito-idp:InitiateAuth",
+          "cognito-idp:RespondToAuthChallenge",
+          "cognito-idp:ForgotPassword",
+          "cognito-idp:ConfirmForgotPassword",
+          "cognito-idp:ChangePassword",
+          "cognito-idp:GetUser",
+          "cognito-idp:AdminGetUser",
+          "cognito-idp:AdminUpdateUserAttributes",
+          "cognito-idp:AdminDisableUser",
+          "cognito-idp:AdminDeleteUser",
+          "cognito-idp:AdminCreateUser",
+          "cognito-idp:AdminSetUserMFAPreference",
+          "cognito-idp:AssociateSoftwareToken",
+          "cognito-idp:VerifySoftwareToken",
+          "cognito-idp:DescribeUserPoolClient",
+        ],
+        resources: [userPool.userPoolArn],
       })
     );
 
@@ -243,6 +365,14 @@ export class ApiStack extends cdk.Stack {
     // Outputs
     new cdk.CfnOutput(this, "ApiUrl", {
       value: httpApi.apiEndpoint,
+    });
+
+    new cdk.CfnOutput(this, "UserPoolId", {
+      value: userPool.userPoolId,
+    });
+
+    new cdk.CfnOutput(this, "UserPoolClientId", {
+      value: userPoolClient.userPoolClientId,
     });
 
     // --- Custom domain: api.coderhelm.com ---

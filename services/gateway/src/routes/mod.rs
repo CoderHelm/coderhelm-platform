@@ -7,3 +7,4 @@ pub mod infrastructure;
 pub mod jira_webhook;
 pub mod plans;
 pub mod stripe_webhook;
+pub mod users;
