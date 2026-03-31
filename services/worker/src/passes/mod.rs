@@ -783,5 +783,8 @@ async fn is_subscription_allowed(state: &WorkerState, tenant_id: &str) -> bool {
         })
         .unwrap_or_default();
 
-    matches!(status.as_str(), "active" | "free" | "trialing")
+    matches!(
+        status.as_str(),
+        "" | "none" | "active" | "free" | "trialing"
+    )
 }
