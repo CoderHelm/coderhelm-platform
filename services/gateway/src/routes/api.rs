@@ -2380,7 +2380,9 @@ pub async fn get_workflow_settings(
         .cloned()
         .unwrap_or_else(|| "github".to_string());
 
-    Ok(Json(json!({ "commit_openspec": commit_openspec, "default_destination": default_destination })))
+    Ok(Json(
+        json!({ "commit_openspec": commit_openspec, "default_destination": default_destination }),
+    ))
 }
 
 /// PUT /api/settings/workflow — update workflow preferences.

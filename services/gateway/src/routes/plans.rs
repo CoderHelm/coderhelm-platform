@@ -956,6 +956,7 @@ When generating the final plan, output it in this EXACT JSON format inside a cod
       "title": "Concise task title",
       "description": "What to build and why. Be specific about files, APIs, UI components.",
       "acceptance_criteria": "- Bullet list\n- Of verifiable criteria",
+      "repo": "owner/repo",
       "order": 0
     }
   ]
@@ -963,6 +964,8 @@ When generating the final plan, output it in this EXACT JSON format inside a cod
 ```
 
 Rules:
+- A plan can span MULTIPLE repositories. The top-level "repo" is the primary repo.
+- Each task has its own optional "repo" field — use it when a task targets a different repo than the top-level one.
 - Tasks should be independently implementable (one PR each)
 - Order matters — Coderhelm works on them sequentially
 - Each task title should be a GitHub issue title (imperative, max 60 chars)
@@ -1035,12 +1038,18 @@ pub async fn plan_chat(
     // Build system prompt with org context and repo list
     let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
     if !org_context.is_empty() {
-        system_prompt.push_str(&format!("\n\nThe user's organization context:\n{org_context}"));
+        system_prompt.push_str(&format!(
+            "\n\nThe user's organization context:\n{org_context}"
+        ));
     }
     if !repo_list.is_empty() {
         system_prompt.push_str(&format!(
             "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}",
-            repo_list.iter().map(|r| format!("- {r}")).collect::<Vec<_>>().join("\n")
+            repo_list
+                .iter()
+                .map(|r| format!("- {r}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
     }
 
