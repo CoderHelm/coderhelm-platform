@@ -173,6 +173,9 @@ pub struct ReviewComment {
     pub body: String,
     #[serde(default)]
     pub comment_id: Option<u64>,
+    /// GraphQL node ID for resolving the review thread.
+    #[serde(default)]
+    pub node_id: Option<String>,
     /// When true, this comment is prior thread context — not a comment to reply to.
     #[serde(default)]
     pub is_context: bool,

@@ -590,6 +590,42 @@ impl GitHubClient {
         self.post(&url, &serde_json::json!({"body": body})).await
     }
 
+    /// Resolve a PR review thread by its GraphQL node ID.
+    pub async fn resolve_review_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let query = serde_json::json!({
+            "query": "mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { isResolved } } }",
+            "variables": { "id": thread_id }
+        });
+        self.post("https://api.github.com/graphql", &query).await
+    }
+
+    /// Get review thread IDs for specific comment node IDs.
+    /// Returns a map of comment_node_id -> thread_node_id.
+    pub async fn get_review_thread_ids(
+        &self,
+        comment_node_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let mut map = std::collections::HashMap::new();
+        for node_id in comment_node_ids {
+            let query = serde_json::json!({
+                "query": "query($id: ID!) { node(id: $id) { ... on PullRequestReviewComment { pullRequestReviewThread { id } } } }",
+                "variables": { "id": node_id }
+            });
+            let resp = self.post("https://api.github.com/graphql", &query).await?;
+            if let Some(thread_id) = resp
+                .pointer("/data/node/pullRequestReviewThread/id")
+                .and_then(|v| v.as_str())
+            {
+                map.insert(node_id.to_string(), thread_id.to_string());
+            }
+        }
+        Ok(map)
+    }
+
     // ─── Check runs ─────────────────────────────────────────────
 
     /// Download check run / action job logs.
