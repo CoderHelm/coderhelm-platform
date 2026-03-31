@@ -90,7 +90,7 @@ export class WorkerStack extends cdk.Stack {
     props.plansTable.grantReadWriteData(this.workerFunction);
     props.jiraConfigTable.grantReadData(this.workerFunction);
     props.reposTable.grantReadWriteData(this.workerFunction);
-    props.settingsTable.grantReadData(this.workerFunction);
+    props.settingsTable.grantReadWriteData(this.workerFunction);
     props.infraTable.grantReadWriteData(this.workerFunction);
     props.billingTable.grantReadWriteData(this.workerFunction);
     props.bucket.grantReadWrite(this.workerFunction);
