@@ -258,6 +258,7 @@ async fn main() -> Result<(), Error> {
         // Webhooks (public, verified by signature)
         .route("/webhooks/github", post(routes::github_webhook::handle))
         .route("/webhooks/jira/:token", post(routes::jira_webhook::handle))
+        .route("/webhooks/jira", post(routes::jira_webhook::handle_forge))
         .route(
             "/integrations/jira/forge-register",
             post(routes::api::forge_register_urls),

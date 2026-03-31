@@ -7,13 +7,6 @@ exports.handler = async (event, context) => {
   const issue = event.issue || {};
   const fields = issue.fields || {};
 
-  // Only proceed if the issue is assigned to someone
-  const assignee = fields.assignee;
-  if (!assignee) {
-    console.log(`Skipping ${issue.key} — no assignee`);
-    return;
-  }
-
   // Load config from Forge storage (set via admin page)
   const config = await storage.get("coderhelm-config");
   if (!config || !config.installationId) {
@@ -52,7 +45,7 @@ exports.handler = async (event, context) => {
         project: fields.project,
       },
     },
-    user: { displayName: assignee.displayName || "jira" },
+    user: { displayName: (fields.assignee && fields.assignee.displayName) || fields.reporter?.displayName || "jira" },
     coderhelm: {
       repo_owner: repoOwner || undefined,
       repo_name: repoName || undefined,
