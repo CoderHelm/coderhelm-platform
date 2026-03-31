@@ -165,7 +165,7 @@ async fn run_passes(
             }
             // Update run record with resolved repo
             let resolved_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
-            let _ = state
+            if let Err(e) = state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
@@ -178,7 +178,10 @@ async fn run_passes(
                     attr_s(&format!("{}#{}", msg.tenant_id, resolved_repo)),
                 )
                 .send()
-                .await;
+                .await
+            {
+                error!(run_id, error = %e, "Failed to update run with resolved repo");
+            }
         } else {
             return Err("repo_owner and repo_name are required for GitHub tickets".into());
         }
@@ -437,12 +440,24 @@ async fn complete_run(
             "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
              tokens_in = :ti, tokens_out = :to, cost_usd = :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
-             status_run_id = :sri, files_modified = :fm",
+             status_run_id = :sri, files_modified = :fm, \
+             repo = :repo, tenant_repo = :tr",
         )
         .expression_attribute_names("#status", "status")
         .expression_attribute_values(":s", attr_s("completed"))
         .expression_attribute_values(":pr", attr_s(&pr.pr_url))
         .expression_attribute_values(":pn", attr_n(pr.pr_number))
+        .expression_attribute_values(
+            ":repo",
+            attr_s(&format!("{}/{}", msg.repo_owner, msg.repo_name)),
+        )
+        .expression_attribute_values(
+            ":tr",
+            attr_s(&format!(
+                "{}#{}/{}",
+                msg.tenant_id, msg.repo_owner, msg.repo_name
+            )),
+        )
         .expression_attribute_values(":b", attr_s(&pr.branch))
         .expression_attribute_values(":ti", attr_n(usage.input_tokens))
         .expression_attribute_values(":to", attr_n(usage.output_tokens))
