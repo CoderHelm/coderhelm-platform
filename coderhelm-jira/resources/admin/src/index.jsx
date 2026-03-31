@@ -4,21 +4,19 @@ import { invoke } from "@forge/bridge";
 
 function App() {
   const [installationId, setInstallationId] = useState("");
-  const [tenantId, setTenantId] = useState("");
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     invoke("getConfig").then((config) => {
       setInstallationId(config.installationId || "");
-      setTenantId(config.tenantId || "");
       setLoading(false);
     });
   }, []);
 
   const save = async () => {
     setStatus("Saving…");
-    const result = await invoke("saveConfig", { installationId, tenantId });
+    const result = await invoke("saveConfig", { installationId });
     if (!result.success) {
       setStatus(`Error: ${result.error}`);
     } else if (result.urlsRegistered) {
@@ -47,11 +45,11 @@ function App() {
 
       <div style={styles.setupBox}>
         <p style={styles.setupText}>
-          <strong>Where to find these values:</strong> Go to{" "}
+          <strong>Where to find your Installation ID:</strong> Go to{" "}
           <a href="https://app.coderhelm.com/settings/jira" target="_blank" rel="noopener noreferrer" style={styles.link}>
             app.coderhelm.com → Settings → Jira
           </a>
-          . Your Installation ID and Tenant ID are shown in Step 2 with copy buttons.
+          . Your Installation ID is shown in Step 2 with a copy button.
         </p>
       </div>
 
@@ -67,19 +65,6 @@ function App() {
         </label>
         <p style={styles.hint}>
           Copy this from the coderhelm dashboard → Settings → Jira → Step 2.
-        </p>
-
-        <label style={styles.label}>
-          Tenant ID <span style={styles.optional}>(optional)</span>
-          <input
-            style={styles.input}
-            value={tenantId}
-            onChange={(e) => setTenantId(e.target.value)}
-            placeholder="e.g. TENANT#120248482"
-          />
-        </label>
-        <p style={styles.hint}>
-          Only needed if shown differently from Installation ID in the dashboard.
         </p>
 
         <button style={styles.button} onClick={save}>
@@ -114,7 +99,7 @@ const styles = {
   label: { display: "block", fontSize: 13, fontWeight: 600, color: "#172B4D", marginBottom: 4 },
   input: { display: "block", width: "100%", padding: "8px 10px", fontSize: 14, border: "1px solid #DFE1E6", borderRadius: 4, marginTop: 4, marginBottom: 4, boxSizing: "border-box" },
   hint: { fontSize: 12, color: "#626F86", marginTop: 0, marginBottom: 16 },
-  optional: { fontWeight: 400, color: "#626F86" },
+
   button: { background: "#0052CC", color: "#fff", border: "none", borderRadius: 4, padding: "8px 20px", fontSize: 14, fontWeight: 600, cursor: "pointer" },
   status: { fontSize: 13, color: "#00875A", marginTop: 8 },
   loading: { textAlign: "center", color: "#626F86", padding: 40 },
