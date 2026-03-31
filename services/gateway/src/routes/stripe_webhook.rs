@@ -287,6 +287,38 @@ async fn handle_subscription_cancelled(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let customer_id = subscription["customer"].as_str().unwrap_or("");
     let tenant_id = resolve_tenant(state, customer_id).await?;
+    let cancelled_sub_id = subscription["id"].as_str().unwrap_or("");
+
+    // Only cancel if this is the CURRENT subscription — ignore stale/old subscription deletions
+    if !cancelled_sub_id.is_empty() {
+        let billing_item = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.billing_table_name)
+            .key("pk", attr_s(&tenant_id))
+            .key("sk", attr_s("BILLING"))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item().cloned());
+
+        let current_sub_id = billing_item
+            .as_ref()
+            .and_then(|item| item.get("stripe_subscription_id"))
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        if !current_sub_id.is_empty() && current_sub_id != cancelled_sub_id {
+            info!(
+                tenant_id,
+                cancelled_sub_id,
+                current_sub_id,
+                "Ignoring subscription.deleted for old/stale subscription"
+            );
+            return Ok(());
+        }
+    }
 
     // current_period_end = when access expires
     let access_until = subscription["current_period_end"]
@@ -333,6 +365,7 @@ async fn handle_subscription_updated(
     let customer_id = subscription["customer"].as_str().unwrap_or("");
     let tenant_id = resolve_tenant(state, customer_id).await?;
     let status = subscription["status"].as_str().unwrap_or("unknown");
+    let sub_id = subscription["id"].as_str().unwrap_or("");
     let plan_id = subscription["items"]["data"][0]["price"]["id"]
         .as_str()
         .unwrap_or("");
@@ -359,12 +392,13 @@ async fn handle_subscription_updated(
             .key("sk", attr_s("BILLING"))
             .update_expression(
                 "SET subscription_status = :status, plan_id = :plan, \
-                 access_until = :end, updated_at = :t",
+                 access_until = :end, updated_at = :t, stripe_subscription_id = :sid",
             )
             .expression_attribute_values(":status", attr_s(status))
             .expression_attribute_values(":plan", attr_s(plan_id))
             .expression_attribute_values(":end", attr_s(&access_until))
             .expression_attribute_values(":t", attr_s(&now))
+            .expression_attribute_values(":sid", attr_s(sub_id))
             .send()
             .await?;
     } else if status == "active" {
@@ -376,12 +410,14 @@ async fn handle_subscription_updated(
             .key("pk", attr_s(&tenant_id))
             .key("sk", attr_s("BILLING"))
             .update_expression(
-                "SET subscription_status = :status, plan_id = :plan, updated_at = :t \
+                "SET subscription_status = :status, plan_id = :plan, \
+                 updated_at = :t, stripe_subscription_id = :sid \
                  REMOVE access_until, cancelled_at",
             )
             .expression_attribute_values(":status", attr_s(status))
             .expression_attribute_values(":plan", attr_s(plan_id))
             .expression_attribute_values(":t", attr_s(&now))
+            .expression_attribute_values(":sid", attr_s(sub_id))
             .send()
             .await?;
     } else {
@@ -392,11 +428,13 @@ async fn handle_subscription_updated(
             .key("pk", attr_s(&tenant_id))
             .key("sk", attr_s("BILLING"))
             .update_expression(
-                "SET subscription_status = :status, plan_id = :plan, updated_at = :t",
+                "SET subscription_status = :status, plan_id = :plan, \
+                 updated_at = :t, stripe_subscription_id = :sid",
             )
             .expression_attribute_values(":status", attr_s(status))
             .expression_attribute_values(":plan", attr_s(plan_id))
             .expression_attribute_values(":t", attr_s(&now))
+            .expression_attribute_values(":sid", attr_s(sub_id))
             .send()
             .await?;
     }
