@@ -303,6 +303,36 @@ pub async fn handle(
         installation_id, ticket_key, repo_owner, repo_name, "Jira webhook received"
     );
 
+    // Dedup: skip if this ticket already has a run (running or completed)
+    let existing_runs = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("tenant_id = :tid")
+        .filter_expression("ticket_id = :ticket")
+        .expression_attribute_values(":tid", attr_s(&tenant_id))
+        .expression_attribute_values(":ticket", attr_s(ticket_key))
+        .limit(5)
+        .send()
+        .await;
+
+    if let Ok(result) = existing_runs {
+        if !result.items().is_empty() {
+            info!(ticket_key, "Skipping — ticket already has a run");
+            log_jira_event(
+                &state,
+                &tenant_id,
+                event_type,
+                ticket_key,
+                &title,
+                "duplicate",
+                None,
+            )
+            .await;
+            return Ok(StatusCode::OK);
+        }
+    }
+
     let message = WorkerMessage::Ticket(TicketMessage {
         tenant_id: tenant_id.clone(),
         installation_id,

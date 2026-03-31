@@ -146,6 +146,27 @@ async fn handle_issue_event(
         return Ok(StatusCode::OK);
     }
 
+    // Dedup: skip if this ticket already has a run
+    let ticket_id_str = format!("GH-{}", issue["number"].as_u64().unwrap_or(0));
+    let existing = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("tenant_id = :tid")
+        .filter_expression("ticket_id = :ticket")
+        .expression_attribute_values(":tid", attr_s(&tenant_id))
+        .expression_attribute_values(":ticket", attr_s(&ticket_id_str))
+        .limit(5)
+        .send()
+        .await;
+
+    if let Ok(result) = existing {
+        if !result.items().is_empty() {
+            info!(ticket_id = %ticket_id_str, "Skipping — ticket already has a run");
+            return Ok(StatusCode::OK);
+        }
+    }
+
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
 
