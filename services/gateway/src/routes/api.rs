@@ -2373,7 +2373,14 @@ pub async fn get_workflow_settings(
         .copied()
         .unwrap_or(false); // default: off
 
-    Ok(Json(json!({ "commit_openspec": commit_openspec })))
+    let default_destination = result
+        .item()
+        .and_then(|i| i.get("default_destination"))
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_else(|| "github".to_string());
+
+    Ok(Json(json!({ "commit_openspec": commit_openspec, "default_destination": default_destination })))
 }
 
 /// PUT /api/settings/workflow — update workflow preferences.
@@ -2383,6 +2390,10 @@ pub async fn update_workflow_settings(
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
     let commit_openspec = body["commit_openspec"].as_bool().unwrap_or(true);
+    let default_destination = body["default_destination"]
+        .as_str()
+        .filter(|d| *d == "github" || *d == "jira")
+        .unwrap_or("github");
 
     state
         .dynamo
@@ -2394,6 +2405,7 @@ pub async fn update_workflow_settings(
             "commit_openspec",
             aws_sdk_dynamodb::types::AttributeValue::Bool(commit_openspec),
         )
+        .item("default_destination", attr_s(default_destination))
         .send()
         .await
         .map_err(|e| {
