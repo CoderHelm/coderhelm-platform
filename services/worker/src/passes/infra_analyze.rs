@@ -399,11 +399,11 @@ async fn get_tenant(
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
 
-    // Get repos from a separate query
+    // Get repos from the repos table
     let repos_result = state
         .dynamo
         .query()
-        .table_name(&state.config.infra_table_name)
+        .table_name(&state.config.repos_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", AttributeValue::S(tenant_id.to_string()))
         .expression_attribute_values(":prefix", AttributeValue::S("REPO#".to_string()))
