@@ -631,6 +631,140 @@ pub async fn list_repos(
     Ok(Json(json!({ "repos": repos })))
 }
 
+/// POST /api/repos/sync — fetch repos from GitHub API and write missing ones to DynamoDB.
+/// Used when the initial installation webhook didn't include repos (e.g. "All repositories" access).
+pub async fn sync_repos(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    // Get installation_id from META record
+    let meta = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("META"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch tenant meta: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let installation_id = meta
+        .item()
+        .and_then(|i| i.get("github_install_id"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .ok_or_else(|| {
+            warn!("No installation_id found for tenant");
+            StatusCode::NOT_FOUND
+        })?;
+
+    // Fetch repos from GitHub API
+    let token = crate::auth::github_app::get_installation_token(&state, installation_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get installation token: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let mut fetched: Vec<OnboardRepo> = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let url =
+            format!("https://api.github.com/installation/repositories?per_page=100&page={page}");
+        let resp = state
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "Coderhelm-bot")
+            .send()
+            .await
+            .map_err(|e| {
+                error!("GitHub API request failed: {e}");
+                StatusCode::BAD_GATEWAY
+            })?
+            .error_for_status()
+            .map_err(|e| {
+                error!("GitHub API error: {e}");
+                StatusCode::BAD_GATEWAY
+            })?;
+
+        let body: Value = resp.json().await.map_err(|e| {
+            error!("Failed to parse GitHub response: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+        if let Some(arr) = body["repositories"].as_array() {
+            for r in arr {
+                if let Some(full_name) = r["full_name"].as_str() {
+                    let parts: Vec<&str> = full_name.splitn(2, '/').collect();
+                    if parts.len() == 2 {
+                        fetched.push(OnboardRepo {
+                            owner: parts[0].to_string(),
+                            name: parts[1].to_string(),
+                            default_branch: r["default_branch"]
+                                .as_str()
+                                .unwrap_or("main")
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            if arr.len() < 100 {
+                break;
+            }
+        } else {
+            break;
+        }
+        page += 1;
+    }
+
+    // Write any repos not already in DynamoDB
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut added = 0u64;
+    for repo in &fetched {
+        let full = format!("{}/{}", repo.owner, repo.name);
+        let sk = format!("REPO#{full}");
+
+        // Only write if not already present
+        let exists = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.repos_table_name)
+            .key("pk", attr_s(&claims.tenant_id))
+            .key("sk", attr_s(&sk))
+            .projection_expression("pk")
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item().cloned())
+            .is_some();
+
+        if !exists {
+            let _ = state
+                .dynamo
+                .put_item()
+                .table_name(&state.config.repos_table_name)
+                .item("pk", attr_s(&claims.tenant_id))
+                .item("sk", attr_s(&sk))
+                .item("repo_name", attr_s(&full))
+                .item("enabled", AttributeValue::Bool(false))
+                .item("ticket_source", attr_s("github"))
+                .item("created_at", attr_s(&now))
+                .send()
+                .await;
+            added += 1;
+        }
+    }
+
+    info!(total = fetched.len(), added, "Synced repos from GitHub API");
+
+    Ok(Json(json!({ "total": fetched.len(), "added": added })))
+}
+
 /// GET /api/integrations/jira/check — quick Jira integration readiness check.
 pub async fn get_jira_integration_check(
     State(state): State<Arc<AppState>>,

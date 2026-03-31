@@ -74,6 +74,7 @@ async fn main() -> Result<(), Error> {
         .route("/runs/:run_id/retry", post(routes::api::retry_run))
         .route("/runs/:run_id/re-review", post(routes::api::re_review_run))
         .route("/repos", get(routes::api::list_repos))
+        .route("/repos/sync", post(routes::api::sync_repos))
         .route(
             "/repos/:owner/:name",
             post(routes::api::update_repo).delete(routes::api::delete_repo),
