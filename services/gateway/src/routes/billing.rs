@@ -712,13 +712,14 @@ pub async fn list_invoices(
         .iter()
         .filter(|item| {
             let status = item.get("status").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or("");
-            status == "paid" || status == "partially_paid"
+            matches!(status, "paid" | "partially_paid" | "refunded" | "partially_refunded")
         })
         .map(|item| {
             json!({
                 "invoice_id": item.get("stripe_invoice_id").and_then(|v| v.as_s().ok()),
                 "invoice_number": item.get("invoice_number").and_then(|v| v.as_s().ok()),
                 "amount_cents": item.get("amount_cents").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
+                "amount_refunded_cents": item.get("amount_refunded_cents").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
                 "period": item.get("period").and_then(|v| v.as_s().ok()),
                 "status": item.get("status").and_then(|v| v.as_s().ok()),
                 "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
