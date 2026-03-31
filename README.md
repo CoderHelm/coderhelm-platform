@@ -33,13 +33,47 @@ GitHub webhook event
 
 | Tool | Minimum Version | Notes |
 |---|---|---|
+| **Native path** | | |
 | Rust | 1.80+ | `rustup update stable` |
 | `cargo-lambda` | latest | `cargo install cargo-lambda` |
 | `cargo-zigbuild` | latest | `pip3 install cargo-zigbuild` |
 | Zig | latest | installed via `mlugg/setup-zig` in CI, or manually |
+| **Docker path (alternative)** | | |
+| Docker | Engine 24+ | Alternative to the native Rust/Zig toolchain above |
+| **Common** | | |
 | Node.js | LTS 20+ | required for AWS CDK |
 | AWS CDK v2 | latest | `npm install -g aws-cdk` |
 | AWS CLI | v2 | configured with valid credentials |
+
+## Docker Build
+
+As an alternative to installing Rust, Zig, and `cargo-zigbuild` locally, you can build the Lambda binaries with Docker.
+
+### Build both services
+
+```bash
+docker compose build
+```
+
+### Extract the bootstrap binaries
+
+The compiled `bootstrap` binary lives at `/bootstrap` inside each image. Extract them to the paths CDK expects:
+
+```bash
+# Gateway
+mkdir -p services/gateway/target/lambda/gateway
+id=$(docker create coderhelm-gateway:local)
+docker cp "$id:/bootstrap" services/gateway/target/lambda/gateway/bootstrap
+docker rm "$id"
+
+# Worker
+mkdir -p services/worker/target/lambda/worker
+id=$(docker create coderhelm-worker:local)
+docker cp "$id:/bootstrap" services/worker/target/lambda/worker/bootstrap
+docker rm "$id"
+```
+
+This is equivalent to the native `cargo zigbuild` path and produces the same aarch64 musl-linked binaries.
 
 ## Setup
 

@@ -1,0 +1,13 @@
+**/target/
+**/node_modules/
+infra/cdk.out/
+infra/**/*.js
+infra/**/*.d.ts
+dashboard/.next/
+dashboard/out/
+out/
+.git/
+.idea/
+.vscode/
+**/.DS_Store
+**/Thumbs.db

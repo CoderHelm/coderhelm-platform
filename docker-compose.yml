@@ -1,0 +1,12 @@
+services:
+  gateway:
+    build:
+      context: ./services
+      dockerfile: gateway/Dockerfile
+    image: coderhelm-gateway:local
+
+  worker:
+    build:
+      context: ./services
+      dockerfile: worker/Dockerfile
+    image: coderhelm-worker:local
