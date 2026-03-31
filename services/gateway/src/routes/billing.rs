@@ -636,8 +636,8 @@ async fn lookup_customer_id_for_tenant(state: &AppState, tenant_id: &str) -> Opt
         .map(|cid| cid.to_string())
 }
 
-/// Get the customer's default payment method from Stripe.
-/// Returns the payment_method ID if one exists on the customer.
+/// Get a payment method for the customer from Stripe.
+/// Checks default PM first, then falls back to listing attached payment methods.
 async fn get_customer_default_pm(
     state: &AppState,
     stripe_key: &str,
@@ -653,17 +653,35 @@ async fn get_customer_default_pm(
         .ok()?;
     let customer: Value = resp.json().await.ok()?;
 
-    // Check invoice_settings.default_payment_method first (most common),
-    // then fall back to default_source
-    customer["invoice_settings"]["default_payment_method"]
+    // 1. Check invoice_settings.default_payment_method
+    if let Some(pm) = customer["invoice_settings"]["default_payment_method"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            customer["default_source"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-        })
-        .map(|s| s.to_string())
+    {
+        return Some(pm.to_string());
+    }
+
+    // 2. Check default_source
+    if let Some(src) = customer["default_source"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        return Some(src.to_string());
+    }
+
+    // 3. Fall back to listing attached payment methods (picks the most recent card)
+    let list_url = format!(
+        "https://api.stripe.com/v1/payment_methods?customer={customer_id}&type=card&limit=1"
+    );
+    let list_resp = state
+        .http
+        .get(&list_url)
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await
+        .ok()?;
+    let list_body: Value = list_resp.json().await.ok()?;
+    list_body["data"][0]["id"].as_str().map(|s| s.to_string())
 }
 
 /// Create a Stripe customer for a tenant.
