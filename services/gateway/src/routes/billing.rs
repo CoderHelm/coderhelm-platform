@@ -467,10 +467,14 @@ pub async fn create_subscription(
         return Err(StatusCode::CONFLICT);
     }
 
+    // If customer has a saved default payment method, skip the card form
+    // and let Stripe auto-charge it.
+    let default_pm = get_customer_default_pm(&state, stripe_key, &customer_id).await;
+    let has_saved_pm = default_pm.is_some();
+
     let mut form_params: Vec<(&str, &str)> = vec![
         ("customer", &customer_id),
         ("items[0][price]", price_id),
-        ("payment_behavior", "default_incomplete"),
         (
             "payment_settings[save_default_payment_method]",
             "on_subscription",
@@ -480,9 +484,12 @@ pub async fn create_subscription(
         ("metadata[tenant_id]", &claims.tenant_id),
     ];
 
-    // If customer has a saved default payment method, attach it so Stripe
-    // uses it automatically instead of showing a card form.
-    let default_pm = get_customer_default_pm(&state, stripe_key, &customer_id).await;
+    // Only require frontend confirmation if there's no saved PM.
+    // With a saved PM, Stripe charges it automatically.
+    if !has_saved_pm {
+        form_params.push(("payment_behavior", "default_incomplete"));
+    }
+
     if let Some(ref pm_id) = default_pm {
         form_params.push(("default_payment_method", pm_id));
     }
@@ -522,15 +529,10 @@ pub async fn create_subscription(
         return Err(StatusCode::BAD_GATEWAY);
     }
 
-    let client_secret = subscription["latest_invoice"]["payment_intent"]["client_secret"]
-        .as_str()
-        .ok_or_else(|| {
-            error!("Stripe subscription missing payment_intent client_secret");
-            StatusCode::BAD_GATEWAY
-        })?;
-
-    // Store subscription ID so webhooks and cancel work
+    // When a saved PM was charged, the subscription may already be active.
+    let sub_status = subscription["status"].as_str().unwrap_or("incomplete");
     let sub_id = subscription["id"].as_str().unwrap_or("");
+
     if !sub_id.is_empty() {
         let _ = state
             .dynamo
@@ -542,11 +544,28 @@ pub async fn create_subscription(
                 "SET stripe_subscription_id = :sid, subscription_status = :s, updated_at = :t",
             )
             .expression_attribute_values(":sid", attr_s(sub_id))
-            .expression_attribute_values(":s", attr_s("incomplete"))
+            .expression_attribute_values(":s", attr_s(sub_status))
             .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
             .send()
             .await;
     }
+
+    // If the subscription is already active (saved PM auto-charged), no client_secret needed
+    if sub_status == "active" {
+        info!(
+            tenant_id = %claims.tenant_id,
+            sub_id,
+            "Subscription auto-activated with saved payment method"
+        );
+        return Ok(Json(json!({ "already_active": true })));
+    }
+
+    let client_secret = subscription["latest_invoice"]["payment_intent"]["client_secret"]
+        .as_str()
+        .ok_or_else(|| {
+            error!("Stripe subscription missing payment_intent client_secret");
+            StatusCode::BAD_GATEWAY
+        })?;
 
     Ok(Json(json!({ "client_secret": client_secret })))
 }
