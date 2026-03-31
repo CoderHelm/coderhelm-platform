@@ -78,13 +78,6 @@ The secret must be a JSON object with the following keys:
 }
 ```
 
-## Environment Variables
-
-| Variable | Description | Required | Default |
-|---|---|---|---|
-| `MODEL_ID` | Bedrock model ID (e.g. `us.anthropic.claude-opus-4-6-v1`) | Yes | _no default_ |
-| `STAGE` | Deployment stage (`dev` or `prod`) | No | `prod` |
-
 ## Deploy
 
 ```bash
@@ -92,27 +85,3 @@ MODEL_ID="your-model-id" cdk deploy --all
 ```
 
 > **CI/CD:** Pushing to `main` automatically triggers `.github/workflows/deploy.yml`, which builds the Rust workspace, packages the Lambda artifacts, and runs `cdk deploy --all` in the target AWS account.
-
-## GitHub App Registration
-
-1. Navigate to <https://github.com/settings/apps/new>
-2. Set **Homepage URL** to `https://coderhelm.com`
-3. Set **Webhook URL** to `https://api.coderhelm.com/webhooks/github`
-4. Configure **Permissions**:
-   - Contents — Read & Write
-   - Issues — Read & Write
-   - Pull requests — Read & Write
-   - Checks — Read
-   - Metadata — Read
-5. Subscribe to **Events**:
-   - Issues
-   - Issue comment
-   - Pull request review
-   - Check run
-   - Installation
-6. Generate a **private key** and store it in the `coderhelm/<stage>/secrets` Secrets Manager entry under the `github_private_key` key.
-
-## Further Reading
-
-- [SETUP.md](SETUP.md) — detailed setup and deployment guide
-- [Jira Integration](docs/jira-integration.md) — connecting CoderHelm to Jira
