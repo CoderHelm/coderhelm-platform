@@ -343,6 +343,22 @@ async fn process_jira_payload(
         }
     }
 
+    // Check token budget before processing
+    if let Some(_reason) = super::github_webhook::check_run_budget(state, tenant_id).await {
+        info!(tenant_id, "Jira webhook skipped — token limit reached");
+        log_jira_event(
+            state,
+            tenant_id,
+            event_type,
+            ticket_key,
+            &title,
+            "token_limit",
+            None,
+        )
+        .await;
+        return Ok(StatusCode::OK);
+    }
+
     let message = WorkerMessage::Ticket(TicketMessage {
         tenant_id: tenant_id.to_string(),
         installation_id,

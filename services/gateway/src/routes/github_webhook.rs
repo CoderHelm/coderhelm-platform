@@ -375,6 +375,12 @@ async fn handle_pr_review(
     let name = repo["name"].as_str().unwrap_or("");
     let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
 
+    if let Some(reason) = check_run_budget(state, &tenant_id).await {
+        info!(tenant_id, "PR review skipped — token limit reached");
+        post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
+        return Ok(StatusCode::OK);
+    }
+
     let run_id = lookup_run_by_pr(state, &tenant_id, owner, name, pr_number).await;
     if run_id.is_empty() {
         warn!(pr_number, "No run found for PR — skipping feedback");
@@ -423,6 +429,11 @@ async fn handle_check_run(
 
     let tenant_id = format!("TENANT#{installation_id}");
     let repo = &payload["repository"];
+
+    if let Some(_reason) = check_run_budget(state, &tenant_id).await {
+        info!(tenant_id, "CI fix skipped — token limit reached");
+        return Ok(StatusCode::OK);
+    }
 
     let message = WorkerMessage::CiFix(CiFixMessage {
         tenant_id,
@@ -1042,7 +1053,7 @@ fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValu
 }
 
 /// Check whether this tenant has budget remaining. Returns Some(reason) if blocked.
-async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
+pub async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
     // 1. Read current month's token usage from analytics
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     let analytics = state
