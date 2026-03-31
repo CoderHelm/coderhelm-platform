@@ -486,7 +486,18 @@ async fn handle_installation(
             }
 
             // Write REPO# items so the dashboard can list them
-            let repos = extract_repos_from_installation(payload);
+            let mut repos = extract_repos_from_installation(payload);
+
+            // When installed with "All repositories", GitHub sends an empty array.
+            // Fetch repos from the API in that case.
+            if repos.is_empty() {
+                info!(
+                    installation_id,
+                    "No repos in webhook payload — fetching from GitHub API"
+                );
+                repos = fetch_installation_repos(state, installation_id).await;
+            }
+
             let now_str = now.clone();
             for repo in &repos {
                 let full = format!("{}/{}", repo.owner, repo.name);
@@ -827,6 +838,83 @@ async fn handle_repository_event(
             Ok(StatusCode::OK)
         }
     }
+}
+
+/// Fetch repos for an installation via GitHub API (used when "All repositories" is selected
+/// and the webhook payload doesn't include the repo list).
+async fn fetch_installation_repos(state: &AppState, installation_id: u64) -> Vec<OnboardRepo> {
+    let token = match crate::auth::github_app::get_installation_token(state, installation_id).await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to get installation token for repo fetch: {e}");
+            return vec![];
+        }
+    };
+
+    let mut repos = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let url =
+            format!("https://api.github.com/installation/repositories?per_page=100&page={page}");
+        let resp = state
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "Coderhelm-bot")
+            .send()
+            .await;
+
+        let body: Value = match resp {
+            Ok(r) => match r.error_for_status() {
+                Ok(r) => match r.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("Failed to parse installation repos response: {e}");
+                        break;
+                    }
+                },
+                Err(e) => {
+                    error!("GitHub API error fetching installation repos: {e}");
+                    break;
+                }
+            },
+            Err(e) => {
+                error!("HTTP error fetching installation repos: {e}");
+                break;
+            }
+        };
+
+        let page_repos = body["repositories"].as_array();
+        if let Some(arr) = page_repos {
+            for r in arr {
+                if let Some(full_name) = r["full_name"].as_str() {
+                    let parts: Vec<&str> = full_name.splitn(2, '/').collect();
+                    if parts.len() == 2 {
+                        repos.push(OnboardRepo {
+                            owner: parts[0].to_string(),
+                            name: parts[1].to_string(),
+                            default_branch: r["default_branch"]
+                                .as_str()
+                                .unwrap_or("main")
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            // Stop when we got fewer than a full page
+            if arr.len() < 100 {
+                break;
+            }
+        } else {
+            break;
+        }
+        page += 1;
+    }
+
+    info!(count = repos.len(), "Fetched repos from GitHub API");
+    repos
 }
 
 fn extract_repos_from_installation(payload: &Value) -> Vec<OnboardRepo> {

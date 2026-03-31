@@ -2163,11 +2163,34 @@ pub async fn get_budget(
 }
 
 /// PUT /api/settings/budget — set monthly budget cap.
+/// Only allowed for users with an active subscription (overage doesn't apply to free tier).
 pub async fn update_budget(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    // Block free-tier users from setting a budget cap
+    let billing = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("BILLING"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned());
+
+    let subscription_status = billing
+        .as_ref()
+        .and_then(|i| i.get("subscription_status"))
+        .and_then(|v| v.as_s().ok())
+        .map_or("none", |v| v);
+
+    if subscription_status != "active" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let max_budget_cents = body["max_budget_cents"].as_u64().unwrap_or(0);
 
     state
