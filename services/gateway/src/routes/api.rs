@@ -2511,7 +2511,7 @@ pub async fn reset_account(
             .await;
     }
 
-    // Wipe all domain tables
+    // Wipe all domain tables (pk/sk keyed)
     let tables = [
         &state.config.plans_table_name,
         &state.config.jira_config_table_name,
@@ -2519,11 +2519,38 @@ pub async fn reset_account(
         &state.config.settings_table_name,
         &state.config.infra_table_name,
         &state.config.billing_table_name,
-        &state.config.jira_events_table_name,
     ];
 
     for table in &tables {
         wipe_table(&state.dynamo, table, tid).await?;
+    }
+
+    // Wipe jira-events table (keyed by tenant_id, event_id)
+    let jira_events = state
+        .dynamo
+        .query()
+        .table_name(&state.config.jira_events_table_name)
+        .key_condition_expression("tenant_id = :tid")
+        .expression_attribute_values(":tid", attr_s(tid))
+        .projection_expression("tenant_id, event_id")
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query jira-events for reset: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    for item in jira_events.items() {
+        if let (Some(pk), Some(sk)) = (item.get("tenant_id"), item.get("event_id")) {
+            let _ = state
+                .dynamo
+                .delete_item()
+                .table_name(&state.config.jira_events_table_name)
+                .key("tenant_id", pk.clone())
+                .key("event_id", sk.clone())
+                .send()
+                .await;
+        }
     }
 
     // Wipe runs table (keyed by tenant_id, run_id)

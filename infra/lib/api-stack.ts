@@ -198,7 +198,13 @@ export class ApiStack extends cdk.Stack {
     });
 
     httpApi.addRoutes({
-      path: "/webhooks/jira",
+      path: "/webhooks/jira/{proxy+}",
+      methods: [apigatewayv2.HttpMethod.POST],
+      integration: lambdaIntegration,
+    });
+
+    httpApi.addRoutes({
+      path: "/integrations/jira/forge-register",
       methods: [apigatewayv2.HttpMethod.POST],
       integration: lambdaIntegration,
     });
