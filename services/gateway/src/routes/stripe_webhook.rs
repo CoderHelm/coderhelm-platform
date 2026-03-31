@@ -309,12 +309,31 @@ async fn handle_subscription_cancelled(
             .map(|s| s.as_str())
             .unwrap_or("");
 
+        let current_status = billing_item
+            .as_ref()
+            .and_then(|item| item.get("subscription_status"))
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        // Skip if: (a) we have a different sub_id stored (stale deletion), OR
+        // (b) the tenant is already on free/incomplete — nothing to cancel
         if !current_sub_id.is_empty() && current_sub_id != cancelled_sub_id {
             info!(
                 tenant_id,
                 cancelled_sub_id,
                 current_sub_id,
                 "Ignoring subscription.deleted for old/stale subscription"
+            );
+            return Ok(());
+        }
+
+        if matches!(current_status, "free" | "incomplete_expired" | "incomplete") {
+            info!(
+                tenant_id,
+                cancelled_sub_id,
+                current_status,
+                "Ignoring subscription.deleted — tenant already inactive"
             );
             return Ok(());
         }
@@ -421,22 +440,30 @@ async fn handle_subscription_updated(
             .send()
             .await?;
     } else {
-        state
+        // Non-active status (incomplete, incomplete_expired, past_due, etc.)
+        // Only store sub_id if it's a recoverable state (past_due) — NOT for terminal states
+        // that could overwrite a valid active subscription's ID
+        let is_terminal = matches!(status, "incomplete_expired" | "canceled");
+        let update_expr = if is_terminal {
+            "SET subscription_status = :status, plan_id = :plan, updated_at = :t"
+        } else {
+            "SET subscription_status = :status, plan_id = :plan, \
+                 updated_at = :t, stripe_subscription_id = :sid"
+        };
+        let mut update = state
             .dynamo
             .update_item()
             .table_name(&state.config.billing_table_name)
             .key("pk", attr_s(&tenant_id))
             .key("sk", attr_s("BILLING"))
-            .update_expression(
-                "SET subscription_status = :status, plan_id = :plan, \
-                 updated_at = :t, stripe_subscription_id = :sid",
-            )
+            .update_expression(update_expr)
             .expression_attribute_values(":status", attr_s(status))
             .expression_attribute_values(":plan", attr_s(plan_id))
-            .expression_attribute_values(":t", attr_s(&now))
-            .expression_attribute_values(":sid", attr_s(sub_id))
-            .send()
-            .await?;
+            .expression_attribute_values(":t", attr_s(&now));
+        if !is_terminal {
+            update = update.expression_attribute_values(":sid", attr_s(sub_id));
+        }
+        update.send().await?;
     }
 
     info!(
