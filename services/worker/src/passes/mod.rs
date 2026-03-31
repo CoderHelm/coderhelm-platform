@@ -172,10 +172,7 @@ async fn run_passes(
                 .key("tenant_id", attr_s(&msg.tenant_id))
                 .key("run_id", attr_s(run_id))
                 .update_expression("SET repo = :r, tenant_repo = :tr")
-                .expression_attribute_values(
-                    ":r",
-                    attr_s(&resolved_repo),
-                )
+                .expression_attribute_values(":r", attr_s(&resolved_repo))
                 .expression_attribute_values(
                     ":tr",
                     attr_s(&format!("{}#{}", msg.tenant_id, resolved_repo)),

@@ -8,21 +8,21 @@ const resolver = new Resolver();
 
 resolver.define("getConfig", async () => {
   const config = await storage.get("coderhelm-config");
-  return config || { installationId: "", tenantId: "" };
+  return config || { installationId: "" };
 });
 
 resolver.define("saveConfig", async ({ payload }) => {
-  const { installationId, tenantId } = payload;
+  const { installationId } = payload;
   if (!installationId) {
     return { success: false, error: "Installation ID is required" };
   }
-  await storage.set("coderhelm-config", { installationId, tenantId: tenantId || "" });
+  await storage.set("coderhelm-config", { installationId });
 
   // Auto-register web trigger URLs with the Coderhelm gateway
   try {
     const listProjectsUrl = await webTrigger.getUrl("list-projects-trigger");
     const createTicketUrl = await webTrigger.getUrl("create-ticket-trigger");
-    const tid = tenantId || `TENANT#${installationId}`;
+    const tid = `TENANT#${installationId}`;
     const res = await forgeFetch(`${GATEWAY_URL}/integrations/jira/forge-register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

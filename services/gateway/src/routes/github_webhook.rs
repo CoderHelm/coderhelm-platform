@@ -181,8 +181,41 @@ async fn handle_issue_comment(
     }
 
     let body = payload["comment"]["body"].as_str().unwrap_or("");
+    let commenter = payload["comment"]["user"]["login"].as_str().unwrap_or("");
 
-    // Trigger on `/coderhelm` slash command or @coderhelm mention
+    // If this comment is on a PR opened by coderhelm, treat as feedback
+    if payload["issue"]["pull_request"].is_object() {
+        let pr_user = payload["issue"]["user"]["login"].as_str().unwrap_or("");
+        if pr_user.contains("coderhelm") && !commenter.contains("coderhelm") {
+            let tenant_id = format!("TENANT#{installation_id}");
+            let repo = &payload["repository"];
+            let owner = repo["owner"]["login"].as_str().unwrap_or("");
+            let name = repo["name"].as_str().unwrap_or("");
+            let pr_number = payload["issue"]["number"].as_u64().unwrap_or(0);
+
+            let run_id = lookup_run_by_pr(state, &tenant_id, owner, name, pr_number).await;
+            if run_id.is_empty() {
+                warn!(pr_number, "No run found for PR comment — skipping");
+                return Ok(StatusCode::OK);
+            }
+
+            info!(pr_number, commenter, "PR comment → feedback queue");
+            let message = WorkerMessage::Feedback(FeedbackMessage {
+                tenant_id,
+                installation_id,
+                run_id,
+                repo_owner: owner.to_string(),
+                repo_name: name.to_string(),
+                pr_number,
+                review_id: 0,
+                review_body: body.to_string(),
+                comments: vec![],
+            });
+            return send_to_queue(state, &state.config.feedback_queue_url, &message).await;
+        }
+    }
+
+    // Trigger on `/coderhelm` slash command or @coderhelm mention (issues or non-bot PRs)
     let is_slash = body.starts_with("/coderhelm");
     let is_mention = body.contains("@coderhelm");
     if !is_slash && !is_mention {
