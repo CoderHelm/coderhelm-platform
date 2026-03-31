@@ -359,6 +359,14 @@ pub async fn retry_run(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    // Block if token limit exceeded
+    if super::github_webhook::check_run_budget(&state, &claims.tenant_id)
+        .await
+        .is_some()
+    {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     // Fetch the failed run
     let result = state
         .dynamo
@@ -479,6 +487,14 @@ pub async fn re_review_run(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    // Block if token limit exceeded
+    if super::github_webhook::check_run_budget(&state, &claims.tenant_id)
+        .await
+        .is_some()
+    {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     let result = state
         .dynamo
         .get_item()
