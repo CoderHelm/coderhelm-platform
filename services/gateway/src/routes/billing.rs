@@ -8,6 +8,52 @@ use crate::AppState;
 
 // ─── Usage limits (included in Pro) ─────────────────────────────────
 pub const INCLUDED_TOKENS: u64 = 5_000_000; // 5M tokens (in+out) included in Pro
+
+// ─── Rate limiting ──────────────────────────────────────────────────
+const BILLING_ACTION_COOLDOWN_SECS: i64 = 10; // Min seconds between billing write actions per tenant
+
+/// DynamoDB-based per-tenant cooldown for billing write actions.
+/// Returns Err(429) if the tenant performed a billing action too recently.
+async fn enforce_billing_cooldown(
+    state: &AppState,
+    tenant_id: &str,
+    action: &str,
+) -> Result<(), StatusCode> {
+    let now = chrono::Utc::now();
+    let key = format!("RATE#{action}");
+
+    // Try a conditional put: only succeeds if no recent entry exists
+    let result = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.table_name)
+        .item("pk", attr_s(tenant_id))
+        .item("sk", attr_s(&key))
+        .item("expires_at", attr_s(&(now + chrono::Duration::seconds(BILLING_ACTION_COOLDOWN_SECS)).to_rfc3339()))
+        .item("ttl", aws_sdk_dynamodb::types::AttributeValue::N(
+            (now.timestamp() + BILLING_ACTION_COOLDOWN_SECS + 60).to_string(),
+        ))
+        .condition_expression("attribute_not_exists(pk) OR expires_at < :now")
+        .expression_attribute_values(":now", attr_s(&now.to_rfc3339()))
+        .send()
+        .await;
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            warn!(tenant_id, action, "Billing rate limit hit");
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        }
+    }
+}
+
+/// Validate that a Stripe ID has the expected prefix (e.g. "pm_", "cus_", "sub_").
+fn validate_stripe_id(id: &str, prefix: &str) -> Result<(), StatusCode> {
+    if !id.starts_with(prefix) || id.len() > 255 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
 pub const FREE_TIER_TOKENS: u64 = 500_000; // 500K tokens for free tier
 pub const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 5; // $0.05 per 1K tokens ($50/1M)
 
@@ -311,12 +357,12 @@ pub async fn create_subscription(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    enforce_billing_cooldown(&state, &claims.tenant_id, "subscribe").await?;
+
     let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
         error!("Stripe secret key not configured");
         StatusCode::SERVICE_UNAVAILABLE
     })?;
-
-    // Use server-side price ID only — never trust client-provided price IDs
     let price_id = state
         .secrets
         .stripe_price_id
@@ -573,9 +619,10 @@ pub async fn create_subscription(
 /// Cancel all incomplete/past_due subscriptions for a Stripe customer.
 /// Prevents duplicates when concurrent subscribe requests arrive.
 async fn cancel_incomplete_subscriptions(state: &AppState, stripe_key: &str, customer_id: &str) {
+    let encoded_cid = urlencoding::encode(customer_id);
     for status in &["incomplete", "past_due"] {
         let url = format!(
-            "https://api.stripe.com/v1/subscriptions?customer={customer_id}&status={status}&limit=10"
+            "https://api.stripe.com/v1/subscriptions?customer={encoded_cid}&status={status}&limit=10"
         );
         let Ok(resp) = state
             .http
@@ -612,8 +659,9 @@ async fn has_active_stripe_subscription(
     stripe_key: &str,
     customer_id: &str,
 ) -> bool {
+    let encoded_cid = urlencoding::encode(customer_id);
     let url = format!(
-        "https://api.stripe.com/v1/subscriptions?customer={customer_id}&status=active&limit=1"
+        "https://api.stripe.com/v1/subscriptions?customer={encoded_cid}&status=active&limit=1"
     );
     let Ok(resp) = state
         .http
@@ -689,8 +737,9 @@ async fn get_customer_default_pm(
     }
 
     // 3. Fall back to listing attached payment methods (picks the most recent card)
+    let encoded_cid = urlencoding::encode(customer_id);
     let list_url = format!(
-        "https://api.stripe.com/v1/payment_methods?customer={customer_id}&type=card&limit=1"
+        "https://api.stripe.com/v1/payment_methods?customer={encoded_cid}&type=card&limit=1"
     );
     let list_resp = state
         .http
@@ -878,6 +927,8 @@ pub async fn cancel_subscription(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    enforce_billing_cooldown(&state, &claims.tenant_id, "cancel").await?;
+
     let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
         error!("Stripe secret key not configured");
         StatusCode::SERVICE_UNAVAILABLE
@@ -938,6 +989,8 @@ pub async fn reactivate_subscription(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    enforce_billing_cooldown(&state, &claims.tenant_id, "reactivate").await?;
+
     let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
         error!("Stripe secret key not configured");
         StatusCode::SERVICE_UNAVAILABLE
@@ -1153,6 +1206,8 @@ pub async fn set_default_payment_method(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(pm_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    validate_stripe_id(&pm_id, "pm_")?;
+
     let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
         error!("Stripe secret key not configured");
         StatusCode::SERVICE_UNAVAILABLE
@@ -1210,6 +1265,8 @@ pub async fn delete_payment_method(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(pm_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    validate_stripe_id(&pm_id, "pm_")?;
+
     let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
         error!("Stripe secret key not configured");
         StatusCode::SERVICE_UNAVAILABLE
