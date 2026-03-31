@@ -163,11 +163,24 @@ pub async fn handle(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "coderhelm".to_string());
 
-    let issue_labels: Vec<&str> = issue
+    // Jira labels can be plain strings or objects with a "name" field
+    let raw_labels = issue
         .get("fields")
         .and_then(|f| f.get("labels"))
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .and_then(|v| v.as_array());
+
+    let issue_labels: Vec<String> = raw_labels
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    v.as_str().map(|s| s.to_string()).or_else(|| {
+                        v.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
     let has_label = issue_labels.iter().any(|l| {
@@ -187,6 +200,16 @@ pub async fn handle(
         })
         .unwrap_or("");
     let is_assigned = assignee_name.to_ascii_lowercase().contains("coderhelm");
+
+    info!(
+        labels = ?issue_labels,
+        raw_labels = ?issue.get("fields").and_then(|f| f.get("labels")),
+        assignee = %assignee_name,
+        trigger_label = %trigger_label,
+        has_label,
+        is_assigned,
+        "Jira trigger check"
+    );
 
     if !has_label && !is_assigned {
         let tk = issue.get("key").and_then(|v| v.as_str()).unwrap_or("?");
