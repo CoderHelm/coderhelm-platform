@@ -176,9 +176,23 @@ pub async fn handle(
                 .starts_with(&format!("{}:", trigger_label.to_ascii_lowercase()))
     });
 
-    if !has_label {
+    // Check assignee — trigger if assigned to "coderhelm" (case-insensitive)
+    let assignee_name = issue
+        .get("fields")
+        .and_then(|f| f.get("assignee"))
+        .and_then(|a| {
+            a.get("displayName")
+                .and_then(|v| v.as_str())
+                .or_else(|| a.get("name").and_then(|v| v.as_str()))
+        })
+        .unwrap_or("");
+    let is_assigned = assignee_name
+        .to_ascii_lowercase()
+        .contains("coderhelm");
+
+    if !has_label && !is_assigned {
         let tk = issue.get("key").and_then(|v| v.as_str()).unwrap_or("?");
-        info!(ticket_key = %tk, label = %trigger_label, "Skipping — trigger label not present");
+        info!(ticket_key = %tk, label = %trigger_label, "Skipping — no trigger label or assignee match");
         log_jira_event(&state, &tenant_id, event_type, tk, "", "filtered", None).await;
         return Ok(StatusCode::OK);
     }

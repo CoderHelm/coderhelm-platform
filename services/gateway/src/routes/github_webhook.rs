@@ -110,7 +110,7 @@ async fn handle_issue_event(
     let is_labeled = action == "labeled"
         && payload["label"]["name"]
             .as_str()
-            .map(|l| l == "coderhelm")
+            .map(|l| l.eq_ignore_ascii_case("coderhelm"))
             .unwrap_or(false);
 
     if !is_assigned_to_bot && !is_labeled {
