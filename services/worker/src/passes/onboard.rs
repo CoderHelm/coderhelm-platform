@@ -288,7 +288,8 @@ async fn onboard_repo(
         ],
         messages,
     )
-    .await?;
+    .await
+    .map_err(|e| format!("Bedrock converse failed: {e:#}"))?;
 
     let agents_md = extract_text_from_response(&response)?;
 
@@ -306,7 +307,8 @@ async fn onboard_repo(
             AttributeValue::S(chrono::Utc::now().to_rfc3339()),
         )
         .send()
-        .await?;
+        .await
+        .map_err(|e| format!("DynamoDB put AGENTS.md failed: {e:#}"))?;
 
     info!(repo = %full_name, "Stored AGENTS.md in DynamoDB");
 
