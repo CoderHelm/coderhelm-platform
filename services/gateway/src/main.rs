@@ -66,6 +66,8 @@ async fn main() -> Result<(), Error> {
     let api_routes = Router::new()
         .route("/me", get(routes::api::me))
         .route("/health", get(routes::api::health))
+        .route("/tenants", get(routes::api::list_tenants))
+        .route("/tenants/switch", post(routes::api::switch_tenant))
         .route("/runs", get(routes::api::list_runs))
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/runs/:run_id/openspec", get(routes::api::get_run_openspec))
@@ -198,6 +200,8 @@ async fn main() -> Result<(), Error> {
         )
         // Banners
         .route("/banners", get(routes::banners::list_banners))
+        // Account management
+        .route("/account/reset", post(routes::api::reset_account))
         // Plan endpoints
         .route(
             "/plans",

@@ -394,38 +394,78 @@ async fn handle_installation(
 
     match action {
         "created" => {
-            // New tenant! Provision in DynamoDB.
             let org = payload["installation"]["account"]["login"]
                 .as_str()
                 .unwrap_or("unknown");
             info!(
                 installation_id,
-                org, "New GitHub App installation — provisioning tenant"
+                org, "GitHub App installation — provisioning/reactivating tenant"
             );
 
+            let tenant_pk = format!("TENANT#{installation_id}");
             let now = chrono::Utc::now().to_rfc3339();
-            state
+
+            // Check if tenant already exists (reinstallation case)
+            let existing = state
                 .dynamo
-                .put_item()
+                .get_item()
                 .table_name(&state.config.table_name)
-                .item("pk", attr_s(&format!("TENANT#{installation_id}")))
-                .item("sk", attr_s("META"))
-                .item("github_install_id", attr_n(installation_id))
-                .item("github_org", attr_s(org))
-                .item("plan", attr_s("free"))
-                .item("status", attr_s("active"))
-                .item("run_count_mtd", attr_n(0))
-                .item("created_at", attr_s(&now))
+                .key("pk", attr_s(&tenant_pk))
+                .key("sk", attr_s("META"))
+                .projection_expression("#s")
+                .expression_attribute_names("#s", "status")
                 .send()
                 .await
-                .map_err(|e| {
-                    error!("Failed to create tenant: {e}");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
+                .ok()
+                .and_then(|r| r.item);
+
+            if existing.is_some() {
+                // Reactivate existing tenant — preserve plan, billing, etc.
+                state
+                    .dynamo
+                    .update_item()
+                    .table_name(&state.config.table_name)
+                    .key("pk", attr_s(&tenant_pk))
+                    .key("sk", attr_s("META"))
+                    .update_expression(
+                        "SET #status = :s, github_install_id = :iid, github_org = :org, reactivated_at = :t",
+                    )
+                    .expression_attribute_names("#status", "status")
+                    .expression_attribute_values(":s", attr_s("active"))
+                    .expression_attribute_values(":iid", attr_n(installation_id))
+                    .expression_attribute_values(":org", attr_s(org))
+                    .expression_attribute_values(":t", attr_s(&now))
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to reactivate tenant: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                info!(installation_id, "Reactivated existing tenant");
+            } else {
+                // Brand new tenant
+                state
+                    .dynamo
+                    .put_item()
+                    .table_name(&state.config.table_name)
+                    .item("pk", attr_s(&tenant_pk))
+                    .item("sk", attr_s("META"))
+                    .item("github_install_id", attr_n(installation_id))
+                    .item("github_org", attr_s(org))
+                    .item("plan", attr_s("free"))
+                    .item("status", attr_s("active"))
+                    .item("run_count_mtd", attr_n(0))
+                    .item("created_at", attr_s(&now))
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to create tenant: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+            }
 
             // Write REPO# items so the dashboard can list them
             let repos = extract_repos_from_installation(payload);
-            let tenant_id = format!("TENANT#{installation_id}");
             let now_str = now.clone();
             for repo in &repos {
                 let full = format!("{}/{}", repo.owner, repo.name);
@@ -433,7 +473,7 @@ async fn handle_installation(
                     .dynamo
                     .put_item()
                     .table_name(&state.config.repos_table_name)
-                    .item("pk", attr_s(&tenant_id))
+                    .item("pk", attr_s(&tenant_pk))
                     .item("sk", attr_s(&format!("REPO#{full}")))
                     .item("repo_name", attr_s(&full))
                     .item(
@@ -449,7 +489,7 @@ async fn handle_installation(
             // Enqueue onboard for all repos in the installation
             if !repos.is_empty() {
                 let onboard = WorkerMessage::Onboard(OnboardMessage {
-                    tenant_id,
+                    tenant_id: tenant_pk,
                     installation_id,
                     repos,
                 });
@@ -463,21 +503,81 @@ async fn handle_installation(
                 installation_id,
                 "GitHub App uninstalled — deactivating tenant"
             );
+            let tenant_id = format!("TENANT#{installation_id}");
             state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.table_name)
-                .key("pk", attr_s(&format!("TENANT#{installation_id}")))
+                .key("pk", attr_s(&tenant_id))
                 .key("sk", attr_s("META"))
-                .update_expression("SET #status = :s")
+                .update_expression("SET #status = :s, deactivated_at = :t")
                 .expression_attribute_names("#status", "status")
                 .expression_attribute_values(":s", attr_s("deactivated"))
+                .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
                 .send()
                 .await
                 .map_err(|e| {
                     error!("Failed to deactivate tenant: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
+
+            // Notify all users in the tenant
+            let users = state
+                .dynamo
+                .query()
+                .table_name(&state.config.users_table_name)
+                .key_condition_expression("pk = :pk")
+                .expression_attribute_values(":pk", attr_s(&tenant_id))
+                .projection_expression("email")
+                .send()
+                .await
+                .ok();
+
+            if let Some(users_result) = users {
+                for item in users_result.items() {
+                    if let Some(email) = item
+                        .get("email")
+                        .and_then(|v| v.as_s().ok())
+                        .filter(|e| !e.is_empty())
+                    {
+                        let subject = aws_sdk_sesv2::types::Content::builder()
+                            .data("Coderhelm GitHub App uninstalled")
+                            .build();
+                        let body_text =
+                            aws_sdk_sesv2::types::Content::builder()
+                                .data("The Coderhelm GitHub App has been uninstalled from your organization. Coderhelm will no longer process any runs or webhooks for this account. To restore access, reinstall the app from https://app.coderhelm.com.")
+                                .build();
+                        if let (Ok(subj), Ok(txt)) = (subject, body_text) {
+                            let _ = state
+                                .ses
+                                .send_email()
+                                .from_email_address(&state.config.ses_from_address)
+                                .destination(
+                                    aws_sdk_sesv2::types::Destination::builder()
+                                        .to_addresses(email)
+                                        .build(),
+                                )
+                                .content(
+                                    aws_sdk_sesv2::types::EmailContent::builder()
+                                        .simple(
+                                            aws_sdk_sesv2::types::Message::builder()
+                                                .subject(subj)
+                                                .body(
+                                                    aws_sdk_sesv2::types::Body::builder()
+                                                        .text(txt)
+                                                        .build(),
+                                                )
+                                                .build(),
+                                        )
+                                        .build(),
+                                )
+                                .send()
+                                .await;
+                        }
+                    }
+                }
+            }
+
             Ok(StatusCode::OK)
         }
         _ => Ok(StatusCode::OK),
