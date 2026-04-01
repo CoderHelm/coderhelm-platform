@@ -599,6 +599,7 @@ async fn check_cancelled(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_run(
     state: &WorkerState,
     msg: &TicketMessage,
