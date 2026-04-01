@@ -148,6 +148,9 @@ async fn run_passes(
         }
     };
 
+    // Load repo-level instruction files (AGENTS.md, CLAUDE.md, copilot-instructions, etc.)
+    let repo_instructions = load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
+
     // Post "working on it" comment only for GitHub-sourced tickets.
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
         github
@@ -272,6 +275,7 @@ async fn run_passes(
         &plan_result,
         &branch_name,
         &rules,
+        &repo_instructions,
         usage,
     )
     .await?;
@@ -304,7 +308,16 @@ async fn run_passes(
     // --- Pass 4: Review ---
     check_cancelled(state, &msg.tenant_id, run_id).await?;
     update_pass(state, &msg.tenant_id, run_id, "review").await?;
-    review::run(state, msg, &github, &branch_name, &rules, usage).await?;
+    review::run(
+        state,
+        msg,
+        &github,
+        &branch_name,
+        &rules,
+        &repo_instructions,
+        usage,
+    )
+    .await?;
     info!(run_id, "Review complete");
 
     // --- Pass 5: Create PR ---
@@ -770,6 +783,69 @@ pub fn format_rules_block(rules: &[String]) -> String {
         block.push_str(&format!("- {rule}\n"));
     }
     block
+}
+
+/// Format repo-level instruction files as a system prompt block.
+pub fn format_instructions_block(instructions: &str) -> String {
+    if instructions.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## Repository Instructions (from the repo's instruction files — follow these conventions)\n\n{}",
+        instructions
+    )
+}
+
+/// Well-known instruction files that coding agents/IDEs use.
+const INSTRUCTION_FILES: &[&str] = &[
+    "AGENTS.md",
+    ".github/AGENTS.md",
+    "CLAUDE.md",
+    ".claude/CLAUDE.md",
+    "COPILOT.md",
+    ".github/copilot-instructions.md",
+    "copilot-instructions.md",
+    ".cursorrules",
+    ".github/instructions.md",
+];
+
+/// Load repo-level instruction files (AGENTS.md, CLAUDE.md, copilot-instructions, etc.)
+/// from the GitHub repo. Returns combined content, capped at 16KB total.
+pub async fn load_repo_instructions(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+) -> String {
+    const MAX_TOTAL_BYTES: usize = 16_000;
+    let mut combined = String::new();
+
+    for path in INSTRUCTION_FILES {
+        if combined.len() >= MAX_TOTAL_BYTES {
+            break;
+        }
+        match github.read_file(owner, repo, path, "HEAD").await {
+            Ok(content) if !content.trim().is_empty() => {
+                let remaining = MAX_TOTAL_BYTES.saturating_sub(combined.len());
+                let truncated = if content.len() > remaining {
+                    &content[..content[..remaining].rfind('\n').unwrap_or(remaining)]
+                } else {
+                    &content
+                };
+                if !combined.is_empty() {
+                    combined.push_str("\n\n---\n\n");
+                }
+                combined.push_str(&format!("### {path}\n\n{truncated}"));
+                info!(
+                    path,
+                    bytes = truncated.len(),
+                    "Loaded repo instruction file"
+                );
+            }
+            _ => {} // File doesn't exist or can't be read — skip silently
+        }
+    }
+
+    combined
 }
 
 /// Truncate file contents to limit token usage.
