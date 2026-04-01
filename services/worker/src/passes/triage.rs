@@ -104,14 +104,25 @@ pub async fn select_repo(
     repos: &[String],
     usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let system = "You are a repo-selection agent. Given a Jira ticket and a list of repositories, \
-                  pick the single best repository for this work. Return ONLY the repo in owner/name format.";
+    let system = "You are a repo-selection agent. Given a Jira ticket, repository descriptions, \
+                  and a list of repositories, pick the single best repository for this work. \
+                  Return ONLY the repo in owner/name format.";
 
     let repo_list = repos
         .iter()
         .map(|r| format!("- {r}"))
         .collect::<Vec<_>>()
         .join("\n");
+
+    let global_agents = super::load_content(state, &msg.tenant_id, "AGENTS#GLOBAL").await;
+
+    let context_section = if global_agents.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## Repository context\n{global_agents}\n"
+        )
+    };
 
     let prompt = format!(
         r#"Pick the best repository for this Jira ticket.
@@ -122,7 +133,7 @@ Title: {title}
 
 Description:
 {body}
-
+{context_section}
 ## Available repositories
 {repo_list}
 
