@@ -50,7 +50,11 @@ pub async fn me(
         .unwrap_or_else(|| "active".to_string());
 
     // Derive auth provider from user record
-    let auth_provider = if item.get("github_login").and_then(|v| v.as_s().ok()).is_some() {
+    let auth_provider = if item
+        .get("github_login")
+        .and_then(|v| v.as_s().ok())
+        .is_some()
+    {
         "github"
     } else if claims.sub.starts_with("USER#Google_") {
         "google"

@@ -915,7 +915,11 @@ pub async fn github_callback(
                     .map(|r| r.count() as usize)
                     .unwrap_or(0);
 
-                if count == 0 { "owner".to_string() } else { "member".to_string() }
+                if count == 0 {
+                    "owner".to_string()
+                } else {
+                    "member".to_string()
+                }
             }
         };
 

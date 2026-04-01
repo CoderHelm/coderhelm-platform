@@ -272,7 +272,10 @@ async fn main() -> Result<(), Error> {
             get(routes::log_analyzer::list_connections)
                 .post(routes::log_analyzer::create_connection),
         )
-        .route("/aws-connections/cfn-url", get(routes::log_analyzer::get_cfn_url))
+        .route(
+            "/aws-connections/cfn-url",
+            get(routes::log_analyzer::get_cfn_url),
+        )
         .route(
             "/aws-connections/:id",
             put(routes::log_analyzer::update_connection)
