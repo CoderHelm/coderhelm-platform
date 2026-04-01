@@ -361,6 +361,40 @@ impl GitHubClient {
         Ok(new_sha.to_string())
     }
 
+    // ─── Merge ───────────────────────────────────────────────────
+
+    /// Merge one branch into another via the GitHub Merges API.
+    /// Returns Ok(true) if merge succeeded or was already up-to-date,
+    /// Ok(false) if there are merge conflicts (HTTP 409).
+    pub async fn merge_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/merges");
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.post(&url).json(&serde_json::json!({
+            "base": base,
+            "head": head,
+            "commit_message": format!("Merge {head} into {base}"),
+        }));
+        for (k, v) in &headers {
+            req = req.header(k.clone(), v.clone());
+        }
+        let resp = req.send().await?;
+        match resp.status().as_u16() {
+            201 | 204 => Ok(true),  // merged or already up-to-date
+            409 => Ok(false),       // conflict
+            _ => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("merge_branch failed: {status} {body}").into())
+            }
+        }
+    }
+
     // ─── Single file write ──────────────────────────────────────
 
     /// Create or update a single file via Contents API.

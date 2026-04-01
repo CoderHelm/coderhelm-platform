@@ -1612,6 +1612,16 @@ fn document_to_json(doc: &Document) -> Value {
     }
 }
 
+/// Return the MCP configs table name, falling back to settings table for migration compat.
+fn mcp_table(state: &AppState) -> &str {
+    let t = &state.config.mcp_configs_table_name;
+    if t.is_empty() {
+        &state.config.settings_table_name
+    } else {
+        t
+    }
+}
+
 /// Load enabled plugins for the tenant, returning (server_id, has_credentials, custom_prompt).
 async fn load_enabled_plugins(
     state: &AppState,
@@ -1620,7 +1630,7 @@ async fn load_enabled_plugins(
     state
         .dynamo
         .query()
-        .table_name(&state.config.settings_table_name)
+        .table_name(mcp_table(state))
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(tenant_id))
         .expression_attribute_values(":prefix", attr_s("PLUGIN#"))
@@ -1785,7 +1795,7 @@ async fn invoke_mcp_tool(
     let creds_item = state
         .dynamo
         .get_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(mcp_table(state))
         .key("pk", attr_s(tenant_id))
         .key("sk", attr_s(&format!("PLUGIN#{server_id}")))
         .send()

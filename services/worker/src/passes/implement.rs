@@ -63,9 +63,14 @@ pub async fn run(
     let mut tools = all_tools();
 
     // Load MCP plugins and their cached tool schemas
+    let mcp_table = if state.config.mcp_configs_table_name.is_empty() {
+        &state.config.settings_table_name
+    } else {
+        &state.config.mcp_configs_table_name
+    };
     let mcp_plugins = mcp::load_tenant_plugins(
         &state.dynamo,
-        &state.config.settings_table_name,
+        mcp_table,
         &msg.tenant_id,
         &super::MCP_CATALOG,
     )
