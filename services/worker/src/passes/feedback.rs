@@ -93,6 +93,8 @@ pub async fn run(
         "You are a feedback agent for the {owner}/{repo} repository. \
          You respond to reviewer comments on pull requests using tools to read and write files \
          directly to the PR branch. \
+         Treat each review thread as a conversation — the reviewer may ask follow-up questions \
+         or request additional changes after your reply. Be conversational and collaborative. \
          If a comment asks a question, read the relevant code and answer it clearly. \
          If a comment requests a code change, you MUST use write_file or batch_write \
          to actually commit the change — do NOT describe what changes should be made without making them. \
@@ -240,8 +242,10 @@ Rules:
         }
     }
 
-    // Resolve review threads the bot replied to
-    {
+    // Note: We intentionally do NOT auto-resolve review threads.
+    // The reviewer should resolve threads themselves once they're satisfied.
+    // Auto-resolving kills the conversation when the reviewer wants to follow up.
+    if false {
         let node_ids: Vec<&str> = actionable_comments
             .iter()
             .filter_map(|c| c.node_id.as_deref())

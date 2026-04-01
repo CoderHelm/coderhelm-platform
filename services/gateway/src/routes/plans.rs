@@ -1233,9 +1233,11 @@ pub async fn plan_chat(
             })
             .collect();
         system_prompt.push_str(&format!(
-            "\n\nEnabled MCP servers (the user has these integrations available — \
-             reference them when relevant, e.g. \"pull designs from Figma\" or \
-             \"check Sentry for related errors\"):\n{}",
+            "\n\nYou have tool-call access to the following MCP servers right now. \
+             You can invoke their tools directly during this conversation to look up \
+             information, search documents, read pages, or query external services. \
+             Use them proactively when the user asks about anything these servers \
+             could answer (e.g. read a Notion doc, search Figma designs, check Sentry errors):\n{}",
             plugin_lines.join("\n")
         ));
     }
