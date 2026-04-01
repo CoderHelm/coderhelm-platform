@@ -177,31 +177,32 @@ async fn handle_payment_succeeded(
     }
     update.send().await?;
 
-    // Get card details for email
-    let card_last4 = invoice["default_payment_method"]["card"]["last4"]
-        .as_str()
-        .or_else(|| invoice["charge"]["payment_method_details"]["card"]["last4"].as_str())
-        .unwrap_or("****");
+    // Skip payment receipt email for $0 invoices (e.g. trial conversions, proration credits)
+    if amount_cents > 0 {
+        let card_last4 = invoice["default_payment_method"]["card"]["last4"]
+            .as_str()
+            .or_else(|| invoice["charge"]["payment_method_details"]["card"]["last4"].as_str())
+            .unwrap_or("****");
 
-    let plan_name = invoice["lines"]["data"][0]["description"]
-        .as_str()
-        .unwrap_or("Coderhelm Pro");
+        let plan_name = invoice["lines"]["data"][0]["description"]
+            .as_str()
+            .unwrap_or("Coderhelm Pro");
 
-    // Send combined payment receipt + invoice email
-    send_billing_email(
-        state,
-        &tenant_id,
-        "payment-receipt",
-        &serde_json::json!({
-            "amount": amount,
-            "invoice_number": invoice_number,
-            "date": now.format("%B %d, %Y").to_string(),
-            "plan_name": plan_name,
-            "card_last4": card_last4,
-            "invoice_url": format!("https://app.coderhelm.com/dashboard/billing/invoices/{}", invoice_id),
-        }),
-    )
-    .await;
+        send_billing_email(
+            state,
+            &tenant_id,
+            "payment-receipt",
+            &serde_json::json!({
+                "amount": amount,
+                "invoice_number": invoice_number,
+                "date": now.format("%B %d, %Y").to_string(),
+                "plan_name": plan_name,
+                "card_last4": card_last4,
+                "invoice_url": format!("https://app.coderhelm.com/dashboard/billing/invoices/{}", invoice_id),
+            }),
+        )
+        .await;
+    }
 
     // Update invoice record status to paid
     let _ = state
