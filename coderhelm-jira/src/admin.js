@@ -22,7 +22,21 @@ resolver.define("saveConfig", async ({ payload }) => {
   try {
     const listProjectsUrl = await webTrigger.getUrl("list-projects-trigger");
     const createTicketUrl = await webTrigger.getUrl("create-ticket-trigger");
+    const addCommentUrl = await webTrigger.getUrl("add-comment-trigger");
     const tid = `TENANT#${installationId}`;
+
+    // Get the Jira site URL (e.g. https://mysite.atlassian.net)
+    let siteUrl = "";
+    try {
+      const siteRes = await forgeFetch(await webTrigger.getUrl("get-site-url-trigger"), { method: "GET" });
+      if (siteRes.ok) {
+        const siteData = await siteRes.json();
+        siteUrl = siteData.baseUrl || "";
+      }
+    } catch (e) {
+      console.log("Failed to fetch site URL:", e);
+    }
+
     const res = await forgeFetch(`${GATEWAY_URL}/integrations/jira/forge-register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -31,6 +45,8 @@ resolver.define("saveConfig", async ({ payload }) => {
         installation_id: installationId,
         list_projects_url: listProjectsUrl,
         create_ticket_url: createTicketUrl,
+        add_comment_url: addCommentUrl,
+        site_url: siteUrl,
       }),
     });
     if (!res.ok) {
@@ -45,7 +61,8 @@ resolver.define("saveConfig", async ({ payload }) => {
 resolver.define("getWebTriggerUrls", async () => {
   const listProjectsUrl = await webTrigger.getUrl("list-projects-trigger");
   const createTicketUrl = await webTrigger.getUrl("create-ticket-trigger");
-  return { listProjectsUrl, createTicketUrl };
+  const addCommentUrl = await webTrigger.getUrl("add-comment-trigger");
+  return { listProjectsUrl, createTicketUrl, addCommentUrl };
 });
 
 exports.resolver = resolver.getDefinitions();

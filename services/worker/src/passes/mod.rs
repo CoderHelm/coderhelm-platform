@@ -395,22 +395,32 @@ async fn run_passes(
     // If no files were changed, comment on the issue and bail — don't open an empty PR
     if impl_result.files_modified.is_empty() {
         warn!(run_id, "Implement pass produced zero file changes");
+        let clarification = "I explored the codebase but couldn't determine what changes to make for this issue.\n\n\
+             This usually means the issue needs more detail — for example:\n\
+             - Which file(s) or component(s) should be modified?\n\
+             - What is the expected behavior vs. current behavior?\n\
+             - Any relevant code snippets or error messages?\n\n\
+             Please add more context and I'll try again.";
         if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-            let comment = format!(
-                "I explored the codebase but couldn't determine what changes to make for this issue.\n\n\
-                 This usually means the issue needs more detail — for example:\n\
-                 - Which file(s) or component(s) should be modified?\n\
-                 - What is the expected behavior vs. current behavior?\n\
-                 - Any relevant code snippets or error messages?\n\n\
-                 Please add more context and I'll try again."
-            );
             if let Err(e) = github
-                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
+                .create_issue_comment(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.issue_number,
+                    clarification,
+                )
                 .await
             {
                 warn!(run_id, error = %e, "Failed to comment on issue about empty implementation");
             }
             return Err("Could not determine what changes to make — commented on issue asking for clarification".into());
+        } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+            if let Err(e) =
+                post_jira_comment(state, &msg.tenant_id, &msg.ticket_id, clarification).await
+            {
+                warn!(run_id, error = %e, "Failed to comment on Jira ticket about empty implementation");
+            }
+            return Err("Could not determine what changes to make — commented on ticket asking for clarification".into());
         }
         return Err("Could not determine what changes to make — please add more detail to the ticket (which files to change, expected behavior, relevant code snippets)".into());
     }
@@ -859,6 +869,18 @@ async fn fail_run(
                 error!("Failed to comment on issue about run failure: {e}");
             }
         }
+    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+        let comment = format!(
+            "⚠️ Coderhelm couldn't complete this issue\n\n\
+             {}\n\n\
+             Add more detail — which files to change, expected behavior, or relevant code snippets — and I'll try again.\n\n\
+             View run → https://app.coderhelm.com/runs/detail?id={}",
+            &error_msg[..error_msg.len().min(300)],
+            run_id,
+        );
+        if let Err(e) = post_jira_comment(state, &msg.tenant_id, &msg.ticket_id, &comment).await {
+            error!("Failed to comment on Jira ticket about run failure: {e}");
+        }
     }
 }
 
@@ -868,6 +890,58 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 
 fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
+}
+
+/// Post a comment on a Jira ticket via the Forge web trigger.
+async fn post_jira_comment(
+    state: &WorkerState,
+    tenant_id: &str,
+    issue_key: &str,
+    comment: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.jira_config_table_name)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("JIRA#config".to_string()),
+        )
+        .send()
+        .await?
+        .item
+        .and_then(|item| {
+            item.get("add_comment_url")
+                .and_then(|v| v.as_s().ok())
+                .filter(|s| !s.is_empty())
+                .cloned()
+        })
+        .ok_or("No Jira add_comment_url configured")?;
+
+    let payload = serde_json::json!({
+        "issueKey": issue_key,
+        "comment": comment,
+    });
+
+    let resp = state
+        .http
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(payload.to_string())
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Jira comment failed ({status}): {body}").into());
+    }
+
+    Ok(())
 }
 
 /// Check if there is already an active (running) run for this ticket.

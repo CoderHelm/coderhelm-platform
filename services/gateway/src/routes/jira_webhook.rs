@@ -123,6 +123,11 @@ async fn process_jira_payload(
 
     let issue = payload.get("issue").ok_or(StatusCode::BAD_REQUEST)?;
 
+    // ── Handle comment events ────────────────────────────────────────────────
+    if event_type.contains("comment") {
+        return handle_jira_comment(state, tenant_id, installation_id, payload, issue).await;
+    }
+
     // Repo mapping — now optional. When absent, triage will auto-pick the repo.
     let repo_owner = payload
         .get("repo_owner")
@@ -438,6 +443,169 @@ pub async fn handle_forge(
     info!(tenant_id, installation_id, "Forge Jira webhook received");
 
     process_jira_payload(&state, &tenant_id, installation_id, &payload).await
+}
+
+/// Handle a Jira comment event — retry failed runs or send feedback for completed runs with PRs.
+async fn handle_jira_comment(
+    state: &AppState,
+    tenant_id: &str,
+    installation_id: u64,
+    payload: &Value,
+    issue: &Value,
+) -> Result<StatusCode, StatusCode> {
+    let ticket_key = issue.get("key").and_then(|v| v.as_str()).unwrap_or("");
+
+    if ticket_key.is_empty() {
+        return Ok(StatusCode::OK);
+    }
+
+    let comment_body = payload
+        .get("comment")
+        .and_then(|c| c.get("body"))
+        .and_then(|b| b.as_str())
+        .unwrap_or("");
+
+    let comment_author = payload
+        .get("comment")
+        .and_then(|c| c.get("author"))
+        .and_then(|a| a.get("displayName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Ignore comments by the bot itself
+    if comment_author.to_ascii_lowercase().contains("coderhelm") {
+        info!(ticket_key, "Skipping own comment");
+        return Ok(StatusCode::OK);
+    }
+
+    info!(
+        tenant_id,
+        ticket_key, comment_author, "Jira comment received"
+    );
+
+    // Find the most recent run for this ticket
+    let runs = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("tenant_id = :tid")
+        .filter_expression("ticket_id = :ticket")
+        .expression_attribute_values(":tid", attr_s(tenant_id))
+        .expression_attribute_values(":ticket", attr_s(ticket_key))
+        .scan_index_forward(false)
+        .limit(1)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query runs for Jira comment: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let Some(run_item) = runs.items().first() else {
+        info!(ticket_key, "No runs found for Jira comment — ignoring");
+        return Ok(StatusCode::OK);
+    };
+
+    let run_status = run_item
+        .get("status")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    let run_id = run_item
+        .get("run_id")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    let pr_number = run_item
+        .get("pr_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let repo = run_item
+        .get("repo")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    let parts: Vec<&str> = repo.splitn(2, '/').collect();
+    let (repo_owner, repo_name) = if parts.len() == 2 {
+        (parts[0], parts[1])
+    } else {
+        ("", "")
+    };
+
+    match run_status {
+        // Failed run — retry by re-queuing the ticket
+        "failed" => {
+            let title = run_item
+                .get("title")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.as_str())
+                .unwrap_or("");
+
+            // Include the new comment as additional context in the body
+            let body = run_item
+                .get("body")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+
+            let extended_body = if comment_body.is_empty() {
+                body
+            } else {
+                format!("{body}\n\n---\n\n**Additional context (from Jira comment by {comment_author}):**\n\n{comment_body}")
+            };
+
+            let message = WorkerMessage::Ticket(TicketMessage {
+                tenant_id: tenant_id.to_string(),
+                installation_id,
+                source: TicketSource::Jira,
+                ticket_id: ticket_key.to_string(),
+                title: title.to_string(),
+                body: extended_body,
+                repo_owner: repo_owner.to_string(),
+                repo_name: repo_name.to_string(),
+                issue_number: 0,
+                sender: comment_author.to_string(),
+            });
+
+            info!(
+                tenant_id,
+                ticket_key, run_id, "Retrying failed Jira run after comment"
+            );
+            send_to_queue(state, &state.config.ticket_queue_url, &message).await
+        }
+        // Completed run with PR — send feedback
+        "completed" if pr_number > 0 => {
+            let message = WorkerMessage::Feedback(crate::models::FeedbackMessage {
+                tenant_id: tenant_id.to_string(),
+                installation_id,
+                run_id: run_id.to_string(),
+                repo_owner: repo_owner.to_string(),
+                repo_name: repo_name.to_string(),
+                pr_number,
+                review_id: 0,
+                review_body: format!("Jira comment by {comment_author}: {comment_body}"),
+                comments: vec![],
+            });
+
+            info!(
+                tenant_id,
+                ticket_key, run_id, "Sending feedback for Jira comment on completed run"
+            );
+            send_to_queue(state, &state.config.feedback_queue_url, &message).await
+        }
+        _ => {
+            info!(
+                ticket_key,
+                run_status, "Ignoring Jira comment — run status not actionable"
+            );
+            Ok(StatusCode::OK)
+        }
+    }
 }
 
 async fn send_to_queue(

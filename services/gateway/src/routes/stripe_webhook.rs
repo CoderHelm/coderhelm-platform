@@ -599,24 +599,26 @@ async fn handle_charge_refunded(
         payments
             .ok()
             .and_then(|r| {
-                r.items().iter().find(|item| {
-                    let amt = item
-                        .get("amount_cents")
-                        .and_then(|v| v.as_n().ok())
-                        .and_then(|n| n.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    let status = item
-                        .get("status")
-                        .and_then(|v| v.as_s().ok())
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    amt == amount_total && status == "paid"
-                })
-                .and_then(|item| {
-                    item.get("stripe_invoice_id")
-                        .and_then(|v| v.as_s().ok())
-                        .map(|s| s.to_string())
-                })
+                r.items()
+                    .iter()
+                    .find(|item| {
+                        let amt = item
+                            .get("amount_cents")
+                            .and_then(|v| v.as_n().ok())
+                            .and_then(|n| n.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let status = item
+                            .get("status")
+                            .and_then(|v| v.as_s().ok())
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+                        amt == amount_total && status == "paid"
+                    })
+                    .and_then(|item| {
+                        item.get("stripe_invoice_id")
+                            .and_then(|v| v.as_s().ok())
+                            .map(|s| s.to_string())
+                    })
             })
             .unwrap_or_default()
     };
@@ -652,7 +654,10 @@ async fn handle_charge_refunded(
             .send()
             .await;
 
-        info!(tenant_id, resolved_invoice_id, "Updated invoice/payment with refund status");
+        info!(
+            tenant_id,
+            resolved_invoice_id, "Updated invoice/payment with refund status"
+        );
     } else {
         warn!(tenant_id, charge_id, "Could not resolve invoice for refund");
     }

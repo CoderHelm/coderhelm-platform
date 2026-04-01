@@ -31,6 +31,7 @@ pub async fn run(
     // Load Jira config for create-ticket URL (only needed if any task targets Jira)
     let jira_create_url = load_jira_create_url(state, &msg.tenant_id).await;
     let jira_default_project = load_jira_default_project(state, &msg.tenant_id).await;
+    let jira_site_url = load_jira_site_url(state, &msg.tenant_id).await;
 
     // Ensure the "coderhelm" label exists in each repo we'll use (GitHub only)
     let mut ensured_repos = std::collections::HashSet::new();
@@ -122,11 +123,12 @@ pub async fn run(
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     let ticket_key = body["key"].as_str().unwrap_or("UNKNOWN");
-                    let site_url = body["self"]
-                        .as_str()
-                        .and_then(|s| s.find("/rest/").map(|i| &s[..i]))
-                        .unwrap_or("https://jira.atlassian.net");
-                    let ticket_url = format!("{}/browse/{}", site_url, ticket_key);
+                    let ticket_url = if let Some(ref site) = jira_site_url {
+                        format!("{}/browse/{}", site.trim_end_matches('/'), ticket_key)
+                    } else {
+                        // No site URL stored — just use the ticket key without a link
+                        String::new()
+                    };
 
                     update_task_with_jira(
                         state,
@@ -452,6 +454,25 @@ async fn load_jira_default_project(state: &WorkerState, tenant_id: &str) -> Opti
         })
 }
 
+async fn load_jira_site_url(state: &WorkerState, tenant_id: &str) -> Option<String> {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.jira_config_table_name)
+        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("sk", AttributeValue::S("JIRA#config".to_string()))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .and_then(|item| {
+            item.get("site_url")
+                .and_then(|v| v.as_s().ok())
+                .filter(|s| !s.is_empty())
+                .cloned()
+        })
+}
+
 async fn update_task_with_jira(
     state: &WorkerState,
     tenant_id: &str,
@@ -507,6 +528,7 @@ pub async fn continue_tasks(
 
     let jira_create_url = load_jira_create_url(state, &msg.tenant_id).await;
     let jira_default_project = load_jira_default_project(state, &msg.tenant_id).await;
+    let jira_site_url = load_jira_site_url(state, &msg.tenant_id).await;
 
     // Ensure labels
     let mut ensured_repos = std::collections::HashSet::new();
@@ -584,11 +606,11 @@ pub async fn continue_tasks(
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     let ticket_key = body["key"].as_str().unwrap_or("UNKNOWN");
-                    let site_url = body["self"]
-                        .as_str()
-                        .and_then(|s| s.find("/rest/").map(|i| &s[..i]))
-                        .unwrap_or("https://jira.atlassian.net");
-                    let ticket_url = format!("{}/browse/{}", site_url, ticket_key);
+                    let ticket_url = if let Some(ref site) = jira_site_url {
+                        format!("{}/browse/{}", site.trim_end_matches('/'), ticket_key)
+                    } else {
+                        String::new()
+                    };
                     update_task_with_jira(
                         state,
                         &msg.tenant_id,

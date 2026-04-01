@@ -6,11 +6,16 @@ modules:
         - avi:jira:created:issue
         - avi:jira:assigned:issue
         - avi:jira:updated:issue
+        - avi:jira:created:comment
   webtrigger:
     - key: list-projects-trigger
       function: listProjectsHandler
     - key: create-ticket-trigger
       function: createTicketHandler
+    - key: add-comment-trigger
+      function: addCommentHandler
+    - key: get-site-url-trigger
+      function: getSiteUrlHandler
   jira:adminPage:
     - key: coderhelm-admin-page
       resource: adminPage
@@ -26,6 +31,10 @@ modules:
       handler: index.listProjectsHandler
     - key: createTicketHandler
       handler: index.createTicketHandler
+    - key: addCommentHandler
+      handler: index.addCommentHandler
+    - key: getSiteUrlHandler
+      handler: index.getSiteUrlHandler
 resources:
   - key: adminPage
     path: resources/admin/build

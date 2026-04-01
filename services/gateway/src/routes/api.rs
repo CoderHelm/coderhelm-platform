@@ -697,6 +697,15 @@ pub async fn re_review_run(
 
     let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
 
+    let status = item
+        .get("status")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    if status == "merged" {
+        return Err(StatusCode::CONFLICT);
+    }
+
     let pr_number = item
         .get("pr_number")
         .and_then(|v| v.as_n().ok())
@@ -1318,6 +1327,11 @@ pub async fn forge_register_urls(
         .get("create_ticket_url")
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
+    let add_comment_url = body
+        .get("add_comment_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let site_url = body.get("site_url").and_then(|v| v.as_str()).unwrap_or("");
 
     // Verify tenant exists and installation_id matches
     let meta = state
@@ -1356,10 +1370,12 @@ pub async fn forge_register_urls(
         .key("pk", attr_s(tenant_id))
         .key("sk", attr_s("JIRA#config"))
         .update_expression(
-            "SET list_projects_url = :lpu, create_ticket_url = :ctu, updated_at = :ua",
+            "SET list_projects_url = :lpu, create_ticket_url = :ctu, add_comment_url = :acu, site_url = :su, updated_at = :ua",
         )
         .expression_attribute_values(":lpu", attr_s(list_projects_url))
         .expression_attribute_values(":ctu", attr_s(create_ticket_url))
+        .expression_attribute_values(":acu", attr_s(add_comment_url))
+        .expression_attribute_values(":su", attr_s(site_url))
         .expression_attribute_values(":ua", attr_s(&now))
         .send()
         .await
@@ -1399,17 +1415,32 @@ pub async fn get_jira_config(
             .unwrap_or_default()
     };
 
-    let (default_project, trigger_label, list_projects_url, create_ticket_url) =
-        if let Some(ref item) = config_item {
-            (
-                get_str(item, "default_project"),
-                get_str(item, "trigger_label"),
-                get_str(item, "list_projects_url"),
-                get_str(item, "create_ticket_url"),
-            )
-        } else {
-            (String::new(), String::new(), String::new(), String::new())
-        };
+    let (
+        default_project,
+        trigger_label,
+        list_projects_url,
+        create_ticket_url,
+        add_comment_url,
+        site_url,
+    ) = if let Some(ref item) = config_item {
+        (
+            get_str(item, "default_project"),
+            get_str(item, "trigger_label"),
+            get_str(item, "list_projects_url"),
+            get_str(item, "create_ticket_url"),
+            get_str(item, "add_comment_url"),
+            get_str(item, "site_url"),
+        )
+    } else {
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    };
 
     // Load enabled projects (JIRA#PROJECT#<key> items)
     let projects_result = state
@@ -1451,6 +1482,8 @@ pub async fn get_jira_config(
         "trigger_label": trigger_label,
         "list_projects_url": list_projects_url,
         "create_ticket_url": create_ticket_url,
+        "add_comment_url": add_comment_url,
+        "site_url": site_url,
         "projects": projects,
     })))
 }
@@ -1471,6 +1504,8 @@ pub async fn update_jira_config(
         ("trigger_label", "trigger_label"),
         ("list_projects_url", "list_projects_url"),
         ("create_ticket_url", "create_ticket_url"),
+        ("add_comment_url", "add_comment_url"),
+        ("site_url", "site_url"),
     ] {
         if let Some(val) = body.get(field).and_then(|v| v.as_str()) {
             update_expr.push(format!("{key} = :{key}"));
