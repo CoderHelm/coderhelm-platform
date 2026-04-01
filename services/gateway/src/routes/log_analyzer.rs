@@ -558,7 +558,7 @@ pub async fn list_recommendations(
             }
             true
         })
-        .filter_map(|item| rec_from_item(item))
+        .filter_map(rec_from_item)
         .collect();
 
     Ok(Json(json!({ "recommendations": recommendations })))
