@@ -1324,6 +1324,7 @@ pub async fn plan_chat(
     let max_turns = 5;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    let mut mcp_servers_used: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for turn in 0..max_turns {
         let mut req = state
@@ -1400,7 +1401,8 @@ pub async fn plan_chat(
                 total_output_tokens,
             )
             .await;
-            return Ok(Json(json!({ "content": text })));
+            let servers: Vec<&str> = mcp_servers_used.iter().map(|s| s.as_str()).collect();
+            return Ok(Json(json!({ "content": text, "mcp_servers": servers })));
         }
 
         // Execute MCP tool calls via proxy Lambda
@@ -1410,6 +1412,7 @@ pub async fn plan_chat(
             let input: Value = document_to_json(tool_use.input());
 
             let result = if let Some((server_id, tool_name)) = full_name.split_once("__") {
+                mcp_servers_used.insert(server_id.to_string());
                 // Find plugin credentials and invoke MCP proxy
                 match invoke_mcp_tool(&state, &claims.tenant_id, server_id, tool_name, &input).await
                 {
@@ -1472,7 +1475,8 @@ pub async fn plan_chat(
         total_output_tokens,
     )
     .await;
-    Ok(Json(json!({ "content": text })))
+    let servers: Vec<&str> = mcp_servers_used.iter().map(|s| s.as_str()).collect();
+    Ok(Json(json!({ "content": text, "mcp_servers": servers })))
 }
 
 /// Track plan chat token usage in analytics.

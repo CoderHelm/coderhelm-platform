@@ -335,6 +335,13 @@ async fn main() -> Result<(), Error> {
         ));
 
     let app = Router::new()
+        // Root health/info
+        .route(
+            "/",
+            get(|| async {
+                axum::Json(serde_json::json!({ "service": "coderhelm", "status": "ok" }))
+            }),
+        )
         // Webhooks (public, verified by signature)
         .route("/webhooks/github", post(routes::github_webhook::handle))
         .route("/webhooks/jira/:token", post(routes::jira_webhook::handle))
