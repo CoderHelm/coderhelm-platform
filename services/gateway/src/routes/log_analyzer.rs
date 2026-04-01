@@ -1,9 +1,9 @@
+use aws_sdk_dynamodb::types::AttributeValue;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     Extension, Json,
 };
-use aws_sdk_dynamodb::types::AttributeValue;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -63,8 +63,7 @@ pub async fn create_connection(
 
     validate_role_arn(&body.role_arn)?;
 
-    let account_id = account_id_from_arn(&body.role_arn)
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    let account_id = account_id_from_arn(&body.role_arn).ok_or(StatusCode::BAD_REQUEST)?;
     let region = body.region.as_deref().unwrap_or("us-east-1");
     let external_id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -124,8 +123,7 @@ pub async fn create_connection(
 
     info!(
         tenant_id = claims.tenant_id,
-        account_id,
-        "AWS connection created"
+        account_id, "AWS connection created"
     );
 
     Ok(Json(json!({
@@ -339,7 +337,9 @@ pub async fn test_connection(
                 .send()
                 .await;
 
-            Ok(Json(json!({ "status": "connected", "message": "Successfully assumed role" })))
+            Ok(Json(
+                json!({ "status": "connected", "message": "Successfully assumed role" }),
+            ))
         }
         Err(e) => {
             warn!(role_arn, error = %e, "AssumeRole test failed");
@@ -422,7 +422,9 @@ pub async fn discover_log_groups(
             StatusCode::BAD_GATEWAY
         })?;
 
-    let creds = assumed.credentials().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let creds = assumed
+        .credentials()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Build CW Logs client with assumed creds
     let assumed_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
