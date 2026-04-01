@@ -256,6 +256,109 @@ pub async fn rename_tenant(
     Ok(Json(json!({ "status": "renamed", "name": new_name })))
 }
 
+/// GET /api/allowlist — list allowed emails (owner only).
+pub async fn list_allowlist(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    if claims.role != "owner" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.settings_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", attr_s("ALLOWLIST"))
+        .expression_attribute_values(":prefix", attr_s("EMAIL#"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to list allowlist: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let emails: Vec<String> = result
+        .items()
+        .iter()
+        .filter_map(|item| item.get("email").and_then(|v| v.as_s().ok()).cloned())
+        .collect();
+
+    Ok(Json(json!({ "emails": emails })))
+}
+
+/// POST /api/allowlist — add an email to the allowlist (owner only).
+pub async fn add_to_allowlist(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    if claims.role != "owner" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let email = body["email"]
+        .as_str()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty() && (s.contains('@') || s.starts_with("*@")))
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s("ALLOWLIST"))
+        .item("sk", attr_s(&format!("EMAIL#{email}")))
+        .item("email", attr_s(&email))
+        .item("added_by", attr_s(&claims.email))
+        .item("created_at", attr_s(&now))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to add to allowlist: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(email = %email, added_by = %claims.email, "Added to allowlist");
+    Ok(Json(json!({ "status": "added", "email": email })))
+}
+
+/// DELETE /api/allowlist — remove an email from the allowlist (owner only).
+pub async fn remove_from_allowlist(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    if claims.role != "owner" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let email = body["email"]
+        .as_str()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s("ALLOWLIST"))
+        .key("sk", attr_s(&format!("EMAIL#{email}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to remove from allowlist: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(email = %email, removed_by = %claims.email, "Removed from allowlist");
+    Ok(Json(json!({ "status": "removed", "email": email })))
+}
+
 #[derive(serde::Deserialize)]
 pub struct RunsQuery {
     source: Option<String>,
