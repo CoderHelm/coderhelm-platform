@@ -791,9 +791,89 @@ pub async fn github_callback(
     let user_id = format!("USER#{github_id}");
     let email = user["email"].as_str().unwrap_or("");
 
+    // Determine role: check if user was invited (existing record) or is the first user
+    let mut role = "member".to_string();
+    let existing_user = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(&tenant_id))
+        .key("sk", attr_s(&user_id))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned());
+
+    if let Some(ref item) = existing_user {
+        // User was invited — keep their assigned role
+        role = item
+            .get("role")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_else(|| "member".to_string());
+    } else {
+        // Check if tenant has any existing users (first user → owner)
+        let tenant_users = state
+            .dynamo
+            .query()
+            .table_name(&state.config.users_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":pk", attr_s(&tenant_id))
+            .expression_attribute_values(":prefix", attr_s("USER#"))
+            .limit(1)
+            .send()
+            .await
+            .ok()
+            .map(|r| r.count() as usize)
+            .unwrap_or(0);
+
+        if tenant_users == 0 {
+            role = "owner".to_string();
+        }
+    }
+
     // Upsert user into ALL tenant user tables
     for (inst_id, _org) in &all_installations {
         let tid = format!("TENANT#{inst_id}");
+        let user_role = if tid == tenant_id {
+            role.clone()
+        } else {
+            // For other tenants, check if invited there too
+            let other_existing = state
+                .dynamo
+                .get_item()
+                .table_name(&state.config.users_table_name)
+                .key("pk", attr_s(&tid))
+                .key("sk", attr_s(&user_id))
+                .send()
+                .await
+                .ok()
+                .and_then(|r| r.item().cloned());
+
+            if let Some(ref item) = other_existing {
+                item.get("role")
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+                    .unwrap_or_else(|| "member".to_string())
+            } else {
+                let count = state
+                    .dynamo
+                    .query()
+                    .table_name(&state.config.users_table_name)
+                    .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+                    .expression_attribute_values(":pk", attr_s(&tid))
+                    .expression_attribute_values(":prefix", attr_s("USER#"))
+                    .limit(1)
+                    .send()
+                    .await
+                    .ok()
+                    .map(|r| r.count() as usize)
+                    .unwrap_or(0);
+
+                if count == 0 { "owner".to_string() } else { "member".to_string() }
+            }
+        };
+
         let _ = state
             .dynamo
             .put_item()
@@ -807,7 +887,7 @@ pub async fn github_callback(
                 "avatar_url",
                 attr_s(user["avatar_url"].as_str().unwrap_or("")),
             )
-            .item("role", attr_s("member"))
+            .item("role", attr_s(&user_role))
             .item("updated_at", attr_s(&now))
             .item("gsi1pk", attr_s(&format!("GHUSER#{github_id}")))
             .item("gsi1sk", attr_s(&tid))
@@ -819,14 +899,16 @@ pub async fn github_callback(
 
     info!(
         github_login,
-        installation_id, "User authenticated via GitHub"
+        installation_id,
+        %role,
+        "User authenticated via GitHub"
     );
 
     let token = jwt::create_token(
         &user_id,
         &tenant_id,
         email,
-        "member",
+        &role,
         Some(github_login),
         &state.secrets.jwt_secret,
         86400,

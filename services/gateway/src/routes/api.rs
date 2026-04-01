@@ -49,6 +49,15 @@ pub async fn me(
         .and_then(|i| i.get("status").and_then(|v| v.as_s().ok()).cloned())
         .unwrap_or_else(|| "active".to_string());
 
+    // Derive auth provider from user record
+    let auth_provider = if item.get("github_login").and_then(|v| v.as_s().ok()).is_some() {
+        "github"
+    } else if claims.sub.starts_with("USER#Google_") {
+        "google"
+    } else {
+        "email"
+    };
+
     Ok(Json(json!({
         "user_id": claims.sub,
         "tenant_id": claims.tenant_id,
@@ -57,6 +66,7 @@ pub async fn me(
         "avatar_url": item.get("avatar_url").and_then(|v| v.as_s().ok()),
         "role": claims.role,
         "status": tenant_status,
+        "auth_provider": auth_provider,
     })))
 }
 

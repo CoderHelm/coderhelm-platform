@@ -12,6 +12,7 @@ import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as cognito from "aws-cdk-lib/aws-cognito";
+import * as ses from "aws-cdk-lib/aws-ses";
 import { Construct } from "constructs";
 
 interface ApiStackProps extends cdk.StackProps {
@@ -67,6 +68,12 @@ export class ApiStack extends cdk.Stack {
       mfa: cognito.Mfa.OPTIONAL,
       mfaSecondFactor: { sms: false, otp: true },
       accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      email: cognito.UserPoolEmail.withSES({
+        fromEmail: "noreply@coderhelm.com",
+        fromName: "Coderhelm",
+        sesRegion: "us-east-1",
+        sesVerifiedDomain: "coderhelm.com",
+      }),
       removalPolicy:
         props.stage === "prod"
           ? cdk.RemovalPolicy.RETAIN

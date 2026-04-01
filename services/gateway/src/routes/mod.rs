@@ -5,6 +5,7 @@ pub mod billing;
 pub mod github_webhook;
 pub mod infrastructure;
 pub mod jira_webhook;
+pub mod log_analyzer;
 pub mod plans;
 pub mod stripe_webhook;
 pub mod users;
