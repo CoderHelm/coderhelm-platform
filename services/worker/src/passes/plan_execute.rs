@@ -1,7 +1,7 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{error, info};
 
-use crate::models::PlanExecuteMessage;
+use crate::models::{PlanExecuteMessage, PlanTaskContinueMessage};
 use crate::WorkerState;
 
 /// Execute a plan: iterate through approved tasks in order, creating GitHub issues or Jira tickets.
@@ -60,6 +60,15 @@ pub async fn run(
             error!(task_id, "Task not found");
             continue;
         };
+
+        // If task has a dependency, mark as waiting instead of processing
+        if let Some(ref dep) = task.depends_on {
+            if !dep.is_empty() {
+                info!(task_id, depends_on = %dep, "Task has dependency — marking as waiting");
+                set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "waiting").await?;
+                continue;
+            }
+        }
 
         // Update task status to "running"
         set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "running").await?;
@@ -182,23 +191,59 @@ pub async fn run(
         }
     }
 
-    // Mark plan as done
-    let now = chrono::Utc::now().to_rfc3339();
-    state
+    // Query all tasks in this plan to see if any are waiting
+    let all_tasks_result = state
         .dynamo
-        .update_item()
+        .query()
         .table_name(&state.config.plans_table_name)
-        .key("pk", AttributeValue::S(msg.tenant_id.clone()))
-        .key("sk", AttributeValue::S(format!("PLAN#{}", msg.plan_id)))
-        .update_expression("SET #s = :s, executed_at = :ea, executed_by = :eb")
-        .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", AttributeValue::S("done".to_string()))
-        .expression_attribute_values(":ea", AttributeValue::S(now))
-        .expression_attribute_values(":eb", AttributeValue::S(msg.triggered_by.clone()))
+        .key_condition_expression("pk = :pk AND begins_with(sk, :sk_prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(msg.tenant_id.clone()))
+        .expression_attribute_values(
+            ":sk_prefix",
+            AttributeValue::S(format!("PLAN#{}#TASK#", msg.plan_id)),
+        )
         .send()
         .await?;
 
-    info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, "Plan execution complete");
+    let any_waiting = all_tasks_result.items().iter().any(|item| {
+        item.get("status")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s == "waiting")
+            .unwrap_or(false)
+    });
+
+    if any_waiting {
+        // Mark plan as "waiting" instead of "done" — tasks are blocked on dependencies
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.plans_table_name)
+            .key("pk", AttributeValue::S(msg.tenant_id.clone()))
+            .key("sk", AttributeValue::S(format!("PLAN#{}", msg.plan_id)))
+            .update_expression("SET #s = :s")
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_values(":s", AttributeValue::S("waiting".to_string()))
+            .send()
+            .await?;
+        info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, "Plan has waiting tasks — not marking done");
+    } else {
+        // Mark plan as done
+        let now = chrono::Utc::now().to_rfc3339();
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.plans_table_name)
+            .key("pk", AttributeValue::S(msg.tenant_id.clone()))
+            .key("sk", AttributeValue::S(format!("PLAN#{}", msg.plan_id)))
+            .update_expression("SET #s = :s, executed_at = :ea, executed_by = :eb")
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_values(":s", AttributeValue::S("done".to_string()))
+            .expression_attribute_values(":ea", AttributeValue::S(now))
+            .expression_attribute_values(":eb", AttributeValue::S(msg.triggered_by.clone()))
+            .send()
+            .await?;
+        info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, "Plan execution complete");
+    }
     Ok(())
 }
 
@@ -251,6 +296,7 @@ struct TaskData {
     repo: Option<String>,
     destination: Option<String>,
     jira_project: Option<String>,
+    depends_on: Option<String>,
 }
 
 async fn get_task(
@@ -282,6 +328,7 @@ async fn get_task(
         repo: str_field(item, "repo"),
         destination: str_field(item, "destination"),
         jira_project: str_field(item, "jira_project"),
+        depends_on: str_field(item, "depends_on"),
     }))
 }
 
@@ -420,5 +467,212 @@ async fn update_task_with_jira(
         .expression_attribute_values(":ca", AttributeValue::S(now))
         .send()
         .await?;
+    Ok(())
+}
+
+/// Process waiting tasks whose dependencies have been met (triggered by PR merge).
+pub async fn continue_tasks(
+    state: &WorkerState,
+    msg: PlanTaskContinueMessage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, tasks = msg.tasks.len(), "Continuing waiting plan tasks");
+
+    let install_id = get_install_id(state, &msg.tenant_id).await?;
+    let Some(install_id) = install_id else {
+        error!(tenant_id = %msg.tenant_id, "Tenant not found for plan task continue");
+        return Ok(());
+    };
+
+    let plan_repo = get_plan_repo(state, &msg.tenant_id, &msg.plan_id).await?;
+
+    let github = crate::clients::github::GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        install_id,
+        &state.http,
+    )?;
+
+    let jira_create_url = load_jira_create_url(state, &msg.tenant_id).await;
+    let jira_default_project = load_jira_default_project(state, &msg.tenant_id).await;
+
+    // Ensure labels
+    let mut ensured_repos = std::collections::HashSet::new();
+    for task_id in &msg.tasks {
+        if let Ok(Some(task)) = get_task(state, &msg.tenant_id, &msg.plan_id, task_id).await {
+            if task.destination.as_deref() == Some("jira") {
+                continue;
+            }
+            let r = task
+                .repo
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .unwrap_or(&plan_repo);
+            if !r.is_empty() && ensured_repos.insert(r.to_string()) {
+                let (owner, repo) = split_repo(r);
+                let _ = github.ensure_label(owner, repo, "coderhelm").await;
+            }
+        }
+    }
+
+    for task_id in &msg.tasks {
+        let task = get_task(state, &msg.tenant_id, &msg.plan_id, task_id).await?;
+        let Some(task) = task else {
+            error!(task_id, "Task not found");
+            continue;
+        };
+
+        set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "running").await?;
+
+        if task.destination.as_deref() == Some("jira") {
+            let project_key = task
+                .jira_project
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(jira_default_project.as_deref())
+                .unwrap_or("");
+
+            if project_key.is_empty() {
+                error!(task_id, "No Jira project configured for task");
+                set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                continue;
+            }
+
+            let Some(ref url) = jira_create_url else {
+                error!(task_id, "No Jira create-ticket URL configured");
+                set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                continue;
+            };
+
+            let description = format_issue_body(&task.description, &task.acceptance_criteria);
+            let payload = serde_json::json!({
+                "projectKey": project_key,
+                "summary": task.title,
+                "description": description,
+                "labels": ["coderhelm"],
+            });
+
+            match state
+                .http
+                .post(url)
+                .header("Content-Type", "application/json")
+                .body(payload.to_string())
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    let ticket_key = body["key"].as_str().unwrap_or("UNKNOWN");
+                    let ticket_url = format!("https://jira.atlassian.net/browse/{}", ticket_key);
+                    update_task_with_jira(
+                        state,
+                        &msg.tenant_id,
+                        &msg.plan_id,
+                        task_id,
+                        ticket_key,
+                        &ticket_url,
+                    )
+                    .await?;
+                    info!(task_id, ticket_key, "Created Jira ticket for waiting task");
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    error!(task_id, status, body = %body, "Failed to create Jira ticket for waiting task");
+                    set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                }
+                Err(e) => {
+                    error!(task_id, error = %e, "Failed to call Forge create-ticket for waiting task");
+                    set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                }
+            }
+        } else {
+            let task_repo = task
+                .repo
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .unwrap_or(&plan_repo);
+            if task_repo.is_empty() {
+                error!(task_id, "No repo configured for task or plan");
+                set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                continue;
+            }
+
+            let (owner, repo) = split_repo(task_repo);
+            let issue_body = format_issue_body(&task.description, &task.acceptance_criteria);
+
+            match github
+                .create_issue(owner, repo, &task.title, &issue_body)
+                .await
+            {
+                Ok((issue_number, issue_url)) => {
+                    if let Err(e) = github
+                        .add_label(owner, repo, issue_number, "coderhelm")
+                        .await
+                    {
+                        error!(task_id, issue_number, error = %e, "Failed to add coderhelm label");
+                        set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed")
+                            .await?;
+                        continue;
+                    }
+                    update_task_with_issue(
+                        state,
+                        &msg.tenant_id,
+                        &msg.plan_id,
+                        task_id,
+                        issue_number,
+                        &issue_url,
+                    )
+                    .await?;
+                    info!(
+                        task_id,
+                        issue_number, "Created GitHub issue for waiting task"
+                    );
+                }
+                Err(e) => {
+                    error!(task_id, error = %e, "Failed to create GitHub issue for waiting task");
+                    set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                }
+            }
+        }
+    }
+
+    // Check if all plan tasks are now complete (no more waiting)
+    let all_tasks_result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.plans_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :sk_prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(msg.tenant_id.clone()))
+        .expression_attribute_values(
+            ":sk_prefix",
+            AttributeValue::S(format!("PLAN#{}#TASK#", msg.plan_id)),
+        )
+        .send()
+        .await?;
+
+    let any_still_waiting = all_tasks_result.items().iter().any(|item| {
+        item.get("status")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s == "waiting")
+            .unwrap_or(false)
+    });
+
+    if !any_still_waiting {
+        let now = chrono::Utc::now().to_rfc3339();
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.plans_table_name)
+            .key("pk", AttributeValue::S(msg.tenant_id.clone()))
+            .key("sk", AttributeValue::S(format!("PLAN#{}", msg.plan_id)))
+            .update_expression("SET #s = :s, executed_at = :ea")
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_values(":s", AttributeValue::S("done".to_string()))
+            .expression_attribute_values(":ea", AttributeValue::S(now))
+            .send()
+            .await?;
+        info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, "All plan tasks complete — plan marked done");
+    }
+
     Ok(())
 }
