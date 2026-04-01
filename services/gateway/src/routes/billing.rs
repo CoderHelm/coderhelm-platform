@@ -928,12 +928,19 @@ pub async fn download_invoice_pdf(
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-/// POST /api/billing/cancel — cancel the current subscription at period end.
+/// POST /api/billing/cancel — cancel the current subscription.
+/// Body: { "immediately": true } to cancel now, or omit/false to cancel at period end.
 pub async fn cancel_subscription(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
+    body: Option<Json<Value>>,
 ) -> Result<Json<Value>, StatusCode> {
     enforce_billing_cooldown(&state, &claims.tenant_id, "cancel").await?;
+
+    let immediately = body
+        .as_ref()
+        .and_then(|b| b["immediately"].as_bool())
+        .unwrap_or(false);
 
     let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
         error!("Stripe secret key not configured");
@@ -961,33 +968,62 @@ pub async fn cancel_subscription(
         .ok_or(StatusCode::NOT_FOUND)?
         .to_string();
 
-    // Cancel at period end (not immediately)
-    let response = state
-        .http
-        .post(format!("https://api.stripe.com/v1/subscriptions/{sub_id}"))
-        .header("Authorization", format!("Bearer {stripe_key}"))
-        .form(&[("cancel_at_period_end", "true")])
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Stripe cancel request failed: {e}");
+    if immediately {
+        // Cancel immediately — deletes the subscription
+        let response = state
+            .http
+            .delete(format!("https://api.stripe.com/v1/subscriptions/{sub_id}"))
+            .header("Authorization", format!("Bearer {stripe_key}"))
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Stripe cancel request failed: {e}");
+                StatusCode::BAD_GATEWAY
+            })?;
+
+        let body: Value = response.json().await.map_err(|e| {
+            error!("Failed to parse Stripe response: {e}");
             StatusCode::BAD_GATEWAY
         })?;
 
-    let body: Value = response.json().await.map_err(|e| {
-        error!("Failed to parse Stripe response: {e}");
-        StatusCode::BAD_GATEWAY
-    })?;
+        if body["error"].is_object() {
+            error!(
+                "Stripe error cancelling subscription: {}",
+                body["error"]["message"]
+            );
+            return Err(StatusCode::BAD_GATEWAY);
+        }
 
-    if body["error"].is_object() {
-        error!(
-            "Stripe error cancelling subscription: {}",
-            body["error"]["message"]
-        );
-        return Err(StatusCode::BAD_GATEWAY);
+        Ok(Json(json!({ "status": "cancelled" })))
+    } else {
+        // Cancel at period end
+        let response = state
+            .http
+            .post(format!("https://api.stripe.com/v1/subscriptions/{sub_id}"))
+            .header("Authorization", format!("Bearer {stripe_key}"))
+            .form(&[("cancel_at_period_end", "true")])
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Stripe cancel request failed: {e}");
+                StatusCode::BAD_GATEWAY
+            })?;
+
+        let body: Value = response.json().await.map_err(|e| {
+            error!("Failed to parse Stripe response: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+        if body["error"].is_object() {
+            error!(
+                "Stripe error cancelling subscription: {}",
+                body["error"]["message"]
+            );
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+
+        Ok(Json(json!({ "status": "cancelling" })))
     }
-
-    Ok(Json(json!({ "status": "cancelling" })))
 }
 
 /// POST /api/billing/reactivate — undo a pending cancellation.
