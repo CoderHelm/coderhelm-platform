@@ -150,7 +150,11 @@ pub async fn create_plan(
             if !task_repo.is_empty() {
                 put = put.item("repo", attr_s(task_repo));
             }
-            if let Some(dest) = task["destination"].as_str().or(if destination.is_empty() { None } else { Some(destination) }) {
+            if let Some(dest) = task["destination"].as_str().or(if destination.is_empty() {
+                None
+            } else {
+                Some(destination)
+            }) {
                 put = put.item("destination", attr_s(dest));
             }
             if let Some(jp) = task["jira_project"].as_str() {

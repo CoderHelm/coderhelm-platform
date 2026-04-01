@@ -66,66 +66,15 @@ pub struct GoogleCallbackParams {
 
 /// POST /auth/signup — Create account with email + password via Cognito.
 pub async fn signup(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<SignupRequest>,
+    State(_state): State<Arc<AppState>>,
+    Json(_body): Json<SignupRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let email = body.email.trim().to_lowercase();
-    if email.is_empty() || body.password.len() < 8 {
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Email and password (min 8 chars) are required"
-        }))));
-    }
-
-    let mut req = state
-        .cognito
-        .sign_up()
-        .client_id(&state.config.cognito_client_id)
-        .username(&email)
-        .password(&body.password)
-        .user_attributes(
-            aws_sdk_cognitoidentityprovider::types::AttributeType::builder()
-                .name("email")
-                .value(&email)
-                .build()
-                .unwrap(),
-        );
-
-    if let Some(name) = &body.name {
-        req = req.user_attributes(
-            aws_sdk_cognitoidentityprovider::types::AttributeType::builder()
-                .name("name")
-                .value(name)
-                .build()
-                .unwrap(),
-        );
-    }
-
-    let result = req.send().await.map_err(|e| {
-        let msg = format!("{e}");
-        if msg.contains("UsernameExistsException") {
-            return (StatusCode::CONFLICT, Json(serde_json::json!({
-                "error": "An account with this email already exists"
-            })));
-        }
-        error!("Cognito signup failed: {e}");
-        let user_msg = if msg.contains("InvalidPasswordException") || msg.contains("Password did not conform") {
-            "Password must contain at least 8 characters, including uppercase, lowercase, a number, and a special character"
-        } else if msg.contains("InvalidParameterException") {
-            "Invalid email or password format"
-        } else {
-            "Signup failed — please try again"
-        };
-        (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": user_msg })))
-    })?;
-
-    let cognito_sub = result.user_sub();
-
-    info!(email = %email, cognito_sub = %cognito_sub, "User signed up, verification pending");
-
-    Ok(Json(serde_json::json!({
-        "status": "verification_required",
-        "message": "Check your email for a verification code"
-    })))
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "Coderhelm is currently in closed beta. Join the waitlist to get notified when we open up."
+        })),
+    ))
 }
 
 // ── Verify email ─────────────────────────────────────────────────────
@@ -1191,6 +1140,47 @@ fn extract_cookie<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
         .find(|c| c.starts_with(&format!("{name}=")))
         .and_then(|c| c.split_once('='))
         .map(|(_, v)| v)
+}
+
+// ── Waitlist ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct WaitlistRequest {
+    pub email: String,
+}
+
+/// POST /auth/waitlist — join the closed beta waitlist.
+pub async fn join_waitlist(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<WaitlistRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let email = body.email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s("WAITLIST"))
+        .item("sk", attr_s(&format!("EMAIL#{email}")))
+        .item("email", attr_s(&email))
+        .item("created_at", attr_s(&now))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to save waitlist entry: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(email = %email, "Waitlist signup");
+    Ok(Json(serde_json::json!({
+        "status": "joined",
+        "message": "You're on the list! We'll notify you when Coderhelm opens up."
+    })))
 }
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
