@@ -791,7 +791,7 @@ pub async fn github_callback(
     let user_id = format!("USER#{github_id}");
     let email = user["email"].as_str().unwrap_or("");
 
-    // Determine role: check if user was invited (existing record) or is the first user
+    // Determine role: check existing record, then pending invites, then first-user logic
     let mut role = "member".to_string();
     let existing_user = state
         .dynamo
@@ -805,30 +805,75 @@ pub async fn github_callback(
         .and_then(|r| r.item().cloned());
 
     if let Some(ref item) = existing_user {
-        // User was invited — keep their assigned role
+        // Existing user record — keep their assigned role
         role = item
             .get("role")
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or_else(|| "member".to_string());
     } else {
-        // Check if tenant has any existing users (first user → owner)
-        let tenant_users = state
+        // No existing record for this user ID — check for a pending invite by email
+        let invite_email = email.to_lowercase();
+        let invite_result = state
             .dynamo
             .query()
             .table_name(&state.config.users_table_name)
-            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-            .expression_attribute_values(":pk", attr_s(&tenant_id))
-            .expression_attribute_values(":prefix", attr_s("USER#"))
-            .limit(1)
+            .index_name("gsi2")
+            .key_condition_expression("gsi2pk = :email AND gsi2sk = :tid")
+            .expression_attribute_values(":email", attr_s(&format!("EMAIL#{invite_email}")))
+            .expression_attribute_values(":tid", attr_s(&tenant_id))
             .send()
             .await
             .ok()
-            .map(|r| r.count() as usize)
-            .unwrap_or(0);
+            .and_then(|r| r.items)
+            .unwrap_or_default();
 
-        if tenant_users == 0 {
-            role = "owner".to_string();
+        let pending_invite = invite_result.iter().find(|item| {
+            item.get("status")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s == "invited")
+                .unwrap_or(false)
+        });
+
+        if let Some(invite) = pending_invite {
+            // Found a pending invite — use its role
+            role = invite
+                .get("role")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_else(|| "member".to_string());
+
+            // Delete the stale invite record
+            if let Some(invite_sk) = invite.get("sk").and_then(|v| v.as_s().ok()) {
+                let _ = state
+                    .dynamo
+                    .delete_item()
+                    .table_name(&state.config.users_table_name)
+                    .key("pk", attr_s(&tenant_id))
+                    .key("sk", attr_s(invite_sk))
+                    .send()
+                    .await;
+                info!(email = %invite_email, invite_sk = %invite_sk, role = %role, "Matched pending invite to GitHub user");
+            }
+        } else {
+            // No invite — check if first user (→ owner)
+            let tenant_users = state
+                .dynamo
+                .query()
+                .table_name(&state.config.users_table_name)
+                .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+                .expression_attribute_values(":pk", attr_s(&tenant_id))
+                .expression_attribute_values(":prefix", attr_s("USER#"))
+                .limit(1)
+                .send()
+                .await
+                .ok()
+                .map(|r| r.count() as usize)
+                .unwrap_or(0);
+
+            if tenant_users == 0 {
+                role = "owner".to_string();
+            }
         }
     }
 

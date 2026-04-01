@@ -88,6 +88,60 @@ INSIGHTS_QUERIES = [
     },
 ]
 
+# ── Token / Secret Scrubbing ───────────────────────────────────
+
+import re
+
+# Patterns that match common secrets, tokens, keys, and credentials
+SECRET_PATTERNS = [
+    # AWS keys
+    (re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}"), "[AWS_ACCESS_KEY]"),
+    (re.compile(r"(?<![A-Za-z0-9/+])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"), None),  # handled separately
+    # AWS session tokens
+    (re.compile(r"(?i)(?:aws[_-]?session[_-]?token|x-amz-security-token)\s*[:=]\s*\S+"), "[AWS_SESSION_TOKEN]"),
+    # Generic API keys / tokens (hex or base64, 32+ chars)
+    (re.compile(r"(?i)(?:api[_-]?key|auth[_-]?token|bearer|secret[_-]?key|access[_-]?token|private[_-]?key)\s*[:=]\s*['\"]?\S{20,}['\"]?"), "[REDACTED_CREDENTIAL]"),
+    # Bearer tokens in headers
+    (re.compile(r"(?i)Bearer\s+[A-Za-z0-9\-._~+/]+=*"), "[BEARER_TOKEN]"),
+    # JWTs (3 base64 segments separated by dots)
+    (re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"), "[JWT_TOKEN]"),
+    # GitHub tokens
+    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{36,}"), "[GITHUB_TOKEN]"),
+    # Slack tokens
+    (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), "[SLACK_TOKEN]"),
+    # Generic password fields
+    (re.compile(r"(?i)(?:password|passwd|pwd)\s*[:=]\s*['\"]?\S+['\"]?"), "[REDACTED_PASSWORD]"),
+    # Connection strings
+    (re.compile(r"(?i)(?:mongodb|postgres|mysql|redis|amqp)://\S+@\S+"), "[REDACTED_CONNECTION_STRING]"),
+    # Private keys
+    (re.compile(r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----"), "[PRIVATE_KEY]"),
+]
+
+
+def scrub_secrets(text):
+    """Remove tokens, secrets, and credentials from log text before analysis."""
+    if not isinstance(text, str):
+        return text
+    for pattern, replacement in SECRET_PATTERNS:
+        if replacement:
+            text = pattern.sub(replacement, text)
+        else:
+            # AWS secret key heuristic — only replace near AWS-related context
+            text = pattern.sub("[POSSIBLE_SECRET_KEY]", text)
+    return text
+
+
+def scrub_query_results(results):
+    """Recursively scrub secrets from query result data."""
+    if isinstance(results, str):
+        return scrub_secrets(results)
+    if isinstance(results, list):
+        return [scrub_query_results(item) for item in results]
+    if isinstance(results, dict):
+        return {k: scrub_query_results(v) for k, v in results.items()}
+    return results
+
+
 # ── Main Handler ────────────────────────────────────────────────
 
 
@@ -216,11 +270,47 @@ def analyze_connection(conn):
         logger.info(f"No errors found for {tenant_id}/{account_id}")
         return 0
 
+    # Check for secrets/tokens in raw results and create advisory if found
+    raw_text = json.dumps(all_results, default=str)
+    secrets_found = 0
+    secret_types = set()
+    for pattern, replacement in SECRET_PATTERNS:
+        matches = pattern.findall(raw_text)
+        if matches and replacement:
+            secrets_found += len(matches)
+            secret_types.add(replacement.strip("[]"))
+
+    if secrets_found > 0:
+        types_str = ", ".join(sorted(secret_types))
+        advisory_rec = {
+            "title": f"Secrets detected in CloudWatch Logs ({secrets_found} instances)",
+            "severity": "critical",
+            "summary": (
+                f"We detected {secrets_found} potential secrets or tokens in your CloudWatch Logs "
+                f"(types: {types_str}). These were automatically scrubbed before AI analysis, "
+                f"but they still exist in your logs and could be exposed."
+            ),
+            "suggested_action": (
+                "1. Rotate any exposed credentials immediately. "
+                "2. Add a CloudWatch Logs subscription filter or Lambda to strip secrets at ingestion. "
+                "3. Update your application to avoid logging sensitive values — use environment variables "
+                "and never pass secrets as command-line arguments or log them at any level. "
+                "4. Consider using AWS Secrets Manager or Parameter Store for credential management."
+            ),
+            "source_log_group": "multiple",
+            "error_pattern": f"secrets_in_logs_{account_id}",
+        }
+        if store_recommendation(tenant_id, account_id, advisory_rec):
+            new_recs = 1
+        else:
+            new_recs = 0
+    else:
+        new_recs = 0
+
     # Send to Bedrock for analysis
     recommendations = analyze_with_bedrock(all_results, account_id)
 
     # Deduplicate and store
-    new_recs = 0
     for rec in recommendations:
         if store_recommendation(tenant_id, account_id, rec):
             new_recs += 1
@@ -299,8 +389,11 @@ def format_query_results(results):
 
 def analyze_with_bedrock(query_results, account_id):
     """Send log error summaries to Bedrock Claude for analysis."""
+    # Scrub any secrets/tokens from the data before sending to AI
+    scrubbed_results = scrub_query_results(query_results)
+
     # Build context — NO raw log data, only aggregated summaries
-    context = json.dumps(query_results, indent=2, default=str)
+    context = json.dumps(scrubbed_results, indent=2, default=str)
 
     # Truncate if too large (keep under 100K tokens)
     if len(context) > 50000:
