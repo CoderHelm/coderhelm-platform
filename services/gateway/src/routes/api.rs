@@ -597,6 +597,38 @@ pub async fn re_review_run(
     Ok(Json(json!({ "status": "re-reviewing" })))
 }
 
+/// POST /api/runs/:run_id/cancel — cancel a running job.
+pub async fn cancel_run(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let now = chrono::Utc::now().to_rfc3339();
+
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("run_id", attr_s(&run_id))
+        .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", attr_s("cancelled"))
+        .expression_attribute_values(":sri", attr_s(&format!("cancelled#{run_id}")))
+        .expression_attribute_values(":t", attr_s(&now))
+        .condition_expression("#s = :running")
+        .expression_attribute_values(":running", attr_s("running"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to cancel run {run_id}: {e}");
+            StatusCode::BAD_REQUEST
+        })?;
+
+    info!(run_id, "Run cancelled by user");
+    Ok(Json(json!({ "status": "cancelled" })))
+}
+
 /// GET /api/repos — list repos configured for this tenant.
 pub async fn list_repos(
     State(state): State<Arc<AppState>>,

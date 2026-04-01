@@ -150,6 +150,12 @@ pub async fn create_plan(
             if !task_repo.is_empty() {
                 put = put.item("repo", attr_s(task_repo));
             }
+            if let Some(dest) = task["destination"].as_str() {
+                put = put.item("destination", attr_s(dest));
+            }
+            if let Some(jp) = task["jira_project"].as_str() {
+                put = put.item("jira_project", attr_s(jp));
+            }
 
             put.send().await.map_err(|e| {
                 error!("Failed to create task: {e}");
@@ -273,6 +279,12 @@ pub async fn update_plan(
         update_parts.push("#st = :s".to_string());
         expr_values.push((":s".to_string(), attr_s(status)));
     }
+    if let Some(dest) = body["destination"].as_str() {
+        if dest == "github" || dest == "jira" {
+            update_parts.push("destination = :dest".to_string());
+            expr_values.push((":dest".to_string(), attr_s(dest)));
+        }
+    }
 
     let update_expr = format!("SET {}", update_parts.join(", "));
 
@@ -298,6 +310,42 @@ pub async fn update_plan(
         error!("Failed to update plan: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // Propagate destination change to all tasks
+    if let Some(dest) = body["destination"].as_str() {
+        if dest == "github" || dest == "jira" {
+            let task_prefix = format!("PLAN#{plan_id}#TASK#");
+            let result = state
+                .dynamo
+                .query()
+                .table_name(&state.config.plans_table_name)
+                .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+                .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+                .expression_attribute_values(":prefix", attr_s(&task_prefix))
+                .projection_expression("pk, sk")
+                .send()
+                .await
+                .map_err(|e| {
+                    error!("Failed to query tasks for destination update: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+            for item in result.items() {
+                if let Some(task_sk) = item.get("sk").and_then(|v| v.as_s().ok()) {
+                    let _ = state
+                        .dynamo
+                        .update_item()
+                        .table_name(&state.config.plans_table_name)
+                        .key("pk", attr_s(&claims.tenant_id))
+                        .key("sk", attr_s(task_sk))
+                        .update_expression("SET destination = :dest")
+                        .expression_attribute_values(":dest", attr_s(dest))
+                        .send()
+                        .await;
+                }
+            }
+        }
+    }
 
     Ok(StatusCode::OK)
 }
@@ -391,6 +439,12 @@ pub async fn add_task(
     if !task_repo.is_empty() {
         put = put.item("repo", attr_s(task_repo));
     }
+    if let Some(dest) = body["destination"].as_str() {
+        put = put.item("destination", attr_s(dest));
+    }
+    if let Some(jp) = body["jira_project"].as_str() {
+        put = put.item("jira_project", attr_s(jp));
+    }
 
     put.send().await.map_err(|e| {
         error!("Failed to create task: {e}");
@@ -456,6 +510,14 @@ pub async fn update_task(
     if let Some(status) = body["status"].as_str() {
         update_parts.push("#st = :s");
         expr_values.push((":s", attr_s(status)));
+    }
+    if let Some(dest) = body["destination"].as_str() {
+        update_parts.push("destination = :dest");
+        expr_values.push((":dest", attr_s(dest)));
+    }
+    if let Some(jp) = body["jira_project"].as_str() {
+        update_parts.push("jira_project = :jp");
+        expr_values.push((":jp", attr_s(jp)));
     }
 
     if update_parts.is_empty() {
@@ -904,6 +966,7 @@ fn plan_from_item(
         "task_count": item.get("task_count").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
         "tokens_in": item.get("total_tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "tokens_out": item.get("total_tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
+        "destination": item.get("destination").and_then(|v| v.as_s().ok()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
         "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
         "executed_at": item.get("executed_at").and_then(|v| v.as_s().ok()),
@@ -930,6 +993,10 @@ fn task_from_item(
         "approved_by": item.get("approved_by").and_then(|v| v.as_s().ok()),
         "rejected_at": item.get("rejected_at").and_then(|v| v.as_s().ok()),
         "rejected_by": item.get("rejected_by").and_then(|v| v.as_s().ok()),
+        "destination": item.get("destination").and_then(|v| v.as_s().ok()),
+        "jira_project": item.get("jira_project").and_then(|v| v.as_s().ok()),
+        "jira_ticket_key": item.get("jira_ticket_key").and_then(|v| v.as_s().ok()),
+        "jira_ticket_url": item.get("jira_ticket_url").and_then(|v| v.as_s().ok()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
     })
 }
