@@ -2444,9 +2444,18 @@ pub async fn get_workflow_settings(
         .cloned()
         .unwrap_or_else(|| "github".to_string());
 
-    Ok(Json(
-        json!({ "commit_openspec": commit_openspec, "default_destination": default_destination }),
-    ))
+    let allow_plan_log_analyzer = result
+        .item()
+        .and_then(|i| i.get("allow_plan_log_analyzer"))
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false); // default: off
+
+    Ok(Json(json!({
+        "commit_openspec": commit_openspec,
+        "default_destination": default_destination,
+        "allow_plan_log_analyzer": allow_plan_log_analyzer,
+    })))
 }
 
 /// PUT /api/settings/workflow — update workflow preferences.
@@ -2455,11 +2464,12 @@ pub async fn update_workflow_settings(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
-    let commit_openspec = body["commit_openspec"].as_bool().unwrap_or(true);
+    let commit_openspec = body["commit_openspec"].as_bool().unwrap_or(false);
     let default_destination = body["default_destination"]
         .as_str()
         .filter(|d| *d == "github" || *d == "jira")
         .unwrap_or("github");
+    let allow_plan_log_analyzer = body["allow_plan_log_analyzer"].as_bool().unwrap_or(false);
 
     state
         .dynamo
@@ -2472,6 +2482,10 @@ pub async fn update_workflow_settings(
             aws_sdk_dynamodb::types::AttributeValue::Bool(commit_openspec),
         )
         .item("default_destination", attr_s(default_destination))
+        .item(
+            "allow_plan_log_analyzer",
+            aws_sdk_dynamodb::types::AttributeValue::Bool(allow_plan_log_analyzer),
+        )
         .send()
         .await
         .map_err(|e| {

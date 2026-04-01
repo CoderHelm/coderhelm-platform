@@ -1123,6 +1123,14 @@ pub async fn plan_chat(
         })
         .unwrap_or_default();
 
+    // Optional AWS Log Analyzer context for planning (off by default).
+    let allow_plan_log_analyzer = load_allow_plan_log_analyzer(&state, &claims.tenant_id).await;
+    let log_analyzer_context = if allow_plan_log_analyzer {
+        Some(load_log_analyzer_context(&state, &claims.tenant_id).await)
+    } else {
+        None
+    };
+
     // Build system prompt with org context and repo list
     let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
     if !org_context.is_empty() {
@@ -1138,6 +1146,11 @@ pub async fn plan_chat(
                 .map(|r| format!("- {r}"))
                 .collect::<Vec<_>>()
                 .join("\n")
+        ));
+    }
+    if let Some(context) = log_analyzer_context.filter(|c| !c.is_empty()) {
+        system_prompt.push_str(&format!(
+            "\n\nAWS Log Analyzer context (enabled in workflow settings):\n{context}"
         ));
     }
 
@@ -1227,4 +1240,73 @@ async fn track_chat_tokens(
             .send()
             .await;
     }
+}
+
+async fn load_allow_plan_log_analyzer(state: &AppState, tenant_id: &str) -> bool {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(tenant_id))
+        .key("sk", attr_s("SETTINGS#WORKFLOW"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .and_then(|i| {
+            i.get("allow_plan_log_analyzer")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+        })
+        .unwrap_or(false)
+}
+
+async fn load_log_analyzer_context(state: &AppState, tenant_id: &str) -> String {
+    let result = match state
+        .dynamo
+        .query()
+        .table_name(&state.config.settings_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", attr_s(tenant_id))
+        .expression_attribute_values(":prefix", attr_s("REC#"))
+        .scan_index_forward(false)
+        .limit(5)
+        .send()
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    for item in result.items() {
+        let status = item
+            .get("status")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if status == "dismissed" {
+            continue;
+        }
+
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("Untitled recommendation");
+        let severity = item
+            .get("severity")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+        let summary = item
+            .get("summary")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        lines.push(format!("- [{severity}] {title}: {summary}"));
+    }
+
+    lines.join("\n")
 }
