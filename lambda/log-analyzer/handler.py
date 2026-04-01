@@ -26,7 +26,7 @@ logger.setLevel(logging.INFO)
 SETTINGS_TABLE = os.environ.get("SETTINGS_TABLE_NAME", "coderhelm-prod-settings")
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-6")
 CODERHELM_ACCOUNT_ID = os.environ.get("CODERHELM_ACCOUNT_ID", "654654210434")
-LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "6"))
+LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 
 dynamodb = boto3.resource("dynamodb")
 settings_table = dynamodb.Table(SETTINGS_TABLE)
@@ -465,7 +465,7 @@ def store_recommendation(tenant_id, account_id, rec):
     raw = f"{account_id}:{rec.get('source_log_group', '')}:{rec.get('error_pattern', rec.get('title', ''))}"
     error_hash = hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-    # Check if we already have a non-dismissed rec with this hash in last 24h
+    # Check if we already have a non-dismissed rec with this hash
     rec_id = ulid_now()
     sk = f"REC#{rec_id}"
     now = datetime.now(timezone.utc).isoformat()
