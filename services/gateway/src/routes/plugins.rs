@@ -24,9 +24,11 @@ struct PluginDef {
     description: &'static str,
     category: &'static str,
     tier: u8,
+    icon: &'static str,
     credential_fields: &'static [CredentialField],
     docs_url: &'static str,
     repo_url: &'static str,
+    default_prompt: &'static str,
 }
 
 #[derive(serde::Serialize)]
@@ -45,6 +47,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Extract design tokens, inspect components, and pull assets from Figma files.",
         category: "Design",
         tier: 1,
+        icon: "🎨",
         credential_fields: &[CredentialField {
             key: "api_token",
             label: "Personal Access Token",
@@ -52,7 +55,8 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://www.figma.com/developers/api",
-        repo_url: "https://github.com/nichochar/figma-mcp",
+        repo_url: "https://github.com/figma/mcp-server-guide",
+        default_prompt: "Use the Figma MCP to extract design tokens, component details, and layout information from design files. Reference specific frames and layers by name.",
     },
     PluginDef {
         id: "sentry",
@@ -60,6 +64,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Query error events, list issues, and resolve incidents from Sentry.",
         category: "Monitoring",
         tier: 1,
+        icon: "🐛",
         credential_fields: &[
             CredentialField {
                 key: "auth_token",
@@ -76,6 +81,7 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://docs.sentry.io/api/",
         repo_url: "https://github.com/getsentry/sentry-mcp",
+        default_prompt: "Use the Sentry MCP to investigate production errors. Query recent issues, inspect stack traces, and correlate errors with recent deployments.",
     },
     PluginDef {
         id: "linear",
@@ -83,6 +89,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Create and update issues, query projects, and sync status with Linear.",
         category: "Project Management",
         tier: 1,
+        icon: "📋",
         credential_fields: &[CredentialField {
             key: "api_key",
             label: "API Key",
@@ -90,7 +97,8 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://developers.linear.app/docs",
-        repo_url: "https://github.com/linear/linear-mcp-server",
+        repo_url: "https://linear.app/docs/mcp",
+        default_prompt: "Use the Linear MCP to manage issues and projects. Create issues with proper labels and priorities, update status, and query project progress.",
     },
     PluginDef {
         id: "notion",
@@ -98,6 +106,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Search pages, read databases, and sync documentation from Notion.",
         category: "Documentation",
         tier: 1,
+        icon: "📓",
         credential_fields: &[CredentialField {
             key: "api_key",
             label: "Integration Token",
@@ -106,6 +115,7 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://developers.notion.com/",
         repo_url: "https://github.com/makenotion/notion-mcp-server",
+        default_prompt: "Use the Notion MCP to search documentation, read database entries, and reference wiki pages for project context.",
     },
     PluginDef {
         id: "slack",
@@ -113,6 +123,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Send messages, query channels, and post updates to Slack.",
         category: "Communication",
         tier: 1,
+        icon: "💬",
         credential_fields: &[CredentialField {
             key: "bot_token",
             label: "Bot Token",
@@ -120,7 +131,8 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://api.slack.com/docs",
-        repo_url: "https://github.com/modelcontextprotocol/servers",
+        repo_url: "https://github.com/zencoderai/slack-mcp-server",
+        default_prompt: "Use the Slack MCP to post deployment updates, send notifications to channels, and query recent messages for context.",
     },
     PluginDef {
         id: "datadog",
@@ -128,6 +140,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Query metrics, list monitors, and search logs from Datadog.",
         category: "Monitoring",
         tier: 1,
+        icon: "🐶",
         credential_fields: &[
             CredentialField {
                 key: "api_key",
@@ -150,6 +163,7 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://docs.datadoghq.com/api/",
         repo_url: "https://github.com/winor30/datadog-mcp-server",
+        default_prompt: "Use the Datadog MCP to query application metrics, check monitor statuses, and search logs for debugging production issues.",
     },
     // Tier 2 — Strong use cases
     PluginDef {
@@ -158,6 +172,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Manage tables, run queries, and inspect database schemas in Supabase.",
         category: "Database",
         tier: 2,
+        icon: "⚡",
         credential_fields: &[
             CredentialField {
                 key: "api_key",
@@ -174,6 +189,7 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://supabase.com/docs/guides/api",
         repo_url: "https://github.com/supabase-community/supabase-mcp",
+        default_prompt: "Use the Supabase MCP to run SQL queries, inspect table schemas, and manage database migrations.",
     },
     PluginDef {
         id: "vercel",
@@ -181,6 +197,7 @@ const CATALOG: &[PluginDef] = &[
         description: "List deployments, check build status, and manage environment variables.",
         category: "Deployment",
         tier: 2,
+        icon: "▲",
         credential_fields: &[CredentialField {
             key: "api_token",
             label: "API Token",
@@ -189,6 +206,7 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://vercel.com/docs/rest-api",
         repo_url: "https://github.com/vercel/vercel-mcp",
+        default_prompt: "Use the Vercel MCP to check deployment statuses, manage environment variables, and inspect build logs.",
     },
     PluginDef {
         id: "stripe",
@@ -196,6 +214,7 @@ const CATALOG: &[PluginDef] = &[
         description: "List charges, subscriptions, and customers from your Stripe account.",
         category: "Payments",
         tier: 2,
+        icon: "💳",
         credential_fields: &[CredentialField {
             key: "api_key",
             label: "Restricted API Key",
@@ -204,6 +223,7 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://docs.stripe.com/api",
         repo_url: "https://github.com/stripe/agent-toolkit",
+        default_prompt: "Use the Stripe MCP to query customers, list recent charges, and inspect subscription statuses.",
     },
     PluginDef {
         id: "cloudflare",
@@ -211,6 +231,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Manage DNS records, check analytics, and configure Workers.",
         category: "Deployment",
         tier: 2,
+        icon: "☁️",
         credential_fields: &[
             CredentialField {
                 key: "api_token",
@@ -227,6 +248,7 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://developers.cloudflare.com/api/",
         repo_url: "https://github.com/cloudflare/mcp-server-cloudflare",
+        default_prompt: "Use the Cloudflare MCP to manage DNS records, inspect Worker deployments, and check zone analytics.",
     },
     PluginDef {
         id: "posthog",
@@ -234,6 +256,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Query events, feature flags, and user analytics from PostHog.",
         category: "Analytics",
         tier: 2,
+        icon: "🦥",
         credential_fields: &[
             CredentialField {
                 key: "api_key",
@@ -249,7 +272,8 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://posthog.com/docs/api",
-        repo_url: "https://github.com/PostHog/posthog-mcp",
+        repo_url: "https://github.com/posthog/mcp",
+        default_prompt: "Use the PostHog MCP to query user analytics events, check feature flag statuses, and analyze user funnels.",
     },
     PluginDef {
         id: "confluence",
@@ -257,6 +281,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Search and read pages, spaces, and documentation from Confluence.",
         category: "Documentation",
         tier: 2,
+        icon: "📘",
         credential_fields: &[
             CredentialField {
                 key: "api_token",
@@ -278,7 +303,8 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://developer.atlassian.com/cloud/confluence/rest/v2/",
-        repo_url: "https://github.com/modelcontextprotocol/servers",
+        repo_url: "https://github.com/sooperset/mcp-atlassian",
+        default_prompt: "Use the Confluence MCP to search documentation, read wiki pages, and reference knowledge base articles.",
     },
     PluginDef {
         id: "planetscale",
@@ -286,6 +312,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Run queries, inspect schemas, and manage branches in PlanetScale.",
         category: "Database",
         tier: 2,
+        icon: "🌍",
         credential_fields: &[
             CredentialField {
                 key: "username",
@@ -307,7 +334,8 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://planetscale.com/docs/concepts/planetscale-api-oauth-applications",
-        repo_url: "https://github.com/planetscale/database-js",
+        repo_url: "https://planetscale.com/docs",
+        default_prompt: "Use the PlanetScale MCP to run SQL queries, inspect table schemas, and manage database branches.",
     },
     PluginDef {
         id: "gitlab",
@@ -315,6 +343,7 @@ const CATALOG: &[PluginDef] = &[
         description: "List merge requests, pipelines, and issues from GitLab.",
         category: "Source Control",
         tier: 2,
+        icon: "🦊",
         credential_fields: &[
             CredentialField {
                 key: "api_token",
@@ -330,7 +359,8 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://docs.gitlab.com/ee/api/rest/",
-        repo_url: "https://github.com/modelcontextprotocol/servers",
+        repo_url: "https://docs.gitlab.com/user/gitlab_duo/model_context_protocol/mcp_server/",
+        default_prompt: "Use the GitLab MCP to list merge requests, check pipeline statuses, and query issues.",
     },
     PluginDef {
         id: "neon",
@@ -338,6 +368,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Manage Postgres databases, branches, and run queries on Neon.",
         category: "Database",
         tier: 2,
+        icon: "🐘",
         credential_fields: &[CredentialField {
             key: "api_key",
             label: "API Key",
@@ -346,6 +377,7 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://neon.tech/docs/manage/api-keys",
         repo_url: "https://github.com/neondatabase/mcp-server-neon",
+        default_prompt: "Use the Neon MCP to manage Postgres branches, run SQL queries, and inspect database schemas.",
     },
     PluginDef {
         id: "turso",
@@ -353,6 +385,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Manage LibSQL databases, run queries, and inspect schemas on Turso.",
         category: "Database",
         tier: 2,
+        icon: "🗄️",
         credential_fields: &[
             CredentialField {
                 key: "api_token",
@@ -369,6 +402,7 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://docs.turso.tech/api-reference",
         repo_url: "https://github.com/tursodatabase/turso-mcp",
+        default_prompt: "Use the Turso MCP to manage LibSQL databases, run queries, and inspect schemas.",
     },
     // Tier 3 — Nice to have
     PluginDef {
@@ -377,6 +411,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Scan for vulnerabilities, list issues, and check dependency health.",
         category: "Security",
         tier: 3,
+        icon: "🔒",
         credential_fields: &[CredentialField {
             key: "api_token",
             label: "API Token",
@@ -384,7 +419,8 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://docs.snyk.io/snyk-api",
-        repo_url: "https://github.com/snyk/snyk-mcp-server",
+        repo_url: "https://github.com/snyk/snyk-ls",
+        default_prompt: "Use the Snyk MCP to scan for vulnerabilities, check dependency health, and list security issues.",
     },
     PluginDef {
         id: "launchdarkly",
@@ -392,6 +428,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Manage feature flags, list environments, and toggle flags.",
         category: "Feature Flags",
         tier: 3,
+        icon: "🚩",
         credential_fields: &[CredentialField {
             key: "api_key",
             label: "Access Token",
@@ -400,6 +437,7 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://apidocs.launchdarkly.com/",
         repo_url: "https://github.com/launchdarkly/mcp-server",
+        default_prompt: "Use the LaunchDarkly MCP to manage feature flags, check flag statuses across environments, and toggle flags.",
     },
     PluginDef {
         id: "mongodb",
@@ -407,6 +445,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Query collections, inspect schemas, and manage clusters on MongoDB Atlas.",
         category: "Database",
         tier: 3,
+        icon: "🍃",
         credential_fields: &[
             CredentialField {
                 key: "public_key",
@@ -428,7 +467,8 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://www.mongodb.com/docs/atlas/api/",
-        repo_url: "https://github.com/mongodb/mongodb-mcp-server",
+        repo_url: "https://github.com/mongodb-js/mongodb-mcp-server",
+        default_prompt: "Use the MongoDB MCP to query collections, inspect document schemas, and manage Atlas clusters.",
     },
     PluginDef {
         id: "grafana",
@@ -436,6 +476,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Query dashboards, list alerts, and explore data sources in Grafana.",
         category: "Monitoring",
         tier: 3,
+        icon: "📊",
         credential_fields: &[
             CredentialField {
                 key: "api_key",
@@ -452,6 +493,7 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://grafana.com/docs/grafana/latest/developers/http_api/",
         repo_url: "https://github.com/grafana/mcp-grafana",
+        default_prompt: "Use the Grafana MCP to query dashboards, check alert statuses, and explore data sources.",
     },
     PluginDef {
         id: "redis",
@@ -459,6 +501,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Inspect keys, run commands, and monitor a Redis instance.",
         category: "Database",
         tier: 3,
+        icon: "🟥",
         credential_fields: &[CredentialField {
             key: "connection_url",
             label: "Connection URL",
@@ -467,6 +510,7 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://redis.io/docs/",
         repo_url: "https://github.com/redis/mcp-redis",
+        default_prompt: "Use the Redis MCP to inspect keys, run commands, and monitor your Redis instance.",
     },
     PluginDef {
         id: "upstash",
@@ -474,6 +518,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Manage Redis and Kafka instances on Upstash.",
         category: "Database",
         tier: 3,
+        icon: "🚀",
         credential_fields: &[
             CredentialField {
                 key: "email",
@@ -490,6 +535,7 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://upstash.com/docs/devops/developer-api",
         repo_url: "https://github.com/upstash/mcp-server",
+        default_prompt: "Use the Upstash MCP to manage Redis databases, run commands, and monitor Kafka instances.",
     },
     PluginDef {
         id: "contentful",
@@ -497,6 +543,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Read content models, entries, and assets from Contentful.",
         category: "CMS",
         tier: 3,
+        icon: "📦",
         credential_fields: &[
             CredentialField {
                 key: "access_token",
@@ -512,7 +559,8 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://www.contentful.com/developers/docs/references/content-delivery-api/",
-        repo_url: "https://github.com/contentful/mcp-server",
+        repo_url: "https://github.com/ivo-toby/contentful-mcp",
+        default_prompt: "Use the Contentful MCP to read content models, query entries, and inspect assets.",
     },
     PluginDef {
         id: "sanity",
@@ -520,6 +568,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Query documents, read schemas, and manage content in Sanity.",
         category: "CMS",
         tier: 3,
+        icon: "📝",
         credential_fields: &[
             CredentialField {
                 key: "api_token",
@@ -536,6 +585,7 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://www.sanity.io/docs/http-api",
         repo_url: "https://github.com/sanity-io/sanity-mcp-server",
+        default_prompt: "Use the Sanity MCP to query documents, read content schemas, and manage structured content.",
     },
     PluginDef {
         id: "airtable",
@@ -543,6 +593,7 @@ const CATALOG: &[PluginDef] = &[
         description: "List bases, read records, and query tables in Airtable.",
         category: "Database",
         tier: 3,
+        icon: "📊",
         credential_fields: &[CredentialField {
             key: "api_key",
             label: "Personal Access Token",
@@ -550,7 +601,8 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://airtable.com/developers/web/api",
-        repo_url: "https://github.com/modelcontextprotocol/servers",
+        repo_url: "https://airtable.com/developers/web/api",
+        default_prompt: "Use the Airtable MCP to list bases, query records, and read table schemas.",
     },
 ];
 

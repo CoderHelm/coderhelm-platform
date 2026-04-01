@@ -1131,6 +1131,41 @@ pub async fn plan_chat(
         None
     };
 
+    // Load enabled plugins (MCP servers) for this tenant
+    let enabled_plugins = state
+        .dynamo
+        .query()
+        .table_name(&state.config.settings_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":prefix", attr_s("PLUGIN#"))
+        .send()
+        .await
+        .ok()
+        .map(|r| {
+            r.items()
+                .iter()
+                .filter(|item| {
+                    item.get("enabled")
+                        .and_then(|v| v.as_bool().ok())
+                        .copied()
+                        .unwrap_or(false)
+                })
+                .filter_map(|item| {
+                    let sk = item.get("sk")?.as_s().ok()?;
+                    sk.strip_prefix("PLUGIN#").map(|id| {
+                        let has_creds = item
+                            .get("has_credentials")
+                            .and_then(|v| v.as_bool().ok())
+                            .copied()
+                            .unwrap_or(false);
+                        (id.to_string(), has_creds)
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     // Build system prompt with org context and repo list
     let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
     if !org_context.is_empty() {
@@ -1146,6 +1181,24 @@ pub async fn plan_chat(
                 .map(|r| format!("- {r}"))
                 .collect::<Vec<_>>()
                 .join("\n")
+        ));
+    }
+    if !enabled_plugins.is_empty() {
+        let plugin_lines: Vec<String> = enabled_plugins
+            .iter()
+            .map(|(id, has_creds)| {
+                if *has_creds {
+                    format!("- {id} (connected)")
+                } else {
+                    format!("- {id} (enabled, needs credentials)")
+                }
+            })
+            .collect();
+        system_prompt.push_str(&format!(
+            "\n\nEnabled MCP servers (the user has these integrations available — \
+             reference them when relevant, e.g. \"pull designs from Figma\" or \
+             \"check Sentry for related errors\"):\n{}",
+            plugin_lines.join("\n")
         ));
     }
     if let Some(context) = log_analyzer_context.filter(|c| !c.is_empty()) {
