@@ -95,11 +95,20 @@ pub async fn run(
             };
 
             let description = format_issue_body(&task.description, &task.acceptance_criteria);
+            let jira_repo = task
+                .repo
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .unwrap_or(&plan_repo);
+            let mut jira_labels = vec!["coderhelm".to_string()];
+            if !jira_repo.is_empty() {
+                jira_labels.push(format!("coderhelm:{jira_repo}"));
+            }
             let payload = serde_json::json!({
                 "projectKey": project_key,
                 "summary": task.title,
                 "description": description,
-                "labels": ["coderhelm"],
+                "labels": jira_labels,
             });
 
             match state
@@ -548,11 +557,20 @@ pub async fn continue_tasks(
             };
 
             let description = format_issue_body(&task.description, &task.acceptance_criteria);
+            let jira_repo = task
+                .repo
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .unwrap_or(&plan_repo);
+            let mut jira_labels = vec!["coderhelm".to_string()];
+            if !jira_repo.is_empty() {
+                jira_labels.push(format!("coderhelm:{jira_repo}"));
+            }
             let payload = serde_json::json!({
                 "projectKey": project_key,
                 "summary": task.title,
                 "description": description,
-                "labels": ["coderhelm"],
+                "labels": jira_labels,
             });
 
             match state
