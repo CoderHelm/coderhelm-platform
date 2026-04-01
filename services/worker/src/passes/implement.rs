@@ -12,6 +12,7 @@ pub struct ImplementResult {
     pub files_modified: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     state: &WorkerState,
     msg: &TicketMessage,
