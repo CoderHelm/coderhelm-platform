@@ -68,7 +68,7 @@ pub async fn me(
         "github_login": claims.github_login,
         "email": claims.email,
         "avatar_url": item.get("avatar_url").and_then(|v| v.as_s().ok()),
-        "role": claims.role,
+        "role": item.get("role").and_then(|v| v.as_s().ok()).unwrap_or(&claims.role),
         "status": tenant_status,
         "auth_provider": auth_provider,
     })))
