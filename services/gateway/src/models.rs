@@ -18,6 +18,7 @@ pub struct Config {
     pub billing_table_name: String,
     pub banners_table_name: String,
     pub mcp_configs_table_name: String,
+    pub waitlist_table_name: String,
     pub bucket_name: String,
     pub invoice_bucket_name: String,
     pub ticket_queue_url: String,
@@ -61,6 +62,8 @@ impl Config {
                 .expect("BANNERS_TABLE_NAME required"),
             mcp_configs_table_name: std::env::var("MCP_CONFIGS_TABLE_NAME")
                 .unwrap_or_default(),
+            waitlist_table_name: std::env::var("WAITLIST_TABLE_NAME")
+                .expect("WAITLIST_TABLE_NAME required"),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
             invoice_bucket_name: std::env::var("INVOICE_BUCKET_NAME")
                 .unwrap_or_else(|_| "coderhelm-prod-invoices".to_string()),

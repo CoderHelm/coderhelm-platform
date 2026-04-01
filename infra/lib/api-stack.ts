@@ -32,11 +32,13 @@ interface ApiStackProps extends cdk.StackProps {
   billingTable: dynamodb.TableV2;
   bannersTable: dynamodb.TableV2;
   mcpConfigsTable: dynamodb.TableV2;
+  waitlistTable: dynamodb.TableV2;
   bucket: s3.Bucket;
 }
 
 export class ApiStack extends cdk.Stack {
   public readonly gatewayFunction: lambda.Function;
+  public readonly mcpProxyFunction: lambda.Function;
   public readonly ticketQueue: sqs.Queue;
   public readonly ciFixQueue: sqs.Queue;
   public readonly feedbackQueue: sqs.Queue;
@@ -255,6 +257,7 @@ export class ApiStack extends cdk.Stack {
         BILLING_TABLE_NAME: props.billingTable.tableName,
         BANNERS_TABLE_NAME: props.bannersTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
+        WAITLIST_TABLE_NAME: props.waitlistTable.tableName,
         TICKET_QUEUE_URL: this.ticketQueue.queueUrl,
         CI_FIX_QUEUE_URL: this.ciFixQueue.queueUrl,
         FEEDBACK_QUEUE_URL: this.feedbackQueue.queueUrl,
@@ -286,6 +289,7 @@ export class ApiStack extends cdk.Stack {
     props.billingTable.grantReadWriteData(this.gatewayFunction);
     props.bannersTable.grantReadData(this.gatewayFunction);
     props.mcpConfigsTable.grantReadWriteData(this.gatewayFunction);
+    props.waitlistTable.grantReadWriteData(this.gatewayFunction);
     props.bucket.grantReadWrite(this.gatewayFunction);
     this.ticketQueue.grantSendMessages(this.gatewayFunction);
     this.ciFixQueue.grantSendMessages(this.gatewayFunction);
@@ -328,6 +332,38 @@ export class ApiStack extends cdk.Stack {
         ],
         resources: [userPool.userPoolArn],
       })
+    );
+
+    // --- MCP Proxy Lambda (Node.js) ---
+    // Spawns MCP server processes via stdio to execute tool calls.
+    // Lives here (api-stack) so gateway can invoke it without a cross-stack cycle.
+
+    const mcpProxyLogGroup = new logs.LogGroup(this, "McpProxyLogGroup", {
+      logGroupName: `/aws/lambda/${prefix}-mcp-proxy`,
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    this.mcpProxyFunction = new lambda.Function(this, "McpProxy", {
+      functionName: `${prefix}-mcp-proxy`,
+      runtime: lambda.Runtime.NODEJS_20_X,
+      architecture: lambda.Architecture.ARM_64,
+      handler: "handler.handler",
+      code: lambda.Code.fromAsset("../lambda/mcp-proxy/dist"),
+      memorySize: 512,
+      timeout: cdk.Duration.minutes(2),
+      logGroup: mcpProxyLogGroup,
+      environment: {
+        BUCKET_NAME: props.bucket.bucketName,
+        NODE_ENV: "production",
+      },
+    });
+
+    props.bucket.grantReadWrite(this.mcpProxyFunction);
+    this.mcpProxyFunction.grantInvoke(this.gatewayFunction);
+    this.gatewayFunction.addEnvironment(
+      "MCP_PROXY_FUNCTION_NAME",
+      this.mcpProxyFunction.functionName
     );
 
     // --- HTTP API Gateway ---
