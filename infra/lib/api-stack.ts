@@ -336,6 +336,9 @@ export class ApiStack extends cdk.Stack {
           props.stage === "prod"
             ? "https://app.coderhelm.com"
             : "http://localhost:3000",
+          ...(props.stage === "prod"
+            ? ["https://coderhelm.com", "https://www.coderhelm.com"]
+            : []),
         ],
         allowMethods: [
           apigatewayv2.CorsHttpMethod.GET,
