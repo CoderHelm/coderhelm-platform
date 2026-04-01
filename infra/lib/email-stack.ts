@@ -97,6 +97,24 @@ export class EmailStack extends cdk.Stack {
       },
     });
 
+    new ses.CfnTemplate(this, "SubscriptionCancelledImmediatelyTemplate", {
+      template: {
+        templateName: `${prefix}-subscription-cancelled-immediately`,
+        subjectPart: "Your Coderhelm subscription has been cancelled",
+        htmlPart: SUBSCRIPTION_CANCELLED_IMMEDIATELY_HTML,
+        textPart: SUBSCRIPTION_CANCELLED_IMMEDIATELY_TEXT,
+      },
+    });
+
+    new ses.CfnTemplate(this, "RefundProcessedTemplate", {
+      template: {
+        templateName: `${prefix}-refund-processed`,
+        subjectPart: "Your Coderhelm refund has been processed",
+        htmlPart: REFUND_PROCESSED_HTML,
+        textPart: REFUND_PROCESSED_TEXT,
+      },
+    });
+
     new ses.CfnTemplate(this, "InvoiceReadyTemplate", {
       template: {
         templateName: `${prefix}-invoice-ready`,
@@ -331,6 +349,42 @@ Your Coderhelm subscription has been cancelled. You'll have access until {{acces
 After that, Coderhelm will stop processing new tickets.
 
 Resubscribe: https://app.coderhelm.com/billing`;
+
+const SUBSCRIPTION_CANCELLED_IMMEDIATELY_HTML = EMAIL_WRAPPER(`
+  <h1 style="color:#f59e0b;font-size:20px;margin:0 0 16px">Subscription cancelled</h1>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    Your Coderhelm subscription has been cancelled effective immediately. Coderhelm will stop processing new tickets for your repositories.
+  </p>
+  <p style="color:#888;font-size:14px;margin-top:16px">
+    Changed your mind? You can resubscribe at any time from your dashboard.
+  </p>
+  <a href="https://app.coderhelm.com/billing" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">Resubscribe</a>
+`);
+
+const SUBSCRIPTION_CANCELLED_IMMEDIATELY_TEXT = `Subscription cancelled
+
+Your Coderhelm subscription has been cancelled effective immediately.
+Coderhelm will stop processing new tickets.
+
+Resubscribe: https://app.coderhelm.com/billing`;
+
+const REFUND_PROCESSED_HTML = EMAIL_WRAPPER(`
+  <h1 style="color:#22c55e;font-size:20px;margin:0 0 16px">Refund processed</h1>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    A refund of <strong style="color:#fff">\${{amount}}</strong> has been processed on <strong style="color:#fff">{{date}}</strong>. It may take 5–10 business days to appear on your statement.
+  </p>
+  <p style="color:#888;font-size:14px;margin-top:16px">
+    If you have any questions, reply to this email or contact us at support@coderhelm.com.
+  </p>
+  <a href="https://app.coderhelm.com/billing" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">View billing</a>
+`);
+
+const REFUND_PROCESSED_TEXT = `Refund processed — \${{amount}}
+
+A refund of \${{amount}} has been processed on {{date}}.
+It may take 5–10 business days to appear on your statement.
+
+View billing: https://app.coderhelm.com/billing`;
 
 const INVOICE_READY_HTML = EMAIL_WRAPPER(`
   <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Invoice #{{invoice_number}}</h1>

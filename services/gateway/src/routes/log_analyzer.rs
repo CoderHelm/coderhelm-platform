@@ -56,6 +56,7 @@ pub async fn create_connection(
     Extension(claims): Extension<Claims>,
     Json(body): Json<CreateConnectionRequest>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
     // Only owner/admin can manage AWS connections
     if !is_admin_or_owner(&claims.role) {
         return Err(StatusCode::FORBIDDEN);
@@ -139,6 +140,7 @@ pub async fn list_connections(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
     let result = state
         .dynamo
         .query()
@@ -191,6 +193,7 @@ pub async fn update_connection(
     Path(connection_id): Path<String>,
     Json(body): Json<UpdateConnectionRequest>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
     if !is_admin_or_owner(&claims.role) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -250,6 +253,7 @@ pub async fn delete_connection(
     Extension(claims): Extension<Claims>,
     Path(connection_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
     if !is_admin_or_owner(&claims.role) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -283,6 +287,7 @@ pub async fn test_connection(
     Extension(claims): Extension<Claims>,
     Path(connection_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
     let sk = format!("AWS_CONN#{connection_id}");
 
     let result = state
@@ -373,6 +378,7 @@ pub async fn discover_log_groups(
     Extension(claims): Extension<Claims>,
     Path(connection_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
     let sk = format!("AWS_CONN#{connection_id}");
 
     let item = state
@@ -476,9 +482,10 @@ pub async fn discover_log_groups(
 
 /// GET /api/aws-connections/cfn-url — get CloudFormation quick-create URL
 pub async fn get_cfn_url(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
     if !is_admin_or_owner(&claims.role) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -518,6 +525,7 @@ pub async fn list_recommendations(
     Extension(claims): Extension<Claims>,
     Query(params): Query<RecommendationsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
     let limit = params.limit.unwrap_or(50).min(100);
 
     let result = state
@@ -570,6 +578,7 @@ pub async fn create_plan_from_recommendation(
     Extension(claims): Extension<Claims>,
     Path(rec_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
     if !is_admin_or_owner(&claims.role) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -672,6 +681,7 @@ pub async fn dismiss_recommendation(
     Extension(claims): Extension<Claims>,
     Path(rec_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
     let sk = format!("REC#{rec_id}");
     let now = chrono::Utc::now().to_rfc3339();
 
