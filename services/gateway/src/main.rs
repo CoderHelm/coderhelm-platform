@@ -71,6 +71,7 @@ async fn main() -> Result<(), Error> {
         .route("/health", get(routes::api::health))
         .route("/tenants", get(routes::api::list_tenants))
         .route("/tenants/switch", post(routes::api::switch_tenant))
+        .route("/tenants/rename", put(routes::api::rename_tenant))
         .route("/runs", get(routes::api::list_runs))
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/runs/:run_id/openspec", get(routes::api::get_run_openspec))
@@ -314,6 +315,10 @@ async fn main() -> Result<(), Error> {
         .route(
             "/plugins/:id/credentials",
             put(routes::plugins::update_credentials),
+        )
+        .route(
+            "/plugins/:id/prompt",
+            put(routes::plugins::update_prompt),
         )
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
