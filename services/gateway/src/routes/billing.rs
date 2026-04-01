@@ -994,6 +994,25 @@ pub async fn cancel_subscription(
             return Err(StatusCode::BAD_GATEWAY);
         }
 
+        // Update DynamoDB immediately so UI reflects the change without waiting for webhook
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&claims.tenant_id))
+            .key("sk", attr_s("BILLING"))
+            .update_expression(
+                "SET subscription_status = :status, cancelled_at = :t, \
+                 access_until = :end, updated_at = :t, previous_status = :prev",
+            )
+            .expression_attribute_values(":status", attr_s("free"))
+            .expression_attribute_values(":prev", attr_s("cancelled"))
+            .expression_attribute_values(":t", attr_s(&now))
+            .expression_attribute_values(":end", attr_s("now"))
+            .send()
+            .await;
+
         Ok(Json(json!({ "status": "cancelled" })))
     } else {
         // Cancel at period end
@@ -1021,6 +1040,26 @@ pub async fn cancel_subscription(
             );
             return Err(StatusCode::BAD_GATEWAY);
         }
+
+        // Store access_until so UI shows "Cancelling" immediately
+        let access_until = body["current_period_end"]
+            .as_u64()
+            .filter(|&ts| ts > 0)
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
+            .map(|dt| dt.format("%B %d, %Y").to_string())
+            .unwrap_or_else(|| "the end of your current billing period".to_string());
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&claims.tenant_id))
+            .key("sk", attr_s("BILLING"))
+            .update_expression("SET access_until = :end, updated_at = :t")
+            .expression_attribute_values(":t", attr_s(&now))
+            .expression_attribute_values(":end", attr_s(&access_until))
+            .send()
+            .await;
 
         Ok(Json(json!({ "status": "cancelling" })))
     }
