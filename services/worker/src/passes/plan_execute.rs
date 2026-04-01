@@ -113,7 +113,11 @@ pub async fn run(
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     let ticket_key = body["key"].as_str().unwrap_or("UNKNOWN");
-                    let ticket_url = format!("https://jira.atlassian.net/browse/{}", ticket_key);
+                    let site_url = body["self"]
+                        .as_str()
+                        .and_then(|s| s.find("/rest/").map(|i| &s[..i]))
+                        .unwrap_or("https://jira.atlassian.net");
+                    let ticket_url = format!("{}/browse/{}", site_url, ticket_key);
 
                     update_task_with_jira(
                         state,
@@ -562,7 +566,11 @@ pub async fn continue_tasks(
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     let ticket_key = body["key"].as_str().unwrap_or("UNKNOWN");
-                    let ticket_url = format!("https://jira.atlassian.net/browse/{}", ticket_key);
+                    let site_url = body["self"]
+                        .as_str()
+                        .and_then(|s| s.find("/rest/").map(|i| &s[..i]))
+                        .unwrap_or("https://jira.atlassian.net");
+                    let ticket_url = format!("{}/browse/{}", site_url, ticket_key);
                     update_task_with_jira(
                         state,
                         &msg.tenant_id,
