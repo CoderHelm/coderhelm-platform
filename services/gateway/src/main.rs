@@ -75,6 +75,12 @@ async fn main() -> Result<(), Error> {
         .route("/tenants", get(routes::api::list_tenants))
         .route("/tenants/switch", post(routes::api::switch_tenant))
         .route("/tenants/rename", put(routes::api::rename_tenant))
+        .route(
+            "/allowlist",
+            get(routes::api::list_allowlist)
+                .post(routes::api::add_to_allowlist)
+                .delete(routes::api::remove_from_allowlist),
+        )
         .route("/runs", get(routes::api::list_runs))
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/runs/:run_id/openspec", get(routes::api::get_run_openspec))

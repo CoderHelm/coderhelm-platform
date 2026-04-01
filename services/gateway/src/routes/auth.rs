@@ -11,6 +11,50 @@ use tracing::{error, info};
 use crate::auth::jwt;
 use crate::AppState;
 
+// ── Closed beta allowlist ───────────────────────────────────────────
+
+/// Check if an email is on the closed beta allowlist.
+/// Returns true if the allowlist is empty (open access) or if the email is listed.
+pub async fn is_email_allowed(state: &AppState, email: &str) -> bool {
+    let email = email.trim().to_lowercase();
+
+    // Check for exact email match
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s("ALLOWLIST"))
+        .key("sk", attr_s(&format!("EMAIL#{email}")))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned());
+
+    if result.is_some() {
+        return true;
+    }
+
+    // Check for domain wildcard (e.g. EMAIL#*@company.com)
+    if let Some(domain) = email.split('@').nth(1) {
+        let domain_result = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s("ALLOWLIST"))
+            .key("sk", attr_s(&format!("EMAIL#*@{domain}")))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item().cloned());
+
+        if domain_result.is_some() {
+            return true;
+        }
+    }
+
+    false
+}
+
 // ── Request bodies ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -66,15 +110,87 @@ pub struct GoogleCallbackParams {
 
 /// POST /auth/signup — Create account with email + password via Cognito.
 pub async fn signup(
-    State(_state): State<Arc<AppState>>,
-    Json(_body): Json<SignupRequest>,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SignupRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    Err((
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({
-            "error": "Coderhelm is currently in closed beta. Join the waitlist to get notified when we open up."
-        })),
-    ))
+    let email = body.email.trim().to_lowercase();
+    if email.is_empty() || body.password.len() < 8 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Email and password (min 8 chars) are required"
+            })),
+        ));
+    }
+
+    // Closed beta: check allowlist
+    if !is_email_allowed(&state, &email).await {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Coderhelm is in closed beta. Join the waitlist to get notified when we open up."
+            })),
+        ));
+    }
+
+    let mut req = state
+        .cognito
+        .sign_up()
+        .client_id(&state.config.cognito_client_id)
+        .username(&email)
+        .password(&body.password)
+        .user_attributes(
+            aws_sdk_cognitoidentityprovider::types::AttributeType::builder()
+                .name("email")
+                .value(&email)
+                .build()
+                .unwrap(),
+        );
+
+    if let Some(name) = &body.name {
+        req = req.user_attributes(
+            aws_sdk_cognitoidentityprovider::types::AttributeType::builder()
+                .name("name")
+                .value(name)
+                .build()
+                .unwrap(),
+        );
+    }
+
+    let result = req.send().await.map_err(|e| {
+        let msg = format!("{e}");
+        if msg.contains("UsernameExistsException") {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "An account with this email already exists"
+                })),
+            );
+        }
+        error!("Cognito signup failed: {e}");
+        let user_msg = if msg.contains("InvalidPasswordException")
+            || msg.contains("Password did not conform")
+        {
+            "Password must contain at least 8 characters, including uppercase, lowercase, a number, and a special character"
+        } else if msg.contains("InvalidParameterException") {
+            "Invalid email or password format"
+        } else {
+            "Signup failed — please try again"
+        };
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": user_msg })),
+        )
+    })?;
+
+    let cognito_sub = result.user_sub();
+
+    info!(email = %email, cognito_sub = %cognito_sub, "User signed up, verification pending");
+
+    Ok(Json(serde_json::json!({
+        "status": "verification_required",
+        "message": "Check your email for a verification code"
+    })))
 }
 
 // ── Verify email ─────────────────────────────────────────────────────
@@ -442,6 +558,17 @@ pub async fn google_callback(
         .and_then(|r| r.items)
         .unwrap_or_default();
 
+    // Closed beta: only allow new users on the allowlist (existing users can always log in)
+    if existing.is_empty() && !is_email_allowed(&state, &email).await {
+        let dash = if state.config.stage == "prod" {
+            "https://app.coderhelm.com"
+        } else {
+            "http://localhost:3000"
+        };
+        let redirect = format!("{dash}?error=closed_beta");
+        return Ok(Redirect::temporary(&redirect).into_response());
+    }
+
     let (tenant_id, user_id, role) = if let Some(item) = existing.first() {
         let tid = item
             .get("pk")
@@ -749,6 +876,30 @@ pub async fn github_callback(
     let tenant_id = format!("TENANT#{installation_id}");
     let user_id = format!("USER#{github_id}");
     let email = user["email"].as_str().unwrap_or("");
+
+    // Closed beta: check allowlist for new GitHub users
+    // Existing users and users with pending invites are always allowed
+    let has_existing_record = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(&tenant_id))
+        .key("sk", attr_s(&user_id))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .is_some();
+
+    if !has_existing_record && !email.is_empty() && !is_email_allowed(&state, email).await {
+        let dash = if state.config.stage == "prod" {
+            "https://app.coderhelm.com"
+        } else {
+            "http://localhost:3000"
+        };
+        let redirect = format!("{dash}?error=closed_beta");
+        return Ok(Redirect::temporary(&redirect).into_response());
+    }
 
     // Determine role: check existing record, then pending invites, then first-user logic
     let mut role = "member".to_string();
