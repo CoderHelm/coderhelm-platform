@@ -150,12 +150,7 @@ pub async fn list_tenants(
             .and_then(|v| v.as_s().ok())
             .filter(|s| !s.is_empty())
             .cloned()
-            .unwrap_or_else(|| {
-                claims.email.split('@').nth(1)
-                    .map(|d| d.split('.').next().unwrap_or("Personal"))
-                    .unwrap_or("Personal")
-                    .to_string()
-            });
+            .unwrap_or_else(|| claims.email.clone());
 
         let status = meta
             .as_ref()
@@ -221,6 +216,41 @@ pub async fn switch_tenant(
         Json(json!({ "tenant_id": target_tenant })),
     )
         .into_response())
+}
+
+/// PUT /api/tenants/rename — rename the current tenant (owner only).
+pub async fn rename_tenant(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    if claims.role != "owner" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let new_name = body["name"]
+        .as_str()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && s.len() <= 100)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("META"))
+        .update_expression("SET github_org = :name")
+        .expression_attribute_values(":name", attr_s(new_name))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to rename tenant: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(tenant = %claims.tenant_id, new_name = %new_name, "Tenant renamed");
+    Ok(Json(json!({ "status": "renamed", "name": new_name })))
 }
 
 #[derive(serde::Deserialize)]

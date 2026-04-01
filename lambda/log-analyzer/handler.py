@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import boto3
 from botocore.exceptions import ClientError
@@ -491,6 +491,7 @@ def store_recommendation(tenant_id, account_id, rec):
 
     # Store new recommendation
     try:
+        ttl_epoch = int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp())
         settings_table.put_item(
             Item={
                 "pk": tenant_id,
@@ -506,6 +507,7 @@ def store_recommendation(tenant_id, account_id, rec):
                 "error_hash": error_hash,
                 "created_at": now,
                 "updated_at": now,
+                "ttl": ttl_epoch,
             }
         )
         return True

@@ -326,6 +326,7 @@ export class DatabaseStack extends cdk.Stack {
       pointInTimeRecoverySpecification: {
         pointInTimeRecoveryEnabled: true,
       },
+      timeToLiveAttribute: "ttl",
       deletionProtection: isProd,
       removalPolicy: isProd
         ? cdk.RemovalPolicy.RETAIN

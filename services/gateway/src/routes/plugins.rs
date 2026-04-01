@@ -29,6 +29,7 @@ struct PluginDef {
     docs_url: &'static str,
     repo_url: &'static str,
     default_prompt: &'static str,
+    recommended_permissions: &'static str,
 }
 
 #[derive(serde::Serialize)]
@@ -47,7 +48,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Extract design tokens, inspect components, and pull assets from Figma files.",
         category: "Design",
         tier: 1,
-        icon: "🎨",
+        icon: "figma",
         credential_fields: &[CredentialField {
             key: "api_token",
             label: "Personal Access Token",
@@ -56,7 +57,8 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://www.figma.com/developers/api",
         repo_url: "https://github.com/figma/mcp-server-guide",
-        default_prompt: "Use the Figma MCP to extract design tokens, component details, and layout information from design files. Reference specific frames and layers by name.",
+        default_prompt: "Use the Figma MCP to extract design tokens, component details, and layout information from design files. Reference specific frames and layers by name. Do not modify or delete any Figma data.",
+        recommended_permissions: "Read-only file access",
     },
     PluginDef {
         id: "sentry",
@@ -64,7 +66,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Query error events, list issues, and resolve incidents from Sentry.",
         category: "Monitoring",
         tier: 1,
-        icon: "🐛",
+        icon: "sentry",
         credential_fields: &[
             CredentialField {
                 key: "auth_token",
@@ -81,7 +83,8 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://docs.sentry.io/api/",
         repo_url: "https://github.com/getsentry/sentry-mcp",
-        default_prompt: "Use the Sentry MCP to investigate production errors. Query recent issues, inspect stack traces, and correlate errors with recent deployments.",
+        default_prompt: "Use the Sentry MCP to investigate production errors. Query recent issues, inspect stack traces, and correlate errors with recent deployments. Do not resolve or delete issues unless explicitly asked.",
+        recommended_permissions: "Read-only: event:read, issue:read, project:read",
     },
     PluginDef {
         id: "linear",
@@ -89,7 +92,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Create and update issues, query projects, and sync status with Linear.",
         category: "Project Management",
         tier: 1,
-        icon: "📋",
+        icon: "linear",
         credential_fields: &[CredentialField {
             key: "api_key",
             label: "API Key",
@@ -98,7 +101,8 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://developers.linear.app/docs",
         repo_url: "https://linear.app/docs/mcp",
-        default_prompt: "Use the Linear MCP to manage issues and projects. Create issues with proper labels and priorities, update status, and query project progress.",
+        default_prompt: "Use the Linear MCP to manage issues and projects. Create issues with proper labels and priorities, update status, and query project progress. Do not delete issues or modify team settings.",
+        recommended_permissions: "Read + write issues only",
     },
     PluginDef {
         id: "notion",
@@ -106,7 +110,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Search pages, read databases, and sync documentation from Notion.",
         category: "Documentation",
         tier: 1,
-        icon: "📓",
+        icon: "notion",
         credential_fields: &[CredentialField {
             key: "api_key",
             label: "Integration Token",
@@ -115,7 +119,8 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://developers.notion.com/",
         repo_url: "https://github.com/makenotion/notion-mcp-server",
-        default_prompt: "Use the Notion MCP to search documentation, read database entries, and reference wiki pages for project context.",
+        default_prompt: "Use the Notion MCP to search documentation, read database entries, and reference wiki pages for project context. Do not create, modify, or delete pages unless explicitly asked.",
+        recommended_permissions: "Read content only — no insert capabilities",
     },
 
     // Tier 2 — Strong use cases
@@ -126,7 +131,7 @@ const CATALOG: &[PluginDef] = &[
         description: "List deployments, check build status, and manage environment variables.",
         category: "Deployment",
         tier: 2,
-        icon: "▲",
+        icon: "vercel",
         credential_fields: &[CredentialField {
             key: "api_token",
             label: "API Token",
@@ -135,7 +140,8 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://vercel.com/docs/rest-api",
         repo_url: "https://github.com/vercel/vercel-mcp",
-        default_prompt: "Use the Vercel MCP to check deployment statuses, manage environment variables, and inspect build logs.",
+        default_prompt: "Use the Vercel MCP to check deployment statuses, manage environment variables, and inspect build logs. Do not trigger deployments or modify production settings without confirmation.",
+        recommended_permissions: "Read-only token — no deploy access",
     },
     PluginDef {
         id: "stripe",
@@ -143,7 +149,7 @@ const CATALOG: &[PluginDef] = &[
         description: "List charges, subscriptions, and customers from your Stripe account.",
         category: "Payments",
         tier: 2,
-        icon: "💳",
+        icon: "stripe",
         credential_fields: &[CredentialField {
             key: "api_key",
             label: "Restricted API Key",
@@ -152,7 +158,8 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://docs.stripe.com/api",
         repo_url: "https://github.com/stripe/agent-toolkit",
-        default_prompt: "Use the Stripe MCP to query customers, list recent charges, and inspect subscription statuses.",
+        default_prompt: "Use the Stripe MCP to query customers, list recent charges, and inspect subscription statuses. Never create charges, refunds, or modify billing data.",
+        recommended_permissions: "Restricted key: read-only charges, customers, subscriptions",
     },
     PluginDef {
         id: "cloudflare",
@@ -160,7 +167,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Manage DNS records, check analytics, and configure Workers.",
         category: "Deployment",
         tier: 2,
-        icon: "☁️",
+        icon: "cloudflare",
         credential_fields: &[
             CredentialField {
                 key: "api_token",
@@ -177,7 +184,8 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://developers.cloudflare.com/api/",
         repo_url: "https://github.com/cloudflare/mcp-server-cloudflare",
-        default_prompt: "Use the Cloudflare MCP to manage DNS records, inspect Worker deployments, and check zone analytics.",
+        default_prompt: "Use the Cloudflare MCP to inspect DNS records, Worker deployments, and zone analytics. Do not modify DNS records or deploy Workers without explicit confirmation.",
+        recommended_permissions: "Read-only: Zone.Zone:Read, Zone.DNS:Read, Zone.Analytics:Read",
     },
     PluginDef {
         id: "posthog",
@@ -185,7 +193,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Query events, feature flags, and user analytics from PostHog.",
         category: "Analytics",
         tier: 2,
-        icon: "🦥",
+        icon: "posthog",
         credential_fields: &[
             CredentialField {
                 key: "api_key",
@@ -202,7 +210,8 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://posthog.com/docs/api",
         repo_url: "https://github.com/posthog/mcp",
-        default_prompt: "Use the PostHog MCP to query user analytics events, check feature flag statuses, and analyze user funnels.",
+        default_prompt: "Use the PostHog MCP to query user analytics events, check feature flag statuses, and analyze user funnels. Do not modify feature flags or delete data.",
+        recommended_permissions: "Read-only personal API key",
     },
 
     PluginDef {
@@ -211,7 +220,7 @@ const CATALOG: &[PluginDef] = &[
         description: "List merge requests, pipelines, and issues from GitLab.",
         category: "Source Control",
         tier: 2,
-        icon: "🦊",
+        icon: "gitlab",
         credential_fields: &[
             CredentialField {
                 key: "api_token",
@@ -228,7 +237,8 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://docs.gitlab.com/ee/api/rest/",
         repo_url: "https://docs.gitlab.com/user/gitlab_duo/model_context_protocol/mcp_server/",
-        default_prompt: "Use the GitLab MCP to list merge requests, check pipeline statuses, and query issues.",
+        default_prompt: "Use the GitLab MCP to list merge requests, check pipeline statuses, and query issues. Do not push code, merge MRs, or modify project settings.",
+        recommended_permissions: "read_api scope only",
     },
     PluginDef {
         id: "neon",
@@ -236,7 +246,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Manage Postgres databases, branches, and run queries on Neon.",
         category: "Database",
         tier: 2,
-        icon: "🐘",
+        icon: "neon",
         credential_fields: &[CredentialField {
             key: "api_key",
             label: "API Key",
@@ -245,7 +255,8 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://neon.tech/docs/manage/api-keys",
         repo_url: "https://github.com/neondatabase/mcp-server-neon",
-        default_prompt: "Use the Neon MCP to manage Postgres branches, run SQL queries, and inspect database schemas.",
+        default_prompt: "Use the Neon MCP to inspect Postgres schemas and run read-only queries. Do not run DDL statements, drop tables, or modify data without explicit approval.",
+        recommended_permissions: "Read-only database role — no DDL, no deletes",
     },
     PluginDef {
         id: "turso",
@@ -253,7 +264,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Manage LibSQL databases, run queries, and inspect schemas on Turso.",
         category: "Database",
         tier: 2,
-        icon: "🗄️",
+        icon: "turso",
         credential_fields: &[
             CredentialField {
                 key: "api_token",
@@ -270,7 +281,8 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://docs.turso.tech/api-reference",
         repo_url: "https://github.com/tursodatabase/turso-mcp",
-        default_prompt: "Use the Turso MCP to manage LibSQL databases, run queries, and inspect schemas.",
+        default_prompt: "Use the Turso MCP to inspect LibSQL schemas and run read-only queries. Do not execute DDL or destructive operations without explicit approval.",
+        recommended_permissions: "Read-only API token",
     },
     // Tier 3 — Nice to have
     PluginDef {
@@ -279,7 +291,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Scan for vulnerabilities, list issues, and check dependency health.",
         category: "Security",
         tier: 3,
-        icon: "🔒",
+        icon: "snyk",
         credential_fields: &[CredentialField {
             key: "api_token",
             label: "API Token",
@@ -288,7 +300,8 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://docs.snyk.io/snyk-api",
         repo_url: "https://github.com/snyk/snyk-ls",
-        default_prompt: "Use the Snyk MCP to scan for vulnerabilities, check dependency health, and list security issues.",
+        default_prompt: "Use the Snyk MCP to scan for vulnerabilities, check dependency health, and list security issues. Do not modify project settings or ignore policies.",
+        recommended_permissions: "Read-only: view org, view project",
     },
     PluginDef {
         id: "launchdarkly",
@@ -296,7 +309,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Manage feature flags, list environments, and toggle flags.",
         category: "Feature Flags",
         tier: 3,
-        icon: "🚩",
+        icon: "launchdarkly",
         credential_fields: &[CredentialField {
             key: "api_key",
             label: "Access Token",
@@ -305,7 +318,8 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://apidocs.launchdarkly.com/",
         repo_url: "https://github.com/launchdarkly/mcp-server",
-        default_prompt: "Use the LaunchDarkly MCP to manage feature flags, check flag statuses across environments, and toggle flags.",
+        default_prompt: "Use the LaunchDarkly MCP to check feature flag statuses across environments. Do not toggle flags or modify targeting rules without explicit confirmation.",
+        recommended_permissions: "Reader role — no write access",
     },
     PluginDef {
         id: "mongodb",
@@ -313,7 +327,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Query collections, inspect schemas, and manage clusters on MongoDB Atlas.",
         category: "Database",
         tier: 3,
-        icon: "🍃",
+        icon: "mongodb",
         credential_fields: &[
             CredentialField {
                 key: "public_key",
@@ -336,7 +350,8 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://www.mongodb.com/docs/atlas/api/",
         repo_url: "https://github.com/mongodb-js/mongodb-mcp-server",
-        default_prompt: "Use the MongoDB MCP to query collections, inspect document schemas, and manage Atlas clusters.",
+        default_prompt: "Use the MongoDB MCP to query collections and inspect document schemas. Do not drop collections, modify indexes, or delete data.",
+        recommended_permissions: "Project Read Only role",
     },
     PluginDef {
         id: "grafana",
@@ -344,7 +359,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Query dashboards, list alerts, and explore data sources in Grafana.",
         category: "Monitoring",
         tier: 3,
-        icon: "📊",
+        icon: "grafana",
         credential_fields: &[
             CredentialField {
                 key: "api_key",
@@ -361,7 +376,8 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://grafana.com/docs/grafana/latest/developers/http_api/",
         repo_url: "https://github.com/grafana/mcp-grafana",
-        default_prompt: "Use the Grafana MCP to query dashboards, check alert statuses, and explore data sources.",
+        default_prompt: "Use the Grafana MCP to query dashboards, check alert statuses, and explore data sources. Do not modify dashboards or silence alerts.",
+        recommended_permissions: "Viewer role service account",
     },
     PluginDef {
         id: "redis",
@@ -369,7 +385,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Inspect keys, run commands, and monitor a Redis instance.",
         category: "Database",
         tier: 3,
-        icon: "🟥",
+        icon: "redis",
         credential_fields: &[CredentialField {
             key: "connection_url",
             label: "Connection URL",
@@ -378,7 +394,8 @@ const CATALOG: &[PluginDef] = &[
         }],
         docs_url: "https://redis.io/docs/",
         repo_url: "https://github.com/redis/mcp-redis",
-        default_prompt: "Use the Redis MCP to inspect keys, run commands, and monitor your Redis instance.",
+        default_prompt: "Use the Redis MCP to inspect keys and run read-only commands. Do not run FLUSHDB, DEL, or any destructive commands.",
+        recommended_permissions: "Read-only user — no write commands",
     },
     PluginDef {
         id: "upstash",
@@ -386,7 +403,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Manage Redis and Kafka instances on Upstash.",
         category: "Database",
         tier: 3,
-        icon: "🚀",
+        icon: "upstash",
         credential_fields: &[
             CredentialField {
                 key: "email",
@@ -403,7 +420,8 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://upstash.com/docs/devops/developer-api",
         repo_url: "https://github.com/upstash/mcp-server",
-        default_prompt: "Use the Upstash MCP to manage Redis databases, run commands, and monitor Kafka instances.",
+        default_prompt: "Use the Upstash MCP to inspect Redis databases and read data. Do not delete databases, flush data, or modify configurations.",
+        recommended_permissions: "Read-only API key",
     },
 
     PluginDef {
@@ -412,7 +430,7 @@ const CATALOG: &[PluginDef] = &[
         description: "Query documents, read schemas, and manage content in Sanity.",
         category: "CMS",
         tier: 3,
-        icon: "📝",
+        icon: "sanity",
         credential_fields: &[
             CredentialField {
                 key: "api_token",
@@ -429,7 +447,8 @@ const CATALOG: &[PluginDef] = &[
         ],
         docs_url: "https://www.sanity.io/docs/http-api",
         repo_url: "https://github.com/sanity-io/sanity-mcp-server",
-        default_prompt: "Use the Sanity MCP to query documents, read content schemas, and manage structured content.",
+        default_prompt: "Use the Sanity MCP to query documents and read content schemas. Do not create, publish, or delete documents without explicit approval.",
+        recommended_permissions: "Viewer token — read-only access",
     },
 
 ];
@@ -485,6 +504,7 @@ pub async fn list_enabled(
                 "enabled": enabled,
                 "has_credentials": has_credentials,
                 "enabled_at": enabled_at,
+                "custom_prompt": item.get("custom_prompt").and_then(|v| v.as_s().ok()).map(|s| s.to_string()),
             }))
         })
         .collect();
@@ -622,5 +642,50 @@ pub async fn update_credentials(
         })?;
 
     info!(tenant = %claims.tenant_id, plugin = %plugin_id, "Plugin credentials updated");
+    Ok(Json(json!({ "status": "saved" })))
+}
+
+/// PUT /api/plugins/:id/prompt — save a custom prompt for a plugin.
+pub async fn update_prompt(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(plugin_id): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    if !is_admin_or_owner(&claims.role) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if !CATALOG.iter().any(|p| p.id == plugin_id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let custom_prompt = body
+        .get("custom_prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if custom_prompt.len() > 4000 {
+        return Ok(Json(json!({ "error": "Prompt too long (max 4000 characters)" })));
+    }
+
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
+        .update_expression("SET custom_prompt = :cp")
+        .expression_attribute_values(":cp", attr_s(&custom_prompt))
+        .condition_expression("attribute_exists(pk)")
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to update prompt for {plugin_id}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(tenant = %claims.tenant_id, plugin = %plugin_id, "Plugin custom prompt updated");
     Ok(Json(json!({ "status": "saved" })))
 }

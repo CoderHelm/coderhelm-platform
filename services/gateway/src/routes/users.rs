@@ -161,13 +161,7 @@ pub async fn invite_user(
                 .cloned()
         })
         .unwrap_or_else(|| {
-            claims
-                .email
-                .split('@')
-                .nth(1)
-                .map(|d| d.split('.').next().unwrap_or("your team"))
-                .unwrap_or("your team")
-                .to_string()
+            claims.email.clone()
         });
 
     let _ = state

@@ -92,14 +92,24 @@ Return ONLY the markdown body text."#,
     .await?;
 
     // Add issue link for GitHub tickets.
+    // Strip any "Closes #N" the model may have included to avoid duplication.
+    let clean_body: String = body_text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim().to_lowercase();
+            !(trimmed.starts_with("closes #") || trimmed.starts_with("fixes #") || trimmed.starts_with("resolves #"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let clean_body = clean_body.trim();
+
     let full_body = if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
         format!(
-            "Closes #{number}\n\n{body_text}",
+            "Closes #{number}\n\n{clean_body}",
             number = msg.issue_number,
-            body_text = body_text.trim(),
         )
     } else {
-        format!("Source ticket: {}\n\n{}", msg.ticket_id, body_text.trim())
+        format!("Source ticket: {}\n\n{clean_body}", msg.ticket_id)
     };
 
     // Create PR title
