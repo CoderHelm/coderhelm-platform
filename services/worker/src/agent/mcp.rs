@@ -1,11 +1,12 @@
 use aws_sdk_lambda::Client as LambdaClient;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use super::llm::ToolDefinition;
 
 /// Cached MCP tool schema loaded from S3.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpToolCache {
     pub server_id: String,
@@ -45,6 +46,7 @@ pub struct McpToolResult {
 #[derive(Debug, Deserialize)]
 pub struct McpContentItem {
     #[serde(default)]
+    #[allow(dead_code)]
     pub r#type: String,
     #[serde(default)]
     pub text: String,
@@ -195,7 +197,8 @@ pub async fn load_tenant_plugins(
     dynamo: &aws_sdk_dynamodb::Client,
     settings_table: &str,
     tenant_id: &str,
-    catalog: &[(&str, &str, &[(&str, &str)])], // (id, npx_package, env_mapping)
+    #[allow(clippy::type_complexity)]
+    catalog: &[(&str, &str, &[(&str, &str)])],
 ) -> Vec<McpPlugin> {
     let result = dynamo
         .query()

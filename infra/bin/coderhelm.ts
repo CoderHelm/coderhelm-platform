@@ -52,6 +52,7 @@ const api = new ApiStack(app, `${prefix}-api`, {
   billingTable: database.billingTable,
   bannersTable: database.bannersTable,
   mcpConfigsTable: database.mcpConfigsTable,
+  waitlistTable: database.waitlistTable,
   bucket: storage.bucket,
 });
 
@@ -73,16 +74,10 @@ const worker = new WorkerStack(app, `${prefix}-worker`, {
   ticketQueue: api.ticketQueue,
   ciFixQueue: api.ciFixQueue,
   feedbackQueue: api.feedbackQueue,
+  mcpProxyFunction: api.mcpProxyFunction,
 });
 
 // --- Email ---
-
-// Grant gateway permission to invoke MCP proxy Lambda
-worker.mcpProxyFunction.grantInvoke(api.gatewayFunction);
-api.gatewayFunction.addEnvironment(
-  "MCP_PROXY_FUNCTION_NAME",
-  worker.mcpProxyFunction.functionName
-);
 
 new EmailStack(app, `${prefix}-email`, {
   env,

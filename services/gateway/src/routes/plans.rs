@@ -1681,6 +1681,7 @@ async fn load_mcp_tool_cache(
 
 /// Gateway plugin catalog — maps server_id to (npx_package, env_mapping).
 /// env_mapping: &[(cred_field_key, env_var_name)]
+#[allow(clippy::type_complexity)]
 const GATEWAY_MCP_CATALOG: &[(&str, &str, &[(&str, &str)])] = &[
     (
         "figma",

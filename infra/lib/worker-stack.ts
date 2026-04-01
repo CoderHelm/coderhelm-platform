@@ -26,11 +26,11 @@ interface WorkerStackProps extends cdk.StackProps {
   ticketQueue: sqs.Queue;
   ciFixQueue: sqs.Queue;
   feedbackQueue: sqs.Queue;
+  mcpProxyFunction: lambda.Function;
 }
 
 export class WorkerStack extends cdk.Stack {
   public readonly workerFunction: lambda.Function;
-  public readonly mcpProxyFunction: lambda.Function;
 
   constructor(scope: Construct, id: string, props: WorkerStackProps) {
     super(scope, id, props);
@@ -138,41 +138,11 @@ export class WorkerStack extends cdk.Stack {
       })
     );
 
-    // --- MCP Proxy Lambda (Node.js) ---
-    // Spawns MCP server processes via stdio to execute tool calls.
-    // Invoked directly by gateway (plan_chat) and worker (passes).
-
-    const mcpProxyLogGroup = new logs.LogGroup(this, "McpProxyLogGroup", {
-      logGroupName: `/aws/lambda/${prefix}-mcp-proxy`,
-      retention: logs.RetentionDays.ONE_MONTH,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-    });
-
-    this.mcpProxyFunction = new lambda.Function(this, "McpProxy", {
-      functionName: `${prefix}-mcp-proxy`,
-      runtime: lambda.Runtime.NODEJS_20_X,
-      architecture: lambda.Architecture.ARM_64,
-      handler: "handler.handler",
-      code: lambda.Code.fromAsset("../lambda/mcp-proxy/dist"),
-      memorySize: 512,
-      timeout: cdk.Duration.minutes(2),
-      logGroup: mcpProxyLogGroup,
-      environment: {
-        BUCKET_NAME: props.bucket.bucketName,
-        NODE_ENV: "production",
-      },
-    });
-
-    // MCP proxy needs S3 write for tool schema caching
-    props.bucket.grantReadWrite(this.mcpProxyFunction);
-
-    // Grant both gateway and worker permission to invoke the MCP proxy
-    this.mcpProxyFunction.grantInvoke(this.workerFunction);
-
-    // Pass MCP proxy function name to worker as env var
+    // Grant worker permission to invoke the MCP proxy (owned by api-stack)
+    props.mcpProxyFunction.grantInvoke(this.workerFunction);
     this.workerFunction.addEnvironment(
       "MCP_PROXY_FUNCTION_NAME",
-      this.mcpProxyFunction.functionName
+      props.mcpProxyFunction.functionName
     );
   }
 }

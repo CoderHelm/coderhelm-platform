@@ -50,6 +50,7 @@ mod triage;
 
 /// Minimal MCP plugin catalog: (server_id, npx_package, env_mapping).
 /// Kept in sync with the full catalog in gateway/routes/plugins.rs.
+#[allow(clippy::type_complexity)]
 pub const MCP_CATALOG: [(&str, &str, &[(&str, &str)]); 17] = [
     (
         "figma",

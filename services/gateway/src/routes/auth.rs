@@ -1377,6 +1377,7 @@ fn normalize_email(email: &str) -> String {
 #[derive(Deserialize)]
 pub struct WaitlistRequest {
     pub email: String,
+    pub reason: Option<String>,
 }
 
 /// POST /auth/waitlist — join the closed beta waitlist.
@@ -1409,9 +1410,8 @@ pub async fn join_waitlist(
     let existing = state
         .dynamo
         .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s("WAITLIST"))
-        .key("sk", attr_s(&format!("EMAIL#{normalized}")))
+        .table_name(&state.config.waitlist_table_name)
+        .key("email", attr_s(&normalized))
         .send()
         .await
         .ok()
@@ -1425,25 +1425,34 @@ pub async fn join_waitlist(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
+    let reason = body
+        .reason
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(500)
+        .collect::<String>();
 
-    state
+    let mut put = state
         .dynamo
         .put_item()
-        .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s("WAITLIST"))
-        .item("sk", attr_s(&format!("EMAIL#{normalized}")))
-        .item("email", attr_s(&email))
-        .item("normalized_email", attr_s(&normalized))
-        .item("created_at", attr_s(&now))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to save waitlist entry: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "Internal error" })),
-            )
-        })?;
+        .table_name(&state.config.waitlist_table_name)
+        .item("email", attr_s(&normalized))
+        .item("original_email", attr_s(&email))
+        .item("created_at", attr_s(&now));
+
+    if !reason.is_empty() {
+        put = put.item("reason", attr_s(&reason));
+    }
+
+    put.send().await.map_err(|e| {
+        error!("Failed to save waitlist entry: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Internal error" })),
+        )
+    })?;
 
     info!(email = %email, normalized = %normalized, "Waitlist signup");
     Ok(Json(serde_json::json!({

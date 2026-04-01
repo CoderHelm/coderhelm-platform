@@ -23,6 +23,7 @@ export class DatabaseStack extends cdk.Stack {
   public readonly billingTable: dynamodb.TableV2;
   public readonly bannersTable: dynamodb.TableV2;
   public readonly mcpConfigsTable: dynamodb.TableV2;
+  public readonly waitlistTable: dynamodb.TableV2;
   public readonly encryptionKey: kms.Key;
 
   constructor(scope: Construct, id: string, props: DatabaseStackProps) {
@@ -357,6 +358,23 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
+    // Waitlist table: beta waitlist signups
+    // PK = EMAIL#{normalized_email}
+    // ──────────────────────────────────────────────
+    this.waitlistTable = new dynamodb.TableV2(this, "WaitlistTable", {
+      tableName: `coderhelm-${props.stage}-waitlist`,
+      partitionKey: { name: "email", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // ──────────────────────────────────────────────
     // Infra table: infrastructure analysis results
     // PK = tenant_id, SK = INFRA#analysis or INFRA#REPO#<owner>/<repo>
     // ──────────────────────────────────────────────
@@ -464,6 +482,9 @@ export class DatabaseStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, "McpConfigsTableName", {
       value: this.mcpConfigsTable.tableName,
+    });
+    new cdk.CfnOutput(this, "WaitlistTableName", {
+      value: this.waitlistTable.tableName,
     });
   }
 }
