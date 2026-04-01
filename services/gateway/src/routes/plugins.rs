@@ -455,6 +455,35 @@ const CATALOG: &[PluginDef] = &[
 
 // ── Handlers ────────────────────────────────────────────────────────
 
+/// Sync the plugin catalog JSON to S3 so other Lambdas can load it.
+pub async fn sync_catalog_to_s3(state: &AppState) {
+    let catalog_json = match serde_json::to_vec(&json!({ "plugins": CATALOG })) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Failed to serialize plugin catalog: {e}");
+            return;
+        }
+    };
+
+    let bucket = &state.config.bucket_name;
+    let key = "config/mcp-catalog.json";
+
+    if let Err(e) = state
+        .s3
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(catalog_json.into())
+        .content_type("application/json")
+        .send()
+        .await
+    {
+        error!("Failed to sync plugin catalog to S3: {e}");
+    } else {
+        info!("Plugin catalog synced to s3://{bucket}/{key}");
+    }
+}
+
 /// GET /api/plugins/catalog — return all available plugins.
 pub async fn list_catalog() -> Json<Value> {
     Json(json!({ "plugins": CATALOG }))
@@ -667,7 +696,9 @@ pub async fn update_prompt(
         .to_string();
 
     if custom_prompt.len() > 4000 {
-        return Ok(Json(json!({ "error": "Prompt too long (max 4000 characters)" })));
+        return Ok(Json(
+            json!({ "error": "Prompt too long (max 4000 characters)" }),
+        ));
     }
 
     state

@@ -160,9 +160,7 @@ pub async fn invite_user(
                 .filter(|s| !s.is_empty())
                 .cloned()
         })
-        .unwrap_or_else(|| {
-            claims.email.clone()
-        });
+        .unwrap_or_else(|| claims.email.clone());
 
     let _ = state
         .ses

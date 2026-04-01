@@ -97,7 +97,9 @@ Return ONLY the markdown body text."#,
         .lines()
         .filter(|line| {
             let trimmed = line.trim().to_lowercase();
-            !(trimmed.starts_with("closes #") || trimmed.starts_with("fixes #") || trimmed.starts_with("resolves #"))
+            !(trimmed.starts_with("closes #")
+                || trimmed.starts_with("fixes #")
+                || trimmed.starts_with("resolves #"))
         })
         .collect::<Vec<_>>()
         .join("\n");

@@ -79,7 +79,10 @@ pub async fn list_tenants(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    let github_id = claims.sub.strip_prefix("USER#").ok_or(StatusCode::BAD_REQUEST)?;
+    let github_id = claims
+        .sub
+        .strip_prefix("USER#")
+        .ok_or(StatusCode::BAD_REQUEST)?;
 
     // Try GSI1 (GitHub users) first, then fall back to GSI2 (email users)
     let gsi1_result = state
@@ -2771,6 +2774,9 @@ pub async fn reset_account(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, StatusCode> {
+    if claims.role != "owner" {
+        return Err(StatusCode::FORBIDDEN);
+    }
     info!(tenant_id = %claims.tenant_id, user = %claims.email, "Account reset requested");
 
     let tid = &claims.tenant_id;

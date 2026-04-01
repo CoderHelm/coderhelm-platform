@@ -64,6 +64,9 @@ async fn main() -> Result<(), Error> {
         config,
     });
 
+    // Sync MCP server catalog to S3 on cold start
+    routes::plugins::sync_catalog_to_s3(&state).await;
+
     // Build router
     // Protected API routes — require valid JWT with tenant scoping
     let api_routes = Router::new()
@@ -316,10 +319,7 @@ async fn main() -> Result<(), Error> {
             "/plugins/:id/credentials",
             put(routes::plugins::update_credentials),
         )
-        .route(
-            "/plugins/:id/prompt",
-            put(routes::plugins::update_prompt),
-        )
+        .route("/plugins/:id/prompt", put(routes::plugins::update_prompt))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,
@@ -337,6 +337,7 @@ async fn main() -> Result<(), Error> {
         .route("/webhooks/stripe", post(routes::stripe_webhook::handle))
         // Auth (public)
         .route("/auth/signup", post(routes::auth::signup))
+        .route("/auth/waitlist", post(routes::auth::join_waitlist))
         .route("/auth/login", post(routes::auth::login_email))
         .route("/auth/verify-email", post(routes::auth::verify_email))
         .route("/auth/forgot-password", post(routes::auth::forgot_password))

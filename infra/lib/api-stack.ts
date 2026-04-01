@@ -283,7 +283,7 @@ export class ApiStack extends cdk.Stack {
     props.infraTable.grantReadWriteData(this.gatewayFunction);
     props.billingTable.grantReadWriteData(this.gatewayFunction);
     props.bannersTable.grantReadData(this.gatewayFunction);
-    props.bucket.grantRead(this.gatewayFunction);
+    props.bucket.grantReadWrite(this.gatewayFunction);
     this.ticketQueue.grantSendMessages(this.gatewayFunction);
     this.ciFixQueue.grantSendMessages(this.gatewayFunction);
     this.feedbackQueue.grantSendMessages(this.gatewayFunction);
