@@ -117,80 +117,9 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/makenotion/notion-mcp-server",
         default_prompt: "Use the Notion MCP to search documentation, read database entries, and reference wiki pages for project context.",
     },
-    PluginDef {
-        id: "slack",
-        name: "Slack",
-        description: "Send messages, query channels, and post updates to Slack.",
-        category: "Communication",
-        tier: 1,
-        icon: "💬",
-        credential_fields: &[CredentialField {
-            key: "bot_token",
-            label: "Bot Token",
-            placeholder: "xoxb-...",
-            secret: true,
-        }],
-        docs_url: "https://api.slack.com/docs",
-        repo_url: "https://github.com/zencoderai/slack-mcp-server",
-        default_prompt: "Use the Slack MCP to post deployment updates, send notifications to channels, and query recent messages for context.",
-    },
-    PluginDef {
-        id: "datadog",
-        name: "Datadog",
-        description: "Query metrics, list monitors, and search logs from Datadog.",
-        category: "Monitoring",
-        tier: 1,
-        icon: "🐶",
-        credential_fields: &[
-            CredentialField {
-                key: "api_key",
-                label: "API Key",
-                placeholder: "dd-api-...",
-                secret: true,
-            },
-            CredentialField {
-                key: "app_key",
-                label: "Application Key",
-                placeholder: "dd-app-...",
-                secret: true,
-            },
-            CredentialField {
-                key: "site",
-                label: "Datadog Site",
-                placeholder: "datadoghq.com",
-                secret: false,
-            },
-        ],
-        docs_url: "https://docs.datadoghq.com/api/",
-        repo_url: "https://github.com/winor30/datadog-mcp-server",
-        default_prompt: "Use the Datadog MCP to query application metrics, check monitor statuses, and search logs for debugging production issues.",
-    },
+
     // Tier 2 — Strong use cases
-    PluginDef {
-        id: "supabase",
-        name: "Supabase",
-        description: "Manage tables, run queries, and inspect database schemas in Supabase.",
-        category: "Database",
-        tier: 2,
-        icon: "⚡",
-        credential_fields: &[
-            CredentialField {
-                key: "api_key",
-                label: "Service Role Key",
-                placeholder: "eyJ...",
-                secret: true,
-            },
-            CredentialField {
-                key: "project_url",
-                label: "Project URL",
-                placeholder: "https://abc.supabase.co",
-                secret: false,
-            },
-        ],
-        docs_url: "https://supabase.com/docs/guides/api",
-        repo_url: "https://github.com/supabase-community/supabase-mcp",
-        default_prompt: "Use the Supabase MCP to run SQL queries, inspect table schemas, and manage database migrations.",
-    },
+
     PluginDef {
         id: "vercel",
         name: "Vercel",
@@ -275,68 +204,7 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/posthog/mcp",
         default_prompt: "Use the PostHog MCP to query user analytics events, check feature flag statuses, and analyze user funnels.",
     },
-    PluginDef {
-        id: "confluence",
-        name: "Confluence",
-        description: "Search and read pages, spaces, and documentation from Confluence.",
-        category: "Documentation",
-        tier: 2,
-        icon: "📘",
-        credential_fields: &[
-            CredentialField {
-                key: "api_token",
-                label: "API Token",
-                placeholder: "ATATT3...",
-                secret: true,
-            },
-            CredentialField {
-                key: "email",
-                label: "Email",
-                placeholder: "user@company.com",
-                secret: false,
-            },
-            CredentialField {
-                key: "base_url",
-                label: "Base URL",
-                placeholder: "https://company.atlassian.net",
-                secret: false,
-            },
-        ],
-        docs_url: "https://developer.atlassian.com/cloud/confluence/rest/v2/",
-        repo_url: "https://github.com/sooperset/mcp-atlassian",
-        default_prompt: "Use the Confluence MCP to search documentation, read wiki pages, and reference knowledge base articles.",
-    },
-    PluginDef {
-        id: "planetscale",
-        name: "PlanetScale",
-        description: "Run queries, inspect schemas, and manage branches in PlanetScale.",
-        category: "Database",
-        tier: 2,
-        icon: "🌍",
-        credential_fields: &[
-            CredentialField {
-                key: "username",
-                label: "Username",
-                placeholder: "ps_user_...",
-                secret: false,
-            },
-            CredentialField {
-                key: "password",
-                label: "Password",
-                placeholder: "pscale_pw_...",
-                secret: true,
-            },
-            CredentialField {
-                key: "database",
-                label: "Database Name",
-                placeholder: "my-database",
-                secret: false,
-            },
-        ],
-        docs_url: "https://planetscale.com/docs/concepts/planetscale-api-oauth-applications",
-        repo_url: "https://planetscale.com/docs",
-        default_prompt: "Use the PlanetScale MCP to run SQL queries, inspect table schemas, and manage database branches.",
-    },
+
     PluginDef {
         id: "gitlab",
         name: "GitLab",
@@ -537,31 +405,7 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/upstash/mcp-server",
         default_prompt: "Use the Upstash MCP to manage Redis databases, run commands, and monitor Kafka instances.",
     },
-    PluginDef {
-        id: "contentful",
-        name: "Contentful",
-        description: "Read content models, entries, and assets from Contentful.",
-        category: "CMS",
-        tier: 3,
-        icon: "📦",
-        credential_fields: &[
-            CredentialField {
-                key: "access_token",
-                label: "Content Delivery Token",
-                placeholder: "CFPAT-...",
-                secret: true,
-            },
-            CredentialField {
-                key: "space_id",
-                label: "Space ID",
-                placeholder: "abc123",
-                secret: false,
-            },
-        ],
-        docs_url: "https://www.contentful.com/developers/docs/references/content-delivery-api/",
-        repo_url: "https://github.com/ivo-toby/contentful-mcp",
-        default_prompt: "Use the Contentful MCP to read content models, query entries, and inspect assets.",
-    },
+
     PluginDef {
         id: "sanity",
         name: "Sanity",
@@ -587,23 +431,7 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/sanity-io/sanity-mcp-server",
         default_prompt: "Use the Sanity MCP to query documents, read content schemas, and manage structured content.",
     },
-    PluginDef {
-        id: "airtable",
-        name: "Airtable",
-        description: "List bases, read records, and query tables in Airtable.",
-        category: "Database",
-        tier: 3,
-        icon: "📊",
-        credential_fields: &[CredentialField {
-            key: "api_key",
-            label: "Personal Access Token",
-            placeholder: "pat...",
-            secret: true,
-        }],
-        docs_url: "https://airtable.com/developers/web/api",
-        repo_url: "https://airtable.com/developers/web/api",
-        default_prompt: "Use the Airtable MCP to list bases, query records, and read table schemas.",
-    },
+
 ];
 
 // ── Handlers ────────────────────────────────────────────────────────
