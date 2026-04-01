@@ -238,6 +238,7 @@ REQUIRED_EVENTS=(
   invoice.payment_succeeded
   invoice.payment_failed
   invoice.finalized
+  charge.refunded
 )
 
 # Find existing webhook for our URL
