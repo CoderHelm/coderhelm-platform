@@ -477,8 +477,8 @@ async fn log_jira_event(
 ) {
     let event_id = ulid::Ulid::new().to_string();
     let now = chrono::Utc::now().to_rfc3339();
-    // TTL: 90 days
-    let expires_at = (chrono::Utc::now() + chrono::Duration::days(90))
+    // TTL: 1 day
+    let expires_at = (chrono::Utc::now() + chrono::Duration::days(1))
         .timestamp()
         .to_string();
 

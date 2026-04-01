@@ -26,6 +26,7 @@ struct PluginDef {
     tier: u8,
     credential_fields: &'static [CredentialField],
     docs_url: &'static str,
+    repo_url: &'static str,
 }
 
 #[derive(serde::Serialize)]
@@ -51,6 +52,7 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://www.figma.com/developers/api",
+        repo_url: "https://github.com/nichochar/figma-mcp",
     },
     PluginDef {
         id: "sentry",
@@ -73,6 +75,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://docs.sentry.io/api/",
+        repo_url: "https://github.com/getsentry/sentry-mcp",
     },
     PluginDef {
         id: "linear",
@@ -87,6 +90,7 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://developers.linear.app/docs",
+        repo_url: "https://github.com/linear/linear-mcp-server",
     },
     PluginDef {
         id: "notion",
@@ -101,6 +105,7 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://developers.notion.com/",
+        repo_url: "https://github.com/makenotion/notion-mcp-server",
     },
     PluginDef {
         id: "slack",
@@ -115,6 +120,7 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://api.slack.com/docs",
+        repo_url: "https://github.com/modelcontextprotocol/servers",
     },
     PluginDef {
         id: "datadog",
@@ -143,6 +149,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://docs.datadoghq.com/api/",
+        repo_url: "https://github.com/winor30/datadog-mcp-server",
     },
     // Tier 2 — Strong use cases
     PluginDef {
@@ -166,6 +173,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://supabase.com/docs/guides/api",
+        repo_url: "https://github.com/supabase-community/supabase-mcp",
     },
     PluginDef {
         id: "vercel",
@@ -180,6 +188,7 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://vercel.com/docs/rest-api",
+        repo_url: "https://github.com/vercel/vercel-mcp",
     },
     PluginDef {
         id: "stripe",
@@ -194,6 +203,7 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://docs.stripe.com/api",
+        repo_url: "https://github.com/stripe/agent-toolkit",
     },
     PluginDef {
         id: "cloudflare",
@@ -216,6 +226,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://developers.cloudflare.com/api/",
+        repo_url: "https://github.com/cloudflare/mcp-server-cloudflare",
     },
     PluginDef {
         id: "posthog",
@@ -238,6 +249,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://posthog.com/docs/api",
+        repo_url: "https://github.com/PostHog/posthog-mcp",
     },
     PluginDef {
         id: "confluence",
@@ -266,6 +278,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://developer.atlassian.com/cloud/confluence/rest/v2/",
+        repo_url: "https://github.com/modelcontextprotocol/servers",
     },
     PluginDef {
         id: "planetscale",
@@ -294,6 +307,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://planetscale.com/docs/concepts/planetscale-api-oauth-applications",
+        repo_url: "https://github.com/planetscale/database-js",
     },
     PluginDef {
         id: "gitlab",
@@ -316,6 +330,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://docs.gitlab.com/ee/api/rest/",
+        repo_url: "https://github.com/modelcontextprotocol/servers",
     },
     PluginDef {
         id: "neon",
@@ -330,6 +345,7 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://neon.tech/docs/manage/api-keys",
+        repo_url: "https://github.com/neondatabase/mcp-server-neon",
     },
     PluginDef {
         id: "turso",
@@ -352,6 +368,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://docs.turso.tech/api-reference",
+        repo_url: "https://github.com/tursodatabase/turso-mcp",
     },
     // Tier 3 — Nice to have
     PluginDef {
@@ -367,6 +384,7 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://docs.snyk.io/snyk-api",
+        repo_url: "https://github.com/snyk/snyk-mcp-server",
     },
     PluginDef {
         id: "launchdarkly",
@@ -381,6 +399,7 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://apidocs.launchdarkly.com/",
+        repo_url: "https://github.com/launchdarkly/mcp-server",
     },
     PluginDef {
         id: "mongodb",
@@ -409,6 +428,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://www.mongodb.com/docs/atlas/api/",
+        repo_url: "https://github.com/mongodb/mongodb-mcp-server",
     },
     PluginDef {
         id: "grafana",
@@ -431,6 +451,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://grafana.com/docs/grafana/latest/developers/http_api/",
+        repo_url: "https://github.com/grafana/mcp-grafana",
     },
     PluginDef {
         id: "redis",
@@ -445,6 +466,7 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://redis.io/docs/",
+        repo_url: "https://github.com/redis/mcp-redis",
     },
     PluginDef {
         id: "upstash",
@@ -467,6 +489,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://upstash.com/docs/devops/developer-api",
+        repo_url: "https://github.com/upstash/mcp-server",
     },
     PluginDef {
         id: "contentful",
@@ -489,6 +512,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://www.contentful.com/developers/docs/references/content-delivery-api/",
+        repo_url: "https://github.com/contentful/mcp-server",
     },
     PluginDef {
         id: "sanity",
@@ -511,6 +535,7 @@ const CATALOG: &[PluginDef] = &[
             },
         ],
         docs_url: "https://www.sanity.io/docs/http-api",
+        repo_url: "https://github.com/sanity-io/sanity-mcp-server",
     },
     PluginDef {
         id: "airtable",
@@ -525,6 +550,7 @@ const CATALOG: &[PluginDef] = &[
             secret: true,
         }],
         docs_url: "https://airtable.com/developers/web/api",
+        repo_url: "https://github.com/modelcontextprotocol/servers",
     },
 ];
 
@@ -647,7 +673,9 @@ pub async fn disable_plugin(
         })?;
 
     info!(tenant = %claims.tenant_id, plugin = %plugin_id, "Plugin disabled");
-    Ok(Json(json!({ "status": "disabled", "plugin_id": plugin_id })))
+    Ok(Json(
+        json!({ "status": "disabled", "plugin_id": plugin_id }),
+    ))
 }
 
 /// PUT /api/plugins/:id/credentials — save credentials for a plugin.

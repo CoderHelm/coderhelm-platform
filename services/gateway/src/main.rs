@@ -302,17 +302,11 @@ async fn main() -> Result<(), Error> {
             "/recommendations/:id/dismiss",
             post(routes::log_analyzer::dismiss_recommendation),
         )
-        // Plugins
+        // MCP Servers
         .route("/plugins/catalog", get(routes::plugins::list_catalog))
         .route("/plugins", get(routes::plugins::list_enabled))
-        .route(
-            "/plugins/:id/enable",
-            post(routes::plugins::enable_plugin),
-        )
-        .route(
-            "/plugins/:id",
-            delete(routes::plugins::disable_plugin),
-        )
+        .route("/plugins/:id/enable", post(routes::plugins::enable_plugin))
+        .route("/plugins/:id", delete(routes::plugins::disable_plugin))
         .route(
             "/plugins/:id/credentials",
             put(routes::plugins::update_credentials),

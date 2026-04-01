@@ -885,6 +885,19 @@ pub async fn get_jira_integration_check(
         .and_then(|v| v.as_s().ok())
         .cloned();
 
+    // Count actual Jira webhook events from the events table
+    let jira_event_count = state
+        .dynamo
+        .query()
+        .table_name(&state.config.jira_events_table_name)
+        .key_condition_expression("tenant_id = :tid")
+        .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
+        .select(aws_sdk_dynamodb::types::Select::Count)
+        .send()
+        .await
+        .map(|r| r.count())
+        .unwrap_or(0);
+
     // Load per-tenant JIRA secret from DynamoDB
     let tenant_secret = load_jira_secret(&state, &claims.tenant_id).await;
     let secret_configured = tenant_secret.is_some() || state.secrets.jira_webhook_secret.is_some();
@@ -923,7 +936,7 @@ pub async fn get_jira_integration_check(
         "enabled_repos": enabled_repos,
         "jira_events_seen": jira_seen,
         "last_jira_event_at": last_jira_event_at,
-        "jira_event_count": jira_runs.len(),
+        "jira_event_count": jira_event_count,
         "installation_id": installation_id,
         "tenant_id": claims.tenant_id,
         "webhook_url": webhook_url,
@@ -1112,7 +1125,7 @@ pub async fn get_jira_events(
     let events =
         crate::routes::jira_webhook::list_jira_events(&state, &claims.tenant_id, limit).await?;
 
-    Ok(Json(json!({ "events": events })))
+    Ok(Json(json!({ "events": events, "total": events.len() })))
 }
 
 /// POST /integrations/jira/forge-register — called by the Forge admin page to register trigger URLs.
