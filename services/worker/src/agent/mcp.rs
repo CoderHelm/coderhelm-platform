@@ -192,12 +192,15 @@ fn build_env_vars(plugin: &McpPlugin) -> Value {
 }
 
 /// Load enabled MCP plugins with credentials for a tenant from DynamoDB.
+/// Type alias for the MCP catalog: (server_id, description, tools)
+pub type McpCatalog<'a> = &'a [(&'a str, &'a str, &'a [(&'a str, &'a str)])];
+
 /// Returns plugins that are enabled AND have credentials stored.
 pub async fn load_tenant_plugins(
     dynamo: &aws_sdk_dynamodb::Client,
     settings_table: &str,
     tenant_id: &str,
-    #[allow(clippy::type_complexity)] catalog: &[(&str, &str, &[(&str, &str)])],
+    catalog: McpCatalog<'_>,
 ) -> Vec<McpPlugin> {
     let result = dynamo
         .query()
