@@ -32,12 +32,11 @@ def scan_all_users(table):
     items = []
     params = {
         "FilterExpression": "begins_with(sk, :prefix)",
-        "ExpressionAttributeValues": {":prefix": {"S": "USER#"}},
+        "ExpressionAttributeValues": {":prefix": "USER#"},
     }
     while True:
-        resp = table.meta.client.scan(TableName=table.name, **params)
-        for item in resp.get("Items", []):
-            items.append({k: list(v.values())[0] for k, v in item.items()})
+        resp = table.scan(**params)
+        items.extend(resp.get("Items", []))
         if "LastEvaluatedKey" not in resp:
             break
         params["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
