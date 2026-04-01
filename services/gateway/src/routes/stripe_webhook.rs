@@ -343,12 +343,18 @@ async fn handle_subscription_cancelled(
     }
 
     // current_period_end = when access expires
-    let access_until = subscription["current_period_end"]
-        .as_u64()
-        .filter(|&ts| ts > 0)
-        .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
-        .map(|dt| dt.format("%B %d, %Y").to_string())
-        .unwrap_or_else(|| "the end of your current billing period".to_string());
+    let now_ts = chrono::Utc::now().timestamp() as u64;
+    let period_end_ts = subscription["current_period_end"].as_u64().unwrap_or(0);
+    // If period end is in the past or within 60s of now, it was an immediate cancellation
+    let immediate = period_end_ts > 0 && period_end_ts <= now_ts + 60;
+
+    let access_until = if immediate {
+        "now".to_string()
+    } else {
+        chrono::DateTime::from_timestamp(period_end_ts as i64, 0)
+            .map(|dt| dt.format("%B %d, %Y").to_string())
+            .unwrap_or_else(|| "the end of your current billing period".to_string())
+    };
 
     state
         .dynamo
@@ -367,16 +373,21 @@ async fn handle_subscription_cancelled(
         .send()
         .await?;
 
-    // Send cancellation email
+    // Send cancellation email — use different template for immediate vs period-end
+    let template = if immediate {
+        "subscription-cancelled-immediately"
+    } else {
+        "subscription-cancelled"
+    };
     send_billing_email(
         state,
         &tenant_id,
-        "subscription-cancelled",
-        &serde_json::json!({ "access_until": access_until }),
+        template,
+        &serde_json::json!({ "access_until": access_until, "immediate": immediate }),
     )
     .await;
 
-    info!(tenant_id, access_until, "Subscription cancelled");
+    info!(tenant_id, access_until, immediate, "Subscription cancelled");
     Ok(())
 }
 
