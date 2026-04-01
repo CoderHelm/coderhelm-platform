@@ -4,7 +4,7 @@ import Script from "next/script";
 import { usePathname } from "next/navigation";
 import { useEffect } from "react";
 
-const GA_MEASUREMENT_ID = "G-NR69JM4TK2";
+const GA_MEASUREMENT_ID = process.env.NEXT_PUBLIC_GA_MEASUREMENT_ID ?? "G-NR69JM4TK2";
 
 declare global {
   interface Window {
@@ -23,6 +23,10 @@ export default function GoogleAnalytics() {
       });
     }
   }, [pathname]);
+
+  if (!GA_MEASUREMENT_ID) {
+    return null;
+  }
 
   return (
     <>
