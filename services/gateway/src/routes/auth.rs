@@ -16,7 +16,7 @@ use crate::AppState;
 /// Check if an email is on the closed beta allowlist.
 /// Returns true if the allowlist is empty (open access) or if the email is listed.
 pub async fn is_email_allowed(state: &AppState, email: &str) -> bool {
-    let email = email.trim().to_lowercase();
+    let email = normalize_email(email);
 
     // Check for exact email match
     let result = state
@@ -260,7 +260,10 @@ pub async fn verify_email(
         .item("role", attr_s("owner"))
         .item("avatar_url", attr_s(""))
         .item("updated_at", attr_s(&now))
-        .item("gsi2pk", attr_s(&format!("EMAIL#{email}")))
+        .item(
+            "gsi2pk",
+            attr_s(&format!("EMAIL#{}", normalize_email(&email))),
+        )
         .item("gsi2sk", attr_s(&tenant_id))
         .send()
         .await;
@@ -555,14 +558,14 @@ pub async fn google_callback(
         .find(|a| a.name() == "picture")
         .and_then(|a| a.value().map(|v| v.to_string()));
 
-    // Check if user already exists (by email GSI2)
+    // Check if user already exists (by normalized email GSI2)
     let existing = state
         .dynamo
         .query()
         .table_name(&state.config.users_table_name)
         .index_name("gsi2")
         .key_condition_expression("gsi2pk = :pk")
-        .expression_attribute_values(":pk", attr_s(&format!("EMAIL#{email}")))
+        .expression_attribute_values(":pk", attr_s(&format!("EMAIL#{}", normalize_email(&email))))
         .limit(1)
         .send()
         .await
@@ -627,7 +630,10 @@ pub async fn google_callback(
             .item("role", attr_s("owner"))
             .item("name", attr_s(name.as_deref().unwrap_or("")))
             .item("updated_at", attr_s(&now))
-            .item("gsi2pk", attr_s(&format!("EMAIL#{email}")))
+            .item(
+                "gsi2pk",
+                attr_s(&format!("EMAIL#{}", normalize_email(&email))),
+            )
             .item("gsi2sk", attr_s(&tid))
             .send()
             .await;
@@ -817,7 +823,10 @@ pub async fn github_callback(
                     .item("updated_at", attr_s(&now))
                     .item("gsi1pk", attr_s(&format!("GHUSER#{github_id}")))
                     .item("gsi1sk", attr_s(&tid))
-                    .item("gsi2pk", attr_s(&format!("EMAIL#{}", &claims.email)))
+                    .item(
+                        "gsi2pk",
+                        attr_s(&format!("EMAIL#{}", normalize_email(&claims.email))),
+                    )
                     .item("gsi2sk", attr_s(&tid))
                     .send()
                     .await;
@@ -886,23 +895,52 @@ pub async fn github_callback(
 
     let installation_id = all_installations[0].0;
     let tenant_id = format!("TENANT#{installation_id}");
-    let user_id = format!("USER#{github_id}");
+    let github_user_id = format!("USER#{github_id}");
     let email = user["email"].as_str().unwrap_or("");
+    let normalized_email = normalize_email(email);
 
-    // Closed beta: check allowlist for new GitHub users
-    // Existing users and users with pending invites are always allowed
-    let has_existing_record = state
+    // Check for existing record by GitHub ID
+    let existing_by_github = state
         .dynamo
         .get_item()
         .table_name(&state.config.users_table_name)
         .key("pk", attr_s(&tenant_id))
-        .key("sk", attr_s(&user_id))
+        .key("sk", attr_s(&github_user_id))
         .send()
         .await
         .ok()
-        .and_then(|r| r.item().cloned())
-        .is_some();
+        .and_then(|r| r.item().cloned());
 
+    // Also check for existing record by email (handles email+tag variants via normalization)
+    let existing_by_email = if !normalized_email.is_empty() && existing_by_github.is_none() {
+        state
+            .dynamo
+            .query()
+            .table_name(&state.config.users_table_name)
+            .index_name("gsi2")
+            .key_condition_expression("gsi2pk = :email AND gsi2sk = :tid")
+            .expression_attribute_values(":email", attr_s(&format!("EMAIL#{normalized_email}")))
+            .expression_attribute_values(":tid", attr_s(&tenant_id))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.items)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|item| {
+                // Find a real user record (USER#...), not an invite
+                item.get("sk")
+                    .and_then(|v| v.as_s().ok())
+                    .map(|s| s.starts_with("USER#"))
+                    .unwrap_or(false)
+            })
+    } else {
+        None
+    };
+
+    let has_existing_record = existing_by_github.is_some() || existing_by_email.is_some();
+
+    // Closed beta: check allowlist for new GitHub users
     if !has_existing_record && !email.is_empty() && !is_email_allowed(&state, email).await {
         let dash = if state.config.stage == "prod" {
             "https://app.coderhelm.com"
@@ -913,18 +951,31 @@ pub async fn github_callback(
         return Ok(Redirect::temporary(&redirect).into_response());
     }
 
+    // Resolve the canonical user_id:
+    // 1. If they have a GitHub record, use that
+    // 2. If they have an email record (e.g. signed up via Cognito), reuse that sk
+    // 3. Otherwise create a new USER#{github_id}
+    let (user_id, existing_user) = if let Some(item) = existing_by_github {
+        (github_user_id.clone(), Some(item))
+    } else if let Some(ref item) = existing_by_email {
+        let sk = item
+            .get("sk")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_else(|| github_user_id.clone());
+        info!(
+            github_login,
+            email,
+            sk = %sk,
+            "Linking GitHub to existing email-based user"
+        );
+        (sk, Some(item.clone()))
+    } else {
+        (github_user_id.clone(), None)
+    };
+
     // Determine role: check existing record, then pending invites, then first-user logic
     let mut role = "member".to_string();
-    let existing_user = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(&tenant_id))
-        .key("sk", attr_s(&user_id))
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned());
 
     if let Some(ref item) = existing_user {
         // Existing user record — keep their assigned role
@@ -934,15 +985,14 @@ pub async fn github_callback(
             .cloned()
             .unwrap_or_else(|| "member".to_string());
     } else {
-        // No existing record for this user ID — check for a pending invite by email
-        let invite_email = email.to_lowercase();
+        // No existing record for this user ID — check for a pending invite by normalized email
         let invite_result = state
             .dynamo
             .query()
             .table_name(&state.config.users_table_name)
             .index_name("gsi2")
             .key_condition_expression("gsi2pk = :email AND gsi2sk = :tid")
-            .expression_attribute_values(":email", attr_s(&format!("EMAIL#{invite_email}")))
+            .expression_attribute_values(":email", attr_s(&format!("EMAIL#{normalized_email}")))
             .expression_attribute_values(":tid", attr_s(&tenant_id))
             .send()
             .await
@@ -975,7 +1025,7 @@ pub async fn github_callback(
                     .key("sk", attr_s(invite_sk))
                     .send()
                     .await;
-                info!(email = %invite_email, invite_sk = %invite_sk, role = %role, "Matched pending invite to GitHub user");
+                info!(email = %normalized_email, invite_sk = %invite_sk, role = %role, "Matched pending invite to GitHub user");
             }
         } else {
             // No invite — check if first user (→ owner)
@@ -1062,7 +1112,7 @@ pub async fn github_callback(
             .item("updated_at", attr_s(&now))
             .item("gsi1pk", attr_s(&format!("GHUSER#{github_id}")))
             .item("gsi1sk", attr_s(&tid))
-            .item("gsi2pk", attr_s(&format!("EMAIL#{email}")))
+            .item("gsi2pk", attr_s(&format!("EMAIL#{normalized_email}")))
             .item("gsi2sk", attr_s(&tid))
             .send()
             .await;
@@ -1143,7 +1193,7 @@ async fn issue_session_from_cognito(
         .table_name(&state.config.users_table_name)
         .index_name("gsi2")
         .key_condition_expression("gsi2pk = :pk")
-        .expression_attribute_values(":pk", attr_s(&format!("EMAIL#{email}")))
+        .expression_attribute_values(":pk", attr_s(&format!("EMAIL#{}", normalize_email(email))))
         .send()
         .await
         .map_err(|e| {
@@ -1210,7 +1260,10 @@ async fn issue_session_from_cognito(
             .item("role", attr_s("owner"))
             .item("avatar_url", attr_s(""))
             .item("updated_at", attr_s(&now))
-            .item("gsi2pk", attr_s(&format!("EMAIL#{email}")))
+            .item(
+                "gsi2pk",
+                attr_s(&format!("EMAIL#{}", normalize_email(email))),
+            )
             .item("gsi2sk", attr_s(&tid))
             .send()
             .await;
@@ -1252,7 +1305,10 @@ async fn issue_session_from_cognito(
             .item("role", attr_s(&invite_role))
             .item("avatar_url", attr_s(""))
             .item("updated_at", attr_s(&now))
-            .item("gsi2pk", attr_s(&format!("EMAIL#{email}")))
+            .item(
+                "gsi2pk",
+                attr_s(&format!("EMAIL#{}", normalize_email(email))),
+            )
             .item("gsi2sk", attr_s(&invite_tid))
             .send()
             .await;
@@ -1305,6 +1361,17 @@ fn extract_cookie<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
+/// Normalize an email: lowercase + strip plus-alias (user+tag@domain.com → user@domain.com)
+fn normalize_email(email: &str) -> String {
+    let email = email.trim().to_lowercase();
+    if let Some((local, domain)) = email.split_once('@') {
+        let base = local.split('+').next().unwrap_or(local);
+        format!("{base}@{domain}")
+    } else {
+        email
+    }
+}
+
 // ── Waitlist ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1336,12 +1403,7 @@ pub async fn join_waitlist(
     }
 
     // Normalize: strip plus-alias (user+tag@domain.com → user@domain.com) for dedup
-    let normalized = if let Some((local, domain)) = email.split_once('@') {
-        let base_local = local.split('+').next().unwrap_or(local);
-        format!("{base_local}@{domain}")
-    } else {
-        email.clone()
-    };
+    let normalized = normalize_email(&email);
 
     // Check if normalized email already exists
     let existing = state
