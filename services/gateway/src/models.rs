@@ -90,6 +90,10 @@ pub struct Secrets {
     pub github_client_secret: String,
     pub jwt_secret: String,
     #[serde(default)]
+    pub google_client_id: Option<String>,
+    #[serde(default)]
+    pub google_client_secret: Option<String>,
+    #[serde(default)]
     pub jira_webhook_secret: Option<String>,
     #[serde(default)]
     pub stripe_webhook_secret: Option<String>,

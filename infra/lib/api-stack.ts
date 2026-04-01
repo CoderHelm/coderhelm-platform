@@ -73,15 +73,27 @@ export class ApiStack extends cdk.Stack {
           : cdk.RemovalPolicy.DESTROY,
     });
 
-    // Google identity provider (client ID/secret stored in Secrets Manager)
+    // Google identity provider
+    // TODO: Set these values in Secrets Manager at coderhelm/{stage}/secrets:
+    //   google_client_id     — from https://console.cloud.google.com/apis/credentials
+    //   google_client_secret — same page
+    //   Callback URL: https://<cognito-domain>.auth.us-east-1.amazoncognito.com/oauth2/idpresponse
+    const googleSecrets = secretsmanager.Secret.fromSecretNameV2(
+      this,
+      "GoogleSecrets",
+      `coderhelm/${props.stage}/secrets`
+    );
+
     const googleProvider = new cognito.UserPoolIdentityProviderGoogle(
       this,
       "GoogleProvider",
       {
         userPool,
-        clientId: "PLACEHOLDER_GOOGLE_CLIENT_ID",
-        clientSecretValue: cdk.SecretValue.unsafePlainText(
-          "PLACEHOLDER_GOOGLE_CLIENT_SECRET"
+        clientId: googleSecrets
+          .secretValueFromJson("google_client_id")
+          .unsafeUnwrap(),
+        clientSecretValue: googleSecrets.secretValueFromJson(
+          "google_client_secret"
         ),
         scopes: ["openid", "email", "profile"],
         attributeMapping: {
