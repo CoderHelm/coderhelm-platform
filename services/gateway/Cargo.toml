@@ -26,6 +26,8 @@ aws-sdk-sesv2 = "1"
 aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-bedrockruntime = "1"
 aws-sdk-cognitoidentityprovider = "1"
+aws-sdk-sts = "1"
+aws-sdk-cloudwatchlogs = "1"
 
 # Auth
 jsonwebtoken = "9"
@@ -49,3 +51,5 @@ ulid = "1"
 thiserror = "2"
 rand = "0.9"
 urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
+regex = "1"

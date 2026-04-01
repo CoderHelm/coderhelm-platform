@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Creates a read-only IAM role that allows Coderhelm to query your CloudWatch Logs.
+  This role uses an External ID to prevent confused deputy attacks.
+
+Parameters:
+  ExternalId:
+    Type: String
+    Description: The External ID provided by Coderhelm (do not change this value).
+    MinLength: 1
+    AllowedPattern: "^[a-f0-9\\-]{36}$"
+    ConstraintDescription: Must be a valid UUID.
+
+  CoderHelmAccountId:
+    Type: String
+    Default: "REDACTED_AWS_ACCOUNT_ID"
+    Description: The AWS account ID of Coderhelm (do not change this value).
+    AllowedPattern: "^\\d{12}$"
+
+Resources:
+  CoderHelmLogReaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CoderHelmLogReader
+      Description: >
+        Read-only role for Coderhelm to query CloudWatch Logs.
+        No data is stored — only error summaries are returned to Coderhelm.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${CoderHelmAccountId}:root"
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Ref ExternalId
+      Policies:
+        - PolicyName: CloudWatchLogsReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DescribeLogGroups
+                Effect: Allow
+                Action:
+                  - "logs:DescribeLogGroups"
+                Resource: "*"
+              - Sid: QueryLogs
+                Effect: Allow
+                Action:
+                  - "logs:StartQuery"
+                  - "logs:GetQueryResults"
+                  - "logs:StopQuery"
+                  - "logs:FilterLogEvents"
+                  - "logs:GetLogEvents"
+                Resource: "arn:aws:logs:*:*:log-group:*"
+              - Sid: VerifyIdentity
+                Effect: Allow
+                Action:
+                  - "sts:GetCallerIdentity"
+                Resource: "*"
+
+Outputs:
+  RoleArn:
+    Description: >
+      Copy this Role ARN and paste it into Coderhelm's AWS Connection settings.
+    Value: !GetAtt CoderHelmLogReaderRole.Arn
+
+  ExternalId:
+    Description: The External ID used for this connection.
+    Value: !Ref ExternalId

@@ -266,6 +266,39 @@ async fn main() -> Result<(), Error> {
             "/infrastructure/repo/:owner/:name/refresh",
             post(routes::infrastructure::refresh_repo_infrastructure),
         )
+        // AWS Connections (Log Analyzer)
+        .route(
+            "/aws-connections",
+            get(routes::log_analyzer::list_connections)
+                .post(routes::log_analyzer::create_connection),
+        )
+        .route("/aws-connections/cfn-url", get(routes::log_analyzer::get_cfn_url))
+        .route(
+            "/aws-connections/:id",
+            put(routes::log_analyzer::update_connection)
+                .delete(routes::log_analyzer::delete_connection),
+        )
+        .route(
+            "/aws-connections/:id/test",
+            post(routes::log_analyzer::test_connection),
+        )
+        .route(
+            "/aws-connections/:id/log-groups",
+            get(routes::log_analyzer::discover_log_groups),
+        )
+        // Recommendations
+        .route(
+            "/recommendations",
+            get(routes::log_analyzer::list_recommendations),
+        )
+        .route(
+            "/recommendations/:id/plan",
+            post(routes::log_analyzer::create_plan_from_recommendation),
+        )
+        .route(
+            "/recommendations/:id/dismiss",
+            post(routes::log_analyzer::dismiss_recommendation),
+        )
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

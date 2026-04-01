@@ -8,6 +8,7 @@ import { WorkerStack } from "../lib/worker-stack";
 import { MonitoringStack } from "../lib/monitoring-stack";
 import { EmailStack } from "../lib/email-stack";
 import { BillingStack } from "../lib/billing-stack";
+import { LogAnalyzerStack } from "../lib/log-analyzer-stack";
 
 const app = new cdk.App();
 
@@ -104,4 +105,13 @@ new MonitoringStack(app, `${prefix}-monitoring`, {
   workerFunction: worker.workerFunction,
   table: database.table,
   ticketQueue: api.ticketQueue,
+});
+
+// --- Log Analyzer ---
+
+new LogAnalyzerStack(app, `${prefix}-log-analyzer`, {
+  env,
+  stage,
+  settingsTable: database.settingsTable,
+  plansTable: database.plansTable,
 });
