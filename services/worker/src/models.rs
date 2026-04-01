@@ -18,6 +18,7 @@ pub struct Config {
     pub light_model_id: String,
     pub ses_from_address: String,
     pub ses_template_prefix: String,
+    pub mcp_proxy_function_name: String,
 }
 
 impl Config {
@@ -48,6 +49,7 @@ impl Config {
                 .unwrap_or_else(|_| "notifications@coderhelm.com".to_string()),
             ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")
                 .unwrap_or_else(|_| "coderhelm-prod".to_string()),
+            mcp_proxy_function_name: std::env::var("MCP_PROXY_FUNCTION_NAME").unwrap_or_default(),
         }
     }
 }

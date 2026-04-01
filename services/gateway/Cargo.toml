@@ -28,6 +28,8 @@ aws-sdk-bedrockruntime = "1"
 aws-sdk-cognitoidentityprovider = "1"
 aws-sdk-sts = "1"
 aws-sdk-cloudwatchlogs = "1"
+aws-sdk-lambda = "1"
+aws-smithy-types = "1"
 
 # Auth
 jsonwebtoken = "9"
