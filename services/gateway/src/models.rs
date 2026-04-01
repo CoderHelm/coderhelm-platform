@@ -60,8 +60,7 @@ impl Config {
                 .expect("BILLING_TABLE_NAME required"),
             banners_table_name: std::env::var("BANNERS_TABLE_NAME")
                 .expect("BANNERS_TABLE_NAME required"),
-            mcp_configs_table_name: std::env::var("MCP_CONFIGS_TABLE_NAME")
-                .unwrap_or_default(),
+            mcp_configs_table_name: std::env::var("MCP_CONFIGS_TABLE_NAME").unwrap_or_default(),
             waitlist_table_name: std::env::var("WAITLIST_TABLE_NAME")
                 .expect("WAITLIST_TABLE_NAME required"),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),

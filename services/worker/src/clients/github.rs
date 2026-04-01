@@ -385,8 +385,8 @@ impl GitHubClient {
         }
         let resp = req.send().await?;
         match resp.status().as_u16() {
-            201 | 204 => Ok(true),  // merged or already up-to-date
-            409 => Ok(false),       // conflict
+            201 | 204 => Ok(true), // merged or already up-to-date
+            409 => Ok(false),      // conflict
             _ => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();

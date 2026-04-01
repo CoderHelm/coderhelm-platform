@@ -259,7 +259,10 @@ pub async fn resolve_conflicts(
     }
 
     if resolved_files.is_empty() {
-        warn!(branch, "Conflict detected but no files to resolve — retrying merge");
+        warn!(
+            branch,
+            "Conflict detected but no files to resolve — retrying merge"
+        );
         return Err("Merge conflict detected but could not identify conflicting files".into());
     }
 

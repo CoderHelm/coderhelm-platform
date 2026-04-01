@@ -311,13 +311,8 @@ async fn run_passes(
     } else {
         &state.config.mcp_configs_table_name
     };
-    let mcp_plugins = mcp::load_tenant_plugins(
-        &state.dynamo,
-        mcp_table,
-        &msg.tenant_id,
-        &MCP_CATALOG,
-    )
-    .await;
+    let mcp_plugins =
+        mcp::load_tenant_plugins(&state.dynamo, mcp_table, &msg.tenant_id, &MCP_CATALOG).await;
     let mcp_server_ids: Vec<String> = mcp_plugins.iter().map(|p| p.server_id.clone()).collect();
     if !mcp_server_ids.is_empty() {
         info!(run_id, servers = ?mcp_server_ids, "MCP servers active for run");
@@ -666,12 +661,7 @@ async fn complete_run(
         )
         .expression_attribute_values(
             ":mcp",
-            AttributeValue::L(
-                mcp_server_ids
-                    .iter()
-                    .map(|s| attr_s(s))
-                    .collect(),
-            ),
+            AttributeValue::L(mcp_server_ids.iter().map(|s| attr_s(s)).collect()),
         )
         .send()
         .await?;

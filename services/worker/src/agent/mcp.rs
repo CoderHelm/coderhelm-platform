@@ -197,8 +197,7 @@ pub async fn load_tenant_plugins(
     dynamo: &aws_sdk_dynamodb::Client,
     settings_table: &str,
     tenant_id: &str,
-    #[allow(clippy::type_complexity)]
-    catalog: &[(&str, &str, &[(&str, &str)])],
+    #[allow(clippy::type_complexity)] catalog: &[(&str, &str, &[(&str, &str)])],
 ) -> Vec<McpPlugin> {
     let result = dynamo
         .query()
