@@ -345,8 +345,8 @@ async fn handle_subscription_cancelled(
     // current_period_end = when access expires
     let now_ts = chrono::Utc::now().timestamp() as u64;
     let period_end_ts = subscription["current_period_end"].as_u64().unwrap_or(0);
-    // If period end is in the past or within 60s of now, it was an immediate cancellation
-    let immediate = period_end_ts > 0 && period_end_ts <= now_ts + 60;
+    // If period end is 0 (missing), in the past, or within 60s of now → immediate cancellation
+    let immediate = period_end_ts == 0 || period_end_ts <= now_ts + 60;
 
     let access_until = if immediate {
         "now".to_string()
