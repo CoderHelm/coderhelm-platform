@@ -44,7 +44,7 @@ pub struct VerifyMfaRequest {
 
 // ── Valid roles ──────────────────────────────────────────────────────
 
-const VALID_ROLES: &[&str] = &["owner", "admin", "member", "viewer"];
+const VALID_ROLES: &[&str] = &["owner", "admin", "billing", "member", "viewer"];
 
 fn is_admin_or_owner(role: &str) -> bool {
     role == "owner" || role == "admin"
