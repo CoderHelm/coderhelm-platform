@@ -19,12 +19,14 @@ pub async fn run(
     plan: &PlanResult,
     branch: &str,
     rules: &[String],
+    repo_instructions: &str,
     usage: &mut TokenUsage,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
+    let instructions_block = super::format_instructions_block(repo_instructions);
     let system = format!(
         "You are an implementation agent for the {owner}/{repo} repository. \
-         Implement each task from the checklist. Follow existing code patterns exactly.{rules_block}",
+         Implement each task from the checklist. Follow existing code patterns exactly.{rules_block}{instructions_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );

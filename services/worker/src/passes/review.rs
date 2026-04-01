@@ -12,12 +12,14 @@ pub async fn run(
     github: &GitHubClient,
     branch: &str,
     rules: &[String],
+    repo_instructions: &str,
     usage: &mut TokenUsage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
+    let instructions_block = super::format_instructions_block(repo_instructions);
     let system = format!(
         "You are a code review agent for the {owner}/{repo} repository. \
-         Review the diff for correctness, completeness, conventions, bugs, and security.{rules_block}",
+         Review the diff for correctness, completeness, conventions, bugs, and security.{rules_block}{instructions_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
