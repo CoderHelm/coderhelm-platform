@@ -106,6 +106,35 @@ export class EmailStack extends cdk.Stack {
       },
     });
 
+    // --- Account email templates ---
+
+    new ses.CfnTemplate(this, "ResetPasswordTemplate", {
+      template: {
+        templateName: `${prefix}-reset-password`,
+        subjectPart: "Reset your Coderhelm password",
+        htmlPart: RESET_PASSWORD_HTML,
+        textPart: RESET_PASSWORD_TEXT,
+      },
+    });
+
+    new ses.CfnTemplate(this, "TeamInviteTemplate", {
+      template: {
+        templateName: `${prefix}-team-invite`,
+        subjectPart: "You've been invited to {{org}} on Coderhelm",
+        htmlPart: TEAM_INVITE_HTML,
+        textPart: TEAM_INVITE_TEXT,
+      },
+    });
+
+    new ses.CfnTemplate(this, "VerifyEmailTemplate", {
+      template: {
+        templateName: `${prefix}-verify-email`,
+        subjectPart: "Verify your Coderhelm email",
+        htmlPart: VERIFY_EMAIL_HTML,
+        textPart: VERIFY_EMAIL_TEXT,
+      },
+    });
+
     // Grant SES send permissions to both lambdas
     const sesPolicy = new iam.PolicyStatement({
       actions: ["ses:SendEmail", "ses:SendTemplatedEmail"],
@@ -325,4 +354,61 @@ Runs: {{total_runs}}
 Usage cost: \${{usage_cost}}
 
 Download: {{invoice_url}}`;
+
+// ─── Account email templates ────────────────────────────────────────
+
+const RESET_PASSWORD_HTML = EMAIL_WRAPPER(`
+  <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Reset your password</h1>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    Use the code below to reset your Coderhelm password. This code expires in 15 minutes.
+  </p>
+  <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:20px;text-align:center;margin:24px 0">
+    <span style="color:#fff;font-size:32px;font-weight:700;letter-spacing:8px;font-family:monospace">{{code}}</span>
+  </div>
+  <p style="color:#888;font-size:14px;line-height:1.6">
+    If you didn't request this, you can safely ignore this email.
+  </p>
+`);
+
+const RESET_PASSWORD_TEXT = `Reset your Coderhelm password
+
+Your reset code: {{code}}
+
+This code expires in 15 minutes. If you didn't request this, ignore this email.`;
+
+const TEAM_INVITE_HTML = EMAIL_WRAPPER(`
+  <h1 style="color:#fff;font-size:20px;margin:0 0 16px">You've been invited</h1>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    <strong style="color:#fff">{{inviter}}</strong> has invited you to join <strong style="color:#fff">{{org}}</strong> on Coderhelm as a <strong style="color:#fff">{{role}}</strong>.
+  </p>
+  <p style="color:#ccc;font-size:15px;line-height:1.6">
+    Coderhelm is an AI coding agent that turns GitHub issues and Jira tickets into production-ready pull requests.
+  </p>
+  <a href="https://app.coderhelm.com" style="display:inline-block;background:#fff;color:#000;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:16px">Accept Invite</a>
+`);
+
+const TEAM_INVITE_TEXT = `You've been invited to {{org}} on Coderhelm
+
+{{inviter}} invited you as a {{role}}.
+
+Accept your invite: https://app.coderhelm.com`;
+
+const VERIFY_EMAIL_HTML = EMAIL_WRAPPER(`
+  <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Verify your email</h1>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    Enter the code below to verify your Coderhelm account.
+  </p>
+  <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:20px;text-align:center;margin:24px 0">
+    <span style="color:#fff;font-size:32px;font-weight:700;letter-spacing:8px;font-family:monospace">{{code}}</span>
+  </div>
+  <p style="color:#888;font-size:14px;line-height:1.6">
+    If you didn't create a Coderhelm account, you can safely ignore this email.
+  </p>
+`);
+
+const VERIFY_EMAIL_TEXT = `Verify your Coderhelm email
+
+Your verification code: {{code}}
+
+If you didn't create a Coderhelm account, ignore this email.`;
 

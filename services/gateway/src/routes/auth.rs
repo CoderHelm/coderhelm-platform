@@ -61,6 +61,7 @@ pub async fn is_email_allowed(state: &AppState, email: &str) -> bool {
 pub struct SignupRequest {
     pub email: String,
     pub password: String,
+    #[allow(dead_code)]
     pub name: Option<String>,
 }
 
@@ -441,10 +442,17 @@ pub async fn google_login(State(state): State<Arc<AppState>>) -> impl IntoRespon
 
     let domain = &state.config.cognito_domain;
     let client_id = &state.config.cognito_client_id;
-    let region = "us-east-1";
+
+    // Custom domains (contain '.') use https://{domain}/oauth2/...
+    // Cognito prefix domains use https://{domain}.auth.{region}.amazoncognito.com/oauth2/...
+    let base = if domain.contains('.') {
+        format!("https://{domain}")
+    } else {
+        format!("https://{domain}.auth.us-east-1.amazoncognito.com")
+    };
 
     let url = format!(
-        "https://{domain}.auth.{region}.amazoncognito.com/oauth2/authorize?\
+        "{base}/oauth2/authorize?\
          response_type=code&client_id={client_id}&\
          redirect_uri={redirect_uri}&\
          identity_provider=Google&\
@@ -467,10 +475,14 @@ pub async fn google_callback(
 
     let domain = &state.config.cognito_domain;
     let client_id = &state.config.cognito_client_id;
-    let region = "us-east-1";
 
     // Exchange code for tokens with Cognito token endpoint
-    let token_url = format!("https://{domain}.auth.{region}.amazoncognito.com/oauth2/token");
+    let base = if domain.contains('.') {
+        format!("https://{domain}")
+    } else {
+        format!("https://{domain}.auth.us-east-1.amazoncognito.com")
+    };
+    let token_url = format!("{base}/oauth2/token");
 
     // Get client secret for confidential client
     let client_secret = state
@@ -1304,10 +1316,50 @@ pub struct WaitlistRequest {
 pub async fn join_waitlist(
     State(state): State<Arc<AppState>>,
     Json(body): Json<WaitlistRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let email = body.email.trim().to_lowercase();
     if email.is_empty() || !email.contains('@') {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid email address" })),
+        ));
+    }
+
+    // Basic email regex validation
+    let email_re =
+        regex::Regex::new(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$").unwrap();
+    if !email_re.is_match(&email) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid email format" })),
+        ));
+    }
+
+    // Normalize: strip plus-alias (user+tag@domain.com → user@domain.com) for dedup
+    let normalized = if let Some((local, domain)) = email.split_once('@') {
+        let base_local = local.split('+').next().unwrap_or(local);
+        format!("{base_local}@{domain}")
+    } else {
+        email.clone()
+    };
+
+    // Check if normalized email already exists
+    let existing = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s("WAITLIST"))
+        .key("sk", attr_s(&format!("EMAIL#{normalized}")))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned());
+
+    if existing.is_some() {
+        return Ok(Json(serde_json::json!({
+            "status": "already_joined",
+            "message": "You're already on the list! We'll notify you when Coderhelm opens up."
+        })));
     }
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -1317,17 +1369,21 @@ pub async fn join_waitlist(
         .put_item()
         .table_name(&state.config.settings_table_name)
         .item("pk", attr_s("WAITLIST"))
-        .item("sk", attr_s(&format!("EMAIL#{email}")))
+        .item("sk", attr_s(&format!("EMAIL#{normalized}")))
         .item("email", attr_s(&email))
+        .item("normalized_email", attr_s(&normalized))
         .item("created_at", attr_s(&now))
         .send()
         .await
         .map_err(|e| {
             error!("Failed to save waitlist entry: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Internal error" })),
+            )
         })?;
 
-    info!(email = %email, "Waitlist signup");
+    info!(email = %email, normalized = %normalized, "Waitlist signup");
     Ok(Json(serde_json::json!({
         "status": "joined",
         "message": "You're on the list! We'll notify you when Coderhelm opens up."
