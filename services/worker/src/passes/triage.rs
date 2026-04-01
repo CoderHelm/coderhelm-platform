@@ -119,9 +119,7 @@ pub async fn select_repo(
     let context_section = if global_agents.is_empty() {
         String::new()
     } else {
-        format!(
-            "\n## Repository context\n{global_agents}\n"
-        )
+        format!("\n## Repository context\n{global_agents}\n")
     };
 
     let prompt = format!(
