@@ -115,8 +115,8 @@ pub async fn converse(
         turns += 1;
         if turns > MAX_TURNS {
             warn!("Hit max turn limit ({MAX_TURNS}), forcing completion");
-            return Ok(
-                "[Turn limit reached — stopping to avoid excessive token usage]".to_string(),
+            return Err(
+                format!("Reached the maximum number of steps ({MAX_TURNS}) without finishing. The issue may need more detail or a narrower scope.").into()
             );
         }
         // Send with automatic retry for transient Bedrock errors (5xx, throttling).

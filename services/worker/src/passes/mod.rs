@@ -392,6 +392,31 @@ async fn run_passes(
         "Implement complete"
     );
 
+    // If no files were changed, comment on the issue and bail — don't open an empty PR
+    if impl_result.files_modified.is_empty() {
+        warn!(run_id, "Implement pass produced zero file changes");
+        let comment = format!(
+            "I explored the codebase but couldn't determine what changes to make for this issue.\n\n\
+             This usually means the issue needs more detail — for example:\n\
+             - Which file(s) or component(s) should be modified?\n\
+             - What is the expected behavior vs. current behavior?\n\
+             - Any relevant code snippets or error messages?\n\n\
+             Please add more context and I'll try again."
+        );
+        if let Err(e) = github
+            .create_issue_comment(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                &comment,
+            )
+            .await
+        {
+            warn!(run_id, error = %e, "Failed to comment on issue about empty implementation");
+        }
+        return Err("Could not determine what changes to make — commented on issue asking for clarification".into());
+    }
+
     // Mark all tasks as done in S3 openspec so retries/dashboard see progress
     let tasks_key = format!(
         "tenants/{}/runs/{}/openspec/tasks.md",
@@ -810,6 +835,32 @@ async fn fail_run(
     .await
     {
         error!("Failed to send run-failed email: {e}");
+    }
+
+    // Comment on the GitHub issue so the user knows the run failed
+    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+        if let Ok(gh) = GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            msg.installation_id,
+            &state.http,
+        ) {
+            let comment = format!(
+                "⚠️ **Coderhelm couldn't complete this issue**\n\n\
+                 {}\n\n\
+                 If you can, add more detail to the issue description — for example which files to change, \
+                 expected behavior, or relevant code snippets — and I'll try again.\n\n\
+                 [View run →](https://app.coderhelm.com/runs/detail?id={})",
+                &error_msg[..error_msg.len().min(300)],
+                run_id,
+            );
+            if let Err(e) = gh
+                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
+                .await
+            {
+                error!("Failed to comment on issue about run failure: {e}");
+            }
+        }
     }
 }
 
