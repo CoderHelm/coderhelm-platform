@@ -83,9 +83,30 @@ pub async fn orchestrate_ticket(
             info!(run_id, duration, "Orchestration complete");
         }
         Err(e) => {
-            error!(run_id, error = %e, "Orchestration failed");
             let duration = start.elapsed().as_secs();
-            let sanitized = sanitize_error(&e.to_string());
+            let err_msg = e.to_string();
+            if err_msg.contains("cancelled by user") {
+                info!(run_id, duration, "Run cancelled — preserving tokens");
+                // Update token counts but keep status as cancelled
+                let cost = usage.estimated_cost();
+                let _ = state
+                    .dynamo
+                    .update_item()
+                    .table_name(&state.config.runs_table_name)
+                    .key("tenant_id", attr_s(&msg.tenant_id))
+                    .key("run_id", attr_s(&run_id))
+                    .update_expression("SET tokens_in = :ti, tokens_out = :to, cost_usd = :c, duration_s = :d, updated_at = :t")
+                    .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+                    .expression_attribute_values(":to", attr_n(usage.output_tokens))
+                    .expression_attribute_values(":c", attr_s(&format!("{cost:.6}")))
+                    .expression_attribute_values(":d", attr_n(duration))
+                    .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+                    .send()
+                    .await;
+                return Ok(());
+            }
+            error!(run_id, error = %e, "Orchestration failed");
+            let sanitized = sanitize_error(&err_msg);
             fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
             return Err(e);
         }
@@ -188,16 +209,19 @@ async fn run_passes(
     }
 
     // --- Pass 1: Triage ---
+    check_cancelled(state, &msg.tenant_id, run_id).await?;
     update_pass(state, &msg.tenant_id, run_id, "triage").await?;
     let triage_result = triage::run(state, msg, &github, usage).await?;
     info!(run_id, "Triage complete");
 
     // --- Pass 2: Plan ---
+    check_cancelled(state, &msg.tenant_id, run_id).await?;
     update_pass(state, &msg.tenant_id, run_id, "plan").await?;
     let plan_result = plan::run(state, msg, &github, &triage_result, usage).await?;
     info!(run_id, "Plan complete");
 
     // --- Pass 3: Implement ---
+    check_cancelled(state, &msg.tenant_id, run_id).await?;
     update_pass(state, &msg.tenant_id, run_id, "implement").await?;
     let branch_name = format!("coderhelm/{}", msg.ticket_id.to_lowercase());
 
@@ -278,11 +302,13 @@ async fn run_passes(
     }
 
     // --- Pass 4: Review ---
+    check_cancelled(state, &msg.tenant_id, run_id).await?;
     update_pass(state, &msg.tenant_id, run_id, "review").await?;
     review::run(state, msg, &github, &branch_name, &rules, usage).await?;
     info!(run_id, "Review complete");
 
     // --- Pass 5: Create PR ---
+    check_cancelled(state, &msg.tenant_id, run_id).await?;
     update_pass(state, &msg.tenant_id, run_id, "pr").await?;
     let pr_result = pr::run(
         state,
@@ -414,6 +440,33 @@ async fn update_pass(
         .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]))
         .send()
         .await?;
+    Ok(())
+}
+
+/// Check if a run has been cancelled by the user via the dashboard.
+async fn check_cancelled(
+    state: &WorkerState,
+    tenant_id: &str,
+    run_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("tenant_id", attr_s(tenant_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("#s")
+        .expression_attribute_names("#s", "status")
+        .send()
+        .await?;
+
+    if let Some(item) = result.item() {
+        if let Some(status) = item.get("status").and_then(|v| v.as_s().ok()) {
+            if status == "cancelled" {
+                return Err("Run cancelled by user".into());
+            }
+        }
+    }
     Ok(())
 }
 
