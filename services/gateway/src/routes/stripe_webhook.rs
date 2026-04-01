@@ -571,22 +571,64 @@ async fn handle_charge_refunded(
         .send()
         .await?;
 
-    // Update the corresponding invoice/payment record status if we have the invoice_id
-    if !invoice_id.is_empty() {
-        let amount_total = charge["amount"].as_u64().unwrap_or(0);
-        let new_status = if amount_refunded_cents >= amount_total {
-            "refunded"
-        } else {
-            "partially_refunded"
-        };
+    // Update the corresponding invoice/payment record status
+    let amount_total = charge["amount"].as_u64().unwrap_or(0);
+    let new_status = if amount_refunded_cents >= amount_total {
+        "refunded"
+    } else {
+        "partially_refunded"
+    };
 
+    // If invoice_id is empty, try to resolve it from payment_intent → recent payments
+    let resolved_invoice_id = if !invoice_id.is_empty() {
+        invoice_id.to_string()
+    } else {
+        // Fall back: find most recent PAYMENT# with matching amount
+        let payments = state
+            .dynamo
+            .query()
+            .table_name(&state.config.events_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":pk", attr_s(&tenant_id))
+            .expression_attribute_values(":prefix", attr_s("PAYMENT#"))
+            .scan_index_forward(false)
+            .limit(20)
+            .send()
+            .await;
+
+        payments
+            .ok()
+            .and_then(|r| {
+                r.items().iter().find(|item| {
+                    let amt = item
+                        .get("amount_cents")
+                        .and_then(|v| v.as_n().ok())
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let status = item
+                        .get("status")
+                        .and_then(|v| v.as_s().ok())
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    amt == amount_total && status == "paid"
+                })
+                .and_then(|item| {
+                    item.get("stripe_invoice_id")
+                        .and_then(|v| v.as_s().ok())
+                        .map(|s| s.to_string())
+                })
+            })
+            .unwrap_or_default()
+    };
+
+    if !resolved_invoice_id.is_empty() {
         // Update invoice record
         let _ = state
             .dynamo
             .update_item()
             .table_name(&state.config.events_table_name)
             .key("pk", attr_s(&tenant_id))
-            .key("sk", attr_s(&format!("INVOICE#{invoice_id}")))
+            .key("sk", attr_s(&format!("INVOICE#{resolved_invoice_id}")))
             .update_expression("SET #s = :s, refunded_at = :t, amount_refunded_cents = :r")
             .expression_attribute_names("#s", "status")
             .expression_attribute_values(":s", attr_s(new_status))
@@ -601,7 +643,7 @@ async fn handle_charge_refunded(
             .update_item()
             .table_name(&state.config.events_table_name)
             .key("pk", attr_s(&tenant_id))
-            .key("sk", attr_s(&format!("PAYMENT#{invoice_id}")))
+            .key("sk", attr_s(&format!("PAYMENT#{resolved_invoice_id}")))
             .update_expression("SET #s = :s, refunded_at = :t, amount_refunded_cents = :r")
             .expression_attribute_names("#s", "status")
             .expression_attribute_values(":s", attr_s(new_status))
@@ -609,6 +651,10 @@ async fn handle_charge_refunded(
             .expression_attribute_values(":r", attr_n(amount_refunded_cents))
             .send()
             .await;
+
+        info!(tenant_id, resolved_invoice_id, "Updated invoice/payment with refund status");
+    } else {
+        warn!(tenant_id, charge_id, "Could not resolve invoice for refund");
     }
 
     // Send refund notification email
