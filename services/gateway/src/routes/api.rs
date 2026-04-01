@@ -458,7 +458,10 @@ pub async fn retry_run(
         repo_owner: parts[0].to_string(),
         repo_name: parts[1].to_string(),
         issue_number,
-        sender: claims.github_login.clone().unwrap_or_else(|| claims.email.clone()),
+        sender: claims
+            .github_login
+            .clone()
+            .unwrap_or_else(|| claims.email.clone()),
     });
 
     let body = serde_json::to_string(&message).map_err(|e| {
