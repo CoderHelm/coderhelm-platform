@@ -90,6 +90,8 @@ pub enum WorkerMessage {
     MarkReady(MarkReadyMessage),
     #[serde(rename = "plan_execute")]
     PlanExecute(PlanExecuteMessage),
+    #[serde(rename = "plan_task_continue")]
+    PlanTaskContinue(PlanTaskContinueMessage),
     #[serde(rename = "infra_analyze")]
     InfraAnalyze(InfraAnalyzeMessage),
 }
@@ -108,6 +110,13 @@ pub struct PlanExecuteMessage {
     pub tenant_id: String,
     pub plan_id: String,
     pub triggered_by: String,
+    pub tasks: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PlanTaskContinueMessage {
+    pub tenant_id: String,
+    pub plan_id: String,
     pub tasks: Vec<String>,
 }
 

@@ -445,6 +445,11 @@ pub async fn add_task(
     if let Some(jp) = body["jira_project"].as_str() {
         put = put.item("jira_project", attr_s(jp));
     }
+    if let Some(dep) = body["depends_on"].as_str() {
+        if !dep.is_empty() {
+            put = put.item("depends_on", attr_s(dep));
+        }
+    }
 
     put.send().await.map_err(|e| {
         error!("Failed to create task: {e}");
@@ -518,6 +523,15 @@ pub async fn update_task(
     if let Some(jp) = body["jira_project"].as_str() {
         update_parts.push("jira_project = :jp");
         expr_values.push((":jp", attr_s(jp)));
+    }
+    if let Some(dep) = body["depends_on"].as_str() {
+        if dep.is_empty() {
+            update_parts.push("depends_on = :dep");
+            expr_values.push((":dep", attr_s("")));
+        } else {
+            update_parts.push("depends_on = :dep");
+            expr_values.push((":dep", attr_s(dep)));
+        }
     }
 
     if update_parts.is_empty() {
@@ -997,6 +1011,7 @@ fn task_from_item(
         "jira_project": item.get("jira_project").and_then(|v| v.as_s().ok()),
         "jira_ticket_key": item.get("jira_ticket_key").and_then(|v| v.as_s().ok()),
         "jira_ticket_url": item.get("jira_ticket_url").and_then(|v| v.as_s().ok()),
+        "depends_on": item.get("depends_on").and_then(|v| v.as_s().ok()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
     })
 }

@@ -137,6 +137,12 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("Plan execute failed: {e}");
                 }
             }
+            models::WorkerMessage::PlanTaskContinue(msg) => {
+                info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, tasks = msg.tasks.len(), "Continuing plan tasks");
+                if let Err(e) = passes::plan_execute::continue_tasks(&state, msg).await {
+                    error!("Plan task continue failed: {e}");
+                }
+            }
             models::WorkerMessage::InfraAnalyze(msg) => {
                 info!(tenant_id = %msg.tenant_id, "Analyzing infrastructure");
                 let tenant_id = msg.tenant_id.clone();
