@@ -140,13 +140,39 @@ export class ApiStack extends cdk.Stack {
 
     userPoolClient.node.addDependency(googleProvider);
 
-    // Cognito hosted UI domain
-    const userPoolDomain = userPool.addDomain("UserPoolDomain", {
-      cognitoDomain: {
-        domainPrefix:
-          props.stage === "prod" ? "coderhelm" : `coderhelm-${props.stage}`,
-      },
-    });
+    // Cognito custom domain (prod: auth.coderhelm.com, dev: hosted UI prefix)
+    let userPoolDomain: cognito.UserPoolDomain;
+    if (props.stage === "prod") {
+      const hostedZone = route53.HostedZone.fromLookup(this, "AuthZone", {
+        domainName: "coderhelm.com",
+      });
+
+      const authCert = new acm.Certificate(this, "AuthCertificate", {
+        domainName: "auth.coderhelm.com",
+        validation: acm.CertificateValidation.fromDns(hostedZone),
+      });
+
+      userPoolDomain = userPool.addDomain("UserPoolDomain", {
+        customDomain: {
+          domainName: "auth.coderhelm.com",
+          certificate: authCert,
+        },
+      });
+
+      new route53.ARecord(this, "AuthAliasRecord", {
+        zone: hostedZone,
+        recordName: "auth",
+        target: route53.RecordTarget.fromAlias(
+          new route53Targets.UserPoolDomainTarget(userPoolDomain)
+        ),
+      });
+    } else {
+      userPoolDomain = userPool.addDomain("UserPoolDomain", {
+        cognitoDomain: {
+          domainPrefix: `coderhelm-${props.stage}`,
+        },
+      });
+    }
 
     // --- SQS Queues ---
 
