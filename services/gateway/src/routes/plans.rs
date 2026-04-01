@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::error;
 
-use crate::models::{Claims, PlanExecuteMessage, WorkerMessage};
+use crate::models::{Claims, PlanExecuteMessage, PlanTaskContinueMessage, WorkerMessage};
 use crate::AppState;
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
@@ -150,7 +150,7 @@ pub async fn create_plan(
             if !task_repo.is_empty() {
                 put = put.item("repo", attr_s(task_repo));
             }
-            if let Some(dest) = task["destination"].as_str() {
+            if let Some(dest) = task["destination"].as_str().or(if destination.is_empty() { None } else { Some(destination) }) {
                 put = put.item("destination", attr_s(dest));
             }
             if let Some(jp) = task["jira_project"].as_str() {
@@ -823,6 +823,67 @@ pub async fn approve_all_and_execute(
         "status": "executing",
         "tasks_queued": task_ids.len(),
     })))
+}
+
+/// POST /api/plans/:plan_id/tasks/:task_id/force-run — force-run a waiting task.
+pub async fn force_run_task(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
+    validate_plan_id(&plan_id)?;
+    validate_plan_id(&task_id)?;
+
+    // Verify task is in "waiting" status
+    let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.plans_table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s(&task_sk))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to get task: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let status = item
+        .item()
+        .and_then(|i| i.get("status"))
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    if status != "waiting" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Send PlanTaskContinue message to the worker
+    let msg = WorkerMessage::PlanTaskContinue(PlanTaskContinueMessage {
+        tenant_id: claims.tenant_id.clone(),
+        plan_id: plan_id.clone(),
+        tasks: vec![task_id.clone()],
+    });
+
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(serde_json::to_string(&msg).map_err(|e| {
+            error!("Failed to serialize force-run message: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to send force-run message: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(json!({ "status": "running" })))
 }
 
 /// POST /api/plans/:plan_id/execute — execute the plan (creates issues, queues tasks).

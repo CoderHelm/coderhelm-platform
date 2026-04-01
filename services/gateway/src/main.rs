@@ -247,6 +247,10 @@ async fn main() -> Result<(), Error> {
         )
         .route("/plans/:plan_id/execute", post(routes::plans::execute_plan))
         .route(
+            "/plans/:plan_id/tasks/:task_id/force-run",
+            post(routes::plans::force_run_task),
+        )
+        .route(
             "/plans/:plan_id/approve-and-execute",
             post(routes::plans::approve_all_and_execute),
         )

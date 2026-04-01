@@ -144,10 +144,31 @@ pub async fn invite_user(
         })?;
 
     // Send invitation email via SES
-    let tenant_name = claims
-        .tenant_id
-        .strip_prefix("TENANT#")
-        .unwrap_or("your team");
+    let tenant_name = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s("META"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .and_then(|i| {
+            i.get("github_org")
+                .and_then(|v| v.as_s().ok())
+                .filter(|s| !s.is_empty())
+                .cloned()
+        })
+        .unwrap_or_else(|| {
+            claims
+                .email
+                .split('@')
+                .nth(1)
+                .map(|d| d.split('.').next().unwrap_or("your team"))
+                .unwrap_or("your team")
+                .to_string()
+        });
 
     let _ = state
         .ses

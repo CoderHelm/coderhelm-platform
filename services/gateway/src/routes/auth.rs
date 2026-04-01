@@ -68,10 +68,12 @@ pub struct GoogleCallbackParams {
 pub async fn signup(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SignupRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let email = body.email.trim().to_lowercase();
     if email.is_empty() || body.password.len() < 8 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Email and password (min 8 chars) are required"
+        }))));
     }
 
     let mut req = state
@@ -101,11 +103,19 @@ pub async fn signup(
     let result = req.send().await.map_err(|e| {
         let msg = format!("{e}");
         if msg.contains("UsernameExistsException") {
-            StatusCode::CONFLICT
-        } else {
-            error!("Cognito signup failed: {e}");
-            StatusCode::BAD_REQUEST
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "An account with this email already exists"
+            })));
         }
+        error!("Cognito signup failed: {e}");
+        let user_msg = if msg.contains("InvalidPasswordException") || msg.contains("Password did not conform") {
+            "Password must contain at least 8 characters, including uppercase, lowercase, a number, and a special character"
+        } else if msg.contains("InvalidParameterException") {
+            "Invalid email or password format"
+        } else {
+            "Signup failed — please try again"
+        };
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": user_msg })))
     })?;
 
     let cognito_sub = result.user_sub();
@@ -1014,7 +1024,7 @@ async fn issue_session_from_cognito(
 
     let cognito_sub = user.username();
 
-    // Look up user by email (GSI2)
+    // Look up user by email (GSI2) — includes personal tenant + any pending invites
     let existing = state
         .dynamo
         .query()
@@ -1022,7 +1032,6 @@ async fn issue_session_from_cognito(
         .index_name("gsi2")
         .key_condition_expression("gsi2pk = :pk")
         .expression_attribute_values(":pk", attr_s(&format!("EMAIL#{email}")))
-        .limit(1)
         .send()
         .await
         .map_err(|e| {
@@ -1031,7 +1040,16 @@ async fn issue_session_from_cognito(
         })?;
 
     let items = existing.items().to_vec();
-    let (tenant_id, user_id, role, github_login) = if let Some(item) = items.first() {
+
+    // Find non-invite record (the user's own tenant) to use for session
+    let active_item = items.iter().find(|item| {
+        item.get("status")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s != "invited")
+            .unwrap_or(true)
+    });
+
+    let (tenant_id, user_id, role, github_login) = if let Some(item) = active_item {
         let tid = item
             .get("pk")
             .and_then(|v| v.as_s().ok())
@@ -1088,6 +1106,58 @@ async fn issue_session_from_cognito(
         info!(email = %email, "Created new user + tenant on first login");
         (tid, uid, "owner".to_string(), None)
     };
+
+    // Process any pending invites — create real user records in the inviting tenants
+    let real_user_id = format!("USER#{cognito_sub}");
+    let now = chrono::Utc::now().to_rfc3339();
+    for item in &items {
+        let is_invite = item
+            .get("status")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s == "invited")
+            .unwrap_or(false);
+        if !is_invite {
+            continue;
+        }
+        let invite_tid = match item.get("pk").and_then(|v| v.as_s().ok()) {
+            Some(t) => t.to_string(),
+            None => continue,
+        };
+        let invite_role = item
+            .get("role")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_else(|| "member".to_string());
+
+        // Create a real user record in the inviting tenant
+        let _ = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.users_table_name)
+            .item("pk", attr_s(&invite_tid))
+            .item("sk", attr_s(&real_user_id))
+            .item("email", attr_s(email))
+            .item("role", attr_s(&invite_role))
+            .item("avatar_url", attr_s(""))
+            .item("updated_at", attr_s(&now))
+            .item("gsi2pk", attr_s(&format!("EMAIL#{email}")))
+            .item("gsi2sk", attr_s(&invite_tid))
+            .send()
+            .await;
+
+        // Delete the invite record
+        if let Some(invite_sk) = item.get("sk").and_then(|v| v.as_s().ok()) {
+            let _ = state
+                .dynamo
+                .delete_item()
+                .table_name(&state.config.users_table_name)
+                .key("pk", attr_s(&invite_tid))
+                .key("sk", attr_s(invite_sk))
+                .send()
+                .await;
+            info!(email = %email, tenant_id = %invite_tid, role = %invite_role, "Processed pending invite on login");
+        }
+    }
 
     let token = jwt::create_token(
         &user_id,

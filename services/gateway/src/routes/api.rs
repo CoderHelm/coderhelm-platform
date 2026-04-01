@@ -79,13 +79,10 @@ pub async fn list_tenants(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Extract github_id from user_id (USER#{github_id})
-    let github_id = claims
-        .sub
-        .strip_prefix("USER#")
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    let github_id = claims.sub.strip_prefix("USER#").ok_or(StatusCode::BAD_REQUEST)?;
 
-    let result = state
+    // Try GSI1 (GitHub users) first, then fall back to GSI2 (email users)
+    let gsi1_result = state
         .dynamo
         .query()
         .table_name(&state.config.users_table_name)
@@ -94,16 +91,44 @@ pub async fn list_tenants(
         .expression_attribute_values(":gk", attr_s(&format!("GHUSER#{github_id}")))
         .send()
         .await
-        .map_err(|e| {
-            error!("Failed to query user tenants: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .ok();
 
-    let tenant_ids: Vec<String> = result
-        .items()
-        .iter()
-        .filter_map(|item| item.get("gsi1sk").and_then(|v| v.as_s().ok()).cloned())
-        .collect();
+    let tenant_ids: Vec<String> = if let Some(ref result) = gsi1_result {
+        let ids: Vec<String> = result
+            .items()
+            .iter()
+            .filter_map(|item| item.get("gsi1sk").and_then(|v| v.as_s().ok()).cloned())
+            .collect();
+        if !ids.is_empty() {
+            ids
+        } else {
+            // Fall back to GSI2 (email)
+            state
+                .dynamo
+                .query()
+                .table_name(&state.config.users_table_name)
+                .index_name("gsi2")
+                .key_condition_expression("gsi2pk = :pk")
+                .expression_attribute_values(":pk", attr_s(&format!("EMAIL#{}", claims.email)))
+                .send()
+                .await
+                .map(|r| {
+                    r.items()
+                        .iter()
+                        .filter(|item| {
+                            item.get("status")
+                                .and_then(|v| v.as_s().ok())
+                                .map(|s| s != "invited")
+                                .unwrap_or(true)
+                        })
+                        .filter_map(|item| item.get("pk").and_then(|v| v.as_s().ok()).cloned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    } else {
+        vec![]
+    };
 
     // Load org name + status for each tenant
     let mut tenants: Vec<Value> = Vec::new();
@@ -123,8 +148,14 @@ pub async fn list_tenants(
             .as_ref()
             .and_then(|item| item.get("github_org"))
             .and_then(|v| v.as_s().ok())
+            .filter(|s| !s.is_empty())
             .cloned()
-            .unwrap_or_else(|| "Unknown".to_string());
+            .unwrap_or_else(|| {
+                claims.email.split('@').nth(1)
+                    .map(|d| d.split('.').next().unwrap_or("Personal"))
+                    .unwrap_or("Personal")
+                    .to_string()
+            });
 
         let status = meta
             .as_ref()
