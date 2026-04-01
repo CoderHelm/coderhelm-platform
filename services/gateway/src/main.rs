@@ -22,6 +22,7 @@ pub struct AppState {
     pub s3: aws_sdk_s3::Client,
     pub bedrock: aws_sdk_bedrockruntime::Client,
     pub cognito: aws_sdk_cognitoidentityprovider::Client,
+    pub lambda: aws_sdk_lambda::Client,
     pub http: reqwest::Client,
     pub secrets: models::Secrets,
     pub config: models::Config,
@@ -43,6 +44,7 @@ async fn main() -> Result<(), Error> {
     let s3 = aws_sdk_s3::Client::new(&aws_config);
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
     let cognito = aws_sdk_cognitoidentityprovider::Client::new(&aws_config);
+    let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
 
     // Load secrets from Secrets Manager
@@ -59,6 +61,7 @@ async fn main() -> Result<(), Error> {
         s3,
         bedrock,
         cognito,
+        lambda: lambda_client,
         http: reqwest::Client::new(),
         secrets,
         config,

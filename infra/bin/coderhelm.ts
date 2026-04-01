@@ -75,6 +75,13 @@ const worker = new WorkerStack(app, `${prefix}-worker`, {
 
 // --- Email ---
 
+// Grant gateway permission to invoke MCP proxy Lambda
+worker.mcpProxyFunction.grantInvoke(api.gatewayFunction);
+api.gatewayFunction.addEnvironment(
+  "MCP_PROXY_FUNCTION_NAME",
+  worker.mcpProxyFunction.functionName
+);
+
 new EmailStack(app, `${prefix}-email`, {
   env,
   stage,

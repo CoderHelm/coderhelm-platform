@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use tracing::warn;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
+use crate::agent::mcp;
 use crate::clients::github::{FileOp, GitHubClient};
 use crate::models::{TicketMessage, TokenUsage};
 use crate::passes::plan::PlanResult;
@@ -59,7 +60,57 @@ pub async fn run(
         spec = plan.spec,
     );
 
-    let tools = all_tools();
+    let mut tools = all_tools();
+
+    // Load MCP plugins and their cached tool schemas
+    let mcp_plugins = mcp::load_tenant_plugins(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.tenant_id,
+        &super::MCP_CATALOG,
+    )
+    .await;
+
+    let mut loaded_mcp_plugins = Vec::new();
+    for plugin in &mcp_plugins {
+        let schemas = match mcp::load_tool_cache(
+            &state.s3,
+            &state.config.bucket_name,
+            &plugin.server_id,
+        )
+        .await
+        {
+            Some(cache) => cache.tools,
+            None if !state.config.mcp_proxy_function_name.is_empty() => {
+                match mcp::list_tools(&state.lambda, &state.config.mcp_proxy_function_name, plugin)
+                    .await
+                {
+                    Ok(schemas) => schemas,
+                    Err(e) => {
+                        tracing::warn!(server_id = %plugin.server_id, error = %e, "Failed to list MCP tools, skipping");
+                        continue;
+                    }
+                }
+            }
+            _ => continue,
+        };
+
+        let mcp_tool_defs = mcp::to_tool_definitions(&plugin.server_id, &schemas);
+        tools.extend(mcp_tool_defs);
+        loaded_mcp_plugins.push(plugin.clone());
+    }
+
+    // Add MCP context to system prompt
+    let mut full_system = system.clone();
+    for plugin in &loaded_mcp_plugins {
+        if let Some(ref prompt) = plugin.custom_prompt {
+            full_system.push_str(&format!(
+                "\n\n## MCP Server: {}\n{}",
+                plugin.server_id, prompt
+            ));
+        }
+    }
+
     let tasks_key = format!(
         "tenants/{}/runs/{}/openspec/tasks.md",
         msg.tenant_id,
@@ -71,13 +122,18 @@ pub async fn run(
         &tasks_key,
         &plan.tasks,
     );
-    let executor = WriteToolExecutor {
-        github,
-        owner: msg.repo_owner.clone(),
-        repo: msg.repo_name.clone(),
-        branch: branch.to_string(),
-        files_modified: std::sync::Mutex::new(HashSet::new()),
-        task_tracker: &task_tracker,
+    let executor = CombinedWriteToolExecutor {
+        write_executor: WriteToolExecutor {
+            github,
+            owner: msg.repo_owner.clone(),
+            repo: msg.repo_name.clone(),
+            branch: branch.to_string(),
+            files_modified: std::sync::Mutex::new(HashSet::new()),
+            task_tracker: &task_tracker,
+        },
+        mcp_plugins: &loaded_mcp_plugins,
+        lambda: &state.lambda,
+        mcp_proxy_function_name: &state.config.mcp_proxy_function_name,
     };
 
     let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
@@ -88,7 +144,7 @@ pub async fn run(
     llm::converse(
         state,
         &state.config.model_id,
-        &system,
+        &full_system,
         &mut messages,
         &tools,
         &executor,
@@ -97,6 +153,7 @@ pub async fn run(
     .await?;
 
     let files = executor
+        .write_executor
         .files_modified
         .lock()
         .unwrap()
@@ -495,5 +552,44 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
             }
             _ => Err(format!("Unknown tool: {name}").into()),
         }
+    }
+}
+
+// ─── Combined tool executor (write + MCP) ───────────────────
+
+struct CombinedWriteToolExecutor<'a> {
+    write_executor: WriteToolExecutor<'a>,
+    mcp_plugins: &'a [mcp::McpPlugin],
+    lambda: &'a aws_sdk_lambda::Client,
+    mcp_proxy_function_name: &'a str,
+}
+
+#[async_trait::async_trait]
+impl<'a> ToolExecutor for CombinedWriteToolExecutor<'a> {
+    async fn execute(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        // Check if this is an MCP tool (prefixed with server_id__)
+        if let Some((server_id, tool_name)) = name.split_once("__") {
+            let plugin = self
+                .mcp_plugins
+                .iter()
+                .find(|p| p.server_id == server_id)
+                .ok_or_else(|| format!("No MCP plugin found for server: {server_id}"))?;
+
+            return mcp::call_tool(
+                self.lambda,
+                self.mcp_proxy_function_name,
+                plugin,
+                tool_name,
+                input,
+            )
+            .await;
+        }
+
+        // Fall through to write tools
+        self.write_executor.execute(name, input).await
     }
 }

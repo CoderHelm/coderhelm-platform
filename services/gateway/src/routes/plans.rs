@@ -1,7 +1,8 @@
+use aws_smithy_types::Document;
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info, warn};
 
 use crate::models::{Claims, PlanExecuteMessage, PlanTaskContinueMessage, WorkerMessage};
 use crate::AppState;
@@ -1197,39 +1198,7 @@ pub async fn plan_chat(
     };
 
     // Load enabled plugins (MCP servers) for this tenant
-    let enabled_plugins = state
-        .dynamo
-        .query()
-        .table_name(&state.config.settings_table_name)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
-        .expression_attribute_values(":prefix", attr_s("PLUGIN#"))
-        .send()
-        .await
-        .ok()
-        .map(|r| {
-            r.items()
-                .iter()
-                .filter(|item| {
-                    item.get("enabled")
-                        .and_then(|v| v.as_bool().ok())
-                        .copied()
-                        .unwrap_or(false)
-                })
-                .filter_map(|item| {
-                    let sk = item.get("sk")?.as_s().ok()?;
-                    sk.strip_prefix("PLUGIN#").map(|id| {
-                        let has_creds = item
-                            .get("has_credentials")
-                            .and_then(|v| v.as_bool().ok())
-                            .copied()
-                            .unwrap_or(false);
-                        (id.to_string(), has_creds)
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let enabled_plugins = load_enabled_plugins(&state, &claims.tenant_id).await;
 
     // Build system prompt with org context and repo list
     let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
@@ -1251,12 +1220,16 @@ pub async fn plan_chat(
     if !enabled_plugins.is_empty() {
         let plugin_lines: Vec<String> = enabled_plugins
             .iter()
-            .map(|(id, has_creds)| {
-                if *has_creds {
+            .map(|(id, has_creds, custom_prompt)| {
+                let mut line = if *has_creds {
                     format!("- {id} (connected)")
                 } else {
                     format!("- {id} (enabled, needs credentials)")
+                };
+                if let Some(prompt) = custom_prompt {
+                    line.push_str(&format!(" — {prompt}"));
                 }
+                line
             })
             .collect();
         system_prompt.push_str(&format!(
@@ -1270,6 +1243,29 @@ pub async fn plan_chat(
         system_prompt.push_str(&format!(
             "\n\nAWS Log Analyzer context (enabled in workflow settings):\n{context}"
         ));
+    }
+
+    // Load MCP tool definitions from S3 cache for enabled plugins with credentials
+    let mut mcp_tools: Vec<McpToolDef> = Vec::new();
+    let mcp_proxy_fn = &state.config.mcp_proxy_function_name;
+    if !mcp_proxy_fn.is_empty() {
+        for (server_id, has_creds, _) in &enabled_plugins {
+            if !has_creds {
+                continue;
+            }
+            if let Some(cache) =
+                load_mcp_tool_cache(&state.s3, &state.config.bucket_name, server_id).await
+            {
+                for tool in cache {
+                    mcp_tools.push(McpToolDef {
+                        server_id: server_id.clone(),
+                        name: tool["name"].as_str().unwrap_or("").to_string(),
+                        description: tool["description"].as_str().unwrap_or("").to_string(),
+                        input_schema: tool["inputSchema"].clone(),
+                    });
+                }
+            }
+        }
     }
 
     // Convert messages to Bedrock format
@@ -1297,43 +1293,185 @@ pub async fn plan_chat(
         bedrock_messages.push(message);
     }
 
-    let response = state
-        .bedrock
-        .converse()
-        .model_id(&state.config.model_id)
-        .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
-            system_prompt,
-        ))
-        .set_messages(Some(bedrock_messages))
-        .send()
-        .await
-        .map_err(|e| {
+    // Build Bedrock tool config from MCP tools
+    let tool_config = if !mcp_tools.is_empty() {
+        let specs: Vec<aws_sdk_bedrockruntime::types::Tool> = mcp_tools
+            .iter()
+            .map(|t| {
+                aws_sdk_bedrockruntime::types::Tool::ToolSpec(
+                    aws_sdk_bedrockruntime::types::ToolSpecification::builder()
+                        .name(format!("{}__{}", t.server_id, t.name))
+                        .description(&t.description)
+                        .input_schema(aws_sdk_bedrockruntime::types::ToolInputSchema::Json(
+                            json_to_document(&t.input_schema),
+                        ))
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        Some(
+            aws_sdk_bedrockruntime::types::ToolConfiguration::builder()
+                .set_tools(Some(specs))
+                .build()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+
+    // Agentic loop — up to 5 tool-use turns for plan chat (gateway has 30s timeout)
+    let max_turns = 5;
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+
+    for turn in 0..max_turns {
+        let mut req = state
+            .bedrock
+            .converse()
+            .model_id(&state.config.model_id)
+            .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
+                system_prompt.clone(),
+            ))
+            .set_messages(Some(bedrock_messages.clone()));
+
+        if let Some(ref tc) = tool_config {
+            req = req.tool_config(tc.clone());
+        }
+
+        let response = req.send().await.map_err(|e| {
             error!("Bedrock converse failed: {e}");
             StatusCode::BAD_GATEWAY
         })?;
 
-    let text = match response.output() {
-        Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg
+        // Track token usage
+        if let Some(usage) = response.usage() {
+            total_input_tokens += usage.input_tokens() as u64;
+            total_output_tokens += usage.output_tokens() as u64;
+        }
+
+        let output_message = match response.output() {
+            Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg.clone(),
+            _ => {
+                track_chat_tokens(
+                    &state,
+                    &claims.tenant_id,
+                    total_input_tokens,
+                    total_output_tokens,
+                )
+                .await;
+                return Ok(Json(json!({ "content": "" })));
+            }
+        };
+
+        bedrock_messages.push(output_message.clone());
+
+        // Check for tool use
+        let tool_uses: Vec<_> = output_message
             .content()
             .iter()
-            .find_map(|block| {
+            .filter_map(|block| {
+                if let aws_sdk_bedrockruntime::types::ContentBlock::ToolUse(tu) = block {
+                    Some(tu.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if tool_uses.is_empty() {
+            // No tool use — extract final text and return
+            let text = output_message
+                .content()
+                .iter()
+                .find_map(|block| {
+                    if let aws_sdk_bedrockruntime::types::ContentBlock::Text(t) = block {
+                        Some(t.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+
+            track_chat_tokens(
+                &state,
+                &claims.tenant_id,
+                total_input_tokens,
+                total_output_tokens,
+            )
+            .await;
+            return Ok(Json(json!({ "content": text })));
+        }
+
+        // Execute MCP tool calls via proxy Lambda
+        let mut tool_results = Vec::new();
+        for tool_use in &tool_uses {
+            let full_name = tool_use.name();
+            let input: Value = document_to_json(tool_use.input());
+
+            let result = if let Some((server_id, tool_name)) = full_name.split_once("__") {
+                // Find plugin credentials and invoke MCP proxy
+                match invoke_mcp_tool(&state, &claims.tenant_id, server_id, tool_name, &input).await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warn!(tool = full_name, error = %e, "MCP tool call failed");
+                        json!(format!("Error: {e}"))
+                    }
+                }
+            } else {
+                json!(format!("Unknown tool: {full_name}"))
+            };
+
+            tool_results.push(aws_sdk_bedrockruntime::types::ContentBlock::ToolResult(
+                aws_sdk_bedrockruntime::types::ToolResultBlock::builder()
+                    .tool_use_id(tool_use.tool_use_id())
+                    .content(aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(
+                        serde_json::to_string(&result).unwrap_or_default(),
+                    ))
+                    .build()
+                    .map_err(|e| {
+                        error!("Failed to build tool result: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?,
+            ));
+        }
+
+        bedrock_messages.push(
+            aws_sdk_bedrockruntime::types::Message::builder()
+                .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
+                .set_content(Some(tool_results))
+                .build()
+                .map_err(|e| {
+                    error!("Failed to build tool result message: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?,
+        );
+
+        info!(turn = turn + 1, "Plan chat tool use turn complete");
+    }
+
+    // Hit max turns — extract last text
+    let text = bedrock_messages
+        .last()
+        .and_then(|msg| {
+            msg.content().iter().find_map(|block| {
                 if let aws_sdk_bedrockruntime::types::ContentBlock::Text(t) = block {
                     Some(t.clone())
                 } else {
                     None
                 }
             })
-            .unwrap_or_default(),
-        _ => String::new(),
-    };
+        })
+        .unwrap_or_default();
 
-    // Track token usage for plan chat
-    if let Some(usage) = response.usage() {
-        let input_tokens = usage.input_tokens() as u64;
-        let output_tokens = usage.output_tokens() as u64;
-        track_chat_tokens(&state, &claims.tenant_id, input_tokens, output_tokens).await;
-    }
-
+    track_chat_tokens(
+        &state,
+        &claims.tenant_id,
+        total_input_tokens,
+        total_output_tokens,
+    )
+    .await;
     Ok(Json(json!({ "content": text })))
 }
 
@@ -1427,4 +1565,284 @@ async fn load_log_analyzer_context(state: &AppState, tenant_id: &str) -> String 
     }
 
     lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// MCP tool helpers for plan_chat
+// ---------------------------------------------------------------------------
+
+struct McpToolDef {
+    server_id: String,
+    name: String,
+    description: String,
+    input_schema: Value,
+}
+
+fn json_to_document(val: &Value) -> Document {
+    match val {
+        Value::Null => Document::Null,
+        Value::Bool(b) => Document::Bool(*b),
+        Value::Number(n) => {
+            Document::Number(aws_smithy_types::Number::Float(n.as_f64().unwrap_or(0.0)))
+        }
+        Value::String(s) => Document::String(s.clone()),
+        Value::Array(arr) => Document::Array(arr.iter().map(json_to_document).collect()),
+        Value::Object(obj) => Document::Object(
+            obj.iter()
+                .map(|(k, v)| (k.clone(), json_to_document(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn document_to_json(doc: &Document) -> Value {
+    match doc {
+        Document::Null => Value::Null,
+        Document::Bool(b) => Value::Bool(*b),
+        Document::Number(n) => json!(n.to_f64_lossy()),
+        Document::String(s) => Value::String(s.clone()),
+        Document::Array(arr) => Value::Array(arr.iter().map(document_to_json).collect()),
+        Document::Object(obj) => {
+            let map: serde_json::Map<String, Value> = obj
+                .iter()
+                .map(|(k, v)| (k.clone(), document_to_json(v)))
+                .collect();
+            Value::Object(map)
+        }
+    }
+}
+
+/// Load enabled plugins for the tenant, returning (server_id, has_credentials, custom_prompt).
+async fn load_enabled_plugins(
+    state: &AppState,
+    tenant_id: &str,
+) -> Vec<(String, bool, Option<String>)> {
+    state
+        .dynamo
+        .query()
+        .table_name(&state.config.settings_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", attr_s(tenant_id))
+        .expression_attribute_values(":prefix", attr_s("PLUGIN#"))
+        .send()
+        .await
+        .ok()
+        .map(|r| {
+            r.items()
+                .iter()
+                .filter(|item| {
+                    item.get("enabled")
+                        .and_then(|v| v.as_bool().ok())
+                        .copied()
+                        .unwrap_or(false)
+                })
+                .filter_map(|item| {
+                    let sk = item.get("sk")?.as_s().ok()?;
+                    sk.strip_prefix("PLUGIN#").map(|id| {
+                        let has_creds = item
+                            .get("has_credentials")
+                            .and_then(|v| v.as_bool().ok())
+                            .copied()
+                            .unwrap_or(false);
+                        let custom_prompt = item
+                            .get("custom_prompt")
+                            .and_then(|v| v.as_s().ok())
+                            .map(|s| s.to_string());
+                        (id.to_string(), has_creds, custom_prompt)
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Load cached MCP tool schemas from S3 for a given server.
+async fn load_mcp_tool_cache(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    server_id: &str,
+) -> Option<Vec<Value>> {
+    let key = format!("config/mcp-tools/{server_id}.json");
+    let resp = s3.get_object().bucket(bucket).key(&key).send().await.ok()?;
+    let bytes = resp.body.collect().await.ok()?.into_bytes();
+    let parsed: Value = serde_json::from_slice(&bytes).ok()?;
+    parsed["tools"].as_array().cloned()
+}
+
+/// Gateway plugin catalog — maps server_id to (npx_package, env_mapping).
+/// env_mapping: &[(cred_field_key, env_var_name)]
+const GATEWAY_MCP_CATALOG: &[(&str, &str, &[(&str, &str)])] = &[
+    (
+        "figma",
+        "figma-developer-mcp",
+        &[("api_token", "FIGMA_API_KEY")],
+    ),
+    (
+        "sentry",
+        "@sentry/mcp-server",
+        &[
+            ("auth_token", "SENTRY_AUTH_TOKEN"),
+            ("org_slug", "SENTRY_ORG"),
+        ],
+    ),
+    (
+        "linear",
+        "@linear/mcp-server",
+        &[("api_key", "LINEAR_API_KEY")],
+    ),
+    (
+        "notion",
+        "@notionhq/notion-mcp-server",
+        &[("api_key", "OPENAPI_MCP_HEADERS")],
+    ),
+    (
+        "vercel",
+        "@vercel/mcp-adapter",
+        &[("api_token", "VERCEL_TOKEN")],
+    ),
+    ("stripe", "@stripe/mcp", &[("api_key", "STRIPE_API_KEY")]),
+    (
+        "cloudflare",
+        "@cloudflare/mcp-server-cloudflare",
+        &[
+            ("api_token", "CLOUDFLARE_API_TOKEN"),
+            ("account_id", "CLOUDFLARE_ACCOUNT_ID"),
+        ],
+    ),
+    (
+        "posthog",
+        "@nicobailon/posthog-mcp",
+        &[
+            ("api_key", "POSTHOG_API_KEY"),
+            ("project_id", "POSTHOG_PROJECT_ID"),
+            ("host", "POSTHOG_HOST"),
+        ],
+    ),
+    (
+        "gitlab",
+        "@nicobailon/gitlab-mcp",
+        &[
+            ("personal_token", "GITLAB_TOKEN"),
+            ("gitlab_url", "GITLAB_URL"),
+        ],
+    ),
+    (
+        "neon",
+        "@nicobailon/neon-mcp",
+        &[("api_key", "NEON_API_KEY")],
+    ),
+    (
+        "turso",
+        "@nicobailon/turso-mcp",
+        &[("api_token", "TURSO_AUTH_TOKEN"), ("org_name", "TURSO_ORG")],
+    ),
+    (
+        "snyk",
+        "@nicobailon/snyk-mcp",
+        &[("api_token", "SNYK_TOKEN"), ("org_id", "SNYK_ORG_ID")],
+    ),
+    (
+        "launchdarkly",
+        "@nicobailon/launchdarkly-mcp",
+        &[("api_key", "LD_API_KEY"), ("project_key", "LD_PROJECT_KEY")],
+    ),
+    (
+        "mongodb",
+        "@nicobailon/mongodb-mcp",
+        &[("connection_string", "MDB_MCP_CONNECTION_STRING")],
+    ),
+    (
+        "grafana",
+        "@nicobailon/grafana-mcp",
+        &[("api_token", "GRAFANA_TOKEN"), ("url", "GRAFANA_URL")],
+    ),
+    ("redis", "@nicobailon/redis-mcp", &[("url", "REDIS_URL")]),
+    (
+        "upstash",
+        "@nicobailon/upstash-mcp",
+        &[
+            ("api_key", "UPSTASH_EMAIL"),
+            ("api_token", "UPSTASH_API_KEY"),
+        ],
+    ),
+];
+
+/// Invoke an MCP tool via the MCP proxy Lambda.
+async fn invoke_mcp_tool(
+    state: &AppState,
+    tenant_id: &str,
+    server_id: &str,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Result<Value, String> {
+    // Find catalog entry for this server
+    let (_, npx_package, env_mapping) = GATEWAY_MCP_CATALOG
+        .iter()
+        .find(|(id, _, _)| *id == server_id)
+        .ok_or_else(|| format!("Unknown MCP server: {server_id}"))?;
+
+    // Load credentials from DynamoDB
+    let creds_item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(tenant_id))
+        .key("sk", attr_s(&format!("PLUGIN#{server_id}")))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to load plugin credentials: {e}"))?
+        .item()
+        .cloned();
+
+    let creds_json: Value = creds_item
+        .as_ref()
+        .and_then(|item| {
+            item.get("credentials")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|s| serde_json::from_str(s).ok())
+        })
+        .unwrap_or(json!({}));
+
+    // Map credential fields to env vars
+    let mut env_vars = serde_json::Map::new();
+    for (cred_key, env_var) in *env_mapping {
+        if let Some(val) = creds_json.get(*cred_key).and_then(|v| v.as_str()) {
+            env_vars.insert(env_var.to_string(), json!(val));
+        }
+    }
+
+    // Build proxy Lambda payload
+    let payload = json!({
+        "action": "call_tool",
+        "server_id": server_id,
+        "npx_package": npx_package,
+        "env_vars": env_vars,
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+    });
+
+    let resp = state
+        .lambda
+        .invoke()
+        .function_name(&state.config.mcp_proxy_function_name)
+        .payload(aws_sdk_lambda::primitives::Blob::new(
+            serde_json::to_vec(&payload).map_err(|e| format!("serialize: {e}"))?,
+        ))
+        .send()
+        .await
+        .map_err(|e| format!("Lambda invoke failed: {e}"))?;
+
+    let response_payload = resp
+        .payload()
+        .map(|p| p.as_ref().to_vec())
+        .unwrap_or_default();
+
+    let response: Value =
+        serde_json::from_slice(&response_payload).map_err(|e| format!("parse response: {e}"))?;
+
+    if let Some(err) = response.get("error").and_then(|v| v.as_str()) {
+        return Err(err.to_string());
+    }
+
+    Ok(response.get("result").cloned().unwrap_or(json!(null)))
 }

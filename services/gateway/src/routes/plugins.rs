@@ -30,6 +30,10 @@ struct PluginDef {
     repo_url: &'static str,
     default_prompt: &'static str,
     recommended_permissions: &'static str,
+    /// npm package to spawn via `npx -y <package>` for MCP stdio transport.
+    npx_package: &'static str,
+    /// Maps credential_field.key → env var name the MCP server expects.
+    env_mapping: &'static [(&'static str, &'static str)],
 }
 
 #[derive(serde::Serialize)]
@@ -59,6 +63,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/figma/mcp-server-guide",
         default_prompt: "Use the Figma MCP to extract design tokens, component details, and layout information from design files. Reference specific frames and layers by name. Do not modify or delete any Figma data.",
         recommended_permissions: "Read-only file access",
+        npx_package: "figma-developer-mcp",
+        env_mapping: &[("api_token", "FIGMA_API_KEY")],
     },
     PluginDef {
         id: "sentry",
@@ -85,6 +91,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/getsentry/sentry-mcp",
         default_prompt: "Use the Sentry MCP to investigate production errors. Query recent issues, inspect stack traces, and correlate errors with recent deployments. Do not resolve or delete issues unless explicitly asked.",
         recommended_permissions: "Read-only: event:read, issue:read, project:read",
+        npx_package: "@sentry/mcp-server",
+        env_mapping: &[("auth_token", "SENTRY_AUTH_TOKEN"), ("org_slug", "SENTRY_ORG")],
     },
     PluginDef {
         id: "linear",
@@ -103,6 +111,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://linear.app/docs/mcp",
         default_prompt: "Use the Linear MCP to manage issues and projects. Create issues with proper labels and priorities, update status, and query project progress. Do not delete issues or modify team settings.",
         recommended_permissions: "Read + write issues only",
+        npx_package: "@linear/mcp-server",
+        env_mapping: &[("api_key", "LINEAR_API_KEY")],
     },
     PluginDef {
         id: "notion",
@@ -121,6 +131,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/makenotion/notion-mcp-server",
         default_prompt: "Use the Notion MCP to search documentation, read database entries, and reference wiki pages for project context. Do not create, modify, or delete pages unless explicitly asked.",
         recommended_permissions: "Read content only — no insert capabilities",
+        npx_package: "@notionhq/notion-mcp-server",
+        env_mapping: &[("api_key", "OPENAPI_MCP_HEADERS")],
     },
 
     // Tier 2 — Strong use cases
@@ -142,6 +154,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/vercel/vercel-mcp",
         default_prompt: "Use the Vercel MCP to check deployment statuses, manage environment variables, and inspect build logs. Do not trigger deployments or modify production settings without confirmation.",
         recommended_permissions: "Read-only token — no deploy access",
+        npx_package: "@vercel/mcp",
+        env_mapping: &[("api_token", "VERCEL_API_TOKEN")],
     },
     PluginDef {
         id: "stripe",
@@ -160,6 +174,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/stripe/agent-toolkit",
         default_prompt: "Use the Stripe MCP to query customers, list recent charges, and inspect subscription statuses. Never create charges, refunds, or modify billing data.",
         recommended_permissions: "Restricted key: read-only charges, customers, subscriptions",
+        npx_package: "@stripe/mcp",
+        env_mapping: &[("api_key", "STRIPE_SECRET_KEY")],
     },
     PluginDef {
         id: "cloudflare",
@@ -186,6 +202,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/cloudflare/mcp-server-cloudflare",
         default_prompt: "Use the Cloudflare MCP to inspect DNS records, Worker deployments, and zone analytics. Do not modify DNS records or deploy Workers without explicit confirmation.",
         recommended_permissions: "Read-only: Zone.Zone:Read, Zone.DNS:Read, Zone.Analytics:Read",
+        npx_package: "@cloudflare/mcp-server-cloudflare",
+        env_mapping: &[("api_token", "CLOUDFLARE_API_TOKEN"), ("account_id", "CLOUDFLARE_ACCOUNT_ID")],
     },
     PluginDef {
         id: "posthog",
@@ -212,6 +230,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/posthog/mcp",
         default_prompt: "Use the PostHog MCP to query user analytics events, check feature flag statuses, and analyze user funnels. Do not modify feature flags or delete data.",
         recommended_permissions: "Read-only personal API key",
+        npx_package: "@nicholasoxford/posthog-mcp",
+        env_mapping: &[("api_key", "POSTHOG_API_KEY"), ("host", "POSTHOG_HOST")],
     },
 
     PluginDef {
@@ -239,6 +259,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://docs.gitlab.com/user/gitlab_duo/model_context_protocol/mcp_server/",
         default_prompt: "Use the GitLab MCP to list merge requests, check pipeline statuses, and query issues. Do not push code, merge MRs, or modify project settings.",
         recommended_permissions: "read_api scope only",
+        npx_package: "@anthropic-ai/gitlab-mcp-server",
+        env_mapping: &[("api_token", "GITLAB_TOKEN"), ("base_url", "GITLAB_URL")],
     },
     PluginDef {
         id: "neon",
@@ -257,6 +279,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/neondatabase/mcp-server-neon",
         default_prompt: "Use the Neon MCP to inspect Postgres schemas and run read-only queries. Do not run DDL statements, drop tables, or modify data without explicit approval.",
         recommended_permissions: "Read-only database role — no DDL, no deletes",
+        npx_package: "@neondatabase/mcp-server-neon",
+        env_mapping: &[("api_key", "NEON_API_KEY")],
     },
     PluginDef {
         id: "turso",
@@ -283,6 +307,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/tursodatabase/turso-mcp",
         default_prompt: "Use the Turso MCP to inspect LibSQL schemas and run read-only queries. Do not execute DDL or destructive operations without explicit approval.",
         recommended_permissions: "Read-only API token",
+        npx_package: "@tursodatabase/turso-mcp",
+        env_mapping: &[("api_token", "TURSO_API_TOKEN"), ("org_name", "TURSO_ORG")],
     },
     // Tier 3 — Nice to have
     PluginDef {
@@ -302,6 +328,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/snyk/snyk-ls",
         default_prompt: "Use the Snyk MCP to scan for vulnerabilities, check dependency health, and list security issues. Do not modify project settings or ignore policies.",
         recommended_permissions: "Read-only: view org, view project",
+        npx_package: "snyk-mcp-server",
+        env_mapping: &[("api_token", "SNYK_TOKEN")],
     },
     PluginDef {
         id: "launchdarkly",
@@ -320,6 +348,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/launchdarkly/mcp-server",
         default_prompt: "Use the LaunchDarkly MCP to check feature flag statuses across environments. Do not toggle flags or modify targeting rules without explicit confirmation.",
         recommended_permissions: "Reader role — no write access",
+        npx_package: "@launchdarkly/mcp-server",
+        env_mapping: &[("api_key", "LAUNCHDARKLY_ACCESS_TOKEN")],
     },
     PluginDef {
         id: "mongodb",
@@ -352,6 +382,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/mongodb-js/mongodb-mcp-server",
         default_prompt: "Use the MongoDB MCP to query collections and inspect document schemas. Do not drop collections, modify indexes, or delete data.",
         recommended_permissions: "Project Read Only role",
+        npx_package: "mongodb-mcp-server",
+        env_mapping: &[("public_key", "MDB_MCP_API_PUBLIC_KEY"), ("private_key", "MDB_MCP_API_PRIVATE_KEY"), ("group_id", "MDB_MCP_API_GROUP_ID")],
     },
     PluginDef {
         id: "grafana",
@@ -378,6 +410,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/grafana/mcp-grafana",
         default_prompt: "Use the Grafana MCP to query dashboards, check alert statuses, and explore data sources. Do not modify dashboards or silence alerts.",
         recommended_permissions: "Viewer role service account",
+        npx_package: "mcp-grafana",
+        env_mapping: &[("api_key", "GRAFANA_API_KEY"), ("base_url", "GRAFANA_URL")],
     },
     PluginDef {
         id: "redis",
@@ -396,6 +430,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/redis/mcp-redis",
         default_prompt: "Use the Redis MCP to inspect keys and run read-only commands. Do not run FLUSHDB, DEL, or any destructive commands.",
         recommended_permissions: "Read-only user — no write commands",
+        npx_package: "@redis/mcp-server",
+        env_mapping: &[("connection_url", "REDIS_URL")],
     },
     PluginDef {
         id: "upstash",
@@ -422,6 +458,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/upstash/mcp-server",
         default_prompt: "Use the Upstash MCP to inspect Redis databases and read data. Do not delete databases, flush data, or modify configurations.",
         recommended_permissions: "Read-only API key",
+        npx_package: "@anthropic-ai/upstash-mcp-server",
+        env_mapping: &[("email", "UPSTASH_EMAIL"), ("api_key", "UPSTASH_API_KEY")],
     },
 
     PluginDef {
@@ -449,6 +487,8 @@ const CATALOG: &[PluginDef] = &[
         repo_url: "https://github.com/sanity-io/sanity-mcp-server",
         default_prompt: "Use the Sanity MCP to query documents and read content schemas. Do not create, publish, or delete documents without explicit approval.",
         recommended_permissions: "Viewer token — read-only access",
+        npx_package: "sanity-mcp-server",
+        env_mapping: &[("api_token", "SANITY_API_TOKEN"), ("project_id", "SANITY_PROJECT_ID")],
     },
 
 ];

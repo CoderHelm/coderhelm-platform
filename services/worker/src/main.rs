@@ -14,6 +14,7 @@ pub struct WorkerState {
     pub s3: aws_sdk_s3::Client,
     pub ses: aws_sdk_sesv2::Client,
     pub bedrock: aws_sdk_bedrockruntime::Client,
+    pub lambda: aws_sdk_lambda::Client,
     pub http: reqwest::Client,
     pub config: models::Config,
     pub secrets: models::Secrets,
@@ -31,6 +32,7 @@ async fn main() -> Result<(), Error> {
     let s3 = aws_sdk_s3::Client::new(&aws_config);
     let ses = aws_sdk_sesv2::Client::new(&aws_config);
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
+    let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
 
     let config = models::Config::from_env();
@@ -41,6 +43,7 @@ async fn main() -> Result<(), Error> {
         s3,
         ses,
         bedrock,
+        lambda: lambda_client,
         http: reqwest::Client::builder()
             .user_agent("coderhelm-worker/0.1")
             .build()?,

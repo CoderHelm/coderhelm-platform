@@ -2,6 +2,7 @@ use serde_json::json;
 use tracing::info;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
+use crate::agent::mcp;
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
 use crate::WorkerState;
@@ -90,12 +91,68 @@ After researching, output the four files using this exact format:
         summary = triage.summary,
     );
 
-    let tools = read_only_tools();
-    let executor = ReadOnlyToolExecutor {
-        github,
-        default_owner: &msg.repo_owner,
-        default_repo: &msg.repo_name,
-        allowed_repos: &tenant_repos,
+    let mut tools = read_only_tools();
+
+    // Load MCP plugins and their cached tool schemas
+    let mcp_plugins = mcp::load_tenant_plugins(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.tenant_id,
+        &super::MCP_CATALOG,
+    )
+    .await;
+
+    let mut loaded_mcp_plugins = Vec::new();
+    for plugin in &mcp_plugins {
+        // Try S3 cache first, then invoke proxy to list tools
+        let schemas = match mcp::load_tool_cache(
+            &state.s3,
+            &state.config.bucket_name,
+            &plugin.server_id,
+        )
+        .await
+        {
+            Some(cache) => cache.tools,
+            None if !state.config.mcp_proxy_function_name.is_empty() => {
+                match mcp::list_tools(&state.lambda, &state.config.mcp_proxy_function_name, plugin)
+                    .await
+                {
+                    Ok(schemas) => schemas,
+                    Err(e) => {
+                        tracing::warn!(server_id = %plugin.server_id, error = %e, "Failed to list MCP tools, skipping");
+                        continue;
+                    }
+                }
+            }
+            _ => continue,
+        };
+
+        let mcp_tool_defs = mcp::to_tool_definitions(&plugin.server_id, &schemas);
+        tools.extend(mcp_tool_defs);
+        loaded_mcp_plugins.push(plugin.clone());
+    }
+
+    // Add MCP context to system prompt if we have active plugins
+    let mut full_system = system.clone();
+    for plugin in &loaded_mcp_plugins {
+        if let Some(ref prompt) = plugin.custom_prompt {
+            full_system.push_str(&format!(
+                "\n\n## MCP Server: {}\n{}",
+                plugin.server_id, prompt
+            ));
+        }
+    }
+
+    let executor = CombinedToolExecutor {
+        read_only: ReadOnlyToolExecutor {
+            github,
+            default_owner: &msg.repo_owner,
+            default_repo: &msg.repo_name,
+            allowed_repos: &tenant_repos,
+        },
+        mcp_plugins: &loaded_mcp_plugins,
+        lambda: &state.lambda,
+        mcp_proxy_function_name: &state.config.mcp_proxy_function_name,
     };
 
     let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
@@ -106,7 +163,7 @@ After researching, output the four files using this exact format:
     let response = llm::converse(
         state,
         &state.config.light_model_id,
-        &system,
+        &full_system,
         &mut messages,
         &tools,
         &executor,
@@ -394,5 +451,44 @@ pub async fn fetch_tenant_repos(state: &WorkerState, tenant_id: &str) -> Vec<Str
             tracing::warn!(error = %e, "Failed to fetch tenant repos for planner");
             Vec::new()
         }
+    }
+}
+
+// ─── Combined tool executor (read-only + MCP) ──────────────
+
+struct CombinedToolExecutor<'a> {
+    read_only: ReadOnlyToolExecutor<'a>,
+    mcp_plugins: &'a [mcp::McpPlugin],
+    lambda: &'a aws_sdk_lambda::Client,
+    mcp_proxy_function_name: &'a str,
+}
+
+#[async_trait::async_trait]
+impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
+    async fn execute(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        // Check if this is an MCP tool (prefixed with server_id__)
+        if let Some((server_id, tool_name)) = name.split_once("__") {
+            let plugin = self
+                .mcp_plugins
+                .iter()
+                .find(|p| p.server_id == server_id)
+                .ok_or_else(|| format!("No MCP plugin found for server: {server_id}"))?;
+
+            return mcp::call_tool(
+                self.lambda,
+                self.mcp_proxy_function_name,
+                plugin,
+                tool_name,
+                input,
+            )
+            .await;
+        }
+
+        // Fall through to read-only tools
+        self.read_only.execute(name, input).await
     }
 }

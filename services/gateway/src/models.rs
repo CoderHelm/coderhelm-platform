@@ -29,6 +29,7 @@ pub struct Config {
     pub cognito_user_pool_id: String,
     pub cognito_client_id: String,
     pub cognito_domain: String,
+    pub mcp_proxy_function_name: String,
 }
 
 impl Config {
@@ -76,6 +77,7 @@ impl Config {
             cognito_client_id: std::env::var("COGNITO_CLIENT_ID")
                 .expect("COGNITO_CLIENT_ID required"),
             cognito_domain: std::env::var("COGNITO_DOMAIN").expect("COGNITO_DOMAIN required"),
+            mcp_proxy_function_name: std::env::var("MCP_PROXY_FUNCTION_NAME").unwrap_or_default(),
         }
     }
 }
