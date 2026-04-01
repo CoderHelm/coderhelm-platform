@@ -1026,6 +1026,12 @@ When the user describes what they want to build, you should:
 2. Only ask clarifying questions when truly critical info is missing (e.g. no repo specified at all).
 3. Never ask more than 2 clarifying questions before generating a plan.
 
+CRITICAL — Conversation continuity:
+- When the user adds new requirements or follow-up messages, ALWAYS incorporate ALL previous requests from the entire conversation into the updated plan.
+- If the user said "update X on dashboard" and then "update Y on landing page", the next plan MUST include BOTH tasks.
+- Never forget or drop earlier requests. The plan should be the complete, cumulative result of everything discussed.
+- When regenerating a plan, re-read the full conversation and include every distinct request as a task.
+
 When generating the final plan, output it in this EXACT JSON format inside a code fence:
 
 ```json
