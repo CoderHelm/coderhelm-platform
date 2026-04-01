@@ -21,6 +21,7 @@ interface WorkerStackProps extends cdk.StackProps {
   settingsTable: dynamodb.TableV2;
   infraTable: dynamodb.TableV2;
   billingTable: dynamodb.TableV2;
+  mcpConfigsTable: dynamodb.TableV2;
   bucket: s3.Bucket;
   ticketQueue: sqs.Queue;
   ciFixQueue: sqs.Queue;
@@ -71,6 +72,7 @@ export class WorkerStack extends cdk.Stack {
         JIRA_CONFIG_TABLE_NAME: props.jiraConfigTable.tableName,
         REPOS_TABLE_NAME: props.reposTable.tableName,
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
+        MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
         INFRA_TABLE_NAME: props.infraTable.tableName,
         BILLING_TABLE_NAME: props.billingTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
@@ -92,6 +94,7 @@ export class WorkerStack extends cdk.Stack {
     props.jiraConfigTable.grantReadData(this.workerFunction);
     props.reposTable.grantReadWriteData(this.workerFunction);
     props.settingsTable.grantReadWriteData(this.workerFunction);
+    props.mcpConfigsTable.grantReadData(this.workerFunction);
     props.infraTable.grantReadWriteData(this.workerFunction);
     props.billingTable.grantReadWriteData(this.workerFunction);
     props.bucket.grantReadWrite(this.workerFunction);

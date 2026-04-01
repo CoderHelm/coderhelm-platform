@@ -22,6 +22,7 @@ export class DatabaseStack extends cdk.Stack {
   public readonly infraTable: dynamodb.TableV2;
   public readonly billingTable: dynamodb.TableV2;
   public readonly bannersTable: dynamodb.TableV2;
+  public readonly mcpConfigsTable: dynamodb.TableV2;
   public readonly encryptionKey: kms.Key;
 
   constructor(scope: Construct, id: string, props: DatabaseStackProps) {
@@ -334,6 +335,28 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
+    // MCP Configs table: plugin enable/disable state + encrypted credentials
+    // PK = tenant_id, SK = PLUGIN#{plugin_id}
+    // Separated from settings to isolate secret material
+    // ──────────────────────────────────────────────
+    this.mcpConfigsTable = new dynamodb.TableV2(this, "McpConfigsTable", {
+      tableName: `coderhelm-${props.stage}-mcp-configs`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // ──────────────────────────────────────────────
     // Infra table: infrastructure analysis results
     // PK = tenant_id, SK = INFRA#analysis or INFRA#REPO#<owner>/<repo>
     // ──────────────────────────────────────────────
@@ -438,6 +461,9 @@ export class DatabaseStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, "BannersTableName", {
       value: this.bannersTable.tableName,
+    });
+    new cdk.CfnOutput(this, "McpConfigsTableName", {
+      value: this.mcpConfigsTable.tableName,
     });
   }
 }

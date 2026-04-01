@@ -12,6 +12,7 @@ pub struct Config {
     pub settings_table_name: String,
     pub infra_table_name: String,
     pub billing_table_name: String,
+    pub mcp_configs_table_name: String,
     pub bucket_name: String,
     pub secrets_name: String,
     pub model_id: String,
@@ -39,6 +40,8 @@ impl Config {
             infra_table_name: std::env::var("INFRA_TABLE_NAME").expect("INFRA_TABLE_NAME required"),
             billing_table_name: std::env::var("BILLING_TABLE_NAME")
                 .expect("BILLING_TABLE_NAME required"),
+            mcp_configs_table_name: std::env::var("MCP_CONFIGS_TABLE_NAME")
+                .unwrap_or_default(),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
             secrets_name: std::env::var("SECRETS_NAME")
                 .unwrap_or_else(|_| "coderhelm/prod/secrets".to_string()),

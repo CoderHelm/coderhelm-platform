@@ -524,6 +524,16 @@ pub async fn sync_catalog_to_s3(state: &AppState) {
     }
 }
 
+/// Return the MCP configs table name, falling back to settings table for migration compat.
+fn mcp_table(state: &AppState) -> &str {
+    let t = &state.config.mcp_configs_table_name;
+    if t.is_empty() {
+        &state.config.settings_table_name
+    } else {
+        t
+    }
+}
+
 /// GET /api/plugins/catalog — return all available plugins.
 pub async fn list_catalog() -> Json<Value> {
     Json(json!({ "plugins": CATALOG }))
@@ -537,7 +547,7 @@ pub async fn list_enabled(
     let result = state
         .dynamo
         .query()
-        .table_name(&state.config.settings_table_name)
+        .table_name(mcp_table(&state))
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
         .expression_attribute_values(":prefix", attr_s("PLUGIN#"))
@@ -601,7 +611,7 @@ pub async fn enable_plugin(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(mcp_table(&state))
         .item("pk", attr_s(&claims.tenant_id))
         .item("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
         .item("enabled", AttributeValue::Bool(true))
@@ -631,7 +641,7 @@ pub async fn disable_plugin(
     state
         .dynamo
         .delete_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(mcp_table(&state))
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
         .send()
@@ -693,7 +703,7 @@ pub async fn update_credentials(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(mcp_table(&state))
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
         .update_expression(
@@ -744,7 +754,7 @@ pub async fn update_prompt(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(mcp_table(&state))
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
         .update_expression("SET custom_prompt = :cp")

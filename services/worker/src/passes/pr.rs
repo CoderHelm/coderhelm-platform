@@ -1,7 +1,7 @@
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::agent::llm;
-use crate::clients::github::GitHubClient;
+use crate::clients::github::{FileOp, GitHubClient};
 use crate::models::{TicketMessage, TicketSource, TokenUsage};
 use crate::passes::plan::PlanResult;
 use crate::WorkerState;
@@ -156,6 +156,140 @@ Return ONLY the markdown body text."#,
         branch: branch.to_string(),
         draft: false,
     })
+}
+
+/// Attempt to merge main into the feature branch before creating the PR.
+/// If there are conflicts, resolve them with the LLM and commit the resolution.
+/// Returns Ok(true) if conflicts were found and resolved, Ok(false) if no conflicts.
+pub async fn resolve_conflicts(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    github: &GitHubClient,
+    branch: &str,
+    usage: &mut TokenUsage,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    // Try to merge main into the feature branch
+    let merged = github
+        .merge_branch(&msg.repo_owner, &msg.repo_name, branch, "main")
+        .await?;
+
+    if merged {
+        info!(branch, "Branch is up-to-date with main (no conflicts)");
+        return Ok(false);
+    }
+
+    // Conflicts detected — find which files conflict
+    info!(branch, "Merge conflicts detected, resolving with LLM");
+
+    let diff = github
+        .get_diff(&msg.repo_owner, &msg.repo_name, "main", branch)
+        .await?;
+
+    let files = diff
+        .get("files")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // For each modified file that exists in both branches, read both versions and resolve
+    let mut resolved_files: Vec<FileOp> = Vec::new();
+
+    for file in &files {
+        let path = match file.get("filename").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let status = file
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("modified");
+
+        // Only resolve files that exist on both sides (modified or changed)
+        if status == "added" || status == "removed" {
+            continue;
+        }
+
+        // Read the file from both branches
+        let main_content = match github
+            .read_file(&msg.repo_owner, &msg.repo_name, path, "main")
+            .await
+        {
+            Ok(c) => c,
+            Err(_) => continue, // file doesn't exist on main, skip
+        };
+        let branch_content = match github
+            .read_file(&msg.repo_owner, &msg.repo_name, path, branch)
+            .await
+        {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        if main_content == branch_content {
+            continue;
+        }
+
+        // Use LLM to resolve the conflict
+        let system = "You are a merge conflict resolver. Given two versions of a file (main and branch), produce the merged file that incorporates both sets of changes. Return ONLY the merged file content, no explanations or markdown fences.".to_string();
+
+        let prompt = format!(
+            "Merge these two versions of `{path}`.\n\n## main version\n```\n{main_content}\n```\n\n## branch version (our changes — prefer these)\n```\n{branch_content}\n```\n\nReturn the merged file content. Prefer the branch version when changes conflict directly.",
+        );
+
+        let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
+            .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
+            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
+            .build()?];
+
+        let merged_content = llm::converse(
+            state,
+            &state.config.light_model_id,
+            &system,
+            &mut messages,
+            &[],
+            &super::triage::NoOpExecutor,
+            usage,
+        )
+        .await?;
+
+        resolved_files.push(FileOp::Write {
+            path: path.to_string(),
+            content: merged_content,
+        });
+    }
+
+    if resolved_files.is_empty() {
+        warn!(branch, "Conflict detected but no files to resolve — retrying merge");
+        return Err("Merge conflict detected but could not identify conflicting files".into());
+    }
+
+    info!(
+        branch,
+        files = resolved_files.len(),
+        "Resolved conflicts, committing"
+    );
+
+    // Commit the resolved files
+    github
+        .batch_write(
+            &msg.repo_owner,
+            &msg.repo_name,
+            branch,
+            "Resolve merge conflicts with main",
+            &resolved_files,
+        )
+        .await?;
+
+    // Verify the merge now succeeds
+    let retry = github
+        .merge_branch(&msg.repo_owner, &msg.repo_name, branch, "main")
+        .await?;
+
+    if !retry {
+        warn!(branch, "Conflicts remain after resolution attempt");
+    }
+
+    Ok(true)
 }
 
 fn format_diff_summary(diff: &serde_json::Value) -> String {

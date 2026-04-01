@@ -1,3 +1,4 @@
+use crate::agent::mcp;
 use crate::clients::email::{self, EmailEvent};
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TicketSource, TokenUsage};
@@ -303,6 +304,24 @@ async fn run_passes(
         }
     }
 
+    // Load enabled MCP plugins once for this run
+    let mcp_table = if state.config.mcp_configs_table_name.is_empty() {
+        &state.config.settings_table_name
+    } else {
+        &state.config.mcp_configs_table_name
+    };
+    let mcp_plugins = mcp::load_tenant_plugins(
+        &state.dynamo,
+        mcp_table,
+        &msg.tenant_id,
+        &MCP_CATALOG,
+    )
+    .await;
+    let mcp_server_ids: Vec<String> = mcp_plugins.iter().map(|p| p.server_id.clone()).collect();
+    if !mcp_server_ids.is_empty() {
+        info!(run_id, servers = ?mcp_server_ids, "MCP servers active for run");
+    }
+
     // --- Pass 1: Triage ---
     check_cancelled(state, &msg.tenant_id, run_id).await?;
     update_pass(state, &msg.tenant_id, run_id, "triage").await?;
@@ -412,7 +431,15 @@ async fn run_passes(
     .await?;
     info!(run_id, "Review complete");
 
-    // --- Pass 5: Create PR ---
+    // --- Pass 5: Resolve conflicts with main ---
+    check_cancelled(state, &msg.tenant_id, run_id).await?;
+    match pr::resolve_conflicts(state, msg, &github, &branch_name, usage).await {
+        Ok(true) => info!(run_id, "Resolved merge conflicts with main"),
+        Ok(false) => {}
+        Err(e) => warn!(run_id, error = %e, "Conflict resolution failed, proceeding with PR"),
+    }
+
+    // --- Pass 6: Create PR ---
     check_cancelled(state, &msg.tenant_id, run_id).await?;
     update_pass(state, &msg.tenant_id, run_id, "pr").await?;
     let pr_result = pr::run(
@@ -435,6 +462,7 @@ async fn run_passes(
         run_id,
         &pr_result,
         &impl_result,
+        &mcp_server_ids,
         usage,
         duration,
     )
@@ -581,6 +609,7 @@ async fn complete_run(
     run_id: &str,
     pr: &pr::PrResult,
     impl_result: &implement::ImplementResult,
+    mcp_server_ids: &[String],
     usage: &TokenUsage,
     duration: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -599,7 +628,7 @@ async fn complete_run(
              tokens_in = :ti, tokens_out = :to, cost_usd = :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri, files_modified = :fm, \
-             repo = :repo, tenant_repo = :tr",
+             repo = :repo, tenant_repo = :tr, mcp_servers = :mcp",
         )
         .expression_attribute_names("#status", "status")
         .expression_attribute_values(":s", attr_s("completed"))
@@ -631,6 +660,15 @@ async fn complete_run(
                     .files_modified
                     .iter()
                     .map(|f| attr_s(f))
+                    .collect(),
+            ),
+        )
+        .expression_attribute_values(
+            ":mcp",
+            AttributeValue::L(
+                mcp_server_ids
+                    .iter()
+                    .map(|s| attr_s(s))
                     .collect(),
             ),
         )
