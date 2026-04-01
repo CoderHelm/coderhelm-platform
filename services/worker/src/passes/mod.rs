@@ -404,12 +404,7 @@ async fn run_passes(
              Please add more context and I'll try again."
         );
         if let Err(e) = github
-            .create_issue_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.issue_number,
-                &comment,
-            )
+            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
             .await
         {
             warn!(run_id, error = %e, "Failed to comment on issue about empty implementation");
