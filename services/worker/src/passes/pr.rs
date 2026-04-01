@@ -66,6 +66,7 @@ Rules:
 - No filler phrases, no hedging, no emojis.
 - Backticks for file paths, function names, env vars, CLI commands.
 - Bold for emphasis on key concepts.
+- Use asterisks (*) for bullet lists, never dashes (-).
 
 Return ONLY the markdown body text."#,
         ticket_ref = ticket_ref,

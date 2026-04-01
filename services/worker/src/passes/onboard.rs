@@ -395,7 +395,8 @@ async fn generate_voice_md(
          3. **PR Descriptions** — Structure, level of detail, typical sections\n\
          4. **Language** — Technical jargon level, abbreviation patterns\n\
          5. **Examples** — 2-3 short examples of commit messages and PR titles matching this voice\n\n\
-         Keep it under 80 lines. Be specific about observed patterns, not generic advice.",
+         Keep it under 80 lines. Be specific about observed patterns, not generic advice.\n\
+         IMPORTANT: Do not use dashes (-) as list markers. Use numbered lists, asterisks (*), or plain prose instead.",
         samples = samples.join("\n\n")
     );
 
