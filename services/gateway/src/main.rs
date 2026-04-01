@@ -214,20 +214,11 @@ async fn main() -> Result<(), Error> {
         // User management
         .route("/users", get(routes::users::list_users))
         .route("/users/invite", post(routes::users::invite_user))
-        .route(
-            "/users/:user_id/role",
-            put(routes::users::update_role),
-        )
-        .route(
-            "/users/:user_id",
-            delete(routes::users::remove_user),
-        )
+        .route("/users/:user_id/role", put(routes::users::update_role))
+        .route("/users/:user_id", delete(routes::users::remove_user))
         .route("/users/password", put(routes::users::change_password))
         .route("/users/mfa/setup", post(routes::users::mfa_setup))
-        .route(
-            "/users/mfa/verify",
-            post(routes::users::mfa_verify_setup),
-        )
+        .route("/users/mfa/verify", post(routes::users::mfa_verify_setup))
         .route("/users/mfa", delete(routes::users::mfa_disable))
         // Plan endpoints
         .route(
@@ -294,22 +285,13 @@ async fn main() -> Result<(), Error> {
         .route("/auth/signup", post(routes::auth::signup))
         .route("/auth/login", post(routes::auth::login_email))
         .route("/auth/verify-email", post(routes::auth::verify_email))
-        .route(
-            "/auth/forgot-password",
-            post(routes::auth::forgot_password),
-        )
+        .route("/auth/forgot-password", post(routes::auth::forgot_password))
         .route("/auth/confirm-reset", post(routes::auth::confirm_reset))
         .route("/auth/mfa/verify", post(routes::auth::mfa_verify))
         .route("/auth/google", get(routes::auth::google_login))
-        .route(
-            "/auth/google/callback",
-            get(routes::auth::google_callback),
-        )
+        .route("/auth/google/callback", get(routes::auth::google_callback))
         .route("/auth/github", get(routes::auth::github_login))
-        .route(
-            "/auth/github/callback",
-            get(routes::auth::github_callback),
-        )
+        .route("/auth/github/callback", get(routes::auth::github_callback))
         .route("/auth/logout", post(routes::auth::logout))
         // Nest protected routes under /api
         .nest("/api", api_routes)

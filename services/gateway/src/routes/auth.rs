@@ -229,8 +229,7 @@ pub async fn login_email(
 
     // Check if MFA challenge is required
     if let Some(challenge) = auth_result.challenge_name() {
-        if *challenge
-            == aws_sdk_cognitoidentityprovider::types::ChallengeNameType::SoftwareTokenMfa
+        if *challenge == aws_sdk_cognitoidentityprovider::types::ChallengeNameType::SoftwareTokenMfa
         {
             let session = auth_result.session().unwrap_or_default();
             return Ok(Json(serde_json::json!({
@@ -264,9 +263,7 @@ pub async fn mfa_verify(
         .cognito
         .respond_to_auth_challenge()
         .client_id(&state.config.cognito_client_id)
-        .challenge_name(
-            aws_sdk_cognitoidentityprovider::types::ChallengeNameType::SoftwareTokenMfa,
-        )
+        .challenge_name(aws_sdk_cognitoidentityprovider::types::ChallengeNameType::SoftwareTokenMfa)
         .session(&body.session)
         .challenge_responses("SOFTWARE_TOKEN_MFA_CODE", &body.code)
         .send()
@@ -398,9 +395,7 @@ pub async fn google_callback(
     let region = "us-east-1";
 
     // Exchange code for tokens with Cognito token endpoint
-    let token_url = format!(
-        "https://{domain}.auth.{region}.amazoncognito.com/oauth2/token"
-    );
+    let token_url = format!("https://{domain}.auth.{region}.amazoncognito.com/oauth2/token");
 
     // Get client secret for confidential client
     let client_secret = state
@@ -530,15 +525,9 @@ pub async fn google_callback(
             .item("pk", attr_s(&tid))
             .item("sk", attr_s(&uid))
             .item("email", attr_s(&email))
-            .item(
-                "avatar_url",
-                attr_s(picture.as_deref().unwrap_or("")),
-            )
+            .item("avatar_url", attr_s(picture.as_deref().unwrap_or("")))
             .item("role", attr_s("owner"))
-            .item(
-                "name",
-                attr_s(name.as_deref().unwrap_or("")),
-            )
+            .item("name", attr_s(name.as_deref().unwrap_or("")))
             .item("updated_at", attr_s(&now))
             .item("gsi2pk", attr_s(&format!("EMAIL#{email}")))
             .item("gsi2sk", attr_s(&tid))
@@ -551,7 +540,13 @@ pub async fn google_callback(
 
     // Issue JWT
     let token = jwt::create_token(
-        &user_id, &tenant_id, &email, &role, None, &state.secrets.jwt_secret, 86400,
+        &user_id,
+        &tenant_id,
+        &email,
+        &role,
+        None,
+        &state.secrets.jwt_secret,
+        86400,
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -697,10 +692,7 @@ pub async fn github_callback(
             )
             .expression_attribute_values(":gid", attr_n(github_id))
             .expression_attribute_values(":gl", attr_s(github_login))
-            .expression_attribute_values(
-                ":g1pk",
-                attr_s(&format!("GHUSER#{github_id}")),
-            )
+            .expression_attribute_values(":g1pk", attr_s(&format!("GHUSER#{github_id}")))
             .expression_attribute_values(":g1sk", attr_s(&claims.tenant_id))
             .expression_attribute_values(":now", attr_s(&now))
             .send()
@@ -719,7 +711,10 @@ pub async fn github_callback(
                     .item("github_id", attr_n(github_id))
                     .item("github_login", attr_s(github_login))
                     .item("email", attr_s(&claims.email))
-                    .item("avatar_url", attr_s(user["avatar_url"].as_str().unwrap_or("")))
+                    .item(
+                        "avatar_url",
+                        attr_s(user["avatar_url"].as_str().unwrap_or("")),
+                    )
                     .item("role", attr_s("member"))
                     .item("updated_at", attr_s(&now))
                     .item("gsi1pk", attr_s(&format!("GHUSER#{github_id}")))
@@ -822,7 +817,10 @@ pub async fn github_callback(
             .await;
     }
 
-    info!(github_login, installation_id, "User authenticated via GitHub");
+    info!(
+        github_login,
+        installation_id, "User authenticated via GitHub"
+    );
 
     let token = jwt::create_token(
         &user_id,

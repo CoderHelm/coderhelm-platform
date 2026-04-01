@@ -79,12 +79,10 @@ export class ApiStack extends cdk.Stack {
       "GoogleProvider",
       {
         userPool,
-        clientIdConfig: {
-          unsafePlainText: "PLACEHOLDER_GOOGLE_CLIENT_ID",
-        },
-        clientSecretConfig: {
-          unsafePlainText: "PLACEHOLDER_GOOGLE_CLIENT_SECRET",
-        },
+        clientId: "PLACEHOLDER_GOOGLE_CLIENT_ID",
+        clientSecretValue: cdk.SecretValue.unsafePlainText(
+          "PLACEHOLDER_GOOGLE_CLIENT_SECRET"
+        ),
         scopes: ["openid", "email", "profile"],
         attributeMapping: {
           email: cognito.ProviderAttribute.GOOGLE_EMAIL,

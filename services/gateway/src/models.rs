@@ -75,8 +75,7 @@ impl Config {
                 .expect("COGNITO_USER_POOL_ID required"),
             cognito_client_id: std::env::var("COGNITO_CLIENT_ID")
                 .expect("COGNITO_CLIENT_ID required"),
-            cognito_domain: std::env::var("COGNITO_DOMAIN")
-                .expect("COGNITO_DOMAIN required"),
+            cognito_domain: std::env::var("COGNITO_DOMAIN").expect("COGNITO_DOMAIN required"),
         }
     }
 }
