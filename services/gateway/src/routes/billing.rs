@@ -265,7 +265,7 @@ pub async fn get_billing(
     let budget = state
         .dynamo
         .get_item()
-        .table_name(&state.config.table_name)
+        .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(&claims.tenant_id))
         .key("sk", attr_s("SETTINGS#BUDGET"))
         .send()
