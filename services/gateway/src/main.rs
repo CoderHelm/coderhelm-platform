@@ -243,6 +243,7 @@ async fn main() -> Result<(), Error> {
         .route("/users", get(routes::users::list_users))
         .route("/users/invite", post(routes::users::invite_user))
         .route("/users/:user_id/role", put(routes::users::update_role))
+        .route("/users/:user_id/resend", post(routes::users::resend_invite))
         .route("/users/:user_id", delete(routes::users::remove_user))
         .route("/users/password", put(routes::users::change_password))
         .route("/users/mfa/setup", post(routes::users::mfa_setup))

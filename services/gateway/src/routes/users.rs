@@ -76,13 +76,19 @@ pub async fn list_users(
         .items()
         .iter()
         .map(|item| {
+            let raw_sk = item
+                .get("sk")
+                .and_then(|v| v.as_s().ok())
+                .map_or("", |v| v);
+            let user_id = raw_sk.strip_prefix("USER#").unwrap_or(raw_sk);
             json!({
-                "user_id": item.get("sk").and_then(|v| v.as_s().ok()),
+                "user_id": user_id,
                 "email": item.get("email").and_then(|v| v.as_s().ok()),
                 "github_login": item.get("github_login").and_then(|v| v.as_s().ok()),
                 "avatar_url": item.get("avatar_url").and_then(|v| v.as_s().ok()),
                 "role": item.get("role").and_then(|v| v.as_s().ok()).unwrap_or(&"member".to_string()),
                 "name": item.get("name").and_then(|v| v.as_s().ok()),
+                "status": item.get("status").and_then(|v| v.as_s().ok()),
                 "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
             })
         })
@@ -119,7 +125,70 @@ pub async fn invite_user(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Check if this email already has a Cognito account
+    let existing_sub = state
+        .cognito
+        .list_users()
+        .user_pool_id(&state.config.cognito_user_pool_id)
+        .filter(&format!("email = \"{email}\""))
+        .limit(1)
+        .send()
+        .await
+        .ok()
+        .and_then(|r| {
+            r.users().first().and_then(|u| {
+                u.attributes()
+                    .iter()
+                    .find(|a| a.name() == "sub")
+                    .and_then(|a| a.value().map(|v| v.to_string()))
+            })
+        });
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    if let Some(sub) = existing_sub {
+        // User already has an account — add them directly to the team
+        let user_sk = format!("USER#{sub}");
+        let stripped_id = sub.clone();
+
+        state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.users_table_name)
+            .item("pk", attr_s(&claims.team_id))
+            .item("sk", attr_s(&user_sk))
+            .item("email", attr_s(&email))
+            .item("role", attr_s(role))
+            .item("status", attr_s("active"))
+            .item("avatar_url", attr_s(""))
+            .item("updated_at", attr_s(&now))
+            .item("invited_by", attr_s(&claims.sub))
+            .item("gsi2pk", attr_s(&format!("EMAIL#{email}")))
+            .item("gsi2sk", attr_s(&claims.team_id))
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to add existing user to team: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Send invite notification email
+        let team_name = get_team_name(state.clone(), &claims).await;
+        let _ = send_invite_email(&state, &email, &claims.email, &team_name, role).await;
+
+        info!(email = %email, role = %role, team_id = %claims.team_id, "Existing user added to team");
+
+        return Ok(Json(json!({
+            "status": "active",
+            "user_id": stripped_id,
+        })));
+    }
+
     let user_id = format!("USER#invite_{}", ulid::Ulid::new());
+    let stripped_id = user_id
+        .strip_prefix("USER#")
+        .unwrap_or(&user_id)
+        .to_string();
     let now = chrono::Utc::now().to_rfc3339();
 
     // Create user record with "invited" status
@@ -144,74 +213,81 @@ pub async fn invite_user(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Send invitation email via SES
-    let team_name = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s("META"))
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned())
-        .and_then(|i| {
-            i.get("github_org")
-                .and_then(|v| v.as_s().ok())
-                .filter(|s| !s.is_empty())
-                .cloned()
-        })
-        .unwrap_or_else(|| claims.email.clone());
-
-    let _ = state
-        .ses
-        .send_email()
-        .from_email_address(&state.config.ses_from_address)
-        .destination(
-            aws_sdk_sesv2::types::Destination::builder()
-                .to_addresses(&email)
-                .build(),
-        )
-        .content(
-            aws_sdk_sesv2::types::EmailContent::builder()
-                .simple(
-                    aws_sdk_sesv2::types::Message::builder()
-                        .subject(
-                            aws_sdk_sesv2::types::Content::builder()
-                                .data(format!(
-                                    "You've been invited to {} on Coderhelm",
-                                    team_name
-                                ))
-                                .build()
-                                .unwrap(),
-                        )
-                        .body(
-                            aws_sdk_sesv2::types::Body::builder()
-                                .text(
-                                    aws_sdk_sesv2::types::Content::builder()
-                                        .data(format!(
-                                            "You've been invited to join {} on Coderhelm.\n\n\
-                                             Sign up or log in at https://app.coderhelm.com to get started.",
-                                            team_name
-                                        ))
-                                        .build()
-                                        .unwrap(),
-                                )
-                                .build(),
-                        )
-                        .build(),
-                )
-                .build(),
-        )
-        .send()
-        .await;
+    // Send invitation email via SES template
+    let team_name = get_team_name(state.clone(), &claims).await;
+    let _ = send_invite_email(&state, &email, &claims.email, &team_name, role).await;
 
     info!(email = %email, role = %role, team_id = %claims.team_id, "User invited");
 
     Ok(Json(json!({
         "status": "invited",
-        "user_id": user_id,
+        "user_id": stripped_id,
     })))
+}
+
+// ── Resend invite ────────────────────────────────────────────────────
+
+/// POST /api/users/:user_id/resend — Resend an invite email.
+pub async fn resend_invite(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(user_id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    if !is_admin_or_owner(&claims.role) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let sk = if user_id.starts_with("USER#") {
+        user_id.clone()
+    } else {
+        format!("USER#{user_id}")
+    };
+
+    // Fetch the invite record
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&sk))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch invite: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item()
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let status = item
+        .get("status")
+        .and_then(|v| v.as_s().ok())
+        .map_or("", |v| v);
+    if status != "invited" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let email = item
+        .get("email")
+        .and_then(|v| v.as_s().ok())
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let role = item
+        .get("role")
+        .and_then(|v| v.as_s().ok())
+        .map_or("member", |v| v);
+
+    let team_name = get_team_name(state.clone(), &claims).await;
+    send_invite_email(&state, email, &claims.email, &team_name, role)
+        .await
+        .map_err(|e| {
+            error!("Failed to resend invite: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(email = %email, team_id = %claims.team_id, "Invite resent");
+
+    Ok(Json(json!({ "status": "sent" })))
 }
 
 // ── Update role ──────────────────────────────────────────────────────
@@ -559,4 +635,68 @@ pub async fn mfa_disable(
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
+}
+
+async fn get_team_name(state: Arc<AppState>, claims: &Claims) -> String {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s("META"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .and_then(|i| {
+            i.get("github_org")
+                .and_then(|v| v.as_s().ok())
+                .filter(|s| !s.is_empty())
+                .cloned()
+        })
+        .unwrap_or_else(|| claims.email.clone())
+}
+
+async fn send_invite_email(
+    state: &AppState,
+    to: &str,
+    inviter: &str,
+    org: &str,
+    role: &str,
+) -> Result<(), StatusCode> {
+    let template_name = format!("{}-team-invite", state.config.ses_template_prefix);
+    let template_data = serde_json::to_string(&json!({
+        "inviter": inviter,
+        "org": org,
+        "role": role,
+    }))
+    .unwrap_or_default();
+
+    state
+        .ses
+        .send_email()
+        .from_email_address(&state.config.ses_from_address)
+        .destination(
+            aws_sdk_sesv2::types::Destination::builder()
+                .to_addresses(to)
+                .build(),
+        )
+        .content(
+            aws_sdk_sesv2::types::EmailContent::builder()
+                .template(
+                    aws_sdk_sesv2::types::Template::builder()
+                        .template_name(&template_name)
+                        .template_data(&template_data)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to send invite email: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(())
 }
