@@ -120,7 +120,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = team_id, SK = run_id (ULID — time-ordered)
     // Designed for millions of records per team
     // ──────────────────────────────────────────────
-    this.runsTable = new dynamodb.TableV2(this, "RunsTableV2", {
+    this.runsTable = new dynamodb.TableV2(this, "RunsTable", {
       tableName: `coderhelm-${props.stage}-runs`,
       partitionKey: {
         name: "team_id",
@@ -166,7 +166,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = team_id, SK = period (e.g. "2026-03", "ALL_TIME")
     // Atomic counters — O(1) reads for dashboard stats
     // ──────────────────────────────────────────────
-    this.analyticsTable = new dynamodb.TableV2(this, "AnalyticsTableV2", {
+    this.analyticsTable = new dynamodb.TableV2(this, "AnalyticsTable", {
       tableName: `coderhelm-${props.stage}-analytics`,
       partitionKey: {
         name: "team_id",
@@ -270,7 +270,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = team_id, SK = event_id (ULID — time-ordered)
     // TTL for auto-cleanup of old events
     // ──────────────────────────────────────────────
-    this.jiraEventsTable = new dynamodb.TableV2(this, "JiraEventsTableV2", {
+    this.jiraEventsTable = new dynamodb.TableV2(this, "JiraEventsTable", {
       tableName: `coderhelm-${props.stage}-jira-events`,
       partitionKey: {
         name: "team_id",
