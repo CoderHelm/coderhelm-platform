@@ -1698,7 +1698,7 @@ const GATEWAY_MCP_CATALOG: &[(&str, &str, &[(&str, &str)])] = &[
         "sentry",
         "@sentry/mcp-server",
         &[
-            ("auth_token", "SENTRY_AUTH_TOKEN"),
+            ("auth_token", "SENTRY_ACCESS_TOKEN"),
             ("org_slug", "SENTRY_ORG"),
         ],
     ),
@@ -1717,15 +1717,8 @@ const GATEWAY_MCP_CATALOG: &[(&str, &str, &[(&str, &str)])] = &[
         "@vercel/mcp-adapter",
         &[("api_token", "VERCEL_TOKEN")],
     ),
-    ("stripe", "@stripe/mcp", &[("api_key", "STRIPE_API_KEY")]),
-    (
-        "cloudflare",
-        "@cloudflare/mcp-server-cloudflare",
-        &[
-            ("api_token", "CLOUDFLARE_API_TOKEN"),
-            ("account_id", "CLOUDFLARE_ACCOUNT_ID"),
-        ],
-    ),
+    ("stripe", "@stripe/mcp", &[("api_key", "STRIPE_SECRET_KEY")]),
+    // Cloudflare removed — their MCP server moved to remote OAuth-only
     (
         "posthog",
         "@nicobailon/posthog-mcp",

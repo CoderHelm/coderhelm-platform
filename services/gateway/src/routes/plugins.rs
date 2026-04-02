@@ -92,7 +92,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Sentry MCP to investigate production errors. Query recent issues, inspect stack traces, and correlate errors with recent deployments. Do not resolve or delete issues unless explicitly asked.",
         recommended_permissions: "Read-only: event:read, issue:read, project:read",
         npx_package: "@sentry/mcp-server",
-        env_mapping: &[("auth_token", "SENTRY_AUTH_TOKEN"), ("org_slug", "SENTRY_ORG")],
+        env_mapping: &[("auth_token", "SENTRY_ACCESS_TOKEN"), ("org_slug", "SENTRY_ORG")],
     },
     PluginDef {
         id: "linear",
@@ -177,34 +177,7 @@ const CATALOG: &[PluginDef] = &[
         npx_package: "@stripe/mcp",
         env_mapping: &[("api_key", "STRIPE_SECRET_KEY")],
     },
-    PluginDef {
-        id: "cloudflare",
-        name: "Cloudflare",
-        description: "Manage DNS records, check analytics, and configure Workers.",
-        category: "Deployment",
-        tier: 2,
-        icon: "cloudflare",
-        credential_fields: &[
-            CredentialField {
-                key: "api_token",
-                label: "API Token",
-                placeholder: "cf_...",
-                secret: true,
-            },
-            CredentialField {
-                key: "account_id",
-                label: "Account ID",
-                placeholder: "abc123...",
-                secret: false,
-            },
-        ],
-        docs_url: "https://developers.cloudflare.com/api/",
-        repo_url: "https://github.com/cloudflare/mcp-server-cloudflare",
-        default_prompt: "Use the Cloudflare MCP to inspect DNS records, Worker deployments, and zone analytics. Do not modify DNS records or deploy Workers without explicit confirmation.",
-        recommended_permissions: "Read-only: Zone.Zone:Read, Zone.DNS:Read, Zone.Analytics:Read",
-        npx_package: "@cloudflare/mcp-server-cloudflare",
-        env_mapping: &[("api_token", "CLOUDFLARE_API_TOKEN"), ("account_id", "CLOUDFLARE_ACCOUNT_ID")],
-    },
+    // Cloudflare removed — their MCP server moved to remote OAuth-only (*.mcp.cloudflare.com)
     PluginDef {
         id: "posthog",
         name: "PostHog",
