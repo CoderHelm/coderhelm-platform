@@ -424,12 +424,7 @@ pub async fn handle_forge(
     let team_id = payload
         .pointer("/coderhelm/team_id")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            // Fall back to resolving via GitHub installation ID
-            // (blocking async call not ideal, but we're already in async context)
-            None
-        });
+        .map(|s| s.to_string());
 
     let team_id = match team_id {
         Some(tid) => tid,
