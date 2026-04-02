@@ -1004,22 +1004,38 @@ pub async fn github_callback(
         .send()
         .await;
 
-    // Link GitHub installations to the team in the teams table
-    if !all_installations.is_empty() {
-        let (inst_id, ref org) = all_installations[0];
-        // Create/update teams table record with github_installation_id
+    // Ensure teams table record exists (for new users without an existing record)
+    if !has_existing_record {
         let _ = state
             .dynamo
             .put_item()
             .table_name(&state.config.teams_table_name)
             .item("team_id", attr_s(&team_id))
             .item("sk", attr_s("META"))
-            .item(
-                "github_installation_id",
+            .item("created_at", attr_s(&now))
+            .condition_expression("attribute_not_exists(team_id)")
+            .send()
+            .await;
+    }
+
+    // Link GitHub installations to the team in the teams table
+    if !all_installations.is_empty() {
+        let (inst_id, ref org) = all_installations[0];
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.teams_table_name)
+            .key("team_id", attr_s(&team_id))
+            .key("sk", attr_s("META"))
+            .update_expression(
+                "SET github_installation_id = :iid, github_org = :org, updated_at = :now",
+            )
+            .expression_attribute_values(
+                ":iid",
                 aws_sdk_dynamodb::types::AttributeValue::N(inst_id.to_string()),
             )
-            .item("github_org", attr_s(org))
-            .item("updated_at", attr_s(&now))
+            .expression_attribute_values(":org", attr_s(org))
+            .expression_attribute_values(":now", attr_s(&now))
             .send()
             .await;
 
