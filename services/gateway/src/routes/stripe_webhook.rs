@@ -851,18 +851,15 @@ async fn handle_invoice_created(
     let invoice_id = invoice["id"].as_str().unwrap_or("");
     let billing_reason = invoice["billing_reason"].as_str().unwrap_or("");
     let status = invoice["status"].as_str().unwrap_or("");
+    let customer_id = invoice["customer"].as_str().unwrap_or("");
 
-    // Only auto-finalize threshold invoices (overage billing)
-    if billing_reason != "subscription_threshold" {
+    // On subscription renewal, attach any leftover unbilled token overage
+    // to the renewal invoice before Stripe finalizes it.
+    if billing_reason != "subscription_cycle" || status != "draft" {
         info!(
             invoice_id,
-            billing_reason, "invoice.created — not a threshold invoice, skipping"
+            billing_reason, status, "invoice.created — not a subscription_cycle draft, skipping"
         );
-        return Ok(());
-    }
-
-    if status != "draft" {
-        info!(invoice_id, status, "invoice.created — not draft, skipping");
         return Ok(());
     }
 
@@ -871,41 +868,157 @@ async fn handle_invoice_created(
         None => return Ok(()),
     };
 
-    // Finalize the draft invoice
-    let finalize_resp = state
-        .http
-        .post(format!(
-            "https://api.stripe.com/v1/invoices/{invoice_id}/finalize"
-        ))
-        .header("Authorization", format!("Bearer {stripe_key}"))
-        .send()
-        .await?;
+    let tenant_id = match resolve_tenant(state, customer_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                invoice_id,
+                customer_id, "invoice.created — failed to resolve tenant: {e}"
+            );
+            return Ok(());
+        }
+    };
 
-    if !finalize_resp.status().is_success() {
-        let body = finalize_resp.text().await.unwrap_or_default();
-        warn!(invoice_id, "Failed to finalize threshold invoice: {body}");
-        return Err(format!("Failed to finalize invoice {invoice_id}").into());
+    // Figure out which month just ended.
+    // The period_end on the renewal invoice is the start of the NEW period,
+    // so the month that just ended is the one before that.
+    let period_end = invoice["period_end"].as_i64().unwrap_or(0);
+    let ended_month = if period_end > 0 {
+        let dt =
+            chrono::DateTime::from_timestamp(period_end, 0).unwrap_or_else(|| chrono::Utc::now());
+        // Go back 1 day to land in the previous period
+        let prev = dt - chrono::Duration::days(1);
+        prev.format("%Y-%m").to_string()
+    } else {
+        // Fallback: current month (likely close enough)
+        chrono::Utc::now().format("%Y-%m").to_string()
+    };
+
+    // Read cumulative token usage for the ended month
+    let analytics = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.analytics_table_name)
+        .key("tenant_id", attr_s(&tenant_id))
+        .key("period", attr_s(&ended_month))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned());
+
+    let total_tokens_in: u64 = analytics
+        .as_ref()
+        .and_then(|i| i.get("total_tokens_in"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let total_tokens_out: u64 = analytics
+        .as_ref()
+        .and_then(|i| i.get("total_tokens_out"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let total_tokens = total_tokens_in + total_tokens_out;
+    let included: u64 = 1_000_000;
+
+    if total_tokens <= included {
+        info!(
+            invoice_id,
+            tenant_id, total_tokens, "invoice.created — no overage for {ended_month}"
+        );
+        return Ok(());
     }
 
-    // Pay it immediately
-    let pay_resp = state
-        .http
-        .post(format!(
-            "https://api.stripe.com/v1/invoices/{invoice_id}/pay"
-        ))
-        .header("Authorization", format!("Bearer {stripe_key}"))
-        .send()
-        .await?;
+    let cumulative_overage_1k = (total_tokens - included).div_ceil(1000);
 
-    if !pay_resp.status().is_success() {
-        let body = pay_resp.text().await.unwrap_or_default();
-        warn!(invoice_id, "Failed to pay threshold invoice: {body}");
-        return Err(format!("Failed to pay invoice {invoice_id}").into());
+    // Read how many 1K-units we've already billed this month via direct invoices
+    let billed_attr = format!("overage_billed_{}", ended_month.replace('-', "_"));
+    let already_billed: u64 = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.billing_table_name)
+        .key("pk", attr_s(&tenant_id))
+        .key("sk", attr_s("BILLING"))
+        .projection_expression("#b")
+        .expression_attribute_names("#b", &billed_attr)
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .and_then(|i| i.get(&billed_attr).cloned())
+        .and_then(|v| v.as_n().ok().cloned())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let unbilled = cumulative_overage_1k.saturating_sub(already_billed);
+    if unbilled == 0 {
+        info!(
+            invoice_id,
+            tenant_id, "invoice.created — all overage already billed for {ended_month}"
+        );
+        return Ok(());
     }
+
+    let amount_cents = unbilled * 1000; // $10/1K tokens
+    let description = format!(
+        "Token overage ({}): {} x 1K tokens @ $10.00/1K",
+        ended_month, unbilled
+    );
 
     info!(
         invoice_id,
-        "Threshold invoice finalized and paid immediately"
+        tenant_id,
+        unbilled,
+        amount_cents,
+        "invoice.created — adding leftover overage to renewal invoice"
+    );
+
+    // Add invoice item attached to THIS invoice (the renewal draft)
+    let ii_resp = state
+        .http
+        .post("https://api.stripe.com/v1/invoiceitems")
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .form(&[
+            ("customer", customer_id),
+            ("invoice", invoice_id),
+            ("amount", &amount_cents.to_string()),
+            ("currency", "usd"),
+            ("description", &description),
+        ])
+        .send()
+        .await?;
+
+    if !ii_resp.status().is_success() {
+        let body = ii_resp.text().await.unwrap_or_default();
+        warn!(
+            invoice_id,
+            "invoice.created — failed to add overage item: {body}"
+        );
+        return Err(format!("Failed to add overage invoice item: {body}").into());
+    }
+
+    // Update the billed counter so the worker doesn't try to bill these again
+    let new_billed = already_billed + unbilled;
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.billing_table_name)
+        .key("pk", attr_s(&tenant_id))
+        .key("sk", attr_s("BILLING"))
+        .update_expression("SET #b = :v")
+        .expression_attribute_names("#b", &billed_attr)
+        .expression_attribute_values(":v", attr_n(new_billed))
+        .send()
+        .await;
+
+    info!(
+        invoice_id,
+        tenant_id,
+        unbilled,
+        "invoice.created — leftover overage ${:.2} added to renewal invoice",
+        amount_cents as f64 / 100.0
     );
     Ok(())
 }

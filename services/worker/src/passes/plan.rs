@@ -76,6 +76,14 @@ If the change is already done, set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reas
 dashboard/src/components/google-analytics.tsx"). Still output proposal.md, design.md, and
 spec.md normally.
 
+**CRITICAL — Ambiguous values:** If the issue asks to change, update, or replace a value
+(an ID, URL, API key, config value, version number, etc.) but does NOT specify what the new
+value should be, do NOT guess or infer the value from other files, websites, or context.
+Set tasks.md to EXACTLY `CLARIFICATION_NEEDED: <what is missing>` where `<what is missing>`
+describes the information the issue must provide (e.g. "The issue asks to update the GTM ID
+but does not specify the new ID to use"). Still output proposal.md, design.md, and spec.md
+normally.
+
 Otherwise, generate four openspec files:
 
 1. **proposal.md** — Problem statement, proposed approach, scope boundaries, risks
