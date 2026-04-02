@@ -134,8 +134,13 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
     let current_overage_1k = current_overage / 1000;
     let current_overage_cents = current_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
 
+    // No budget set — don't report any overage to Stripe
+    if max_budget_cents == 0 {
+        return;
+    }
+
     // If budget cap is set and we've already reported up to the cap, stop
-    if max_budget_cents > 0 && current_overage_cents >= max_budget_cents {
+    if current_overage_cents >= max_budget_cents {
         // Check if we already exceeded the cap before this run
         let prev_total = total_tokens.saturating_sub(tokens_used);
         let prev_overage_1k = prev_total.saturating_sub(INCLUDED_TOKENS) / 1000;

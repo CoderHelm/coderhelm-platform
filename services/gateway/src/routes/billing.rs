@@ -300,6 +300,7 @@ pub async fn get_billing(
         "limits": {
             "tokens": token_limit,
             "overage_per_1k_tokens_cents": OVERAGE_PER_1K_TOKENS_CENTS,
+            "max_budget_cents": max_budget_cents,
         },
         "current_period": {
             "month": month,

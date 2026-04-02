@@ -1288,12 +1288,24 @@ pub async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<Strin
             .and_then(|n| n.parse::<u64>().ok())
             .unwrap_or(0);
 
-        if max_budget_cents > 0 {
-            // Calculate current overage spend (excludes base subscription)
+        if total_tokens >= INCLUDED_TOKENS {
+            // Calculate current overage spend
             let overage_tokens = total_tokens.saturating_sub(INCLUDED_TOKENS);
             let overage_1k = overage_tokens / 1000;
             let overage_spend = overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
-            if overage_spend >= max_budget_cents {
+
+            if max_budget_cents == 0 {
+                // No budget set — block overage runs
+                let included_label = if INCLUDED_TOKENS >= 1_000_000 {
+                    format!("{}M", INCLUDED_TOKENS / 1_000_000)
+                } else {
+                    format!("{}K", INCLUDED_TOKENS / 1_000)
+                };
+                return Some(format!(
+                    "You've used all **{included_label}** included tokens this month. \
+                     Set an overage budget in [Settings → Budget](https://app.coderhelm.com/settings/budget) to continue.",
+                ));
+            } else if overage_spend >= max_budget_cents {
                 return Some(format!(
                     "Monthly overage budget of **${:.2}** reached (current overage: **${:.2}**). \
                      Adjust your budget in [Settings](https://app.coderhelm.com/settings/budget).",
