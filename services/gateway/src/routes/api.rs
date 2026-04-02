@@ -1265,6 +1265,79 @@ pub async fn delete_jira_secret(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// DELETE /api/integrations/jira — remove the entire Jira integration.
+pub async fn delete_jira_integration(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<StatusCode, StatusCode> {
+    let tid = &claims.tenant_id;
+
+    // 1. Delete the webhook token from the jira-tokens lookup table
+    if let Some((old_token, _)) = load_jira_secret(&state, tid).await {
+        let _ = state
+            .dynamo
+            .delete_item()
+            .table_name(&state.config.jira_tokens_table_name)
+            .key("token", attr_s(&old_token))
+            .send()
+            .await;
+    }
+
+    // 2. Delete all items in the jira-config table for this tenant (config, secret, projects)
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.jira_config_table_name)
+        .key_condition_expression("pk = :pk")
+        .expression_attribute_values(":pk", attr_s(tid))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query jira config for delete: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    for item in result.items() {
+        if let (Some(pk), Some(sk)) = (item.get("pk"), item.get("sk")) {
+            let _ = state
+                .dynamo
+                .delete_item()
+                .table_name(&state.config.jira_config_table_name)
+                .key("pk", pk.clone())
+                .key("sk", sk.clone())
+                .send()
+                .await;
+        }
+    }
+
+    // 3. Delete jira events for this tenant
+    if let Ok(events) = state
+        .dynamo
+        .query()
+        .table_name(&state.config.jira_events_table_name)
+        .key_condition_expression("tenant_id = :tid")
+        .expression_attribute_values(":tid", attr_s(tid))
+        .send()
+        .await
+    {
+        for item in events.items() {
+            if let (Some(tid_attr), Some(eid)) = (item.get("tenant_id"), item.get("event_id")) {
+                let _ = state
+                    .dynamo
+                    .delete_item()
+                    .table_name(&state.config.jira_events_table_name)
+                    .key("tenant_id", tid_attr.clone())
+                    .key("event_id", eid.clone())
+                    .send()
+                    .await;
+            }
+        }
+    }
+
+    info!(tenant_id = %tid, "Deleted entire Jira integration");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Load per-tenant JIRA token and webhook secret from DynamoDB.
 /// Returns (token, webhook_secret) if configured.
 pub async fn load_jira_secret(state: &AppState, tenant_id: &str) -> Option<(String, String)> {
