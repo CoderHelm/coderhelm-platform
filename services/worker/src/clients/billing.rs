@@ -139,6 +139,7 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
 
 /// Create an invoice for unbilled overage when it exceeds the threshold.
 /// Tracks `overage_billed_{month}` in the BILLING record per billing period.
+/// Uses a conditional DynamoDB update to prevent double-billing from concurrent workers.
 async fn create_overage_invoice_if_needed(
     state: &WorkerState,
     tenant_id: &str,
@@ -193,9 +194,56 @@ async fn create_overage_invoice_if_needed(
     }
 
     info!(
-        "[billing] unbilled overage {unbilled} units (${:.2}) exceeds threshold — creating invoice for {tenant_id}",
+        "[billing] unbilled overage {unbilled} units (${:.2}) exceeds threshold — claiming for {tenant_id}",
         unbilled_cents as f64 / 100.0
     );
+
+    // Atomically claim these units BEFORE creating the invoice.
+    // If another worker already updated the counter, the condition fails and we skip.
+    let new_billed = already_billed + unbilled;
+    let claim_result = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.billing_table_name)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("BILLING".to_string()),
+        )
+        .update_expression("SET #b = :new_val")
+        .condition_expression(if already_billed == 0 {
+            "attribute_not_exists(#b) OR #b = :old_val"
+        } else {
+            "#b = :old_val"
+        })
+        .expression_attribute_names("#b", &billed_attr)
+        .expression_attribute_values(
+            ":new_val",
+            aws_sdk_dynamodb::types::AttributeValue::N(new_billed.to_string()),
+        )
+        .expression_attribute_values(
+            ":old_val",
+            aws_sdk_dynamodb::types::AttributeValue::N(already_billed.to_string()),
+        )
+        .send()
+        .await;
+
+    if let Err(e) = &claim_result {
+        // ConditionalCheckFailedException means another worker already claimed these units
+        let err_str = format!("{e}");
+        if err_str.contains("ConditionalCheckFailed") {
+            info!("[billing] Another worker already claimed overage for {tenant_id}, skipping");
+            return;
+        }
+        warn!("[billing] Failed to claim overage units: {e}");
+        return;
+    }
+
+    // Units claimed — now create and pay the invoice.
+    // If invoice creation fails, roll back the counter so units can be billed next time.
 
     // Create an invoice item for the unbilled overage
     let amount = (unbilled * OVERAGE_PER_1K_TOKENS_CENTS).to_string();
@@ -222,10 +270,12 @@ async fn create_overage_invoice_if_needed(
         Ok(r) => {
             let body = r.text().await.unwrap_or_default();
             warn!("[billing] Invoice item creation failed: {body}");
+            rollback_billed_counter(state, tenant_id, &billed_attr, already_billed).await;
             return;
         }
         Err(e) => {
             warn!("[billing] Failed to create invoice item: {e}");
+            rollback_billed_counter(state, tenant_id, &billed_attr, already_billed).await;
             return;
         }
     }
@@ -249,6 +299,7 @@ async fn create_overage_invoice_if_needed(
                 Some(id) => id.to_string(),
                 None => {
                     warn!("[billing] Invoice created but no ID in response");
+                    rollback_billed_counter(state, tenant_id, &billed_attr, already_billed).await;
                     return;
                 }
             }
@@ -256,10 +307,12 @@ async fn create_overage_invoice_if_needed(
         Ok(r) => {
             let body = r.text().await.unwrap_or_default();
             warn!("[billing] Invoice creation failed: {body}");
+            rollback_billed_counter(state, tenant_id, &billed_attr, already_billed).await;
             return;
         }
         Err(e) => {
             warn!("[billing] Failed to create invoice: {e}");
+            rollback_billed_counter(state, tenant_id, &billed_attr, already_billed).await;
             return;
         }
     };
@@ -279,6 +332,7 @@ async fn create_overage_invoice_if_needed(
         Ok(r) => {
             let body = r.text().await.unwrap_or_default();
             warn!("[billing] Failed to finalize invoice {invoice_id}: {body}");
+            // Don't rollback — invoice exists in Stripe, manual cleanup needed
             return;
         }
         Err(e) => {
@@ -307,37 +361,61 @@ async fn create_overage_invoice_if_needed(
         Ok(r) => {
             let body = r.text().await.unwrap_or_default();
             warn!("[billing] Failed to pay invoice {invoice_id}: {body}");
-            return;
+            // Don't rollback — invoice is finalized, will retry via Stripe's own retry logic
         }
         Err(e) => {
             warn!("[billing] Failed to pay invoice {invoice_id}: {e}");
-            return;
         }
     }
+}
 
-    // Update billed counter in DynamoDB
-    let new_billed = already_billed + unbilled;
-    if let Err(e) = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.billing_table_name)
-        .key(
-            "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
-        )
-        .key(
-            "sk",
-            aws_sdk_dynamodb::types::AttributeValue::S("BILLING".to_string()),
-        )
-        .update_expression("SET #b = :b")
-        .expression_attribute_names("#b", &billed_attr)
-        .expression_attribute_values(
-            ":b",
-            aws_sdk_dynamodb::types::AttributeValue::N(new_billed.to_string()),
-        )
-        .send()
-        .await
-    {
-        warn!("[billing] Failed to update billed counter: {e}");
+/// Roll back the billed counter to its previous value when invoice creation fails.
+async fn rollback_billed_counter(
+    state: &WorkerState,
+    tenant_id: &str,
+    billed_attr: &str,
+    old_value: u64,
+) {
+    let update = if old_value == 0 {
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.billing_table_name)
+            .key(
+                "pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+            )
+            .key(
+                "sk",
+                aws_sdk_dynamodb::types::AttributeValue::S("BILLING".to_string()),
+            )
+            .update_expression("REMOVE #b")
+            .expression_attribute_names("#b", billed_attr)
+            .send()
+            .await
+    } else {
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.billing_table_name)
+            .key(
+                "pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+            )
+            .key(
+                "sk",
+                aws_sdk_dynamodb::types::AttributeValue::S("BILLING".to_string()),
+            )
+            .update_expression("SET #b = :v")
+            .expression_attribute_names("#b", billed_attr)
+            .expression_attribute_values(
+                ":v",
+                aws_sdk_dynamodb::types::AttributeValue::N(old_value.to_string()),
+            )
+            .send()
+            .await
+    };
+    if let Err(e) = update {
+        warn!("[billing] Failed to rollback billed counter: {e}");
     }
 }
