@@ -91,119 +91,7 @@ else
 fi
 
 echo ""
-echo "=== 3. Finding or creating Plans Meter and Price (\$10/plan overage) ==="
-
-# Find or create the billing meter for plans
-PLANS_METER_ID=$(stripe_get "https://api.stripe.com/v1/billing/meters?limit=100" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for m in data.get('data', []):
-    if m.get('event_name') == 'coderhelm_plans_overage' and m.get('status') == 'active':
-        print(m['id'])
-        break
-else:
-    print('')
-")
-
-if [[ -n "$PLANS_METER_ID" ]]; then
-  echo "Using existing plans meter: $PLANS_METER_ID"
-else
-  PLANS_METER=$(stripe_post "https://api.stripe.com/v1/billing/meters" \
-    -d "display_name=Plan Overages" \
-    -d "event_name=coderhelm_plans_overage" \
-    -d "default_aggregation[formula]=sum")
-  PLANS_METER_ID=$(printf '%s\n' "$PLANS_METER" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-  echo "Created plans meter: $PLANS_METER_ID"
-fi
-
-# Find or create the metered price backed by the meter
-PLANS_PRICE_ID=$(stripe_get "https://api.stripe.com/v1/prices?product=${PRODUCT_ID}&active=true&limit=50" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for p in data.get('data', []):
-    if p.get('nickname') == 'plans_overage' and p.get('recurring', {}).get('meter'):
-        print(p['id'])
-        break
-else:
-    print('')
-")
-
-if [[ -n "$PLANS_PRICE_ID" ]]; then
-  echo "Using existing plans overage price: $PLANS_PRICE_ID"
-else
-  PLANS_PRICE=$(stripe_post "https://api.stripe.com/v1/prices" \
-    -d "product=${PRODUCT_ID}" \
-    -d "unit_amount=1000" \
-    -d "currency=usd" \
-    -d "recurring[interval]=month" \
-    -d "recurring[usage_type]=metered" \
-    -d "recurring[meter]=${PLANS_METER_ID}" \
-    -d "nickname=plans_overage" \
-    -d "metadata[app]=coderhelm" \
-    -d "metadata[type]=plans_overage")
-  PLANS_PRICE_ID=$(printf '%s\n' "$PLANS_PRICE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-  echo "Created plans overage price: $PLANS_PRICE_ID"
-fi
-
-echo ""
-echo "=== 4. Finding or creating Tokens Meter and Price (\$50/1M token overage) ==="
-
-# Find or create the billing meter for tokens
-TOKENS_METER_ID=$(stripe_get "https://api.stripe.com/v1/billing/meters?limit=100" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for m in data.get('data', []):
-    if m.get('event_name') == 'coderhelm_token_overage' and m.get('status') == 'active':
-        print(m['id'])
-        break
-else:
-    print('')
-")
-
-if [[ -n "$TOKENS_METER_ID" ]]; then
-  echo "Using existing tokens meter: $TOKENS_METER_ID"
-else
-  TOKENS_METER=$(stripe_post "https://api.stripe.com/v1/billing/meters" \
-    -d "display_name=Token Overages (per 1K tokens)" \
-    -d "event_name=coderhelm_token_overage" \
-    -d "default_aggregation[formula]=sum")
-  TOKENS_METER_ID=$(printf '%s\n' "$TOKENS_METER" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-  echo "Created tokens meter: $TOKENS_METER_ID"
-fi
-
-# Find or create the metered price backed by the meter
-# TODO: restore to unit_amount=5 ($0.05/1K tokens) after overage testing
-# Priced at $10 per 1K tokens (TEST — normally $0.05)
-TOKENS_PRICE_ID=$(stripe_get "https://api.stripe.com/v1/prices?product=${PRODUCT_ID}&active=true&limit=50" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for p in data.get('data', []):
-    if p.get('nickname') == 'tokens_overage' and p.get('recurring', {}).get('meter'):
-        print(p['id'])
-        break
-else:
-    print('')
-")
-
-if [[ -n "$TOKENS_PRICE_ID" ]]; then
-  echo "Using existing tokens overage price: $TOKENS_PRICE_ID"
-else
-  TOKENS_PRICE=$(stripe_post "https://api.stripe.com/v1/prices" \
-    -d "product=${PRODUCT_ID}" \
-    -d "unit_amount=1000" \
-    -d "currency=usd" \
-    -d "recurring[interval]=month" \
-    -d "recurring[usage_type]=metered" \
-    -d "recurring[meter]=${TOKENS_METER_ID}" \
-    -d "nickname=tokens_overage" \
-    -d "metadata[app]=coderhelm" \
-    -d "metadata[type]=tokens_overage")
-  TOKENS_PRICE_ID=$(printf '%s\n' "$TOKENS_PRICE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-  echo "Created tokens overage price: $TOKENS_PRICE_ID"
-fi
-
-echo ""
-echo "=== 5. Configuring Customer Portal (non-fatal) ==="
+echo "=== 3. Configuring Customer Portal (non-fatal) ==="
 # Portal configuration may already exist — treat failure as a warning, not an error.
 PORTAL_JSON=$(curl -s -X POST "https://api.stripe.com/v1/billing_portal/configurations" \
   -u "$SK:" \
@@ -229,7 +117,7 @@ PORTAL_ID=$(printf '%s\n' "$PORTAL_JSON" | python3 -c \
 echo "Portal: ${PORTAL_ID}"
 
 echo ""
-echo "=== 6. Ensuring Webhook endpoint has all required events ==="
+echo "=== 4. Ensuring Webhook endpoint has all required events ==="
 WEBHOOK_URL="https://api.coderhelm.com/webhooks/stripe"
 REQUIRED_EVENTS=(
   checkout.session.completed
@@ -268,7 +156,7 @@ fi
 echo "Webhook events: ${REQUIRED_EVENTS[*]}"
 
 echo ""
-echo "=== 7. Updating Secrets Manager with price IDs ==="
+echo "=== 5. Updating Secrets Manager with price ID ==="
 python3 << PYEOF
 import json, subprocess, sys
 
@@ -279,20 +167,16 @@ raw = subprocess.check_output([
 ])
 secrets = json.loads(raw)
 secrets["stripe_price_id"] = "${PRICE_ID}"
-secrets["stripe_overage_price_id"] = "${TOKENS_PRICE_ID}"
 
 subprocess.check_call([
     "aws", "secretsmanager", "put-secret-value",
     "--secret-id", "${SECRET_NAME}",
     "--secret-string", json.dumps(secrets)
 ])
-print("Updated secrets: stripe_price_id={}, stripe_overage_price_id={}".format(
-    secrets["stripe_price_id"], secrets["stripe_overage_price_id"]))
+print("Updated secrets: stripe_price_id={}".format(secrets["stripe_price_id"]))
 PYEOF
 
 echo ""
 echo "=== DONE ==="
 echo ""
 echo "  STRIPE_PRICE_ID=${PRICE_ID}"
-echo "  STRIPE_PLANS_OVERAGE_PRICE_ID=${PLANS_PRICE_ID}"
-echo "  STRIPE_TOKENS_OVERAGE_PRICE_ID=${TOKENS_PRICE_ID}"

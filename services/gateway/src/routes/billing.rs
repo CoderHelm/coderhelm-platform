@@ -547,17 +547,8 @@ pub async fn create_subscription(
         form_params.push(("default_payment_method", pm_id));
     }
 
-    // Add metered overage price as second line item if configured
-    let overage_price_id = state
-        .secrets
-        .stripe_overage_price_id
-        .as_deref()
-        .unwrap_or("");
-    if !overage_price_id.is_empty() {
-        form_params.push(("items[1][price]", overage_price_id));
-        // Bill overage in $100 increments
-        form_params.push(("billing_thresholds[amount_gte]", "10000"));
-    }
+    // Overage billing is handled by the worker via direct invoice items
+    // (not via metered subscription items)
 
     let response = state
         .http
