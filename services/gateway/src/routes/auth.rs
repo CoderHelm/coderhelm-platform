@@ -4,12 +4,24 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     Json,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
+use sha2::Sha256;
 use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::auth::jwt;
 use crate::AppState;
+
+/// Compute Cognito SECRET_HASH = Base64(HMAC-SHA256(client_secret, username + client_id))
+fn cognito_secret_hash(client_secret: &str, username: &str, client_id: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(client_secret.as_bytes())
+        .expect("HMAC key length");
+    mac.update(username.as_bytes());
+    mac.update(client_id.as_bytes());
+    STANDARD.encode(mac.finalize().into_bytes())
+}
 
 // ── Closed beta allowlist ───────────────────────────────────────────
 
@@ -93,6 +105,7 @@ pub struct ConfirmResetRequest {
 pub struct MfaChallengeRequest {
     pub session: String,
     pub code: String,
+    pub email: String,
 }
 
 #[derive(Deserialize)]
@@ -134,10 +147,13 @@ pub async fn signup(
         ));
     }
 
+    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
+
     let mut req = state
         .cognito
         .sign_up()
         .client_id(&state.config.cognito_client_id)
+        .secret_hash(&hash)
         .username(&email)
         .password(&body.password)
         .user_attributes(
@@ -203,10 +219,13 @@ pub async fn verify_email(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let email = body.email.trim().to_lowercase();
 
+    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
+
     state
         .cognito
         .confirm_sign_up()
         .client_id(&state.config.cognito_client_id)
+        .secret_hash(&hash)
         .username(&email)
         .confirmation_code(&body.code)
         .send()
@@ -297,6 +316,8 @@ pub async fn login_email(
 ) -> Result<Response, StatusCode> {
     let email = body.email.trim().to_lowercase();
 
+    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
+
     let auth_result = state
         .cognito
         .initiate_auth()
@@ -304,6 +325,7 @@ pub async fn login_email(
         .auth_flow(aws_sdk_cognitoidentityprovider::types::AuthFlowType::UserPasswordAuth)
         .auth_parameters("USERNAME", &email)
         .auth_parameters("PASSWORD", &body.password)
+        .auth_parameters("SECRET_HASH", &hash)
         .send()
         .await
         .map_err(|e| {
@@ -350,6 +372,9 @@ pub async fn mfa_verify(
     State(state): State<Arc<AppState>>,
     Json(body): Json<MfaChallengeRequest>,
 ) -> Result<Response, StatusCode> {
+    let email = body.email.trim().to_lowercase();
+    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
+
     let result = state
         .cognito
         .respond_to_auth_challenge()
@@ -357,6 +382,8 @@ pub async fn mfa_verify(
         .challenge_name(aws_sdk_cognitoidentityprovider::types::ChallengeNameType::SoftwareTokenMfa)
         .session(&body.session)
         .challenge_responses("SOFTWARE_TOKEN_MFA_CODE", &body.code)
+        .challenge_responses("USERNAME", &email)
+        .challenge_responses("SECRET_HASH", &hash)
         .send()
         .await
         .map_err(|e| {
@@ -402,12 +429,14 @@ pub async fn forgot_password(
     Json(body): Json<ForgotPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let email = body.email.trim().to_lowercase();
+    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
 
     // Always return success to prevent email enumeration
     let _ = state
         .cognito
         .forgot_password()
         .client_id(&state.config.cognito_client_id)
+        .secret_hash(&hash)
         .username(&email)
         .send()
         .await;
@@ -424,11 +453,13 @@ pub async fn confirm_reset(
     Json(body): Json<ConfirmResetRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let email = body.email.trim().to_lowercase();
+    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
 
     state
         .cognito
         .confirm_forgot_password()
         .client_id(&state.config.cognito_client_id)
+        .secret_hash(&hash)
         .username(&email)
         .confirmation_code(&body.code)
         .password(&body.new_password)
@@ -499,18 +530,7 @@ pub async fn google_callback(
     };
     let token_url = format!("{base}/oauth2/token");
 
-    // Get client secret for confidential client
-    let client_secret = state
-        .cognito
-        .describe_user_pool_client()
-        .user_pool_id(&state.config.cognito_user_pool_id)
-        .client_id(client_id)
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.user_pool_client)
-        .and_then(|c| c.client_secret)
-        .unwrap_or_default();
+    let client_secret = &state.cognito_client_secret;
 
     let token_resp = state
         .http
@@ -519,7 +539,7 @@ pub async fn google_callback(
             ("grant_type", "authorization_code"),
             ("code", &params.code),
             ("client_id", client_id),
-            ("client_secret", &client_secret),
+            ("client_secret", client_secret),
             ("redirect_uri", redirect_uri),
         ])
         .send()

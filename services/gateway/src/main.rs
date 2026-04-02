@@ -26,6 +26,7 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub secrets: models::Secrets,
     pub config: models::Config,
+    pub cognito_client_secret: String,
 }
 
 #[tokio::main]
@@ -54,6 +55,18 @@ async fn main() -> Result<(), Error> {
 
     let config = models::Config::from_env();
 
+    // Fetch Cognito client secret for SECRET_HASH computation
+    let cognito_client_secret = cognito
+        .describe_user_pool_client()
+        .user_pool_id(&config.cognito_user_pool_id)
+        .client_id(&config.cognito_client_id)
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.user_pool_client)
+        .and_then(|c| c.client_secret)
+        .unwrap_or_default();
+
     let state = Arc::new(AppState {
         dynamo,
         sqs,
@@ -65,6 +78,7 @@ async fn main() -> Result<(), Error> {
         http: reqwest::Client::new(),
         secrets,
         config,
+        cognito_client_secret,
     });
 
     // Sync MCP server catalog to S3 on cold start
