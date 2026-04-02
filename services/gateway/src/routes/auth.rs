@@ -909,17 +909,20 @@ pub async fn github_callback(
             .await
             .ok()
             .and_then(|r| {
-                r.items().iter().find(|item| {
-                    item.get("sk")
-                        .and_then(|v| v.as_s().ok())
-                        .map(|s| s.starts_with("USER#"))
-                        .unwrap_or(false)
-                        && item
-                            .get("status")
+                r.items()
+                    .iter()
+                    .find(|item| {
+                        item.get("sk")
                             .and_then(|v| v.as_s().ok())
-                            .map(|s| s != "invited")
-                            .unwrap_or(true)
-                }).cloned()
+                            .map(|s| s.starts_with("USER#"))
+                            .unwrap_or(false)
+                            && item
+                                .get("status")
+                                .and_then(|v| v.as_s().ok())
+                                .map(|s| s != "invited")
+                                .unwrap_or(true)
+                    })
+                    .cloned()
             })
     } else {
         None

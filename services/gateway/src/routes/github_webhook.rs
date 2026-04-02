@@ -86,7 +86,10 @@ pub async fn handle(
     let team_id = match resolve_team_by_installation(&state, installation_id).await {
         Some(tid) => tid,
         None => {
-            warn!(installation_id, event_type, "No team linked to this GitHub installation");
+            warn!(
+                installation_id,
+                event_type, "No team linked to this GitHub installation"
+            );
             return Ok(StatusCode::OK);
         }
     };
@@ -95,7 +98,9 @@ pub async fn handle(
         "issues" => handle_issue_event(&state, &payload, installation_id, &team_id).await,
         "issue_comment" => handle_issue_comment(&state, &payload, installation_id, &team_id).await,
         "pull_request" => handle_pull_request(&state, &payload, installation_id, &team_id).await,
-        "pull_request_review" => handle_pr_review(&state, &payload, installation_id, &team_id).await,
+        "pull_request_review" => {
+            handle_pr_review(&state, &payload, installation_id, &team_id).await
+        }
         "pull_request_review_comment" | "pull_request_review_thread" => {
             info!(
                 event_type,
@@ -573,7 +578,9 @@ async fn handle_installation(
                     .table_name(&state.config.teams_table_name)
                     .key("team_id", attr_s(&team_id))
                     .key("sk", attr_s("META"))
-                    .update_expression("REMOVE github_installation_id, github_org SET updated_at = :t")
+                    .update_expression(
+                        "REMOVE github_installation_id, github_org SET updated_at = :t",
+                    )
                     .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
                     .send()
                     .await;
@@ -600,7 +607,10 @@ async fn handle_installation_repos(
     let team_id = match resolve_team_by_installation(state, installation_id).await {
         Some(tid) => tid,
         None => {
-            warn!(installation_id, "installation_repositories event but no team linked");
+            warn!(
+                installation_id,
+                "installation_repositories event but no team linked"
+            );
             return Ok(StatusCode::OK);
         }
     };
