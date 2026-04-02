@@ -96,17 +96,17 @@ pub async fn list_teams(
         .await
         .ok();
 
-    let team_ids: Vec<String> = if let Some(ref result) = gsi1_result {
+    let (team_ids, _gsi2_items) = if let Some(ref result) = gsi1_result {
         let ids: Vec<String> = result
             .items()
             .iter()
             .filter_map(|item| item.get("gsi1sk").and_then(|v| v.as_s().ok()).cloned())
             .collect();
         if !ids.is_empty() {
-            ids
+            (ids, vec![])
         } else {
             // Fall back to GSI2 (email)
-            state
+            let all_items = state
                 .dynamo
                 .query()
                 .table_name(&state.config.users_table_name)
@@ -115,22 +115,81 @@ pub async fn list_teams(
                 .expression_attribute_values(":pk", attr_s(&format!("EMAIL#{}", claims.email)))
                 .send()
                 .await
-                .map(|r| {
-                    r.items()
-                        .iter()
-                        .filter(|item| {
-                            item.get("status")
-                                .and_then(|v| v.as_s().ok())
-                                .map(|s| s != "invited")
-                                .unwrap_or(true)
-                        })
-                        .filter_map(|item| item.get("pk").and_then(|v| v.as_s().ok()).cloned())
-                        .collect()
-                })
-                .unwrap_or_default()
+                .map(|r| r.items().to_vec())
+                .unwrap_or_default();
+
+            // Process any pending invites — convert them to real user records
+            let real_user_sk = format!("USER#{github_id}");
+            let now = chrono::Utc::now().to_rfc3339();
+            for item in &all_items {
+                let is_invite = item
+                    .get("status")
+                    .and_then(|v| v.as_s().ok())
+                    .map(|s| s == "invited")
+                    .unwrap_or(false);
+                if !is_invite {
+                    continue;
+                }
+                let invite_tid = match item.get("pk").and_then(|v| v.as_s().ok()) {
+                    Some(t) => t.to_string(),
+                    None => continue,
+                };
+                let invite_role = item
+                    .get("role")
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+                    .unwrap_or_else(|| "member".to_string());
+
+                // Create real user record in the inviting team
+                let _ = state
+                    .dynamo
+                    .put_item()
+                    .table_name(&state.config.users_table_name)
+                    .item("pk", attr_s(&invite_tid))
+                    .item("sk", attr_s(&real_user_sk))
+                    .item("email", attr_s(&claims.email))
+                    .item("role", attr_s(&invite_role))
+                    .item("avatar_url", attr_s(""))
+                    .item("updated_at", attr_s(&now))
+                    .item("gsi2pk", attr_s(&format!("EMAIL#{}", claims.email)))
+                    .item("gsi2sk", attr_s(&invite_tid))
+                    .send()
+                    .await;
+
+                // Delete the invite placeholder
+                if let Some(invite_sk) = item.get("sk").and_then(|v| v.as_s().ok()) {
+                    let _ = state
+                        .dynamo
+                        .delete_item()
+                        .table_name(&state.config.users_table_name)
+                        .key("pk", attr_s(&invite_tid))
+                        .key("sk", attr_s(invite_sk))
+                        .send()
+                        .await;
+                    info!(
+                        email = %claims.email,
+                        team_id = %invite_tid,
+                        role = %invite_role,
+                        "Processed pending invite on list_teams"
+                    );
+                }
+            }
+
+            let ids: Vec<String> = all_items
+                .iter()
+                .filter_map(|item| item.get("pk").and_then(|v| v.as_s().ok()).cloned())
+                .collect();
+            // Deduplicate (invite + real record may both point to same team)
+            let mut unique_ids: Vec<String> = Vec::new();
+            for id in ids {
+                if !unique_ids.contains(&id) {
+                    unique_ids.push(id);
+                }
+            }
+            (unique_ids, all_items)
         }
     } else {
-        vec![]
+        (vec![], vec![])
     };
 
     // Load org name + status for each team
@@ -181,8 +240,8 @@ pub async fn switch_team(
 ) -> Result<axum::response::Response, StatusCode> {
     let target_team = body["team_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
 
-    // Verify user exists in target team via users table
-    let user_exists = state
+    // Verify user exists in target team and get their role there
+    let target_item = state
         .dynamo
         .get_item()
         .table_name(&state.config.users_table_name)
@@ -190,20 +249,21 @@ pub async fn switch_team(
         .key("sk", attr_s(&claims.sub))
         .send()
         .await
-        .ok()
-        .and_then(|r| r.item)
-        .is_some();
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .item
+        .ok_or(StatusCode::FORBIDDEN)?;
 
-    if !user_exists {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    let target_role = target_item
+        .get("role")
+        .and_then(|v| v.as_s().ok())
+        .map_or("member", |v| v);
 
-    // Re-issue JWT with new team_id
+    // Re-issue JWT with new team_id and correct role
     let token = jwt::create_token(
         &claims.sub,
         target_team,
         &claims.email,
-        &claims.role,
+        target_role,
         claims.github_login.as_deref(),
         &state.secrets.jwt_secret,
         86400,
