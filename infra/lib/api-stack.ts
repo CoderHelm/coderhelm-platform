@@ -19,12 +19,9 @@ interface ApiStackProps extends cdk.StackProps {
   stage: string;
   table: dynamodb.TableV2;
   teamsTable: dynamodb.TableV2;
-  runsTable: dynamodb.TableV2;
-  analyticsTable: dynamodb.TableV2;
   eventsTable: dynamodb.TableV2;
   usersTable: dynamodb.TableV2;
   jiraTokensTable: dynamodb.TableV2;
-  jiraEventsTable: dynamodb.TableV2;
   plansTable: dynamodb.TableV2;
   jiraConfigTable: dynamodb.TableV2;
   reposTable: dynamodb.TableV2;
@@ -244,12 +241,12 @@ export class ApiStack extends cdk.Stack {
         STAGE: props.stage,
         TABLE_NAME: props.table.tableName,
         TEAMS_TABLE_NAME: props.teamsTable.tableName,
-        RUNS_TABLE_NAME: props.runsTable.tableName,
-        ANALYTICS_TABLE_NAME: props.analyticsTable.tableName,
+        RUNS_TABLE_NAME: `coderhelm-${props.stage}-runs`,
+        ANALYTICS_TABLE_NAME: `coderhelm-${props.stage}-analytics`,
         EVENTS_TABLE_NAME: props.eventsTable.tableName,
         USERS_TABLE_NAME: props.usersTable.tableName,
         JIRA_TOKENS_TABLE_NAME: props.jiraTokensTable.tableName,
-        JIRA_EVENTS_TABLE_NAME: props.jiraEventsTable.tableName,
+        JIRA_EVENTS_TABLE_NAME: `coderhelm-${props.stage}-jira-events`,
         PLANS_TABLE_NAME: props.plansTable.tableName,
         JIRA_CONFIG_TABLE_NAME: props.jiraConfigTable.tableName,
         REPOS_TABLE_NAME: props.reposTable.tableName,
@@ -278,12 +275,18 @@ export class ApiStack extends cdk.Stack {
     // Permissions
     props.table.grantReadWriteData(this.gatewayFunction);
     props.teamsTable.grantReadWriteData(this.gatewayFunction);
-    props.runsTable.grantReadWriteData(this.gatewayFunction);
-    props.analyticsTable.grantReadData(this.gatewayFunction);
+
+    // Decoupled tables — use fromTableName to avoid cross-stack exports
+    const runsTable = dynamodb.TableV2.fromTableName(this, "RunsTableRef", `coderhelm-${props.stage}-runs`);
+    const analyticsTable = dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `coderhelm-${props.stage}-analytics`);
+    const jiraEventsTable = dynamodb.TableV2.fromTableName(this, "JiraEventsTableRef", `coderhelm-${props.stage}-jira-events`);
+    runsTable.grantReadWriteData(this.gatewayFunction);
+    analyticsTable.grantReadData(this.gatewayFunction);
+    jiraEventsTable.grantReadWriteData(this.gatewayFunction);
+
     props.eventsTable.grantReadWriteData(this.gatewayFunction);
     props.usersTable.grantReadWriteData(this.gatewayFunction);
     props.jiraTokensTable.grantReadWriteData(this.gatewayFunction);
-    props.jiraEventsTable.grantReadWriteData(this.gatewayFunction);
     props.plansTable.grantReadWriteData(this.gatewayFunction);
     props.jiraConfigTable.grantReadWriteData(this.gatewayFunction);
     props.reposTable.grantReadWriteData(this.gatewayFunction);
