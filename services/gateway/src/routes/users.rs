@@ -130,7 +130,7 @@ pub async fn invite_user(
         .cognito
         .list_users()
         .user_pool_id(&state.config.cognito_user_pool_id)
-        .filter(&format!("email = \"{email}\""))
+        .filter(format!("email = \"{email}\""))
         .limit(1)
         .send()
         .await
