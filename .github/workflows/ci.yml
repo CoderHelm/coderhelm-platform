@@ -47,3 +47,17 @@ jobs:
           workspaces: services/worker
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
+
+  mcp-proxy:
+    name: MCP Proxy (Node)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lambda/mcp-proxy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - run: npm ci
+      - run: npm run build

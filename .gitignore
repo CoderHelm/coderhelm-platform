@@ -26,3 +26,5 @@ infra/dist/
 d3ftly-jira/node_modules/
 d3ftly-jira/resources/admin/node_modules/
 d3ftly-jira/resources/admin/build/
+lambda/mcp-proxy/dist/
+lambda/mcp-proxy/mcp-proxy.zip
