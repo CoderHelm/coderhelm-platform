@@ -290,7 +290,7 @@ async fn process_jira_payload(
         .or_else(|| issue.get("description"))
     {
         Some(Value::String(s)) => s.clone(),
-        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+        Some(other) => extract_adf_text(other),
         None => String::new(),
     };
 
@@ -727,4 +727,66 @@ pub async fn list_jira_events(
         .collect();
 
     Ok(events)
+}
+
+/// Extract plain text from Jira Atlassian Document Format (ADF).
+/// ADF is a nested JSON tree with `content` arrays and `text` leaf nodes.
+/// Falls back to raw JSON if the structure is unexpected.
+fn extract_adf_text(value: &Value) -> String {
+    let mut parts = Vec::new();
+    extract_adf_text_inner(value, &mut parts);
+    let result = parts.join("");
+    if result.trim().is_empty() {
+        // Fallback: serialize as JSON so we don't lose data entirely
+        serde_json::to_string(value).unwrap_or_default()
+    } else {
+        result.trim().to_string()
+    }
+}
+
+fn extract_adf_text_inner(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            // Text leaf node
+            if let Some(Value::String(text)) = map.get("text") {
+                parts.push(text.clone());
+                return;
+            }
+            // Block nodes that should produce line breaks
+            let node_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let is_block = matches!(
+                node_type,
+                "paragraph"
+                    | "heading"
+                    | "bulletList"
+                    | "orderedList"
+                    | "listItem"
+                    | "blockquote"
+                    | "codeBlock"
+                    | "rule"
+                    | "table"
+                    | "tableRow"
+                    | "tableCell"
+            );
+            // Hard break inline node
+            if node_type == "hardBreak" {
+                parts.push("\n".to_string());
+                return;
+            }
+            if let Some(Value::Array(children)) = map.get("content") {
+                for child in children {
+                    extract_adf_text_inner(child, parts);
+                }
+            }
+            if is_block && !parts.last().map_or(true, |s| s.ends_with('\n')) {
+                parts.push("\n".to_string());
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                extract_adf_text_inner(item, parts);
+            }
+        }
+        _ => {}
+    }
 }
