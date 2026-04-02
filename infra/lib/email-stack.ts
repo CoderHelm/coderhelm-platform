@@ -171,6 +171,15 @@ export class EmailStack extends cdk.Stack {
       },
     });
 
+    new ses.CfnTemplate(this, "PasskeyRemovedTemplate", {
+      template: {
+        templateName: `${prefix}-passkey-removed`,
+        subjectPart: "A passkey was removed from your Coderhelm account",
+        htmlPart: PASSKEY_REMOVED_HTML,
+        textPart: PASSKEY_REMOVED_TEXT,
+      },
+    });
+
     // Grant SES send permissions to both lambdas
     const sesPolicy = new iam.PolicyStatement({
       actions: ["ses:SendEmail", "ses:SendTemplatedEmail"],
@@ -532,4 +541,31 @@ Date: {{date}}
 
 If you made this change, no action is needed.
 If you didn't, review your security settings: https://app.coderhelm.com/settings`;
+
+const PASSKEY_REMOVED_HTML = EMAIL_WRAPPER(`
+  <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Passkey removed from your account</h1>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    A passkey was removed from your Coderhelm account (<strong style="color:#fff">{{email}}</strong>).
+  </p>
+  <table style="width:100%;border-collapse:collapse;margin:16px 0">
+    <tr><td style="color:#888;padding:4px 0;font-size:14px">Device</td><td style="color:#fff;padding:4px 0;font-size:14px">{{device_name}}</td></tr>
+    <tr><td style="color:#888;padding:4px 0;font-size:14px">Date</td><td style="color:#fff;padding:4px 0;font-size:14px">{{date}}</td></tr>
+  </table>
+  <p style="color:#ccc;font-size:15px;line-height:1.6">
+    If you made this change, no further action is needed.
+  </p>
+  <p style="color:#fca5a5;font-size:15px;line-height:1.6">
+    If you didn't remove this passkey, please <a href="https://app.coderhelm.com/settings" style="color:#60a5fa">review your security settings</a> immediately and change your password.
+  </p>
+`);
+
+const PASSKEY_REMOVED_TEXT = `Passkey removed from your Coderhelm account
+
+A passkey was removed from your account ({{email}}).
+
+Device: {{device_name}}
+Date: {{date}}
+
+If you made this change, no action is needed.
+If you didn't, review your security settings immediately and change your password: https://app.coderhelm.com/settings`;
 
