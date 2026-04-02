@@ -80,6 +80,33 @@ export class ApiStack extends cdk.Stack {
           : cdk.RemovalPolicy.DESTROY,
     });
 
+    // Custom message Lambda — sends branded SES emails for verification and password reset
+    const customMessageFn = new lambda.Function(this, "CustomMessageFn", {
+      functionName: `${prefix}-custom-message`,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: "handler.handler",
+      code: lambda.Code.fromAsset("../lambda/custom-message"),
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 128,
+      environment: {
+        SES_TEMPLATE_PREFIX: prefix,
+        SES_FROM_ADDRESS: "noreply@coderhelm.com",
+      },
+      logRetention: logs.RetentionDays.ONE_MONTH,
+    });
+
+    customMessageFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["ses:GetEmailTemplate"],
+        resources: ["*"],
+      })
+    );
+
+    userPool.addTrigger(
+      cognito.UserPoolOperation.CUSTOM_MESSAGE,
+      customMessageFn
+    );
+
     // Google identity provider
     // TODO: Set these values in Secrets Manager at coderhelm/{stage}/secrets:
     //   google_client_id     — from https://console.cloud.google.com/apis/credentials

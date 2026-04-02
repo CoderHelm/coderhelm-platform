@@ -153,6 +153,24 @@ export class EmailStack extends cdk.Stack {
       },
     });
 
+    new ses.CfnTemplate(this, "PasswordChangedTemplate", {
+      template: {
+        templateName: `${prefix}-password-changed`,
+        subjectPart: "Your Coderhelm password was changed",
+        htmlPart: PASSWORD_CHANGED_HTML,
+        textPart: PASSWORD_CHANGED_TEXT,
+      },
+    });
+
+    new ses.CfnTemplate(this, "PasskeyAddedTemplate", {
+      template: {
+        templateName: `${prefix}-passkey-added`,
+        subjectPart: "A passkey was added to your Coderhelm account",
+        htmlPart: PASSKEY_ADDED_HTML,
+        textPart: PASSKEY_ADDED_TEXT,
+      },
+    });
+
     // Grant SES send permissions to both lambdas
     const sesPolicy = new iam.PolicyStatement({
       actions: ["ses:SendEmail", "ses:SendTemplatedEmail"],
@@ -465,4 +483,53 @@ const VERIFY_EMAIL_TEXT = `Verify your Coderhelm email
 Your verification code: {{code}}
 
 If you didn't create a Coderhelm account, ignore this email.`;
+
+const PASSWORD_CHANGED_HTML = EMAIL_WRAPPER(`
+  <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Your password was changed</h1>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    The password for your Coderhelm account (<strong style="color:#fff">{{email}}</strong>) was just changed.
+  </p>
+  <p style="color:#ccc;font-size:15px;line-height:1.6">
+    If you made this change, no further action is needed.
+  </p>
+  <p style="color:#fca5a5;font-size:15px;line-height:1.6">
+    If you didn't change your password, please <a href="https://app.coderhelm.com" style="color:#60a5fa">reset it immediately</a> and contact us at support@coderhelm.com.
+  </p>
+`);
+
+const PASSWORD_CHANGED_TEXT = `Your Coderhelm password was changed
+
+The password for your account ({{email}}) was just changed.
+
+If you made this change, no action is needed.
+If you didn't, reset your password immediately: https://app.coderhelm.com
+
+Contact: support@coderhelm.com`;
+
+const PASSKEY_ADDED_HTML = EMAIL_WRAPPER(`
+  <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Passkey added to your account</h1>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    A new passkey was registered on your Coderhelm account (<strong style="color:#fff">{{email}}</strong>).
+  </p>
+  <table style="width:100%;border-collapse:collapse;margin:16px 0">
+    <tr><td style="color:#888;padding:4px 0;font-size:14px">Device</td><td style="color:#fff;padding:4px 0;font-size:14px">{{device_name}}</td></tr>
+    <tr><td style="color:#888;padding:4px 0;font-size:14px">Date</td><td style="color:#fff;padding:4px 0;font-size:14px">{{date}}</td></tr>
+  </table>
+  <p style="color:#ccc;font-size:15px;line-height:1.6">
+    If you made this change, no further action is needed.
+  </p>
+  <p style="color:#fca5a5;font-size:15px;line-height:1.6">
+    If you didn't add this passkey, please <a href="https://app.coderhelm.com/settings" style="color:#60a5fa">review your security settings</a> immediately.
+  </p>
+`);
+
+const PASSKEY_ADDED_TEXT = `Passkey added to your Coderhelm account
+
+A new passkey was registered on your account ({{email}}).
+
+Device: {{device_name}}
+Date: {{date}}
+
+If you made this change, no action is needed.
+If you didn't, review your security settings: https://app.coderhelm.com/settings`;
 
