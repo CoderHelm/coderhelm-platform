@@ -134,6 +134,7 @@ export class ApiStack extends cdk.Stack {
           cognito.OAuthScope.OPENID,
           cognito.OAuthScope.EMAIL,
           cognito.OAuthScope.PROFILE,
+          cognito.OAuthScope.COGNITO_ADMIN,
         ],
         callbackUrls: [`${apiUrl}/auth/google/callback`],
         logoutUrls: [dashboardUrl],
