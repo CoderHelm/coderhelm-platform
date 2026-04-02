@@ -299,7 +299,7 @@ async fn handle_issue_comment(
 async fn handle_pull_request(
     state: &AppState,
     payload: &Value,
-    installation_id: u64,
+    _installation_id: u64,
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
