@@ -420,7 +420,34 @@ pub async fn handle_forge(
             StatusCode::BAD_REQUEST
         })?;
 
-    let team_id = format!("TEAM#{installation_id}");
+    // Also check for team_id directly in the payload (set by the Forge app)
+    let team_id = payload
+        .pointer("/coderhelm/team_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            // Fall back to resolving via GitHub installation ID
+            // (blocking async call not ideal, but we're already in async context)
+            None
+        });
+
+    let team_id = match team_id {
+        Some(tid) => tid,
+        None => {
+            // Resolve team via GitHub installation GSI on teams table
+            match super::github_webhook::resolve_team_by_installation(&state, installation_id).await
+            {
+                Some(tid) => tid,
+                None => {
+                    warn!(
+                        installation_id,
+                        "Forge Jira webhook: no team linked to installation"
+                    );
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+        }
+    };
 
     // Verify this team actually exists by checking jira config
     let config_exists = state
@@ -440,7 +467,7 @@ pub async fn handle_forge(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    info!(team_id, installation_id, "Forge Jira webhook received");
+    info!(team_id, installation_id, payload = %payload, "Forge Jira webhook received");
 
     process_jira_payload(&state, &team_id, installation_id, &payload).await
 }
@@ -768,6 +795,17 @@ fn extract_adf_text_inner(value: &Value, parts: &mut Vec<String>) {
             // Hard break inline node
             if node_type == "hardBreak" {
                 parts.push("\n".to_string());
+                return;
+            }
+            // Inline card (pasted URLs like Notion links)
+            if node_type == "inlineCard" || node_type == "blockCard" {
+                if let Some(url) = map
+                    .get("attrs")
+                    .and_then(|a| a.get("url"))
+                    .and_then(|v| v.as_str())
+                {
+                    parts.push(url.to_string());
+                }
                 return;
             }
             if let Some(Value::Array(children)) = map.get("content") {

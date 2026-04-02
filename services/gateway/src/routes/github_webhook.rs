@@ -15,6 +15,33 @@ use crate::models::{
 };
 use crate::AppState;
 
+/// Look up team_id by GitHub installation_id using the teams table GSI.
+/// Returns None if no team has linked this installation yet.
+pub async fn resolve_team_by_installation(
+    state: &AppState,
+    installation_id: u64,
+) -> Option<String> {
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.teams_table_name)
+        .index_name("github-installation-index")
+        .key_condition_expression("github_installation_id = :iid")
+        .expression_attribute_values(
+            ":iid",
+            aws_sdk_dynamodb::types::AttributeValue::N(installation_id.to_string()),
+        )
+        .limit(1)
+        .send()
+        .await
+        .ok()?;
+
+    result
+        .items()
+        .first()
+        .and_then(|item| item.get("team_id").and_then(|v| v.as_s().ok()).cloned())
+}
+
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -47,13 +74,28 @@ pub async fn handle(
 
     info!(event_type, installation_id, "GitHub webhook received");
 
+    // Installation events handle their own team resolution/creation
+    if event_type == "installation" {
+        return handle_installation(&state, &payload, installation_id).await;
+    }
+    if event_type == "installation_repositories" {
+        return handle_installation_repos(&state, &payload, installation_id).await;
+    }
+
+    // For all other events, resolve team_id from the installation
+    let team_id = match resolve_team_by_installation(&state, installation_id).await {
+        Some(tid) => tid,
+        None => {
+            warn!(installation_id, event_type, "No team linked to this GitHub installation");
+            return Ok(StatusCode::OK);
+        }
+    };
+
     match event_type {
-        "issues" => handle_issue_event(&state, &payload, installation_id).await,
-        "issue_comment" => handle_issue_comment(&state, &payload, installation_id).await,
-        "pull_request" => handle_pull_request(&state, &payload, installation_id).await,
-        "pull_request_review" => handle_pr_review(&state, &payload, installation_id).await,
-        // Review-comment events are handled by handle_pr_review (fetches comments by review_id)
-        // to avoid duplicate SQS dispatches when a review is submitted with inline comments.
+        "issues" => handle_issue_event(&state, &payload, installation_id, &team_id).await,
+        "issue_comment" => handle_issue_comment(&state, &payload, installation_id, &team_id).await,
+        "pull_request" => handle_pull_request(&state, &payload, installation_id, &team_id).await,
+        "pull_request_review" => handle_pr_review(&state, &payload, installation_id, &team_id).await,
         "pull_request_review_comment" | "pull_request_review_thread" => {
             info!(
                 event_type,
@@ -61,14 +103,10 @@ pub async fn handle(
             );
             Ok(StatusCode::OK)
         }
-        "check_run" => handle_check_run(&state, &payload, installation_id).await,
-        "check_suite" => handle_check_suite(&state, &payload, installation_id).await,
-        "installation" => handle_installation(&state, &payload, installation_id).await,
-        "installation_repositories" => {
-            handle_installation_repos(&state, &payload, installation_id).await
-        }
-        "repository" => handle_repository_event(&state, &payload, installation_id).await,
-        "workflow_run" => handle_workflow_run(&state, &payload, installation_id).await,
+        "check_run" => handle_check_run(&state, &payload, installation_id, &team_id).await,
+        "check_suite" => handle_check_suite(&state, &payload, installation_id, &team_id).await,
+        "repository" => handle_repository_event(&state, &payload, installation_id, &team_id).await,
+        "workflow_run" => handle_workflow_run(&state, &payload, installation_id, &team_id).await,
         // Log-only events — acknowledge but no action needed
         "workflow_dispatch" | "workflow_job" => {
             info!(event_type, "Workflow event received — logged");
@@ -97,6 +135,7 @@ async fn handle_issue_event(
     state: &AppState,
     payload: &Value,
     installation_id: u64,
+    team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
 
@@ -116,13 +155,11 @@ async fn handle_issue_event(
     if !is_assigned_to_bot && !is_labeled {
         return Ok(StatusCode::OK);
     }
-
-    let team_id = format!("TEAM#{installation_id}");
     let issue = &payload["issue"];
     let repo = &payload["repository"];
 
     let message = WorkerMessage::Ticket(TicketMessage {
-        team_id: team_id.clone(),
+        team_id: team_id.to_string(),
         installation_id,
         source: TicketSource::Github,
         ticket_id: format!("GH-{}", issue["number"].as_u64().unwrap_or(0)),
@@ -138,7 +175,7 @@ async fn handle_issue_event(
     });
 
     // Check usage limits before dispatching
-    if let Some(reason) = check_run_budget(state, &team_id).await {
+    if let Some(reason) = check_run_budget(state, team_id).await {
         let owner = repo["owner"]["login"].as_str().unwrap_or("");
         let name = repo["name"].as_str().unwrap_or("");
         let number = issue["number"].as_u64().unwrap_or(0);
@@ -154,7 +191,7 @@ async fn handle_issue_event(
         .table_name(&state.config.runs_table_name)
         .key_condition_expression("team_id = :tid")
         .filter_expression("ticket_id = :ticket")
-        .expression_attribute_values(":tid", attr_s(&team_id))
+        .expression_attribute_values(":tid", attr_s(team_id))
         .expression_attribute_values(":ticket", attr_s(&ticket_id_str))
         .limit(5)
         .send()
@@ -174,6 +211,7 @@ async fn handle_issue_comment(
     state: &AppState,
     payload: &Value,
     installation_id: u64,
+    team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     if action != "created" {
@@ -187,13 +225,12 @@ async fn handle_issue_comment(
     if payload["issue"]["pull_request"].is_object() {
         let pr_user = payload["issue"]["user"]["login"].as_str().unwrap_or("");
         if pr_user.contains("coderhelm") && !commenter.contains("coderhelm") {
-            let team_id = format!("TEAM#{installation_id}");
             let repo = &payload["repository"];
             let owner = repo["owner"]["login"].as_str().unwrap_or("");
             let name = repo["name"].as_str().unwrap_or("");
             let pr_number = payload["issue"]["number"].as_u64().unwrap_or(0);
 
-            let run_id = lookup_run_by_pr(state, &team_id, owner, name, pr_number).await;
+            let run_id = lookup_run_by_pr(state, team_id, owner, name, pr_number).await;
             if run_id.is_empty() {
                 warn!(pr_number, "No run found for PR comment — skipping");
                 return Ok(StatusCode::OK);
@@ -201,7 +238,7 @@ async fn handle_issue_comment(
 
             info!(pr_number, commenter, "PR comment → feedback queue");
             let message = WorkerMessage::Feedback(FeedbackMessage {
-                team_id,
+                team_id: team_id.to_string(),
                 installation_id,
                 run_id,
                 repo_owner: owner.to_string(),
@@ -222,12 +259,11 @@ async fn handle_issue_comment(
         return Ok(StatusCode::OK);
     }
 
-    let team_id = format!("TEAM#{installation_id}");
     let issue = &payload["issue"];
     let repo = &payload["repository"];
 
     let message = WorkerMessage::Ticket(TicketMessage {
-        team_id: team_id.clone(),
+        team_id: team_id.to_string(),
         installation_id,
         source: TicketSource::Github,
         ticket_id: format!("GH-{}", issue["number"].as_u64().unwrap_or(0)),
@@ -243,7 +279,7 @@ async fn handle_issue_comment(
     });
 
     // Check usage limits before dispatching
-    if let Some(reason) = check_run_budget(state, &team_id).await {
+    if let Some(reason) = check_run_budget(state, team_id).await {
         let owner = repo["owner"]["login"].as_str().unwrap_or("");
         let name = repo["name"].as_str().unwrap_or("");
         let number = issue["number"].as_u64().unwrap_or(0);
@@ -259,6 +295,7 @@ async fn handle_pull_request(
     state: &AppState,
     payload: &Value,
     installation_id: u64,
+    team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
@@ -280,7 +317,6 @@ async fn handle_pull_request(
         return Ok(StatusCode::OK);
     }
 
-    let team_id = format!("TEAM#{installation_id}");
     let repo = &payload["repository"];
     let owner = repo["owner"]["login"].as_str().unwrap_or("");
     let name = repo["name"].as_str().unwrap_or("");
@@ -318,7 +354,7 @@ async fn handle_pull_request(
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
-                .key("team_id", attr_s(&team_id))
+                .key("team_id", attr_s(team_id))
                 .key("run_id", attr_s(&run_id))
                 .update_expression("SET #status = :s, status_run_id = :sri, updated_at = :t")
                 .expression_attribute_names("#status", "status")
@@ -337,7 +373,7 @@ async fn handle_pull_request(
                 .and_then(|v| v.as_n().ok())
                 .and_then(|n| n.parse::<u64>().ok())
             {
-                if let Err(e) = trigger_plan_dependents(state, &team_id, issue_num).await {
+                if let Err(e) = trigger_plan_dependents(state, team_id, issue_num).await {
                     warn!(
                         team_id,
                         issue_num,
@@ -356,6 +392,7 @@ async fn handle_pr_review(
     state: &AppState,
     payload: &Value,
     installation_id: u64,
+    team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     if action != "submitted" {
@@ -383,19 +420,18 @@ async fn handle_pr_review(
         return Ok(StatusCode::OK);
     }
 
-    let team_id = format!("TEAM#{installation_id}");
     let repo = &payload["repository"];
     let owner = repo["owner"]["login"].as_str().unwrap_or("");
     let name = repo["name"].as_str().unwrap_or("");
     let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
 
-    if let Some(reason) = check_run_budget(state, &team_id).await {
+    if let Some(reason) = check_run_budget(state, team_id).await {
         info!(team_id, "PR review skipped — token limit reached");
         post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
         return Ok(StatusCode::OK);
     }
 
-    let run_id = lookup_run_by_pr(state, &team_id, owner, name, pr_number).await;
+    let run_id = lookup_run_by_pr(state, team_id, owner, name, pr_number).await;
     if run_id.is_empty() {
         warn!(pr_number, "No run found for PR — skipping feedback");
         return Ok(StatusCode::OK);
@@ -404,7 +440,7 @@ async fn handle_pr_review(
     // The review body is the top-level comment; individual line comments
     // will be fetched by the worker using the review_id via GitHub API.
     let message = WorkerMessage::Feedback(FeedbackMessage {
-        team_id,
+        team_id: team_id.to_string(),
         installation_id,
         run_id,
         repo_owner: owner.to_string(),
@@ -422,6 +458,7 @@ async fn handle_check_run(
     state: &AppState,
     payload: &Value,
     installation_id: u64,
+    team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     if action != "completed" {
@@ -441,16 +478,15 @@ async fn handle_check_run(
         return Ok(StatusCode::OK);
     }
 
-    let team_id = format!("TEAM#{installation_id}");
     let repo = &payload["repository"];
 
-    if let Some(_reason) = check_run_budget(state, &team_id).await {
+    if let Some(_reason) = check_run_budget(state, team_id).await {
         info!(team_id, "CI fix skipped — token limit reached");
         return Ok(StatusCode::OK);
     }
 
     let message = WorkerMessage::CiFix(CiFixMessage {
-        team_id,
+        team_id: team_id.to_string(),
         installation_id,
         run_id: String::new(), // TODO: look up from DynamoDB by branch
         repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
@@ -478,112 +514,47 @@ async fn handle_installation(
                 .unwrap_or("unknown");
             info!(
                 installation_id,
-                org, "GitHub App installation — provisioning/reactivating team"
+                org, "GitHub App installed — will be linked when user connects via OAuth"
             );
+            // No team creation here. The link is established when the user
+            // connects GitHub from the dashboard (OAuth callback writes
+            // github_installation_id to the teams table).
+            //
+            // If a team is already linked (reinstall), sync repos.
+            if let Some(team_id) = resolve_team_by_installation(state, installation_id).await {
+                let mut repos = extract_repos_from_installation(payload);
+                if repos.is_empty() {
+                    repos = fetch_installation_repos(state, installation_id).await;
+                }
 
-            let team_pk = format!("TEAM#{installation_id}");
-            let now = chrono::Utc::now().to_rfc3339();
+                let now = chrono::Utc::now().to_rfc3339();
+                for repo in &repos {
+                    let full = format!("{}/{}", repo.owner, repo.name);
+                    let _ = state
+                        .dynamo
+                        .put_item()
+                        .table_name(&state.config.repos_table_name)
+                        .item("pk", attr_s(&team_id))
+                        .item("sk", attr_s(&format!("REPO#{full}")))
+                        .item("repo_name", attr_s(&full))
+                        .item(
+                            "enabled",
+                            aws_sdk_dynamodb::types::AttributeValue::Bool(false),
+                        )
+                        .item("ticket_source", attr_s("github"))
+                        .item("created_at", attr_s(&now))
+                        .send()
+                        .await;
+                }
 
-            // Check if team already exists (reinstallation case)
-            let existing = state
-                .dynamo
-                .get_item()
-                .table_name(&state.config.table_name)
-                .key("pk", attr_s(&team_pk))
-                .key("sk", attr_s("META"))
-                .projection_expression("#s")
-                .expression_attribute_names("#s", "status")
-                .send()
-                .await
-                .ok()
-                .and_then(|r| r.item);
-
-            if existing.is_some() {
-                // Reactivate existing team — preserve plan, billing, etc.
-                state
-                    .dynamo
-                    .update_item()
-                    .table_name(&state.config.table_name)
-                    .key("pk", attr_s(&team_pk))
-                    .key("sk", attr_s("META"))
-                    .update_expression(
-                        "SET #status = :s, github_install_id = :iid, github_org = :org, reactivated_at = :t",
-                    )
-                    .expression_attribute_names("#status", "status")
-                    .expression_attribute_values(":s", attr_s("active"))
-                    .expression_attribute_values(":iid", attr_n(installation_id))
-                    .expression_attribute_values(":org", attr_s(org))
-                    .expression_attribute_values(":t", attr_s(&now))
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to reactivate team: {e}");
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-                info!(installation_id, "Reactivated existing team");
-            } else {
-                // Brand new team
-                state
-                    .dynamo
-                    .put_item()
-                    .table_name(&state.config.table_name)
-                    .item("pk", attr_s(&team_pk))
-                    .item("sk", attr_s("META"))
-                    .item("github_install_id", attr_n(installation_id))
-                    .item("github_org", attr_s(org))
-                    .item("plan", attr_s("free"))
-                    .item("status", attr_s("active"))
-                    .item("run_count_mtd", attr_n(0))
-                    .item("created_at", attr_s(&now))
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to create team: {e}");
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-            }
-
-            // Write REPO# items so the dashboard can list them
-            let mut repos = extract_repos_from_installation(payload);
-
-            // When installed with "All repositories", GitHub sends an empty array.
-            // Fetch repos from the API in that case.
-            if repos.is_empty() {
-                info!(
-                    installation_id,
-                    "No repos in webhook payload — fetching from GitHub API"
-                );
-                repos = fetch_installation_repos(state, installation_id).await;
-            }
-
-            let now_str = now.clone();
-            for repo in &repos {
-                let full = format!("{}/{}", repo.owner, repo.name);
-                let _ = state
-                    .dynamo
-                    .put_item()
-                    .table_name(&state.config.repos_table_name)
-                    .item("pk", attr_s(&team_pk))
-                    .item("sk", attr_s(&format!("REPO#{full}")))
-                    .item("repo_name", attr_s(&full))
-                    .item(
-                        "enabled",
-                        aws_sdk_dynamodb::types::AttributeValue::Bool(false),
-                    )
-                    .item("ticket_source", attr_s("github"))
-                    .item("created_at", attr_s(&now_str))
-                    .send()
-                    .await;
-            }
-
-            // Enqueue onboard for all repos in the installation
-            if !repos.is_empty() {
-                let onboard = WorkerMessage::Onboard(OnboardMessage {
-                    team_id: team_pk,
-                    installation_id,
-                    repos,
-                });
-                let _ = send_to_queue(state, &state.config.ticket_queue_url, &onboard).await;
+                if !repos.is_empty() {
+                    let onboard = WorkerMessage::Onboard(OnboardMessage {
+                        team_id,
+                        installation_id,
+                        repos,
+                    });
+                    let _ = send_to_queue(state, &state.config.ticket_queue_url, &onboard).await;
+                }
             }
 
             Ok(StatusCode::CREATED)
@@ -591,81 +562,23 @@ async fn handle_installation(
         "deleted" => {
             info!(
                 installation_id,
-                "GitHub App uninstalled — deactivating team"
+                "GitHub App uninstalled — removing installation link"
             );
-            let team_id = format!("TEAM#{installation_id}");
-            state
-                .dynamo
-                .update_item()
-                .table_name(&state.config.table_name)
-                .key("pk", attr_s(&team_id))
-                .key("sk", attr_s("META"))
-                .update_expression("SET #status = :s, deactivated_at = :t")
-                .expression_attribute_names("#status", "status")
-                .expression_attribute_values(":s", attr_s("deactivated"))
-                .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
-                .send()
-                .await
-                .map_err(|e| {
-                    error!("Failed to deactivate team: {e}");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
 
-            // Notify all users in the team
-            let users = state
-                .dynamo
-                .query()
-                .table_name(&state.config.users_table_name)
-                .key_condition_expression("pk = :pk")
-                .expression_attribute_values(":pk", attr_s(&team_id))
-                .projection_expression("email")
-                .send()
-                .await
-                .ok();
+            // Find the team linked to this installation and remove the link
+            if let Some(team_id) = resolve_team_by_installation(state, installation_id).await {
+                let _ = state
+                    .dynamo
+                    .update_item()
+                    .table_name(&state.config.teams_table_name)
+                    .key("team_id", attr_s(&team_id))
+                    .key("sk", attr_s("META"))
+                    .update_expression("REMOVE github_installation_id, github_org SET updated_at = :t")
+                    .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+                    .send()
+                    .await;
 
-            if let Some(users_result) = users {
-                for item in users_result.items() {
-                    if let Some(email) = item
-                        .get("email")
-                        .and_then(|v| v.as_s().ok())
-                        .filter(|e| !e.is_empty())
-                    {
-                        let subject = aws_sdk_sesv2::types::Content::builder()
-                            .data("Coderhelm GitHub App uninstalled")
-                            .build();
-                        let body_text =
-                            aws_sdk_sesv2::types::Content::builder()
-                                .data("The Coderhelm GitHub App has been uninstalled from your organization. Coderhelm will no longer process any runs or webhooks for this account. To restore access, reinstall the app from https://app.coderhelm.com.")
-                                .build();
-                        if let (Ok(subj), Ok(txt)) = (subject, body_text) {
-                            let _ = state
-                                .ses
-                                .send_email()
-                                .from_email_address(&state.config.ses_from_address)
-                                .destination(
-                                    aws_sdk_sesv2::types::Destination::builder()
-                                        .to_addresses(email)
-                                        .build(),
-                                )
-                                .content(
-                                    aws_sdk_sesv2::types::EmailContent::builder()
-                                        .simple(
-                                            aws_sdk_sesv2::types::Message::builder()
-                                                .subject(subj)
-                                                .body(
-                                                    aws_sdk_sesv2::types::Body::builder()
-                                                        .text(txt)
-                                                        .build(),
-                                                )
-                                                .build(),
-                                        )
-                                        .build(),
-                                )
-                                .send()
-                                .await;
-                        }
-                    }
-                }
+                info!(team_id, "GitHub installation unlinked from team");
             }
 
             Ok(StatusCode::OK)
@@ -683,6 +596,14 @@ async fn handle_installation_repos(
     if action != "added" {
         return Ok(StatusCode::OK);
     }
+
+    let team_id = match resolve_team_by_installation(state, installation_id).await {
+        Some(tid) => tid,
+        None => {
+            warn!(installation_id, "installation_repositories event but no team linked");
+            return Ok(StatusCode::OK);
+        }
+    };
 
     let repos: Vec<OnboardRepo> = payload["repositories_added"]
         .as_array()
@@ -707,7 +628,6 @@ async fn handle_installation_repos(
     }
 
     // Write REPO# items so the dashboard can list them
-    let team_id = format!("TEAM#{installation_id}");
     let now = chrono::Utc::now().to_rfc3339();
     for repo in &repos {
         let full = format!("{}/{}", repo.owner, repo.name);
@@ -742,6 +662,7 @@ async fn handle_check_suite(
     state: &AppState,
     payload: &Value,
     installation_id: u64,
+    team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     if action != "completed" {
@@ -770,7 +691,7 @@ async fn handle_check_suite(
                 }
                 info!(branch, pr_number, "CI passed — marking PR ready");
                 let message = WorkerMessage::MarkReady(MarkReadyMessage {
-                    team_id: format!("TEAM#{installation_id}"),
+                    team_id: team_id.to_string(),
                     installation_id,
                     repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
                     repo_name: repo["name"].as_str().unwrap_or("").to_string(),
@@ -797,6 +718,7 @@ async fn handle_workflow_run(
     state: &AppState,
     payload: &Value,
     installation_id: u64,
+    team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     if action != "completed" {
@@ -822,7 +744,7 @@ async fn handle_workflow_run(
                 }
                 info!(branch, pr_number, "CI passed — marking PR ready");
                 let message = WorkerMessage::MarkReady(MarkReadyMessage {
-                    team_id: format!("TEAM#{installation_id}"),
+                    team_id: team_id.to_string(),
                     installation_id,
                     repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
                     repo_name: repo["name"].as_str().unwrap_or("").to_string(),
@@ -848,6 +770,7 @@ async fn handle_repository_event(
     state: &AppState,
     payload: &Value,
     installation_id: u64,
+    team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     let repo = &payload["repository"];
@@ -859,14 +782,13 @@ async fn handle_repository_event(
                 action,
                 repo_name, installation_id, "Repository removed — deactivating repo record"
             );
-            let team_id = format!("TEAM#{installation_id}");
             let parts: Vec<&str> = repo_name.splitn(2, '/').collect();
             if parts.len() == 2 {
                 let _ = state
                     .dynamo
                     .update_item()
                     .table_name(&state.config.repos_table_name)
-                    .key("pk", attr_s(&team_id))
+                    .key("pk", attr_s(team_id))
                     .key("sk", attr_s(&format!("REPO#{}", parts[1])))
                     .update_expression("SET #status = :s, updated_at = :t")
                     .expression_attribute_names("#status", "status")
@@ -900,7 +822,7 @@ async fn handle_repository_event(
 
 /// Fetch repos for an installation via GitHub API (used when "All repositories" is selected
 /// and the webhook payload doesn't include the repo list).
-async fn fetch_installation_repos(state: &AppState, installation_id: u64) -> Vec<OnboardRepo> {
+pub async fn fetch_installation_repos(state: &AppState, installation_id: u64) -> Vec<OnboardRepo> {
     let token = match crate::auth::github_app::get_installation_token(state, installation_id).await
     {
         Ok(t) => t,

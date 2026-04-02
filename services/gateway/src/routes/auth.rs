@@ -249,6 +249,18 @@ pub async fn verify_email(
         .send()
         .await;
 
+    // Also create teams table record (for future GitHub/Jira linking)
+    let _ = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.teams_table_name)
+        .item("team_id", attr_s(&team_id))
+        .item("sk", attr_s("META"))
+        .item("created_at", attr_s(&now))
+        .condition_expression("attribute_not_exists(team_id)")
+        .send()
+        .await;
+
     // Create user record
     let _ = state
         .dynamo
@@ -802,47 +814,38 @@ pub async fn github_callback(
             .send()
             .await;
 
-        // Also upsert into ALL installation teams
-        for (inst_id, _org) in &all_installations {
-            let tid = format!("TEAM#{inst_id}");
-            if tid != claims.team_id {
-                let _ = state
-                    .dynamo
-                    .put_item()
-                    .table_name(&state.config.users_table_name)
-                    .item("pk", attr_s(&tid))
-                    .item("sk", attr_s(&claims.sub))
-                    .item("github_id", attr_n(github_id))
-                    .item("github_login", attr_s(github_login))
-                    .item("email", attr_s(&claims.email))
-                    .item(
-                        "avatar_url",
-                        attr_s(user["avatar_url"].as_str().unwrap_or("")),
-                    )
-                    .item("role", attr_s("member"))
-                    .item("updated_at", attr_s(&now))
-                    .item("gsi1pk", attr_s(&format!("GHUSER#{github_id}")))
-                    .item("gsi1sk", attr_s(&tid))
-                    .item(
-                        "gsi2pk",
-                        attr_s(&format!("EMAIL#{}", normalize_email(&claims.email))),
-                    )
-                    .item("gsi2sk", attr_s(&tid))
-                    .send()
-                    .await;
-            }
+        // Link GitHub installations to the user's team in the teams table
+        for (inst_id, org) in &all_installations {
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.teams_table_name)
+                .key("team_id", attr_s(&claims.team_id))
+                .key("sk", attr_s("META"))
+                .update_expression(
+                    "SET github_installation_id = :iid, github_org = :org, updated_at = :now",
+                )
+                .expression_attribute_values(
+                    ":iid",
+                    aws_sdk_dynamodb::types::AttributeValue::N(inst_id.to_string()),
+                )
+                .expression_attribute_values(":org", attr_s(org))
+                .expression_attribute_values(":now", attr_s(&now))
+                .send()
+                .await;
+
+            info!(
+                installation_id = inst_id,
+                org,
+                team_id = %claims.team_id,
+                "Linked GitHub installation to team"
+            );
         }
 
-        // Re-issue JWT with github_login
-        let first_install_team = if !all_installations.is_empty() {
-            format!("TEAM#{}", all_installations[0].0)
-        } else {
-            claims.team_id.clone()
-        };
-
+        // Re-issue JWT with github_login (keep the user's existing team)
         let token = jwt::create_token(
             &claims.sub,
-            &first_install_team,
+            &claims.team_id,
             &claims.email,
             &claims.role,
             Some(github_login),
@@ -873,72 +876,58 @@ pub async fn github_callback(
             .into_response());
     }
 
-    // No existing session — legacy GitHub login flow
-    if all_installations.is_empty() {
-        let found: Vec<String> = installs["installations"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .map(|i| {
-                format!(
-                    "app_id={} slug={}",
-                    i["app_id"].as_u64().unwrap_or(0),
-                    i["app_slug"].as_str().unwrap_or("?")
-                )
-            })
-            .collect();
-        error!(
-            "User {github_login} has no Coderhelm installation (our_app_id={our_app_id}, found: {found:?})"
-        );
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    let installation_id = all_installations[0].0;
-    let team_id = format!("TEAM#{installation_id}");
+    // No existing session — GitHub-only login flow
     let github_user_id = format!("USER#{github_id}");
     let email = user["email"].as_str().unwrap_or("");
     let normalized_email = normalize_email(email);
 
-    // Check for existing record by GitHub ID
+    // 1. Try to find an existing user by GitHub ID (GSI1 across all teams)
     let existing_by_github = state
         .dynamo
-        .get_item()
+        .query()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(&team_id))
-        .key("sk", attr_s(&github_user_id))
+        .index_name("gsi1")
+        .key_condition_expression("gsi1pk = :gpk")
+        .expression_attribute_values(":gpk", attr_s(&format!("GHUSER#{github_id}")))
+        .limit(1)
         .send()
         .await
         .ok()
-        .and_then(|r| r.item().cloned());
+        .and_then(|r| r.items().first().cloned());
 
-    // Also check for existing record by email (handles email+tag variants via normalization)
-    let existing_by_email = if !normalized_email.is_empty() && existing_by_github.is_none() {
+    // 2. If not found by GitHub ID, try by email
+    let existing_by_email = if existing_by_github.is_none() && !normalized_email.is_empty() {
         state
             .dynamo
             .query()
             .table_name(&state.config.users_table_name)
             .index_name("gsi2")
-            .key_condition_expression("gsi2pk = :email AND gsi2sk = :tid")
+            .key_condition_expression("gsi2pk = :email")
             .expression_attribute_values(":email", attr_s(&format!("EMAIL#{normalized_email}")))
-            .expression_attribute_values(":tid", attr_s(&team_id))
+            .limit(5)
             .send()
             .await
             .ok()
-            .and_then(|r| r.items)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|item| {
-                // Find a real user record (USER#...), not an invite
-                item.get("sk")
-                    .and_then(|v| v.as_s().ok())
-                    .map(|s| s.starts_with("USER#"))
-                    .unwrap_or(false)
+            .and_then(|r| {
+                r.items().iter().find(|item| {
+                    item.get("sk")
+                        .and_then(|v| v.as_s().ok())
+                        .map(|s| s.starts_with("USER#"))
+                        .unwrap_or(false)
+                        && item
+                            .get("status")
+                            .and_then(|v| v.as_s().ok())
+                            .map(|s| s != "invited")
+                            .unwrap_or(true)
+                }).cloned()
             })
     } else {
         None
     };
 
-    let has_existing_record = existing_by_github.is_some() || existing_by_email.is_some();
+    let existing_user = existing_by_github.or(existing_by_email);
+
+    let has_existing_record = existing_user.is_some();
 
     // Closed beta: check allowlist for new GitHub users
     if !has_existing_record && !email.is_empty() && !is_email_allowed(&state, email).await {
@@ -951,177 +940,123 @@ pub async fn github_callback(
         return Ok(Redirect::temporary(&redirect).into_response());
     }
 
-    // Resolve the canonical user_id:
-    // 1. If they have a GitHub record, use that
-    // 2. If they have an email record (e.g. signed up via Cognito), reuse that sk
-    // 3. Otherwise create a new USER#{github_id}
-    let (user_id, existing_user) = if let Some(item) = existing_by_github {
-        (github_user_id.clone(), Some(item))
-    } else if let Some(ref item) = existing_by_email {
-        let sk = item
+    let (team_id, user_id, role) = if let Some(ref item) = existing_user {
+        // Existing user — extract team_id, user_id, role
+        let tid = item
+            .get("pk")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default();
+        let uid = item
             .get("sk")
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or_else(|| github_user_id.clone());
-        info!(
-            github_login,
-            email,
-            sk = %sk,
-            "Linking GitHub to existing email-based user"
-        );
-        (sk, Some(item.clone()))
-    } else {
-        (github_user_id.clone(), None)
-    };
-
-    // Determine role: check existing record, then pending invites, then first-user logic
-    let mut role = "member".to_string();
-
-    if let Some(ref item) = existing_user {
-        // Existing user record — keep their assigned role
-        role = item
+        let r = item
             .get("role")
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or_else(|| "member".to_string());
+        (tid, uid, r)
     } else {
-        // No existing record for this user ID — check for a pending invite by normalized email
-        let invite_result = state
-            .dynamo
-            .query()
-            .table_name(&state.config.users_table_name)
-            .index_name("gsi2")
-            .key_condition_expression("gsi2pk = :email AND gsi2sk = :tid")
-            .expression_attribute_values(":email", attr_s(&format!("EMAIL#{normalized_email}")))
-            .expression_attribute_values(":tid", attr_s(&team_id))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| r.items)
-            .unwrap_or_default();
+        // Brand new user — create a new team with ULID
+        let new_team_id = format!("TEAM#{}", ulid::Ulid::new().to_string().to_lowercase());
+        let uid = github_user_id.clone();
 
-        let pending_invite = invite_result.iter().find(|item| {
-            item.get("status")
-                .and_then(|v| v.as_s().ok())
-                .map(|s| s == "invited")
-                .unwrap_or(false)
-        });
-
-        if let Some(invite) = pending_invite {
-            // Found a pending invite — use its role
-            role = invite
-                .get("role")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-                .unwrap_or_else(|| "member".to_string());
-
-            // Delete the stale invite record
-            if let Some(invite_sk) = invite.get("sk").and_then(|v| v.as_s().ok()) {
-                let _ = state
-                    .dynamo
-                    .delete_item()
-                    .table_name(&state.config.users_table_name)
-                    .key("pk", attr_s(&team_id))
-                    .key("sk", attr_s(invite_sk))
-                    .send()
-                    .await;
-                info!(email = %normalized_email, invite_sk = %invite_sk, role = %role, "Matched pending invite to GitHub user");
-            }
-        } else {
-            // No invite — check if first user (→ owner)
-            let team_users = state
-                .dynamo
-                .query()
-                .table_name(&state.config.users_table_name)
-                .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-                .expression_attribute_values(":pk", attr_s(&team_id))
-                .expression_attribute_values(":prefix", attr_s("USER#"))
-                .limit(1)
-                .send()
-                .await
-                .ok()
-                .map(|r| r.count() as usize)
-                .unwrap_or(0);
-
-            if team_users == 0 {
-                role = "owner".to_string();
-            }
-        }
-    }
-
-    // Upsert user into ALL team user tables
-    for (inst_id, _org) in &all_installations {
-        let tid = format!("TEAM#{inst_id}");
-        let user_role = if tid == team_id {
-            role.clone()
-        } else {
-            // For other teams, check if invited there too
-            let other_existing = state
-                .dynamo
-                .get_item()
-                .table_name(&state.config.users_table_name)
-                .key("pk", attr_s(&tid))
-                .key("sk", attr_s(&user_id))
-                .send()
-                .await
-                .ok()
-                .and_then(|r| r.item().cloned());
-
-            if let Some(ref item) = other_existing {
-                item.get("role")
-                    .and_then(|v| v.as_s().ok())
-                    .cloned()
-                    .unwrap_or_else(|| "member".to_string())
-            } else {
-                let count = state
-                    .dynamo
-                    .query()
-                    .table_name(&state.config.users_table_name)
-                    .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-                    .expression_attribute_values(":pk", attr_s(&tid))
-                    .expression_attribute_values(":prefix", attr_s("USER#"))
-                    .limit(1)
-                    .send()
-                    .await
-                    .ok()
-                    .map(|r| r.count() as usize)
-                    .unwrap_or(0);
-
-                if count == 0 {
-                    "owner".to_string()
-                } else {
-                    "member".to_string()
-                }
-            }
-        };
-
+        // Create team META in main table
         let _ = state
             .dynamo
             .put_item()
-            .table_name(&state.config.users_table_name)
-            .item("pk", attr_s(&tid))
-            .item("sk", attr_s(&user_id))
-            .item("github_id", attr_n(github_id))
-            .item("github_login", attr_s(github_login))
-            .item("email", attr_s(email))
-            .item(
-                "avatar_url",
-                attr_s(user["avatar_url"].as_str().unwrap_or("")),
-            )
-            .item("role", attr_s(&user_role))
-            .item("updated_at", attr_s(&now))
-            .item("gsi1pk", attr_s(&format!("GHUSER#{github_id}")))
-            .item("gsi1sk", attr_s(&tid))
-            .item("gsi2pk", attr_s(&format!("EMAIL#{normalized_email}")))
-            .item("gsi2sk", attr_s(&tid))
+            .table_name(&state.config.table_name)
+            .item("pk", attr_s(&new_team_id))
+            .item("sk", attr_s("META"))
+            .item("status", attr_s("active"))
+            .item("plan", attr_s("free"))
+            .item("run_count_mtd", attr_n(0))
+            .item("created_at", attr_s(&now))
+            .condition_expression("attribute_not_exists(pk)")
             .send()
             .await;
+
+        (new_team_id, uid, "owner".to_string())
+    };
+
+    // Upsert user record
+    let _ = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.users_table_name)
+        .item("pk", attr_s(&team_id))
+        .item("sk", attr_s(&user_id))
+        .item("github_id", attr_n(github_id))
+        .item("github_login", attr_s(github_login))
+        .item("email", attr_s(email))
+        .item(
+            "avatar_url",
+            attr_s(user["avatar_url"].as_str().unwrap_or("")),
+        )
+        .item("role", attr_s(&role))
+        .item("updated_at", attr_s(&now))
+        .item("gsi1pk", attr_s(&format!("GHUSER#{github_id}")))
+        .item("gsi1sk", attr_s(&team_id))
+        .item("gsi2pk", attr_s(&format!("EMAIL#{normalized_email}")))
+        .item("gsi2sk", attr_s(&team_id))
+        .send()
+        .await;
+
+    // Link GitHub installations to the team in the teams table
+    if !all_installations.is_empty() {
+        let (inst_id, ref org) = all_installations[0];
+        // Create/update teams table record with github_installation_id
+        let _ = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.teams_table_name)
+            .item("team_id", attr_s(&team_id))
+            .item("sk", attr_s("META"))
+            .item(
+                "github_installation_id",
+                aws_sdk_dynamodb::types::AttributeValue::N(inst_id.to_string()),
+            )
+            .item("github_org", attr_s(org))
+            .item("updated_at", attr_s(&now))
+            .send()
+            .await;
+
+        info!(
+            github_login,
+            installation_id = inst_id,
+            org = org.as_str(),
+            team_id = %team_id,
+            "Linked GitHub installation to team"
+        );
+
+        // Sync repos from the installation
+        let repos = super::github_webhook::fetch_installation_repos(&state, inst_id).await;
+        for repo in &repos {
+            let full = format!("{}/{}", repo.owner, repo.name);
+            let _ = state
+                .dynamo
+                .put_item()
+                .table_name(&state.config.repos_table_name)
+                .item("pk", attr_s(&team_id))
+                .item("sk", attr_s(&format!("REPO#{full}")))
+                .item("repo_name", attr_s(&full))
+                .item(
+                    "enabled",
+                    aws_sdk_dynamodb::types::AttributeValue::Bool(false),
+                )
+                .item("ticket_source", attr_s("github"))
+                .item("created_at", attr_s(&now))
+                .send()
+                .await;
+        }
     }
 
     info!(
         github_login,
-        installation_id,
         %role,
+        %team_id,
         "User authenticated via GitHub"
     );
 
@@ -1247,6 +1182,18 @@ async fn issue_session_from_cognito(
             .item("status", attr_s("active"))
             .item("created_at", attr_s(&now))
             .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await;
+
+        // Create teams table record
+        let _ = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.teams_table_name)
+            .item("team_id", attr_s(&tid))
+            .item("sk", attr_s("META"))
+            .item("created_at", attr_s(&now))
+            .condition_expression("attribute_not_exists(team_id)")
             .send()
             .await;
 
