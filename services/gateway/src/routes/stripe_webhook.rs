@@ -91,9 +91,7 @@ pub async fn handle(
         }
 
         // Invoice created — auto-finalize threshold invoices so they charge immediately
-        "invoice.created" => {
-            handle_invoice_created(&state, &event["data"]["object"]).await
-        }
+        "invoice.created" => handle_invoice_created(&state, &event["data"]["object"]).await,
 
         // Invoice finalized — ready for download
         "invoice.finalized" => handle_invoice_finalized(&state, &event["data"]["object"]).await,
@@ -856,7 +854,10 @@ async fn handle_invoice_created(
 
     // Only auto-finalize threshold invoices (overage billing)
     if billing_reason != "subscription_threshold" {
-        info!(invoice_id, billing_reason, "invoice.created — not a threshold invoice, skipping");
+        info!(
+            invoice_id,
+            billing_reason, "invoice.created — not a threshold invoice, skipping"
+        );
         return Ok(());
     }
 
@@ -873,7 +874,9 @@ async fn handle_invoice_created(
     // Finalize the draft invoice
     let finalize_resp = state
         .http
-        .post(format!("https://api.stripe.com/v1/invoices/{invoice_id}/finalize"))
+        .post(format!(
+            "https://api.stripe.com/v1/invoices/{invoice_id}/finalize"
+        ))
         .header("Authorization", format!("Bearer {stripe_key}"))
         .send()
         .await?;
@@ -887,7 +890,9 @@ async fn handle_invoice_created(
     // Pay it immediately
     let pay_resp = state
         .http
-        .post(format!("https://api.stripe.com/v1/invoices/{invoice_id}/pay"))
+        .post(format!(
+            "https://api.stripe.com/v1/invoices/{invoice_id}/pay"
+        ))
         .header("Authorization", format!("Bearer {stripe_key}"))
         .send()
         .await?;
@@ -898,7 +903,10 @@ async fn handle_invoice_created(
         return Err(format!("Failed to pay invoice {invoice_id}").into());
     }
 
-    info!(invoice_id, "Threshold invoice finalized and paid immediately");
+    info!(
+        invoice_id,
+        "Threshold invoice finalized and paid immediately"
+    );
     Ok(())
 }
 
