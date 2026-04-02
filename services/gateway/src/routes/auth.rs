@@ -471,7 +471,7 @@ pub async fn google_login(State(state): State<Arc<AppState>>) -> impl IntoRespon
          response_type=code&client_id={client_id}&\
          redirect_uri={redirect_uri}&\
          identity_provider=Google&\
-         scope=openid+email+profile"
+         scope=openid+email+profile+aws.cognito.signin.user.admin"
     );
 
     Redirect::temporary(&url)
