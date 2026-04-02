@@ -1325,6 +1325,7 @@ dependencies = [
  "aws-sdk-sts",
  "aws-smithy-types",
  "axum",
+ "base64",
  "chrono",
  "hex",
  "hmac",

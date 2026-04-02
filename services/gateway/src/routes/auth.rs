@@ -15,7 +15,7 @@ use crate::auth::jwt;
 use crate::AppState;
 
 /// Compute Cognito SECRET_HASH = Base64(HMAC-SHA256(client_secret, username + client_id))
-fn cognito_secret_hash(client_secret: &str, username: &str, client_id: &str) -> String {
+pub fn cognito_secret_hash(client_secret: &str, username: &str, client_id: &str) -> String {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(client_secret.as_bytes()).expect("HMAC key length");
     mac.update(username.as_bytes());

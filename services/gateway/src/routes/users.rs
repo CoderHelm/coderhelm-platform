@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::models::Claims;
+use crate::routes::auth::cognito_secret_hash;
 use crate::AppState;
 
 // ── Request bodies ──────────────────────────────────────────────────
@@ -32,12 +33,12 @@ pub struct ChangePasswordRequest {
 
 #[derive(Deserialize)]
 pub struct EnableMfaRequest {
-    pub access_token: String,
+    pub password: String,
 }
 
 #[derive(Deserialize)]
 pub struct VerifyMfaRequest {
-    pub access_token: String,
+    pub password: String,
     pub code: String,
     pub session: String,
 }
@@ -345,6 +346,12 @@ pub async fn change_password(
     Json(body): Json<ChangePasswordRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     // First authenticate with current password to get access token
+    let hash = cognito_secret_hash(
+        &state.cognito_client_secret,
+        &claims.email,
+        &state.config.cognito_client_id,
+    );
+
     let auth_result = state
         .cognito
         .initiate_auth()
@@ -352,6 +359,7 @@ pub async fn change_password(
         .auth_flow(aws_sdk_cognitoidentityprovider::types::AuthFlowType::UserPasswordAuth)
         .auth_parameters("USERNAME", &claims.email)
         .auth_parameters("PASSWORD", &body.current_password)
+        .auth_parameters("SECRET_HASH", &hash)
         .send()
         .await
         .map_err(|e| {
@@ -391,10 +399,37 @@ pub async fn mfa_setup(
     Extension(claims): Extension<Claims>,
     Json(body): Json<EnableMfaRequest>,
 ) -> Result<Json<Value>, StatusCode> {
+    // Authenticate to get a Cognito access token
+    let hash = cognito_secret_hash(
+        &state.cognito_client_secret,
+        &claims.email,
+        &state.config.cognito_client_id,
+    );
+
+    let auth_result = state
+        .cognito
+        .initiate_auth()
+        .client_id(&state.config.cognito_client_id)
+        .auth_flow(aws_sdk_cognitoidentityprovider::types::AuthFlowType::UserPasswordAuth)
+        .auth_parameters("USERNAME", &claims.email)
+        .auth_parameters("PASSWORD", &body.password)
+        .auth_parameters("SECRET_HASH", &hash)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("MFA setup auth failed: {e}");
+            StatusCode::UNAUTHORIZED
+        })?;
+
+    let access_token = auth_result
+        .authentication_result()
+        .and_then(|r| r.access_token())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
     let result = state
         .cognito
         .associate_software_token()
-        .access_token(&body.access_token)
+        .access_token(access_token)
         .send()
         .await
         .map_err(|e| {
@@ -421,11 +456,38 @@ pub async fn mfa_verify_setup(
     Extension(claims): Extension<Claims>,
     Json(body): Json<VerifyMfaRequest>,
 ) -> Result<Json<Value>, StatusCode> {
+    // Authenticate to get a Cognito access token
+    let hash = cognito_secret_hash(
+        &state.cognito_client_secret,
+        &claims.email,
+        &state.config.cognito_client_id,
+    );
+
+    let auth_result = state
+        .cognito
+        .initiate_auth()
+        .client_id(&state.config.cognito_client_id)
+        .auth_flow(aws_sdk_cognitoidentityprovider::types::AuthFlowType::UserPasswordAuth)
+        .auth_parameters("USERNAME", &claims.email)
+        .auth_parameters("PASSWORD", &body.password)
+        .auth_parameters("SECRET_HASH", &hash)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("MFA verify auth failed: {e}");
+            StatusCode::UNAUTHORIZED
+        })?;
+
+    let access_token = auth_result
+        .authentication_result()
+        .and_then(|r| r.access_token())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
     // Verify the TOTP token
     let mut req = state
         .cognito
         .verify_software_token()
-        .access_token(&body.access_token)
+        .access_token(access_token)
         .user_code(&body.code);
 
     if !body.session.is_empty() {
