@@ -16,8 +16,8 @@ use crate::AppState;
 
 /// Compute Cognito SECRET_HASH = Base64(HMAC-SHA256(client_secret, username + client_id))
 fn cognito_secret_hash(client_secret: &str, username: &str, client_id: &str) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(client_secret.as_bytes())
-        .expect("HMAC key length");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(client_secret.as_bytes()).expect("HMAC key length");
     mac.update(username.as_bytes());
     mac.update(client_id.as_bytes());
     STANDARD.encode(mac.finalize().into_bytes())
@@ -147,7 +147,11 @@ pub async fn signup(
         ));
     }
 
-    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
+    let hash = cognito_secret_hash(
+        &state.cognito_client_secret,
+        &email,
+        &state.config.cognito_client_id,
+    );
 
     let mut req = state
         .cognito
@@ -219,7 +223,11 @@ pub async fn verify_email(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let email = body.email.trim().to_lowercase();
 
-    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
+    let hash = cognito_secret_hash(
+        &state.cognito_client_secret,
+        &email,
+        &state.config.cognito_client_id,
+    );
 
     state
         .cognito
@@ -316,7 +324,11 @@ pub async fn login_email(
 ) -> Result<Response, StatusCode> {
     let email = body.email.trim().to_lowercase();
 
-    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
+    let hash = cognito_secret_hash(
+        &state.cognito_client_secret,
+        &email,
+        &state.config.cognito_client_id,
+    );
 
     let auth_result = state
         .cognito
@@ -373,7 +385,11 @@ pub async fn mfa_verify(
     Json(body): Json<MfaChallengeRequest>,
 ) -> Result<Response, StatusCode> {
     let email = body.email.trim().to_lowercase();
-    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
+    let hash = cognito_secret_hash(
+        &state.cognito_client_secret,
+        &email,
+        &state.config.cognito_client_id,
+    );
 
     let result = state
         .cognito
@@ -429,7 +445,11 @@ pub async fn forgot_password(
     Json(body): Json<ForgotPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let email = body.email.trim().to_lowercase();
-    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
+    let hash = cognito_secret_hash(
+        &state.cognito_client_secret,
+        &email,
+        &state.config.cognito_client_id,
+    );
 
     // Always return success to prevent email enumeration
     let _ = state
@@ -453,7 +473,11 @@ pub async fn confirm_reset(
     Json(body): Json<ConfirmResetRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let email = body.email.trim().to_lowercase();
-    let hash = cognito_secret_hash(&state.cognito_client_secret, &email, &state.config.cognito_client_id);
+    let hash = cognito_secret_hash(
+        &state.cognito_client_secret,
+        &email,
+        &state.config.cognito_client_id,
+    );
 
     state
         .cognito
