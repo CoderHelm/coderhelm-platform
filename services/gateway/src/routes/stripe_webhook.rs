@@ -884,8 +884,7 @@ async fn handle_invoice_created(
     // so the month that just ended is the one before that.
     let period_end = invoice["period_end"].as_i64().unwrap_or(0);
     let ended_month = if period_end > 0 {
-        let dt =
-            chrono::DateTime::from_timestamp(period_end, 0).unwrap_or_else(|| chrono::Utc::now());
+        let dt = chrono::DateTime::from_timestamp(period_end, 0).unwrap_or_else(chrono::Utc::now);
         // Go back 1 day to land in the previous period
         let prev = dt - chrono::Duration::days(1);
         prev.format("%Y-%m").to_string()

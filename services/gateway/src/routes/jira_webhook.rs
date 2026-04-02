@@ -778,7 +778,7 @@ fn extract_adf_text_inner(value: &Value, parts: &mut Vec<String>) {
                     extract_adf_text_inner(child, parts);
                 }
             }
-            if is_block && !parts.last().map_or(true, |s| s.ends_with('\n')) {
+            if is_block && !parts.last().is_none_or(|s| s.ends_with('\n')) {
                 parts.push("\n".to_string());
             }
         }
