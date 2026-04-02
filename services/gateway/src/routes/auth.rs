@@ -536,7 +536,10 @@ pub async fn google_callback(
 
     let access_token = token_data["access_token"]
         .as_str()
-        .ok_or(StatusCode::BAD_GATEWAY)?;
+        .ok_or_else(|| {
+            error!("No access_token in Cognito response: {token_data}");
+            StatusCode::BAD_GATEWAY
+        })?;
 
     // Get user info from Cognito
     let user = state
@@ -546,7 +549,7 @@ pub async fn google_callback(
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to get Cognito user: {e}");
+            error!("Failed to get Cognito user: {e:?}");
             StatusCode::BAD_GATEWAY
         })?;
 
