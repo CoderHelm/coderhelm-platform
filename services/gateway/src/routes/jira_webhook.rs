@@ -598,6 +598,14 @@ async fn handle_jira_comment(
             );
             send_to_queue(state, &state.config.feedback_queue_url, &message).await
         }
+        // Running/queued — don't reprocess
+        "running" | "queued" => {
+            info!(
+                ticket_key,
+                run_status, "Ignoring Jira comment — run already in progress"
+            );
+            Ok(StatusCode::OK)
+        }
         _ => {
             info!(
                 ticket_key,
