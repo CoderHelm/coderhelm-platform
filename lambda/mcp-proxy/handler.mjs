@@ -41,6 +41,19 @@ export async function handler(event) {
     ...env_vars,
   };
 
+  // Notion MCP expects OPENAPI_MCP_HEADERS as JSON: {"Authorization":"Bearer <token>","Notion-Version":"2022-06-28"}
+  // If the value is a raw token (not valid JSON), wrap it automatically.
+  if (childEnv.OPENAPI_MCP_HEADERS) {
+    try {
+      JSON.parse(childEnv.OPENAPI_MCP_HEADERS);
+    } catch {
+      childEnv.OPENAPI_MCP_HEADERS = JSON.stringify({
+        Authorization: `Bearer ${childEnv.OPENAPI_MCP_HEADERS}`,
+        "Notion-Version": "2022-06-28",
+      });
+    }
+  }
+
   let transport;
   let client;
 
