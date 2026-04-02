@@ -512,7 +512,7 @@ pub async fn list_catalog() -> Json<Value> {
     Json(json!({ "plugins": CATALOG }))
 }
 
-/// GET /api/plugins — list plugins enabled for this tenant.
+/// GET /api/plugins — list plugins enabled for this team.
 pub async fn list_enabled(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -522,7 +522,7 @@ pub async fn list_enabled(
         .query()
         .table_name(mcp_table(&state))
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("PLUGIN#"))
         .send()
         .await
@@ -585,7 +585,7 @@ pub async fn enable_plugin(
         .dynamo
         .put_item()
         .table_name(mcp_table(&state))
-        .item("pk", attr_s(&claims.tenant_id))
+        .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
         .item("enabled", AttributeValue::Bool(true))
         .item("has_credentials", AttributeValue::Bool(false))
@@ -597,7 +597,7 @@ pub async fn enable_plugin(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(tenant = %claims.tenant_id, plugin = %plugin_id, "Plugin enabled");
+    info!(team = %claims.team_id, plugin = %plugin_id, "Plugin enabled");
     Ok(Json(json!({ "status": "enabled", "plugin_id": plugin_id })))
 }
 
@@ -615,7 +615,7 @@ pub async fn disable_plugin(
         .dynamo
         .delete_item()
         .table_name(mcp_table(&state))
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
         .send()
         .await
@@ -624,7 +624,7 @@ pub async fn disable_plugin(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(tenant = %claims.tenant_id, plugin = %plugin_id, "Plugin disabled");
+    info!(team = %claims.team_id, plugin = %plugin_id, "Plugin disabled");
     Ok(Json(
         json!({ "status": "disabled", "plugin_id": plugin_id }),
     ))
@@ -677,7 +677,7 @@ pub async fn update_credentials(
         .dynamo
         .update_item()
         .table_name(mcp_table(&state))
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
         .update_expression(
             "SET credentials = :creds, has_credentials = :hc, credentials_updated_at = :ts",
@@ -693,7 +693,7 @@ pub async fn update_credentials(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(tenant = %claims.tenant_id, plugin = %plugin_id, "Plugin credentials updated");
+    info!(team = %claims.team_id, plugin = %plugin_id, "Plugin credentials updated");
     Ok(Json(json!({ "status": "saved" })))
 }
 
@@ -728,7 +728,7 @@ pub async fn update_prompt(
         .dynamo
         .update_item()
         .table_name(mcp_table(&state))
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
         .update_expression("SET custom_prompt = :cp")
         .expression_attribute_values(":cp", attr_s(&custom_prompt))
@@ -740,7 +740,7 @@ pub async fn update_prompt(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(tenant = %claims.tenant_id, plugin = %plugin_id, "Plugin custom prompt updated");
+    info!(team = %claims.team_id, plugin = %plugin_id, "Plugin custom prompt updated");
     Ok(Json(json!({ "status": "saved" })))
 }
 
@@ -760,7 +760,7 @@ pub async fn test_connection(
         .dynamo
         .get_item()
         .table_name(mcp_table(&state))
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
         .send()
         .await
@@ -819,7 +819,7 @@ pub async fn test_connection(
         serde_json::from_slice(&response_payload).unwrap_or(json!({}));
 
     if let Some(err) = response.get("error").and_then(|v| v.as_str()) {
-        info!(tenant = %claims.tenant_id, plugin = %plugin_id, "Plugin test failed: {err}");
+        info!(team = %claims.team_id, plugin = %plugin_id, "Plugin test failed: {err}");
         return Ok(Json(json!({ "status": "error", "message": err })));
     }
 
@@ -829,6 +829,6 @@ pub async fn test_connection(
         .map(|a| a.len())
         .unwrap_or(0);
 
-    info!(tenant = %claims.tenant_id, plugin = %plugin_id, tools = tool_count, "Plugin test succeeded");
+    info!(team = %claims.team_id, plugin = %plugin_id, tools = tool_count, "Plugin test succeeded");
     Ok(Json(json!({ "status": "ok", "tool_count": tool_count })))
 }

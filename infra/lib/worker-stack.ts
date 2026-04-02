@@ -12,6 +12,7 @@ import { Construct } from "constructs";
 interface WorkerStackProps extends cdk.StackProps {
   stage: string;
   table: dynamodb.TableV2;
+  teamsTable: dynamodb.TableV2;
   runsTable: dynamodb.TableV2;
   analyticsTable: dynamodb.TableV2;
   usersTable: dynamodb.TableV2;
@@ -65,6 +66,7 @@ export class WorkerStack extends cdk.Stack {
         environment: {
         STAGE: props.stage,
         TABLE_NAME: props.table.tableName,
+        TEAMS_TABLE_NAME: props.teamsTable.tableName,
         RUNS_TABLE_NAME: props.runsTable.tableName,
         ANALYTICS_TABLE_NAME: props.analyticsTable.tableName,
         USERS_TABLE_NAME: props.usersTable.tableName,
@@ -87,6 +89,7 @@ export class WorkerStack extends cdk.Stack {
 
     // DynamoDB: read/write all tables
     props.table.grantReadWriteData(this.workerFunction);
+    props.teamsTable.grantReadWriteData(this.workerFunction);
     props.runsTable.grantReadWriteData(this.workerFunction);
     props.analyticsTable.grantReadWriteData(this.workerFunction);
     props.usersTable.grantReadData(this.workerFunction);

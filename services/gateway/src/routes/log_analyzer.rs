@@ -56,7 +56,7 @@ pub async fn create_connection(
     Extension(claims): Extension<Claims>,
     Json(body): Json<CreateConnectionRequest>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_paid_subscription(&state, &claims.team_id).await?;
     // Only owner/admin can manage AWS connections
     if !is_admin_or_owner(&claims.role) {
         return Err(StatusCode::FORBIDDEN);
@@ -104,7 +104,7 @@ pub async fn create_connection(
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&claims.tenant_id))
+        .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(&conn_id))
         .item("role_arn", attr_s(&body.role_arn))
         .item("external_id", attr_s(&external_id))
@@ -123,7 +123,7 @@ pub async fn create_connection(
         })?;
 
     info!(
-        tenant_id = claims.tenant_id,
+        team_id = claims.team_id,
         account_id, "AWS connection created"
     );
 
@@ -135,18 +135,18 @@ pub async fn create_connection(
     })))
 }
 
-/// GET /api/aws-connections — list all AWS connections for tenant
+/// GET /api/aws-connections — list all AWS connections for team
 pub async fn list_connections(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_paid_subscription(&state, &claims.team_id).await?;
     let result = state
         .dynamo
         .query()
         .table_name(&state.config.settings_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("AWS_CONN#"))
         .send()
         .await
@@ -193,7 +193,7 @@ pub async fn update_connection(
     Path(connection_id): Path<String>,
     Json(body): Json<UpdateConnectionRequest>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_paid_subscription(&state, &claims.team_id).await?;
     if !is_admin_or_owner(&claims.role) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -225,7 +225,7 @@ pub async fn update_connection(
         .dynamo
         .update_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .update_expression(format!("SET {}", update_expr.join(", ")))
         .condition_expression("attribute_exists(pk)");
@@ -240,7 +240,7 @@ pub async fn update_connection(
     })?;
 
     info!(
-        tenant_id = claims.tenant_id,
+        team_id = claims.team_id,
         connection_id, "AWS connection updated"
     );
 
@@ -253,7 +253,7 @@ pub async fn delete_connection(
     Extension(claims): Extension<Claims>,
     Path(connection_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_paid_subscription(&state, &claims.team_id).await?;
     if !is_admin_or_owner(&claims.role) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -264,7 +264,7 @@ pub async fn delete_connection(
         .dynamo
         .delete_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .send()
         .await
@@ -274,7 +274,7 @@ pub async fn delete_connection(
         })?;
 
     info!(
-        tenant_id = claims.tenant_id,
+        team_id = claims.team_id,
         connection_id, "AWS connection deleted"
     );
 
@@ -287,14 +287,14 @@ pub async fn test_connection(
     Extension(claims): Extension<Claims>,
     Path(connection_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_paid_subscription(&state, &claims.team_id).await?;
     let sk = format!("AWS_CONN#{connection_id}");
 
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .send()
         .await
@@ -333,7 +333,7 @@ pub async fn test_connection(
                 .dynamo
                 .update_item()
                 .table_name(&state.config.settings_table_name)
-                .key("pk", attr_s(&claims.tenant_id))
+                .key("pk", attr_s(&claims.team_id))
                 .key("sk", attr_s(&sk))
                 .update_expression("SET #s = :s, updated_at = :t")
                 .expression_attribute_names("#s", "status")
@@ -354,7 +354,7 @@ pub async fn test_connection(
                 .dynamo
                 .update_item()
                 .table_name(&state.config.settings_table_name)
-                .key("pk", attr_s(&claims.tenant_id))
+                .key("pk", attr_s(&claims.team_id))
                 .key("sk", attr_s(&sk))
                 .update_expression("SET #s = :s, updated_at = :t, last_error = :e")
                 .expression_attribute_names("#s", "status")
@@ -378,14 +378,14 @@ pub async fn discover_log_groups(
     Extension(claims): Extension<Claims>,
     Path(connection_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_paid_subscription(&state, &claims.team_id).await?;
     let sk = format!("AWS_CONN#{connection_id}");
 
     let item = state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .send()
         .await
@@ -485,7 +485,7 @@ pub async fn get_cfn_url(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_paid_subscription(&state, &claims.team_id).await?;
     if !is_admin_or_owner(&claims.role) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -519,13 +519,13 @@ pub struct RecommendationsQuery {
     limit: Option<i32>,
 }
 
-/// GET /api/recommendations — list recommendations for tenant
+/// GET /api/recommendations — list recommendations for team
 pub async fn list_recommendations(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Query(params): Query<RecommendationsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_paid_subscription(&state, &claims.team_id).await?;
     let limit = params.limit.unwrap_or(50).min(100);
 
     let result = state
@@ -533,7 +533,7 @@ pub async fn list_recommendations(
         .query()
         .table_name(&state.config.settings_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("REC#"))
         .scan_index_forward(false)
         .limit(limit)
@@ -578,7 +578,7 @@ pub async fn create_plan_from_recommendation(
     Extension(claims): Extension<Claims>,
     Path(rec_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_paid_subscription(&state, &claims.team_id).await?;
     if !is_admin_or_owner(&claims.role) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -590,7 +590,7 @@ pub async fn create_plan_from_recommendation(
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .send()
         .await
@@ -630,7 +630,7 @@ pub async fn create_plan_from_recommendation(
         .dynamo
         .put_item()
         .table_name(&state.config.plans_table_name)
-        .item("pk", attr_s(&claims.tenant_id))
+        .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(&format!("PLAN#{plan_id}")))
         .item("plan_id", attr_s(&plan_id))
         .item("title", attr_s(&format!("Fix: {title}")))
@@ -654,7 +654,7 @@ pub async fn create_plan_from_recommendation(
         .dynamo
         .update_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .update_expression("SET #s = :s, plan_id = :pid, updated_at = :t")
         .expression_attribute_names("#s", "status")
@@ -665,7 +665,7 @@ pub async fn create_plan_from_recommendation(
         .await;
 
     info!(
-        tenant_id = claims.tenant_id,
+        team_id = claims.team_id,
         rec_id, plan_id, "Plan created from recommendation"
     );
 
@@ -681,7 +681,7 @@ pub async fn dismiss_recommendation(
     Extension(claims): Extension<Claims>,
     Path(rec_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_paid_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_paid_subscription(&state, &claims.team_id).await?;
     let sk = format!("REC#{rec_id}");
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -689,7 +689,7 @@ pub async fn dismiss_recommendation(
         .dynamo
         .update_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .update_expression("SET #s = :s, updated_at = :t, dismissed_by = :u")
         .expression_attribute_names("#s", "status")
@@ -704,10 +704,7 @@ pub async fn dismiss_recommendation(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(
-        tenant_id = claims.tenant_id,
-        rec_id, "Recommendation dismissed"
-    );
+    info!(team_id = claims.team_id, rec_id, "Recommendation dismissed");
 
     Ok(Json(json!({ "status": "dismissed" })))
 }

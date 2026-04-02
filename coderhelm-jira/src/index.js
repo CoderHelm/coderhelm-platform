@@ -41,7 +41,7 @@ exports.handler = async (event, context) => {
       },
       coderhelm: {
         installation_id: parseInt(config.installationId, 10),
-        tenant_id: config.tenantId || undefined,
+        team_id: config.teamId || undefined,
       },
     };
 
@@ -98,7 +98,7 @@ exports.handler = async (event, context) => {
       repo_owner: repoOwner || undefined,
       repo_name: repoName || undefined,
       installation_id: parseInt(config.installationId, 10),
-      tenant_id: config.tenantId || undefined,
+      team_id: config.teamId || undefined,
     },
   };
 

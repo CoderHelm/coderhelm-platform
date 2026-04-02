@@ -22,13 +22,13 @@ pub async fn run(
     triage: &super::triage::TriageResult,
     usage: &mut TokenUsage,
 ) -> Result<PlanResult, Box<dyn std::error::Error + Send + Sync>> {
-    // Fetch all enabled repos for this tenant so the planner can explore cross-repo
-    let tenant_repos = fetch_tenant_repos(state, &msg.tenant_id).await;
+    // Fetch all enabled repos for this team so the planner can explore cross-repo
+    let team_repos = fetch_team_repos(state, &msg.team_id).await;
     let default_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
-    let repos_list = if tenant_repos.is_empty() {
+    let repos_list = if team_repos.is_empty() {
         format!("- {default_repo} (this repo)")
     } else {
-        tenant_repos
+        team_repos
             .iter()
             .map(|r| {
                 if r == &default_repo {
@@ -122,13 +122,8 @@ After researching, output the four files using this exact format:
     } else {
         &state.config.mcp_configs_table_name
     };
-    let mcp_plugins = mcp::load_tenant_plugins(
-        &state.dynamo,
-        mcp_table,
-        &msg.tenant_id,
-        &super::MCP_CATALOG,
-    )
-    .await;
+    let mcp_plugins =
+        mcp::load_team_plugins(&state.dynamo, mcp_table, &msg.team_id, &super::MCP_CATALOG).await;
 
     let mut loaded_mcp_plugins = Vec::new();
     for plugin in &mcp_plugins {
@@ -176,7 +171,7 @@ After researching, output the four files using this exact format:
             github,
             default_owner: &msg.repo_owner,
             default_repo: &msg.repo_name,
-            allowed_repos: &tenant_repos,
+            allowed_repos: &team_repos,
         },
         mcp_plugins: &loaded_mcp_plugins,
         lambda: &state.lambda,
@@ -203,8 +198,8 @@ After researching, output the four files using this exact format:
 
     // Write openspec to S3
     let prefix = format!(
-        "tenants/{}/runs/{}/openspec",
-        msg.tenant_id,
+        "teams/{}/runs/{}/openspec",
+        msg.team_id,
         msg.ticket_id.to_lowercase()
     );
     for (name, content) in [
@@ -445,8 +440,8 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
     }
 }
 
-/// Fetch enabled repos for a tenant from DynamoDB.
-pub async fn fetch_tenant_repos(state: &WorkerState, tenant_id: &str) -> Vec<String> {
+/// Fetch enabled repos for a team from DynamoDB.
+pub async fn fetch_team_repos(state: &WorkerState, team_id: &str) -> Vec<String> {
     let result = state
         .dynamo
         .query()
@@ -454,7 +449,7 @@ pub async fn fetch_tenant_repos(state: &WorkerState, tenant_id: &str) -> Vec<Str
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(
             ":pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
         )
         .expression_attribute_values(
             ":prefix",
@@ -476,7 +471,7 @@ pub async fn fetch_tenant_repos(state: &WorkerState, tenant_id: &str) -> Vec<Str
             .filter_map(|item| item.get("repo_name").and_then(|v| v.as_s().ok()).cloned())
             .collect(),
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to fetch tenant repos for planner");
+            tracing::warn!(error = %e, "Failed to fetch team repos for planner");
             Vec::new()
         }
     }

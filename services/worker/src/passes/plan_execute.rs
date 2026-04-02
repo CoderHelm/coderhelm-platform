@@ -9,17 +9,17 @@ pub async fn run(
     state: &WorkerState,
     msg: PlanExecuteMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, tasks = msg.tasks.len(), "Starting plan execution");
+    info!(team_id = %msg.team_id, plan_id = %msg.plan_id, tasks = msg.tasks.len(), "Starting plan execution");
 
-    // Get tenant install_id
-    let install_id = get_install_id(state, &msg.tenant_id).await?;
+    // Get team install_id
+    let install_id = get_install_id(state, &msg.team_id).await?;
     let Some(install_id) = install_id else {
-        error!(tenant_id = %msg.tenant_id, "Tenant not found for plan execute");
+        error!(team_id = %msg.team_id, "Team not found for plan execute");
         return Ok(());
     };
 
     // Get the plan to find the repo
-    let plan_repo = get_plan_repo(state, &msg.tenant_id, &msg.plan_id).await?;
+    let plan_repo = get_plan_repo(state, &msg.team_id, &msg.plan_id).await?;
 
     let github = crate::clients::github::GitHubClient::new(
         &state.secrets.github_app_id,
@@ -29,14 +29,14 @@ pub async fn run(
     )?;
 
     // Load Jira config for create-ticket URL (only needed if any task targets Jira)
-    let jira_create_url = load_jira_create_url(state, &msg.tenant_id).await;
-    let jira_default_project = load_jira_default_project(state, &msg.tenant_id).await;
-    let jira_site_url = load_jira_site_url(state, &msg.tenant_id).await;
+    let jira_create_url = load_jira_create_url(state, &msg.team_id).await;
+    let jira_default_project = load_jira_default_project(state, &msg.team_id).await;
+    let jira_site_url = load_jira_site_url(state, &msg.team_id).await;
 
     // Ensure the "coderhelm" label exists in each repo we'll use (GitHub only)
     let mut ensured_repos = std::collections::HashSet::new();
     for task_id in &msg.tasks {
-        if let Ok(Some(task)) = get_task(state, &msg.tenant_id, &msg.plan_id, task_id).await {
+        if let Ok(Some(task)) = get_task(state, &msg.team_id, &msg.plan_id, task_id).await {
             if task.destination.as_deref() == Some("jira") {
                 continue;
             }
@@ -56,7 +56,7 @@ pub async fn run(
 
     // Execute tasks in order
     for task_id in &msg.tasks {
-        let task = get_task(state, &msg.tenant_id, &msg.plan_id, task_id).await?;
+        let task = get_task(state, &msg.team_id, &msg.plan_id, task_id).await?;
         let Some(task) = task else {
             error!(task_id, "Task not found");
             continue;
@@ -66,13 +66,13 @@ pub async fn run(
         if let Some(ref dep) = task.depends_on {
             if !dep.is_empty() {
                 info!(task_id, depends_on = %dep, "Task has dependency — marking as waiting");
-                set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "waiting").await?;
+                set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "waiting").await?;
                 continue;
             }
         }
 
         // Update task status to "running"
-        set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "running").await?;
+        set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "running").await?;
 
         if task.destination.as_deref() == Some("jira") {
             // ── Create Jira ticket via Forge web trigger ──
@@ -85,13 +85,13 @@ pub async fn run(
 
             if project_key.is_empty() {
                 error!(task_id, "No Jira project configured for task");
-                set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 continue;
             }
 
             let Some(ref url) = jira_create_url else {
                 error!(task_id, "No Jira create-ticket URL configured");
-                set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 continue;
             };
 
@@ -132,7 +132,7 @@ pub async fn run(
 
                     update_task_with_jira(
                         state,
-                        &msg.tenant_id,
+                        &msg.team_id,
                         &msg.plan_id,
                         task_id,
                         ticket_key,
@@ -146,11 +146,11 @@ pub async fn run(
                     let status = resp.status().as_u16();
                     let body = resp.text().await.unwrap_or_default();
                     error!(task_id, status, body = %body, "Failed to create Jira ticket");
-                    set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                    set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 }
                 Err(e) => {
                     error!(task_id, error = %e, "Failed to call Forge create-ticket");
-                    set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                    set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 }
             }
         } else {
@@ -162,7 +162,7 @@ pub async fn run(
                 .unwrap_or(&plan_repo);
             if task_repo.is_empty() {
                 error!(task_id, "No repo configured for task or plan");
-                set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 continue;
             }
 
@@ -180,7 +180,7 @@ pub async fn run(
                         .await
                     {
                         error!(task_id, issue_number, error = %e, "Failed to add coderhelm label — issue won't auto-run");
-                        set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed")
+                        set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed")
                             .await?;
                         continue;
                     }
@@ -188,7 +188,7 @@ pub async fn run(
                     // Only mark done after label is confirmed
                     update_task_with_issue(
                         state,
-                        &msg.tenant_id,
+                        &msg.team_id,
                         &msg.plan_id,
                         task_id,
                         issue_number,
@@ -200,7 +200,7 @@ pub async fn run(
                 }
                 Err(e) => {
                     error!(task_id, error = %e, "Failed to create GitHub issue");
-                    set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                    set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 }
             }
         }
@@ -212,7 +212,7 @@ pub async fn run(
         .query()
         .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(msg.tenant_id.clone()))
+        .expression_attribute_values(":pk", AttributeValue::S(msg.team_id.clone()))
         .expression_attribute_values(
             ":sk_prefix",
             AttributeValue::S(format!("PLAN#{}#TASK#", msg.plan_id)),
@@ -233,14 +233,14 @@ pub async fn run(
             .dynamo
             .update_item()
             .table_name(&state.config.plans_table_name)
-            .key("pk", AttributeValue::S(msg.tenant_id.clone()))
+            .key("pk", AttributeValue::S(msg.team_id.clone()))
             .key("sk", AttributeValue::S(format!("PLAN#{}", msg.plan_id)))
             .update_expression("SET #s = :s")
             .expression_attribute_names("#s", "status")
             .expression_attribute_values(":s", AttributeValue::S("waiting".to_string()))
             .send()
             .await?;
-        info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, "Plan has waiting tasks — not marking done");
+        info!(team_id = %msg.team_id, plan_id = %msg.plan_id, "Plan has waiting tasks — not marking done");
     } else {
         // Mark plan as done
         let now = chrono::Utc::now().to_rfc3339();
@@ -248,7 +248,7 @@ pub async fn run(
             .dynamo
             .update_item()
             .table_name(&state.config.plans_table_name)
-            .key("pk", AttributeValue::S(msg.tenant_id.clone()))
+            .key("pk", AttributeValue::S(msg.team_id.clone()))
             .key("sk", AttributeValue::S(format!("PLAN#{}", msg.plan_id)))
             .update_expression("SET #s = :s, executed_at = :ea, executed_by = :eb")
             .expression_attribute_names("#s", "status")
@@ -257,7 +257,7 @@ pub async fn run(
             .expression_attribute_values(":eb", AttributeValue::S(msg.triggered_by.clone()))
             .send()
             .await?;
-        info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, "Plan execution complete");
+        info!(team_id = %msg.team_id, plan_id = %msg.plan_id, "Plan execution complete");
     }
     Ok(())
 }
@@ -266,13 +266,13 @@ pub async fn run(
 
 async fn get_install_id(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
 ) -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> {
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S("META".to_string()))
         .send()
         .await?;
@@ -286,14 +286,14 @@ async fn get_install_id(
 
 async fn get_plan_repo(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     plan_id: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S(format!("PLAN#{plan_id}")))
         .send()
         .await?;
@@ -316,7 +316,7 @@ struct TaskData {
 
 async fn get_task(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     plan_id: &str,
     task_id: &str,
 ) -> Result<Option<TaskData>, Box<dyn std::error::Error + Send + Sync>> {
@@ -324,7 +324,7 @@ async fn get_task(
         .dynamo
         .get_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key(
             "sk",
             AttributeValue::S(format!("PLAN#{plan_id}#TASK#{task_id}")),
@@ -349,7 +349,7 @@ async fn get_task(
 
 async fn set_task_status(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     plan_id: &str,
     task_id: &str,
     status: &str,
@@ -358,7 +358,7 @@ async fn set_task_status(
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key(
             "sk",
             AttributeValue::S(format!("PLAN#{plan_id}#TASK#{task_id}")),
@@ -373,7 +373,7 @@ async fn set_task_status(
 
 async fn update_task_with_issue(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     plan_id: &str,
     task_id: &str,
     issue_number: u64,
@@ -384,7 +384,7 @@ async fn update_task_with_issue(
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key(
             "sk",
             AttributeValue::S(format!("PLAN#{plan_id}#TASK#{task_id}")),
@@ -416,12 +416,12 @@ fn split_repo(repo_full: &str) -> (&str, &str) {
     (owner, repo)
 }
 
-async fn load_jira_create_url(state: &WorkerState, tenant_id: &str) -> Option<String> {
+async fn load_jira_create_url(state: &WorkerState, team_id: &str) -> Option<String> {
     state
         .dynamo
         .get_item()
         .table_name(&state.config.jira_config_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S("JIRA#config".to_string()))
         .send()
         .await
@@ -435,12 +435,12 @@ async fn load_jira_create_url(state: &WorkerState, tenant_id: &str) -> Option<St
         })
 }
 
-async fn load_jira_default_project(state: &WorkerState, tenant_id: &str) -> Option<String> {
+async fn load_jira_default_project(state: &WorkerState, team_id: &str) -> Option<String> {
     state
         .dynamo
         .get_item()
         .table_name(&state.config.jira_config_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S("JIRA#config".to_string()))
         .send()
         .await
@@ -454,12 +454,12 @@ async fn load_jira_default_project(state: &WorkerState, tenant_id: &str) -> Opti
         })
 }
 
-async fn load_jira_site_url(state: &WorkerState, tenant_id: &str) -> Option<String> {
+async fn load_jira_site_url(state: &WorkerState, team_id: &str) -> Option<String> {
     state
         .dynamo
         .get_item()
         .table_name(&state.config.jira_config_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S("JIRA#config".to_string()))
         .send()
         .await
@@ -475,7 +475,7 @@ async fn load_jira_site_url(state: &WorkerState, tenant_id: &str) -> Option<Stri
 
 async fn update_task_with_jira(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     plan_id: &str,
     task_id: &str,
     ticket_key: &str,
@@ -486,7 +486,7 @@ async fn update_task_with_jira(
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key(
             "sk",
             AttributeValue::S(format!("PLAN#{plan_id}#TASK#{task_id}")),
@@ -509,15 +509,15 @@ pub async fn continue_tasks(
     state: &WorkerState,
     msg: PlanTaskContinueMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, tasks = msg.tasks.len(), "Continuing waiting plan tasks");
+    info!(team_id = %msg.team_id, plan_id = %msg.plan_id, tasks = msg.tasks.len(), "Continuing waiting plan tasks");
 
-    let install_id = get_install_id(state, &msg.tenant_id).await?;
+    let install_id = get_install_id(state, &msg.team_id).await?;
     let Some(install_id) = install_id else {
-        error!(tenant_id = %msg.tenant_id, "Tenant not found for plan task continue");
+        error!(team_id = %msg.team_id, "Team not found for plan task continue");
         return Ok(());
     };
 
-    let plan_repo = get_plan_repo(state, &msg.tenant_id, &msg.plan_id).await?;
+    let plan_repo = get_plan_repo(state, &msg.team_id, &msg.plan_id).await?;
 
     let github = crate::clients::github::GitHubClient::new(
         &state.secrets.github_app_id,
@@ -526,14 +526,14 @@ pub async fn continue_tasks(
         &state.http,
     )?;
 
-    let jira_create_url = load_jira_create_url(state, &msg.tenant_id).await;
-    let jira_default_project = load_jira_default_project(state, &msg.tenant_id).await;
-    let jira_site_url = load_jira_site_url(state, &msg.tenant_id).await;
+    let jira_create_url = load_jira_create_url(state, &msg.team_id).await;
+    let jira_default_project = load_jira_default_project(state, &msg.team_id).await;
+    let jira_site_url = load_jira_site_url(state, &msg.team_id).await;
 
     // Ensure labels
     let mut ensured_repos = std::collections::HashSet::new();
     for task_id in &msg.tasks {
-        if let Ok(Some(task)) = get_task(state, &msg.tenant_id, &msg.plan_id, task_id).await {
+        if let Ok(Some(task)) = get_task(state, &msg.team_id, &msg.plan_id, task_id).await {
             if task.destination.as_deref() == Some("jira") {
                 continue;
             }
@@ -550,13 +550,13 @@ pub async fn continue_tasks(
     }
 
     for task_id in &msg.tasks {
-        let task = get_task(state, &msg.tenant_id, &msg.plan_id, task_id).await?;
+        let task = get_task(state, &msg.team_id, &msg.plan_id, task_id).await?;
         let Some(task) = task else {
             error!(task_id, "Task not found");
             continue;
         };
 
-        set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "running").await?;
+        set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "running").await?;
 
         if task.destination.as_deref() == Some("jira") {
             let project_key = task
@@ -568,13 +568,13 @@ pub async fn continue_tasks(
 
             if project_key.is_empty() {
                 error!(task_id, "No Jira project configured for task");
-                set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 continue;
             }
 
             let Some(ref url) = jira_create_url else {
                 error!(task_id, "No Jira create-ticket URL configured");
-                set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 continue;
             };
 
@@ -613,7 +613,7 @@ pub async fn continue_tasks(
                     };
                     update_task_with_jira(
                         state,
-                        &msg.tenant_id,
+                        &msg.team_id,
                         &msg.plan_id,
                         task_id,
                         ticket_key,
@@ -626,11 +626,11 @@ pub async fn continue_tasks(
                     let status = resp.status().as_u16();
                     let body = resp.text().await.unwrap_or_default();
                     error!(task_id, status, body = %body, "Failed to create Jira ticket for waiting task");
-                    set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                    set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 }
                 Err(e) => {
                     error!(task_id, error = %e, "Failed to call Forge create-ticket for waiting task");
-                    set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                    set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 }
             }
         } else {
@@ -641,7 +641,7 @@ pub async fn continue_tasks(
                 .unwrap_or(&plan_repo);
             if task_repo.is_empty() {
                 error!(task_id, "No repo configured for task or plan");
-                set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 continue;
             }
 
@@ -658,13 +658,13 @@ pub async fn continue_tasks(
                         .await
                     {
                         error!(task_id, issue_number, error = %e, "Failed to add coderhelm label");
-                        set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed")
+                        set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed")
                             .await?;
                         continue;
                     }
                     update_task_with_issue(
                         state,
-                        &msg.tenant_id,
+                        &msg.team_id,
                         &msg.plan_id,
                         task_id,
                         issue_number,
@@ -678,7 +678,7 @@ pub async fn continue_tasks(
                 }
                 Err(e) => {
                     error!(task_id, error = %e, "Failed to create GitHub issue for waiting task");
-                    set_task_status(state, &msg.tenant_id, &msg.plan_id, task_id, "failed").await?;
+                    set_task_status(state, &msg.team_id, &msg.plan_id, task_id, "failed").await?;
                 }
             }
         }
@@ -690,7 +690,7 @@ pub async fn continue_tasks(
         .query()
         .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(msg.tenant_id.clone()))
+        .expression_attribute_values(":pk", AttributeValue::S(msg.team_id.clone()))
         .expression_attribute_values(
             ":sk_prefix",
             AttributeValue::S(format!("PLAN#{}#TASK#", msg.plan_id)),
@@ -711,7 +711,7 @@ pub async fn continue_tasks(
             .dynamo
             .update_item()
             .table_name(&state.config.plans_table_name)
-            .key("pk", AttributeValue::S(msg.tenant_id.clone()))
+            .key("pk", AttributeValue::S(msg.team_id.clone()))
             .key("sk", AttributeValue::S(format!("PLAN#{}", msg.plan_id)))
             .update_expression("SET #s = :s, executed_at = :ea")
             .expression_attribute_names("#s", "status")
@@ -719,7 +719,7 @@ pub async fn continue_tasks(
             .expression_attribute_values(":ea", AttributeValue::S(now))
             .send()
             .await?;
-        info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, "All plan tasks complete — plan marked done");
+        info!(team_id = %msg.team_id, plan_id = %msg.plan_id, "All plan tasks complete — plan marked done");
     }
 
     Ok(())

@@ -52,7 +52,7 @@ pub async fn get_infrastructure(
         .dynamo
         .get_item()
         .table_name(&state.config.infra_table_name)
-        .key("pk", AttributeValue::S(claims.tenant_id.clone()))
+        .key("pk", AttributeValue::S(claims.team_id.clone()))
         .key("sk", AttributeValue::S(sk))
         .send()
         .await
@@ -143,7 +143,7 @@ pub async fn refresh_infrastructure(
         .dynamo
         .put_item()
         .table_name(&state.config.infra_table_name)
-        .item("pk", AttributeValue::S(claims.tenant_id.clone()))
+        .item("pk", AttributeValue::S(claims.team_id.clone()))
         .item("sk", AttributeValue::S(sk))
         .item("status", AttributeValue::S("pending".to_string()))
         .item("has_infra", AttributeValue::Bool(false))
@@ -157,7 +157,7 @@ pub async fn refresh_infrastructure(
 
     // Send SQS message to the tickets queue (worker handles infra_analyze type)
     let msg = WorkerMessage::InfraAnalyze(crate::models::InfraAnalyzeMessage {
-        tenant_id: claims.tenant_id.clone(),
+        team_id: claims.team_id.clone(),
         triggered_by: claims.display_name(),
         repo: None,
     });
@@ -195,7 +195,7 @@ pub async fn get_repo_infrastructure(
         .dynamo
         .get_item()
         .table_name(&state.config.infra_table_name)
-        .key("pk", AttributeValue::S(claims.tenant_id.clone()))
+        .key("pk", AttributeValue::S(claims.team_id.clone()))
         .key("sk", AttributeValue::S(sk))
         .send()
         .await
@@ -268,7 +268,7 @@ pub async fn refresh_repo_infrastructure(
         .dynamo
         .put_item()
         .table_name(&state.config.infra_table_name)
-        .item("pk", AttributeValue::S(claims.tenant_id.clone()))
+        .item("pk", AttributeValue::S(claims.team_id.clone()))
         .item("sk", AttributeValue::S(sk))
         .item("status", AttributeValue::S("pending".to_string()))
         .item("has_infra", AttributeValue::Bool(false))
@@ -281,7 +281,7 @@ pub async fn refresh_repo_infrastructure(
         })?;
 
     let msg = WorkerMessage::InfraAnalyze(crate::models::InfraAnalyzeMessage {
-        tenant_id: claims.tenant_id.clone(),
+        team_id: claims.team_id.clone(),
         triggered_by: claims.display_name(),
         repo: Some(repo_full),
     });
@@ -311,7 +311,7 @@ pub async fn refresh_repo_infrastructure(
 fn default_infra_prompt() -> String {
     "Create a production-ready AWS CDK TypeScript stack for a SaaS backend with the following components:\n\n\
     - API Gateway (HTTP API) + Lambda function (ARM64, Rust)\n\
-    - DynamoDB single-table design with GSIs for tenant lookup\n\
+    - DynamoDB single-table design with GSIs for team lookup\n\
     - SQS queues with dead-letter queues for async job processing\n\
     - S3 bucket for file storage with lifecycle policies\n\
     - Secrets Manager for API keys\n\

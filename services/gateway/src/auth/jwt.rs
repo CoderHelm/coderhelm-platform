@@ -3,7 +3,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 
 pub fn create_token(
     user_id: &str,
-    tenant_id: &str,
+    team_id: &str,
     email: &str,
     role: &str,
     github_login: Option<&str>,
@@ -13,7 +13,7 @@ pub fn create_token(
     let now = chrono::Utc::now().timestamp() as u64;
     let claims = Claims {
         sub: user_id.to_string(),
-        tenant_id: tenant_id.to_string(),
+        team_id: team_id.to_string(),
         email: email.to_string(),
         role: role.to_string(),
         github_login: github_login.map(|s| s.to_string()),
@@ -45,7 +45,7 @@ mod tests {
         let secret = "test-jwt-secret-at-least-32-chars!";
         let token = create_token(
             "user-1",
-            "tenant-1",
+            "team-1",
             "user@example.com",
             "owner",
             Some("octocat"),
@@ -55,7 +55,7 @@ mod tests {
         .unwrap();
         let claims = validate_token(&token, secret).unwrap();
         assert_eq!(claims.sub, "user-1");
-        assert_eq!(claims.tenant_id, "tenant-1");
+        assert_eq!(claims.team_id, "team-1");
         assert_eq!(claims.email, "user@example.com");
         assert_eq!(claims.role, "owner");
         assert_eq!(claims.github_login.as_deref(), Some("octocat"));

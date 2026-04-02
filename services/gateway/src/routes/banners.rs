@@ -10,11 +10,11 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
 }
 
-/// GET /api/banners — fetch active notification banners (global + tenant-specific).
+/// GET /api/banners — fetch active notification banners (global + team-specific).
 ///
 /// DynamoDB schema (main table):
 ///   Global:     pk=BANNER#GLOBAL,       sk=<banner_id>
-///   Per-tenant: pk=BANNER#<tenant_id>,  sk=<banner_id>
+///   Per-team: pk=BANNER#<team_id>,  sk=<banner_id>
 ///
 /// Item attributes: message, banner_type (info|warning|error), dismissible,
 ///   link_text, link_url, starts_at, expires_at, created_at, active
@@ -40,25 +40,25 @@ pub async fn list_banners(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Fetch tenant-specific banners
-    let tenant = state
+    // Fetch team-specific banners
+    let team = state
         .dynamo
         .query()
         .table_name(&state.config.banners_table_name)
         .key_condition_expression("pk = :pk")
         .filter_expression("active = :t")
-        .expression_attribute_values(":pk", attr_s(&format!("BANNER#{}", claims.tenant_id)))
+        .expression_attribute_values(":pk", attr_s(&format!("BANNER#{}", claims.team_id)))
         .expression_attribute_values(":t", attr_s("true"))
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to query tenant banners: {e}");
+            error!("Failed to query team banners: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     let mut banners: Vec<Value> = Vec::new();
 
-    for item in global.items().iter().chain(tenant.items().iter()) {
+    for item in global.items().iter().chain(team.items().iter()) {
         // Skip expired banners
         if let Some(expires) = item
             .get("expires_at")

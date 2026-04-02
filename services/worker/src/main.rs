@@ -67,20 +67,20 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
 
         match message {
             models::WorkerMessage::Ticket(msg) => {
-                info!(tenant_id = %msg.tenant_id, ticket_id = %msg.ticket_id, "Starting ticket run");
+                info!(team_id = %msg.team_id, ticket_id = %msg.ticket_id, "Starting ticket run");
                 if let Err(e) = passes::orchestrate_ticket(&state, msg).await {
                     error!("Ticket run failed: {e}");
                 }
             }
             models::WorkerMessage::CiFix(msg) => {
-                info!(tenant_id = %msg.tenant_id, run_id = %msg.run_id, "Starting CI fix");
+                info!(team_id = %msg.team_id, run_id = %msg.run_id, "Starting CI fix");
                 if let Err(e) = passes::ci_fix::run(&state, msg).await {
                     error!("CI fix failed: {e}");
                 }
             }
             models::WorkerMessage::Feedback(msg) => {
-                info!(tenant_id = %msg.tenant_id, run_id = %msg.run_id, "Processing feedback");
-                let tenant_id = msg.tenant_id.clone();
+                info!(team_id = %msg.team_id, run_id = %msg.run_id, "Processing feedback");
+                let team_id = msg.team_id.clone();
                 let run_id = msg.run_id.clone();
                 if let Err(e) = passes::feedback::run(&state, msg).await {
                     error!("Feedback run failed: {e}");
@@ -90,8 +90,8 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                         .update_item()
                         .table_name(&state.config.runs_table_name)
                         .key(
-                            "tenant_id",
-                            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id),
+                            "team_id",
+                            aws_sdk_dynamodb::types::AttributeValue::S(team_id),
                         )
                         .key(
                             "run_id",
@@ -123,32 +123,32 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                 }
             }
             models::WorkerMessage::Onboard(msg) => {
-                info!(tenant_id = %msg.tenant_id, repos = msg.repos.len(), "Processing onboard");
+                info!(team_id = %msg.team_id, repos = msg.repos.len(), "Processing onboard");
                 if let Err(e) = passes::onboard::run(&state, msg).await {
                     error!("Onboard failed: {e}");
                 }
             }
             models::WorkerMessage::MarkReady(msg) => {
-                info!(tenant_id = %msg.tenant_id, pr_number = msg.pr_number, "Marking PR ready");
+                info!(team_id = %msg.team_id, pr_number = msg.pr_number, "Marking PR ready");
                 if let Err(e) = mark_pr_ready(&state, msg).await {
                     error!("Mark PR ready failed: {e}");
                 }
             }
             models::WorkerMessage::PlanExecute(msg) => {
-                info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, "Executing plan");
+                info!(team_id = %msg.team_id, plan_id = %msg.plan_id, "Executing plan");
                 if let Err(e) = passes::plan_execute::run(&state, msg).await {
                     error!("Plan execute failed: {e}");
                 }
             }
             models::WorkerMessage::PlanTaskContinue(msg) => {
-                info!(tenant_id = %msg.tenant_id, plan_id = %msg.plan_id, tasks = msg.tasks.len(), "Continuing plan tasks");
+                info!(team_id = %msg.team_id, plan_id = %msg.plan_id, tasks = msg.tasks.len(), "Continuing plan tasks");
                 if let Err(e) = passes::plan_execute::continue_tasks(&state, msg).await {
                     error!("Plan task continue failed: {e}");
                 }
             }
             models::WorkerMessage::InfraAnalyze(msg) => {
-                info!(tenant_id = %msg.tenant_id, "Analyzing infrastructure");
-                let tenant_id = msg.tenant_id.clone();
+                info!(team_id = %msg.team_id, "Analyzing infrastructure");
+                let team_id = msg.team_id.clone();
                 if let Err(e) = passes::infra_analyze::run(&state, msg).await {
                     error!("Infra analyze failed: {e}");
                     // Store failed status so the dashboard can show the error
@@ -157,7 +157,7 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                         .dynamo
                         .put_item()
                         .table_name(&state.config.infra_table_name)
-                        .item("pk", aws_sdk_dynamodb::types::AttributeValue::S(tenant_id))
+                        .item("pk", aws_sdk_dynamodb::types::AttributeValue::S(team_id))
                         .item(
                             "sk",
                             aws_sdk_dynamodb::types::AttributeValue::S(

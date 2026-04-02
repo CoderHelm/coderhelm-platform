@@ -114,7 +114,7 @@ pub async fn select_repo(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let global_agents = super::load_content(state, &msg.tenant_id, "AGENTS#GLOBAL").await;
+    let global_agents = super::load_content(state, &msg.team_id, "AGENTS#GLOBAL").await;
 
     let context_section = if global_agents.is_empty() {
         String::new()

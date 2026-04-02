@@ -70,14 +70,14 @@ def main():
     users = scan_all_users(table)
     print(f"Found {len(users)} user records")
 
-    # Group by (tenant, normalized_email)
+    # Group by (team, normalized_email)
     groups = defaultdict(list)
     for u in users:
-        tenant = u.get("pk", "")
+        team = u.get("pk", "")
         email = u.get("email", "")
         if not email:
             continue
-        key = (tenant, normalize_email(email))
+        key = (team, normalize_email(email))
         groups[key].append(u)
 
     duplicates = {k: v for k, v in groups.items() if len(v) > 1}
@@ -88,8 +88,8 @@ def main():
 
     print(f"\nFound {len(duplicates)} duplicate groups:\n")
 
-    for (tenant, norm_email), records in duplicates.items():
-        print(f"  Tenant: {tenant}")
+    for (team, norm_email), records in duplicates.items():
+        print(f"  Team: {team}")
         print(f"  Email:  {norm_email}")
         keeper = pick_keeper(records)
         for r in records:
@@ -120,7 +120,7 @@ def main():
                         update_parts.append("gsi1pk = :g1pk")
                         update_parts.append("gsi1sk = :g1sk")
                         attr_values[":g1pk"] = dup["gsi1pk"]
-                        attr_values[":g1sk"] = dup.get("gsi1sk", tenant)
+                        attr_values[":g1sk"] = dup.get("gsi1sk", team)
                         break
 
             if update_parts:

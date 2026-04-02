@@ -10,13 +10,13 @@ use crate::AppState;
 pub const INCLUDED_TOKENS: u64 = 5_000_000; // 5M tokens (in+out) included in Pro
 
 // ─── Rate limiting ──────────────────────────────────────────────────
-const BILLING_ACTION_COOLDOWN_SECS: i64 = 10; // Min seconds between billing write actions per tenant
+const BILLING_ACTION_COOLDOWN_SECS: i64 = 10; // Min seconds between billing write actions per team
 
-/// DynamoDB-based per-tenant cooldown for billing write actions.
-/// Returns Err(429) if the tenant performed a billing action too recently.
+/// DynamoDB-based per-team cooldown for billing write actions.
+/// Returns Err(429) if the team performed a billing action too recently.
 async fn enforce_billing_cooldown(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     action: &str,
 ) -> Result<(), StatusCode> {
     let now = chrono::Utc::now();
@@ -27,7 +27,7 @@ async fn enforce_billing_cooldown(
         .dynamo
         .put_item()
         .table_name(&state.config.table_name)
-        .item("pk", attr_s(tenant_id))
+        .item("pk", attr_s(team_id))
         .item("sk", attr_s(&key))
         .item(
             "expires_at",
@@ -47,7 +47,7 @@ async fn enforce_billing_cooldown(
     match result {
         Ok(_) => Ok(()),
         Err(_) => {
-            warn!(tenant_id, action, "Billing rate limit hit");
+            warn!(team_id, action, "Billing rate limit hit");
             Err(StatusCode::TOO_MANY_REQUESTS)
         }
     }
@@ -73,7 +73,7 @@ pub async fn get_billing(
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("BILLING"))
         .send()
         .await
@@ -100,20 +100,20 @@ pub async fn get_billing(
 
     if stripe_customer_id.is_empty() {
         // Try to restore from reverse mapping table
-        if let Some(cid) = lookup_customer_id_for_tenant(&state, &claims.tenant_id).await {
+        if let Some(cid) = lookup_customer_id_for_team(&state, &claims.team_id).await {
             stripe_customer_id = cid.clone();
             let _ = state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.table_name)
-                .key("pk", attr_s(&claims.tenant_id))
+                .key("pk", attr_s(&claims.team_id))
                 .key("sk", attr_s("BILLING"))
                 .update_expression("SET stripe_customer_id = :cid, updated_at = :t")
                 .expression_attribute_values(":cid", attr_s(&cid))
                 .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
                 .send()
                 .await;
-            info!(tenant_id = %claims.tenant_id, "Restored stripe_customer_id from reverse mapping");
+            info!(team_id = %claims.team_id, "Restored stripe_customer_id from reverse mapping");
         }
     }
 
@@ -128,7 +128,7 @@ pub async fn get_billing(
             if stripe_has_active && !dynamo_says_active {
                 // Stripe active, DynamoDB not → restore to active
                 warn!(
-                    tenant_id = %claims.tenant_id,
+                    team_id = %claims.team_id,
                     dynamo_status = %subscription_status,
                     "Reconcile: Stripe has active sub but DynamoDB disagrees — restoring to active"
                 );
@@ -136,7 +136,7 @@ pub async fn get_billing(
                     .dynamo
                     .update_item()
                     .table_name(&state.config.table_name)
-                    .key("pk", attr_s(&claims.tenant_id))
+                    .key("pk", attr_s(&claims.team_id))
                     .key("sk", attr_s("BILLING"))
                     .update_expression("SET subscription_status = :s, updated_at = :t")
                     .expression_attribute_values(":s", attr_s("active"))
@@ -147,14 +147,14 @@ pub async fn get_billing(
             } else if !stripe_has_active && dynamo_says_active {
                 // Stripe NOT active, DynamoDB says active → downgrade to free
                 warn!(
-                    tenant_id = %claims.tenant_id,
+                    team_id = %claims.team_id,
                     "Reconcile: DynamoDB says active but Stripe has no active sub — setting to free"
                 );
                 let _ = state
                     .dynamo
                     .update_item()
                     .table_name(&state.config.table_name)
-                    .key("pk", attr_s(&claims.tenant_id))
+                    .key("pk", attr_s(&claims.team_id))
                     .key("sk", attr_s("BILLING"))
                     .update_expression(
                         "SET subscription_status = :s, updated_at = :t, previous_status = :prev",
@@ -175,7 +175,7 @@ pub async fn get_billing(
         .dynamo
         .get_item()
         .table_name(&state.config.analytics_table_name)
-        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("team_id", attr_s(&claims.team_id))
         .key("period", attr_s(&month))
         .send()
         .await
@@ -225,7 +225,7 @@ pub async fn get_billing(
         .query()
         .table_name(&state.config.events_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("PAYMENT#"))
         .scan_index_forward(false)
         .limit(5)
@@ -266,7 +266,7 @@ pub async fn get_billing(
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("SETTINGS#BUDGET"))
         .send()
         .await
@@ -325,8 +325,8 @@ pub async fn create_portal_session(
         StatusCode::SERVICE_UNAVAILABLE
     })?;
 
-    // Get the Stripe customer ID for this tenant
-    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+    // Get the Stripe customer ID for this team
+    let customer_id = get_stripe_customer_id(&state, &claims.team_id).await?;
 
     // Create portal session via Stripe API
     let response = state
@@ -364,7 +364,7 @@ pub async fn create_subscription(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    enforce_billing_cooldown(&state, &claims.tenant_id, "subscribe").await?;
+    enforce_billing_cooldown(&state, &claims.team_id, "subscribe").await?;
 
     let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
         error!("Stripe secret key not configured");
@@ -385,7 +385,7 @@ pub async fn create_subscription(
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("BILLING"))
         .send()
         .await
@@ -429,7 +429,7 @@ pub async fn create_subscription(
         .dynamo
         .get_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&claims.sub))
         .send()
         .await
@@ -447,28 +447,26 @@ pub async fn create_subscription(
         Some(cid) => cid.to_string(),
         None => {
             // Try reverse mapping before creating a brand new customer
-            if let Some(existing_cid) =
-                lookup_customer_id_for_tenant(&state, &claims.tenant_id).await
-            {
+            if let Some(existing_cid) = lookup_customer_id_for_team(&state, &claims.team_id).await {
                 info!(
-                    tenant_id = %claims.tenant_id,
+                    team_id = %claims.team_id,
                     customer_id = %existing_cid,
                     "Recovered Stripe customer from reverse mapping"
                 );
                 existing_cid
             } else {
-                create_stripe_customer(&state, stripe_key, &claims.tenant_id, &user_email).await?
+                create_stripe_customer(&state, stripe_key, &claims.team_id, &user_email).await?
             }
         }
     };
 
-    // Store customer + reverse mapping before checkout so webhooks can resolve tenant
+    // Store customer + reverse mapping before checkout so webhooks can resolve team
     let now = chrono::Utc::now().to_rfc3339();
     state
         .dynamo
         .update_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("BILLING"))
         .update_expression("SET stripe_customer_id = :cid, updated_at = :t")
         .expression_attribute_values(":cid", attr_s(&customer_id))
@@ -486,7 +484,7 @@ pub async fn create_subscription(
         .table_name(&state.config.events_table_name)
         .item("pk", attr_s(&format!("STRIPE#{customer_id}")))
         .item("sk", attr_s("MAPPING"))
-        .item("tenant_id", attr_s(&claims.tenant_id))
+        .item("team_id", attr_s(&claims.team_id))
         .item("created_at", attr_s(&now))
         .send()
         .await;
@@ -501,7 +499,7 @@ pub async fn create_subscription(
     // (e.g. from a stale subscription.deleted webhook).
     if has_active_stripe_subscription(&state, stripe_key, &customer_id).await {
         warn!(
-            tenant_id = %claims.tenant_id,
+            team_id = %claims.team_id,
             customer_id,
             "Blocked subscribe — customer already has an active Stripe subscription"
         );
@@ -510,7 +508,7 @@ pub async fn create_subscription(
             .dynamo
             .update_item()
             .table_name(&state.config.table_name)
-            .key("pk", attr_s(&claims.tenant_id))
+            .key("pk", attr_s(&claims.team_id))
             .key("sk", attr_s("BILLING"))
             .update_expression("SET subscription_status = :s, updated_at = :t")
             .expression_attribute_values(":s", attr_s("active"))
@@ -534,7 +532,7 @@ pub async fn create_subscription(
         ),
         ("payment_settings[payment_method_types][]", "card"),
         ("expand[]", "latest_invoice.payment_intent"),
-        ("metadata[tenant_id]", &claims.tenant_id),
+        ("metadata[team_id]", &claims.team_id),
     ];
 
     // Only require frontend confirmation if there's no saved PM.
@@ -582,7 +580,7 @@ pub async fn create_subscription(
             .dynamo
             .update_item()
             .table_name(&state.config.table_name)
-            .key("pk", attr_s(&claims.tenant_id))
+            .key("pk", attr_s(&claims.team_id))
             .key("sk", attr_s("BILLING"))
             .update_expression(
                 "SET stripe_subscription_id = :sid, subscription_status = :s, updated_at = :t",
@@ -597,7 +595,7 @@ pub async fn create_subscription(
     // If the subscription is already active (saved PM auto-charged), no client_secret needed
     if sub_status == "active" {
         info!(
-            tenant_id = %claims.tenant_id,
+            team_id = %claims.team_id,
             sub_id,
             "Subscription auto-activated with saved payment method"
         );
@@ -676,18 +674,18 @@ async fn has_active_stripe_subscription(
     body["data"].as_array().is_some_and(|subs| !subs.is_empty())
 }
 
-/// Look up the Stripe customer ID for a tenant from the reverse mapping table.
+/// Look up the Stripe customer ID for a team from the reverse mapping table.
 /// This recovers the customer ID even if the billing record lost it.
-async fn lookup_customer_id_for_tenant(state: &AppState, tenant_id: &str) -> Option<String> {
-    // Scan the events table for STRIPE#<cid> → MAPPING rows where tenant_id matches.
+async fn lookup_customer_id_for_team(state: &AppState, team_id: &str) -> Option<String> {
+    // Scan the events table for STRIPE#<cid> → MAPPING rows where team_id matches.
     // There are very few MAPPING rows (one per customer) so this scan is cheap.
     let result = state
         .dynamo
         .scan()
         .table_name(&state.config.events_table_name)
-        .filter_expression("sk = :sk AND tenant_id = :tid")
+        .filter_expression("sk = :sk AND team_id = :tid")
         .expression_attribute_values(":sk", attr_s("MAPPING"))
-        .expression_attribute_values(":tid", attr_s(tenant_id))
+        .expression_attribute_values(":tid", attr_s(team_id))
         .limit(1)
         .send()
         .await
@@ -750,34 +748,34 @@ async fn get_customer_default_pm(
     list_body["data"][0]["id"].as_str().map(|s| s.to_string())
 }
 
-/// Create a Stripe customer for a tenant.
+/// Create a Stripe customer for a team.
 async fn create_stripe_customer(
     state: &AppState,
     stripe_key: &str,
-    tenant_id: &str,
+    team_id: &str,
     email: &str,
 ) -> Result<String, StatusCode> {
-    // Get tenant name for the customer record
-    let tenant = state
+    // Get team name for the customer record
+    let team = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(tenant_id))
-        .key("sk", attr_s("TENANT"))
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s("TEAM"))
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to fetch tenant: {e}");
+            error!("Failed to fetch team: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let name = tenant
+    let name = team
         .item()
         .and_then(|i| i.get("name"))
         .and_then(|v| v.as_s().ok())
-        .map_or(tenant_id, |v| v.as_str());
+        .map_or(team_id, |v| v.as_str());
 
-    let mut form_params = vec![("name", name), ("metadata[tenant_id]", tenant_id)];
+    let mut form_params = vec![("name", name), ("metadata[team_id]", team_id)];
     if !email.is_empty() {
         form_params.push(("email", email));
     }
@@ -807,7 +805,7 @@ async fn create_stripe_customer(
         })
 }
 
-/// GET /api/billing/invoices — list all invoices for this tenant.
+/// GET /api/billing/invoices — list all invoices for this team.
 pub async fn list_invoices(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -817,7 +815,7 @@ pub async fn list_invoices(
         .query()
         .table_name(&state.config.events_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("INVOICE#"))
         .scan_index_forward(false)
         .limit(50)
@@ -863,7 +861,7 @@ pub async fn download_invoice_pdf(
         .dynamo
         .get_item()
         .table_name(&state.config.events_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&format!("INVOICE#{invoice_id}")))
         .send()
         .await
@@ -927,7 +925,7 @@ pub async fn cancel_subscription(
     Extension(claims): Extension<Claims>,
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>, StatusCode> {
-    enforce_billing_cooldown(&state, &claims.tenant_id, "cancel").await?;
+    enforce_billing_cooldown(&state, &claims.team_id, "cancel").await?;
 
     let immediately = body
         .as_ref()
@@ -944,7 +942,7 @@ pub async fn cancel_subscription(
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("BILLING"))
         .send()
         .await
@@ -992,7 +990,7 @@ pub async fn cancel_subscription(
             .dynamo
             .update_item()
             .table_name(&state.config.table_name)
-            .key("pk", attr_s(&claims.tenant_id))
+            .key("pk", attr_s(&claims.team_id))
             .key("sk", attr_s("BILLING"))
             .update_expression(
                 "SET subscription_status = :status, cancelled_at = :t, \
@@ -1045,7 +1043,7 @@ pub async fn cancel_subscription(
             .dynamo
             .update_item()
             .table_name(&state.config.table_name)
-            .key("pk", attr_s(&claims.tenant_id))
+            .key("pk", attr_s(&claims.team_id))
             .key("sk", attr_s("BILLING"))
             .update_expression("SET access_until = :end, updated_at = :t")
             .expression_attribute_values(":t", attr_s(&now))
@@ -1062,7 +1060,7 @@ pub async fn reactivate_subscription(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    enforce_billing_cooldown(&state, &claims.tenant_id, "reactivate").await?;
+    enforce_billing_cooldown(&state, &claims.team_id, "reactivate").await?;
 
     let stripe_key = state.secrets.stripe_secret_key.as_deref().ok_or_else(|| {
         error!("Stripe secret key not configured");
@@ -1073,7 +1071,7 @@ pub async fn reactivate_subscription(
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("BILLING"))
         .send()
         .await
@@ -1128,7 +1126,7 @@ pub async fn create_setup_intent(
         StatusCode::SERVICE_UNAVAILABLE
     })?;
 
-    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+    let customer_id = get_stripe_customer_id(&state, &claims.team_id).await?;
 
     let response = state
         .http
@@ -1169,7 +1167,7 @@ pub async fn list_payment_methods(
         StatusCode::SERVICE_UNAVAILABLE
     })?;
 
-    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+    let customer_id = get_stripe_customer_id(&state, &claims.team_id).await?;
 
     // Get customer to find default PM
     let cust_resp = state
@@ -1286,7 +1284,7 @@ pub async fn set_default_payment_method(
         StatusCode::SERVICE_UNAVAILABLE
     })?;
 
-    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+    let customer_id = get_stripe_customer_id(&state, &claims.team_id).await?;
 
     // Verify the payment method belongs to this customer
     let pm_response = state
@@ -1346,7 +1344,7 @@ pub async fn delete_payment_method(
     })?;
 
     // Verify the payment method belongs to this customer
-    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+    let customer_id = get_stripe_customer_id(&state, &claims.team_id).await?;
 
     let pm_response = state
         .http
@@ -1418,7 +1416,7 @@ pub async fn update_billing_email(
         StatusCode::SERVICE_UNAVAILABLE
     })?;
 
-    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+    let customer_id = get_stripe_customer_id(&state, &claims.team_id).await?;
 
     let response = state
         .http
@@ -1460,7 +1458,7 @@ pub async fn get_billing_customer(
         StatusCode::SERVICE_UNAVAILABLE
     })?;
 
-    let customer_id = get_stripe_customer_id(&state, &claims.tenant_id).await?;
+    let customer_id = get_stripe_customer_id(&state, &claims.team_id).await?;
 
     let response = state
         .http
@@ -1484,16 +1482,16 @@ pub async fn get_billing_customer(
     })))
 }
 
-/// Check if tenant has an active subscription. Returns Ok(()) if active, 402 if not.
+/// Check if team has an active subscription. Returns Ok(()) if active, 402 if not.
 pub async fn require_active_subscription(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
 ) -> Result<(), StatusCode> {
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(tenant_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s("BILLING"))
         .send()
         .await
@@ -1512,22 +1510,19 @@ pub async fn require_active_subscription(
     match status {
         "active" | "free" => Ok(()),
         _ => {
-            warn!("Tenant {tenant_id} blocked: subscription_status={status}");
+            warn!("Team {team_id} blocked: subscription_status={status}");
             Err(StatusCode::PAYMENT_REQUIRED)
         }
     }
 }
 
 /// Like require_active_subscription but excludes free-tier accounts.
-pub async fn require_paid_subscription(
-    state: &AppState,
-    tenant_id: &str,
-) -> Result<(), StatusCode> {
+pub async fn require_paid_subscription(state: &AppState, team_id: &str) -> Result<(), StatusCode> {
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(tenant_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s("BILLING"))
         .send()
         .await
@@ -1546,18 +1541,18 @@ pub async fn require_paid_subscription(
     match status {
         "active" => Ok(()),
         _ => {
-            warn!("Tenant {tenant_id} requires paid plan: subscription_status={status}");
+            warn!("Team {team_id} requires paid plan: subscription_status={status}");
             Err(StatusCode::PAYMENT_REQUIRED)
         }
     }
 }
 
-async fn get_stripe_customer_id(state: &AppState, tenant_id: &str) -> Result<String, StatusCode> {
+async fn get_stripe_customer_id(state: &AppState, team_id: &str) -> Result<String, StatusCode> {
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(tenant_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s("BILLING"))
         .send()
         .await

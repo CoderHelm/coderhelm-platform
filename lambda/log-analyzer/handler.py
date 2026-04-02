@@ -1,7 +1,7 @@
 """
 Coderhelm Log Analyzer Lambda
 
-Triggered by EventBridge every 6 hours. For each tenant with an AWS connection:
+Triggered by EventBridge every 6 hours. For each team with an AWS connection:
 1. AssumeRole into the customer's account
 2. Run pre-built CloudWatch Logs Insights queries
 3. Send error summaries to Bedrock Claude for analysis
@@ -149,7 +149,7 @@ def handler(event, context):
     """EventBridge scheduled handler — runs every 6 hours."""
     logger.info("Log analyzer started")
 
-    # Scan all tenants with AWS connections
+    # Scan all teams with AWS connections
     connections = scan_aws_connections()
     logger.info(f"Found {len(connections)} AWS connections")
 
@@ -160,12 +160,12 @@ def handler(event, context):
             total_recs += recs
         except Exception as e:
             logger.error(
-                f"Failed to analyze connection {conn['tenant_id']}/{conn['account_id']}: {e}",
+                f"Failed to analyze connection {conn['team_id']}/{conn['account_id']}: {e}",
                 exc_info=True,
             )
             # Update connection status to error
             update_connection_status(
-                conn["tenant_id"], conn["account_id"], "error", str(e)
+                conn["team_id"], conn["account_id"], "error", str(e)
             )
 
     logger.info(f"Log analyzer complete — {total_recs} new recommendations")
@@ -173,7 +173,7 @@ def handler(event, context):
 
 
 def scan_aws_connections():
-    """Scan settings table for all active AWS connections across all tenants."""
+    """Scan settings table for all active AWS connections across all teams."""
     connections = []
     last_key = None
 
@@ -194,7 +194,7 @@ def scan_aws_connections():
         for item in resp.get("Items", []):
             connections.append(
                 {
-                    "tenant_id": item["pk"],
+                    "team_id": item["pk"],
                     "account_id": item.get("account_id", ""),
                     "role_arn": item["role_arn"],
                     "external_id": item["external_id"],
@@ -212,13 +212,13 @@ def scan_aws_connections():
 
 def analyze_connection(conn):
     """Analyze a single AWS connection — AssumeRole, query logs, generate recommendations."""
-    tenant_id = conn["tenant_id"]
+    team_id = conn["team_id"]
     account_id = conn["account_id"]
     role_arn = conn["role_arn"]
     external_id = conn["external_id"]
     region = conn["region"]
 
-    logger.info(f"Analyzing {tenant_id} / account {account_id}")
+    logger.info(f"Analyzing {team_id} / account {account_id}")
 
     # AssumeRole with 15-minute session (minimum)
     assumed = sts_client.assume_role(
@@ -237,7 +237,7 @@ def analyze_connection(conn):
         aws_session_token=creds["SessionToken"],
     )
 
-    # Get the log groups this tenant has configured (or discover them)
+    # Get the log groups this team has configured (or discover them)
     log_groups = conn.get("log_groups", [])
     if not log_groups:
         log_groups = discover_log_groups(cw_logs)
@@ -267,7 +267,7 @@ def analyze_connection(conn):
                 logger.warning(f"Query {query_def['name']} failed: {e}")
 
     if not all_results:
-        logger.info(f"No errors found for {tenant_id}/{account_id}")
+        logger.info(f"No errors found for {team_id}/{account_id}")
         return 0
 
     # Check for secrets/tokens in raw results and create advisory if found
@@ -300,7 +300,7 @@ def analyze_connection(conn):
             "source_log_group": "multiple",
             "error_pattern": f"secrets_in_logs_{account_id}",
         }
-        if store_recommendation(tenant_id, account_id, advisory_rec):
+        if store_recommendation(team_id, account_id, advisory_rec):
             new_recs = 1
         else:
             new_recs = 0
@@ -312,10 +312,10 @@ def analyze_connection(conn):
 
     # Deduplicate and store
     for rec in recommendations:
-        if store_recommendation(tenant_id, account_id, rec):
+        if store_recommendation(team_id, account_id, rec):
             new_recs += 1
 
-    logger.info(f"{tenant_id}/{account_id}: {new_recs} new recommendations")
+    logger.info(f"{team_id}/{account_id}: {new_recs} new recommendations")
     return new_recs
 
 
@@ -459,7 +459,7 @@ Return ONLY the JSON array, no surrounding text."""
         return []
 
 
-def store_recommendation(tenant_id, account_id, rec):
+def store_recommendation(team_id, account_id, rec):
     """Deduplicate and store a recommendation. Returns True if new."""
     # Create error hash for dedup: hash(account_id + log_group + error_pattern)
     raw = f"{account_id}:{rec.get('source_log_group', '')}:{rec.get('error_pattern', rec.get('title', ''))}"
@@ -477,7 +477,7 @@ def store_recommendation(tenant_id, account_id, rec):
             FilterExpression="error_hash = :hash AND #s <> :dismissed",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
-                ":pk": tenant_id,
+                ":pk": team_id,
                 ":prefix": "REC#",
                 ":hash": error_hash,
                 ":dismissed": "dismissed",
@@ -494,7 +494,7 @@ def store_recommendation(tenant_id, account_id, rec):
         ttl_epoch = int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp())
         settings_table.put_item(
             Item={
-                "pk": tenant_id,
+                "pk": team_id,
                 "sk": sk,
                 "status": "pending",
                 "severity": rec.get("severity", "info"),
@@ -516,7 +516,7 @@ def store_recommendation(tenant_id, account_id, rec):
         return False
 
 
-def update_connection_status(tenant_id, account_id, status, error_msg=None):
+def update_connection_status(team_id, account_id, status, error_msg=None):
     """Update the status of an AWS connection."""
     try:
         update_expr = "SET #s = :s, updated_at = :t"
@@ -530,7 +530,7 @@ def update_connection_status(tenant_id, account_id, status, error_msg=None):
             expr_values[":e"] = error_msg[:500]
 
         settings_table.update_item(
-            Key={"pk": tenant_id, "sk": f"AWS_CONN#{account_id}"},
+            Key={"pk": team_id, "sk": f"AWS_CONN#{account_id}"},
             UpdateExpression=update_expr,
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues=expr_values,

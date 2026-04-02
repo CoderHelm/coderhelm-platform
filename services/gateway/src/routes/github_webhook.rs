@@ -117,12 +117,12 @@ async fn handle_issue_event(
         return Ok(StatusCode::OK);
     }
 
-    let tenant_id = format!("TENANT#{installation_id}");
+    let team_id = format!("TEAM#{installation_id}");
     let issue = &payload["issue"];
     let repo = &payload["repository"];
 
     let message = WorkerMessage::Ticket(TicketMessage {
-        tenant_id: tenant_id.clone(),
+        team_id: team_id.clone(),
         installation_id,
         source: TicketSource::Github,
         ticket_id: format!("GH-{}", issue["number"].as_u64().unwrap_or(0)),
@@ -138,7 +138,7 @@ async fn handle_issue_event(
     });
 
     // Check usage limits before dispatching
-    if let Some(reason) = check_run_budget(state, &tenant_id).await {
+    if let Some(reason) = check_run_budget(state, &team_id).await {
         let owner = repo["owner"]["login"].as_str().unwrap_or("");
         let name = repo["name"].as_str().unwrap_or("");
         let number = issue["number"].as_u64().unwrap_or(0);
@@ -152,9 +152,9 @@ async fn handle_issue_event(
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
-        .key_condition_expression("tenant_id = :tid")
+        .key_condition_expression("team_id = :tid")
         .filter_expression("ticket_id = :ticket")
-        .expression_attribute_values(":tid", attr_s(&tenant_id))
+        .expression_attribute_values(":tid", attr_s(&team_id))
         .expression_attribute_values(":ticket", attr_s(&ticket_id_str))
         .limit(5)
         .send()
@@ -187,13 +187,13 @@ async fn handle_issue_comment(
     if payload["issue"]["pull_request"].is_object() {
         let pr_user = payload["issue"]["user"]["login"].as_str().unwrap_or("");
         if pr_user.contains("coderhelm") && !commenter.contains("coderhelm") {
-            let tenant_id = format!("TENANT#{installation_id}");
+            let team_id = format!("TEAM#{installation_id}");
             let repo = &payload["repository"];
             let owner = repo["owner"]["login"].as_str().unwrap_or("");
             let name = repo["name"].as_str().unwrap_or("");
             let pr_number = payload["issue"]["number"].as_u64().unwrap_or(0);
 
-            let run_id = lookup_run_by_pr(state, &tenant_id, owner, name, pr_number).await;
+            let run_id = lookup_run_by_pr(state, &team_id, owner, name, pr_number).await;
             if run_id.is_empty() {
                 warn!(pr_number, "No run found for PR comment — skipping");
                 return Ok(StatusCode::OK);
@@ -201,7 +201,7 @@ async fn handle_issue_comment(
 
             info!(pr_number, commenter, "PR comment → feedback queue");
             let message = WorkerMessage::Feedback(FeedbackMessage {
-                tenant_id,
+                team_id,
                 installation_id,
                 run_id,
                 repo_owner: owner.to_string(),
@@ -222,12 +222,12 @@ async fn handle_issue_comment(
         return Ok(StatusCode::OK);
     }
 
-    let tenant_id = format!("TENANT#{installation_id}");
+    let team_id = format!("TEAM#{installation_id}");
     let issue = &payload["issue"];
     let repo = &payload["repository"];
 
     let message = WorkerMessage::Ticket(TicketMessage {
-        tenant_id: tenant_id.clone(),
+        team_id: team_id.clone(),
         installation_id,
         source: TicketSource::Github,
         ticket_id: format!("GH-{}", issue["number"].as_u64().unwrap_or(0)),
@@ -243,7 +243,7 @@ async fn handle_issue_comment(
     });
 
     // Check usage limits before dispatching
-    if let Some(reason) = check_run_budget(state, &tenant_id).await {
+    if let Some(reason) = check_run_budget(state, &team_id).await {
         let owner = repo["owner"]["login"].as_str().unwrap_or("");
         let name = repo["name"].as_str().unwrap_or("");
         let number = issue["number"].as_u64().unwrap_or(0);
@@ -280,11 +280,11 @@ async fn handle_pull_request(
         return Ok(StatusCode::OK);
     }
 
-    let tenant_id = format!("TENANT#{installation_id}");
+    let team_id = format!("TEAM#{installation_id}");
     let repo = &payload["repository"];
     let owner = repo["owner"]["login"].as_str().unwrap_or("");
     let name = repo["name"].as_str().unwrap_or("");
-    let tenant_repo = format!("{tenant_id}#{owner}/{name}");
+    let team_repo = format!("{team_id}#{owner}/{name}");
 
     // Query repo-index GSI to find the run with this PR number
     let result = state
@@ -292,9 +292,9 @@ async fn handle_pull_request(
         .query()
         .table_name(&state.config.runs_table_name)
         .index_name("repo-index")
-        .key_condition_expression("tenant_repo = :tr")
+        .key_condition_expression("team_repo = :tr")
         .filter_expression("pr_number = :pn")
-        .expression_attribute_values(":tr", attr_s(&tenant_repo))
+        .expression_attribute_values(":tr", attr_s(&team_repo))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .scan_index_forward(false)
         .limit(1)
@@ -318,7 +318,7 @@ async fn handle_pull_request(
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
-                .key("tenant_id", attr_s(&tenant_id))
+                .key("team_id", attr_s(&team_id))
                 .key("run_id", attr_s(&run_id))
                 .update_expression("SET #status = :s, status_run_id = :sri, updated_at = :t")
                 .expression_attribute_names("#status", "status")
@@ -328,10 +328,7 @@ async fn handle_pull_request(
                 .send()
                 .await;
 
-            info!(
-                tenant_id,
-                run_id, pr_number, "PR merged — run status updated"
-            );
+            info!(team_id, run_id, pr_number, "PR merged — run status updated");
 
             // ── Plan task dependency continuation ──
             // If this run's issue belongs to a plan task, check for waiting dependents.
@@ -340,9 +337,9 @@ async fn handle_pull_request(
                 .and_then(|v| v.as_n().ok())
                 .and_then(|n| n.parse::<u64>().ok())
             {
-                if let Err(e) = trigger_plan_dependents(state, &tenant_id, issue_num).await {
+                if let Err(e) = trigger_plan_dependents(state, &team_id, issue_num).await {
                     warn!(
-                        tenant_id,
+                        team_id,
                         issue_num,
                         error = %e,
                         "Failed to check plan task dependents"
@@ -386,19 +383,19 @@ async fn handle_pr_review(
         return Ok(StatusCode::OK);
     }
 
-    let tenant_id = format!("TENANT#{installation_id}");
+    let team_id = format!("TEAM#{installation_id}");
     let repo = &payload["repository"];
     let owner = repo["owner"]["login"].as_str().unwrap_or("");
     let name = repo["name"].as_str().unwrap_or("");
     let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
 
-    if let Some(reason) = check_run_budget(state, &tenant_id).await {
-        info!(tenant_id, "PR review skipped — token limit reached");
+    if let Some(reason) = check_run_budget(state, &team_id).await {
+        info!(team_id, "PR review skipped — token limit reached");
         post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
         return Ok(StatusCode::OK);
     }
 
-    let run_id = lookup_run_by_pr(state, &tenant_id, owner, name, pr_number).await;
+    let run_id = lookup_run_by_pr(state, &team_id, owner, name, pr_number).await;
     if run_id.is_empty() {
         warn!(pr_number, "No run found for PR — skipping feedback");
         return Ok(StatusCode::OK);
@@ -407,7 +404,7 @@ async fn handle_pr_review(
     // The review body is the top-level comment; individual line comments
     // will be fetched by the worker using the review_id via GitHub API.
     let message = WorkerMessage::Feedback(FeedbackMessage {
-        tenant_id,
+        team_id,
         installation_id,
         run_id,
         repo_owner: owner.to_string(),
@@ -444,16 +441,16 @@ async fn handle_check_run(
         return Ok(StatusCode::OK);
     }
 
-    let tenant_id = format!("TENANT#{installation_id}");
+    let team_id = format!("TEAM#{installation_id}");
     let repo = &payload["repository"];
 
-    if let Some(_reason) = check_run_budget(state, &tenant_id).await {
-        info!(tenant_id, "CI fix skipped — token limit reached");
+    if let Some(_reason) = check_run_budget(state, &team_id).await {
+        info!(team_id, "CI fix skipped — token limit reached");
         return Ok(StatusCode::OK);
     }
 
     let message = WorkerMessage::CiFix(CiFixMessage {
-        tenant_id,
+        team_id,
         installation_id,
         run_id: String::new(), // TODO: look up from DynamoDB by branch
         repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
@@ -481,18 +478,18 @@ async fn handle_installation(
                 .unwrap_or("unknown");
             info!(
                 installation_id,
-                org, "GitHub App installation — provisioning/reactivating tenant"
+                org, "GitHub App installation — provisioning/reactivating team"
             );
 
-            let tenant_pk = format!("TENANT#{installation_id}");
+            let team_pk = format!("TEAM#{installation_id}");
             let now = chrono::Utc::now().to_rfc3339();
 
-            // Check if tenant already exists (reinstallation case)
+            // Check if team already exists (reinstallation case)
             let existing = state
                 .dynamo
                 .get_item()
                 .table_name(&state.config.table_name)
-                .key("pk", attr_s(&tenant_pk))
+                .key("pk", attr_s(&team_pk))
                 .key("sk", attr_s("META"))
                 .projection_expression("#s")
                 .expression_attribute_names("#s", "status")
@@ -502,12 +499,12 @@ async fn handle_installation(
                 .and_then(|r| r.item);
 
             if existing.is_some() {
-                // Reactivate existing tenant — preserve plan, billing, etc.
+                // Reactivate existing team — preserve plan, billing, etc.
                 state
                     .dynamo
                     .update_item()
                     .table_name(&state.config.table_name)
-                    .key("pk", attr_s(&tenant_pk))
+                    .key("pk", attr_s(&team_pk))
                     .key("sk", attr_s("META"))
                     .update_expression(
                         "SET #status = :s, github_install_id = :iid, github_org = :org, reactivated_at = :t",
@@ -520,17 +517,17 @@ async fn handle_installation(
                     .send()
                     .await
                     .map_err(|e| {
-                        error!("Failed to reactivate tenant: {e}");
+                        error!("Failed to reactivate team: {e}");
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
-                info!(installation_id, "Reactivated existing tenant");
+                info!(installation_id, "Reactivated existing team");
             } else {
-                // Brand new tenant
+                // Brand new team
                 state
                     .dynamo
                     .put_item()
                     .table_name(&state.config.table_name)
-                    .item("pk", attr_s(&tenant_pk))
+                    .item("pk", attr_s(&team_pk))
                     .item("sk", attr_s("META"))
                     .item("github_install_id", attr_n(installation_id))
                     .item("github_org", attr_s(org))
@@ -541,7 +538,7 @@ async fn handle_installation(
                     .send()
                     .await
                     .map_err(|e| {
-                        error!("Failed to create tenant: {e}");
+                        error!("Failed to create team: {e}");
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
             }
@@ -566,7 +563,7 @@ async fn handle_installation(
                     .dynamo
                     .put_item()
                     .table_name(&state.config.repos_table_name)
-                    .item("pk", attr_s(&tenant_pk))
+                    .item("pk", attr_s(&team_pk))
                     .item("sk", attr_s(&format!("REPO#{full}")))
                     .item("repo_name", attr_s(&full))
                     .item(
@@ -582,7 +579,7 @@ async fn handle_installation(
             // Enqueue onboard for all repos in the installation
             if !repos.is_empty() {
                 let onboard = WorkerMessage::Onboard(OnboardMessage {
-                    tenant_id: tenant_pk,
+                    team_id: team_pk,
                     installation_id,
                     repos,
                 });
@@ -594,14 +591,14 @@ async fn handle_installation(
         "deleted" => {
             info!(
                 installation_id,
-                "GitHub App uninstalled — deactivating tenant"
+                "GitHub App uninstalled — deactivating team"
             );
-            let tenant_id = format!("TENANT#{installation_id}");
+            let team_id = format!("TEAM#{installation_id}");
             state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.table_name)
-                .key("pk", attr_s(&tenant_id))
+                .key("pk", attr_s(&team_id))
                 .key("sk", attr_s("META"))
                 .update_expression("SET #status = :s, deactivated_at = :t")
                 .expression_attribute_names("#status", "status")
@@ -610,17 +607,17 @@ async fn handle_installation(
                 .send()
                 .await
                 .map_err(|e| {
-                    error!("Failed to deactivate tenant: {e}");
+                    error!("Failed to deactivate team: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            // Notify all users in the tenant
+            // Notify all users in the team
             let users = state
                 .dynamo
                 .query()
                 .table_name(&state.config.users_table_name)
                 .key_condition_expression("pk = :pk")
-                .expression_attribute_values(":pk", attr_s(&tenant_id))
+                .expression_attribute_values(":pk", attr_s(&team_id))
                 .projection_expression("email")
                 .send()
                 .await
@@ -710,7 +707,7 @@ async fn handle_installation_repos(
     }
 
     // Write REPO# items so the dashboard can list them
-    let tenant_id = format!("TENANT#{installation_id}");
+    let team_id = format!("TEAM#{installation_id}");
     let now = chrono::Utc::now().to_rfc3339();
     for repo in &repos {
         let full = format!("{}/{}", repo.owner, repo.name);
@@ -718,7 +715,7 @@ async fn handle_installation_repos(
             .dynamo
             .put_item()
             .table_name(&state.config.repos_table_name)
-            .item("pk", attr_s(&tenant_id))
+            .item("pk", attr_s(&team_id))
             .item("sk", attr_s(&format!("REPO#{full}")))
             .item("repo_name", attr_s(&full))
             .item(
@@ -732,7 +729,7 @@ async fn handle_installation_repos(
     }
 
     let onboard = WorkerMessage::Onboard(OnboardMessage {
-        tenant_id,
+        team_id,
         installation_id,
         repos,
     });
@@ -773,7 +770,7 @@ async fn handle_check_suite(
                 }
                 info!(branch, pr_number, "CI passed — marking PR ready");
                 let message = WorkerMessage::MarkReady(MarkReadyMessage {
-                    tenant_id: format!("TENANT#{installation_id}"),
+                    team_id: format!("TEAM#{installation_id}"),
                     installation_id,
                     repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
                     repo_name: repo["name"].as_str().unwrap_or("").to_string(),
@@ -825,7 +822,7 @@ async fn handle_workflow_run(
                 }
                 info!(branch, pr_number, "CI passed — marking PR ready");
                 let message = WorkerMessage::MarkReady(MarkReadyMessage {
-                    tenant_id: format!("TENANT#{installation_id}"),
+                    team_id: format!("TEAM#{installation_id}"),
                     installation_id,
                     repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
                     repo_name: repo["name"].as_str().unwrap_or("").to_string(),
@@ -862,14 +859,14 @@ async fn handle_repository_event(
                 action,
                 repo_name, installation_id, "Repository removed — deactivating repo record"
             );
-            let tenant_id = format!("TENANT#{installation_id}");
+            let team_id = format!("TEAM#{installation_id}");
             let parts: Vec<&str> = repo_name.splitn(2, '/').collect();
             if parts.len() == 2 {
                 let _ = state
                     .dynamo
                     .update_item()
                     .table_name(&state.config.repos_table_name)
-                    .key("pk", attr_s(&tenant_id))
+                    .key("pk", attr_s(&team_id))
                     .key("sk", attr_s(&format!("REPO#{}", parts[1])))
                     .update_expression("SET #status = :s, updated_at = :t")
                     .expression_attribute_names("#status", "status")
@@ -1028,12 +1025,12 @@ async fn send_to_queue(
 /// If so, find waiting tasks that depend on it and dispatch them to the worker.
 async fn trigger_plan_dependents(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     issue_number: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use aws_sdk_dynamodb::types::AttributeValue;
 
-    // Query all items in the plans table for this tenant (plans + tasks share pk)
+    // Query all items in the plans table for this team (plans + tasks share pk)
     let mut exclusive_start_key = None;
     let mut matched_plan_id = String::new();
     let mut matched_task_id = String::new();
@@ -1044,7 +1041,7 @@ async fn trigger_plan_dependents(
             .query()
             .table_name(&state.config.plans_table_name)
             .key_condition_expression("pk = :pk")
-            .expression_attribute_values(":pk", AttributeValue::S(tenant_id.to_string()));
+            .expression_attribute_values(":pk", AttributeValue::S(team_id.to_string()));
 
         if let Some(key) = exclusive_start_key.take() {
             query = query.set_exclusive_start_key(Some(key));
@@ -1090,7 +1087,7 @@ async fn trigger_plan_dependents(
     }
 
     info!(
-        tenant_id,
+        team_id,
         plan_id = %matched_plan_id,
         task_id = %matched_task_id,
         "Merged PR belongs to plan task — checking for waiting dependents"
@@ -1102,7 +1099,7 @@ async fn trigger_plan_dependents(
         .query()
         .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(tenant_id.to_string()))
+        .expression_attribute_values(":pk", AttributeValue::S(team_id.to_string()))
         .expression_attribute_values(
             ":sk_prefix",
             AttributeValue::S(format!("PLAN#{}#TASK#", matched_plan_id)),
@@ -1141,14 +1138,14 @@ async fn trigger_plan_dependents(
     }
 
     info!(
-        tenant_id,
+        team_id,
         plan_id = %matched_plan_id,
         tasks = tasks_to_continue.len(),
         "Triggering waiting plan tasks"
     );
 
     let message = WorkerMessage::PlanTaskContinue(PlanTaskContinueMessage {
-        tenant_id: tenant_id.to_string(),
+        team_id: team_id.to_string(),
         plan_id: matched_plan_id,
         tasks: tasks_to_continue,
     });
@@ -1168,20 +1165,20 @@ async fn trigger_plan_dependents(
 /// Look up run_id from the runs table by PR number using the repo-index GSI.
 async fn lookup_run_by_pr(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     owner: &str,
     name: &str,
     pr_number: u64,
 ) -> String {
-    let tenant_repo = format!("{tenant_id}#{owner}/{name}");
+    let team_repo = format!("{team_id}#{owner}/{name}");
     let result = state
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
         .index_name("repo-index")
-        .key_condition_expression("tenant_repo = :tr")
+        .key_condition_expression("team_repo = :tr")
         .filter_expression("pr_number = :pn")
-        .expression_attribute_values(":tr", attr_s(&tenant_repo))
+        .expression_attribute_values(":tr", attr_s(&team_repo))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .scan_index_forward(false)
         .limit(1)
@@ -1210,15 +1207,15 @@ fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValu
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
 }
 
-/// Check whether this tenant has budget remaining. Returns Some(reason) if blocked.
-pub async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<String> {
+/// Check whether this team has budget remaining. Returns Some(reason) if blocked.
+pub async fn check_run_budget(state: &AppState, team_id: &str) -> Option<String> {
     // 1. Read current month's token usage from analytics
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     let analytics = state
         .dynamo
         .get_item()
         .table_name(&state.config.analytics_table_name)
-        .key("tenant_id", attr_s(tenant_id))
+        .key("team_id", attr_s(team_id))
         .key("period", attr_s(&month))
         .send()
         .await
@@ -1245,7 +1242,7 @@ pub async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<Strin
         .dynamo
         .get_item()
         .table_name(&state.config.billing_table_name)
-        .key("pk", attr_s(tenant_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s("BILLING"))
         .send()
         .await
@@ -1275,7 +1272,7 @@ pub async fn check_run_budget(state: &AppState, tenant_id: &str) -> Option<Strin
             .dynamo
             .get_item()
             .table_name(&state.config.settings_table_name)
-            .key("pk", attr_s(tenant_id))
+            .key("pk", attr_s(team_id))
             .key("sk", attr_s("SETTINGS#BUDGET"))
             .send()
             .await

@@ -25,7 +25,7 @@ resolver.define("saveConfig", async ({ payload }) => {
     const listProjectsUrl = await webTrigger.getUrl("list-projects-trigger");
     const createTicketUrl = await webTrigger.getUrl("create-ticket-trigger");
     const addCommentUrl = await webTrigger.getUrl("add-comment-trigger");
-    const tid = `TENANT#${installationId}`;
+    const tid = `TEAM#${installationId}`;
 
     // Get the Jira site URL (e.g. https://mysite.atlassian.net)
     let siteUrl = "";
@@ -43,7 +43,7 @@ resolver.define("saveConfig", async ({ payload }) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        tenant_id: tid,
+        team_id: tid,
         installation_id: installationId,
         list_projects_url: listProjectsUrl,
         create_ticket_url: createTicketUrl,

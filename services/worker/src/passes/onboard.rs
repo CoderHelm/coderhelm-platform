@@ -12,7 +12,7 @@ pub async fn run(
     msg: OnboardMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
-        tenant_id = %msg.tenant_id,
+        team_id = %msg.team_id,
         repos = msg.repos.len(),
         "Starting onboard"
     );
@@ -25,12 +25,12 @@ pub async fn run(
     )?;
 
     // Load custom global instructions from DynamoDB (if any)
-    let global_instructions = load_instructions(state, &msg.tenant_id, "INSTRUCTIONS#GLOBAL").await;
+    let global_instructions = load_instructions(state, &msg.team_id, "INSTRUCTIONS#GLOBAL").await;
 
     for repo in &msg.repos {
         let repo_instructions = load_instructions(
             state,
-            &msg.tenant_id,
+            &msg.team_id,
             &format!("INSTRUCTIONS#REPO#{}/{}", repo.owner, repo.name),
         )
         .await;
@@ -40,20 +40,20 @@ pub async fn run(
             state,
             &github,
             repo,
-            &msg.tenant_id,
+            &msg.team_id,
             &global_instructions,
             &repo_instructions,
         )
         .await
         {
             Ok(()) => {
-                set_onboard_status(state, &msg.tenant_id, &full_name, "ready", None).await;
+                set_onboard_status(state, &msg.team_id, &full_name, "ready", None).await;
             }
             Err(e) => {
                 error!(repo = %full_name, error = %e, "Failed to onboard repo");
                 set_onboard_status(
                     state,
-                    &msg.tenant_id,
+                    &msg.team_id,
                     &full_name,
                     "failed",
                     Some(&e.to_string()),
@@ -69,7 +69,7 @@ pub async fn run(
         .query()
         .table_name(&state.config.repos_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(msg.tenant_id.clone()))
+        .expression_attribute_values(":pk", AttributeValue::S(msg.team_id.clone()))
         .expression_attribute_values(":prefix", AttributeValue::S("REPO#".to_string()))
         .send()
         .await
@@ -93,7 +93,7 @@ pub async fn run(
         let mut repo_summaries: Vec<String> = Vec::new();
         for repo_name in &enabled_repos {
             let agents_md =
-                load_instructions(state, &msg.tenant_id, &format!("AGENTS#REPO#{repo_name}")).await;
+                load_instructions(state, &msg.team_id, &format!("AGENTS#REPO#{repo_name}")).await;
             if !agents_md.is_empty() {
                 // Take first ~500 chars (overview + tech stack, not full file)
                 let summary = if agents_md.len() > 500 {
@@ -122,7 +122,7 @@ pub async fn run(
             .dynamo
             .put_item()
             .table_name(&state.config.settings_table_name)
-            .item("pk", AttributeValue::S(msg.tenant_id.clone()))
+            .item("pk", AttributeValue::S(msg.team_id.clone()))
             .item("sk", AttributeValue::S("AGENTS#GLOBAL".to_string()))
             .item("content", AttributeValue::S(global_content))
             .item(
@@ -136,14 +136,14 @@ pub async fn run(
         }
     }
 
-    info!(tenant_id = %msg.tenant_id, "Onboard complete");
+    info!(team_id = %msg.team_id, "Onboard complete");
 
-    // Send welcome email only once per tenant
+    // Send welcome email only once per team
     let welcome_check = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", AttributeValue::S(msg.tenant_id.clone()))
+        .key("pk", AttributeValue::S(msg.team_id.clone()))
         .key("sk", AttributeValue::S("WELCOME_SENT".to_string()))
         .send()
         .await;
@@ -157,7 +157,7 @@ pub async fn run(
             .unwrap_or_default();
         if let Err(e) = email::send_notification(
             state,
-            &msg.tenant_id,
+            &msg.team_id,
             EmailEvent::Welcome {
                 org,
                 repo_count: msg.repos.len(),
@@ -172,7 +172,7 @@ pub async fn run(
             .dynamo
             .put_item()
             .table_name(&state.config.table_name)
-            .item("pk", AttributeValue::S(msg.tenant_id.clone()))
+            .item("pk", AttributeValue::S(msg.team_id.clone()))
             .item("sk", AttributeValue::S("WELCOME_SENT".to_string()))
             .item(
                 "sent_at",
@@ -189,7 +189,7 @@ async fn onboard_repo(
     state: &WorkerState,
     github: &GitHubClient,
     repo: &crate::models::OnboardRepo,
-    tenant_id: &str,
+    team_id: &str,
     global_instructions: &str,
     repo_instructions: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -299,7 +299,7 @@ async fn onboard_repo(
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", AttributeValue::S(tenant_id.to_string()))
+        .item("pk", AttributeValue::S(team_id.to_string()))
         .item("sk", AttributeValue::S(agents_sk))
         .item("content", AttributeValue::S(agents_md))
         .item(
@@ -313,7 +313,7 @@ async fn onboard_repo(
     info!(repo = %full_name, "Stored AGENTS.md in DynamoDB");
 
     // Generate and store VOICE.md in DynamoDB
-    if let Err(e) = generate_voice_md(state, github, repo, tenant_id).await {
+    if let Err(e) = generate_voice_md(state, github, repo, team_id).await {
         warn!(repo = %full_name, error = %e, "Failed to generate VOICE.md");
     }
 
@@ -341,7 +341,7 @@ async fn generate_voice_md(
     state: &WorkerState,
     github: &GitHubClient,
     repo: &crate::models::OnboardRepo,
-    tenant_id: &str,
+    team_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let full_name = format!("{}/{}", repo.owner, repo.name);
 
@@ -424,7 +424,7 @@ async fn generate_voice_md(
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", AttributeValue::S(tenant_id.to_string()))
+        .item("pk", AttributeValue::S(team_id.to_string()))
         .item("sk", AttributeValue::S(voice_sk))
         .item("content", AttributeValue::S(voice_md))
         .item(
@@ -497,12 +497,12 @@ fn fallback_global_context(repo_names: &[String]) -> String {
     )
 }
 
-async fn load_instructions(state: &WorkerState, tenant_id: &str, sk: &str) -> String {
+async fn load_instructions(state: &WorkerState, team_id: &str, sk: &str) -> String {
     match state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S(sk.to_string()))
         .send()
         .await
@@ -522,7 +522,7 @@ async fn load_instructions(state: &WorkerState, tenant_id: &str, sk: &str) -> St
 
 async fn set_onboard_status(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     repo: &str,
     status: &str,
     error_msg: Option<&str>,
@@ -532,7 +532,7 @@ async fn set_onboard_status(
         .dynamo
         .update_item()
         .table_name(&state.config.repos_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S(format!("REPO#{repo}")))
         .update_expression(if error_msg.is_some() {
             "SET onboard_status = :s, onboard_error = :e, updated_at = :t"

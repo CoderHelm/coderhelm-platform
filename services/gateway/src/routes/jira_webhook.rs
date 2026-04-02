@@ -19,8 +19,8 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 
 /// Jira webhook handler — `/webhooks/jira/:token`
 ///
-/// The token is an opaque random string that maps to a tenant (stored in the jira-tokens table).
-/// Additionally, if the tenant has a webhook_secret configured, we verify the `X-Hub-Signature`
+/// The token is an opaque random string that maps to a team (stored in the jira-tokens table).
+/// Additionally, if the team has a webhook_secret configured, we verify the `X-Hub-Signature`
 /// header (HMAC-SHA256) for defense-in-depth.
 pub async fn handle(
     State(state): State<Arc<AppState>>,
@@ -28,7 +28,7 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    // Look up tenant by webhook token from jira-tokens table
+    // Look up team by webhook token from jira-tokens table
     let token_item = state
         .dynamo
         .get_item()
@@ -46,8 +46,8 @@ pub async fn handle(
             StatusCode::UNAUTHORIZED
         })?;
 
-    let tenant_id = token_item
-        .get("tenant_id")
+    let team_id = token_item
+        .get("team_id")
         .and_then(|v| v.as_s().ok())
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
         .to_string();
@@ -85,10 +85,10 @@ pub async fn handle(
                 .unwrap_u8()
                 != 1
         {
-            warn!(tenant_id, "Jira webhook: invalid HMAC signature");
+            warn!(team_id, "Jira webhook: invalid HMAC signature");
             log_jira_event(
                 &state,
-                &tenant_id,
+                &team_id,
                 "signature_rejected",
                 "",
                 "",
@@ -106,13 +106,13 @@ pub async fn handle(
         StatusCode::BAD_REQUEST
     })?;
 
-    process_jira_payload(&state, &tenant_id, installation_id, &payload).await
+    process_jira_payload(&state, &team_id, installation_id, &payload).await
 }
 
 /// Shared payload processing for both token-based and Forge webhook paths.
 async fn process_jira_payload(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     installation_id: u64,
     payload: &Value,
 ) -> Result<StatusCode, StatusCode> {
@@ -125,7 +125,7 @@ async fn process_jira_payload(
 
     // ── Handle comment events ────────────────────────────────────────────────
     if event_type.contains("comment") {
-        return handle_jira_comment(state, tenant_id, installation_id, payload, issue).await;
+        return handle_jira_comment(state, team_id, installation_id, payload, issue).await;
     }
 
     // Repo mapping — now optional. When absent, triage will auto-pick the repo.
@@ -160,7 +160,7 @@ async fn process_jira_payload(
         .table_name(&state.config.jira_config_table_name)
         .key(
             "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
         )
         .key(
             "sk",
@@ -229,7 +229,7 @@ async fn process_jira_payload(
     if !has_label && !is_assigned {
         let tk = issue.get("key").and_then(|v| v.as_str()).unwrap_or("?");
         info!(ticket_key = %tk, label = %trigger_label, "Skipping — no trigger label or assignee match");
-        log_jira_event(state, tenant_id, event_type, tk, "", "filtered", None).await;
+        log_jira_event(state, team_id, event_type, tk, "", "filtered", None).await;
         return Ok(StatusCode::OK);
     }
 
@@ -248,7 +248,7 @@ async fn process_jira_payload(
             .table_name(&state.config.jira_config_table_name)
             .key(
                 "pk",
-                aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+                aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
             )
             .key(
                 "sk",
@@ -269,7 +269,7 @@ async fn process_jira_payload(
             if !enabled {
                 info!(project_key, "Skipping — Jira project not enabled");
                 let tk = issue.get("key").and_then(|v| v.as_str()).unwrap_or("?");
-                log_jira_event(state, tenant_id, event_type, tk, "", "filtered", None).await;
+                log_jira_event(state, team_id, event_type, tk, "", "filtered", None).await;
                 return Ok(StatusCode::OK);
             }
         }
@@ -314,7 +314,7 @@ async fn process_jira_payload(
         .to_string();
 
     info!(
-        tenant_id,
+        team_id,
         installation_id, ticket_key, repo_owner, repo_name, "Jira webhook received"
     );
 
@@ -323,9 +323,9 @@ async fn process_jira_payload(
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
-        .key_condition_expression("tenant_id = :tid")
+        .key_condition_expression("team_id = :tid")
         .filter_expression("ticket_id = :ticket")
-        .expression_attribute_values(":tid", attr_s(tenant_id))
+        .expression_attribute_values(":tid", attr_s(team_id))
         .expression_attribute_values(":ticket", attr_s(ticket_key))
         .limit(5)
         .send()
@@ -336,7 +336,7 @@ async fn process_jira_payload(
             info!(ticket_key, "Skipping — ticket already has a run");
             log_jira_event(
                 state,
-                tenant_id,
+                team_id,
                 event_type,
                 ticket_key,
                 &title,
@@ -349,11 +349,11 @@ async fn process_jira_payload(
     }
 
     // Check token budget before processing
-    if let Some(_reason) = super::github_webhook::check_run_budget(state, tenant_id).await {
-        info!(tenant_id, "Jira webhook skipped — token limit reached");
+    if let Some(_reason) = super::github_webhook::check_run_budget(state, team_id).await {
+        info!(team_id, "Jira webhook skipped — token limit reached");
         log_jira_event(
             state,
-            tenant_id,
+            team_id,
             event_type,
             ticket_key,
             &title,
@@ -365,7 +365,7 @@ async fn process_jira_payload(
     }
 
     let message = WorkerMessage::Ticket(TicketMessage {
-        tenant_id: tenant_id.to_string(),
+        team_id: team_id.to_string(),
         installation_id,
         source: TicketSource::Jira,
         ticket_id: ticket_key.to_string(),
@@ -387,7 +387,7 @@ async fn process_jira_payload(
     };
     log_jira_event(
         state,
-        tenant_id,
+        team_id,
         event_type,
         ticket_key,
         &title,
@@ -420,14 +420,14 @@ pub async fn handle_forge(
             StatusCode::BAD_REQUEST
         })?;
 
-    let tenant_id = format!("TENANT#{installation_id}");
+    let team_id = format!("TEAM#{installation_id}");
 
-    // Verify this tenant actually exists by checking jira config
+    // Verify this team actually exists by checking jira config
     let config_exists = state
         .dynamo
         .get_item()
         .table_name(&state.config.jira_config_table_name)
-        .key("pk", attr_s(&tenant_id))
+        .key("pk", attr_s(&team_id))
         .key("sk", attr_s("JIRA#config"))
         .send()
         .await
@@ -436,19 +436,19 @@ pub async fn handle_forge(
         .is_some();
 
     if !config_exists {
-        warn!(tenant_id, "Forge Jira webhook: tenant not configured");
+        warn!(team_id, "Forge Jira webhook: team not configured");
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    info!(tenant_id, installation_id, "Forge Jira webhook received");
+    info!(team_id, installation_id, "Forge Jira webhook received");
 
-    process_jira_payload(&state, &tenant_id, installation_id, &payload).await
+    process_jira_payload(&state, &team_id, installation_id, &payload).await
 }
 
 /// Handle a Jira comment event — retry failed runs or send feedback for completed runs with PRs.
 async fn handle_jira_comment(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     installation_id: u64,
     payload: &Value,
     issue: &Value,
@@ -478,19 +478,16 @@ async fn handle_jira_comment(
         return Ok(StatusCode::OK);
     }
 
-    info!(
-        tenant_id,
-        ticket_key, comment_author, "Jira comment received"
-    );
+    info!(team_id, ticket_key, comment_author, "Jira comment received");
 
     // Find the most recent run for this ticket
     let runs = state
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
-        .key_condition_expression("tenant_id = :tid")
+        .key_condition_expression("team_id = :tid")
         .filter_expression("ticket_id = :ticket")
-        .expression_attribute_values(":tid", attr_s(tenant_id))
+        .expression_attribute_values(":tid", attr_s(team_id))
         .expression_attribute_values(":ticket", attr_s(ticket_key))
         .scan_index_forward(false)
         .limit(1)
@@ -560,7 +557,7 @@ async fn handle_jira_comment(
             };
 
             let message = WorkerMessage::Ticket(TicketMessage {
-                tenant_id: tenant_id.to_string(),
+                team_id: team_id.to_string(),
                 installation_id,
                 source: TicketSource::Jira,
                 ticket_id: ticket_key.to_string(),
@@ -573,7 +570,7 @@ async fn handle_jira_comment(
             });
 
             info!(
-                tenant_id,
+                team_id,
                 ticket_key, run_id, "Retrying failed Jira run after comment"
             );
             send_to_queue(state, &state.config.ticket_queue_url, &message).await
@@ -581,7 +578,7 @@ async fn handle_jira_comment(
         // Completed run with PR — send feedback
         "completed" if pr_number > 0 => {
             let message = WorkerMessage::Feedback(crate::models::FeedbackMessage {
-                tenant_id: tenant_id.to_string(),
+                team_id: team_id.to_string(),
                 installation_id,
                 run_id: run_id.to_string(),
                 repo_owner: repo_owner.to_string(),
@@ -593,7 +590,7 @@ async fn handle_jira_comment(
             });
 
             info!(
-                tenant_id,
+                team_id,
                 ticket_key, run_id, "Sending feedback for Jira comment on completed run"
             );
             send_to_queue(state, &state.config.feedback_queue_url, &message).await
@@ -644,7 +641,7 @@ async fn send_to_queue(
 /// Log a Jira webhook event to the jira-events table.
 async fn log_jira_event(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     event_type: &str,
     ticket_key: &str,
     title: &str,
@@ -662,7 +659,7 @@ async fn log_jira_event(
         .dynamo
         .put_item()
         .table_name(&state.config.jira_events_table_name)
-        .item("tenant_id", attr_s(tenant_id))
+        .item("team_id", attr_s(team_id))
         .item("event_id", attr_s(&event_id))
         .item("event_type", attr_s(event_type))
         .item("ticket_key", attr_s(ticket_key))
@@ -683,18 +680,18 @@ async fn log_jira_event(
     }
 }
 
-/// Query Jira events for a tenant (used by the Events tab API).
+/// Query Jira events for a team (used by the Events tab API).
 pub async fn list_jira_events(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     limit: i32,
 ) -> Result<Vec<serde_json::Value>, StatusCode> {
     let result = state
         .dynamo
         .query()
         .table_name(&state.config.jira_events_table_name)
-        .key_condition_expression("tenant_id = :tid")
-        .expression_attribute_values(":tid", attr_s(tenant_id))
+        .key_condition_expression("team_id = :tid")
+        .expression_attribute_values(":tid", attr_s(team_id))
         .scan_index_forward(false)
         .limit(limit)
         .send()

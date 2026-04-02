@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub stage: String,
     pub table_name: String,
+    pub teams_table_name: String,
     pub runs_table_name: String,
     pub analytics_table_name: String,
     pub events_table_name: String,
@@ -39,6 +40,7 @@ impl Config {
         Self {
             stage: std::env::var("STAGE").unwrap_or_else(|_| "dev".to_string()),
             table_name: std::env::var("TABLE_NAME").expect("TABLE_NAME required"),
+            teams_table_name: std::env::var("TEAMS_TABLE_NAME").expect("TEAMS_TABLE_NAME required"),
             runs_table_name: std::env::var("RUNS_TABLE_NAME").expect("RUNS_TABLE_NAME required"),
             analytics_table_name: std::env::var("ANALYTICS_TABLE_NAME")
                 .expect("ANALYTICS_TABLE_NAME required"),
@@ -152,7 +154,7 @@ pub enum WorkerMessage {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MarkReadyMessage {
-    pub tenant_id: String,
+    pub team_id: String,
     pub installation_id: u64,
     pub repo_owner: String,
     pub repo_name: String,
@@ -161,7 +163,7 @@ pub struct MarkReadyMessage {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PlanExecuteMessage {
-    pub tenant_id: String,
+    pub team_id: String,
     pub plan_id: String,
     pub triggered_by: String,
     pub tasks: Vec<String>, // ordered task_ids
@@ -169,14 +171,14 @@ pub struct PlanExecuteMessage {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PlanTaskContinueMessage {
-    pub tenant_id: String,
+    pub team_id: String,
     pub plan_id: String,
     pub tasks: Vec<String>, // task_ids to process
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct InfraAnalyzeMessage {
-    pub tenant_id: String,
+    pub team_id: String,
     pub triggered_by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
@@ -184,7 +186,7 @@ pub struct InfraAnalyzeMessage {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TicketMessage {
-    pub tenant_id: String,
+    pub team_id: String,
     pub installation_id: u64,
     pub source: TicketSource,
     pub ticket_id: String,
@@ -205,7 +207,7 @@ pub enum TicketSource {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CiFixMessage {
-    pub tenant_id: String,
+    pub team_id: String,
     pub installation_id: u64,
     pub run_id: String,
     pub repo_owner: String,
@@ -218,7 +220,7 @@ pub struct CiFixMessage {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct FeedbackMessage {
-    pub tenant_id: String,
+    pub team_id: String,
     pub installation_id: u64,
     pub run_id: String,
     pub repo_owner: String,
@@ -241,8 +243,8 @@ pub struct ReviewComment {
 /// JWT claims for authenticated dashboard sessions.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Claims {
-    pub sub: String,       // user_id (USER#<cognito_sub> or USER#<github_id>)
-    pub tenant_id: String, // TENANT#<id>
+    pub sub: String,     // user_id (USER#<cognito_sub> or USER#<github_id>)
+    pub team_id: String, // TEAM#<id>
     pub email: String,
     pub role: String, // owner, admin, member, viewer
     #[serde(default)]
@@ -263,8 +265,8 @@ impl Claims {
 /// DynamoDB item types.
 #[derive(Serialize, Deserialize, Debug)]
 #[allow(dead_code)]
-pub struct Tenant {
-    pub pk: String, // TENANT#<install_id>
+pub struct Team {
+    pub pk: String, // TEAM#<install_id>
     pub sk: String, // META
     pub github_install_id: u64,
     pub github_org: String,
@@ -274,7 +276,7 @@ pub struct Tenant {
     pub created_at: String,
 }
 
-/// Notification preferences (stored in main table: pk=TENANT#<id>, sk=NOTIFICATIONS#<user_id>)
+/// Notification preferences (stored in main table: pk=TEAM#<id>, sk=NOTIFICATIONS#<user_id>)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NotificationPrefs {
     pub email_run_complete: bool,
@@ -296,7 +298,7 @@ impl Default for NotificationPrefs {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct OnboardMessage {
-    pub tenant_id: String,
+    pub team_id: String,
     pub installation_id: u64,
     pub repos: Vec<OnboardRepo>,
 }
@@ -315,7 +317,7 @@ mod tests {
     #[test]
     fn ticket_message_roundtrip() {
         let msg = WorkerMessage::Ticket(TicketMessage {
-            tenant_id: "TENANT#1".into(),
+            team_id: "TEAM#1".into(),
             installation_id: 1,
             source: TicketSource::Github,
             ticket_id: "GH-42".into(),
@@ -334,7 +336,7 @@ mod tests {
     #[test]
     fn onboard_message_roundtrip() {
         let msg = WorkerMessage::Onboard(OnboardMessage {
-            tenant_id: "TENANT#1".into(),
+            team_id: "TEAM#1".into(),
             installation_id: 1,
             repos: vec![OnboardRepo {
                 owner: "org".into(),
@@ -366,7 +368,7 @@ mod tests {
     fn claims_roundtrip() {
         let c = Claims {
             sub: "user1".into(),
-            tenant_id: "TENANT#1".into(),
+            team_id: "TEAM#1".into(),
             github_login: "octocat".into(),
             exp: 9999999999,
             iat: 1000000000,

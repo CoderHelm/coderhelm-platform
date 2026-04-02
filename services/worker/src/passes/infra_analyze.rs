@@ -279,10 +279,10 @@ pub async fn run(
     state: &WorkerState,
     msg: InfraAnalyzeMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 1. Get tenant to find installation_id + repos
-    let tenant = get_tenant(state, &msg.tenant_id).await?;
-    let Some((install_id, repos)) = tenant else {
-        warn!(tenant_id = %msg.tenant_id, "Tenant not found for infra analyze");
+    // 1. Get team to find installation_id + repos
+    let team = get_team(state, &msg.team_id).await?;
+    let Some((install_id, repos)) = team else {
+        warn!(team_id = %msg.team_id, "Team not found for infra analyze");
         return Ok(());
     };
 
@@ -310,8 +310,8 @@ pub async fn run(
     };
 
     if infra_code.is_empty() {
-        store_no_infra(state, &msg.tenant_id, &sk).await?;
-        info!(tenant_id = %msg.tenant_id, sk = %sk, "No infrastructure code found");
+        store_no_infra(state, &msg.team_id, &sk).await?;
+        info!(team_id = %msg.team_id, sk = %sk, "No infrastructure code found");
         return Ok(());
     }
 
@@ -326,14 +326,14 @@ pub async fn run(
     let (diagram_str, findings_str) = match &diagram {
         Some(d) if validate_diagram(d).is_err() => {
             let errs = validate_diagram(d).unwrap_err();
-            warn!(tenant_id = %msg.tenant_id, errors = %errs, "Diagram validation failed, retrying");
+            warn!(team_id = %msg.team_id, errors = %errs, "Diagram validation failed, retrying");
             let retry = call_bedrock_retry(state, &code_context, d, &errs).await?;
             let (retry_diagram, retry_findings) = parse_response(&retry);
             let rd = retry_diagram.unwrap_or_default();
             let rf =
                 retry_findings.unwrap_or_else(|| findings_json.unwrap_or_else(|| "[]".to_string()));
             if let Err(e2) = validate_diagram(&rd) {
-                warn!(tenant_id = %msg.tenant_id, errors = %e2, "Diagram still invalid after retry, using as-is");
+                warn!(team_id = %msg.team_id, errors = %e2, "Diagram still invalid after retry, using as-is");
             }
             (rd, rf)
         }
@@ -351,7 +351,7 @@ pub async fn run(
         .dynamo
         .put_item()
         .table_name(&state.config.infra_table_name)
-        .item("pk", AttributeValue::S(msg.tenant_id.clone()))
+        .item("pk", AttributeValue::S(msg.team_id.clone()))
         .item("sk", AttributeValue::S(sk.clone()))
         .item("status", AttributeValue::S("ready".to_string()))
         .item("has_infra", AttributeValue::Bool(true))
@@ -369,21 +369,21 @@ pub async fn run(
         .send()
         .await?;
 
-    info!(tenant_id = %msg.tenant_id, files = scanned.len(), "Infra analysis complete");
+    info!(team_id = %msg.team_id, files = scanned.len(), "Infra analysis complete");
     Ok(())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-async fn get_tenant(
+async fn get_team(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
 ) -> Result<Option<(u64, Vec<String>)>, Box<dyn std::error::Error + Send + Sync>> {
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S("META".to_string()))
         .send()
         .await?;
@@ -405,7 +405,7 @@ async fn get_tenant(
         .query()
         .table_name(&state.config.repos_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(tenant_id.to_string()))
+        .expression_attribute_values(":pk", AttributeValue::S(team_id.to_string()))
         .expression_attribute_values(":prefix", AttributeValue::S("REPO#".to_string()))
         .send()
         .await?;
@@ -918,7 +918,7 @@ fn validate_diagram(diagram: &str) -> Result<(), String> {
 
 async fn store_no_infra(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     sk: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
@@ -926,7 +926,7 @@ async fn store_no_infra(
         .dynamo
         .put_item()
         .table_name(&state.config.infra_table_name)
-        .item("pk", AttributeValue::S(tenant_id.to_string()))
+        .item("pk", AttributeValue::S(team_id.to_string()))
         .item("sk", AttributeValue::S(sk.to_string()))
         .item("status", AttributeValue::S("no_infra".to_string()))
         .item("has_infra", AttributeValue::Bool(false))

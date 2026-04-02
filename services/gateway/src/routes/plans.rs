@@ -15,7 +15,7 @@ fn attr_n(val: impl ToString) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
 }
 
-/// GET /api/plans — list plans for the tenant (paginated).
+/// GET /api/plans — list plans for the team (paginated).
 pub async fn list_plans(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -32,7 +32,7 @@ pub async fn list_plans(
         .query()
         .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("PLAN#"))
         .filter_expression("attribute_exists(plan_id)")
         .scan_index_forward(false)
@@ -41,7 +41,7 @@ pub async fn list_plans(
     // Resume from cursor
     if let Some(cursor) = params.get("cursor").filter(|c| !c.is_empty()) {
         let lek = std::collections::HashMap::from([
-            ("pk".to_string(), attr_s(&claims.tenant_id)),
+            ("pk".to_string(), attr_s(&claims.team_id)),
             ("sk".to_string(), attr_s(cursor)),
         ]);
         query = query.set_exclusive_start_key(Some(lek));
@@ -84,7 +84,7 @@ pub async fn create_plan(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     let title = body["title"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
     let description = body["description"].as_str().unwrap_or("");
     let repo = body["repo"].as_str().unwrap_or("");
@@ -105,7 +105,7 @@ pub async fn create_plan(
         .dynamo
         .put_item()
         .table_name(&state.config.plans_table_name)
-        .item("pk", attr_s(&claims.tenant_id))
+        .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(&sk))
         .item("plan_id", attr_s(&plan_id))
         .item("title", attr_s(title))
@@ -137,7 +137,7 @@ pub async fn create_plan(
                 .dynamo
                 .put_item()
                 .table_name(&state.config.plans_table_name)
-                .item("pk", attr_s(&claims.tenant_id))
+                .item("pk", attr_s(&claims.team_id))
                 .item("sk", attr_s(&task_sk))
                 .item("plan_id", attr_s(&plan_id))
                 .item("task_id", attr_s(&task_id))
@@ -173,7 +173,7 @@ pub async fn create_plan(
             .dynamo
             .update_item()
             .table_name(&state.config.plans_table_name)
-            .key("pk", attr_s(&claims.tenant_id))
+            .key("pk", attr_s(&claims.team_id))
             .key("sk", attr_s(&sk))
             .update_expression("SET task_count = :c")
             .expression_attribute_values(":c", attr_n(tasks.len()))
@@ -183,20 +183,20 @@ pub async fn create_plan(
     }
 
     // Track plan usage and report overage to Stripe
-    track_plan_usage(&state, &claims.tenant_id).await;
+    track_plan_usage(&state, &claims.team_id).await;
 
     Ok(Json(json!({ "plan_id": plan_id })))
 }
 
 /// Increment total_plans in analytics (plans are unlimited, no overage billing).
-async fn track_plan_usage(state: &Arc<AppState>, tenant_id: &str) {
+async fn track_plan_usage(state: &Arc<AppState>, team_id: &str) {
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     for period in &[month.as_str(), "ALL_TIME"] {
         let _ = state
             .dynamo
             .update_item()
             .table_name(&state.config.analytics_table_name)
-            .key("tenant_id", attr_s(tenant_id))
+            .key("team_id", attr_s(team_id))
             .key("period", attr_s(period))
             .update_expression("ADD total_plans :one")
             .expression_attribute_values(":one", attr_n(1))
@@ -218,7 +218,7 @@ pub async fn get_plan(
         .query()
         .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s(&format!("PLAN#{plan_id}")))
         .send()
         .await
@@ -297,7 +297,7 @@ pub async fn update_plan(
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .update_expression(&update_expr)
         .condition_expression("attribute_exists(pk)");
@@ -325,7 +325,7 @@ pub async fn update_plan(
                 .query()
                 .table_name(&state.config.plans_table_name)
                 .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-                .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+                .expression_attribute_values(":pk", attr_s(&claims.team_id))
                 .expression_attribute_values(":prefix", attr_s(&task_prefix))
                 .projection_expression("pk, sk")
                 .send()
@@ -341,7 +341,7 @@ pub async fn update_plan(
                         .dynamo
                         .update_item()
                         .table_name(&state.config.plans_table_name)
-                        .key("pk", attr_s(&claims.tenant_id))
+                        .key("pk", attr_s(&claims.team_id))
                         .key("sk", attr_s(task_sk))
                         .update_expression("SET destination = :dest")
                         .expression_attribute_values(":dest", attr_s(dest))
@@ -369,7 +369,7 @@ pub async fn delete_plan(
         .query()
         .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s(&format!("PLAN#{plan_id}")))
         .projection_expression("pk, sk")
         .send()
@@ -430,7 +430,7 @@ pub async fn add_task(
         .dynamo
         .put_item()
         .table_name(&state.config.plans_table_name)
-        .item("pk", attr_s(&claims.tenant_id))
+        .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(&task_sk))
         .item("plan_id", attr_s(&plan_id))
         .item("task_id", attr_s(&task_id))
@@ -467,7 +467,7 @@ pub async fn add_task(
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&plan_sk))
         .update_expression(
             "SET task_count = if_not_exists(task_count, :zero) + :one, updated_at = :now",
@@ -549,7 +549,7 @@ pub async fn update_task(
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&task_sk))
         .update_expression(&update_expr)
         .condition_expression("attribute_exists(pk)");
@@ -585,7 +585,7 @@ pub async fn delete_task(
         .dynamo
         .delete_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&task_sk))
         .send()
         .await
@@ -601,7 +601,7 @@ pub async fn delete_task(
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&plan_sk))
         .update_expression(
             "SET task_count = if_not_exists(task_count, :one) - :one, updated_at = :now",
@@ -621,7 +621,7 @@ pub async fn approve_task(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
 ) -> Result<StatusCode, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
 
@@ -632,7 +632,7 @@ pub async fn approve_task(
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&task_sk))
         .update_expression("SET #st = :s, approved_at = :now, approved_by = :by")
         .expression_attribute_names("#st", "status")
@@ -666,7 +666,7 @@ pub async fn reject_task(
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&task_sk))
         .update_expression("SET #st = :s, rejected_at = :now, rejected_by = :by")
         .expression_attribute_names("#st", "status")
@@ -690,7 +690,7 @@ pub async fn approve_all_and_execute(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     validate_plan_id(&plan_id)?;
 
     let result = state
@@ -698,7 +698,7 @@ pub async fn approve_all_and_execute(
         .query()
         .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s(&format!("PLAN#{plan_id}")))
         .send()
         .await
@@ -742,7 +742,7 @@ pub async fn approve_all_and_execute(
                 .dynamo
                 .update_item()
                 .table_name(&state.config.plans_table_name)
-                .key("pk", attr_s(&claims.tenant_id))
+                .key("pk", attr_s(&claims.team_id))
                 .key("sk", attr_s(&task_sk))
                 .update_expression("SET #st = :s, approved_at = :now, approved_by = :by")
                 .expression_attribute_names("#st", "status")
@@ -770,7 +770,7 @@ pub async fn approve_all_and_execute(
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&plan_sk))
         .update_expression("SET #st = :s, executed_at = :now, executed_by = :by, updated_at = :now")
         .expression_attribute_names("#st", "status")
@@ -786,7 +786,7 @@ pub async fn approve_all_and_execute(
 
     // Send SQS message
     let plan_msg = WorkerMessage::PlanExecute(PlanExecuteMessage {
-        tenant_id: claims.tenant_id.clone(),
+        team_id: claims.team_id.clone(),
         plan_id: plan_id.clone(),
         triggered_by: claims.display_name(),
         tasks: task_ids.iter().map(|(tid, _)| tid.clone()).collect(),
@@ -814,7 +814,7 @@ pub async fn approve_all_and_execute(
             .dynamo
             .update_item()
             .table_name(&state.config.plans_table_name)
-            .key("pk", attr_s(&claims.tenant_id))
+            .key("pk", attr_s(&claims.team_id))
             .key("sk", attr_s(&task_sk))
             .update_expression("SET #st = :s")
             .expression_attribute_names("#st", "status")
@@ -836,7 +836,7 @@ pub async fn force_run_task(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
 
@@ -846,7 +846,7 @@ pub async fn force_run_task(
         .dynamo
         .get_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&task_sk))
         .send()
         .await
@@ -868,7 +868,7 @@ pub async fn force_run_task(
 
     // Send PlanTaskContinue message to the worker
     let msg = WorkerMessage::PlanTaskContinue(PlanTaskContinueMessage {
-        tenant_id: claims.tenant_id.clone(),
+        team_id: claims.team_id.clone(),
         plan_id: plan_id.clone(),
         tasks: vec![task_id.clone()],
     });
@@ -897,7 +897,7 @@ pub async fn execute_plan(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     validate_plan_id(&plan_id)?;
 
     // Get plan + all tasks
@@ -906,7 +906,7 @@ pub async fn execute_plan(
         .query()
         .table_name(&state.config.plans_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s(&format!("PLAN#{plan_id}")))
         .send()
         .await
@@ -962,7 +962,7 @@ pub async fn execute_plan(
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&plan_sk))
         .update_expression("SET #st = :s, executed_at = :now, executed_by = :by, updated_at = :now")
         .expression_attribute_names("#st", "status")
@@ -978,7 +978,7 @@ pub async fn execute_plan(
 
     // Send SQS message for plan execution (worker creates issues + queues runs)
     let plan_msg = WorkerMessage::PlanExecute(PlanExecuteMessage {
-        tenant_id: claims.tenant_id.clone(),
+        team_id: claims.team_id.clone(),
         plan_id: plan_id.clone(),
         triggered_by: claims.display_name(),
         tasks: approved_task_ids
@@ -1009,7 +1009,7 @@ pub async fn execute_plan(
             .dynamo
             .update_item()
             .table_name(&state.config.plans_table_name)
-            .key("pk", attr_s(&claims.tenant_id))
+            .key("pk", attr_s(&claims.team_id))
             .key("sk", attr_s(&task_sk))
             .update_expression("SET #st = :s")
             .expression_attribute_names("#st", "status")
@@ -1151,7 +1151,7 @@ pub async fn plan_chat(
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("AGENTS#GLOBAL"))
         .send()
         .await
@@ -1166,7 +1166,7 @@ pub async fn plan_chat(
         .query()
         .table_name(&state.config.repos_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("REPO#"))
         .send()
         .await
@@ -1190,15 +1190,15 @@ pub async fn plan_chat(
         .unwrap_or_default();
 
     // Optional AWS Log Analyzer context for planning (off by default).
-    let allow_plan_log_analyzer = load_allow_plan_log_analyzer(&state, &claims.tenant_id).await;
+    let allow_plan_log_analyzer = load_allow_plan_log_analyzer(&state, &claims.team_id).await;
     let log_analyzer_context = if allow_plan_log_analyzer {
-        Some(load_log_analyzer_context(&state, &claims.tenant_id).await)
+        Some(load_log_analyzer_context(&state, &claims.team_id).await)
     } else {
         None
     };
 
-    // Load enabled plugins (MCP servers) for this tenant
-    let enabled_plugins = load_enabled_plugins(&state, &claims.tenant_id).await;
+    // Load enabled plugins (MCP servers) for this team
+    let enabled_plugins = load_enabled_plugins(&state, &claims.team_id).await;
 
     // Build system prompt with org context and repo list
     let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
@@ -1358,7 +1358,7 @@ pub async fn plan_chat(
             _ => {
                 track_chat_tokens(
                     &state,
-                    &claims.tenant_id,
+                    &claims.team_id,
                     total_input_tokens,
                     total_output_tokens,
                 )
@@ -1398,7 +1398,7 @@ pub async fn plan_chat(
 
             track_chat_tokens(
                 &state,
-                &claims.tenant_id,
+                &claims.team_id,
                 total_input_tokens,
                 total_output_tokens,
             )
@@ -1416,8 +1416,7 @@ pub async fn plan_chat(
             let result = if let Some((server_id, tool_name)) = full_name.split_once("__") {
                 mcp_servers_used.insert(server_id.to_string());
                 // Find plugin credentials and invoke MCP proxy
-                match invoke_mcp_tool(&state, &claims.tenant_id, server_id, tool_name, &input).await
-                {
+                match invoke_mcp_tool(&state, &claims.team_id, server_id, tool_name, &input).await {
                     Ok(result) => result,
                     Err(e) => {
                         warn!(tool = full_name, error = %e, "MCP tool call failed");
@@ -1472,7 +1471,7 @@ pub async fn plan_chat(
 
     track_chat_tokens(
         &state,
-        &claims.tenant_id,
+        &claims.team_id,
         total_input_tokens,
         total_output_tokens,
     )
@@ -1482,19 +1481,14 @@ pub async fn plan_chat(
 }
 
 /// Track plan chat token usage in analytics.
-async fn track_chat_tokens(
-    state: &AppState,
-    tenant_id: &str,
-    input_tokens: u64,
-    output_tokens: u64,
-) {
+async fn track_chat_tokens(state: &AppState, team_id: &str, input_tokens: u64, output_tokens: u64) {
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     for period in &[month.as_str(), "ALL_TIME"] {
         let _ = state
             .dynamo
             .update_item()
             .table_name(&state.config.analytics_table_name)
-            .key("tenant_id", attr_s(tenant_id))
+            .key("team_id", attr_s(team_id))
             .key("period", attr_s(period))
             .update_expression("ADD total_tokens_in :tin, total_tokens_out :tout")
             .expression_attribute_values(":tin", attr_n(input_tokens))
@@ -1504,12 +1498,12 @@ async fn track_chat_tokens(
     }
 }
 
-async fn load_allow_plan_log_analyzer(state: &AppState, tenant_id: &str) -> bool {
+async fn load_allow_plan_log_analyzer(state: &AppState, team_id: &str) -> bool {
     state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(tenant_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s("SETTINGS#WORKFLOW"))
         .send()
         .await
@@ -1523,13 +1517,13 @@ async fn load_allow_plan_log_analyzer(state: &AppState, tenant_id: &str) -> bool
         .unwrap_or(false)
 }
 
-async fn load_log_analyzer_context(state: &AppState, tenant_id: &str) -> String {
+async fn load_log_analyzer_context(state: &AppState, team_id: &str) -> String {
     let result = match state
         .dynamo
         .query()
         .table_name(&state.config.settings_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(tenant_id))
+        .expression_attribute_values(":pk", attr_s(team_id))
         .expression_attribute_values(":prefix", attr_s("REC#"))
         .scan_index_forward(false)
         .limit(5)
@@ -1628,17 +1622,17 @@ fn mcp_table(state: &AppState) -> &str {
     }
 }
 
-/// Load enabled plugins for the tenant, returning (server_id, has_credentials, custom_prompt).
+/// Load enabled plugins for the team, returning (server_id, has_credentials, custom_prompt).
 async fn load_enabled_plugins(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
 ) -> Vec<(String, bool, Option<String>)> {
     state
         .dynamo
         .query()
         .table_name(mcp_table(state))
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(tenant_id))
+        .expression_attribute_values(":pk", attr_s(team_id))
         .expression_attribute_values(":prefix", attr_s("PLUGIN#"))
         .send()
         .await
@@ -1780,7 +1774,7 @@ const GATEWAY_MCP_CATALOG: &[(&str, &str, &[(&str, &str)])] = &[
 /// Invoke an MCP tool via the MCP proxy Lambda.
 async fn invoke_mcp_tool(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     server_id: &str,
     tool_name: &str,
     tool_input: &Value,
@@ -1796,7 +1790,7 @@ async fn invoke_mcp_tool(
         .dynamo
         .get_item()
         .table_name(mcp_table(state))
-        .key("pk", attr_s(tenant_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s(&format!("PLUGIN#{server_id}")))
         .send()
         .await

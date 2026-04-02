@@ -231,17 +231,17 @@ pub async fn verify_email(
 
     let cognito_sub = user_result.username();
 
-    // Create a personal tenant for the new user
-    let tenant_id = format!("TENANT#{cognito_sub}");
+    // Create a personal team for the new user
+    let team_id = format!("TEAM#{cognito_sub}");
     let user_id = format!("USER#{cognito_sub}");
     let now = chrono::Utc::now().to_rfc3339();
 
-    // Create tenant META record
+    // Create team META record
     let _ = state
         .dynamo
         .put_item()
         .table_name(&state.config.table_name)
-        .item("pk", attr_s(&tenant_id))
+        .item("pk", attr_s(&team_id))
         .item("sk", attr_s("META"))
         .item("status", attr_s("active"))
         .item("created_at", attr_s(&now))
@@ -254,7 +254,7 @@ pub async fn verify_email(
         .dynamo
         .put_item()
         .table_name(&state.config.users_table_name)
-        .item("pk", attr_s(&tenant_id))
+        .item("pk", attr_s(&team_id))
         .item("sk", attr_s(&user_id))
         .item("email", attr_s(&email))
         .item("role", attr_s("owner"))
@@ -264,11 +264,11 @@ pub async fn verify_email(
             "gsi2pk",
             attr_s(&format!("EMAIL#{}", normalize_email(&email))),
         )
-        .item("gsi2sk", attr_s(&tenant_id))
+        .item("gsi2sk", attr_s(&team_id))
         .send()
         .await;
 
-    info!(email = %email, tenant_id = %tenant_id, "Email verified, user + tenant created");
+    info!(email = %email, team_id = %team_id, "Email verified, user + team created");
 
     Ok(Json(serde_json::json!({
         "status": "verified",
@@ -584,7 +584,7 @@ pub async fn google_callback(
         return Ok(Redirect::temporary(&redirect).into_response());
     }
 
-    let (tenant_id, user_id, role) = if let Some(item) = existing.first() {
+    let (team_id, user_id, role) = if let Some(item) = existing.first() {
         let tid = item
             .get("pk")
             .and_then(|v| v.as_s().ok())
@@ -602,8 +602,8 @@ pub async fn google_callback(
             .unwrap_or_else(|| "member".to_string());
         (tid, uid, r)
     } else {
-        // New user — create personal tenant
-        let tid = format!("TENANT#{cognito_sub}");
+        // New user — create personal team
+        let tid = format!("TEAM#{cognito_sub}");
         let uid = format!("USER#{cognito_sub}");
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -638,14 +638,14 @@ pub async fn google_callback(
             .send()
             .await;
 
-        info!(email = %email, tenant_id = %tid, "Google user created");
+        info!(email = %email, team_id = %tid, "Google user created");
         (tid, uid, "owner".to_string())
     };
 
     // Issue JWT
     let token = jwt::create_token(
         &user_id,
-        &tenant_id,
+        &team_id,
         &email,
         &role,
         None,
@@ -741,7 +741,7 @@ pub async fn github_callback(
     let github_id = user["id"].as_u64().ok_or(StatusCode::BAD_GATEWAY)?;
     let github_login = user["login"].as_str().ok_or(StatusCode::BAD_GATEWAY)?;
 
-    // Fetch user's app installations to find tenant
+    // Fetch user's app installations to find team
     let installs_resp = client
         .get("https://api.github.com/user/installations")
         .header("Authorization", format!("Bearer {access_token}"))
@@ -788,7 +788,7 @@ pub async fn github_callback(
             .dynamo
             .update_item()
             .table_name(&state.config.users_table_name)
-            .key("pk", attr_s(&claims.tenant_id))
+            .key("pk", attr_s(&claims.team_id))
             .key("sk", attr_s(&claims.sub))
             .update_expression(
                 "SET github_id = :gid, github_login = :gl, \
@@ -797,15 +797,15 @@ pub async fn github_callback(
             .expression_attribute_values(":gid", attr_n(github_id))
             .expression_attribute_values(":gl", attr_s(github_login))
             .expression_attribute_values(":g1pk", attr_s(&format!("GHUSER#{github_id}")))
-            .expression_attribute_values(":g1sk", attr_s(&claims.tenant_id))
+            .expression_attribute_values(":g1sk", attr_s(&claims.team_id))
             .expression_attribute_values(":now", attr_s(&now))
             .send()
             .await;
 
-        // Also upsert into ALL installation tenants
+        // Also upsert into ALL installation teams
         for (inst_id, _org) in &all_installations {
-            let tid = format!("TENANT#{inst_id}");
-            if tid != claims.tenant_id {
+            let tid = format!("TEAM#{inst_id}");
+            if tid != claims.team_id {
                 let _ = state
                     .dynamo
                     .put_item()
@@ -834,15 +834,15 @@ pub async fn github_callback(
         }
 
         // Re-issue JWT with github_login
-        let first_install_tenant = if !all_installations.is_empty() {
-            format!("TENANT#{}", all_installations[0].0)
+        let first_install_team = if !all_installations.is_empty() {
+            format!("TEAM#{}", all_installations[0].0)
         } else {
-            claims.tenant_id.clone()
+            claims.team_id.clone()
         };
 
         let token = jwt::create_token(
             &claims.sub,
-            &first_install_tenant,
+            &first_install_team,
             &claims.email,
             &claims.role,
             Some(github_login),
@@ -894,7 +894,7 @@ pub async fn github_callback(
     }
 
     let installation_id = all_installations[0].0;
-    let tenant_id = format!("TENANT#{installation_id}");
+    let team_id = format!("TEAM#{installation_id}");
     let github_user_id = format!("USER#{github_id}");
     let email = user["email"].as_str().unwrap_or("");
     let normalized_email = normalize_email(email);
@@ -904,7 +904,7 @@ pub async fn github_callback(
         .dynamo
         .get_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(&tenant_id))
+        .key("pk", attr_s(&team_id))
         .key("sk", attr_s(&github_user_id))
         .send()
         .await
@@ -920,7 +920,7 @@ pub async fn github_callback(
             .index_name("gsi2")
             .key_condition_expression("gsi2pk = :email AND gsi2sk = :tid")
             .expression_attribute_values(":email", attr_s(&format!("EMAIL#{normalized_email}")))
-            .expression_attribute_values(":tid", attr_s(&tenant_id))
+            .expression_attribute_values(":tid", attr_s(&team_id))
             .send()
             .await
             .ok()
@@ -993,7 +993,7 @@ pub async fn github_callback(
             .index_name("gsi2")
             .key_condition_expression("gsi2pk = :email AND gsi2sk = :tid")
             .expression_attribute_values(":email", attr_s(&format!("EMAIL#{normalized_email}")))
-            .expression_attribute_values(":tid", attr_s(&tenant_id))
+            .expression_attribute_values(":tid", attr_s(&team_id))
             .send()
             .await
             .ok()
@@ -1021,7 +1021,7 @@ pub async fn github_callback(
                     .dynamo
                     .delete_item()
                     .table_name(&state.config.users_table_name)
-                    .key("pk", attr_s(&tenant_id))
+                    .key("pk", attr_s(&team_id))
                     .key("sk", attr_s(invite_sk))
                     .send()
                     .await;
@@ -1029,12 +1029,12 @@ pub async fn github_callback(
             }
         } else {
             // No invite — check if first user (→ owner)
-            let tenant_users = state
+            let team_users = state
                 .dynamo
                 .query()
                 .table_name(&state.config.users_table_name)
                 .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-                .expression_attribute_values(":pk", attr_s(&tenant_id))
+                .expression_attribute_values(":pk", attr_s(&team_id))
                 .expression_attribute_values(":prefix", attr_s("USER#"))
                 .limit(1)
                 .send()
@@ -1043,19 +1043,19 @@ pub async fn github_callback(
                 .map(|r| r.count() as usize)
                 .unwrap_or(0);
 
-            if tenant_users == 0 {
+            if team_users == 0 {
                 role = "owner".to_string();
             }
         }
     }
 
-    // Upsert user into ALL tenant user tables
+    // Upsert user into ALL team user tables
     for (inst_id, _org) in &all_installations {
-        let tid = format!("TENANT#{inst_id}");
-        let user_role = if tid == tenant_id {
+        let tid = format!("TEAM#{inst_id}");
+        let user_role = if tid == team_id {
             role.clone()
         } else {
-            // For other tenants, check if invited there too
+            // For other teams, check if invited there too
             let other_existing = state
                 .dynamo
                 .get_item()
@@ -1127,7 +1127,7 @@ pub async fn github_callback(
 
     let token = jwt::create_token(
         &user_id,
-        &tenant_id,
+        &team_id,
         email,
         &role,
         Some(github_login),
@@ -1186,7 +1186,7 @@ async fn issue_session_from_cognito(
 
     let cognito_sub = user.username();
 
-    // Look up user by email (GSI2) — includes personal tenant + any pending invites
+    // Look up user by email (GSI2) — includes personal team + any pending invites
     let existing = state
         .dynamo
         .query()
@@ -1203,7 +1203,7 @@ async fn issue_session_from_cognito(
 
     let items = existing.items().to_vec();
 
-    // Find non-invite record (the user's own tenant) to use for session
+    // Find non-invite record (the user's own team) to use for session
     let active_item = items.iter().find(|item| {
         item.get("status")
             .and_then(|v| v.as_s().ok())
@@ -1211,7 +1211,7 @@ async fn issue_session_from_cognito(
             .unwrap_or(true)
     });
 
-    let (tenant_id, user_id, role, github_login) = if let Some(item) = active_item {
+    let (team_id, user_id, role, github_login) = if let Some(item) = active_item {
         let tid = item
             .get("pk")
             .and_then(|v| v.as_s().ok())
@@ -1233,8 +1233,8 @@ async fn issue_session_from_cognito(
             .cloned();
         (tid, uid, r, gl)
     } else {
-        // First login — create personal tenant
-        let tid = format!("TENANT#{cognito_sub}");
+        // First login — create personal team
+        let tid = format!("TEAM#{cognito_sub}");
         let uid = format!("USER#{cognito_sub}");
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -1268,11 +1268,11 @@ async fn issue_session_from_cognito(
             .send()
             .await;
 
-        info!(email = %email, "Created new user + tenant on first login");
+        info!(email = %email, "Created new user + team on first login");
         (tid, uid, "owner".to_string(), None)
     };
 
-    // Process any pending invites — create real user records in the inviting tenants
+    // Process any pending invites — create real user records in the inviting teams
     let real_user_id = format!("USER#{cognito_sub}");
     let now = chrono::Utc::now().to_rfc3339();
     for item in &items {
@@ -1294,7 +1294,7 @@ async fn issue_session_from_cognito(
             .cloned()
             .unwrap_or_else(|| "member".to_string());
 
-        // Create a real user record in the inviting tenant
+        // Create a real user record in the inviting team
         let _ = state
             .dynamo
             .put_item()
@@ -1323,13 +1323,13 @@ async fn issue_session_from_cognito(
                 .key("sk", attr_s(invite_sk))
                 .send()
                 .await;
-            info!(email = %email, tenant_id = %invite_tid, role = %invite_role, "Processed pending invite on login");
+            info!(email = %email, team_id = %invite_tid, role = %invite_role, "Processed pending invite on login");
         }
     }
 
     let token = jwt::create_token(
         &user_id,
-        &tenant_id,
+        &team_id,
         email,
         &role,
         github_login.as_deref(),
@@ -1346,7 +1346,7 @@ async fn issue_session_from_cognito(
         [(header::SET_COOKIE, cookie)],
         Json(serde_json::json!({
             "status": "ok",
-            "tenant_id": tenant_id,
+            "team_id": team_id,
         })),
     )
         .into_response())

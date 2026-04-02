@@ -9,6 +9,7 @@ interface DatabaseStackProps extends cdk.StackProps {
 
 export class DatabaseStack extends cdk.Stack {
   public readonly table: dynamodb.TableV2;
+  public readonly teamsTable: dynamodb.TableV2;
   public readonly runsTable: dynamodb.TableV2;
   public readonly analyticsTable: dynamodb.TableV2;
   public readonly eventsTable: dynamodb.TableV2;
@@ -40,7 +41,7 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
-    // Main table: tenant identity only (META, TENANT, WELCOME_SENT)
+    // Main table: team identity (META, TEAM, WELCOME_SENT)
     // ──────────────────────────────────────────────
     this.table = new dynamodb.TableV2(this, "Table", {
       tableName: `coderhelm-${props.stage}`,
@@ -60,14 +61,14 @@ export class DatabaseStack extends cdk.Stack {
       timeToLiveAttribute: "expires_at",
     });
 
-    // GSI1: Look up tenants by github_id (for OAuth login)
+    // GSI1: Look up teams by github_id (for OAuth login)
     this.table.addGlobalSecondaryIndex({
       indexName: "gsi1",
       partitionKey: { name: "gsi1pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "gsi1sk", type: dynamodb.AttributeType.STRING },
     });
 
-    // GSI2: Look up tenants by stripe_customer_id (for Stripe webhooks)
+    // GSI2: Look up teams by stripe_customer_id (for Stripe webhooks)
     this.table.addGlobalSecondaryIndex({
       indexName: "gsi2",
       partitionKey: { name: "gsi2pk", type: dynamodb.AttributeType.STRING },
@@ -75,14 +76,54 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
+    // Teams table: team records with connection metadata
+    // PK = team_id (TEAM#<nanoid>), SK = META | CONNECTION#github | etc.
+    // GSI: github_installation_id → team_id (for webhook lookup)
+    // ──────────────────────────────────────────────
+    this.teamsTable = new dynamodb.TableV2(this, "TeamsTable", {
+      tableName: `coderhelm-${props.stage}-teams`,
+      partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // GSI: Look up team by GitHub installation ID (for webhooks)
+    this.teamsTable.addGlobalSecondaryIndex({
+      indexName: "github-installation-index",
+      partitionKey: {
+        name: "github_installation_id",
+        type: dynamodb.AttributeType.NUMBER,
+      },
+    });
+
+    // GSI: Look up team by Stripe customer ID (for Stripe webhooks)
+    this.teamsTable.addGlobalSecondaryIndex({
+      indexName: "stripe-customer-index",
+      partitionKey: {
+        name: "stripe_customer_id",
+        type: dynamodb.AttributeType.STRING,
+      },
+    });
+
+    // ──────────────────────────────────────────────
     // Runs table: high-volume run records
-    // PK = tenant_id, SK = run_id (ULID — time-ordered)
-    // Designed for millions of records per tenant
+    // PK = team_id, SK = run_id (ULID — time-ordered)
+    // Designed for millions of records per team
     // ──────────────────────────────────────────────
     this.runsTable = new dynamodb.TableV2(this, "RunsTable", {
       tableName: `coderhelm-${props.stage}-runs`,
       partitionKey: {
-        name: "tenant_id",
+        name: "team_id",
         type: dynamodb.AttributeType.STRING,
       },
       sortKey: { name: "run_id", type: dynamodb.AttributeType.STRING },
@@ -104,7 +145,7 @@ export class DatabaseStack extends cdk.Stack {
     this.runsTable.addGlobalSecondaryIndex({
       indexName: "status-index",
       partitionKey: {
-        name: "tenant_id",
+        name: "team_id",
         type: dynamodb.AttributeType.STRING,
       },
       sortKey: { name: "status_run_id", type: dynamodb.AttributeType.STRING },
@@ -114,7 +155,7 @@ export class DatabaseStack extends cdk.Stack {
     this.runsTable.addGlobalSecondaryIndex({
       indexName: "repo-index",
       partitionKey: {
-        name: "tenant_repo",
+        name: "team_repo",
         type: dynamodb.AttributeType.STRING,
       },
       sortKey: { name: "run_id", type: dynamodb.AttributeType.STRING },
@@ -122,13 +163,13 @@ export class DatabaseStack extends cdk.Stack {
 
     // ──────────────────────────────────────────────
     // Analytics table: pre-computed aggregates
-    // PK = tenant_id, SK = period (e.g. "2026-03", "ALL_TIME")
+    // PK = team_id, SK = period (e.g. "2026-03", "ALL_TIME")
     // Atomic counters — O(1) reads for dashboard stats
     // ──────────────────────────────────────────────
     this.analyticsTable = new dynamodb.TableV2(this, "AnalyticsTable", {
       tableName: `coderhelm-${props.stage}-analytics`,
       partitionKey: {
-        name: "tenant_id",
+        name: "team_id",
         type: dynamodb.AttributeType.STRING,
       },
       sortKey: { name: "period", type: dynamodb.AttributeType.STRING },
@@ -169,9 +210,9 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
-    // Users table: user records per tenant
-    // PK = tenant_id, SK = USER#<github_id>
-    // GSI1: reverse lookup by github_id → tenant
+    // Users table: user records per team
+    // PK = team_id, SK = USER#<github_id>
+    // GSI1: reverse lookup by github_id → team
     // ──────────────────────────────────────────────
     this.usersTable = new dynamodb.TableV2(this, "UsersTable", {
       tableName: `coderhelm-${props.stage}-users`,
@@ -190,14 +231,14 @@ export class DatabaseStack extends cdk.Stack {
         : cdk.RemovalPolicy.DESTROY,
     });
 
-    // GSI1: Look up user by github_id (for OAuth login tenant resolution)
+    // GSI1: Look up user by github_id (for OAuth login team resolution)
     this.usersTable.addGlobalSecondaryIndex({
       indexName: "gsi1",
       partitionKey: { name: "gsi1pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "gsi1sk", type: dynamodb.AttributeType.STRING },
     });
 
-    // GSI2: Look up user by email (for Cognito login tenant resolution)
+    // GSI2: Look up user by email (for Cognito login team resolution)
     this.usersTable.addGlobalSecondaryIndex({
       indexName: "gsi2",
       partitionKey: { name: "gsi2pk", type: dynamodb.AttributeType.STRING },
@@ -205,7 +246,7 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
-    // Jira tokens table: opaque webhook token → tenant mapping
+    // Jira tokens table: opaque webhook token → team mapping
     // PK = token (the random 40-char string)
     // ──────────────────────────────────────────────
     this.jiraTokensTable = new dynamodb.TableV2(this, "JiraTokensTable", {
@@ -226,13 +267,13 @@ export class DatabaseStack extends cdk.Stack {
 
     // ──────────────────────────────────────────────
     // Jira events table: log every webhook event received
-    // PK = tenant_id, SK = event_id (ULID — time-ordered)
+    // PK = team_id, SK = event_id (ULID — time-ordered)
     // TTL for auto-cleanup of old events
     // ──────────────────────────────────────────────
     this.jiraEventsTable = new dynamodb.TableV2(this, "JiraEventsTable", {
       tableName: `coderhelm-${props.stage}-jira-events`,
       partitionKey: {
-        name: "tenant_id",
+        name: "team_id",
         type: dynamodb.AttributeType.STRING,
       },
       sortKey: { name: "event_id", type: dynamodb.AttributeType.STRING },
@@ -252,7 +293,7 @@ export class DatabaseStack extends cdk.Stack {
 
     // ──────────────────────────────────────────────
     // Plans table: plans + tasks
-    // PK = tenant_id, SK = PLAN#<plan_id> or PLAN#<plan_id>#TASK#<task_id>
+    // PK = team_id, SK = PLAN#<plan_id> or PLAN#<plan_id>#TASK#<task_id>
     // ──────────────────────────────────────────────
     this.plansTable = new dynamodb.TableV2(this, "PlansTable", {
       tableName: `coderhelm-${props.stage}-plans`,
@@ -273,7 +314,7 @@ export class DatabaseStack extends cdk.Stack {
 
     // ──────────────────────────────────────────────
     // Jira config table: JIRA_SECRET, JIRA#config, JIRA#PROJECT#<key>
-    // PK = tenant_id, SK = config key
+    // PK = team_id, SK = config key
     // ──────────────────────────────────────────────
     this.jiraConfigTable = new dynamodb.TableV2(this, "JiraConfigTable", {
       tableName: `coderhelm-${props.stage}-jira-config`,
@@ -294,7 +335,7 @@ export class DatabaseStack extends cdk.Stack {
 
     // ──────────────────────────────────────────────
     // Repos table: repository records
-    // PK = tenant_id, SK = REPO#<owner>/<repo>
+    // PK = team_id, SK = REPO#<owner>/<repo>
     // ──────────────────────────────────────────────
     this.reposTable = new dynamodb.TableV2(this, "ReposTable", {
       tableName: `coderhelm-${props.stage}-repos`,
@@ -315,7 +356,7 @@ export class DatabaseStack extends cdk.Stack {
 
     // ──────────────────────────────────────────────
     // Settings table: instructions, rules, voice, agents, notifications, budget, workflow
-    // PK = tenant_id, SK = setting key
+    // PK = team_id, SK = setting key
     // ──────────────────────────────────────────────
     this.settingsTable = new dynamodb.TableV2(this, "SettingsTable", {
       tableName: `coderhelm-${props.stage}-settings`,
@@ -337,7 +378,7 @@ export class DatabaseStack extends cdk.Stack {
 
     // ──────────────────────────────────────────────
     // MCP Configs table: plugin enable/disable state + encrypted credentials
-    // PK = tenant_id, SK = PLUGIN#{plugin_id}
+    // PK = team_id, SK = PLUGIN#{plugin_id}
     // Separated from settings to isolate secret material
     // ──────────────────────────────────────────────
     this.mcpConfigsTable = new dynamodb.TableV2(this, "McpConfigsTable", {
@@ -376,7 +417,7 @@ export class DatabaseStack extends cdk.Stack {
 
     // ──────────────────────────────────────────────
     // Infra table: infrastructure analysis results
-    // PK = tenant_id, SK = INFRA#analysis or INFRA#REPO#<owner>/<repo>
+    // PK = team_id, SK = INFRA#analysis or INFRA#REPO#<owner>/<repo>
     // ──────────────────────────────────────────────
     this.infraTable = new dynamodb.TableV2(this, "InfraTable", {
       tableName: `coderhelm-${props.stage}-infra`,
@@ -397,7 +438,7 @@ export class DatabaseStack extends cdk.Stack {
 
     // ──────────────────────────────────────────────
     // Billing table: subscription & payment data
-    // PK = tenant_id, SK = BILLING
+    // PK = team_id, SK = BILLING
     // ──────────────────────────────────────────────
     this.billingTable = new dynamodb.TableV2(this, "BillingTable", {
       tableName: `coderhelm-${props.stage}-billing-data`,
@@ -418,7 +459,7 @@ export class DatabaseStack extends cdk.Stack {
 
     // ──────────────────────────────────────────────
     // Banners table: dynamic UI banners
-    // PK = scope (BANNER#GLOBAL or BANNER#<tenant_id>), SK = banner_id
+    // PK = scope (BANNER#GLOBAL or BANNER#<team_id>), SK = banner_id
     // ──────────────────────────────────────────────
     this.bannersTable = new dynamodb.TableV2(this, "BannersTable", {
       tableName: `coderhelm-${props.stage}-banners`,
@@ -441,6 +482,9 @@ export class DatabaseStack extends cdk.Stack {
     // Outputs
     new cdk.CfnOutput(this, "TableName", { value: this.table.tableName });
     new cdk.CfnOutput(this, "TableArn", { value: this.table.tableArn });
+    new cdk.CfnOutput(this, "TeamsTableName", {
+      value: this.teamsTable.tableName,
+    });
     new cdk.CfnOutput(this, "RunsTableName", {
       value: this.runsTable.tableName,
     });

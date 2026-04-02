@@ -14,7 +14,7 @@ const BILLING_THRESHOLD_CENTS: u64 = 10_000;
 /// Report token overage to Stripe via direct invoice items.
 /// Creates and pays an invoice when unbilled overage exceeds the threshold ($100).
 /// Budget enforcement (blocking new runs) is handled at the gateway, not here.
-pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_used: u64) {
+pub async fn report_token_overage(state: &WorkerState, team_id: &str, tokens_used: u64) {
     if tokens_used == 0 {
         return;
     }
@@ -24,14 +24,14 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
         _ => return,
     };
 
-    // Get the Stripe customer ID for this tenant
+    // Get the Stripe customer ID for this team
     let billing = match state
         .dynamo
         .get_item()
         .table_name(&state.config.billing_table_name)
         .key(
             "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
         )
         .key(
             "sk",
@@ -50,7 +50,7 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
     let item = match billing.item() {
         Some(i) => i,
         None => {
-            info!("[billing] no BILLING record for {tenant_id}, skipping overage report");
+            info!("[billing] no BILLING record for {team_id}, skipping overage report");
             return;
         }
     };
@@ -62,7 +62,7 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
     {
         Some(id) => id.to_string(),
         None => {
-            info!("[billing] no stripe_customer_id for {tenant_id}");
+            info!("[billing] no stripe_customer_id for {team_id}");
             return;
         }
     };
@@ -75,7 +75,7 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
 
     if status != "active" {
         info!(
-            "[billing] subscription not active ({status}) for {tenant_id}, skipping overage report"
+            "[billing] subscription not active ({status}) for {team_id}, skipping overage report"
         );
         return;
     }
@@ -87,8 +87,8 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
         .get_item()
         .table_name(&state.config.analytics_table_name)
         .key(
-            "tenant_id",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
         )
         .key(
             "period",
@@ -123,12 +123,12 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
     let current_overage = total_tokens.saturating_sub(INCLUDED_TOKENS);
     let cumulative_overage_1k = current_overage.div_ceil(1000);
 
-    info!("[billing] overage check for {tenant_id}: {cumulative_overage_1k} x 1K tokens total");
+    info!("[billing] overage check for {team_id}: {cumulative_overage_1k} x 1K tokens total");
 
     // Check unbilled overage and create invoice if threshold exceeded
     create_overage_invoice_if_needed(
         state,
-        tenant_id,
+        team_id,
         &customer_id,
         &stripe_key,
         cumulative_overage_1k,
@@ -142,7 +142,7 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
 /// Uses a conditional DynamoDB update to prevent double-billing from concurrent workers.
 async fn create_overage_invoice_if_needed(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     customer_id: &str,
     stripe_key: &str,
     cumulative_overage_1k: u64,
@@ -157,7 +157,7 @@ async fn create_overage_invoice_if_needed(
         .table_name(&state.config.billing_table_name)
         .key(
             "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
         )
         .key(
             "sk",
@@ -187,14 +187,14 @@ async fn create_overage_invoice_if_needed(
 
     if unbilled_cents < BILLING_THRESHOLD_CENTS {
         info!(
-            "[billing] unbilled overage ${:.2} below threshold for {tenant_id}",
+            "[billing] unbilled overage ${:.2} below threshold for {team_id}",
             unbilled_cents as f64 / 100.0,
         );
         return;
     }
 
     info!(
-        "[billing] unbilled overage {unbilled} units (${:.2}) exceeds threshold — claiming for {tenant_id}",
+        "[billing] unbilled overage {unbilled} units (${:.2}) exceeds threshold — claiming for {team_id}",
         unbilled_cents as f64 / 100.0
     );
 
@@ -207,7 +207,7 @@ async fn create_overage_invoice_if_needed(
         .table_name(&state.config.billing_table_name)
         .key(
             "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
         )
         .key(
             "sk",
@@ -235,7 +235,7 @@ async fn create_overage_invoice_if_needed(
         // ConditionalCheckFailedException means another worker already claimed these units
         let err_str = format!("{e}");
         if err_str.contains("ConditionalCheckFailed") {
-            info!("[billing] Another worker already claimed overage for {tenant_id}, skipping");
+            info!("[billing] Another worker already claimed overage for {team_id}, skipping");
             return;
         }
         warn!("[billing] Failed to claim overage units: {e}");
@@ -270,12 +270,12 @@ async fn create_overage_invoice_if_needed(
         Ok(r) => {
             let body = r.text().await.unwrap_or_default();
             warn!("[billing] Invoice item creation failed: {body}");
-            rollback_billed_counter(state, tenant_id, &billed_attr, already_billed).await;
+            rollback_billed_counter(state, team_id, &billed_attr, already_billed).await;
             return;
         }
         Err(e) => {
             warn!("[billing] Failed to create invoice item: {e}");
-            rollback_billed_counter(state, tenant_id, &billed_attr, already_billed).await;
+            rollback_billed_counter(state, team_id, &billed_attr, already_billed).await;
             return;
         }
     }
@@ -299,7 +299,7 @@ async fn create_overage_invoice_if_needed(
                 Some(id) => id.to_string(),
                 None => {
                     warn!("[billing] Invoice created but no ID in response");
-                    rollback_billed_counter(state, tenant_id, &billed_attr, already_billed).await;
+                    rollback_billed_counter(state, team_id, &billed_attr, already_billed).await;
                     return;
                 }
             }
@@ -307,12 +307,12 @@ async fn create_overage_invoice_if_needed(
         Ok(r) => {
             let body = r.text().await.unwrap_or_default();
             warn!("[billing] Invoice creation failed: {body}");
-            rollback_billed_counter(state, tenant_id, &billed_attr, already_billed).await;
+            rollback_billed_counter(state, team_id, &billed_attr, already_billed).await;
             return;
         }
         Err(e) => {
             warn!("[billing] Failed to create invoice: {e}");
-            rollback_billed_counter(state, tenant_id, &billed_attr, already_billed).await;
+            rollback_billed_counter(state, team_id, &billed_attr, already_billed).await;
             return;
         }
     };
@@ -354,7 +354,7 @@ async fn create_overage_invoice_if_needed(
     match pay_resp {
         Ok(r) if r.status().is_success() => {
             info!(
-                "[billing] Invoice {invoice_id} paid: {unbilled} units (${:.2}) for {tenant_id}",
+                "[billing] Invoice {invoice_id} paid: {unbilled} units (${:.2}) for {team_id}",
                 unbilled_cents as f64 / 100.0
             );
         }
@@ -372,7 +372,7 @@ async fn create_overage_invoice_if_needed(
 /// Roll back the billed counter to its previous value when invoice creation fails.
 async fn rollback_billed_counter(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     billed_attr: &str,
     old_value: u64,
 ) {
@@ -383,7 +383,7 @@ async fn rollback_billed_counter(
             .table_name(&state.config.billing_table_name)
             .key(
                 "pk",
-                aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+                aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
             )
             .key(
                 "sk",
@@ -400,7 +400,7 @@ async fn rollback_billed_counter(
             .table_name(&state.config.billing_table_name)
             .key(
                 "pk",
-                aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+                aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
             )
             .key(
                 "sk",

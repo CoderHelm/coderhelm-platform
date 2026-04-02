@@ -68,13 +68,8 @@ pub async fn run(
     } else {
         &state.config.mcp_configs_table_name
     };
-    let mcp_plugins = mcp::load_tenant_plugins(
-        &state.dynamo,
-        mcp_table,
-        &msg.tenant_id,
-        &super::MCP_CATALOG,
-    )
-    .await;
+    let mcp_plugins =
+        mcp::load_team_plugins(&state.dynamo, mcp_table, &msg.team_id, &super::MCP_CATALOG).await;
 
     let mut loaded_mcp_plugins = Vec::new();
     for plugin in &mcp_plugins {
@@ -117,8 +112,8 @@ pub async fn run(
     }
 
     let tasks_key = format!(
-        "tenants/{}/runs/{}/openspec/tasks.md",
-        msg.tenant_id,
+        "teams/{}/runs/{}/openspec/tasks.md",
+        msg.team_id,
         msg.ticket_id.to_lowercase()
     );
     let task_tracker = TaskTracker::new(

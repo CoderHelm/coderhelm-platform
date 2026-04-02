@@ -134,7 +134,7 @@ async fn handle_payment_succeeded(
     invoice: &Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let customer_id = invoice["customer"].as_str().unwrap_or("");
-    let tenant_id = resolve_tenant(state, customer_id).await?;
+    let team_id = resolve_team(state, customer_id).await?;
     let amount_cents = invoice["amount_paid"].as_u64().unwrap_or(0);
     let amount = format!("{:.2}", amount_cents as f64 / 100.0);
     let invoice_number = invoice["number"].as_str().unwrap_or("N/A");
@@ -147,7 +147,7 @@ async fn handle_payment_succeeded(
         .dynamo
         .put_item()
         .table_name(&state.config.events_table_name)
-        .item("pk", attr_s(&tenant_id))
+        .item("pk", attr_s(&team_id))
         .item("sk", attr_s(&format!("PAYMENT#{invoice_id}")))
         .item("invoice_number", attr_s(invoice_number))
         .item("amount_cents", attr_n(amount_cents))
@@ -169,7 +169,7 @@ async fn handle_payment_succeeded(
         .dynamo
         .update_item()
         .table_name(&state.config.billing_table_name)
-        .key("pk", attr_s(&tenant_id))
+        .key("pk", attr_s(&team_id))
         .key("sk", attr_s("BILLING"))
         .update_expression(&update_expr)
         .expression_attribute_values(":t", attr_s(&now.to_rfc3339()))
@@ -193,7 +193,7 @@ async fn handle_payment_succeeded(
 
         send_billing_email(
             state,
-            &tenant_id,
+            &team_id,
             "payment-receipt",
             &serde_json::json!({
                 "amount": amount,
@@ -212,7 +212,7 @@ async fn handle_payment_succeeded(
         .dynamo
         .update_item()
         .table_name(&state.config.events_table_name)
-        .key("pk", attr_s(&tenant_id))
+        .key("pk", attr_s(&team_id))
         .key("sk", attr_s(&format!("INVOICE#{invoice_id}")))
         .update_expression("SET #s = :s, paid_at = :t")
         .expression_attribute_names("#s", "status")
@@ -221,7 +221,7 @@ async fn handle_payment_succeeded(
         .send()
         .await;
 
-    info!(tenant_id, amount, invoice_number, "Payment succeeded");
+    info!(team_id, amount, invoice_number, "Payment succeeded");
     Ok(())
 }
 
@@ -230,7 +230,7 @@ async fn handle_payment_failed(
     invoice: &Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let customer_id = invoice["customer"].as_str().unwrap_or("");
-    let tenant_id = resolve_tenant(state, customer_id).await?;
+    let team_id = resolve_team(state, customer_id).await?;
     let amount_cents = invoice["amount_due"].as_u64().unwrap_or(0);
     let amount = format!("{:.2}", amount_cents as f64 / 100.0);
     let attempt_count = invoice["attempt_count"].as_u64().unwrap_or(1);
@@ -257,7 +257,7 @@ async fn handle_payment_failed(
         .dynamo
         .update_item()
         .table_name(&state.config.billing_table_name)
-        .key("pk", attr_s(&tenant_id))
+        .key("pk", attr_s(&team_id))
         .key("sk", attr_s("BILLING"))
         .update_expression(
             "SET payment_retry_count = :rc, subscription_status = :status, \
@@ -273,7 +273,7 @@ async fn handle_payment_failed(
     // Send payment failed email
     send_billing_email(
         state,
-        &tenant_id,
+        &team_id,
         "payment-failed",
         &serde_json::json!({
             "amount": amount,
@@ -284,7 +284,7 @@ async fn handle_payment_failed(
     )
     .await;
 
-    warn!(tenant_id, amount, attempt_count, "Payment failed");
+    warn!(team_id, amount, attempt_count, "Payment failed");
     Ok(())
 }
 
@@ -293,7 +293,7 @@ async fn handle_subscription_cancelled(
     subscription: &Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let customer_id = subscription["customer"].as_str().unwrap_or("");
-    let tenant_id = resolve_tenant(state, customer_id).await?;
+    let team_id = resolve_team(state, customer_id).await?;
     let cancelled_sub_id = subscription["id"].as_str().unwrap_or("");
 
     // Only cancel if this is the CURRENT subscription — ignore stale/old subscription deletions
@@ -302,7 +302,7 @@ async fn handle_subscription_cancelled(
             .dynamo
             .get_item()
             .table_name(&state.config.billing_table_name)
-            .key("pk", attr_s(&tenant_id))
+            .key("pk", attr_s(&team_id))
             .key("sk", attr_s("BILLING"))
             .send()
             .await
@@ -324,10 +324,10 @@ async fn handle_subscription_cancelled(
             .unwrap_or("");
 
         // Skip if: (a) we have a different sub_id stored (stale deletion), OR
-        // (b) the tenant is already on free/incomplete — nothing to cancel
+        // (b) the team is already on free/incomplete — nothing to cancel
         if !current_sub_id.is_empty() && current_sub_id != cancelled_sub_id {
             info!(
-                tenant_id,
+                team_id,
                 cancelled_sub_id,
                 current_sub_id,
                 "Ignoring subscription.deleted for old/stale subscription"
@@ -337,10 +337,10 @@ async fn handle_subscription_cancelled(
 
         if matches!(current_status, "free" | "incomplete_expired" | "incomplete") {
             info!(
-                tenant_id,
+                team_id,
                 cancelled_sub_id,
                 current_status,
-                "Ignoring subscription.deleted — tenant already inactive"
+                "Ignoring subscription.deleted — team already inactive"
             );
             return Ok(());
         }
@@ -364,7 +364,7 @@ async fn handle_subscription_cancelled(
         .dynamo
         .update_item()
         .table_name(&state.config.billing_table_name)
-        .key("pk", attr_s(&tenant_id))
+        .key("pk", attr_s(&team_id))
         .key("sk", attr_s("BILLING"))
         .update_expression(
             "SET subscription_status = :status, cancelled_at = :t, \
@@ -385,13 +385,13 @@ async fn handle_subscription_cancelled(
     };
     send_billing_email(
         state,
-        &tenant_id,
+        &team_id,
         template,
         &serde_json::json!({ "access_until": access_until, "immediate": immediate }),
     )
     .await;
 
-    info!(tenant_id, access_until, immediate, "Subscription cancelled");
+    info!(team_id, access_until, immediate, "Subscription cancelled");
     Ok(())
 }
 
@@ -400,7 +400,7 @@ async fn handle_subscription_updated(
     subscription: &Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let customer_id = subscription["customer"].as_str().unwrap_or("");
-    let tenant_id = resolve_tenant(state, customer_id).await?;
+    let team_id = resolve_team(state, customer_id).await?;
     let status = subscription["status"].as_str().unwrap_or("unknown");
     let sub_id = subscription["id"].as_str().unwrap_or("");
     let plan_id = subscription["items"]["data"][0]["price"]["id"]
@@ -425,7 +425,7 @@ async fn handle_subscription_updated(
             .dynamo
             .update_item()
             .table_name(&state.config.billing_table_name)
-            .key("pk", attr_s(&tenant_id))
+            .key("pk", attr_s(&team_id))
             .key("sk", attr_s("BILLING"))
             .update_expression(
                 "SET subscription_status = :status, plan_id = :plan, \
@@ -444,7 +444,7 @@ async fn handle_subscription_updated(
             .dynamo
             .update_item()
             .table_name(&state.config.billing_table_name)
-            .key("pk", attr_s(&tenant_id))
+            .key("pk", attr_s(&team_id))
             .key("sk", attr_s("BILLING"))
             .update_expression(
                 "SET subscription_status = :status, plan_id = :plan, \
@@ -472,7 +472,7 @@ async fn handle_subscription_updated(
             .dynamo
             .update_item()
             .table_name(&state.config.billing_table_name)
-            .key("pk", attr_s(&tenant_id))
+            .key("pk", attr_s(&team_id))
             .key("sk", attr_s("BILLING"))
             .update_expression(update_expr)
             .expression_attribute_values(":status", attr_s(status))
@@ -485,7 +485,7 @@ async fn handle_subscription_updated(
     }
 
     info!(
-        tenant_id,
+        team_id,
         status, plan_id, cancel_at_period_end, "Subscription updated"
     );
     Ok(())
@@ -496,7 +496,7 @@ async fn handle_invoice_finalized(
     invoice: &Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let customer_id = invoice["customer"].as_str().unwrap_or("");
-    let tenant_id = resolve_tenant(state, customer_id).await?;
+    let team_id = resolve_team(state, customer_id).await?;
     let invoice_number = invoice["number"].as_str().unwrap_or("N/A");
     let invoice_id = invoice["id"].as_str().unwrap_or("");
     let amount_cents = invoice["amount_due"].as_u64().unwrap_or(0);
@@ -518,7 +518,7 @@ async fn handle_invoice_finalized(
         .dynamo
         .put_item()
         .table_name(&state.config.events_table_name)
-        .item("pk", attr_s(&tenant_id))
+        .item("pk", attr_s(&team_id))
         .item("sk", attr_s(&format!("INVOICE#{invoice_id}")))
         .item("invoice_number", attr_s(invoice_number))
         .item("amount_cents", attr_n(amount_cents))
@@ -540,7 +540,7 @@ async fn handle_invoice_finalized(
     // so users only receive the email once payment is confirmed.
 
     info!(
-        tenant_id,
+        team_id,
         invoice_number, amount, "Invoice finalized (record stored, email deferred to payment)"
     );
     Ok(())
@@ -551,7 +551,7 @@ async fn handle_charge_refunded(
     charge: &Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let customer_id = charge["customer"].as_str().unwrap_or("");
-    let tenant_id = resolve_tenant(state, customer_id).await?;
+    let team_id = resolve_team(state, customer_id).await?;
     let charge_id = charge["id"].as_str().unwrap_or("");
     let invoice_id = charge["invoice"].as_str().unwrap_or("");
     let amount_refunded_cents = charge["amount_refunded"].as_u64().unwrap_or(0);
@@ -564,7 +564,7 @@ async fn handle_charge_refunded(
         .dynamo
         .put_item()
         .table_name(&state.config.events_table_name)
-        .item("pk", attr_s(&tenant_id))
+        .item("pk", attr_s(&team_id))
         .item("sk", attr_s(&format!("REFUND#{charge_id}")))
         .item("amount_cents", attr_n(amount_refunded_cents))
         .item("stripe_charge_id", attr_s(charge_id))
@@ -592,7 +592,7 @@ async fn handle_charge_refunded(
             .query()
             .table_name(&state.config.events_table_name)
             .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-            .expression_attribute_values(":pk", attr_s(&tenant_id))
+            .expression_attribute_values(":pk", attr_s(&team_id))
             .expression_attribute_values(":prefix", attr_s("PAYMENT#"))
             .scan_index_forward(false)
             .limit(20)
@@ -632,7 +632,7 @@ async fn handle_charge_refunded(
             .dynamo
             .update_item()
             .table_name(&state.config.events_table_name)
-            .key("pk", attr_s(&tenant_id))
+            .key("pk", attr_s(&team_id))
             .key("sk", attr_s(&format!("INVOICE#{resolved_invoice_id}")))
             .update_expression("SET #s = :s, refunded_at = :t, amount_refunded_cents = :r")
             .expression_attribute_names("#s", "status")
@@ -647,7 +647,7 @@ async fn handle_charge_refunded(
             .dynamo
             .update_item()
             .table_name(&state.config.events_table_name)
-            .key("pk", attr_s(&tenant_id))
+            .key("pk", attr_s(&team_id))
             .key("sk", attr_s(&format!("PAYMENT#{resolved_invoice_id}")))
             .update_expression("SET #s = :s, refunded_at = :t, amount_refunded_cents = :r")
             .expression_attribute_names("#s", "status")
@@ -658,17 +658,17 @@ async fn handle_charge_refunded(
             .await;
 
         info!(
-            tenant_id,
+            team_id,
             resolved_invoice_id, "Updated invoice/payment with refund status"
         );
     } else {
-        warn!(tenant_id, charge_id, "Could not resolve invoice for refund");
+        warn!(team_id, charge_id, "Could not resolve invoice for refund");
     }
 
     // Send refund notification email
     send_billing_email(
         state,
-        &tenant_id,
+        &team_id,
         "refund-processed",
         &serde_json::json!({
             "amount": amount_refunded,
@@ -677,14 +677,14 @@ async fn handle_charge_refunded(
     )
     .await;
 
-    info!(tenant_id, amount_refunded, charge_id, "Charge refunded");
+    info!(team_id, amount_refunded, charge_id, "Charge refunded");
     Ok(())
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-/// Resolve tenant_id from Stripe customer_id using reverse mapping.
-async fn resolve_tenant(
+/// Resolve team_id from Stripe customer_id using reverse mapping.
+async fn resolve_team(
     state: &AppState,
     customer_id: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -699,28 +699,23 @@ async fn resolve_tenant(
 
     result
         .item()
-        .and_then(|item| item.get("tenant_id"))
+        .and_then(|item| item.get("team_id"))
         .and_then(|v| v.as_s().ok())
         .cloned()
-        .ok_or_else(|| format!("No tenant found for Stripe customer {customer_id}").into())
+        .ok_or_else(|| format!("No team found for Stripe customer {customer_id}").into())
 }
 
-/// Send a billing email to all users under a tenant.
-async fn send_billing_email(
-    state: &AppState,
-    tenant_id: &str,
-    template_suffix: &str,
-    data: &Value,
-) {
+/// Send a billing email to all users under a team.
+async fn send_billing_email(state: &AppState, team_id: &str, template_suffix: &str, data: &Value) {
     let template_name = format!("{}-{}", state.config.ses_template_prefix, template_suffix);
 
-    // Query all users for this tenant
+    // Query all users for this team
     let users = match state
         .dynamo
         .query()
         .table_name(&state.config.users_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(tenant_id))
+        .expression_attribute_values(":pk", attr_s(team_id))
         .expression_attribute_values(":prefix", attr_s("USER#"))
         .projection_expression("email")
         .send()
@@ -728,7 +723,7 @@ async fn send_billing_email(
     {
         Ok(r) => r,
         Err(e) => {
-            error!("Failed to query tenant users for billing email: {e}");
+            error!("Failed to query team users for billing email: {e}");
             return;
         }
     };
@@ -868,12 +863,12 @@ async fn handle_invoice_created(
         None => return Ok(()),
     };
 
-    let tenant_id = match resolve_tenant(state, customer_id).await {
+    let team_id = match resolve_team(state, customer_id).await {
         Ok(t) => t,
         Err(e) => {
             warn!(
                 invoice_id,
-                customer_id, "invoice.created — failed to resolve tenant: {e}"
+                customer_id, "invoice.created — failed to resolve team: {e}"
             );
             return Ok(());
         }
@@ -898,7 +893,7 @@ async fn handle_invoice_created(
         .dynamo
         .get_item()
         .table_name(&state.config.analytics_table_name)
-        .key("tenant_id", attr_s(&tenant_id))
+        .key("team_id", attr_s(&team_id))
         .key("period", attr_s(&ended_month))
         .send()
         .await
@@ -925,7 +920,7 @@ async fn handle_invoice_created(
     if total_tokens <= included {
         info!(
             invoice_id,
-            tenant_id, total_tokens, "invoice.created — no overage for {ended_month}"
+            team_id, total_tokens, "invoice.created — no overage for {ended_month}"
         );
         return Ok(());
     }
@@ -938,7 +933,7 @@ async fn handle_invoice_created(
         .dynamo
         .get_item()
         .table_name(&state.config.billing_table_name)
-        .key("pk", attr_s(&tenant_id))
+        .key("pk", attr_s(&team_id))
         .key("sk", attr_s("BILLING"))
         .projection_expression("#b")
         .expression_attribute_names("#b", &billed_attr)
@@ -955,7 +950,7 @@ async fn handle_invoice_created(
     if unbilled == 0 {
         info!(
             invoice_id,
-            tenant_id, "invoice.created — all overage already billed for {ended_month}"
+            team_id, "invoice.created — all overage already billed for {ended_month}"
         );
         return Ok(());
     }
@@ -968,7 +963,7 @@ async fn handle_invoice_created(
 
     info!(
         invoice_id,
-        tenant_id,
+        team_id,
         unbilled,
         amount_cents,
         "invoice.created — adding leftover overage to renewal invoice"
@@ -1004,7 +999,7 @@ async fn handle_invoice_created(
         .dynamo
         .update_item()
         .table_name(&state.config.billing_table_name)
-        .key("pk", attr_s(&tenant_id))
+        .key("pk", attr_s(&team_id))
         .key("sk", attr_s("BILLING"))
         .update_expression("SET #b = :v")
         .expression_attribute_names("#b", &billed_attr)
@@ -1014,7 +1009,7 @@ async fn handle_invoice_created(
 
     info!(
         invoice_id,
-        tenant_id,
+        team_id,
         unbilled,
         "invoice.created — leftover overage ${:.2} added to renewal invoice",
         amount_cents as f64 / 100.0

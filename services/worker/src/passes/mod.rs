@@ -153,8 +153,8 @@ pub async fn orchestrate_ticket(
     info!(run_id, ticket_id = %msg.ticket_id, "Orchestration started");
 
     // Block processing if subscription is past_due (unpaid invoices)
-    if !is_subscription_allowed(state, &msg.tenant_id).await {
-        warn!(run_id, tenant_id = %msg.tenant_id, "Skipping ticket: subscription not active");
+    if !is_subscription_allowed(state, &msg.team_id).await {
+        warn!(run_id, team_id = %msg.team_id, "Skipping ticket: subscription not active");
         return Ok(());
     }
 
@@ -187,7 +187,7 @@ pub async fn orchestrate_ticket(
                     .dynamo
                     .update_item()
                     .table_name(&state.config.runs_table_name)
-                    .key("tenant_id", attr_s(&msg.tenant_id))
+                    .key("team_id", attr_s(&msg.team_id))
                     .key("run_id", attr_s(&run_id))
                     .update_expression("SET tokens_in = :ti, tokens_out = :to, cost_usd = :c, duration_s = :d, updated_at = :t")
                     .expression_attribute_values(":ti", attr_n(usage.input_tokens))
@@ -216,7 +216,7 @@ async fn run_passes(
     usage: &mut TokenUsage,
     start: &std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Initialize GitHub client for this tenant
+    // Initialize GitHub client for this team
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
         &state.secrets.github_private_key,
@@ -231,12 +231,12 @@ async fn run_passes(
     let voice = {
         let repo_voice = load_content(
             state,
-            &msg.tenant_id,
+            &msg.team_id,
             &format!("VOICE#REPO#{}/{}", msg.repo_owner, msg.repo_name),
         )
         .await;
         if repo_voice.is_empty() {
-            load_content(state, &msg.tenant_id, "VOICE#GLOBAL").await
+            load_content(state, &msg.team_id, "VOICE#GLOBAL").await
         } else {
             repo_voice
         }
@@ -263,9 +263,9 @@ async fn run_passes(
     // --- Auto-resolve repo for Jira tickets with bare "coderhelm" label ---
     if msg.repo_owner.is_empty() || msg.repo_name.is_empty() {
         if matches!(msg.source, TicketSource::Jira) {
-            let repos = plan::fetch_tenant_repos(state, &msg.tenant_id).await;
+            let repos = plan::fetch_team_repos(state, &msg.team_id).await;
             if repos.is_empty() {
-                return Err("No enabled repos found for tenant — cannot auto-pick repo".into());
+                return Err("No enabled repos found for team — cannot auto-pick repo".into());
             }
             if repos.len() == 1 {
                 // Single repo — no need to triage
@@ -287,13 +287,13 @@ async fn run_passes(
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
-                .key("tenant_id", attr_s(&msg.tenant_id))
+                .key("team_id", attr_s(&msg.team_id))
                 .key("run_id", attr_s(run_id))
-                .update_expression("SET repo = :r, tenant_repo = :tr")
+                .update_expression("SET repo = :r, team_repo = :tr")
                 .expression_attribute_values(":r", attr_s(&resolved_repo))
                 .expression_attribute_values(
                     ":tr",
-                    attr_s(&format!("{}#{}", msg.tenant_id, resolved_repo)),
+                    attr_s(&format!("{}#{}", msg.team_id, resolved_repo)),
                 )
                 .send()
                 .await
@@ -312,21 +312,21 @@ async fn run_passes(
         &state.config.mcp_configs_table_name
     };
     let mcp_plugins =
-        mcp::load_tenant_plugins(&state.dynamo, mcp_table, &msg.tenant_id, &MCP_CATALOG).await;
+        mcp::load_team_plugins(&state.dynamo, mcp_table, &msg.team_id, &MCP_CATALOG).await;
     let mcp_server_ids: Vec<String> = mcp_plugins.iter().map(|p| p.server_id.clone()).collect();
     if !mcp_server_ids.is_empty() {
         info!(run_id, servers = ?mcp_server_ids, "MCP servers active for run");
     }
 
     // --- Pass 1: Triage ---
-    check_cancelled(state, &msg.tenant_id, run_id).await?;
-    update_pass(state, &msg.tenant_id, run_id, "triage").await?;
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "triage").await?;
     let triage_result = triage::run(state, msg, &github, usage).await?;
     info!(run_id, "Triage complete");
 
     // --- Pass 2: Plan ---
-    check_cancelled(state, &msg.tenant_id, run_id).await?;
-    update_pass(state, &msg.tenant_id, run_id, "plan").await?;
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "plan").await?;
     let plan_result = plan::run(state, msg, &github, &triage_result, usage).await?;
     info!(run_id, "Plan complete");
 
@@ -348,7 +348,7 @@ async fn run_passes(
                 .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
                 .await;
         } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-            let _ = post_jira_comment(state, &msg.tenant_id, &msg.ticket_id, &comment).await;
+            let _ = post_jira_comment(state, &msg.team_id, &msg.ticket_id, &comment).await;
         }
 
         // Complete the run with no PR
@@ -359,7 +359,7 @@ async fn run_passes(
             .dynamo
             .update_item()
             .table_name(&state.config.runs_table_name)
-            .key("tenant_id", attr_s(&msg.tenant_id))
+            .key("team_id", attr_s(&msg.team_id))
             .key("run_id", attr_s(run_id))
             .update_expression(
                 "SET #status = :s, tokens_in = :ti, tokens_out = :to, cost_usd = :c, \
@@ -384,7 +384,7 @@ async fn run_passes(
 
         // Report token usage for billing
         let total_tokens = usage.input_tokens + usage.output_tokens;
-        crate::clients::billing::report_token_overage(state, &msg.tenant_id, total_tokens).await;
+        crate::clients::billing::report_token_overage(state, &msg.team_id, total_tokens).await;
         return Ok(());
     }
 
@@ -409,7 +409,7 @@ async fn run_passes(
                 .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
                 .await;
         } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-            let _ = post_jira_comment(state, &msg.tenant_id, &msg.ticket_id, &comment).await;
+            let _ = post_jira_comment(state, &msg.team_id, &msg.ticket_id, &comment).await;
         }
 
         // Complete the run with no PR
@@ -420,7 +420,7 @@ async fn run_passes(
             .dynamo
             .update_item()
             .table_name(&state.config.runs_table_name)
-            .key("tenant_id", attr_s(&msg.tenant_id))
+            .key("team_id", attr_s(&msg.team_id))
             .key("run_id", attr_s(run_id))
             .update_expression(
                 "SET #status = :s, tokens_in = :ti, tokens_out = :to, cost_usd = :c, \
@@ -445,13 +445,13 @@ async fn run_passes(
 
         // Report token usage for billing
         let total_tokens = usage.input_tokens + usage.output_tokens;
-        crate::clients::billing::report_token_overage(state, &msg.tenant_id, total_tokens).await;
+        crate::clients::billing::report_token_overage(state, &msg.team_id, total_tokens).await;
         return Ok(());
     }
 
     // --- Pass 3: Implement ---
-    check_cancelled(state, &msg.tenant_id, run_id).await?;
-    update_pass(state, &msg.tenant_id, run_id, "implement").await?;
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "implement").await?;
     let branch_name = format!("coderhelm/{}", msg.ticket_id.to_lowercase());
 
     // Create working branch first
@@ -461,7 +461,7 @@ async fn run_passes(
     info!(run_id, branch = %branch_name, "Created working branch");
 
     // Commit openspec to the repo branch if enabled (default: on)
-    let commit_openspec = load_workflow_setting(state, &msg.tenant_id, "commit_openspec").await;
+    let commit_openspec = load_workflow_setting(state, &msg.team_id, "commit_openspec").await;
     if commit_openspec {
         let ticket_slug = msg.ticket_id.to_lowercase();
         let spec_files: Vec<crate::clients::github::FileOp> = [
@@ -535,7 +535,7 @@ async fn run_passes(
             return Err("Could not determine what changes to make — commented on issue asking for clarification".into());
         } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
             if let Err(e) =
-                post_jira_comment(state, &msg.tenant_id, &msg.ticket_id, clarification).await
+                post_jira_comment(state, &msg.team_id, &msg.ticket_id, clarification).await
             {
                 warn!(run_id, error = %e, "Failed to comment on Jira ticket about empty implementation");
             }
@@ -546,8 +546,8 @@ async fn run_passes(
 
     // Mark all tasks as done in S3 openspec so retries/dashboard see progress
     let tasks_key = format!(
-        "tenants/{}/runs/{}/openspec/tasks.md",
-        msg.tenant_id,
+        "teams/{}/runs/{}/openspec/tasks.md",
+        msg.team_id,
         msg.ticket_id.to_lowercase()
     );
     let checked = plan_result.tasks.replace("- [ ]", "- [x]");
@@ -565,8 +565,8 @@ async fn run_passes(
     }
 
     // --- Pass 4: Review ---
-    check_cancelled(state, &msg.tenant_id, run_id).await?;
-    update_pass(state, &msg.tenant_id, run_id, "review").await?;
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "review").await?;
     review::run(
         state,
         msg,
@@ -580,7 +580,7 @@ async fn run_passes(
     info!(run_id, "Review complete");
 
     // --- Pass 5: Resolve conflicts with main ---
-    check_cancelled(state, &msg.tenant_id, run_id).await?;
+    check_cancelled(state, &msg.team_id, run_id).await?;
     match pr::resolve_conflicts(state, msg, &github, &branch_name, usage).await {
         Ok(true) => info!(run_id, "Resolved merge conflicts with main"),
         Ok(false) => {}
@@ -588,8 +588,8 @@ async fn run_passes(
     }
 
     // --- Pass 6: Create PR ---
-    check_cancelled(state, &msg.tenant_id, run_id).await?;
-    update_pass(state, &msg.tenant_id, run_id, "pr").await?;
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "pr").await?;
     let pr_result = pr::run(
         state,
         msg,
@@ -647,16 +647,13 @@ async fn create_run_record(
         .dynamo
         .put_item()
         .table_name(&state.config.runs_table_name)
-        .item("tenant_id", attr_s(&msg.tenant_id))
+        .item("team_id", attr_s(&msg.team_id))
         .item("run_id", attr_s(run_id))
         .item("status", attr_s("running"))
         // Composite SK for status-index GSI: "running#<run_id>" for efficient status queries
         .item("status_run_id", attr_s(&format!("running#{run_id}")))
         // Composite key for repo-index GSI
-        .item(
-            "tenant_repo",
-            attr_s(&format!("{}#{}", msg.tenant_id, repo)),
-        )
+        .item("team_repo", attr_s(&format!("{}#{}", msg.team_id, repo)))
         .item(
             "ticket_source",
             attr_s(match msg.source {
@@ -684,7 +681,7 @@ async fn create_run_record(
             .dynamo
             .update_item()
             .table_name(&state.config.analytics_table_name)
-            .key("tenant_id", attr_s(&msg.tenant_id))
+            .key("team_id", attr_s(&msg.team_id))
             .key("period", attr_s(period))
             .update_expression("ADD total_runs :one")
             .expression_attribute_values(":one", attr_n(1))
@@ -697,7 +694,7 @@ async fn create_run_record(
 
 async fn update_pass(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     run_id: &str,
     pass: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -710,7 +707,7 @@ async fn update_pass(
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
-        .key("tenant_id", attr_s(tenant_id))
+        .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET current_pass = :p, updated_at = :t, pass_history = list_append(if_not_exists(pass_history, :empty), :entry)",
@@ -727,14 +724,14 @@ async fn update_pass(
 /// Check if a run has been cancelled by the user via the dashboard.
 async fn check_cancelled(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     run_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.runs_table_name)
-        .key("tenant_id", attr_s(tenant_id))
+        .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
         .projection_expression("#s")
         .expression_attribute_names("#s", "status")
@@ -770,14 +767,14 @@ async fn complete_run(
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
-        .key("tenant_id", attr_s(&msg.tenant_id))
+        .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
              tokens_in = :ti, tokens_out = :to, cost_usd = :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri, files_modified = :fm, \
-             repo = :repo, tenant_repo = :tr, mcp_servers = :mcp",
+             repo = :repo, team_repo = :tr, mcp_servers = :mcp",
         )
         .expression_attribute_names("#status", "status")
         .expression_attribute_values(":s", attr_s("completed"))
@@ -791,7 +788,7 @@ async fn complete_run(
             ":tr",
             attr_s(&format!(
                 "{}#{}/{}",
-                msg.tenant_id, msg.repo_owner, msg.repo_name
+                msg.team_id, msg.repo_owner, msg.repo_name
             )),
         )
         .expression_attribute_values(":b", attr_s(&pr.branch))
@@ -826,7 +823,7 @@ async fn complete_run(
             .dynamo
             .update_item()
             .table_name(&state.config.analytics_table_name)
-            .key("tenant_id", attr_s(&msg.tenant_id))
+            .key("team_id", attr_s(&msg.team_id))
             .key("period", attr_s(period))
             .update_expression(
                 "ADD completed :one, total_cost_usd :cost, \
@@ -843,12 +840,12 @@ async fn complete_run(
             .await?;
     }
 
-    // Increment tenant's monthly run count in main table
+    // Increment team's monthly run count in main table
     state
         .dynamo
         .update_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&msg.tenant_id))
+        .key("pk", attr_s(&msg.team_id))
         .key("sk", attr_s("META"))
         .update_expression("ADD run_count_mtd :one")
         .expression_attribute_values(":one", attr_n(1))
@@ -857,7 +854,7 @@ async fn complete_run(
 
     // Report token overage to Stripe (after analytics are updated)
     let total_tokens = usage.input_tokens + usage.output_tokens;
-    crate::clients::billing::report_token_overage(state, &msg.tenant_id, total_tokens).await;
+    crate::clients::billing::report_token_overage(state, &msg.team_id, total_tokens).await;
 
     // Send run-complete notification
     let duration_str = format!("{}m {}s", duration / 60, duration % 60);
@@ -870,7 +867,7 @@ async fn complete_run(
     };
     if let Err(e) = email::send_notification(
         state,
-        &msg.tenant_id,
+        &msg.team_id,
         EmailEvent::RunComplete {
             run_id: run_id.to_string(),
             title: msg.title.clone(),
@@ -905,7 +902,7 @@ async fn fail_run(
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
-        .key("tenant_id", attr_s(&msg.tenant_id))
+        .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #status = :s, error_message = :err, tokens_in = :ti, \
@@ -931,7 +928,7 @@ async fn fail_run(
             .dynamo
             .update_item()
             .table_name(&state.config.analytics_table_name)
-            .key("tenant_id", attr_s(&msg.tenant_id))
+            .key("team_id", attr_s(&msg.team_id))
             .key("period", attr_s(period))
             .update_expression(
                 "ADD failed :one, total_cost_usd :cost, \
@@ -951,7 +948,7 @@ async fn fail_run(
     // Send run-failed notification
     if let Err(e) = email::send_notification(
         state,
-        &msg.tenant_id,
+        &msg.team_id,
         EmailEvent::RunFailed {
             run_id: run_id.to_string(),
             title: msg.title.clone(),
@@ -997,7 +994,7 @@ async fn fail_run(
             &error_msg[..error_msg.len().min(300)],
             run_id,
         );
-        if let Err(e) = post_jira_comment(state, &msg.tenant_id, &msg.ticket_id, &comment).await {
+        if let Err(e) = post_jira_comment(state, &msg.team_id, &msg.ticket_id, &comment).await {
             error!("Failed to comment on Jira ticket about run failure: {e}");
         }
     }
@@ -1014,7 +1011,7 @@ fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValu
 /// Post a comment on a Jira ticket via the Forge web trigger.
 async fn post_jira_comment(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     issue_key: &str,
     comment: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1024,7 +1021,7 @@ async fn post_jira_comment(
         .table_name(&state.config.jira_config_table_name)
         .key(
             "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
         )
         .key(
             "sk",
@@ -1071,9 +1068,9 @@ async fn is_ticket_already_running(state: &WorkerState, msg: &TicketMessage) -> 
         .query()
         .table_name(&state.config.runs_table_name)
         .index_name("status-index")
-        .key_condition_expression("tenant_id = :tid AND begins_with(status_run_id, :prefix)")
+        .key_condition_expression("team_id = :tid AND begins_with(status_run_id, :prefix)")
         .filter_expression("ticket_id = :ticket")
-        .expression_attribute_values(":tid", attr_s(&msg.tenant_id))
+        .expression_attribute_values(":tid", attr_s(&msg.team_id))
         .expression_attribute_values(":prefix", attr_s("running#"))
         .expression_attribute_values(":ticket", attr_s(&msg.ticket_id))
         .limit(1)
@@ -1100,13 +1097,13 @@ async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<String> {
     ];
 
     // Load global rules
-    if let Some(global) = load_rule_list(state, &msg.tenant_id, "RULES#GLOBAL").await {
+    if let Some(global) = load_rule_list(state, &msg.team_id, "RULES#GLOBAL").await {
         rules.extend(global);
     }
 
     // Load repo-specific rules
     let repo_sk = format!("RULES#REPO#{}/{}", msg.repo_owner, msg.repo_name);
-    if let Some(repo_rules) = load_rule_list(state, &msg.tenant_id, &repo_sk).await {
+    if let Some(repo_rules) = load_rule_list(state, &msg.team_id, &repo_sk).await {
         rules.extend(repo_rules);
     }
 
@@ -1114,12 +1111,12 @@ async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<String> {
     rules
 }
 
-async fn load_rule_list(state: &WorkerState, tenant_id: &str, sk: &str) -> Option<Vec<String>> {
+async fn load_rule_list(state: &WorkerState, team_id: &str, sk: &str) -> Option<Vec<String>> {
     match state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S(sk.to_string()))
         .send()
         .await
@@ -1244,12 +1241,12 @@ pub fn truncate_tree(paths: &[&str]) -> String {
 }
 
 /// Load a text content field from single-table DynamoDB (voice, agents, etc.).
-pub(crate) async fn load_content(state: &WorkerState, tenant_id: &str, sk: &str) -> String {
+pub(crate) async fn load_content(state: &WorkerState, team_id: &str, sk: &str) -> String {
     match state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S(sk.to_string()))
         .send()
         .await
@@ -1268,12 +1265,12 @@ pub(crate) async fn load_content(state: &WorkerState, tenant_id: &str, sk: &str)
 }
 
 /// Load a boolean workflow setting from SETTINGS#WORKFLOW. Returns default (true) if not found.
-async fn load_workflow_setting(state: &WorkerState, tenant_id: &str, key: &str) -> bool {
+async fn load_workflow_setting(state: &WorkerState, team_id: &str, key: &str) -> bool {
     match state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S("SETTINGS#WORKFLOW".to_string()))
         .send()
         .await
@@ -1288,13 +1285,13 @@ async fn load_workflow_setting(state: &WorkerState, tenant_id: &str, key: &str) 
     }
 }
 
-/// Check if tenant subscription allows processing (active or free).
-async fn is_subscription_allowed(state: &WorkerState, tenant_id: &str) -> bool {
+/// Check if team subscription allows processing (active or free).
+async fn is_subscription_allowed(state: &WorkerState, team_id: &str) -> bool {
     let status = state
         .dynamo
         .get_item()
         .table_name(&state.config.billing_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S("BILLING".to_string()))
         .send()
         .await

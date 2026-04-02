@@ -18,6 +18,7 @@ import { Construct } from "constructs";
 interface ApiStackProps extends cdk.StackProps {
   stage: string;
   table: dynamodb.TableV2;
+  teamsTable: dynamodb.TableV2;
   runsTable: dynamodb.TableV2;
   analyticsTable: dynamodb.TableV2;
   eventsTable: dynamodb.TableV2;
@@ -242,6 +243,7 @@ export class ApiStack extends cdk.Stack {
       environment: {
         STAGE: props.stage,
         TABLE_NAME: props.table.tableName,
+        TEAMS_TABLE_NAME: props.teamsTable.tableName,
         RUNS_TABLE_NAME: props.runsTable.tableName,
         ANALYTICS_TABLE_NAME: props.analyticsTable.tableName,
         EVENTS_TABLE_NAME: props.eventsTable.tableName,
@@ -275,6 +277,7 @@ export class ApiStack extends cdk.Stack {
 
     // Permissions
     props.table.grantReadWriteData(this.gatewayFunction);
+    props.teamsTable.grantReadWriteData(this.gatewayFunction);
     props.runsTable.grantReadWriteData(this.gatewayFunction);
     props.analyticsTable.grantReadData(this.gatewayFunction);
     props.eventsTable.grantReadWriteData(this.gatewayFunction);

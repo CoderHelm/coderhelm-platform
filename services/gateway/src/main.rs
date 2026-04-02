@@ -71,13 +71,13 @@ async fn main() -> Result<(), Error> {
     routes::plugins::sync_catalog_to_s3(&state).await;
 
     // Build router
-    // Protected API routes — require valid JWT with tenant scoping
+    // Protected API routes — require valid JWT with team scoping
     let api_routes = Router::new()
         .route("/me", get(routes::api::me))
         .route("/health", get(routes::api::health))
-        .route("/tenants", get(routes::api::list_tenants))
-        .route("/tenants/switch", post(routes::api::switch_tenant))
-        .route("/tenants/rename", put(routes::api::rename_tenant))
+        .route("/teams", get(routes::api::list_teams))
+        .route("/teams/switch", post(routes::api::switch_team))
+        .route("/teams/rename", put(routes::api::rename_team))
         .route(
             "/allowlist",
             get(routes::api::list_allowlist)

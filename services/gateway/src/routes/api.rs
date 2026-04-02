@@ -22,7 +22,7 @@ pub async fn me(
         .dynamo
         .get_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&claims.sub))
         .send()
         .await
@@ -33,12 +33,12 @@ pub async fn me(
 
     let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
 
-    // Load tenant status from META record
-    let tenant_status = state
+    // Load team status from META record
+    let team_status = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("META"))
         .projection_expression("#s")
         .expression_attribute_names("#s", "status")
@@ -64,18 +64,18 @@ pub async fn me(
 
     Ok(Json(json!({
         "user_id": claims.sub,
-        "tenant_id": claims.tenant_id,
+        "team_id": claims.team_id,
         "github_login": claims.github_login,
         "email": claims.email,
         "avatar_url": item.get("avatar_url").and_then(|v| v.as_s().ok()),
         "role": item.get("role").and_then(|v| v.as_s().ok()).unwrap_or(&claims.role),
-        "status": tenant_status,
+        "status": team_status,
         "auth_provider": auth_provider,
     })))
 }
 
-/// GET /api/tenants — list all tenants the current user has access to.
-pub async fn list_tenants(
+/// GET /api/teams — list all teams the current user has access to.
+pub async fn list_teams(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
@@ -96,7 +96,7 @@ pub async fn list_tenants(
         .await
         .ok();
 
-    let tenant_ids: Vec<String> = if let Some(ref result) = gsi1_result {
+    let team_ids: Vec<String> = if let Some(ref result) = gsi1_result {
         let ids: Vec<String> = result
             .items()
             .iter()
@@ -133,9 +133,9 @@ pub async fn list_tenants(
         vec![]
     };
 
-    // Load org name + status for each tenant
-    let mut tenants: Vec<Value> = Vec::new();
-    for tid in &tenant_ids {
+    // Load org name + status for each team
+    let mut teams: Vec<Value> = Vec::new();
+    for tid in &team_ids {
         let meta = state
             .dynamo
             .get_item()
@@ -162,31 +162,31 @@ pub async fn list_tenants(
             .cloned()
             .unwrap_or_else(|| "active".to_string());
 
-        tenants.push(json!({
-            "tenant_id": tid,
+        teams.push(json!({
+            "team_id": tid,
             "org": org,
             "status": status,
-            "current": *tid == claims.tenant_id,
+            "current": *tid == claims.team_id,
         }));
     }
 
-    Ok(Json(json!({ "tenants": tenants })))
+    Ok(Json(json!({ "teams": teams })))
 }
 
-/// POST /api/tenants/switch — switch to a different tenant.
-pub async fn switch_tenant(
+/// POST /api/teams/switch — switch to a different team.
+pub async fn switch_team(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<axum::response::Response, StatusCode> {
-    let target_tenant = body["tenant_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    let target_team = body["team_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
 
-    // Verify user exists in target tenant via users table
+    // Verify user exists in target team via users table
     let user_exists = state
         .dynamo
         .get_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(target_tenant))
+        .key("pk", attr_s(target_team))
         .key("sk", attr_s(&claims.sub))
         .send()
         .await
@@ -198,10 +198,10 @@ pub async fn switch_tenant(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Re-issue JWT with new tenant_id
+    // Re-issue JWT with new team_id
     let token = jwt::create_token(
         &claims.sub,
-        target_tenant,
+        target_team,
         &claims.email,
         &claims.role,
         claims.github_login.as_deref(),
@@ -216,13 +216,13 @@ pub async fn switch_tenant(
 
     Ok((
         [(axum::http::header::SET_COOKIE, cookie)],
-        Json(json!({ "tenant_id": target_tenant })),
+        Json(json!({ "team_id": target_team })),
     )
         .into_response())
 }
 
-/// PUT /api/tenants/rename — rename the current tenant (owner only).
-pub async fn rename_tenant(
+/// PUT /api/teams/rename — rename the current team (owner only).
+pub async fn rename_team(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
@@ -241,18 +241,18 @@ pub async fn rename_tenant(
         .dynamo
         .update_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("META"))
         .update_expression("SET github_org = :name")
         .expression_attribute_values(":name", attr_s(new_name))
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to rename tenant: {e}");
+            error!("Failed to rename team: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(tenant = %claims.tenant_id, new_name = %new_name, "Tenant renamed");
+    info!(team = %claims.team_id, new_name = %new_name, "Team renamed");
     Ok(Json(json!({ "status": "renamed", "name": new_name })))
 }
 
@@ -365,7 +365,7 @@ pub struct RunsQuery {
     limit: Option<i32>,
 }
 
-/// GET /api/runs — list runs for the tenant (from runs table).
+/// GET /api/runs — list runs for the team (from runs table).
 pub async fn list_runs(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -376,8 +376,8 @@ pub async fn list_runs(
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
-        .key_condition_expression("tenant_id = :tid")
-        .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
+        .key_condition_expression("team_id = :tid")
+        .expression_attribute_values(":tid", attr_s(&claims.team_id))
         .scan_index_forward(false) // newest first (ULID sorts lexicographically)
         .limit(query_limit)
         .send()
@@ -439,7 +439,7 @@ pub async fn get_run(
         .dynamo
         .get_item()
         .table_name(&state.config.runs_table_name)
-        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("team_id", attr_s(&claims.team_id))
         .key("run_id", attr_s(&run_id))
         .send()
         .await
@@ -488,12 +488,12 @@ pub async fn get_run_openspec(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    // First verify the run belongs to this tenant
+    // First verify the run belongs to this team
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.runs_table_name)
-        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("team_id", attr_s(&claims.team_id))
         .key("run_id", attr_s(&run_id))
         .projection_expression("ticket_id")
         .send()
@@ -510,8 +510,8 @@ pub async fn get_run_openspec(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     let prefix = format!(
-        "tenants/{}/runs/{}/openspec",
-        claims.tenant_id,
+        "teams/{}/runs/{}/openspec",
+        claims.team_id,
         ticket_id.to_lowercase()
     );
 
@@ -544,7 +544,7 @@ pub async fn retry_run(
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     // Block if token limit exceeded
-    if super::github_webhook::check_run_budget(&state, &claims.tenant_id)
+    if super::github_webhook::check_run_budget(&state, &claims.team_id)
         .await
         .is_some()
     {
@@ -556,7 +556,7 @@ pub async fn retry_run(
         .dynamo
         .get_item()
         .table_name(&state.config.runs_table_name)
-        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("team_id", attr_s(&claims.team_id))
         .key("run_id", attr_s(&run_id))
         .send()
         .await
@@ -586,7 +586,7 @@ pub async fn retry_run(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Prefer stored installation_id; fall back to extracting from tenant_id (TENANT#<id>)
+    // Prefer stored installation_id; fall back to extracting from team_id (TEAM#<id>)
     let mut installation_id = item
         .get("installation_id")
         .and_then(|v| v.as_n().ok())
@@ -594,8 +594,8 @@ pub async fn retry_run(
         .unwrap_or(0);
     if installation_id == 0 {
         installation_id = claims
-            .tenant_id
-            .strip_prefix("TENANT#")
+            .team_id
+            .strip_prefix("TEAM#")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
     }
@@ -621,7 +621,7 @@ pub async fn retry_run(
     };
 
     let message = WorkerMessage::Ticket(TicketMessage {
-        tenant_id: claims.tenant_id.clone(),
+        team_id: claims.team_id.clone(),
         installation_id,
         source,
         ticket_id: item
@@ -675,7 +675,7 @@ pub async fn re_review_run(
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     // Block if token limit exceeded
-    if super::github_webhook::check_run_budget(&state, &claims.tenant_id)
+    if super::github_webhook::check_run_budget(&state, &claims.team_id)
         .await
         .is_some()
     {
@@ -686,7 +686,7 @@ pub async fn re_review_run(
         .dynamo
         .get_item()
         .table_name(&state.config.runs_table_name)
-        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("team_id", attr_s(&claims.team_id))
         .key("run_id", attr_s(&run_id))
         .send()
         .await
@@ -732,8 +732,8 @@ pub async fn re_review_run(
         .unwrap_or(0);
     if installation_id == 0 {
         installation_id = claims
-            .tenant_id
-            .strip_prefix("TENANT#")
+            .team_id
+            .strip_prefix("TEAM#")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
     }
@@ -742,7 +742,7 @@ pub async fn re_review_run(
     }
 
     let message = WorkerMessage::Feedback(FeedbackMessage {
-        tenant_id: claims.tenant_id.clone(),
+        team_id: claims.team_id.clone(),
         installation_id,
         run_id: run_id.clone(),
         repo_owner: parts[0].to_string(),
@@ -776,7 +776,7 @@ pub async fn re_review_run(
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
-        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("team_id", attr_s(&claims.team_id))
         .key("run_id", attr_s(&run_id))
         .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t, current_pass = :p")
         .expression_attribute_names("#s", "status")
@@ -803,7 +803,7 @@ pub async fn cancel_run(
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
-        .key("tenant_id", attr_s(&claims.tenant_id))
+        .key("team_id", attr_s(&claims.team_id))
         .key("run_id", attr_s(&run_id))
         .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t")
         .expression_attribute_names("#s", "status")
@@ -823,7 +823,7 @@ pub async fn cancel_run(
     Ok(Json(json!({ "status": "cancelled" })))
 }
 
-/// GET /api/repos — list repos configured for this tenant.
+/// GET /api/repos — list repos configured for this team.
 pub async fn list_repos(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -833,7 +833,7 @@ pub async fn list_repos(
         .query()
         .table_name(&state.config.repos_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("REPO#"))
         .send()
         .await
@@ -871,12 +871,12 @@ pub async fn sync_repos(
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("META"))
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to fetch tenant meta: {e}");
+            error!("Failed to fetch team meta: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -886,7 +886,7 @@ pub async fn sync_repos(
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse::<u64>().ok())
         .ok_or_else(|| {
-            warn!("No installation_id found for tenant");
+            warn!("No installation_id found for team");
             StatusCode::NOT_FOUND
         })?;
 
@@ -963,7 +963,7 @@ pub async fn sync_repos(
             .dynamo
             .get_item()
             .table_name(&state.config.repos_table_name)
-            .key("pk", attr_s(&claims.tenant_id))
+            .key("pk", attr_s(&claims.team_id))
             .key("sk", attr_s(&sk))
             .projection_expression("pk")
             .send()
@@ -977,7 +977,7 @@ pub async fn sync_repos(
                 .dynamo
                 .put_item()
                 .table_name(&state.config.repos_table_name)
-                .item("pk", attr_s(&claims.tenant_id))
+                .item("pk", attr_s(&claims.team_id))
                 .item("sk", attr_s(&sk))
                 .item("repo_name", attr_s(&full))
                 .item("enabled", AttributeValue::Bool(false))
@@ -1004,7 +1004,7 @@ pub async fn get_jira_integration_check(
         .query()
         .table_name(&state.config.repos_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("REPO#"))
         .send()
         .await
@@ -1034,8 +1034,8 @@ pub async fn get_jira_integration_check(
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
-        .key_condition_expression("tenant_id = :tid")
-        .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
+        .key_condition_expression("team_id = :tid")
+        .expression_attribute_values(":tid", attr_s(&claims.team_id))
         .scan_index_forward(false)
         .limit(25)
         .send()
@@ -1067,25 +1067,25 @@ pub async fn get_jira_integration_check(
         .dynamo
         .query()
         .table_name(&state.config.jira_events_table_name)
-        .key_condition_expression("tenant_id = :tid")
-        .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
+        .key_condition_expression("team_id = :tid")
+        .expression_attribute_values(":tid", attr_s(&claims.team_id))
         .select(aws_sdk_dynamodb::types::Select::Count)
         .send()
         .await
         .map(|r| r.count())
         .unwrap_or(0);
 
-    // Load per-tenant JIRA secret from DynamoDB
-    let tenant_secret = load_jira_secret(&state, &claims.tenant_id).await;
-    let secret_configured = tenant_secret.is_some() || state.secrets.jira_webhook_secret.is_some();
+    // Load per-team JIRA secret from DynamoDB
+    let team_secret = load_jira_secret(&state, &claims.team_id).await;
+    let secret_configured = team_secret.is_some() || state.secrets.jira_webhook_secret.is_some();
     let ready = secret_configured && enabled_repo_count > 0;
 
-    // Load installation_id from tenant META
+    // Load installation_id from team META
     let meta_result = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("META"))
         .send()
         .await
@@ -1099,7 +1099,7 @@ pub async fn get_jira_integration_check(
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let webhook_url = tenant_secret
+    let webhook_url = team_secret
         .as_ref()
         .map(|(token, _)| format!("https://api.coderhelm.com/webhooks/jira/{token}"));
 
@@ -1115,7 +1115,7 @@ pub async fn get_jira_integration_check(
         "last_jira_event_at": last_jira_event_at,
         "jira_event_count": jira_event_count,
         "installation_id": installation_id,
-        "tenant_id": claims.tenant_id,
+        "team_id": claims.team_id,
         "webhook_url": webhook_url,
     })))
 }
@@ -1144,7 +1144,7 @@ pub async fn generate_jira_secret(
     let now = chrono::Utc::now().to_rfc3339();
 
     // Delete old token from jira-tokens table if one exists
-    let old = load_jira_secret(&state, &claims.tenant_id).await;
+    let old = load_jira_secret(&state, &claims.team_id).await;
     if let Some(old_token) = old.as_ref().map(|(t, _)| t) {
         let _ = state
             .dynamo
@@ -1160,7 +1160,7 @@ pub async fn generate_jira_secret(
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("META"))
         .send()
         .await
@@ -1173,12 +1173,12 @@ pub async fn generate_jira_secret(
         })
         .unwrap_or(0);
 
-    // Store token + webhook_secret on tenant record (main table)
+    // Store token + webhook_secret on team record (main table)
     state
         .dynamo
         .put_item()
         .table_name(&state.config.jira_config_table_name)
-        .item("pk", attr_s(&claims.tenant_id))
+        .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s("JIRA_SECRET"))
         .item("secret", attr_s(&token))
         .item("webhook_secret", attr_s(&webhook_secret))
@@ -1190,13 +1190,13 @@ pub async fn generate_jira_secret(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Store token → tenant mapping in jira-tokens table (with conditional write)
+    // Store token → team mapping in jira-tokens table (with conditional write)
     let put_result = state
         .dynamo
         .put_item()
         .table_name(&state.config.jira_tokens_table_name)
         .item("token", attr_s(&token))
-        .item("tenant_id", attr_s(&claims.tenant_id))
+        .item("team_id", attr_s(&claims.team_id))
         .item("installation_id", AttributeValue::N(install_id.to_string()))
         .item("webhook_secret", attr_s(&webhook_secret))
         .item("created_at", attr_s(&now))
@@ -1215,7 +1215,7 @@ pub async fn generate_jira_secret(
                 .dynamo
                 .delete_item()
                 .table_name(&state.config.jira_config_table_name)
-                .key("pk", attr_s(&claims.tenant_id))
+                .key("pk", attr_s(&claims.team_id))
                 .key("sk", attr_s("JIRA_SECRET"))
                 .send()
                 .await;
@@ -1225,7 +1225,7 @@ pub async fn generate_jira_secret(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    info!(tenant_id = %claims.tenant_id, "Generated Jira webhook token + signing secret");
+    info!(team_id = %claims.team_id, "Generated Jira webhook token + signing secret");
     Ok(Json(
         json!({ "token": token, "webhook_secret": webhook_secret }),
     ))
@@ -1237,7 +1237,7 @@ pub async fn delete_jira_secret(
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, StatusCode> {
     // Delete token from jira-tokens table first
-    let old = load_jira_secret(&state, &claims.tenant_id).await;
+    let old = load_jira_secret(&state, &claims.team_id).await;
     if let Some((old_token, _)) = old {
         let _ = state
             .dynamo
@@ -1252,7 +1252,7 @@ pub async fn delete_jira_secret(
         .dynamo
         .delete_item()
         .table_name(&state.config.jira_config_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("JIRA_SECRET"))
         .send()
         .await
@@ -1261,7 +1261,7 @@ pub async fn delete_jira_secret(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(tenant_id = %claims.tenant_id, "Deleted Jira webhook token");
+    info!(team_id = %claims.team_id, "Deleted Jira webhook token");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1270,7 +1270,7 @@ pub async fn delete_jira_integration(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, StatusCode> {
-    let tid = &claims.tenant_id;
+    let tid = &claims.team_id;
 
     // 1. Delete the webhook token from the jira-tokens lookup table
     if let Some((old_token, _)) = load_jira_secret(&state, tid).await {
@@ -1283,7 +1283,7 @@ pub async fn delete_jira_integration(
             .await;
     }
 
-    // 2. Delete all items in the jira-config table for this tenant (config, secret, projects)
+    // 2. Delete all items in the jira-config table for this team (config, secret, projects)
     let result = state
         .dynamo
         .query()
@@ -1310,23 +1310,23 @@ pub async fn delete_jira_integration(
         }
     }
 
-    // 3. Delete jira events for this tenant
+    // 3. Delete jira events for this team
     if let Ok(events) = state
         .dynamo
         .query()
         .table_name(&state.config.jira_events_table_name)
-        .key_condition_expression("tenant_id = :tid")
+        .key_condition_expression("team_id = :tid")
         .expression_attribute_values(":tid", attr_s(tid))
         .send()
         .await
     {
         for item in events.items() {
-            if let (Some(tid_attr), Some(eid)) = (item.get("tenant_id"), item.get("event_id")) {
+            if let (Some(tid_attr), Some(eid)) = (item.get("team_id"), item.get("event_id")) {
                 let _ = state
                     .dynamo
                     .delete_item()
                     .table_name(&state.config.jira_events_table_name)
-                    .key("tenant_id", tid_attr.clone())
+                    .key("team_id", tid_attr.clone())
                     .key("event_id", eid.clone())
                     .send()
                     .await;
@@ -1334,18 +1334,18 @@ pub async fn delete_jira_integration(
         }
     }
 
-    info!(tenant_id = %tid, "Deleted entire Jira integration");
+    info!(team_id = %tid, "Deleted entire Jira integration");
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Load per-tenant JIRA token and webhook secret from DynamoDB.
+/// Load per-team JIRA token and webhook secret from DynamoDB.
 /// Returns (token, webhook_secret) if configured.
-pub async fn load_jira_secret(state: &AppState, tenant_id: &str) -> Option<(String, String)> {
+pub async fn load_jira_secret(state: &AppState, team_id: &str) -> Option<(String, String)> {
     let item = state
         .dynamo
         .get_item()
         .table_name(&state.config.jira_config_table_name)
-        .key("pk", AttributeValue::S(tenant_id.to_string()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
         .key("sk", AttributeValue::S("JIRA_SECRET".to_string()))
         .send()
         .await
@@ -1373,19 +1373,19 @@ pub async fn get_jira_events(
         .min(100);
 
     let events =
-        crate::routes::jira_webhook::list_jira_events(&state, &claims.tenant_id, limit).await?;
+        crate::routes::jira_webhook::list_jira_events(&state, &claims.team_id, limit).await?;
 
     Ok(Json(json!({ "events": events, "total": events.len() })))
 }
 
 /// POST /integrations/jira/forge-register — called by the Forge admin page to register trigger URLs.
-/// Public endpoint, verified by matching installation_id against the tenant's META record.
+/// Public endpoint, verified by matching installation_id against the team's META record.
 pub async fn forge_register_urls(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
-    let tenant_id = body
-        .get("tenant_id")
+    let team_id = body
+        .get("team_id")
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
     let installation_id = body
@@ -1406,22 +1406,22 @@ pub async fn forge_register_urls(
         .unwrap_or("");
     let site_url = body.get("site_url").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Verify tenant exists and installation_id matches
+    // Verify team exists and installation_id matches
     let meta = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(tenant_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s("META"))
         .send()
         .await
         .map_err(|e| {
-            error!("forge-register: failed to query tenant META: {e}");
+            error!("forge-register: failed to query team META: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .item
         .ok_or_else(|| {
-            warn!("forge-register: tenant not found: {tenant_id}");
+            warn!("forge-register: team not found: {team_id}");
             StatusCode::NOT_FOUND
         })?;
 
@@ -1430,7 +1430,7 @@ pub async fn forge_register_urls(
         .and_then(|v| v.as_n().ok())
         .map_or("", |v| v.as_str());
     if stored_id != installation_id {
-        warn!("forge-register: installation_id mismatch for {tenant_id}");
+        warn!("forge-register: installation_id mismatch for {team_id}");
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1440,7 +1440,7 @@ pub async fn forge_register_urls(
         .dynamo
         .update_item()
         .table_name(&state.config.jira_config_table_name)
-        .key("pk", attr_s(tenant_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s("JIRA#config"))
         .update_expression(
             "SET list_projects_url = :lpu, create_ticket_url = :ctu, add_comment_url = :acu, site_url = :su, updated_at = :ua",
@@ -1457,7 +1457,7 @@ pub async fn forge_register_urls(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(tenant_id, "Forge trigger URLs registered");
+    info!(team_id, "Forge trigger URLs registered");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1471,7 +1471,7 @@ pub async fn get_jira_config(
         .dynamo
         .get_item()
         .table_name(&state.config.jira_config_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("JIRA#config"))
         .send()
         .await
@@ -1521,7 +1521,7 @@ pub async fn get_jira_config(
         .query()
         .table_name(&state.config.jira_config_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("JIRA#PROJECT#"))
         .send()
         .await
@@ -1590,7 +1590,7 @@ pub async fn update_jira_config(
         .dynamo
         .update_item()
         .table_name(&state.config.jira_config_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("JIRA#config"))
         .update_expression(format!("SET {}", update_expr.join(", ")));
 
@@ -1603,7 +1603,7 @@ pub async fn update_jira_config(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    info!(tenant_id = %claims.tenant_id, "Updated Jira config");
+    info!(team_id = %claims.team_id, "Updated Jira config");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1633,7 +1633,7 @@ pub async fn update_jira_projects(
             .dynamo
             .put_item()
             .table_name(&state.config.jira_config_table_name)
-            .item("pk", attr_s(&claims.tenant_id))
+            .item("pk", attr_s(&claims.team_id))
             .item("sk", attr_s(&format!("JIRA#PROJECT#{key}")))
             .item("project_name", attr_s(name))
             .item("enabled", AttributeValue::Bool(enabled))
@@ -1645,7 +1645,7 @@ pub async fn update_jira_projects(
             })?;
     }
 
-    info!(tenant_id = %claims.tenant_id, count = projects.len(), "Updated Jira projects");
+    info!(team_id = %claims.team_id, count = projects.len(), "Updated Jira projects");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1659,7 +1659,7 @@ pub async fn fetch_jira_projects(
         .dynamo
         .get_item()
         .table_name(&state.config.jira_config_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("JIRA#config"))
         .send()
         .await
@@ -1675,7 +1675,7 @@ pub async fn fetch_jira_projects(
         .and_then(|v| v.as_s().ok())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            warn!(tenant_id = %claims.tenant_id, "No list_projects_url configured");
+            warn!(team_id = %claims.team_id, "No list_projects_url configured");
             StatusCode::NOT_FOUND
         })?;
 
@@ -1731,7 +1731,7 @@ pub async fn validate_jira_integration_payload(
                 .and_then(|v| v.get("installation_id"))
                 .and_then(|v| v.as_u64())
         });
-    let tenant_id = top("tenant_id").or_else(|| nested("coderhelm", "tenant_id"));
+    let team_id = top("team_id").or_else(|| nested("coderhelm", "team_id"));
 
     let issue_key = body
         .get("issue")
@@ -1765,8 +1765,8 @@ pub async fn validate_jira_integration_payload(
     if repo_name.is_none() {
         missing.push("repo_name (or coderhelm.repo_name)");
     }
-    if installation_id.is_none() && tenant_id.is_none() {
-        missing.push("installation_id (or tenant_id)");
+    if installation_id.is_none() && team_id.is_none() {
+        missing.push("installation_id (or team_id)");
     }
     if issue_key.is_none() {
         missing.push("issue.key (or issue.id)");
@@ -1784,7 +1784,7 @@ pub async fn validate_jira_integration_payload(
             "repo_owner": repo_owner,
             "repo_name": repo_name,
             "installation_id": installation_id,
-            "tenant_id": tenant_id,
+            "team_id": team_id,
             "ticket_id": issue_key,
             "title": issue_summary,
             "event": body.get("webhookEvent").and_then(|v| v.as_str()).unwrap_or("unknown")
@@ -1812,7 +1812,7 @@ pub async fn update_repo(
         .dynamo
         .put_item()
         .table_name(&state.config.repos_table_name)
-        .item("pk", attr_s(&claims.tenant_id))
+        .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(&format!("REPO#{repo}")))
         .item("repo_name", attr_s(&repo))
         .item(
@@ -1833,14 +1833,14 @@ pub async fn update_repo(
     // When enabling a repo, trigger onboarding to generate voice, instructions, etc.
     if enabled {
         let installation_id = claims
-            .tenant_id
-            .strip_prefix("TENANT#")
+            .team_id
+            .strip_prefix("TEAM#")
             .unwrap_or("0")
             .parse::<u64>()
             .unwrap_or(0);
 
         let message = WorkerMessage::Onboard(OnboardMessage {
-            tenant_id: claims.tenant_id.clone(),
+            team_id: claims.team_id.clone(),
             installation_id,
             repos: vec![OnboardRepo {
                 owner: owner.clone(),
@@ -1862,7 +1862,7 @@ pub async fn update_repo(
 
         // Trigger per-repo infrastructure analysis
         let per_repo_msg = WorkerMessage::InfraAnalyze(InfraAnalyzeMessage {
-            tenant_id: claims.tenant_id.clone(),
+            team_id: claims.team_id.clone(),
             triggered_by: claims.display_name(),
             repo: Some(repo.clone()),
         });
@@ -1873,7 +1873,7 @@ pub async fn update_repo(
                 .dynamo
                 .put_item()
                 .table_name(&state.config.infra_table_name)
-                .item("pk", attr_s(&claims.tenant_id))
+                .item("pk", attr_s(&claims.team_id))
                 .item("sk", attr_s(&sk))
                 .item("status", attr_s("pending"))
                 .item("has_infra", AttributeValue::Bool(false))
@@ -1890,9 +1890,9 @@ pub async fn update_repo(
             info!(repo = %repo, "Dispatched per-repo infra analysis");
         }
 
-        // Also trigger tenant-wide infrastructure analysis
+        // Also trigger team-wide infrastructure analysis
         let infra_msg = WorkerMessage::InfraAnalyze(InfraAnalyzeMessage {
-            tenant_id: claims.tenant_id.clone(),
+            team_id: claims.team_id.clone(),
             triggered_by: claims.display_name(),
             repo: None,
         });
@@ -1902,7 +1902,7 @@ pub async fn update_repo(
                 .dynamo
                 .put_item()
                 .table_name(&state.config.infra_table_name)
-                .item("pk", attr_s(&claims.tenant_id))
+                .item("pk", attr_s(&claims.team_id))
                 .item("sk", attr_s("INFRA#analysis"))
                 .item("status", attr_s("pending"))
                 .item("has_infra", AttributeValue::Bool(false))
@@ -1916,22 +1916,22 @@ pub async fn update_repo(
                 .message_body(&body)
                 .send()
                 .await;
-            info!(repo = %repo, "Dispatched tenant-wide infra analysis");
+            info!(repo = %repo, "Dispatched team-wide infra analysis");
         }
     } else {
-        // When disabling a repo, remove its per-repo infra and refresh tenant-wide
+        // When disabling a repo, remove its per-repo infra and refresh team-wide
         let sk = format!("INFRA#REPO#{repo}");
         let _ = state
             .dynamo
             .delete_item()
             .table_name(&state.config.infra_table_name)
-            .key("pk", attr_s(&claims.tenant_id))
+            .key("pk", attr_s(&claims.team_id))
             .key("sk", attr_s(&sk))
             .send()
             .await;
 
         let infra_msg = WorkerMessage::InfraAnalyze(InfraAnalyzeMessage {
-            tenant_id: claims.tenant_id.clone(),
+            team_id: claims.team_id.clone(),
             triggered_by: claims.display_name(),
             repo: None,
         });
@@ -1941,7 +1941,7 @@ pub async fn update_repo(
                 .dynamo
                 .put_item()
                 .table_name(&state.config.infra_table_name)
-                .item("pk", attr_s(&claims.tenant_id))
+                .item("pk", attr_s(&claims.team_id))
                 .item("sk", attr_s("INFRA#analysis"))
                 .item("status", attr_s("pending"))
                 .item("has_infra", AttributeValue::Bool(false))
@@ -1962,7 +1962,7 @@ pub async fn update_repo(
     Ok(StatusCode::OK)
 }
 
-/// DELETE /api/repos/:owner/:name — remove a repo from this tenant.
+/// DELETE /api/repos/:owner/:name — remove a repo from this team.
 pub async fn delete_repo(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -1975,7 +1975,7 @@ pub async fn delete_repo(
         .dynamo
         .delete_item()
         .table_name(&state.config.repos_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&format!("REPO#{repo}")))
         .send()
         .await
@@ -2001,14 +2001,14 @@ pub async fn get_stats(
             .dynamo
             .get_item()
             .table_name(&state.config.analytics_table_name)
-            .key("tenant_id", attr_s(&claims.tenant_id))
+            .key("team_id", attr_s(&claims.team_id))
             .key("period", attr_s(&month_period))
             .send(),
         state
             .dynamo
             .get_item()
             .table_name(&state.config.analytics_table_name)
-            .key("tenant_id", attr_s(&claims.tenant_id))
+            .key("team_id", attr_s(&claims.team_id))
             .key("period", attr_s("ALL_TIME"))
             .send()
     );
@@ -2094,7 +2094,7 @@ pub async fn get_stats_history(
             .dynamo
             .get_item()
             .table_name(&state.config.analytics_table_name)
-            .key("tenant_id", attr_s(&claims.tenant_id))
+            .key("team_id", attr_s(&claims.team_id))
             .key("period", attr_s(period))
             .send()
             .await
@@ -2145,7 +2145,7 @@ pub async fn get_notification_prefs(
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .send()
         .await
@@ -2194,7 +2194,7 @@ pub async fn update_notification_prefs(
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&claims.tenant_id))
+        .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(&sk))
         .item(
             "email_run_complete",
@@ -2236,7 +2236,7 @@ pub async fn get_global_instructions(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    get_instructions_inner(&state, &claims.tenant_id, "INSTRUCTIONS#GLOBAL").await
+    get_instructions_inner(&state, &claims.team_id, "INSTRUCTIONS#GLOBAL").await
 }
 
 /// PUT /api/instructions/global — update global custom instructions.
@@ -2246,7 +2246,7 @@ pub async fn update_global_instructions(
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
     let content = body["content"].as_str().unwrap_or("");
-    update_instructions_inner(&state, &claims.tenant_id, "INSTRUCTIONS#GLOBAL", content).await
+    update_instructions_inner(&state, &claims.team_id, "INSTRUCTIONS#GLOBAL", content).await
 }
 
 /// GET /api/instructions/repo/:owner/:name — get per-repo custom instructions.
@@ -2258,7 +2258,7 @@ pub async fn get_repo_instructions(
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let sk = format!("INSTRUCTIONS#REPO#{repo}");
-    get_instructions_inner(&state, &claims.tenant_id, &sk).await
+    get_instructions_inner(&state, &claims.team_id, &sk).await
 }
 
 /// PUT /api/instructions/repo/:owner/:name — update per-repo custom instructions.
@@ -2272,7 +2272,7 @@ pub async fn update_repo_instructions(
     validate_repo_name(&repo)?;
     let content = body["content"].as_str().unwrap_or("");
     let sk = format!("INSTRUCTIONS#REPO#{repo}");
-    update_instructions_inner(&state, &claims.tenant_id, &sk, content).await
+    update_instructions_inner(&state, &claims.team_id, &sk, content).await
 }
 
 /// Validate repo path parameter to prevent DynamoDB key injection.
@@ -2292,14 +2292,14 @@ fn validate_repo_name(repo: &str) -> Result<(), StatusCode> {
 
 async fn get_instructions_inner(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     sk: &str,
 ) -> Result<Json<Value>, StatusCode> {
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(tenant_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s(sk))
         .send()
         .await
@@ -2320,7 +2320,7 @@ async fn get_instructions_inner(
 
 async fn update_instructions_inner(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     sk: &str,
     content: &str,
 ) -> Result<StatusCode, StatusCode> {
@@ -2332,7 +2332,7 @@ async fn update_instructions_inner(
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(tenant_id))
+        .item("pk", attr_s(team_id))
         .item("sk", attr_s(sk))
         .item("content", attr_s(content))
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
@@ -2355,7 +2355,7 @@ pub async fn get_global_rules(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    get_rules_inner(&state, &claims.tenant_id, "RULES#GLOBAL").await
+    get_rules_inner(&state, &claims.team_id, "RULES#GLOBAL").await
 }
 
 /// PUT /api/rules/global — update global must-rules.
@@ -2365,7 +2365,7 @@ pub async fn update_global_rules(
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
     let rules = body["rules"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
-    update_rules_inner(&state, &claims.tenant_id, "RULES#GLOBAL", rules).await
+    update_rules_inner(&state, &claims.team_id, "RULES#GLOBAL", rules).await
 }
 
 /// GET /api/rules/repo/:owner/:name — get per-repo must-rules.
@@ -2377,7 +2377,7 @@ pub async fn get_repo_rules(
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let sk = format!("RULES#REPO#{repo}");
-    get_rules_inner(&state, &claims.tenant_id, &sk).await
+    get_rules_inner(&state, &claims.team_id, &sk).await
 }
 
 /// PUT /api/rules/repo/:owner/:name — update per-repo must-rules.
@@ -2391,19 +2391,19 @@ pub async fn update_repo_rules(
     validate_repo_name(&repo)?;
     let rules = body["rules"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
     let sk = format!("RULES#REPO#{repo}");
-    update_rules_inner(&state, &claims.tenant_id, &sk, rules).await
+    update_rules_inner(&state, &claims.team_id, &sk, rules).await
 }
 
 async fn get_rules_inner(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     sk: &str,
 ) -> Result<Json<Value>, StatusCode> {
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(tenant_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s(sk))
         .send()
         .await
@@ -2424,7 +2424,7 @@ async fn get_rules_inner(
 
 async fn update_rules_inner(
     state: &AppState,
-    tenant_id: &str,
+    team_id: &str,
     sk: &str,
     rules: &[Value],
 ) -> Result<StatusCode, StatusCode> {
@@ -2447,7 +2447,7 @@ async fn update_rules_inner(
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(tenant_id))
+        .item("pk", attr_s(team_id))
         .item("sk", attr_s(sk))
         .item(
             "rules",
@@ -2471,7 +2471,7 @@ pub async fn get_global_voice(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    get_instructions_inner(&state, &claims.tenant_id, "VOICE#GLOBAL").await
+    get_instructions_inner(&state, &claims.team_id, "VOICE#GLOBAL").await
 }
 
 /// PUT /api/voice/global — update global voice settings.
@@ -2481,7 +2481,7 @@ pub async fn update_global_voice(
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
     let content = body["content"].as_str().unwrap_or("");
-    update_instructions_inner(&state, &claims.tenant_id, "VOICE#GLOBAL", content).await
+    update_instructions_inner(&state, &claims.team_id, "VOICE#GLOBAL", content).await
 }
 
 /// GET /api/voice/repo/:owner/:name — get voice/tone settings for a repo.
@@ -2493,7 +2493,7 @@ pub async fn get_repo_voice(
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let sk = format!("VOICE#REPO#{repo}");
-    get_instructions_inner(&state, &claims.tenant_id, &sk).await
+    get_instructions_inner(&state, &claims.team_id, &sk).await
 }
 
 /// PUT /api/voice/repo/:owner/:name — update voice/tone settings for a repo.
@@ -2507,7 +2507,7 @@ pub async fn update_repo_voice(
     validate_repo_name(&repo)?;
     let content = body["content"].as_str().unwrap_or("");
     let sk = format!("VOICE#REPO#{repo}");
-    update_instructions_inner(&state, &claims.tenant_id, &sk, content).await
+    update_instructions_inner(&state, &claims.team_id, &sk, content).await
 }
 
 // ─── Agents context ─────────────────────────────────────────────────
@@ -2517,7 +2517,7 @@ pub async fn get_global_agents(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    get_instructions_inner(&state, &claims.tenant_id, "AGENTS#GLOBAL").await
+    get_instructions_inner(&state, &claims.team_id, "AGENTS#GLOBAL").await
 }
 
 /// PUT /api/agents/global — update global agents context.
@@ -2527,7 +2527,7 @@ pub async fn update_global_agents(
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
     let content = body["content"].as_str().unwrap_or("");
-    update_instructions_inner(&state, &claims.tenant_id, "AGENTS#GLOBAL", content).await
+    update_instructions_inner(&state, &claims.team_id, "AGENTS#GLOBAL", content).await
 }
 
 /// GET /api/agents/repo/:owner/:name — get agents context for a repo.
@@ -2539,7 +2539,7 @@ pub async fn get_repo_agents(
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let sk = format!("AGENTS#REPO#{repo}");
-    get_instructions_inner(&state, &claims.tenant_id, &sk).await
+    get_instructions_inner(&state, &claims.team_id, &sk).await
 }
 
 /// PUT /api/agents/repo/:owner/:name — update agents context for a repo.
@@ -2553,7 +2553,7 @@ pub async fn update_repo_agents(
     validate_repo_name(&repo)?;
     let content = body["content"].as_str().unwrap_or("");
     let sk = format!("AGENTS#REPO#{repo}");
-    update_instructions_inner(&state, &claims.tenant_id, &sk, content).await
+    update_instructions_inner(&state, &claims.team_id, &sk, content).await
 }
 
 /// POST /api/repos/:owner/:name/regenerate — re-run onboard (voice + agents) for a repo.
@@ -2562,7 +2562,7 @@ pub async fn regenerate_repo(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.tenant_id).await?;
+    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
 
@@ -2572,14 +2572,14 @@ pub async fn regenerate_repo(
     }
 
     let installation_id = claims
-        .tenant_id
-        .strip_prefix("TENANT#")
+        .team_id
+        .strip_prefix("TEAM#")
         .unwrap_or("0")
         .parse::<u64>()
         .unwrap_or(0);
 
     let message = WorkerMessage::Onboard(OnboardMessage {
-        tenant_id: claims.tenant_id.clone(),
+        team_id: claims.team_id.clone(),
         installation_id,
         repos: vec![OnboardRepo {
             owner: parts[0].to_string(),
@@ -2618,7 +2618,7 @@ pub async fn get_budget(
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("SETTINGS#BUDGET"))
         .send()
         .await
@@ -2649,7 +2649,7 @@ pub async fn update_budget(
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("BILLING"))
         .send()
         .await
@@ -2672,7 +2672,7 @@ pub async fn update_budget(
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&claims.tenant_id))
+        .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s("SETTINGS#BUDGET"))
         .item(
             "max_budget_cents",
@@ -2697,7 +2697,7 @@ pub async fn get_workflow_settings(
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("SETTINGS#WORKFLOW"))
         .send()
         .await
@@ -2751,7 +2751,7 @@ pub async fn update_workflow_settings(
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&claims.tenant_id))
+        .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s("SETTINGS#WORKFLOW"))
         .item(
             "commit_openspec",
@@ -2787,10 +2787,10 @@ pub async fn health(
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
-        .key_condition_expression("tenant_id = :tid")
+        .key_condition_expression("team_id = :tid")
         .filter_expression("#s = :running AND created_at < :cutoff")
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":tid", attr_s(&claims.team_id))
         .expression_attribute_values(":running", attr_s("running"))
         .expression_attribute_values(":cutoff", attr_s(&crash_cutoff))
         .limit(20)
@@ -2828,10 +2828,10 @@ pub async fn health(
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
-        .key_condition_expression("tenant_id = :tid")
+        .key_condition_expression("team_id = :tid")
         .filter_expression("#s = :queued AND created_at < :cutoff")
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":tid", attr_s(&claims.team_id))
         .expression_attribute_values(":queued", attr_s("queued"))
         .expression_attribute_values(":cutoff", attr_s(&stale_cutoff))
         .limit(20)
@@ -2941,10 +2941,10 @@ pub async fn health(
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
-        .key_condition_expression("tenant_id = :tid")
+        .key_condition_expression("team_id = :tid")
         .filter_expression("#s = :failed AND created_at > :cutoff")
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":tid", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":tid", attr_s(&claims.team_id))
         .expression_attribute_values(":failed", attr_s("failed"))
         .expression_attribute_values(":cutoff", attr_s(&error_cutoff))
         .limit(50)
@@ -2980,8 +2980,8 @@ pub async fn health(
     })))
 }
 
-/// POST /api/account/reset — wipe all tenant data across all tables.
-/// Keeps the TENANT META record so the account identity remains.
+/// POST /api/account/reset — wipe all team data across all tables.
+/// Keeps the TEAM META record so the account identity remains.
 pub async fn reset_account(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -2989,11 +2989,11 @@ pub async fn reset_account(
     if claims.role != "owner" {
         return Err(StatusCode::FORBIDDEN);
     }
-    info!(tenant_id = %claims.tenant_id, user = %claims.email, "Account reset requested");
+    info!(team_id = %claims.team_id, user = %claims.email, "Account reset requested");
 
-    let tid = &claims.tenant_id;
+    let tid = &claims.team_id;
 
-    // Helper: delete all items with pk=tenant_id from a table
+    // Helper: delete all items with pk=team_id from a table
     async fn wipe_table(
         dynamo: &aws_sdk_dynamodb::Client,
         table: &str,
@@ -3054,14 +3054,14 @@ pub async fn reset_account(
         wipe_table(&state.dynamo, table, tid).await?;
     }
 
-    // Wipe jira-events table (keyed by tenant_id, event_id)
+    // Wipe jira-events table (keyed by team_id, event_id)
     let jira_events = state
         .dynamo
         .query()
         .table_name(&state.config.jira_events_table_name)
-        .key_condition_expression("tenant_id = :tid")
+        .key_condition_expression("team_id = :tid")
         .expression_attribute_values(":tid", attr_s(tid))
-        .projection_expression("tenant_id, event_id")
+        .projection_expression("team_id, event_id")
         .send()
         .await
         .map_err(|e| {
@@ -3070,26 +3070,26 @@ pub async fn reset_account(
         })?;
 
     for item in jira_events.items() {
-        if let (Some(pk), Some(sk)) = (item.get("tenant_id"), item.get("event_id")) {
+        if let (Some(pk), Some(sk)) = (item.get("team_id"), item.get("event_id")) {
             let _ = state
                 .dynamo
                 .delete_item()
                 .table_name(&state.config.jira_events_table_name)
-                .key("tenant_id", pk.clone())
+                .key("team_id", pk.clone())
                 .key("event_id", sk.clone())
                 .send()
                 .await;
         }
     }
 
-    // Wipe runs table (keyed by tenant_id, run_id)
+    // Wipe runs table (keyed by team_id, run_id)
     let runs = state
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
-        .key_condition_expression("tenant_id = :tid")
+        .key_condition_expression("team_id = :tid")
         .expression_attribute_values(":tid", attr_s(tid))
-        .projection_expression("tenant_id, run_id")
+        .projection_expression("team_id, run_id")
         .send()
         .await
         .map_err(|e| {
@@ -3098,19 +3098,19 @@ pub async fn reset_account(
         })?;
 
     for item in runs.items() {
-        if let (Some(pk), Some(sk)) = (item.get("tenant_id"), item.get("run_id")) {
+        if let (Some(pk), Some(sk)) = (item.get("team_id"), item.get("run_id")) {
             let _ = state
                 .dynamo
                 .delete_item()
                 .table_name(&state.config.runs_table_name)
-                .key("tenant_id", pk.clone())
+                .key("team_id", pk.clone())
                 .key("run_id", sk.clone())
                 .send()
                 .await;
         }
     }
 
-    // Delete WELCOME_SENT from main table (keep META, TENANT)
+    // Delete WELCOME_SENT from main table (keep META, TEAM)
     let _ = state
         .dynamo
         .delete_item()
@@ -3120,6 +3120,6 @@ pub async fn reset_account(
         .send()
         .await;
 
-    info!(tenant_id = %claims.tenant_id, "Account data reset complete");
+    info!(team_id = %claims.team_id, "Account data reset complete");
     Ok(StatusCode::OK)
 }

@@ -107,8 +107,8 @@ Rules:
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key(
-            "tenant_id",
-            aws_sdk_dynamodb::types::AttributeValue::S(msg.tenant_id.clone()),
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
         )
         .key(
             "run_id",

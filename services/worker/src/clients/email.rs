@@ -27,14 +27,14 @@ pub enum EmailEvent {
     },
 }
 
-/// Send a templated email to all users of a tenant who have the notification enabled.
+/// Send a templated email to all users of a team who have the notification enabled.
 ///
-/// 1. Queries all USER# records under the tenant to get emails.
+/// 1. Queries all USER# records under the team to get emails.
 /// 2. For each user, checks their NOTIFICATIONS# preferences.
 /// 3. Sends via SES templated email only if the preference is enabled.
 pub async fn send_notification(
     state: &WorkerState,
-    tenant_id: &str,
+    team_id: &str,
     event: EmailEvent,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (template_suffix, pref_field, template_data) = match &event {
@@ -85,7 +85,7 @@ pub async fn send_notification(
 
     let template_name = format!("{}-{}", state.config.ses_template_prefix, template_suffix);
 
-    // Get all users under this tenant
+    // Get all users under this team
     let users = state
         .dynamo
         .query()
@@ -93,7 +93,7 @@ pub async fn send_notification(
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(
             ":pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
         )
         .expression_attribute_values(
             ":prefix",
@@ -122,7 +122,7 @@ pub async fn send_notification(
                 .table_name(&state.config.settings_table_name)
                 .key(
                     "pk",
-                    aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+                    aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
                 )
                 .key("sk", aws_sdk_dynamodb::types::AttributeValue::S(pref_sk))
                 .send()

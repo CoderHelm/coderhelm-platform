@@ -43,8 +43,8 @@ pub async fn run(
             .update_item()
             .table_name(&state.config.runs_table_name)
             .key(
-                "tenant_id",
-                aws_sdk_dynamodb::types::AttributeValue::S(msg.tenant_id.clone()),
+                "team_id",
+                aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
             )
             .key(
                 "run_id",
@@ -73,12 +73,12 @@ pub async fn run(
     let voice = {
         let repo_voice = super::load_content(
             state,
-            &msg.tenant_id,
+            &msg.team_id,
             &format!("VOICE#REPO#{}/{}", msg.repo_owner, msg.repo_name),
         )
         .await;
         if repo_voice.is_empty() {
-            super::load_content(state, &msg.tenant_id, "VOICE#GLOBAL").await
+            super::load_content(state, &msg.team_id, "VOICE#GLOBAL").await
         } else {
             repo_voice
         }
@@ -284,8 +284,8 @@ Rules:
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key(
-            "tenant_id",
-            aws_sdk_dynamodb::types::AttributeValue::S(msg.tenant_id.clone()),
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
         )
         .key(
             "run_id",
@@ -351,8 +351,8 @@ Rules:
             .update_item()
             .table_name(&state.config.analytics_table_name)
             .key(
-                "tenant_id",
-                aws_sdk_dynamodb::types::AttributeValue::S(msg.tenant_id.clone()),
+                "team_id",
+                aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
             )
             .key(
                 "period",
@@ -373,7 +373,7 @@ Rules:
 
     // Report token overage to Stripe
     let total_tokens = usage.input_tokens + usage.output_tokens;
-    crate::clients::billing::report_token_overage(state, &msg.tenant_id, total_tokens).await;
+    crate::clients::billing::report_token_overage(state, &msg.team_id, total_tokens).await;
 
     Ok(())
 }
@@ -388,8 +388,8 @@ async fn get_pr_branch(
         .get_item()
         .table_name(&state.config.runs_table_name)
         .key(
-            "tenant_id",
-            aws_sdk_dynamodb::types::AttributeValue::S(msg.tenant_id.clone()),
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
         )
         .key(
             "run_id",

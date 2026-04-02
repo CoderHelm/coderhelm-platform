@@ -52,7 +52,7 @@ fn is_admin_or_owner(role: &str) -> bool {
 
 // ── List users ───────────────────────────────────────────────────────
 
-/// GET /api/users — List all users in the tenant.
+/// GET /api/users — List all users in the team.
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -62,7 +62,7 @@ pub async fn list_users(
         .query()
         .table_name(&state.config.users_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.tenant_id))
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("USER#"))
         .send()
         .await
@@ -126,7 +126,7 @@ pub async fn invite_user(
         .dynamo
         .put_item()
         .table_name(&state.config.users_table_name)
-        .item("pk", attr_s(&claims.tenant_id))
+        .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(&user_id))
         .item("email", attr_s(&email))
         .item("role", attr_s(role))
@@ -135,7 +135,7 @@ pub async fn invite_user(
         .item("updated_at", attr_s(&now))
         .item("invited_by", attr_s(&claims.sub))
         .item("gsi2pk", attr_s(&format!("EMAIL#{email}")))
-        .item("gsi2sk", attr_s(&claims.tenant_id))
+        .item("gsi2sk", attr_s(&claims.team_id))
         .send()
         .await
         .map_err(|e| {
@@ -144,11 +144,11 @@ pub async fn invite_user(
         })?;
 
     // Send invitation email via SES
-    let tenant_name = state
+    let team_name = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("META"))
         .send()
         .await
@@ -179,7 +179,7 @@ pub async fn invite_user(
                             aws_sdk_sesv2::types::Content::builder()
                                 .data(format!(
                                     "You've been invited to {} on Coderhelm",
-                                    tenant_name
+                                    team_name
                                 ))
                                 .build()
                                 .unwrap(),
@@ -191,7 +191,7 @@ pub async fn invite_user(
                                         .data(format!(
                                             "You've been invited to join {} on Coderhelm.\n\n\
                                              Sign up or log in at https://app.coderhelm.com to get started.",
-                                            tenant_name
+                                            team_name
                                         ))
                                         .build()
                                         .unwrap(),
@@ -205,7 +205,7 @@ pub async fn invite_user(
         .send()
         .await;
 
-    info!(email = %email, role = %role, tenant_id = %claims.tenant_id, "User invited");
+    info!(email = %email, role = %role, team_id = %claims.team_id, "User invited");
 
     Ok(Json(json!({
         "status": "invited",
@@ -250,7 +250,7 @@ pub async fn update_role(
         .dynamo
         .update_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .update_expression("SET #r = :role, updated_at = :now")
         .expression_attribute_names("#r", "role")
@@ -264,14 +264,14 @@ pub async fn update_role(
             StatusCode::NOT_FOUND
         })?;
 
-    info!(user_id = %sk, new_role = %body.role, tenant_id = %claims.tenant_id, "Role updated");
+    info!(user_id = %sk, new_role = %body.role, team_id = %claims.team_id, "Role updated");
 
     Ok(Json(json!({ "status": "updated" })))
 }
 
 // ── Remove user ──────────────────────────────────────────────────────
 
-/// DELETE /api/users/:user_id — Remove a user from the tenant.
+/// DELETE /api/users/:user_id — Remove a user from the team.
 pub async fn remove_user(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -297,7 +297,7 @@ pub async fn remove_user(
         .dynamo
         .get_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .send()
         .await
@@ -322,7 +322,7 @@ pub async fn remove_user(
         .dynamo
         .delete_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(&claims.tenant_id))
+        .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .send()
         .await
@@ -331,7 +331,7 @@ pub async fn remove_user(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(user_id = %sk, tenant_id = %claims.tenant_id, "User removed");
+    info!(user_id = %sk, team_id = %claims.team_id, "User removed");
 
     Ok(Json(json!({ "status": "removed" })))
 }

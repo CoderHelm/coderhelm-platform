@@ -191,15 +191,15 @@ fn build_env_vars(plugin: &McpPlugin) -> Value {
     Value::Object(env)
 }
 
-/// Load enabled MCP plugins with credentials for a tenant from DynamoDB.
+/// Load enabled MCP plugins with credentials for a team from DynamoDB.
 /// Type alias for the MCP catalog: (server_id, description, tools)
 pub type McpCatalog<'a> = &'a [(&'a str, &'a str, &'a [(&'a str, &'a str)])];
 
 /// Returns plugins that are enabled AND have credentials stored.
-pub async fn load_tenant_plugins(
+pub async fn load_team_plugins(
     dynamo: &aws_sdk_dynamodb::Client,
     settings_table: &str,
-    tenant_id: &str,
+    team_id: &str,
     catalog: McpCatalog<'_>,
 ) -> Vec<McpPlugin> {
     let result = dynamo
@@ -208,7 +208,7 @@ pub async fn load_tenant_plugins(
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(
             ":pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
         )
         .expression_attribute_values(
             ":prefix",
@@ -220,7 +220,7 @@ pub async fn load_tenant_plugins(
     let items = match result {
         Ok(output) => output.items().to_vec(),
         Err(e) => {
-            warn!(error = %e, "Failed to load tenant plugins");
+            warn!(error = %e, "Failed to load team plugins");
             return Vec::new();
         }
     };
@@ -285,6 +285,6 @@ pub async fn load_tenant_plugins(
         });
     }
 
-    info!(count = plugins.len(), "Loaded MCP plugins for tenant");
+    info!(count = plugins.len(), "Loaded MCP plugins for team");
     plugins
 }
