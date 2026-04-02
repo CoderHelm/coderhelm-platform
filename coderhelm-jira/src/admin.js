@@ -1,5 +1,7 @@
 const { storage, fetch: forgeFetch } = require("@forge/api");
 const { webTrigger } = require("@forge/api");
+const api = require("@forge/api");
+const { route } = require("@forge/api");
 const Resolver = require("@forge/resolver").default;
 
 const GATEWAY_URL = "https://api.coderhelm.com";
@@ -28,7 +30,7 @@ resolver.define("saveConfig", async ({ payload }) => {
     // Get the Jira site URL (e.g. https://mysite.atlassian.net)
     let siteUrl = "";
     try {
-      const siteRes = await forgeFetch(await webTrigger.getUrl("get-site-url-trigger"), { method: "GET" });
+      const siteRes = await api.asApp().requestJira(route`/rest/api/3/serverInfo`);
       if (siteRes.ok) {
         const siteData = await siteRes.json();
         siteUrl = siteData.baseUrl || "";

@@ -45,17 +45,17 @@ function App() {
 
       <div style={styles.setupBox}>
         <p style={styles.setupText}>
-          <strong>Where to find your Installation ID:</strong> Go to{" "}
+          <strong>Where to find your Team ID:</strong> Go to{" "}
           <a href="https://app.coderhelm.com/settings/jira" target="_blank" rel="noopener noreferrer" style={styles.link}>
             app.coderhelm.com → Settings → Jira
           </a>
-          . Your Installation ID is shown in Step 2 with a copy button.
+          . Your Team ID is shown in Step 2 with a copy button.
         </p>
       </div>
 
       <div style={styles.card}>
         <label style={styles.label}>
-          Installation ID
+          Team ID
           <input
             style={styles.input}
             value={installationId}
