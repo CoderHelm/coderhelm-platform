@@ -2,11 +2,11 @@ use tracing::{info, warn};
 
 use crate::WorkerState;
 
-/// Included tokens in the Pro plan (1M in+out).
-const INCLUDED_TOKENS: u64 = 1_000_000;
+/// Included tokens in the Pro plan (5M in+out).
+const INCLUDED_TOKENS: u64 = 5_000_000;
 
 /// Price per 1K overage tokens in cents.
-const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 1000;
+const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 5;
 
 /// Billing threshold in cents — create an invoice when unbilled overage exceeds this.
 const BILLING_THRESHOLD_CENTS: u64 = 10_000;

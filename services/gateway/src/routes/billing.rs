@@ -7,7 +7,7 @@ use crate::models::Claims;
 use crate::AppState;
 
 // ─── Usage limits (included in Pro) ─────────────────────────────────
-pub const INCLUDED_TOKENS: u64 = 1_000_000; // 1M tokens (in+out) included in Pro
+pub const INCLUDED_TOKENS: u64 = 5_000_000; // 5M tokens (in+out) included in Pro
 
 // ─── Rate limiting ──────────────────────────────────────────────────
 const BILLING_ACTION_COOLDOWN_SECS: i64 = 10; // Min seconds between billing write actions per tenant
@@ -61,7 +61,7 @@ fn validate_stripe_id(id: &str, prefix: &str) -> Result<(), StatusCode> {
     Ok(())
 }
 pub const FREE_TIER_TOKENS: u64 = 500_000; // 500K tokens for free tier
-pub const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 1000; // $10.00 per 1K tokens
+pub const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 5; // $0.05 per 1K tokens
 
 /// GET /api/billing — get billing overview (subscription status, plan, payment method, balance).
 pub async fn get_billing(
