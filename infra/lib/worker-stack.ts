@@ -12,7 +12,6 @@ import { Construct } from "constructs";
 interface WorkerStackProps extends cdk.StackProps {
   stage: string;
   table: dynamodb.TableV2;
-  teamsTable: dynamodb.TableV2;
   usersTable: dynamodb.TableV2;
   plansTable: dynamodb.TableV2;
   jiraConfigTable: dynamodb.TableV2;
@@ -64,7 +63,7 @@ export class WorkerStack extends cdk.Stack {
         environment: {
         STAGE: props.stage,
         TABLE_NAME: props.table.tableName,
-        TEAMS_TABLE_NAME: props.teamsTable.tableName,
+        TEAMS_TABLE_NAME: `coderhelm-${props.stage}-teams`,
         RUNS_TABLE_NAME: `coderhelm-${props.stage}-runs`,
         ANALYTICS_TABLE_NAME: `coderhelm-${props.stage}-analytics`,
         USERS_TABLE_NAME: props.usersTable.tableName,
@@ -87,11 +86,12 @@ export class WorkerStack extends cdk.Stack {
 
     // DynamoDB: read/write all tables
     props.table.grantReadWriteData(this.workerFunction);
-    props.teamsTable.grantReadWriteData(this.workerFunction);
 
     // Decoupled tables — use fromTableName to avoid cross-stack exports
+    const teamsTable = dynamodb.TableV2.fromTableName(this, "TeamsTableRef", `coderhelm-${props.stage}-teams`);
     const runsTable = dynamodb.TableV2.fromTableName(this, "RunsTableRef", `coderhelm-${props.stage}-runs`);
     const analyticsTable = dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `coderhelm-${props.stage}-analytics`);
+    teamsTable.grantReadWriteData(this.workerFunction);
     runsTable.grantReadWriteData(this.workerFunction);
     analyticsTable.grantReadWriteData(this.workerFunction);
 

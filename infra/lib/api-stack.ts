@@ -18,7 +18,6 @@ import { Construct } from "constructs";
 interface ApiStackProps extends cdk.StackProps {
   stage: string;
   table: dynamodb.TableV2;
-  teamsTable: dynamodb.TableV2;
   eventsTable: dynamodb.TableV2;
   usersTable: dynamodb.TableV2;
   jiraTokensTable: dynamodb.TableV2;
@@ -240,7 +239,7 @@ export class ApiStack extends cdk.Stack {
       environment: {
         STAGE: props.stage,
         TABLE_NAME: props.table.tableName,
-        TEAMS_TABLE_NAME: props.teamsTable.tableName,
+        TEAMS_TABLE_NAME: `coderhelm-${props.stage}-teams`,
         RUNS_TABLE_NAME: `coderhelm-${props.stage}-runs`,
         ANALYTICS_TABLE_NAME: `coderhelm-${props.stage}-analytics`,
         EVENTS_TABLE_NAME: props.eventsTable.tableName,
@@ -274,12 +273,13 @@ export class ApiStack extends cdk.Stack {
 
     // Permissions
     props.table.grantReadWriteData(this.gatewayFunction);
-    props.teamsTable.grantReadWriteData(this.gatewayFunction);
 
     // Decoupled tables — use fromTableName to avoid cross-stack exports
+    const teamsTable = dynamodb.TableV2.fromTableName(this, "TeamsTableRef", `coderhelm-${props.stage}-teams`);
     const runsTable = dynamodb.TableV2.fromTableName(this, "RunsTableRef", `coderhelm-${props.stage}-runs`);
     const analyticsTable = dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `coderhelm-${props.stage}-analytics`);
     const jiraEventsTable = dynamodb.TableV2.fromTableName(this, "JiraEventsTableRef", `coderhelm-${props.stage}-jira-events`);
+    teamsTable.grantReadWriteData(this.gatewayFunction);
     runsTable.grantReadWriteData(this.gatewayFunction);
     analyticsTable.grantReadData(this.gatewayFunction);
     jiraEventsTable.grantReadWriteData(this.gatewayFunction);

@@ -116,16 +116,13 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
-    // Runs table: high-volume run records
-    // PK = team_id, SK = run_id (ULID — time-ordered)
-    // Designed for millions of records per team
+    // Runs table: code-review run records
+    // PK = team_id, SK = run_id
+    // GSI: status-index (team_id + status_run_id), repo-index (team_repo + run_id)
     // ──────────────────────────────────────────────
-    this.runsTable = new dynamodb.TableV2(this, "RunsTable", {
+    this.runsTable = new dynamodb.TableV2(this, "RunsTableV2", {
       tableName: `coderhelm-${props.stage}-runs`,
-      partitionKey: {
-        name: "team_id",
-        type: dynamodb.AttributeType.STRING,
-      },
+      partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "run_id", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
@@ -141,17 +138,15 @@ export class DatabaseStack extends cdk.Stack {
       timeToLiveAttribute: "expires_at",
     });
 
-    // GSI: query runs by status (e.g. all currently running)
     this.runsTable.addGlobalSecondaryIndex({
       indexName: "status-index",
-      partitionKey: {
-        name: "team_id",
+      partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
+      sortKey: {
+        name: "status_run_id",
         type: dynamodb.AttributeType.STRING,
       },
-      sortKey: { name: "status_run_id", type: dynamodb.AttributeType.STRING },
     });
 
-    // GSI: look up run by repo + run_id (for CI fix / feedback lookups)
     this.runsTable.addGlobalSecondaryIndex({
       indexName: "repo-index",
       partitionKey: {
@@ -162,16 +157,12 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
-    // Analytics table: pre-computed aggregates
-    // PK = team_id, SK = period (e.g. "2026-03", "ALL_TIME")
-    // Atomic counters — O(1) reads for dashboard stats
+    // Analytics table: usage analytics per team
+    // PK = team_id, SK = period
     // ──────────────────────────────────────────────
-    this.analyticsTable = new dynamodb.TableV2(this, "AnalyticsTable", {
+    this.analyticsTable = new dynamodb.TableV2(this, "AnalyticsTableV2", {
       tableName: `coderhelm-${props.stage}-analytics`,
-      partitionKey: {
-        name: "team_id",
-        type: dynamodb.AttributeType.STRING,
-      },
+      partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "period", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
@@ -266,16 +257,12 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
-    // Jira events table: log every webhook event received
-    // PK = team_id, SK = event_id (ULID — time-ordered)
-    // TTL for auto-cleanup of old events
+    // Jira events table: Jira webhook event log
+    // PK = team_id, SK = event_id
     // ──────────────────────────────────────────────
-    this.jiraEventsTable = new dynamodb.TableV2(this, "JiraEventsTable", {
+    this.jiraEventsTable = new dynamodb.TableV2(this, "JiraEventsTableV2", {
       tableName: `coderhelm-${props.stage}-jira-events`,
-      partitionKey: {
-        name: "team_id",
-        type: dynamodb.AttributeType.STRING,
-      },
+      partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "event_id", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
