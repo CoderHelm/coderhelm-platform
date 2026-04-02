@@ -61,7 +61,22 @@ Summary: {summary}
 ## Instructions
 
 Research the codebase using the `read_tree`, `read_file`, and `list_directory` tools to
-understand the existing patterns. Then generate four openspec files:
+understand the existing patterns.
+
+**CRITICAL — Verify before planning:** Before generating a plan, check if the requested change
+is ALREADY in place in the codebase. Read the relevant files and compare their current state
+against what the issue asks for. Examples of already-done work:
+- A value the issue asks to set is already that value
+- A feature the issue describes already exists and works as specified
+- A bug the issue reports is already fixed in the current code
+- A config the issue asks to add is already present
+
+If the change is already done, set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reason>` where
+`<reason>` is a one-line explanation (e.g. "The GA measurement ID is already G-NR69JM4TK2 in
+dashboard/src/components/google-analytics.tsx"). Still output proposal.md, design.md, and
+spec.md normally.
+
+Otherwise, generate four openspec files:
 
 1. **proposal.md** — Problem statement, proposed approach, scope boundaries, risks
 2. **design.md** — Technical design: which files to modify/create, patterns to follow, data flow

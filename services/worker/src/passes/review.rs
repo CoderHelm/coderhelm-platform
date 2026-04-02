@@ -35,6 +35,10 @@ Use the `get_diff` tool to see all changes compared to main. Then review for:
 4. **Obvious bugs** — Null checks, off-by-one, missing error handling, typos?
 5. **Security** — Any injection risks, exposed secrets, unsafe operations?
 6. **Must-rules** — If must-rules are listed in the system prompt, verify every rule is respected.
+7. **Regressions** — Does the change remove or break existing working functionality? Watch for:
+   - Hardcoded values replaced with env vars or config WITHOUT a fallback to the original value
+   - Features that silently stop working if a new env var / config is not set
+   - Default behavior changes that could break production
 
 If you find issues:
 - Fix them using `write_file` or `batch_write`

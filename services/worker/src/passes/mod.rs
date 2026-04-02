@@ -330,6 +330,64 @@ async fn run_passes(
     let plan_result = plan::run(state, msg, &github, &triage_result, usage).await?;
     info!(run_id, "Plan complete");
 
+    // --- Check: already done? ---
+    if plan_result.tasks.starts_with("NO_CHANGES_NEEDED:") {
+        let reason = plan_result
+            .tasks
+            .strip_prefix("NO_CHANGES_NEEDED:")
+            .unwrap_or("")
+            .trim();
+        info!(run_id, reason, "Plan determined no changes needed");
+
+        let comment = format!(
+            "✅ **No changes needed**\n\n{reason}\n\nThe codebase already satisfies what this issue asks for."
+        );
+
+        if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+            let _ = github
+                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
+                .await;
+        } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+            let _ = post_jira_comment(state, &msg.tenant_id, &msg.ticket_id, &comment).await;
+        }
+
+        // Complete the run with no PR
+        let duration = start.elapsed().as_secs();
+        let cost = usage.estimated_cost();
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("tenant_id", attr_s(&msg.tenant_id))
+            .key("run_id", attr_s(run_id))
+            .update_expression(
+                "SET #status = :s, tokens_in = :ti, tokens_out = :to, cost_usd = :c, \
+                 duration_s = :d, updated_at = :t, current_pass = :cp, \
+                 status_run_id = :sri, mcp_servers = :mcp",
+            )
+            .expression_attribute_names("#status", "status")
+            .expression_attribute_values(":s", attr_s("completed"))
+            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+            .expression_attribute_values(":to", attr_n(usage.output_tokens))
+            .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+            .expression_attribute_values(":d", attr_n(duration))
+            .expression_attribute_values(":t", attr_s(&now))
+            .expression_attribute_values(":cp", attr_s("done"))
+            .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
+            .expression_attribute_values(
+                ":mcp",
+                AttributeValue::L(mcp_server_ids.iter().map(|s| attr_s(s)).collect()),
+            )
+            .send()
+            .await;
+
+        // Report token usage for billing
+        let total_tokens = usage.input_tokens + usage.output_tokens;
+        crate::clients::billing::report_token_overage(state, &msg.tenant_id, total_tokens).await;
+        return Ok(());
+    }
+
     // --- Pass 3: Implement ---
     check_cancelled(state, &msg.tenant_id, run_id).await?;
     update_pass(state, &msg.tenant_id, run_id, "implement").await?;

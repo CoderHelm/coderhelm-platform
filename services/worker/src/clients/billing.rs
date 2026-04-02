@@ -5,9 +5,15 @@ use crate::WorkerState;
 /// Included tokens in the Pro plan (1M in+out).
 const INCLUDED_TOKENS: u64 = 1_000_000;
 
-/// Report token overage to Stripe via Billing Meter Events.
-/// Always reports actual overage — budget enforcement (blocking new runs)
-/// is handled at the gateway, not here.
+/// Price per 1K overage tokens in cents.
+const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 1000;
+
+/// Billing threshold in cents — create an invoice when unbilled overage exceeds this.
+const BILLING_THRESHOLD_CENTS: u64 = 10_000;
+
+/// Report token overage to Stripe via direct invoice items.
+/// Creates and pays an invoice when unbilled overage exceeds the threshold ($100).
+/// Budget enforcement (blocking new runs) is handled at the gateway, not here.
 pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_used: u64) {
     if tokens_used == 0 {
         return;
@@ -44,7 +50,7 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
     let item = match billing.item() {
         Some(i) => i,
         None => {
-            info!("[billing] no BILLING record for {tenant_id}, skipping meter event");
+            info!("[billing] no BILLING record for {tenant_id}, skipping overage report");
             return;
         }
     };
@@ -68,7 +74,9 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
         .unwrap_or("none");
 
     if status != "active" {
-        info!("[billing] subscription not active ({status}) for {tenant_id}, skipping meter event");
+        info!(
+            "[billing] subscription not active ({status}) for {tenant_id}, skipping overage report"
+        );
         return;
     }
 
@@ -82,7 +90,10 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
             "tenant_id",
             aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
         )
-        .key("period", aws_sdk_dynamodb::types::AttributeValue::S(month))
+        .key(
+            "period",
+            aws_sdk_dynamodb::types::AttributeValue::S(month.clone()),
+        )
         .send()
         .await
         .ok()
@@ -109,48 +120,224 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
         return;
     }
 
-    // Calculate only the NEW overage from this run
-    let prev_total = total_tokens.saturating_sub(tokens_used);
-    let prev_overage = prev_total.saturating_sub(INCLUDED_TOKENS);
     let current_overage = total_tokens.saturating_sub(INCLUDED_TOKENS);
-    let new_overage = current_overage.saturating_sub(prev_overage);
+    let cumulative_overage_1k = current_overage.div_ceil(1000);
 
-    if new_overage == 0 {
+    info!("[billing] overage check for {tenant_id}: {cumulative_overage_1k} x 1K tokens total");
+
+    // Check unbilled overage and create invoice if threshold exceeded
+    create_overage_invoice_if_needed(
+        state,
+        tenant_id,
+        &customer_id,
+        &stripe_key,
+        cumulative_overage_1k,
+        &month,
+    )
+    .await;
+}
+
+/// Create an invoice for unbilled overage when it exceeds the threshold.
+/// Tracks `overage_billed_{month}` in the BILLING record per billing period.
+async fn create_overage_invoice_if_needed(
+    state: &WorkerState,
+    tenant_id: &str,
+    customer_id: &str,
+    stripe_key: &str,
+    cumulative_overage_1k: u64,
+    month: &str,
+) {
+    let billed_attr = format!("overage_billed_{}", month.replace('-', "_"));
+
+    // Read how many 1K-units we've already billed this month
+    let billing = match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.billing_table_name)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("BILLING".to_string()),
+        )
+        .projection_expression("#b")
+        .expression_attribute_names("#b", &billed_attr)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("[billing] Failed to read billed counter: {e}");
+            return;
+        }
+    };
+
+    let already_billed: u64 = billing
+        .item()
+        .and_then(|i| i.get(&billed_attr))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let unbilled = cumulative_overage_1k.saturating_sub(already_billed);
+    let unbilled_cents = unbilled * OVERAGE_PER_1K_TOKENS_CENTS;
+
+    if unbilled_cents < BILLING_THRESHOLD_CENTS {
+        info!(
+            "[billing] unbilled overage ${:.2} below threshold for {tenant_id}",
+            unbilled_cents as f64 / 100.0,
+        );
         return;
     }
 
-    let overage_1k = new_overage.div_ceil(1000);
-    let ts = chrono::Utc::now().timestamp().to_string();
-    let qty = overage_1k.to_string();
-
     info!(
-        "[billing] reporting {overage_1k} x 1K token overage to Stripe for {tenant_id} (cumulative: {current_overage}, new: {new_overage})"
+        "[billing] unbilled overage {unbilled} units (${:.2}) exceeds threshold — creating invoice for {tenant_id}",
+        unbilled_cents as f64 / 100.0
     );
 
-    let resp = state
+    // Create an invoice item for the unbilled overage
+    let amount = (unbilled * OVERAGE_PER_1K_TOKENS_CENTS).to_string();
+    let description = format!(
+        "Token overage: {} x 1K tokens @ ${:.2}/1K",
+        unbilled,
+        OVERAGE_PER_1K_TOKENS_CENTS as f64 / 100.0
+    );
+    let ii_resp = state
         .http
-        .post("https://api.stripe.com/v1/billing/meter_events")
+        .post("https://api.stripe.com/v1/invoiceitems")
         .header("Authorization", format!("Bearer {stripe_key}"))
         .form(&[
-            ("event_name", "coderhelm_token_overage"),
-            ("timestamp", ts.as_str()),
-            ("payload[value]", qty.as_str()),
-            ("payload[stripe_customer_id]", customer_id.as_str()),
+            ("customer", customer_id),
+            ("amount", amount.as_str()),
+            ("currency", "usd"),
+            ("description", description.as_str()),
         ])
         .send()
         .await;
 
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            info!("[billing] meter event sent: {qty} units for {tenant_id}");
-        }
+    match ii_resp {
+        Ok(r) if r.status().is_success() => {}
         Ok(r) => {
-            let status = r.status();
             let body = r.text().await.unwrap_or_default();
-            warn!("[billing] Stripe meter event failed {status}: {body}");
+            warn!("[billing] Invoice item creation failed: {body}");
+            return;
         }
         Err(e) => {
-            warn!("[billing] Failed to send Stripe meter event: {e}");
+            warn!("[billing] Failed to create invoice item: {e}");
+            return;
         }
+    }
+
+    // Create invoice with pending items
+    let inv_resp = state
+        .http
+        .post("https://api.stripe.com/v1/invoices")
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .form(&[
+            ("customer", customer_id),
+            ("pending_invoice_items_behavior", "include"),
+        ])
+        .send()
+        .await;
+
+    let invoice_id = match inv_resp {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            match body["id"].as_str() {
+                Some(id) => id.to_string(),
+                None => {
+                    warn!("[billing] Invoice created but no ID in response");
+                    return;
+                }
+            }
+        }
+        Ok(r) => {
+            let body = r.text().await.unwrap_or_default();
+            warn!("[billing] Invoice creation failed: {body}");
+            return;
+        }
+        Err(e) => {
+            warn!("[billing] Failed to create invoice: {e}");
+            return;
+        }
+    };
+
+    // Finalize
+    let fin_resp = state
+        .http
+        .post(format!(
+            "https://api.stripe.com/v1/invoices/{invoice_id}/finalize"
+        ))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await;
+
+    match fin_resp {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => {
+            let body = r.text().await.unwrap_or_default();
+            warn!("[billing] Failed to finalize invoice {invoice_id}: {body}");
+            return;
+        }
+        Err(e) => {
+            warn!("[billing] Failed to finalize invoice {invoice_id}: {e}");
+            return;
+        }
+    }
+
+    // Pay immediately
+    let pay_resp = state
+        .http
+        .post(format!(
+            "https://api.stripe.com/v1/invoices/{invoice_id}/pay"
+        ))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await;
+
+    match pay_resp {
+        Ok(r) if r.status().is_success() => {
+            info!(
+                "[billing] Invoice {invoice_id} paid: {unbilled} units (${:.2}) for {tenant_id}",
+                unbilled_cents as f64 / 100.0
+            );
+        }
+        Ok(r) => {
+            let body = r.text().await.unwrap_or_default();
+            warn!("[billing] Failed to pay invoice {invoice_id}: {body}");
+            return;
+        }
+        Err(e) => {
+            warn!("[billing] Failed to pay invoice {invoice_id}: {e}");
+            return;
+        }
+    }
+
+    // Update billed counter in DynamoDB
+    let new_billed = already_billed + unbilled;
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.billing_table_name)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("BILLING".to_string()),
+        )
+        .update_expression("SET #b = :b")
+        .expression_attribute_names("#b", &billed_attr)
+        .expression_attribute_values(
+            ":b",
+            aws_sdk_dynamodb::types::AttributeValue::N(new_billed.to_string()),
+        )
+        .send()
+        .await
+    {
+        warn!("[billing] Failed to update billed counter: {e}");
     }
 }
