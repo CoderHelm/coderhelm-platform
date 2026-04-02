@@ -555,8 +555,8 @@ pub async fn create_subscription(
         .unwrap_or("");
     if !overage_price_id.is_empty() {
         form_params.push(("items[1][price]", overage_price_id));
-        // Bill overage in $50 increments
-        form_params.push(("billing_thresholds[amount_gte]", "5000"));
+        // Bill overage in $100 increments
+        form_params.push(("billing_thresholds[amount_gte]", "10000"));
     }
 
     let response = state

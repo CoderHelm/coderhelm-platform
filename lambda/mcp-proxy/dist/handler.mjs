@@ -1,3 +1,4 @@
+import{createRequire}from'module';const require=createRequire(import.meta.url);
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -21549,7 +21550,7 @@ async function handler(event) {
     client = new Client({ name: "coderhelm-proxy", version: "1.0.0" });
     await Promise.race([
       client.connect(transport),
-      timeout(3e4, `MCP server ${server_id} failed to initialize within 30s`)
+      timeout(9e4, `MCP server ${server_id} failed to initialize within 90s`)
     ]);
     if (action === "list_tools") {
       const result = await Promise.race([

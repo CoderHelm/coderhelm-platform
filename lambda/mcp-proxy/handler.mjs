@@ -53,10 +53,10 @@ export async function handler(event) {
 
     client = new Client({ name: "coderhelm-proxy", version: "1.0.0" });
 
-    // Connect with a timeout — server must initialize within 30s
+    // Connect with a timeout — server must initialize within 90s (npx downloads on cold start)
     await Promise.race([
       client.connect(transport),
-      timeout(30_000, `MCP server ${server_id} failed to initialize within 30s`),
+      timeout(90_000, `MCP server ${server_id} failed to initialize within 90s`),
     ]);
 
     if (action === "list_tools") {

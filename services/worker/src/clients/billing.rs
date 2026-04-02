@@ -1,16 +1,13 @@
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::WorkerState;
 
 /// Included tokens in the Pro plan (1M in+out).
 const INCLUDED_TOKENS: u64 = 1_000_000;
 
-/// $10.00 per 1K overage tokens.
-const OVERAGE_PER_1K_TOKENS_CENTS: u64 = 1000;
-
 /// Report token overage to Stripe via Billing Meter Events.
-/// Checks current month's cumulative usage against the included limit,
-/// and only reports the overage portion.
+/// Always reports actual overage — budget enforcement (blocking new runs)
+/// is handled at the gateway, not here.
 pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_used: u64) {
     if tokens_used == 0 {
         return;
@@ -46,7 +43,10 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
 
     let item = match billing.item() {
         Some(i) => i,
-        None => return,
+        None => {
+            info!("[billing] no BILLING record for {tenant_id}, skipping meter event");
+            return;
+        }
     };
 
     let customer_id = match item
@@ -55,7 +55,10 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
         .filter(|s| !s.is_empty())
     {
         Some(id) => id.to_string(),
-        None => return,
+        None => {
+            info!("[billing] no stripe_customer_id for {tenant_id}");
+            return;
+        }
     };
 
     let status = item
@@ -65,6 +68,7 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
         .unwrap_or("none");
 
     if status != "active" {
+        info!("[billing] subscription not active ({status}) for {tenant_id}, skipping meter event");
         return;
     }
 
@@ -105,52 +109,7 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
         return;
     }
 
-    // Check budget cap
-    let budget = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key(
-            "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(tenant_id.to_string()),
-        )
-        .key(
-            "sk",
-            aws_sdk_dynamodb::types::AttributeValue::S("SETTINGS#BUDGET".to_string()),
-        )
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned());
-
-    let max_budget_cents: u64 = budget
-        .as_ref()
-        .and_then(|i| i.get("max_budget_cents"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
-
-    let current_overage = total_tokens.saturating_sub(INCLUDED_TOKENS);
-    let current_overage_1k = current_overage / 1000;
-    let current_overage_cents = current_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
-
-    // No budget set — don't report any overage to Stripe
-    if max_budget_cents == 0 {
-        return;
-    }
-
-    // If budget cap is set and we've already reported up to the cap, stop
-    if current_overage_cents >= max_budget_cents {
-        // Check if we already exceeded the cap before this run
-        let prev_total = total_tokens.saturating_sub(tokens_used);
-        let prev_overage_1k = prev_total.saturating_sub(INCLUDED_TOKENS) / 1000;
-        let prev_overage_cents = prev_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
-        if prev_overage_cents >= max_budget_cents {
-            return; // Already at cap, nothing new to report
-        }
-    }
-
-    // Calculate what overage was already reported vs. what's new from this run
+    // Calculate only the NEW overage from this run
     let prev_total = total_tokens.saturating_sub(tokens_used);
     let prev_overage = prev_total.saturating_sub(INCLUDED_TOKENS);
     let current_overage = total_tokens.saturating_sub(INCLUDED_TOKENS);
@@ -160,22 +119,15 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
         return;
     }
 
-    // Cap at budget limit if set
-    let mut overage_1k = new_overage.div_ceil(1000);
-    if max_budget_cents > 0 {
-        let prev_overage_1k = prev_overage / 1000;
-        let prev_reported_cents = prev_overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
-        let remaining_budget = max_budget_cents.saturating_sub(prev_reported_cents);
-        let max_reportable_1k = remaining_budget / OVERAGE_PER_1K_TOKENS_CENTS;
-        overage_1k = overage_1k.min(max_reportable_1k);
-        if overage_1k == 0 {
-            return;
-        }
-    }
+    let overage_1k = new_overage.div_ceil(1000);
     let ts = chrono::Utc::now().timestamp().to_string();
     let qty = overage_1k.to_string();
 
-    if let Err(e) = state
+    info!(
+        "[billing] reporting {overage_1k} x 1K token overage to Stripe for {tenant_id} (cumulative: {current_overage}, new: {new_overage})"
+    );
+
+    let resp = state
         .http
         .post("https://api.stripe.com/v1/billing/meter_events")
         .header("Authorization", format!("Bearer {stripe_key}"))
@@ -186,8 +138,19 @@ pub async fn report_token_overage(state: &WorkerState, tenant_id: &str, tokens_u
             ("payload[stripe_customer_id]", customer_id.as_str()),
         ])
         .send()
-        .await
-    {
-        warn!("Failed to report Stripe meter event: {e}");
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            info!("[billing] meter event sent: {qty} units for {tenant_id}");
+        }
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            warn!("[billing] Stripe meter event failed {status}: {body}");
+        }
+        Err(e) => {
+            warn!("[billing] Failed to send Stripe meter event: {e}");
+        }
     }
 }

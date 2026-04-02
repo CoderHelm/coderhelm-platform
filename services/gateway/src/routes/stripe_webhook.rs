@@ -90,6 +90,11 @@ pub async fn handle(
             handle_subscription_updated(&state, &event["data"]["object"]).await
         }
 
+        // Invoice created — auto-finalize threshold invoices so they charge immediately
+        "invoice.created" => {
+            handle_invoice_created(&state, &event["data"]["object"]).await
+        }
+
         // Invoice finalized — ready for download
         "invoice.finalized" => handle_invoice_finalized(&state, &event["data"]["object"]).await,
 
@@ -836,6 +841,65 @@ fn verify_stripe_signature(payload: &str, header: &str, secret: &str) -> bool {
 
     // Constant-time comparison
     subtle::ConstantTimeEq::ct_eq(expected.as_bytes(), signature.as_bytes()).into()
+}
+
+/// When Stripe creates a threshold invoice (metered overage hit $50), it starts
+/// as a draft scheduled to finalize ~1 hour later. We finalize + pay it immediately
+/// so the customer is billed right away.
+async fn handle_invoice_created(
+    state: &AppState,
+    invoice: &Value,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let invoice_id = invoice["id"].as_str().unwrap_or("");
+    let billing_reason = invoice["billing_reason"].as_str().unwrap_or("");
+    let status = invoice["status"].as_str().unwrap_or("");
+
+    // Only auto-finalize threshold invoices (overage billing)
+    if billing_reason != "subscription_threshold" {
+        info!(invoice_id, billing_reason, "invoice.created — not a threshold invoice, skipping");
+        return Ok(());
+    }
+
+    if status != "draft" {
+        info!(invoice_id, status, "invoice.created — not draft, skipping");
+        return Ok(());
+    }
+
+    let stripe_key = match &state.secrets.stripe_secret_key {
+        Some(k) => k.clone(),
+        None => return Ok(()),
+    };
+
+    // Finalize the draft invoice
+    let finalize_resp = state
+        .http
+        .post(format!("https://api.stripe.com/v1/invoices/{invoice_id}/finalize"))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await?;
+
+    if !finalize_resp.status().is_success() {
+        let body = finalize_resp.text().await.unwrap_or_default();
+        warn!(invoice_id, "Failed to finalize threshold invoice: {body}");
+        return Err(format!("Failed to finalize invoice {invoice_id}").into());
+    }
+
+    // Pay it immediately
+    let pay_resp = state
+        .http
+        .post(format!("https://api.stripe.com/v1/invoices/{invoice_id}/pay"))
+        .header("Authorization", format!("Bearer {stripe_key}"))
+        .send()
+        .await?;
+
+    if !pay_resp.status().is_success() {
+        let body = pay_resp.text().await.unwrap_or_default();
+        warn!(invoice_id, "Failed to pay threshold invoice: {body}");
+        return Err(format!("Failed to pay invoice {invoice_id}").into());
+    }
+
+    info!(invoice_id, "Threshold invoice finalized and paid immediately");
+    Ok(())
 }
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {

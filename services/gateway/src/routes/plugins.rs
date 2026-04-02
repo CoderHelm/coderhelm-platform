@@ -770,3 +770,92 @@ pub async fn update_prompt(
     info!(tenant = %claims.tenant_id, plugin = %plugin_id, "Plugin custom prompt updated");
     Ok(Json(json!({ "status": "saved" })))
 }
+
+/// POST /api/plugins/:id/test — test connection to an MCP server.
+pub async fn test_connection(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(plugin_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let plugin_def = CATALOG
+        .iter()
+        .find(|p| p.id == plugin_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Load stored credentials
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(mcp_table(&state))
+        .key("pk", attr_s(&claims.tenant_id))
+        .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to load plugin item for test: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item()
+        .cloned();
+
+    let creds_json: serde_json::Value = item
+        .as_ref()
+        .and_then(|i| {
+            i.get("credentials")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|s| serde_json::from_str(s).ok())
+        })
+        .unwrap_or(json!({}));
+
+    // Map credentials to env vars
+    let mut env_vars = serde_json::Map::new();
+    for (cred_key, env_var) in plugin_def.env_mapping {
+        if let Some(val) = creds_json.get(*cred_key).and_then(|v| v.as_str()) {
+            env_vars.insert(env_var.to_string(), json!(val));
+        }
+    }
+
+    // Invoke MCP proxy Lambda with list_tools action
+    let payload = json!({
+        "action": "list_tools",
+        "server_id": plugin_def.id,
+        "npx_package": plugin_def.npx_package,
+        "env_vars": env_vars,
+    });
+
+    let resp = state
+        .lambda
+        .invoke()
+        .function_name(&state.config.mcp_proxy_function_name)
+        .payload(aws_sdk_lambda::primitives::Blob::new(
+            serde_json::to_vec(&payload).unwrap_or_default(),
+        ))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Lambda invoke failed for plugin test {plugin_id}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let response_payload = resp
+        .payload()
+        .map(|p| p.as_ref().to_vec())
+        .unwrap_or_default();
+
+    let response: serde_json::Value =
+        serde_json::from_slice(&response_payload).unwrap_or(json!({}));
+
+    if let Some(err) = response.get("error").and_then(|v| v.as_str()) {
+        info!(tenant = %claims.tenant_id, plugin = %plugin_id, "Plugin test failed: {err}");
+        return Ok(Json(json!({ "status": "error", "message": err })));
+    }
+
+    let tool_count = response
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    info!(tenant = %claims.tenant_id, plugin = %plugin_id, tools = tool_count, "Plugin test succeeded");
+    Ok(Json(json!({ "status": "ok", "tool_count": tool_count })))
+}

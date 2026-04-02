@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "esbuild handler.mjs --bundle --platform=node --target=node20 --outfile=dist/handler.mjs --format=esm --external:@aws-sdk/*",
+    "build": "esbuild handler.mjs --bundle --platform=node --target=node20 --outfile=dist/handler.mjs --format=esm --external:@aws-sdk/* --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
     "package": "npm run build && cd dist && zip -r ../mcp-proxy.zip ."
   },
   "dependencies": {
