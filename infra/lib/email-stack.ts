@@ -226,23 +226,22 @@ const EMAIL_WRAPPER = (body: string) => `<!DOCTYPE html>
 const WELCOME_HTML = EMAIL_WRAPPER(`
   <h1 style="color:#fff;font-size:24px;margin:0 0 16px">Welcome to Coderhelm</h1>
   <p style="color:#ccc;font-size:15px;line-height:1.6">
-    Your AI coding agent is ready. Coderhelm is now installed on <strong style="color:#fff">{{org}}</strong>
-    with access to <strong style="color:#fff">{{repo_count}}</strong> repositories.
+    Your AI coding agent is ready. Connect your GitHub organization and install the Coderhelm app to get started.
   </p>
   <p style="color:#ccc;font-size:15px;line-height:1.6">
-    To get started, assign an issue to <code style="background:#1a1a1a;padding:2px 6px;border-radius:4px;color:#4ade80">coderhelm[bot]</code>
+    Once installed, assign an issue to <code style="background:#1a1a1a;padding:2px 6px;border-radius:4px;color:#4ade80">coderhelm[bot]</code>
     or add the <code style="background:#1a1a1a;padding:2px 6px;border-radius:4px;color:#4ade80">coderhelm</code> label.
   </p>
-  <a href="https://app.coderhelm.com" style="display:inline-block;background:#fff;color:#000;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:16px">Open Dashboard</a>
+  <a href="https://app.coderhelm.com/settings/github" style="display:inline-block;background:#fff;color:#000;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:16px">Connect GitHub</a>
 `);
 
 const WELCOME_TEXT = `Welcome to Coderhelm!
 
-Your AI coding agent is now installed on {{org}} with access to {{repo_count}} repositories.
+Your AI coding agent is ready. Connect your GitHub organization and install the Coderhelm app to get started.
 
-To get started, assign an issue to coderhelm[bot] or add the "coderhelm" label.
+Once installed, assign an issue to coderhelm[bot] or add the "coderhelm" label.
 
-Dashboard: https://app.coderhelm.com
+Connect GitHub: https://app.coderhelm.com/settings/github
 
 Manage notifications: https://app.coderhelm.com/settings`;
 

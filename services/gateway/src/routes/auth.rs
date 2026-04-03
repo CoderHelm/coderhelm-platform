@@ -309,6 +309,9 @@ pub async fn verify_email(
 
     info!(email = %email, team_id = %team_id, "Email verified, user + team created");
 
+    // Send welcome email
+    send_welcome_email(&state, &email).await;
+
     Ok(Json(serde_json::json!({
         "status": "verified",
         "message": "Email verified. You can now log in."
@@ -1064,6 +1067,9 @@ pub async fn github_callback(
             .condition_expression("attribute_not_exists(team_id)")
             .send()
             .await;
+
+        // Send welcome email for new GitHub signups
+        send_welcome_email(&state, email).await;
     }
 
     // Link GitHub installations to the team in the teams table
@@ -1478,4 +1484,37 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 
 fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
+}
+
+/// Send the welcome email to a single address (best-effort, non-blocking).
+async fn send_welcome_email(state: &AppState, email: &str) {
+    let template_name = format!("{}-welcome", state.config.ses_template_prefix);
+    let template_data = serde_json::json!({ "org": "", "repo_count": 0 }).to_string();
+
+    if let Err(e) = state
+        .ses
+        .send_email()
+        .from_email_address(&state.config.ses_from_address)
+        .destination(
+            aws_sdk_sesv2::types::Destination::builder()
+                .to_addresses(email)
+                .build(),
+        )
+        .content(
+            aws_sdk_sesv2::types::EmailContent::builder()
+                .template(
+                    aws_sdk_sesv2::types::Template::builder()
+                        .template_name(&template_name)
+                        .template_data(&template_data)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+    {
+        error!("Failed to send welcome email to {email}: {e}");
+    } else {
+        info!(email, "Welcome email sent");
+    }
 }

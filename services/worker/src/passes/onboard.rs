@@ -138,50 +138,6 @@ pub async fn run(
 
     info!(team_id = %msg.team_id, "Onboard complete");
 
-    // Send welcome email only once per team
-    let welcome_check = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.table_name)
-        .key("pk", AttributeValue::S(msg.team_id.clone()))
-        .key("sk", AttributeValue::S("WELCOME_SENT".to_string()))
-        .send()
-        .await;
-    let already_sent = welcome_check.as_ref().ok().and_then(|r| r.item()).is_some();
-
-    if !already_sent {
-        let org = msg
-            .repos
-            .first()
-            .map(|r| r.owner.clone())
-            .unwrap_or_default();
-        if let Err(e) = email::send_notification(
-            state,
-            &msg.team_id,
-            EmailEvent::Welcome {
-                org,
-                repo_count: msg.repos.len(),
-            },
-        )
-        .await
-        {
-            error!("Failed to send welcome email: {e}");
-        }
-        // Mark welcome as sent
-        let _ = state
-            .dynamo
-            .put_item()
-            .table_name(&state.config.table_name)
-            .item("pk", AttributeValue::S(msg.team_id.clone()))
-            .item("sk", AttributeValue::S("WELCOME_SENT".to_string()))
-            .item(
-                "sent_at",
-                AttributeValue::S(chrono::Utc::now().to_rfc3339()),
-            )
-            .send()
-            .await;
-    }
-
     Ok(())
 }
 
