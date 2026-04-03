@@ -34,13 +34,13 @@ pub struct UpdateConnectionRequest {
     log_groups: Option<Vec<String>>,
 }
 
-/// Validate that role_arn matches expected format: arn:aws:iam::<12-digit>:role/<name>
+/// Validate that role_arn matches expected format: arn:aws:iam::<12-digit>:role/CoderHelmLogReader
 fn validate_role_arn(arn: &str) -> Result<&str, StatusCode> {
-    let re = regex::Regex::new(r"^arn:aws:iam::\d{12}:role/.+$").unwrap();
+    let re = regex::Regex::new(r"^arn:aws:iam::\d{12}:role/CoderHelmLogReader$").unwrap();
     if re.is_match(arn) {
         Ok(arn)
     } else {
-        warn!(role_arn = arn, "Invalid role ARN format");
+        warn!(role_arn = arn, "Invalid role ARN — must be CoderHelmLogReader");
         Err(StatusCode::BAD_REQUEST)
     }
 }
@@ -143,6 +143,7 @@ pub async fn list_connections(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    let is_admin = is_admin_or_owner(&claims.role);
     super::billing::require_paid_subscription(&state, &claims.team_id).await?;
     let result = state
         .dynamo
@@ -173,10 +174,16 @@ pub async fn list_connections(
                 })
                 .unwrap_or_default();
 
+            let external_id = if is_admin {
+                item.get("external_id").and_then(|v| v.as_s().ok()).map(|s| s.to_string())
+            } else {
+                None
+            };
+
             Some(json!({
                 "connection_id": account_id,
                 "role_arn": item.get("role_arn")?.as_s().ok()?,
-                "external_id": item.get("external_id")?.as_s().ok()?,
+                "external_id": external_id,
                 "region": item.get("region").and_then(|v| v.as_s().ok()).map(|v| v.as_str()).unwrap_or("us-east-1"),
                 "status": item.get("status").and_then(|v| v.as_s().ok()).map(|v| v.as_str()).unwrap_or("active"),
                 "log_groups": log_groups,
