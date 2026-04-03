@@ -344,6 +344,7 @@ async fn process_jira_payload(
     );
 
     // Dedup: skip if this ticket already has a run (running or completed)
+    // Allow re-trigger if all existing runs are failed or needs_input
     let existing_runs = state
         .dynamo
         .query()
@@ -357,7 +358,15 @@ async fn process_jira_payload(
         .await;
 
     if let Ok(result) = existing_runs {
-        if !result.items().is_empty() {
+        let has_blocking_run = result.items().iter().any(|item| {
+            let status = item
+                .get("status")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            matches!(status, "running" | "completed" | "queued")
+        });
+        if has_blocking_run {
             info!(ticket_key, "Skipping — ticket already has a run");
             log_jira_event(
                 state,
@@ -607,8 +616,8 @@ async fn handle_jira_comment(
     };
 
     match run_status {
-        // Failed run — retry by re-queuing the ticket
-        "failed" => {
+        // Failed or needs_input run — retry by re-queuing the ticket
+        "failed" | "needs_input" => {
             let title = run_item
                 .get("title")
                 .and_then(|v| v.as_s().ok())
@@ -643,7 +652,7 @@ async fn handle_jira_comment(
 
             info!(
                 team_id,
-                ticket_key, run_id, "Retrying failed Jira run after comment"
+                ticket_key, run_id, run_status, "Retrying Jira run after comment"
             );
             send_to_queue(state, &state.config.ticket_queue_url, &message).await
         }

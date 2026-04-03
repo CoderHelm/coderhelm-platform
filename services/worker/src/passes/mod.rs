@@ -339,16 +339,31 @@ async fn run_passes(
             .trim();
         info!(run_id, reason, "Plan determined no changes needed");
 
-        let comment = format!(
+        let github_comment = format!(
             "✅ **No changes needed**\n\n{reason}\n\nThe codebase already satisfies what this issue asks for."
         );
+        let jira_comment =
+            format!("{reason}\n\nThe codebase already satisfies what this issue asks for.");
 
         if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
             let _ = github
-                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
+                .create_issue_comment(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.issue_number,
+                    &github_comment,
+                )
                 .await;
         } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-            let _ = post_jira_comment(state, &msg.team_id, &msg.ticket_id, &comment).await;
+            let _ = post_jira_comment(
+                state,
+                &msg.team_id,
+                &msg.ticket_id,
+                &jira_comment,
+                "no_changes",
+                "No changes needed",
+            )
+            .await;
         }
 
         // Complete the run with no PR
@@ -400,19 +415,35 @@ async fn run_passes(
             detail, "Plan needs clarification from the ticket author"
         );
 
-        let comment = format!(
+        let github_comment = format!(
             "❓ **Clarification needed**\n\n{detail}\n\nPlease update the issue with the missing details and re-trigger the run."
+        );
+        let jira_comment = format!(
+            "{detail}\n\nPlease update the issue with the missing details and comment to re-trigger."
         );
 
         if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
             let _ = github
-                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
+                .create_issue_comment(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.issue_number,
+                    &github_comment,
+                )
                 .await;
         } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-            let _ = post_jira_comment(state, &msg.team_id, &msg.ticket_id, &comment).await;
+            let _ = post_jira_comment(
+                state,
+                &msg.team_id,
+                &msg.ticket_id,
+                &jira_comment,
+                "clarification",
+                "Clarification needed",
+            )
+            .await;
         }
 
-        // Complete the run with no PR
+        // Mark the run as needs_input so a comment can re-trigger it
         let duration = start.elapsed().as_secs();
         let cost = usage.estimated_cost();
         let now = chrono::Utc::now().to_rfc3339();
@@ -428,14 +459,14 @@ async fn run_passes(
                  status_run_id = :sri, mcp_servers = :mcp",
             )
             .expression_attribute_names("#status", "status")
-            .expression_attribute_values(":s", attr_s("completed"))
+            .expression_attribute_values(":s", attr_s("needs_input"))
             .expression_attribute_values(":ti", attr_n(usage.input_tokens))
             .expression_attribute_values(":to", attr_n(usage.output_tokens))
             .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
             .expression_attribute_values(":d", attr_n(duration))
             .expression_attribute_values(":t", attr_s(&now))
             .expression_attribute_values(":cp", attr_s("done"))
-            .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
+            .expression_attribute_values(":sri", attr_s(&format!("needs_input#{run_id}")))
             .expression_attribute_values(
                 ":mcp",
                 AttributeValue::L(mcp_server_ids.iter().map(|s| attr_s(s)).collect()),
@@ -534,8 +565,15 @@ async fn run_passes(
             }
             return Err("Could not determine what changes to make — commented on issue asking for clarification".into());
         } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-            if let Err(e) =
-                post_jira_comment(state, &msg.team_id, &msg.ticket_id, clarification).await
+            if let Err(e) = post_jira_comment(
+                state,
+                &msg.team_id,
+                &msg.ticket_id,
+                clarification,
+                "clarification",
+                "More detail needed",
+            )
+            .await
             {
                 warn!(run_id, error = %e, "Failed to comment on Jira ticket about empty implementation");
             }
@@ -631,6 +669,22 @@ async fn run_passes(
                 ),
             )
             .await?;
+    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+        let comment = format!(
+            "PR: {}\nFiles: {} modified\n\nView run → https://app.coderhelm.com/runs/detail?id={}",
+            pr_result.pr_url,
+            impl_result.files_modified.len(),
+            run_id,
+        );
+        let _ = post_jira_comment(
+            state,
+            &msg.team_id,
+            &msg.ticket_id,
+            &comment,
+            "success",
+            "Completed",
+        )
+        .await;
     }
 
     Ok(())
@@ -987,14 +1041,22 @@ async fn fail_run(
         }
     } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
         let comment = format!(
-            "⚠️ Coderhelm couldn't complete this issue\n\n\
-             {}\n\n\
-             Add more detail — which files to change, expected behavior, or relevant code snippets — and I'll try again.\n\n\
+            "{}\n\n\
+             Add more detail — which files to change, expected behavior, or relevant code snippets — and comment to retry.\n\n\
              View run → https://app.coderhelm.com/runs/detail?id={}",
             &error_msg[..error_msg.len().min(300)],
             run_id,
         );
-        if let Err(e) = post_jira_comment(state, &msg.team_id, &msg.ticket_id, &comment).await {
+        if let Err(e) = post_jira_comment(
+            state,
+            &msg.team_id,
+            &msg.ticket_id,
+            &comment,
+            "error",
+            "Run failed",
+        )
+        .await
+        {
             error!("Failed to comment on Jira ticket about run failure: {e}");
         }
     }
@@ -1014,6 +1076,8 @@ async fn post_jira_comment(
     team_id: &str,
     issue_key: &str,
     comment: &str,
+    comment_type: &str,
+    title: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = state
         .dynamo
@@ -1041,6 +1105,8 @@ async fn post_jira_comment(
     let payload = serde_json::json!({
         "issueKey": issue_key,
         "comment": comment,
+        "commentType": comment_type,
+        "title": title,
     });
 
     let resp = state

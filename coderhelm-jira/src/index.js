@@ -194,17 +194,13 @@ exports.createTicketHandler = async (request) => {
 exports.addCommentHandler = async (request) => {
   try {
     const body = JSON.parse(request.body || "{}");
-    const { issueKey, comment } = body;
+    const { issueKey, comment, commentType, title } = body;
 
     if (!issueKey || !comment) {
       return { statusCode: 400, body: JSON.stringify({ error: "issueKey and comment required" }) };
     }
 
-    const adfBody = {
-      type: "doc",
-      version: 1,
-      content: [{ type: "paragraph", content: [{ type: "text", text: comment }] }],
-    };
+    const adfBody = buildCommentAdf(comment, commentType, title);
 
     const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/comment`, {
       method: "POST",
@@ -229,6 +225,56 @@ exports.addCommentHandler = async (request) => {
     return { statusCode: 500, body: JSON.stringify({ error: e.message }) };
   }
 };
+
+/**
+ * Build ADF (Atlassian Document Format) for a comment.
+ * Uses native Jira panel nodes for professional styling.
+ */
+function buildCommentAdf(comment, commentType, title) {
+  // Map comment type to Jira ADF panel type
+  const panelTypeMap = {
+    clarification: "warning",  // yellow
+    no_changes: "info",        // blue
+    error: "error",            // red
+    success: "success",        // green
+  };
+
+  const panelType = panelTypeMap[commentType];
+
+  // Split comment into paragraphs
+  const paragraphs = comment.split("\n\n").filter(Boolean).map((para) => ({
+    type: "paragraph",
+    content: [{ type: "text", text: para.replace(/\n/g, " ") }],
+  }));
+
+  // If we have a known panel type, wrap in a panel with bold title
+  if (panelType && title) {
+    return {
+      type: "doc",
+      version: 1,
+      content: [
+        {
+          type: "panel",
+          attrs: { panelType },
+          content: [
+            {
+              type: "paragraph",
+              content: [{ type: "text", text: title, marks: [{ type: "strong" }] }],
+            },
+            ...paragraphs,
+          ],
+        },
+      ],
+    };
+  }
+
+  // Fallback: plain paragraphs
+  return {
+    type: "doc",
+    version: 1,
+    content: paragraphs.length > 0 ? paragraphs : [{ type: "paragraph", content: [{ type: "text", text: comment }] }],
+  };
+}
 
 // ── Web trigger: get Jira site URL ───────────────────────────────────────────
 exports.getSiteUrlHandler = async () => {
