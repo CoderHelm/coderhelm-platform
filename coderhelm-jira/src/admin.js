@@ -10,15 +10,18 @@ const resolver = new Resolver();
 
 resolver.define("getConfig", async () => {
   const config = await storage.get("coderhelm-config");
-  return config || { teamId: "" };
+  return config || { teamId: "", forgeSecret: "" };
 });
 
 resolver.define("saveConfig", async ({ payload }) => {
-  const { teamId } = payload;
+  const { teamId, forgeSecret } = payload;
   if (!teamId) {
     return { success: false, error: "Team ID is required" };
   }
-  await storage.set("coderhelm-config", { teamId });
+  if (!forgeSecret) {
+    return { success: false, error: "Secret is required" };
+  }
+  await storage.set("coderhelm-config", { teamId, forgeSecret });
 
   // Auto-register web trigger URLs with the Coderhelm gateway
   try {
@@ -43,6 +46,7 @@ resolver.define("saveConfig", async ({ payload }) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         team_id: teamId,
+        forge_secret: forgeSecret,
         list_projects_url: listProjectsUrl,
         create_ticket_url: createTicketUrl,
         add_comment_url: addCommentUrl,

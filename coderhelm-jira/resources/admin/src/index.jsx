@@ -4,19 +4,21 @@ import { invoke } from "@forge/bridge";
 
 function App() {
   const [teamId, setTeamId] = useState("");
+  const [forgeSecret, setForgeSecret] = useState("");
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     invoke("getConfig").then((config) => {
       setTeamId(config.teamId || "");
+      setForgeSecret(config.forgeSecret || "");
       setLoading(false);
     });
   }, []);
 
   const save = async () => {
     setStatus("Saving…");
-    const result = await invoke("saveConfig", { teamId });
+    const result = await invoke("saveConfig", { teamId, forgeSecret });
     if (!result.success) {
       setStatus(`Error: ${result.error}`);
     } else if (result.urlsRegistered) {
@@ -45,11 +47,11 @@ function App() {
 
       <div style={styles.setupBox}>
         <p style={styles.setupText}>
-          <strong>Where to find your Team ID:</strong> Go to{" "}
+          <strong>Where to find your Team ID and Secret:</strong> Go to{" "}
           <a href="https://app.coderhelm.com/settings/jira" target="_blank" rel="noopener noreferrer" style={styles.link}>
             app.coderhelm.com → Settings → Jira
           </a>
-          . Your Team ID is shown in Step 2 with a copy button.
+          . Your Team ID and Secret are shown in Step 2 with copy buttons.
         </p>
       </div>
 
@@ -63,8 +65,18 @@ function App() {
             placeholder="e.g. a1b2c3d4-5678-9abc-def0-123456789abc"
           />
         </label>
+
+        <label style={{ ...styles.label, marginTop: 12 }}>
+          Secret
+          <input
+            style={styles.input}
+            value={forgeSecret}
+            onChange={(e) => setForgeSecret(e.target.value)}
+            placeholder="Paste secret from coderhelm dashboard"
+          />
+        </label>
         <p style={styles.hint}>
-          Copy this from the coderhelm dashboard → Settings → Jira → Step 2.
+          Copy both values from the coderhelm dashboard → Settings → Jira → Step 2.
         </p>
 
         <button style={styles.button} onClick={save}>

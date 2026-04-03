@@ -425,7 +425,11 @@ pub async fn handle_forge(
 
     let team_id = match team_id {
         Some(tid) if !tid.is_empty() => {
-            if tid.starts_with("TEAM#") { tid } else { format!("TEAM#{tid}") }
+            if tid.starts_with("TEAM#") {
+                tid
+            } else {
+                format!("TEAM#{tid}")
+            }
         }
         _ => {
             // Fallback: resolve team via GitHub installation GSI
@@ -448,7 +452,7 @@ pub async fn handle_forge(
     };
 
     // Verify this team actually exists by checking jira config
-    let config_exists = state
+    let config_item = state
         .dynamo
         .get_item()
         .table_name(&state.config.jira_config_table_name)
@@ -457,12 +461,30 @@ pub async fn handle_forge(
         .send()
         .await
         .ok()
-        .and_then(|r| r.item)
-        .is_some();
+        .and_then(|r| r.item);
 
-    if !config_exists {
+    if config_item.is_none() {
         warn!(team_id, "Forge Jira webhook: team not configured");
         return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Verify forge_secret from the payload matches stored secret
+    let request_secret = payload
+        .pointer("/coderhelm/forge_secret")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let stored_secret = config_item
+        .as_ref()
+        .and_then(|item| item.get("forge_secret"))
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    if stored_secret.is_empty() || request_secret != stored_secret {
+        warn!(
+            team_id,
+            "Forge Jira webhook: invalid or missing forge_secret"
+        );
+        return Err(StatusCode::FORBIDDEN);
     }
 
     info!(team_id, installation_id, payload = %payload, "Forge Jira webhook received");

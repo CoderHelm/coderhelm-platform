@@ -24,6 +24,7 @@ fn attr_s(val: &str) -> AttributeValue {
 pub struct CreateConnectionRequest {
     role_arn: String,
     region: Option<String>,
+    external_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -66,7 +67,9 @@ pub async fn create_connection(
 
     let account_id = account_id_from_arn(&body.role_arn).ok_or(StatusCode::BAD_REQUEST)?;
     let region = body.region.as_deref().unwrap_or("us-east-1");
-    let external_id = Uuid::new_v4().to_string();
+    let external_id = body
+        .external_id
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let now = chrono::Utc::now().to_rfc3339();
     let conn_id = format!("AWS_CONN#{account_id}");
 

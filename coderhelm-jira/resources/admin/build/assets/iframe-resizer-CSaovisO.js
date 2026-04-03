@@ -1,4 +1,4 @@
-import{t as e}from"./index-9uzvrgIu.js";var t=e(((e,t)=>{console.info(`
+import{t as e}from"./index-BsC5eXuq.js";var t=e(((e,t)=>{console.info(`
 IFRAME-RESIZER
 
 Iframe-Resizer 5 is now available via the following two packages:

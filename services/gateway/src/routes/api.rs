@@ -1147,6 +1147,47 @@ pub async fn get_jira_integration_check(
         .as_ref()
         .map(|(token, _)| format!("https://api.coderhelm.com/webhooks/jira/{token}"));
 
+    // Load or generate forge_secret for the Forge app integration
+    let jira_config = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.jira_config_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s("JIRA#config"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item);
+
+    let forge_secret = jira_config
+        .as_ref()
+        .and_then(|item| item.get("forge_secret"))
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.to_string());
+
+    let forge_secret = match forge_secret {
+        Some(s) => s,
+        None => {
+            use rand::Rng;
+            let secret: String = rand::rng()
+                .sample_iter(&rand::distr::Alphanumeric)
+                .take(48)
+                .map(char::from)
+                .collect();
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.jira_config_table_name)
+                .key("pk", attr_s(&claims.team_id))
+                .key("sk", attr_s("JIRA#config"))
+                .update_expression("SET forge_secret = :fs")
+                .expression_attribute_values(":fs", attr_s(&secret))
+                .send()
+                .await;
+            secret
+        }
+    };
+
     Ok(Json(json!({
         "ready": ready,
         "secret_configured": secret_configured,
@@ -1161,6 +1202,7 @@ pub async fn get_jira_integration_check(
         "installation_id": installation_id,
         "team_id": claims.team_id.strip_prefix("TEAM#").unwrap_or(&claims.team_id),
         "webhook_url": webhook_url,
+        "forge_secret": forge_secret,
     })))
 }
 
@@ -1437,6 +1479,10 @@ pub async fn forge_register_urls(
     } else {
         format!("TEAM#{raw_team_id}")
     };
+    let forge_secret = body
+        .get("forge_secret")
+        .and_then(|v| v.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let list_projects_url = body
         .get("list_projects_url")
         .and_then(|v| v.as_str())
@@ -1469,6 +1515,40 @@ pub async fn forge_register_urls(
             warn!("forge-register: team not found: {team_id}");
             StatusCode::NOT_FOUND
         })?;
+
+    // Verify forge_secret matches the stored secret
+    let config_item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.jira_config_table_name)
+        .key("pk", attr_s(&team_id))
+        .key("sk", attr_s("JIRA#config"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("forge-register: failed to load JIRA#config: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item;
+    let stored_secret = config_item
+        .as_ref()
+        .and_then(|item| item.get("forge_secret"))
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str());
+    match stored_secret {
+        Some(s) if s == forge_secret => {}
+        Some(_) => {
+            warn!(team_id, "forge-register: invalid forge_secret");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        None => {
+            warn!(
+                team_id,
+                "forge-register: no forge_secret configured — run /jira/check first"
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
 
     // Save trigger URLs to JIRA#config
     let now = chrono::Utc::now().to_rfc3339();

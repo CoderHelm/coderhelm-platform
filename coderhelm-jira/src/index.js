@@ -41,6 +41,7 @@ exports.handler = async (event, context) => {
       },
       coderhelm: {
         team_id: config.teamId,
+        forge_secret: config.forgeSecret,
       },
     };
 
@@ -97,6 +98,7 @@ exports.handler = async (event, context) => {
       repo_owner: repoOwner || undefined,
       repo_name: repoName || undefined,
       team_id: config.teamId,
+      forge_secret: config.forgeSecret,
     },
   };
 
