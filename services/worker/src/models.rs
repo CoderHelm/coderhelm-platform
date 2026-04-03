@@ -207,6 +207,8 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub tool_calls: u64,
+    pub tool_names: Vec<String>,
 }
 
 impl TokenUsage {
@@ -215,6 +217,14 @@ impl TokenUsage {
         self.output_tokens += output;
         self.cache_read_tokens += cache_read;
         self.cache_write_tokens += cache_write;
+    }
+
+    pub fn record_tool_call(&mut self, name: &str, duration_ms: u64) {
+        self.tool_calls += 1;
+        if !self.tool_names.contains(&name.to_string()) {
+            self.tool_names.push(name.to_string());
+        }
+        let _ = duration_ms; // tracked for logging, not stored in cumulative
     }
 
     /// Estimated cost using blended rates across Opus (implement) and Sonnet (other passes).

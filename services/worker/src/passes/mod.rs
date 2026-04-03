@@ -321,6 +321,20 @@ async fn run_passes(
         info!(run_id, servers = ?mcp_server_ids, "MCP servers active for run");
     }
 
+    // --- Checkpoint Resume: skip expensive passes if we've already completed them ---
+    let checkpoint = load_checkpoint(state, &msg.team_id, run_id).await;
+    let can_skip_implement = checkpoint.as_ref().map_or(false, |(last_pass, branch, _)| {
+        !branch.is_empty()
+            && matches!(
+                last_pass.as_str(),
+                "implement" | "test" | "review" | "security"
+            )
+    });
+
+    if let Some((ref last_pass, ref branch, ref cycle)) = checkpoint {
+        info!(run_id, last_pass, branch, cycle, "Found checkpoint for run");
+    }
+
     // --- Pass 1: Triage ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "triage").await?;
@@ -350,11 +364,13 @@ async fn run_passes(
             .trim();
         info!(run_id, reason, "Plan determined no changes needed");
 
-        let github_comment = format!(
+        let raw_github = format!(
             "✅ **No changes needed**\n\n{reason}\n\nThe codebase already satisfies what this issue asks for."
         );
-        let jira_comment =
+        let github_comment = formatter::format_with_voice(state, &voice, &raw_github, usage).await;
+        let raw_jira =
             format!("{reason}\n\nThe codebase already satisfies what this issue asks for.");
+        let jira_comment = formatter::format_with_voice(state, &voice, &raw_jira, usage).await;
 
         if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
             let _ = github
@@ -450,12 +466,14 @@ async fn run_passes(
             detail, "Plan needs clarification from the ticket author"
         );
 
-        let github_comment = format!(
+        let raw_github = format!(
             "❓ **Clarification needed**\n\n{detail}\n\nPlease update the issue with the missing details and re-trigger the run."
         );
-        let jira_comment = format!(
+        let github_comment = formatter::format_with_voice(state, &voice, &raw_github, usage).await;
+        let raw_jira = format!(
             "{detail}\n\nPlease update the issue with the missing details and comment to re-trigger."
         );
+        let jira_comment = formatter::format_with_voice(state, &voice, &raw_jira, usage).await;
 
         if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
             let _ = github
@@ -540,155 +558,184 @@ async fn run_passes(
     }
 
     // --- Pass 3: Implement ---
-    check_cancelled(state, &msg.team_id, run_id).await?;
-    update_pass(state, &msg.team_id, run_id, "implement").await?;
-    let branch_name = format!("coderhelm/{}", msg.ticket_id.to_lowercase());
+    let branch_name = if can_skip_implement {
+        checkpoint.as_ref().unwrap().1.clone()
+    } else {
+        format!("coderhelm/{}", msg.ticket_id.to_lowercase())
+    };
 
-    // Create working branch first
-    github
-        .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, "main")
+    let impl_result = if can_skip_implement {
+        // Resume: reconstruct impl_result from the existing branch diff
+        info!(run_id, branch = %branch_name, "Checkpoint resume: skipping implement pass");
+        update_pass(state, &msg.team_id, run_id, "implement").await?;
+
+        let diff_json = github
+            .get_diff(&msg.repo_owner, &msg.repo_name, "main", &branch_name)
+            .await?;
+        let files_modified: Vec<String> = diff_json["files"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|f| f["filename"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        info!(run_id, files = files_modified.len(), "Reconstructed files_modified from branch diff");
+        implement::ImplementResult { files_modified }
+    } else {
+        check_cancelled(state, &msg.team_id, run_id).await?;
+        update_pass(state, &msg.team_id, run_id, "implement").await?;
+
+        // Create working branch first
+        github
+            .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, "main")
+            .await?;
+        info!(run_id, branch = %branch_name, "Created working branch");
+
+        // Commit openspec to the repo branch if enabled (default: on)
+        let commit_openspec = load_workflow_setting(state, &msg.team_id, "commit_openspec").await;
+        if commit_openspec {
+            let ticket_slug = msg.ticket_id.to_lowercase();
+            let spec_files: Vec<crate::clients::github::FileOp> = [
+                ("proposal.md", &plan_result.proposal),
+                ("design.md", &plan_result.design),
+                ("tasks.md", &plan_result.tasks),
+                ("spec.md", &plan_result.spec),
+            ]
+            .iter()
+            .filter(|(_, content)| !content.is_empty())
+            .map(|(name, content)| crate::clients::github::FileOp::Write {
+                path: format!("openspec/specs/{ticket_slug}/{name}"),
+                content: content.to_string(),
+            })
+            .collect();
+
+            if !spec_files.is_empty() {
+                if let Err(e) = github
+                    .batch_write(
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        &branch_name,
+                        &format!("Add openspec for {}", msg.ticket_id),
+                        &spec_files,
+                    )
+                    .await
+                {
+                    warn!(run_id, error = %e, "Failed to commit openspec to branch");
+                }
+            }
+        }
+
+        // --- Plan Validation (deterministic, no LLM) ---
+        let plan_warnings = validate_plan(&plan_result, &github, &msg.repo_owner, &msg.repo_name, state, &msg.team_id).await;
+        if plan_warnings.blocked {
+            let warning_text = plan_warnings.warnings.join("\n");
+            let comment = format!(
+                "⚠️ **Plan validation failed**\n\n{warning_text}\n\nPlease narrow the scope and re-trigger."
+            );
+            if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+                let _ = github
+                    .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
+                    .await;
+            } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+                let _ = post_jira_comment(
+                    state, &msg.team_id, &msg.ticket_id, &warning_text, "scope_too_large", "Plan scope too large",
+                ).await;
+            }
+            return Err(format!("Plan validation blocked: {warning_text}").into());
+        }
+        if !plan_warnings.warnings.is_empty() {
+            for w in &plan_warnings.warnings {
+                warn!(run_id, warning = %w, "Plan validation warning");
+            }
+        }
+
+        let pass_start = std::time::Instant::now();
+        let usage_before = usage.clone();
+        let result = implement::run(
+            state,
+            msg,
+            &github,
+            &plan_result,
+            &branch_name,
+            &rules,
+            &repo_instructions,
+            None,
+            usage,
+        )
         .await?;
-    info!(run_id, branch = %branch_name, "Created working branch");
-
-    // Commit openspec to the repo branch if enabled (default: on)
-    let commit_openspec = load_workflow_setting(state, &msg.team_id, "commit_openspec").await;
-    if commit_openspec {
-        let ticket_slug = msg.ticket_id.to_lowercase();
-        let spec_files: Vec<crate::clients::github::FileOp> = [
-            ("proposal.md", &plan_result.proposal),
-            ("design.md", &plan_result.design),
-            ("tasks.md", &plan_result.tasks),
-            ("spec.md", &plan_result.spec),
-        ]
-        .iter()
-        .filter(|(_, content)| !content.is_empty())
-        .map(|(name, content)| crate::clients::github::FileOp::Write {
-            path: format!("openspec/specs/{ticket_slug}/{name}"),
-            content: content.to_string(),
-        })
-        .collect();
-
-        if !spec_files.is_empty() {
-            if let Err(e) = github
-                .batch_write(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    &branch_name,
-                    &format!("Add openspec for {}", msg.ticket_id),
-                    &spec_files,
-                )
-                .await
-            {
-                warn!(run_id, error = %e, "Failed to commit openspec to branch");
-            }
-        }
-    }
-
-    // --- Plan Validation (deterministic, no LLM) ---
-    let plan_warnings = validate_plan(&plan_result, &github, &msg.repo_owner, &msg.repo_name, state, &msg.team_id).await;
-    if plan_warnings.blocked {
-        let warning_text = plan_warnings.warnings.join("\n");
-        let comment = format!(
-            "⚠️ **Plan validation failed**\n\n{warning_text}\n\nPlease narrow the scope and re-trigger."
+        write_pass_trace(state, &msg.team_id, run_id, "implement", pass_start, &usage_before, usage, None).await;
+        save_checkpoint(state, &msg.team_id, run_id, "implement", &branch_name, 0, usage).await;
+        info!(
+            run_id,
+            files = result.files_modified.len(),
+            "Implement complete"
         );
-        if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-            let _ = github
-                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
-                .await;
-        } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-            let _ = post_jira_comment(
-                state, &msg.team_id, &msg.ticket_id, &warning_text, "scope_too_large", "Plan scope too large",
-            ).await;
-        }
-        return Err(format!("Plan validation blocked: {warning_text}").into());
-    }
-    if !plan_warnings.warnings.is_empty() {
-        for w in &plan_warnings.warnings {
-            warn!(run_id, warning = %w, "Plan validation warning");
-        }
-    }
 
-    let pass_start = std::time::Instant::now();
-    let usage_before = usage.clone();
-    let impl_result = implement::run(
-        state,
-        msg,
-        &github,
-        &plan_result,
-        &branch_name,
-        &rules,
-        &repo_instructions,
-        None,
-        usage,
-    )
-    .await?;
-    write_pass_trace(state, &msg.team_id, run_id, "implement", pass_start, &usage_before, usage, None).await;
-    save_checkpoint(state, &msg.team_id, run_id, "implement", &branch_name, 0, usage).await;
-    info!(
-        run_id,
-        files = impl_result.files_modified.len(),
-        "Implement complete"
-    );
-
-    // If no files were changed, comment on the issue and bail — don't open an empty PR
-    if impl_result.files_modified.is_empty() {
-        warn!(run_id, "Implement pass produced zero file changes");
-        let clarification = "I explored the codebase but couldn't determine what changes to make for this issue.\n\n\
-             This usually means the issue needs more detail — for example:\n\
-             - Which file(s) or component(s) should be modified?\n\
-             - What is the expected behavior vs. current behavior?\n\
-             - Any relevant code snippets or error messages?\n\n\
-             Please add more context and I'll try again.";
-        if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-            if let Err(e) = github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.issue_number,
-                    clarification,
+        // If no files were changed, comment on the issue and bail — don't open an empty PR
+        if result.files_modified.is_empty() {
+            warn!(run_id, "Implement pass produced zero file changes");
+            let raw_clarification = "I explored the codebase but couldn't determine what changes to make for this issue.\n\n\
+                 This usually means the issue needs more detail — for example:\n\
+                 - Which file(s) or component(s) should be modified?\n\
+                 - What is the expected behavior vs. current behavior?\n\
+                 - Any relevant code snippets or error messages?\n\n\
+                 Please add more context and I'll try again.";
+            let clarification = formatter::format_with_voice(state, &voice, raw_clarification, usage).await;
+            if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+                if let Err(e) = github
+                    .create_issue_comment(
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        msg.issue_number,
+                        &clarification,
+                    )
+                    .await
+                {
+                    warn!(run_id, error = %e, "Failed to comment on issue about empty implementation");
+                }
+                return Err("Could not determine what changes to make — commented on issue asking for clarification".into());
+            } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+                if let Err(e) = post_jira_comment(
+                    state,
+                    &msg.team_id,
+                    &msg.ticket_id,
+                    &clarification,
+                    "clarification",
+                    "More detail needed",
                 )
                 .await
-            {
-                warn!(run_id, error = %e, "Failed to comment on issue about empty implementation");
+                {
+                    warn!(run_id, error = %e, "Failed to comment on Jira ticket about empty implementation");
+                }
+                return Err("Could not determine what changes to make — commented on ticket asking for clarification".into());
             }
-            return Err("Could not determine what changes to make — commented on issue asking for clarification".into());
-        } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-            if let Err(e) = post_jira_comment(
-                state,
-                &msg.team_id,
-                &msg.ticket_id,
-                clarification,
-                "clarification",
-                "More detail needed",
-            )
-            .await
-            {
-                warn!(run_id, error = %e, "Failed to comment on Jira ticket about empty implementation");
-            }
-            return Err("Could not determine what changes to make — commented on ticket asking for clarification".into());
+            return Err("Could not determine what changes to make — please add more detail to the ticket (which files to change, expected behavior, relevant code snippets)".into());
         }
-        return Err("Could not determine what changes to make — please add more detail to the ticket (which files to change, expected behavior, relevant code snippets)".into());
-    }
 
-    // Mark all tasks as done in S3 openspec so retries/dashboard see progress
-    let tasks_key = format!(
-        "teams/{}/runs/{}/openspec/tasks.md",
-        msg.team_id,
-        msg.ticket_id.to_lowercase()
-    );
-    let checked = plan_result.tasks.replace("- [ ]", "- [x]");
-    if let Err(e) = state
-        .s3
-        .put_object()
-        .bucket(&state.config.bucket_name)
-        .key(&tasks_key)
-        .body(checked.as_bytes().to_vec().into())
-        .content_type("text/markdown")
-        .send()
-        .await
-    {
-        warn!(run_id, error = %e, "Failed to update tasks.md with checked items");
-    }
+        // Mark all tasks as done in S3 openspec so retries/dashboard see progress
+        let tasks_key = format!(
+            "teams/{}/runs/{}/openspec/tasks.md",
+            msg.team_id,
+            msg.ticket_id.to_lowercase()
+        );
+        let checked = plan_result.tasks.replace("- [ ]", "- [x]");
+        if let Err(e) = state
+            .s3
+            .put_object()
+            .bucket(&state.config.bucket_name)
+            .key(&tasks_key)
+            .body(checked.as_bytes().to_vec().into())
+            .content_type("text/markdown")
+            .send()
+            .await
+        {
+            warn!(run_id, error = %e, "Failed to update tasks.md with checked items");
+        }
+
+        result
+    };
 
     // --- Pass 4: Test + Review loop (max 3 cycles) ---
     let review_loop_enabled = load_workflow_setting(state, &msg.team_id, "review_loop").await;
@@ -833,26 +880,29 @@ async fn run_passes(
 
     // Post success comment only for GitHub-sourced tickets.
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+        let raw_comment = format!(
+            "✅ **Coderhelm completed this ticket**\n\n**PR**: {}\n**Files**: {} modified\n\n[View run →](https://app.coderhelm.com/runs/detail?id={})",
+            pr_result.pr_url,
+            impl_result.files_modified.len(),
+            run_id,
+        );
+        let comment = formatter::format_with_voice(state, &voice, &raw_comment, usage).await;
         github
             .create_issue_comment(
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.issue_number,
-                &format!(
-                    "✅ **Coderhelm completed this ticket**\n\n**PR**: {}\n**Files**: {} modified\n\n[View run →](https://app.coderhelm.com/runs/detail?id={})",
-                    pr_result.pr_url,
-                    impl_result.files_modified.len(),
-                    run_id,
-                ),
+                &comment,
             )
             .await?;
     } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-        let comment = format!(
+        let raw_comment = format!(
             "PR: {}\nFiles: {} modified\n\nView run → https://app.coderhelm.com/runs/detail?id={}",
             pr_result.pr_url,
             impl_result.files_modified.len(),
             run_id,
         );
+        let comment = formatter::format_with_voice(state, &voice, &raw_comment, usage).await;
         let _ = post_jira_comment(
             state,
             &msg.team_id,
@@ -1683,6 +1733,14 @@ async fn write_pass_trace(
     let output_tokens = usage_after.output_tokens.saturating_sub(usage_before.output_tokens);
     let cache_read = usage_after.cache_read_tokens.saturating_sub(usage_before.cache_read_tokens);
     let cache_write = usage_after.cache_write_tokens.saturating_sub(usage_before.cache_write_tokens);
+    let tool_calls = usage_after.tool_calls.saturating_sub(usage_before.tool_calls);
+    // Collect tool names used in this pass (names in after but not in before)
+    let tool_names: Vec<String> = usage_after
+        .tool_names
+        .iter()
+        .filter(|n| !usage_before.tool_names.contains(n))
+        .cloned()
+        .collect();
     let now = chrono::Utc::now().to_rfc3339();
     let sk = format!("RUN#{run_id}#PASS#{pass_name}");
 
@@ -1698,11 +1756,19 @@ async fn write_pass_trace(
         .item("output_tokens", attr_n(output_tokens))
         .item("cache_read_tokens", attr_n(cache_read))
         .item("cache_write_tokens", attr_n(cache_write))
+        .item("tool_calls", attr_n(tool_calls))
         .item("timestamp", AttributeValue::S(now))
         .item(
             "ttl",
             attr_n(chrono::Utc::now().timestamp() as u64 + 30 * 86400),
         );
+
+    if !tool_names.is_empty() {
+        req = req.item(
+            "tool_names",
+            AttributeValue::L(tool_names.iter().map(|s| AttributeValue::S(s.clone())).collect()),
+        );
+    }
 
     if let Some(err) = error {
         req = req.item("error", AttributeValue::S(err.to_string()));

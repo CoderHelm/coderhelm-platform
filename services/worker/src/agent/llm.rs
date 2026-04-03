@@ -251,11 +251,15 @@ pub async fn converse(
         // Execute tools and build tool result message
         let mut tool_results = Vec::new();
         for tool_use in &tool_uses {
+            let tool_start = std::time::Instant::now();
             info!(tool = tool_use.name(), "Executing tool");
             let input: Value = document_to_json(tool_use.input());
 
             match tool_executor.execute(tool_use.name(), &input).await {
                 Ok(result) => {
+                    let duration_ms = tool_start.elapsed().as_millis() as u64;
+                    usage.record_tool_call(tool_use.name(), duration_ms);
+                    info!(tool = tool_use.name(), duration_ms, "Tool completed");
                     tool_results.push(ContentBlock::ToolResult(
                         aws_sdk_bedrockruntime::types::ToolResultBlock::builder()
                             .tool_use_id(tool_use.tool_use_id())
@@ -266,7 +270,9 @@ pub async fn converse(
                     ));
                 }
                 Err(e) => {
-                    warn!(tool = tool_use.name(), error = %e, "Tool execution failed");
+                    let duration_ms = tool_start.elapsed().as_millis() as u64;
+                    usage.record_tool_call(tool_use.name(), duration_ms);
+                    warn!(tool = tool_use.name(), error = %e, duration_ms, "Tool execution failed");
                     tool_results.push(ContentBlock::ToolResult(
                         aws_sdk_bedrockruntime::types::ToolResultBlock::builder()
                             .tool_use_id(tool_use.tool_use_id())
