@@ -40,7 +40,8 @@ pub struct EnableMfaRequest {
 pub struct VerifyMfaRequest {
     pub password: String,
     pub code: String,
-    pub session: String,
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 // ── Valid roles ──────────────────────────────────────────────────────
@@ -566,8 +567,10 @@ pub async fn mfa_verify_setup(
         .access_token(access_token)
         .user_code(&body.code);
 
-    if !body.session.is_empty() {
-        req = req.session(&body.session);
+    if let Some(ref session) = body.session {
+        if !session.is_empty() {
+            req = req.session(session);
+        }
     }
 
     req.send().await.map_err(|e| {
