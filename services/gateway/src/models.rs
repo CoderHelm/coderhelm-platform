@@ -251,8 +251,14 @@ pub struct Claims {
     pub role: String, // owner, admin, member, viewer
     #[serde(default)]
     pub github_login: Option<String>,
+    #[serde(default = "default_aud")]
+    pub aud: String,
     pub exp: u64,
     pub iat: u64,
+}
+
+fn default_aud() -> String {
+    "coderhelm-dashboard".to_string()
 }
 
 impl Claims {
@@ -371,12 +377,16 @@ mod tests {
         let c = Claims {
             sub: "user1".into(),
             team_id: "TEAM#1".into(),
-            github_login: "octocat".into(),
+            email: "user@example.com".into(),
+            role: "owner".into(),
+            github_login: Some("octocat".into()),
+            aud: "coderhelm-dashboard".into(),
             exp: 9999999999,
             iat: 1000000000,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: Claims = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.sub, "user1");
+        assert_eq!(parsed.aud, "coderhelm-dashboard");
     }
 }

@@ -721,7 +721,7 @@ pub async fn google_callback(
     };
 
     let cookie = format!(
-        "coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
     );
 
     Ok((
@@ -836,7 +836,7 @@ pub async fn github_callback(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let existing_claims = extract_cookie(cookie_header, "coderhelm_session")
+    let existing_claims = extract_cookie(cookie_header, "__Host-coderhelm_session")
         .and_then(|token| jwt::validate_token(token, &state.secrets.jwt_secret).ok());
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -911,7 +911,7 @@ pub async fn github_callback(
         };
 
         let cookie = format!(
-            "coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+            "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
         );
 
         return Ok((
@@ -1148,7 +1148,7 @@ pub async fn github_callback(
     };
 
     let cookie = format!(
-        "coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
     );
 
     Ok((
@@ -1165,7 +1165,7 @@ pub async fn github_callback(
 
 /// POST /auth/logout — Clear session cookie.
 pub async fn logout() -> impl IntoResponse {
-    let cookie = "coderhelm_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
+    let cookie = "__Host-coderhelm_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
     ([(header::SET_COOKIE, cookie.to_string())], StatusCode::OK)
 }
 
@@ -1356,7 +1356,7 @@ async fn issue_session_from_cognito(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let cookie = format!(
-        "coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
     );
 
     Ok((

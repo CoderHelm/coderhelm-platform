@@ -361,6 +361,36 @@ async fn main() -> Result<(), Error> {
             middleware::auth::require_auth,
         ));
 
+    // Webhook routes (public, verified by signature, rate-limited)
+    let webhook_routes = Router::new()
+        .route("/github", post(routes::github_webhook::handle))
+        .route("/jira/:token", post(routes::jira_webhook::handle))
+        .route("/jira", post(routes::jira_webhook::handle_forge))
+        .route("/stripe", post(routes::stripe_webhook::handle))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit::rate_limit_webhook,
+        ));
+
+    // Auth routes (public, rate-limited)
+    let auth_routes = Router::new()
+        .route("/signup", post(routes::auth::signup))
+        .route("/waitlist", post(routes::auth::join_waitlist))
+        .route("/login", post(routes::auth::login_email))
+        .route("/verify-email", post(routes::auth::verify_email))
+        .route("/forgot-password", post(routes::auth::forgot_password))
+        .route("/confirm-reset", post(routes::auth::confirm_reset))
+        .route("/mfa/verify", post(routes::auth::mfa_verify))
+        .route("/google", get(routes::auth::google_login))
+        .route("/google/callback", get(routes::auth::google_callback))
+        .route("/github", get(routes::auth::github_login))
+        .route("/github/callback", get(routes::auth::github_callback))
+        .route("/logout", post(routes::auth::logout))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit::rate_limit_auth,
+        ));
+
     let app = Router::new()
         // Root health/info
         .route(
@@ -369,28 +399,12 @@ async fn main() -> Result<(), Error> {
                 axum::Json(serde_json::json!({ "service": "coderhelm", "status": "ok" }))
             }),
         )
-        // Webhooks (public, verified by signature)
-        .route("/webhooks/github", post(routes::github_webhook::handle))
-        .route("/webhooks/jira/:token", post(routes::jira_webhook::handle))
-        .route("/webhooks/jira", post(routes::jira_webhook::handle_forge))
+        .nest("/webhooks", webhook_routes)
         .route(
             "/integrations/jira/forge-register",
             post(routes::api::forge_register_urls),
         )
-        .route("/webhooks/stripe", post(routes::stripe_webhook::handle))
-        // Auth (public)
-        .route("/auth/signup", post(routes::auth::signup))
-        .route("/auth/waitlist", post(routes::auth::join_waitlist))
-        .route("/auth/login", post(routes::auth::login_email))
-        .route("/auth/verify-email", post(routes::auth::verify_email))
-        .route("/auth/forgot-password", post(routes::auth::forgot_password))
-        .route("/auth/confirm-reset", post(routes::auth::confirm_reset))
-        .route("/auth/mfa/verify", post(routes::auth::mfa_verify))
-        .route("/auth/google", get(routes::auth::google_login))
-        .route("/auth/google/callback", get(routes::auth::google_callback))
-        .route("/auth/github", get(routes::auth::github_login))
-        .route("/auth/github/callback", get(routes::auth::github_callback))
-        .route("/auth/logout", post(routes::auth::logout))
+        .nest("/auth", auth_routes)
         // Nest protected routes under /api
         .nest("/api", api_routes)
         .layer(SetResponseHeaderLayer::overriding(

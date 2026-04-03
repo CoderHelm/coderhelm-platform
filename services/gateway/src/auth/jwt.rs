@@ -17,6 +17,7 @@ pub fn create_token(
         email: email.to_string(),
         role: role.to_string(),
         github_login: github_login.map(|s| s.to_string()),
+        aud: "coderhelm-dashboard".to_string(),
         iat: now,
         exp: now + ttl_secs,
     };
@@ -28,10 +29,12 @@ pub fn create_token(
 }
 
 pub fn validate_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
+    let mut validation = Validation::default();
+    validation.set_audience(&["coderhelm-dashboard"]);
     let token_data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
-        &Validation::default(),
+        &validation,
     )?;
     Ok(token_data.claims)
 }

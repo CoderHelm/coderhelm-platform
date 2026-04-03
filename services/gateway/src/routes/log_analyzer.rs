@@ -40,7 +40,10 @@ fn validate_role_arn(arn: &str) -> Result<&str, StatusCode> {
     if re.is_match(arn) {
         Ok(arn)
     } else {
-        warn!(role_arn = arn, "Invalid role ARN — must be CoderHelmLogReader");
+        warn!(
+            role_arn = arn,
+            "Invalid role ARN — must be CoderHelmLogReader"
+        );
         Err(StatusCode::BAD_REQUEST)
     }
 }

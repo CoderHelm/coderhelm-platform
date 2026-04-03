@@ -25,12 +25,39 @@ const s3 = new S3Client();
 const BUCKET = process.env.BUCKET_NAME || "";
 const TOOL_CACHE_PREFIX = "config/mcp-tools";
 
+// Allowlist of permitted npx packages — must match gateway and worker catalogs.
+const ALLOWED_PACKAGES = new Set([
+  "figma-developer-mcp",
+  "@sentry/mcp-server",
+  "@linear/mcp-server",
+  "@notionhq/notion-mcp-server",
+  "@vercel/mcp",
+  "@stripe/mcp",
+  "@cloudflare/mcp-server-cloudflare",
+  "@nicholasoxford/posthog-mcp",
+  "@anthropic-ai/gitlab-mcp-server",
+  "@neondatabase/mcp-server-neon",
+  "@tursodatabase/turso-mcp",
+  "snyk-mcp-server",
+  "@launchdarkly/mcp-server",
+  "mongodb-mcp-server",
+  "mcp-grafana",
+  "@redis/mcp-server",
+  "@anthropic-ai/upstash-mcp-server",
+]);
+
 export async function handler(event) {
   const { action, server_id, npx_package, env_vars, tool_name, tool_input } =
     typeof event === "string" ? JSON.parse(event) : event;
 
   if (!server_id || !npx_package) {
     return { statusCode: 400, error: "Missing server_id or npx_package" };
+  }
+
+  // Validate npx_package against allowlist to prevent arbitrary code execution
+  if (!ALLOWED_PACKAGES.has(npx_package)) {
+    console.error(`Blocked npx_package not in allowlist: ${npx_package}`);
+    return { statusCode: 403, error: "Package not permitted" };
   }
 
   // Build environment — inherit PATH/HOME for npx, add user credentials
@@ -126,7 +153,7 @@ export async function handler(event) {
     console.error(`MCP proxy error [${server_id}/${action}]:`, err);
     return {
       statusCode: 500,
-      error: err.message || "MCP proxy internal error",
+      error: "MCP proxy internal error",
     };
   } finally {
     try {
