@@ -393,11 +393,17 @@ async fn get_team(
         Some(i) => i,
     };
 
-    let install_id: u64 = item
+    let install_id: u64 = match item
         .get("github_install_id")
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
+    {
+        Some(id) if id > 0 => id,
+        _ => {
+            warn!(team_id, "No github_install_id found for team, skipping infra analyze");
+            return Ok(None);
+        }
+    };
 
     // Get repos from the repos table
     let repos_result = state

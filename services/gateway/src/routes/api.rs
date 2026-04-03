@@ -646,29 +646,20 @@ pub async fn retry_run(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Prefer stored installation_id; fall back to extracting from team_id (TEAM#<id>)
+    // Prefer stored installation_id; fall back to reading from team META
     let mut installation_id = item
         .get("installation_id")
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0);
     if installation_id == 0 {
-        installation_id = claims
-            .team_id
-            .strip_prefix("TEAM#")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+        installation_id = get_team_installation_id(&state, &claims.team_id).await?;
     }
     let issue_number = item
         .get("issue_number")
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0);
-
-    if installation_id == 0 {
-        error!("Cannot retry run {run_id}: unable to determine installation_id");
-        return Err(StatusCode::BAD_REQUEST);
-    }
 
     let ticket_source = item
         .get("ticket_source")
@@ -791,14 +782,7 @@ pub async fn re_review_run(
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0);
     if installation_id == 0 {
-        installation_id = claims
-            .team_id
-            .strip_prefix("TEAM#")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-    }
-    if installation_id == 0 {
-        return Err(StatusCode::BAD_REQUEST);
+        installation_id = get_team_installation_id(&state, &claims.team_id).await?;
     }
 
     let message = WorkerMessage::Feedback(FeedbackMessage {
@@ -1892,12 +1876,7 @@ pub async fn update_repo(
 
     // When enabling a repo, trigger onboarding to generate voice, instructions, etc.
     if enabled {
-        let installation_id = claims
-            .team_id
-            .strip_prefix("TEAM#")
-            .unwrap_or("0")
-            .parse::<u64>()
-            .unwrap_or(0);
+        let installation_id = get_team_installation_id(&state, &claims.team_id).await?;
 
         let message = WorkerMessage::Onboard(OnboardMessage {
             team_id: claims.team_id.clone(),
@@ -2281,6 +2260,37 @@ pub async fn update_notification_prefs(
 
 // ─── Instructions ───────────────────────────────────────────────────
 
+/// Look up the GitHub installation ID from the team's META record in the main table.
+async fn get_team_installation_id(
+    state: &AppState,
+    team_id: &str,
+) -> Result<u64, StatusCode> {
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s("META"))
+        .projection_expression("github_install_id")
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch team META for installation_id: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    result
+        .item()
+        .and_then(|i| i.get("github_install_id"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .filter(|&id| id > 0)
+        .ok_or_else(|| {
+            warn!(team_id, "No github_install_id found for team");
+            StatusCode::BAD_REQUEST
+        })
+}
+
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
 }
@@ -2631,12 +2641,7 @@ pub async fn regenerate_repo(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let installation_id = claims
-        .team_id
-        .strip_prefix("TEAM#")
-        .unwrap_or("0")
-        .parse::<u64>()
-        .unwrap_or(0);
+    let installation_id = get_team_installation_id(&state, &claims.team_id).await?;
 
     let message = WorkerMessage::Onboard(OnboardMessage {
         team_id: claims.team_id.clone(),
