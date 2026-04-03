@@ -517,13 +517,12 @@ async fn handle_installation(
             let org = payload["installation"]["account"]["login"]
                 .as_str()
                 .unwrap_or("unknown");
-            info!(
-                installation_id,
-                org, "GitHub App installed"
-            );
+            info!(installation_id, org, "GitHub App installed");
 
             // Check if a team is already linked (reinstall scenario)
-            let team_id = if let Some(tid) = resolve_team_by_installation(state, installation_id).await {
+            let team_id = if let Some(tid) =
+                resolve_team_by_installation(state, installation_id).await
+            {
                 Some(tid)
             } else {
                 // Try to auto-link: look up the installing user's github_id in the users table
@@ -535,10 +534,7 @@ async fn handle_installation(
                         .table_name(&state.config.users_table_name)
                         .index_name("gsi1")
                         .key_condition_expression("gsi1pk = :gpk")
-                        .expression_attribute_values(
-                            ":gpk",
-                            attr_s(&format!("GHUSER#{github_id}")),
-                        )
+                        .expression_attribute_values(":gpk", attr_s(&format!("GHUSER#{github_id}")))
                         .limit(1)
                         .send()
                         .await
@@ -685,7 +681,10 @@ async fn handle_installation(
                     .send()
                     .await;
 
-                info!(team_id, "GitHub installation unlinked from team (both tables)");
+                info!(
+                    team_id,
+                    "GitHub installation unlinked from team (both tables)"
+                );
             }
 
             Ok(StatusCode::OK)
