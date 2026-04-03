@@ -521,6 +521,27 @@ pub async fn handle_forge(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    // Resolve GitHub installation_id from team record if not provided by Forge
+    let installation_id = if installation_id == 0 {
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.teams_table_name)
+            .key("team_id", attr_s(&team_id))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item().cloned())
+            .and_then(|item| {
+                item.get("github_installation_id")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+    } else {
+        installation_id
+    };
+
     info!(team_id, installation_id, payload = %payload, "Forge Jira webhook received");
 
     process_jira_payload(&state, &team_id, installation_id, &payload).await
