@@ -400,7 +400,10 @@ async fn get_team(
     {
         Some(id) if id > 0 => id,
         _ => {
-            warn!(team_id, "No github_install_id found for team, skipping infra analyze");
+            warn!(
+                team_id,
+                "No github_install_id found for team, skipping infra analyze"
+            );
             return Ok(None);
         }
     };

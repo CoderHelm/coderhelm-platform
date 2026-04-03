@@ -2261,10 +2261,7 @@ pub async fn update_notification_prefs(
 // ─── Instructions ───────────────────────────────────────────────────
 
 /// Look up the GitHub installation ID from the team's META record in the main table.
-async fn get_team_installation_id(
-    state: &AppState,
-    team_id: &str,
-) -> Result<u64, StatusCode> {
+async fn get_team_installation_id(state: &AppState, team_id: &str) -> Result<u64, StatusCode> {
     let result = state
         .dynamo
         .get_item()
