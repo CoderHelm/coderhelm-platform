@@ -22,6 +22,7 @@ pub async fn run(
     branch: &str,
     rules: &[String],
     repo_instructions: &str,
+    review_feedback: Option<&str>,
     usage: &mut TokenUsage,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
@@ -33,6 +34,13 @@ pub async fn run(
         repo = msg.repo_name,
     );
 
+    let feedback_section = match review_feedback {
+        Some(fb) => format!(
+            "\n\n## Review Feedback (from previous cycle)\nThe reviewer found issues with the previous implementation. Fix ALL of the following:\n{fb}"
+        ),
+        None => String::new(),
+    };
+
     let prompt = format!(
         r#"Implement the following tasks for issue #{number}: {title}
 
@@ -43,7 +51,7 @@ pub async fn run(
 {design}
 
 ## Acceptance Criteria
-{spec}
+{spec}{feedback}
 
 ## Instructions
 - Implement each unchecked task (`- [ ]`) one at a time, in order.
@@ -58,6 +66,7 @@ pub async fn run(
         tasks = plan.tasks,
         design = plan.design,
         spec = plan.spec,
+        feedback = feedback_section,
     );
 
     let mut tools = all_tools();

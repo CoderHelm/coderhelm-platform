@@ -20,6 +20,8 @@ interface WorkerStackProps extends cdk.StackProps {
   infraTable: dynamodb.TableV2;
   billingTable: dynamodb.TableV2;
   mcpConfigsTable: dynamodb.TableV2;
+  tracesTable: dynamodb.TableV2;
+  checkpointsTable: dynamodb.TableV2;
   bucket: s3.Bucket;
   ticketQueue: sqs.Queue;
   ciFixQueue: sqs.Queue;
@@ -74,6 +76,8 @@ export class WorkerStack extends cdk.Stack {
         MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
         INFRA_TABLE_NAME: props.infraTable.tableName,
         BILLING_TABLE_NAME: props.billingTable.tableName,
+        TRACES_TABLE_NAME: props.tracesTable.tableName,
+        CHECKPOINTS_TABLE_NAME: props.checkpointsTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         MODEL_ID: process.env.MODEL_ID || "us.anthropic.claude-opus-4-6-v1",
@@ -103,6 +107,8 @@ export class WorkerStack extends cdk.Stack {
     props.mcpConfigsTable.grantReadData(this.workerFunction);
     props.infraTable.grantReadWriteData(this.workerFunction);
     props.billingTable.grantReadWriteData(this.workerFunction);
+    props.tracesTable.grantReadWriteData(this.workerFunction);
+    props.checkpointsTable.grantReadWriteData(this.workerFunction);
     props.bucket.grantReadWrite(this.workerFunction);
     secrets.grantRead(this.workerFunction);
 

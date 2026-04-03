@@ -6,6 +6,12 @@ use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
 use crate::WorkerState;
 
+/// Structured result from the review pass.
+pub struct ReviewResult {
+    pub passed: bool,
+    pub summary: String,
+}
+
 pub async fn run(
     state: &WorkerState,
     msg: &TicketMessage,
@@ -14,12 +20,13 @@ pub async fn run(
     rules: &[String],
     repo_instructions: &str,
     usage: &mut TokenUsage,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ReviewResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
     let instructions_block = super::format_instructions_block(repo_instructions);
     let system = format!(
         "You are a code review agent for the {owner}/{repo} repository. \
-         Review the diff for correctness, completeness, conventions, bugs, and security.{rules_block}{instructions_block}",
+         Review the diff for correctness, completeness, conventions, bugs, and security. \
+         You are READ-ONLY — you cannot modify files. Report issues for the implementation agent to fix.{rules_block}{instructions_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
@@ -40,17 +47,17 @@ Use the `get_diff` tool to see all changes compared to main. Then review for:
    - Features that silently stop working if a new env var / config is not set
    - Default behavior changes that could break production
 
-If you find issues:
-- Fix them using `write_file` or `batch_write`
+If you find issues, start your response with "ISSUES_FOUND:" followed by a detailed list of every issue with:
+- File path and line range
+- Description of the problem
+- Suggested fix
 
-If everything looks good, say "LGTM — no issues found."
-
-Output a brief summary of what you reviewed and any fixes applied."#,
+If everything looks good, start your response with "LGTM" followed by a brief summary."#,
         number = msg.issue_number,
         title = msg.title,
     );
 
-    // Reuse the same tool set as implement (read + write + diff)
+    // Read-only tool set — no write_file or batch_write
     let tools = review_tools();
     let executor = ReviewToolExecutor {
         github,
@@ -75,7 +82,12 @@ Output a brief summary of what you reviewed and any fixes applied."#,
     )
     .await?;
     info!("Review result: {}", &response[..response.len().min(200)]);
-    Ok(())
+
+    let passed = response.starts_with("LGTM") || !response.starts_with("ISSUES_FOUND:");
+    Ok(ReviewResult {
+        passed,
+        summary: response,
+    })
 }
 
 fn review_tools() -> Vec<ToolDefinition> {
@@ -129,43 +141,6 @@ fn review_tools() -> Vec<ToolDefinition> {
                     "query": {"type": "string", "description": "Search query"}
                 },
                 "required": ["query"]
-            }),
-        },
-        ToolDefinition {
-            name: "write_file".to_string(),
-            description: "Create or update a single file.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
-                    "message": {"type": "string"},
-                    "sha": {"type": "string"}
-                },
-                "required": ["path", "content", "message"]
-            }),
-        },
-        ToolDefinition {
-            name: "batch_write".to_string(),
-            description: "Atomically write multiple files in a single commit.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string"},
-                    "files": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string"},
-                                "content": {"type": "string"},
-                                "action": {"type": "string", "enum": ["write", "delete"]}
-                            },
-                            "required": ["path"]
-                        }
-                    }
-                },
-                "required": ["message", "files"]
             }),
         },
     ]
@@ -284,71 +259,6 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                     })
                     .collect();
                 Ok(json!(lines.join("\n---\n")))
-            }
-            "write_file" => {
-                let path = input
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .ok_or("Missing path")?;
-                let content = input
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .ok_or("Missing content")?;
-                let message = input
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .ok_or("Missing message")?;
-                let sha = input.get("sha").and_then(|v| v.as_str());
-                self.github
-                    .write_file(
-                        self.owner,
-                        self.repo,
-                        path,
-                        content,
-                        self.branch,
-                        message,
-                        sha,
-                    )
-                    .await?;
-                Ok(json!(format!("Wrote {path}")))
-            }
-            "batch_write" => {
-                let message = input
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .ok_or("Missing message")?;
-                let files_arr = input
-                    .get("files")
-                    .and_then(|v| v.as_array())
-                    .ok_or("Missing files")?;
-                let mut ops = Vec::new();
-                for f in files_arr {
-                    let path = f
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .ok_or("Missing file path")?;
-                    let action = f.get("action").and_then(|v| v.as_str()).unwrap_or("write");
-                    if action == "delete" {
-                        ops.push(crate::clients::github::FileOp::Delete {
-                            path: path.to_string(),
-                        });
-                    } else {
-                        let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                        ops.push(crate::clients::github::FileOp::Write {
-                            path: path.to_string(),
-                            content: content.to_string(),
-                        });
-                    }
-                }
-                let sha = self
-                    .github
-                    .batch_write(self.owner, self.repo, self.branch, message, &ops)
-                    .await?;
-                Ok(json!(format!(
-                    "Batch commit {} — {} files",
-                    &sha[..8],
-                    ops.len()
-                )))
             }
             _ => Err(format!("Unknown tool: {name}").into()),
         }

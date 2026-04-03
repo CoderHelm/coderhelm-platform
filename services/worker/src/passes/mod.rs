@@ -39,6 +39,7 @@ fn sanitize_error(msg: &str) -> String {
 
 pub mod ci_fix;
 pub mod feedback;
+pub mod formatter;
 mod implement;
 pub mod infra_analyze;
 pub mod onboard;
@@ -46,6 +47,8 @@ mod plan;
 pub mod plan_execute;
 mod pr;
 mod review;
+mod security;
+mod test;
 mod triage;
 
 /// Minimal MCP plugin catalog: (server_id, npx_package, env_mapping).
@@ -573,6 +576,30 @@ async fn run_passes(
         }
     }
 
+    // --- Plan Validation (deterministic, no LLM) ---
+    let plan_warnings = validate_plan(&plan_result, &github, &msg.repo_owner, &msg.repo_name, state, &msg.team_id).await;
+    if plan_warnings.blocked {
+        let warning_text = plan_warnings.warnings.join("\n");
+        let comment = format!(
+            "⚠️ **Plan validation failed**\n\n{warning_text}\n\nPlease narrow the scope and re-trigger."
+        );
+        if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+            let _ = github
+                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
+                .await;
+        } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+            let _ = post_jira_comment(
+                state, &msg.team_id, &msg.ticket_id, &warning_text, "scope_too_large", "Plan scope too large",
+            ).await;
+        }
+        return Err(format!("Plan validation blocked: {warning_text}").into());
+    }
+    if !plan_warnings.warnings.is_empty() {
+        for w in &plan_warnings.warnings {
+            warn!(run_id, warning = %w, "Plan validation warning");
+        }
+    }
+
     let impl_result = implement::run(
         state,
         msg,
@@ -581,6 +608,7 @@ async fn run_passes(
         &branch_name,
         &rules,
         &repo_instructions,
+        None,
         usage,
     )
     .await?;
@@ -650,22 +678,97 @@ async fn run_passes(
         warn!(run_id, error = %e, "Failed to update tasks.md with checked items");
     }
 
-    // --- Pass 4: Review ---
-    check_cancelled(state, &msg.team_id, run_id).await?;
-    update_pass(state, &msg.team_id, run_id, "review").await?;
-    review::run(
-        state,
-        msg,
-        &github,
-        &branch_name,
-        &rules,
-        &repo_instructions,
-        usage,
-    )
-    .await?;
-    info!(run_id, "Review complete");
+    // --- Pass 4: Test + Review loop (max 3 cycles) ---
+    let review_loop_enabled = load_workflow_setting(state, &msg.team_id, "review_loop").await;
+    let max_review_cycles: usize = if review_loop_enabled { 3 } else { 1 };
 
-    // --- Pass 5: Resolve conflicts with main ---
+    for cycle in 1..=max_review_cycles {
+        // Test gate: wait for CI if configured
+        check_cancelled(state, &msg.team_id, run_id).await?;
+        update_pass(state, &msg.team_id, run_id, "test").await?;
+        let test_result = test::run(state, msg, &github, &branch_name).await?;
+        if !test_result.passed {
+            info!(run_id, cycle, "CI failed, feeding back to implement");
+            if cycle < max_review_cycles {
+                check_cancelled(state, &msg.team_id, run_id).await?;
+                update_pass(state, &msg.team_id, run_id, "implement").await?;
+                let test_feedback = test_result.output.unwrap_or_default();
+                implement::run(
+                    state, msg, &github, &plan_result, &branch_name,
+                    &rules, &repo_instructions,
+                    Some(&format!("CI tests failed. Fix the failures:\n\n{test_feedback}")),
+                    usage,
+                ).await?;
+                continue; // Re-test on next cycle
+            }
+            warn!(run_id, "CI still failing after {max_review_cycles} cycles, proceeding");
+        }
+
+        // Review
+        check_cancelled(state, &msg.team_id, run_id).await?;
+        update_pass(state, &msg.team_id, run_id, "review").await?;
+        let review_result = review::run(
+            state,
+            msg,
+            &github,
+            &branch_name,
+            &rules,
+            &repo_instructions,
+            usage,
+        )
+        .await?;
+        info!(run_id, cycle, passed = review_result.passed, "Review cycle complete");
+
+        if review_result.passed || cycle == max_review_cycles {
+            break;
+        }
+
+        // Feed review issues back into implement
+        info!(run_id, cycle, "Re-implementing based on review feedback");
+        check_cancelled(state, &msg.team_id, run_id).await?;
+        update_pass(state, &msg.team_id, run_id, "implement").await?;
+        implement::run(
+            state,
+            msg,
+            &github,
+            &plan_result,
+            &branch_name,
+            &rules,
+            &repo_instructions,
+            Some(&review_result.summary),
+            usage,
+        )
+        .await?;
+    }
+
+    // --- Security Audit (after review loop, before PR) ---
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "security").await?;
+    let security_result = security::run(state, msg, &github, &branch_name, usage).await?;
+    info!(run_id, passed = security_result.passed, "Security audit complete");
+
+    if !security_result.passed {
+        // One remediation cycle: implement fixes, then re-audit
+        info!(run_id, "Security issues found, running remediation cycle");
+        check_cancelled(state, &msg.team_id, run_id).await?;
+        update_pass(state, &msg.team_id, run_id, "implement").await?;
+        implement::run(
+            state, msg, &github, &plan_result, &branch_name,
+            &rules, &repo_instructions,
+            Some(&format!("Security audit found vulnerabilities. Fix ALL of the following:\n\n{}", security_result.summary)),
+            usage,
+        ).await?;
+
+        // Re-audit once
+        check_cancelled(state, &msg.team_id, run_id).await?;
+        update_pass(state, &msg.team_id, run_id, "security").await?;
+        let retry = security::run(state, msg, &github, &branch_name, usage).await?;
+        if !retry.passed {
+            warn!(run_id, "Security issues remain after remediation, proceeding with PR");
+        }
+    }
+
+    // --- Resolve conflicts with main ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     match pr::resolve_conflicts(state, msg, &github, &branch_name, usage).await {
         Ok(true) => info!(run_id, "Resolved merge conflicts with main"),
@@ -1378,6 +1481,117 @@ pub(crate) async fn load_content(state: &WorkerState, team_id: &str, sk: &str) -
     }
 }
 
+struct PlanValidation {
+    warnings: Vec<String>,
+    blocked: bool,
+}
+
+/// Deterministic plan validation — catches bad plans before the expensive Implement pass.
+async fn validate_plan(
+    plan: &plan::PlanResult,
+    github: &GitHubClient,
+    repo_owner: &str,
+    repo_name: &str,
+    state: &WorkerState,
+    team_id: &str,
+) -> PlanValidation {
+    let mut warnings = Vec::new();
+    let mut blocked = false;
+
+    // Extract file paths from plan text (design + tasks)
+    let plan_text = format!("{}\n{}", plan.design, plan.tasks);
+    let file_re = regex::Regex::new(r"(?:^|[\s`\(])([a-zA-Z0-9_./\-]+\.\w{1,5})(?:[\s`\)\:]|$)")
+        .unwrap();
+    let known_extensions = [
+        "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "rb", "html", "css", "scss",
+        "json", "yaml", "yml", "toml", "md", "sql", "sh", "tf", "vue", "svelte",
+    ];
+    let mut mentioned_files: Vec<String> = file_re
+        .captures_iter(&plan_text)
+        .filter_map(|cap| {
+            let path = cap.get(1)?.as_str().to_string();
+            let ext = path.rsplit('.').next().unwrap_or("");
+            if known_extensions.contains(&ext) && path.contains('/') {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    mentioned_files.sort();
+    mentioned_files.dedup();
+
+    // 1. Scope check
+    let max_plan_files = load_workflow_setting_num(state, team_id, "max_plan_files")
+        .await
+        .unwrap_or(15)
+        .min(30) as usize;
+
+    if mentioned_files.len() > max_plan_files + 10 {
+        warnings.push(format!(
+            "This plan modifies {} files — exceeds the hard cap of {}. Please break into smaller tickets.",
+            mentioned_files.len(),
+            max_plan_files + 10,
+        ));
+        blocked = true;
+    } else if mentioned_files.len() > max_plan_files {
+        warnings.push(format!(
+            "This plan modifies {} files (limit: {}). Consider breaking into smaller tickets.",
+            mentioned_files.len(),
+            max_plan_files,
+        ));
+    }
+
+    // 2. File existence check (sample up to 10 files to avoid API spam)
+    if !mentioned_files.is_empty() {
+        let sample: Vec<&String> = mentioned_files.iter().take(10).collect();
+        let mut missing = Vec::new();
+        for path in &sample {
+            match github
+                .read_file(repo_owner, repo_name, path, "main")
+                .await
+            {
+                Ok(_) => {}
+                Err(_) => missing.push(path.to_string()),
+            }
+        }
+        let missing_pct = if sample.is_empty() {
+            0.0
+        } else {
+            missing.len() as f64 / sample.len() as f64
+        };
+        if missing_pct > 0.3 && missing.len() >= 2 {
+            warnings.push(format!(
+                "Warning: Plan references {} files that don't exist: {}. The plan may be hallucinating.",
+                missing.len(),
+                missing.join(", "),
+            ));
+        }
+    }
+
+    PlanValidation { warnings, blocked }
+}
+
+/// Load a numeric workflow setting from SETTINGS#WORKFLOW.
+async fn load_workflow_setting_num(state: &WorkerState, team_id: &str, key: &str) -> Option<u64> {
+    match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S("SETTINGS#WORKFLOW".to_string()))
+        .send()
+        .await
+    {
+        Ok(output) => output
+            .item()
+            .and_then(|item| item.get(key))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok()),
+        Err(_) => None,
+    }
+}
+
 /// Load a boolean workflow setting from SETTINGS#WORKFLOW. Returns default (true) if not found.
 async fn load_workflow_setting(state: &WorkerState, team_id: &str, key: &str) -> bool {
     match state
@@ -1422,4 +1636,120 @@ async fn is_subscription_allowed(state: &WorkerState, team_id: &str) -> bool {
         status.as_str(),
         "" | "none" | "active" | "free" | "trialing"
     )
+}
+
+/// Write a per-pass trace record to the traces table.
+async fn write_pass_trace(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    pass_name: &str,
+    start_time: std::time::Instant,
+    usage_before: &TokenUsage,
+    usage_after: &TokenUsage,
+    error: Option<&str>,
+) {
+    if state.config.traces_table_name.is_empty() {
+        return;
+    }
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+    let input_tokens = usage_after.input_tokens.saturating_sub(usage_before.input_tokens);
+    let output_tokens = usage_after.output_tokens.saturating_sub(usage_before.output_tokens);
+    let cache_read = usage_after.cache_read_tokens.saturating_sub(usage_before.cache_read_tokens);
+    let cache_write = usage_after.cache_write_tokens.saturating_sub(usage_before.cache_write_tokens);
+    let now = chrono::Utc::now().to_rfc3339();
+    let sk = format!("RUN#{run_id}#PASS#{pass_name}");
+
+    let mut req = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.traces_table_name)
+        .item("team_id", AttributeValue::S(team_id.to_string()))
+        .item("sk", AttributeValue::S(sk))
+        .item("pass", AttributeValue::S(pass_name.to_string()))
+        .item("duration_ms", attr_n(duration_ms))
+        .item("input_tokens", attr_n(input_tokens))
+        .item("output_tokens", attr_n(output_tokens))
+        .item("cache_read_tokens", attr_n(cache_read))
+        .item("cache_write_tokens", attr_n(cache_write))
+        .item("timestamp", AttributeValue::S(now))
+        .item(
+            "ttl",
+            attr_n(chrono::Utc::now().timestamp() as u64 + 30 * 86400),
+        );
+
+    if let Some(err) = error {
+        req = req.item("error", AttributeValue::S(err.to_string()));
+    }
+
+    if let Err(e) = req.send().await {
+        warn!(error = %e, "Failed to write pass trace for {pass_name}");
+    }
+}
+
+/// Save a checkpoint after a pass completes so runs can resume on Lambda timeout.
+async fn save_checkpoint(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    last_pass: &str,
+    branch: &str,
+    review_cycle: u8,
+    usage: &TokenUsage,
+) {
+    if state.config.checkpoints_table_name.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp() as u64;
+    let ttl = now + 7 * 86400; // 7 day TTL
+
+    if let Err(e) = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.checkpoints_table_name)
+        .item("team_id", AttributeValue::S(team_id.to_string()))
+        .item("sk", AttributeValue::S(format!("RUN#{run_id}")))
+        .item("last_pass", AttributeValue::S(last_pass.to_string()))
+        .item("branch", AttributeValue::S(branch.to_string()))
+        .item("review_cycle", attr_n(review_cycle as u64))
+        .item("tokens_in", attr_n(usage.input_tokens))
+        .item("tokens_out", attr_n(usage.output_tokens))
+        .item("cache_read", attr_n(usage.cache_read_tokens))
+        .item("cache_write", attr_n(usage.cache_write_tokens))
+        .item("updated_at", attr_n(now))
+        .item("ttl", attr_n(ttl))
+        .send()
+        .await
+    {
+        warn!(error = %e, "Failed to save checkpoint after {last_pass}");
+    }
+}
+
+/// Load an existing checkpoint for a run (if any).
+async fn load_checkpoint(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+) -> Option<(String, String, u8)> {
+    if state.config.checkpoints_table_name.is_empty() {
+        return None;
+    }
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.checkpoints_table_name)
+        .key("team_id", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(format!("RUN#{run_id}")))
+        .send()
+        .await
+        .ok()?;
+    let item = result.item()?;
+    let last_pass = item.get("last_pass")?.as_s().ok()?.clone();
+    let branch = item.get("branch")?.as_s().ok()?.clone();
+    let review_cycle = item
+        .get("review_cycle")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u8>().ok())
+        .unwrap_or(0);
+    Some((last_pass, branch, review_cycle))
 }

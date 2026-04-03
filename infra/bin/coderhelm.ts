@@ -65,6 +65,8 @@ const worker = new WorkerStack(app, `${prefix}-worker`, {
   infraTable: database.infraTable,
   billingTable: database.billingTable,
   mcpConfigsTable: database.mcpConfigsTable,
+  tracesTable: database.tracesTable,
+  checkpointsTable: database.checkpointsTable,
   bucket: storage.bucket,
   ticketQueue: api.ticketQueue,
   ciFixQueue: api.ciFixQueue,

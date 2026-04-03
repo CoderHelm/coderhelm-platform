@@ -723,6 +723,18 @@ impl GitHubClient {
         Ok(resp.text().await?)
     }
 
+    /// List check runs for a git ref (branch name or SHA).
+    pub async fn list_check_runs_for_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url =
+            format!("{API_BASE}/repos/{owner}/{repo}/commits/{git_ref}/check-runs?per_page=100");
+        self.get(&url).await
+    }
+
     /// List pull requests (state: "open", "closed", "all").
     pub async fn list_pull_requests(
         &self,

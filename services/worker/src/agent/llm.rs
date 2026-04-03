@@ -172,6 +172,24 @@ pub async fn converse(
                 u.cache_read_input_tokens().unwrap_or(0) as u64,
                 u.cache_write_input_tokens().unwrap_or(0) as u64,
             );
+
+            // Context intelligence: tiered compaction based on actual input tokens
+            let input_tokens = u.input_tokens() as u64;
+            let model_limit: u64 = 200_000;
+            let context_pct = input_tokens as f64 / model_limit as f64;
+
+            if context_pct > 0.90 {
+                // Tier 3: Emergency — clear all tool results except last 3 turns
+                info!("Context at {:.0}%, emergency compaction (clearing all but last 3 turns)", context_pct * 100.0);
+                clear_old_tool_results(messages, 3);
+            } else if context_pct > 0.75 {
+                // Tier 2: Aggressive — clear tool results older than last 5 turns
+                info!("Context at {:.0}%, clearing old tool results (keeping last 5 turns)", context_pct * 100.0);
+                clear_old_tool_results(messages, 5);
+            } else if context_pct > 0.60 {
+                // Tier 1: Gentle — clear tool results older than last 8 turns
+                clear_old_tool_results(messages, 8);
+            }
         }
 
         let output = response.output().ok_or("No output from Bedrock")?;
@@ -251,6 +269,58 @@ pub async fn converse(
                 .set_content(Some(tool_results))
                 .build()?,
         );
+    }
+}
+
+/// Replace tool result content with a placeholder for messages older than `keep_last` turns.
+/// Preserves tool use blocks (names + inputs) but drops the full output text to reclaim context.
+fn clear_old_tool_results(messages: &mut [Message], keep_last: usize) {
+    let total = messages.len();
+    if total <= keep_last * 2 {
+        return; // Not enough messages to compact
+    }
+    let cutoff = total.saturating_sub(keep_last * 2); // Each tool turn = 2 messages (assistant + user)
+
+    for msg in messages[..cutoff].iter_mut() {
+        if msg.role() != &ConversationRole::User {
+            continue;
+        }
+        let mut new_content = Vec::new();
+        let mut modified = false;
+        for block in msg.content() {
+            match block {
+                ContentBlock::ToolResult(tr) => {
+                    // Replace large tool results with placeholder
+                    let text_len: usize = tr.content().iter().map(|c| {
+                        match c {
+                            aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(t) => t.len(),
+                            _ => 0,
+                        }
+                    }).sum();
+                    if text_len > 200 {
+                        let placeholder = aws_sdk_bedrockruntime::types::ToolResultBlock::builder()
+                            .tool_use_id(tr.tool_use_id())
+                            .content(aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(
+                                "[Tool result cleared — see recent context]".to_string(),
+                            ))
+                            .build()
+                            .unwrap();
+                        new_content.push(ContentBlock::ToolResult(placeholder));
+                        modified = true;
+                    } else {
+                        new_content.push(block.clone());
+                    }
+                }
+                _ => new_content.push(block.clone()),
+            }
+        }
+        if modified {
+            *msg = Message::builder()
+                .role(ConversationRole::User)
+                .set_content(Some(new_content))
+                .build()
+                .unwrap();
+        }
     }
 }
 

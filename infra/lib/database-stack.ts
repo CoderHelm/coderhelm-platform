@@ -25,6 +25,8 @@ export class DatabaseStack extends cdk.Stack {
   public readonly bannersTable: dynamodb.TableV2;
   public readonly mcpConfigsTable: dynamodb.TableV2;
   public readonly waitlistTable: dynamodb.TableV2;
+  public readonly tracesTable: dynamodb.TableV2;
+  public readonly checkpointsTable: dynamodb.TableV2;
   public readonly encryptionKey: kms.Key;
 
   constructor(scope: Construct, id: string, props: DatabaseStackProps) {
@@ -466,6 +468,40 @@ export class DatabaseStack extends cdk.Stack {
       timeToLiveAttribute: "expires_at",
     });
 
+    // ──────────────────────────────────────────────
+    // Traces table: per-pass observability traces
+    // PK = team_id, SK = RUN#{run_id}#PASS#{pass}
+    // TTL: 30 days
+    // ──────────────────────────────────────────────
+    this.tracesTable = new dynamodb.TableV2(this, "TracesTable", {
+      tableName: `coderhelm-${props.stage}-traces`,
+      partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      timeToLiveAttribute: "ttl",
+    });
+
+    // ──────────────────────────────────────────────
+    // Checkpoints table: pipeline resume state
+    // PK = team_id, SK = RUN#{run_id}
+    // TTL: 7 days
+    // ──────────────────────────────────────────────
+    this.checkpointsTable = new dynamodb.TableV2(this, "CheckpointsTable", {
+      tableName: `coderhelm-${props.stage}-checkpoints`,
+      partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      timeToLiveAttribute: "ttl",
+    });
+
     // Outputs
     new cdk.CfnOutput(this, "TableName", { value: this.table.tableName });
     new cdk.CfnOutput(this, "TableArn", { value: this.table.tableArn });
@@ -516,6 +552,12 @@ export class DatabaseStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, "WaitlistTableName", {
       value: this.waitlistTable.tableName,
+    });
+    new cdk.CfnOutput(this, "TracesTableName", {
+      value: this.tracesTable.tableName,
+    });
+    new cdk.CfnOutput(this, "CheckpointsTableName", {
+      value: this.checkpointsTable.tableName,
     });
   }
 }
