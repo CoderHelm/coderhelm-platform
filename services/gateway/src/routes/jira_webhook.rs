@@ -398,6 +398,29 @@ async fn process_jira_payload(
         return Ok(StatusCode::OK);
     }
 
+    // Atomic dedup: write a short-lived lock to prevent duplicate SQS sends
+    // when Forge fires the same event twice in quick succession.
+    let dedup_key = format!("DEDUP#jira#{ticket_key}");
+    let dedup_ttl = (chrono::Utc::now() + chrono::Duration::minutes(5))
+        .timestamp()
+        .to_string();
+    let dedup_result = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.jira_events_table_name)
+        .item("team_id", attr_s(team_id))
+        .item("event_id", attr_s(&dedup_key))
+        .item("expires_at", aws_sdk_dynamodb::types::AttributeValue::N(dedup_ttl))
+        .condition_expression("attribute_not_exists(team_id)")
+        .send()
+        .await;
+
+    if dedup_result.is_err() {
+        info!(ticket_key, "Skipping — duplicate Forge event (dedup lock exists)");
+        log_jira_event(state, team_id, event_type, ticket_key, &title, "duplicate", None).await;
+        return Ok(StatusCode::OK);
+    }
+
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: team_id.to_string(),
         installation_id,
