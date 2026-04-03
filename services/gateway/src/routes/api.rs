@@ -1122,7 +1122,6 @@ pub async fn get_jira_integration_check(
     // Load per-team JIRA secret from DynamoDB
     let team_secret = load_jira_secret(&state, &claims.team_id).await;
     let secret_configured = team_secret.is_some() || state.secrets.jira_webhook_secret.is_some();
-    let ready = secret_configured && enabled_repo_count > 0;
 
     // Load installation_id from team META
     let meta_result = state
@@ -1164,6 +1163,15 @@ pub async fn get_jira_integration_check(
         .and_then(|item| item.get("forge_secret"))
         .and_then(|v| v.as_s().ok())
         .map(|s| s.to_string());
+
+    // Forge app is connected if it has registered its trigger URLs
+    let forge_connected = jira_config
+        .as_ref()
+        .and_then(|item| item.get("add_comment_url"))
+        .and_then(|v| v.as_s().ok())
+        .is_some();
+
+    let ready = (secret_configured || forge_connected) && enabled_repo_count > 0;
 
     let forge_secret = match forge_secret {
         Some(s) => s,

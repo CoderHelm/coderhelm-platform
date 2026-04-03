@@ -331,6 +331,14 @@ export class ApiStack extends cdk.Stack {
     dlq.grantConsumeMessages(this.gatewayFunction);
     secrets.grantRead(this.gatewayFunction);
 
+    // STS AssumeRole — gateway validates customer IAM roles on AWS connection setup
+    this.gatewayFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["sts:AssumeRole"],
+        resources: ["arn:aws:iam::*:role/CoderHelmLogReader"],
+      })
+    );
+
     // Bedrock access for plan chat
     this.gatewayFunction.addToRolePolicy(
       new iam.PolicyStatement({
