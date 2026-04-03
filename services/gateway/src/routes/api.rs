@@ -62,6 +62,23 @@ pub async fn me(
         "email"
     };
 
+    // Check MFA status from Cognito (only for email users)
+    let mfa_enabled = if auth_provider == "email" {
+        state
+            .cognito
+            .admin_get_user()
+            .user_pool_id(&state.config.cognito_user_pool_id)
+            .username(&claims.email)
+            .send()
+            .await
+            .ok()
+            .and_then(|u| u.user_mfa_setting_list)
+            .map(|list| list.iter().any(|s| s == "SOFTWARE_TOKEN_MFA"))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     Ok(Json(json!({
         "user_id": claims.sub,
         "team_id": claims.team_id,
@@ -71,6 +88,7 @@ pub async fn me(
         "role": item.get("role").and_then(|v| v.as_s().ok()).unwrap_or(&claims.role),
         "status": team_status,
         "auth_provider": auth_provider,
+        "mfa_enabled": mfa_enabled,
     })))
 }
 

@@ -498,21 +498,24 @@ pub async fn mfa_setup(
             StatusCode::UNAUTHORIZED
         })?;
 
-    let access_token = auth_result
-        .authentication_result()
-        .and_then(|r| r.access_token())
-        .ok_or_else(|| {
-            error!(
-                "MFA setup: no access_token in auth result, challenge={:?}",
-                auth_result.challenge_name()
+    // If Cognito returns a challenge (e.g. SOFTWARE_TOKEN_MFA), user already has MFA enabled
+    let access_token = match auth_result.authentication_result().and_then(|r| r.access_token()) {
+        Some(token) => token.to_string(),
+        None => {
+            // User already has MFA enabled — return 409 Conflict
+            info!(
+                email = %claims.email,
+                challenge = ?auth_result.challenge_name(),
+                "MFA setup: user already has MFA enabled"
             );
-            StatusCode::UNAUTHORIZED
-        })?;
+            return Err(StatusCode::CONFLICT);
+        }
+    };
 
     let result = state
         .cognito
         .associate_software_token()
-        .access_token(access_token)
+        .access_token(&access_token)
         .send()
         .await
         .map_err(|e| {
@@ -561,22 +564,26 @@ pub async fn mfa_verify_setup(
             StatusCode::UNAUTHORIZED
         })?;
 
-    let access_token = auth_result
+    let access_token = match auth_result
         .authentication_result()
         .and_then(|r| r.access_token())
-        .ok_or_else(|| {
-            error!(
-                "MFA verify: no access_token in auth result, challenge={:?}",
-                auth_result.challenge_name()
+    {
+        Some(token) => token.to_string(),
+        None => {
+            info!(
+                email = %claims.email,
+                challenge = ?auth_result.challenge_name(),
+                "MFA verify: user already has MFA, cannot re-setup"
             );
-            StatusCode::UNAUTHORIZED
-        })?;
+            return Err(StatusCode::CONFLICT);
+        }
+    };
 
     // Verify the TOTP token
     let mut req = state
         .cognito
         .verify_software_token()
-        .access_token(access_token)
+        .access_token(&access_token)
         .user_code(&body.code);
 
     if let Some(ref session) = body.session {
