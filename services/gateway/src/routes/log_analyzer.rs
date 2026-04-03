@@ -250,7 +250,7 @@ pub async fn update_connection(
     }
 
     update.send().await.map_err(|e| {
-        error!("Failed to update AWS connection: {e}");
+        error!("Failed to update AWS connection: {e:?}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 

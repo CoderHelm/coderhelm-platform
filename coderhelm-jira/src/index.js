@@ -14,14 +14,32 @@ exports.handler = async (event, context) => {
     return;
   }
 
-  // Handle comment events — forward to gateway as a comment webhook
-  if (eventType.includes("comment") && event.comment) {
-    const comment = event.comment;
-    // Fetch comment author to skip bot comments
-    let authorName = "";
-    if (comment.author && comment.author.accountId) {
-      authorName = comment.author.displayName || comment.author.accountId;
+  // Handle comment events — Forge payloads don't include comment data,
+  // so we fetch the latest comment via REST API
+  if (eventType.includes("comment")) {
+    let comment;
+    try {
+      const res = await api
+        .asApp()
+        .requestJira(route`/rest/api/3/issue/${issue.id}/comment?orderBy=-created&maxResults=1`);
+      if (res.ok) {
+        const data = await res.json();
+        comment = (data.comments || [])[0];
+      } else {
+        console.log(`Failed to fetch comments for ${issue.key}: ${res.status}`);
+        return;
+      }
+    } catch (e) {
+      console.log(`Error fetching comments for ${issue.key}: ${e.message}`);
+      return;
     }
+
+    if (!comment) {
+      console.log(`No comments found on ${issue.key}`);
+      return;
+    }
+
+    const authorName = (comment.author && (comment.author.displayName || comment.author.accountId)) || "";
 
     // Skip comments by the app itself to avoid loops
     if (authorName.toLowerCase().includes("coderhelm")) {
