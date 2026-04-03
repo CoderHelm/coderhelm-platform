@@ -117,10 +117,7 @@ pub async fn run(
         }
 
         let output = failures.join("\n\n---\n\n");
-        info!(
-            failed_checks = failures.len(),
-            "CI checks failed"
-        );
+        info!(failed_checks = failures.len(), "CI checks failed");
         return Ok(TestResult {
             passed: false,
             output: Some(output),

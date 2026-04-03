@@ -43,12 +43,7 @@ pub async fn format_with_voice(
         Ok(response) => {
             // Track usage
             if let Some(u) = response.usage() {
-                usage.add(
-                    u.input_tokens() as u64,
-                    u.output_tokens() as u64,
-                    0,
-                    0,
-                );
+                usage.add(u.input_tokens() as u64, u.output_tokens() as u64, 0, 0);
             }
             // Extract text from response
             response

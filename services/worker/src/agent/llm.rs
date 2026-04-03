@@ -198,11 +198,17 @@ pub async fn converse(
 
             if context_pct > 0.90 {
                 // Tier 3: Emergency — clear all tool results except last 3 turns
-                info!("Context at {:.0}%, emergency compaction (clearing all but last 3 turns)", context_pct * 100.0);
+                info!(
+                    "Context at {:.0}%, emergency compaction (clearing all but last 3 turns)",
+                    context_pct * 100.0
+                );
                 clear_old_tool_results(messages, 3);
             } else if context_pct > 0.75 {
                 // Tier 2: Aggressive — clear tool results older than last 5 turns
-                info!("Context at {:.0}%, clearing old tool results (keeping last 5 turns)", context_pct * 100.0);
+                info!(
+                    "Context at {:.0}%, clearing old tool results (keeping last 5 turns)",
+                    context_pct * 100.0
+                );
                 clear_old_tool_results(messages, 5);
             } else if context_pct > 0.60 {
                 // Tier 1: Gentle — clear tool results older than last 8 turns
@@ -315,12 +321,16 @@ fn clear_old_tool_results(messages: &mut [Message], keep_last: usize) {
             match block {
                 ContentBlock::ToolResult(tr) => {
                     // Replace large tool results with placeholder
-                    let text_len: usize = tr.content().iter().map(|c| {
-                        match c {
-                            aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(t) => t.len(),
+                    let text_len: usize = tr
+                        .content()
+                        .iter()
+                        .map(|c| match c {
+                            aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(t) => {
+                                t.len()
+                            }
                             _ => 0,
-                        }
-                    }).sum();
+                        })
+                        .sum();
                     if text_len > 200 {
                         let placeholder = aws_sdk_bedrockruntime::types::ToolResultBlock::builder()
                             .tool_use_id(tr.tool_use_id())

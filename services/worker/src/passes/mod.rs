@@ -341,7 +341,17 @@ async fn run_passes(
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
     let triage_result = triage::run(state, msg, &github, usage).await?;
-    write_pass_trace(state, &msg.team_id, run_id, "triage", pass_start, &usage_before, usage, None).await;
+    write_pass_trace(
+        state,
+        &msg.team_id,
+        run_id,
+        "triage",
+        pass_start,
+        &usage_before,
+        usage,
+        None,
+    )
+    .await;
     save_checkpoint(state, &msg.team_id, run_id, "triage", "", 0, usage).await;
     info!(run_id, "Triage complete");
 
@@ -351,7 +361,17 @@ async fn run_passes(
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
     let plan_result = plan::run(state, msg, &github, &triage_result, usage).await?;
-    write_pass_trace(state, &msg.team_id, run_id, "plan", pass_start, &usage_before, usage, None).await;
+    write_pass_trace(
+        state,
+        &msg.team_id,
+        run_id,
+        "plan",
+        pass_start,
+        &usage_before,
+        usage,
+        None,
+    )
+    .await;
     save_checkpoint(state, &msg.team_id, run_id, "plan", "", 0, usage).await;
     info!(run_id, "Plan complete");
 
@@ -581,7 +601,11 @@ async fn run_passes(
             })
             .unwrap_or_default();
 
-        info!(run_id, files = files_modified.len(), "Reconstructed files_modified from branch diff");
+        info!(
+            run_id,
+            files = files_modified.len(),
+            "Reconstructed files_modified from branch diff"
+        );
         implement::ImplementResult { files_modified }
     } else {
         check_cancelled(state, &msg.team_id, run_id).await?;
@@ -628,7 +652,15 @@ async fn run_passes(
         }
 
         // --- Plan Validation (deterministic, no LLM) ---
-        let plan_warnings = validate_plan(&plan_result, &github, &msg.repo_owner, &msg.repo_name, state, &msg.team_id).await;
+        let plan_warnings = validate_plan(
+            &plan_result,
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            state,
+            &msg.team_id,
+        )
+        .await;
         if plan_warnings.blocked {
             let warning_text = plan_warnings.warnings.join("\n");
             let comment = format!(
@@ -636,12 +668,23 @@ async fn run_passes(
             );
             if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
                 let _ = github
-                    .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
+                    .create_issue_comment(
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        msg.issue_number,
+                        &comment,
+                    )
                     .await;
             } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
                 let _ = post_jira_comment(
-                    state, &msg.team_id, &msg.ticket_id, &warning_text, "scope_too_large", "Plan scope too large",
-                ).await;
+                    state,
+                    &msg.team_id,
+                    &msg.ticket_id,
+                    &warning_text,
+                    "scope_too_large",
+                    "Plan scope too large",
+                )
+                .await;
             }
             return Err(format!("Plan validation blocked: {warning_text}").into());
         }
@@ -665,8 +708,27 @@ async fn run_passes(
             usage,
         )
         .await?;
-        write_pass_trace(state, &msg.team_id, run_id, "implement", pass_start, &usage_before, usage, None).await;
-        save_checkpoint(state, &msg.team_id, run_id, "implement", &branch_name, 0, usage).await;
+        write_pass_trace(
+            state,
+            &msg.team_id,
+            run_id,
+            "implement",
+            pass_start,
+            &usage_before,
+            usage,
+            None,
+        )
+        .await;
+        save_checkpoint(
+            state,
+            &msg.team_id,
+            run_id,
+            "implement",
+            &branch_name,
+            0,
+            usage,
+        )
+        .await;
         info!(
             run_id,
             files = result.files_modified.len(),
@@ -682,7 +744,8 @@ async fn run_passes(
                  - What is the expected behavior vs. current behavior?\n\
                  - Any relevant code snippets or error messages?\n\n\
                  Please add more context and I'll try again.";
-            let clarification = formatter::format_with_voice(state, &voice, raw_clarification, usage).await;
+            let clarification =
+                formatter::format_with_voice(state, &voice, raw_clarification, usage).await;
             if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
                 if let Err(e) = github
                     .create_issue_comment(
@@ -748,7 +811,17 @@ async fn run_passes(
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
         let test_result = test::run(state, msg, &github, &branch_name).await?;
-        write_pass_trace(state, &msg.team_id, run_id, &format!("test:{cycle}"), pass_start, &usage_before, usage, None).await;
+        write_pass_trace(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!("test:{cycle}"),
+            pass_start,
+            &usage_before,
+            usage,
+            None,
+        )
+        .await;
         if !test_result.passed {
             info!(run_id, cycle, "CI failed, feeding back to implement");
             if cycle < max_review_cycles {
@@ -756,14 +829,25 @@ async fn run_passes(
                 update_pass(state, &msg.team_id, run_id, "implement").await?;
                 let test_feedback = test_result.output.unwrap_or_default();
                 implement::run(
-                    state, msg, &github, &plan_result, &branch_name,
-                    &rules, &repo_instructions,
-                    Some(&format!("CI tests failed. Fix the failures:\n\n{test_feedback}")),
+                    state,
+                    msg,
+                    &github,
+                    &plan_result,
+                    &branch_name,
+                    &rules,
+                    &repo_instructions,
+                    Some(&format!(
+                        "CI tests failed. Fix the failures:\n\n{test_feedback}"
+                    )),
                     usage,
-                ).await?;
+                )
+                .await?;
                 continue; // Re-test on next cycle
             }
-            warn!(run_id, "CI still failing after {max_review_cycles} cycles, proceeding");
+            warn!(
+                run_id,
+                "CI still failing after {max_review_cycles} cycles, proceeding"
+            );
         }
 
         // Review
@@ -781,9 +865,33 @@ async fn run_passes(
             usage,
         )
         .await?;
-        write_pass_trace(state, &msg.team_id, run_id, &format!("review:{cycle}"), pass_start, &usage_before, usage, None).await;
-        save_checkpoint(state, &msg.team_id, run_id, "review", &branch_name, cycle as u8, usage).await;
-        info!(run_id, cycle, passed = review_result.passed, "Review cycle complete");
+        write_pass_trace(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!("review:{cycle}"),
+            pass_start,
+            &usage_before,
+            usage,
+            None,
+        )
+        .await;
+        save_checkpoint(
+            state,
+            &msg.team_id,
+            run_id,
+            "review",
+            &branch_name,
+            cycle as u8,
+            usage,
+        )
+        .await;
+        info!(
+            run_id,
+            cycle,
+            passed = review_result.passed,
+            "Review cycle complete"
+        );
 
         if review_result.passed || cycle == max_review_cycles {
             break;
@@ -813,9 +921,32 @@ async fn run_passes(
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
     let security_result = security::run(state, msg, &github, &branch_name, usage).await?;
-    write_pass_trace(state, &msg.team_id, run_id, "security", pass_start, &usage_before, usage, None).await;
-    save_checkpoint(state, &msg.team_id, run_id, "security", &branch_name, 0, usage).await;
-    info!(run_id, passed = security_result.passed, "Security audit complete");
+    write_pass_trace(
+        state,
+        &msg.team_id,
+        run_id,
+        "security",
+        pass_start,
+        &usage_before,
+        usage,
+        None,
+    )
+    .await;
+    save_checkpoint(
+        state,
+        &msg.team_id,
+        run_id,
+        "security",
+        &branch_name,
+        0,
+        usage,
+    )
+    .await;
+    info!(
+        run_id,
+        passed = security_result.passed,
+        "Security audit complete"
+    );
 
     if !security_result.passed {
         // One remediation cycle: implement fixes, then re-audit
@@ -823,18 +954,30 @@ async fn run_passes(
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "implement").await?;
         implement::run(
-            state, msg, &github, &plan_result, &branch_name,
-            &rules, &repo_instructions,
-            Some(&format!("Security audit found vulnerabilities. Fix ALL of the following:\n\n{}", security_result.summary)),
+            state,
+            msg,
+            &github,
+            &plan_result,
+            &branch_name,
+            &rules,
+            &repo_instructions,
+            Some(&format!(
+                "Security audit found vulnerabilities. Fix ALL of the following:\n\n{}",
+                security_result.summary
+            )),
             usage,
-        ).await?;
+        )
+        .await?;
 
         // Re-audit once
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "security").await?;
         let retry = security::run(state, msg, &github, &branch_name, usage).await?;
         if !retry.passed {
-            warn!(run_id, "Security issues remain after remediation, proceeding with PR");
+            warn!(
+                run_id,
+                "Security issues remain after remediation, proceeding with PR"
+            );
         }
     }
 
@@ -861,7 +1004,17 @@ async fn run_passes(
         usage,
     )
     .await?;
-    write_pass_trace(state, &msg.team_id, run_id, "pr", pass_start, &usage_before, usage, None).await;
+    write_pass_trace(
+        state,
+        &msg.team_id,
+        run_id,
+        "pr",
+        pass_start,
+        &usage_before,
+        usage,
+        None,
+    )
+    .await;
     info!(run_id, pr_url = %pr_result.pr_url, "PR created");
 
     // Update run record with final state
@@ -888,12 +1041,7 @@ async fn run_passes(
         );
         let comment = formatter::format_with_voice(state, &voice, &raw_comment, usage).await;
         github
-            .create_issue_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.issue_number,
-                &comment,
-            )
+            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
             .await?;
     } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
         let raw_comment = format!(
@@ -1576,11 +1724,11 @@ async fn validate_plan(
 
     // Extract file paths from plan text (design + tasks)
     let plan_text = format!("{}\n{}", plan.design, plan.tasks);
-    let file_re = regex::Regex::new(r"(?:^|[\s`\(])([a-zA-Z0-9_./\-]+\.\w{1,5})(?:[\s`\)\:]|$)")
-        .unwrap();
+    let file_re =
+        regex::Regex::new(r"(?:^|[\s`\(])([a-zA-Z0-9_./\-]+\.\w{1,5})(?:[\s`\)\:]|$)").unwrap();
     let known_extensions = [
-        "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "rb", "html", "css", "scss",
-        "json", "yaml", "yml", "toml", "md", "sql", "sh", "tf", "vue", "svelte",
+        "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "rb", "html", "css", "scss", "json",
+        "yaml", "yml", "toml", "md", "sql", "sh", "tf", "vue", "svelte",
     ];
     let mut mentioned_files: Vec<String> = file_re
         .captures_iter(&plan_text)
@@ -1623,10 +1771,7 @@ async fn validate_plan(
         let sample: Vec<&String> = mentioned_files.iter().take(10).collect();
         let mut missing = Vec::new();
         for path in &sample {
-            match github
-                .read_file(repo_owner, repo_name, path, "main")
-                .await
-            {
+            match github.read_file(repo_owner, repo_name, path, "main").await {
                 Ok(_) => {}
                 Err(_) => missing.push(path.to_string()),
             }
@@ -1729,11 +1874,21 @@ async fn write_pass_trace(
         return;
     }
     let duration_ms = start_time.elapsed().as_millis() as u64;
-    let input_tokens = usage_after.input_tokens.saturating_sub(usage_before.input_tokens);
-    let output_tokens = usage_after.output_tokens.saturating_sub(usage_before.output_tokens);
-    let cache_read = usage_after.cache_read_tokens.saturating_sub(usage_before.cache_read_tokens);
-    let cache_write = usage_after.cache_write_tokens.saturating_sub(usage_before.cache_write_tokens);
-    let tool_calls = usage_after.tool_calls.saturating_sub(usage_before.tool_calls);
+    let input_tokens = usage_after
+        .input_tokens
+        .saturating_sub(usage_before.input_tokens);
+    let output_tokens = usage_after
+        .output_tokens
+        .saturating_sub(usage_before.output_tokens);
+    let cache_read = usage_after
+        .cache_read_tokens
+        .saturating_sub(usage_before.cache_read_tokens);
+    let cache_write = usage_after
+        .cache_write_tokens
+        .saturating_sub(usage_before.cache_write_tokens);
+    let tool_calls = usage_after
+        .tool_calls
+        .saturating_sub(usage_before.tool_calls);
     // Collect tool names used in this pass (names in after but not in before)
     let tool_names: Vec<String> = usage_after
         .tool_names
@@ -1766,7 +1921,12 @@ async fn write_pass_trace(
     if !tool_names.is_empty() {
         req = req.item(
             "tool_names",
-            AttributeValue::L(tool_names.iter().map(|s| AttributeValue::S(s.clone())).collect()),
+            AttributeValue::L(
+                tool_names
+                    .iter()
+                    .map(|s| AttributeValue::S(s.clone()))
+                    .collect(),
+            ),
         );
     }
 
