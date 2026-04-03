@@ -361,16 +361,12 @@ async fn main() -> Result<(), Error> {
             middleware::auth::require_auth,
         ));
 
-    // Webhook routes (public, verified by signature, rate-limited)
+    // Webhook routes (public, verified by signature)
     let webhook_routes = Router::new()
         .route("/github", post(routes::github_webhook::handle))
         .route("/jira/:token", post(routes::jira_webhook::handle))
         .route("/jira", post(routes::jira_webhook::handle_forge))
-        .route("/stripe", post(routes::stripe_webhook::handle))
-        .layer(axum_middleware::from_fn_with_state(
-            state.clone(),
-            middleware::rate_limit::rate_limit_webhook,
-        ));
+        .route("/stripe", post(routes::stripe_webhook::handle));
 
     // Auth routes (public, rate-limited)
     let auth_routes = Router::new()
