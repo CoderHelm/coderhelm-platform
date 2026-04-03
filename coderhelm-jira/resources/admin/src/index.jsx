@@ -3,20 +3,20 @@ import { createRoot } from "react-dom/client";
 import { invoke } from "@forge/bridge";
 
 function App() {
-  const [installationId, setInstallationId] = useState("");
+  const [teamId, setTeamId] = useState("");
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     invoke("getConfig").then((config) => {
-      setInstallationId(config.installationId || "");
+      setTeamId(config.teamId || "");
       setLoading(false);
     });
   }, []);
 
   const save = async () => {
     setStatus("Saving…");
-    const result = await invoke("saveConfig", { installationId });
+    const result = await invoke("saveConfig", { teamId });
     if (!result.success) {
       setStatus(`Error: ${result.error}`);
     } else if (result.urlsRegistered) {
@@ -58,9 +58,9 @@ function App() {
           Team ID
           <input
             style={styles.input}
-            value={installationId}
-            onChange={(e) => setInstallationId(e.target.value)}
-            placeholder="e.g. 120248482"
+            value={teamId}
+            onChange={(e) => setTeamId(e.target.value)}
+            placeholder="e.g. a1b2c3d4-5678-9abc-def0-123456789abc"
           />
         </label>
         <p style={styles.hint}>

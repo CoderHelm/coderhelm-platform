@@ -9,7 +9,7 @@ exports.handler = async (event, context) => {
 
   // Load config from Forge storage (set via admin page)
   const config = await storage.get("coderhelm-config");
-  if (!config || !config.installationId) {
+  if (!config || !config.teamId) {
     console.log(`Skipping ${issue.key} — coderhelm not configured. Go to Apps > coderhelm Settings.`);
     return;
   }
@@ -40,8 +40,7 @@ exports.handler = async (event, context) => {
         author: { displayName: authorName },
       },
       coderhelm: {
-        installation_id: parseInt(config.installationId, 10),
-        team_id: config.teamId || undefined,
+        team_id: config.teamId,
       },
     };
 
@@ -97,8 +96,7 @@ exports.handler = async (event, context) => {
     coderhelm: {
       repo_owner: repoOwner || undefined,
       repo_name: repoName || undefined,
-      installation_id: parseInt(config.installationId, 10),
-      team_id: config.teamId || undefined,
+      team_id: config.teamId,
     },
   };
 

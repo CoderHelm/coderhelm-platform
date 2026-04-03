@@ -415,21 +415,24 @@ pub async fn handle_forge(
     let installation_id = payload
         .pointer("/coderhelm/installation_id")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| {
-            warn!("Forge Jira webhook: missing coderhelm.installation_id");
-            StatusCode::BAD_REQUEST
-        })?;
+        .unwrap_or(0);
 
-    // Also check for team_id directly in the payload (set by the Forge app)
+    // team_id is now the primary identifier, set by the Forge app
     let team_id = payload
         .pointer("/coderhelm/team_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
     let team_id = match team_id {
-        Some(tid) => tid,
-        None => {
-            // Resolve team via GitHub installation GSI on teams table
+        Some(tid) if !tid.is_empty() => {
+            if tid.starts_with("TEAM#") { tid } else { format!("TEAM#{tid}") }
+        }
+        _ => {
+            // Fallback: resolve team via GitHub installation GSI
+            if installation_id == 0 {
+                warn!("Forge Jira webhook: missing both team_id and installation_id");
+                return Err(StatusCode::BAD_REQUEST);
+            }
             match super::github_webhook::resolve_team_by_installation(&state, installation_id).await
             {
                 Some(tid) => tid,

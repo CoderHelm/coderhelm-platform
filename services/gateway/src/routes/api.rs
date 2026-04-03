@@ -1159,7 +1159,7 @@ pub async fn get_jira_integration_check(
         "last_jira_event_at": last_jira_event_at,
         "jira_event_count": jira_event_count,
         "installation_id": installation_id,
-        "team_id": claims.team_id,
+        "team_id": claims.team_id.strip_prefix("TEAM#").unwrap_or(&claims.team_id),
         "webhook_url": webhook_url,
     })))
 }
@@ -1423,19 +1423,20 @@ pub async fn get_jira_events(
 }
 
 /// POST /integrations/jira/forge-register — called by the Forge admin page to register trigger URLs.
-/// Public endpoint, verified by matching installation_id against the team's META record.
+/// Public endpoint, verified by checking the team exists.
 pub async fn forge_register_urls(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
-    let team_id = body
+    let raw_team_id = body
         .get("team_id")
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let installation_id = body
-        .get("installation_id")
-        .and_then(|v| v.as_str())
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    let team_id = if raw_team_id.starts_with("TEAM#") {
+        raw_team_id.to_string()
+    } else {
+        format!("TEAM#{raw_team_id}")
+    };
     let list_projects_url = body
         .get("list_projects_url")
         .and_then(|v| v.as_str())
@@ -1450,12 +1451,12 @@ pub async fn forge_register_urls(
         .unwrap_or("");
     let site_url = body.get("site_url").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Verify team exists and installation_id matches
-    let meta = state
+    // Verify the team exists
+    state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(team_id))
+        .key("pk", attr_s(&team_id))
         .key("sk", attr_s("META"))
         .send()
         .await
@@ -1469,22 +1470,13 @@ pub async fn forge_register_urls(
             StatusCode::NOT_FOUND
         })?;
 
-    let stored_id = meta
-        .get("github_install_id")
-        .and_then(|v| v.as_n().ok())
-        .map_or("", |v| v.as_str());
-    if stored_id != installation_id {
-        warn!("forge-register: installation_id mismatch for {team_id}");
-        return Err(StatusCode::FORBIDDEN);
-    }
-
     // Save trigger URLs to JIRA#config
     let now = chrono::Utc::now().to_rfc3339();
     state
         .dynamo
         .update_item()
         .table_name(&state.config.jira_config_table_name)
-        .key("pk", attr_s(team_id))
+        .key("pk", attr_s(&team_id))
         .key("sk", attr_s("JIRA#config"))
         .update_expression(
             "SET list_projects_url = :lpu, create_ticket_url = :ctu, add_comment_url = :acu, site_url = :su, updated_at = :ua",
