@@ -397,6 +397,30 @@ async fn run_passes(
             .send()
             .await;
 
+        // Update analytics counters
+        let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
+        for period in &[analytics_month.as_str(), "ALL_TIME"] {
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.analytics_table_name)
+                .key("team_id", attr_s(&msg.team_id))
+                .key("period", attr_s(period))
+                .update_expression(
+                    "ADD completed :one, total_cost_usd :cost, \
+                     total_tokens_in :ti, total_tokens_out :to, \
+                     cache_read_tokens :cr, cache_write_tokens :cw",
+                )
+                .expression_attribute_values(":one", attr_n(1))
+                .expression_attribute_values(":cost", attr_n(format!("{:.4}", cost)))
+                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+                .expression_attribute_values(":to", attr_n(usage.output_tokens))
+                .expression_attribute_values(":cr", attr_n(usage.cache_read_tokens))
+                .expression_attribute_values(":cw", attr_n(usage.cache_write_tokens))
+                .send()
+                .await;
+        }
+
         // Report token usage for billing
         let total_tokens = usage.input_tokens + usage.output_tokens;
         crate::clients::billing::report_token_overage(state, &msg.team_id, total_tokens).await;
@@ -473,6 +497,30 @@ async fn run_passes(
             )
             .send()
             .await;
+
+        // Update analytics counters
+        let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
+        for period in &[analytics_month.as_str(), "ALL_TIME"] {
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.analytics_table_name)
+                .key("team_id", attr_s(&msg.team_id))
+                .key("period", attr_s(period))
+                .update_expression(
+                    "ADD completed :one, total_cost_usd :cost, \
+                     total_tokens_in :ti, total_tokens_out :to, \
+                     cache_read_tokens :cr, cache_write_tokens :cw",
+                )
+                .expression_attribute_values(":one", attr_n(1))
+                .expression_attribute_values(":cost", attr_n(format!("{:.4}", cost)))
+                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+                .expression_attribute_values(":to", attr_n(usage.output_tokens))
+                .expression_attribute_values(":cr", attr_n(usage.cache_read_tokens))
+                .expression_attribute_values(":cw", attr_n(usage.cache_write_tokens))
+                .send()
+                .await;
+        }
 
         // Report token usage for billing
         let total_tokens = usage.input_tokens + usage.output_tokens;
