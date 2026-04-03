@@ -1101,7 +1101,7 @@ pub async fn github_callback(
             "Linked GitHub installation to team"
         );
 
-        // Sync repos from the installation
+        // Sync repos from the installation (only add repos not already present)
         let repos = super::github_webhook::fetch_installation_repos(&state, inst_id).await;
         for repo in &repos {
             let full = format!("{}/{}", repo.owner, repo.name);
@@ -1118,6 +1118,7 @@ pub async fn github_callback(
                 )
                 .item("ticket_source", attr_s("github"))
                 .item("created_at", attr_s(&now))
+                .condition_expression("attribute_not_exists(pk)")
                 .send()
                 .await;
         }
