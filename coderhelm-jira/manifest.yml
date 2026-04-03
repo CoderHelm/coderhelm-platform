@@ -6,7 +6,7 @@ modules:
         - avi:jira:created:issue
         - avi:jira:assigned:issue
         - avi:jira:updated:issue
-        - avi:jira:created:comment
+        - avi:jira:commented:issue
   webtrigger:
     - key: list-projects-trigger
       function: listProjectsHandler
