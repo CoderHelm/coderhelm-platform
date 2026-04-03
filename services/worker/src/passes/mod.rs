@@ -323,7 +323,7 @@ async fn run_passes(
 
     // --- Checkpoint Resume: skip expensive passes if we've already completed them ---
     let checkpoint = load_checkpoint(state, &msg.team_id, run_id).await;
-    let can_skip_implement = checkpoint.as_ref().map_or(false, |(last_pass, branch, _)| {
+    let can_skip_implement = checkpoint.as_ref().is_some_and(|(last_pass, branch, _)| {
         !branch.is_empty()
             && matches!(
                 last_pass.as_str(),
@@ -1860,6 +1860,7 @@ async fn is_subscription_allowed(state: &WorkerState, team_id: &str) -> bool {
 }
 
 /// Write a per-pass trace record to the traces table.
+#[allow(clippy::too_many_arguments)]
 async fn write_pass_trace(
     state: &WorkerState,
     team_id: &str,
