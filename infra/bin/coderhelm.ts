@@ -49,6 +49,7 @@ const api = new ApiStack(app, `${prefix}-api`, {
   billingTable: database.billingTable,
   bannersTable: database.bannersTable,
   mcpConfigsTable: database.mcpConfigsTable,
+  awsInsightsTable: database.awsInsightsTable,
   waitlistTable: database.waitlistTable,
   bucket: storage.bucket,
 });
@@ -113,6 +114,6 @@ new MonitoringStack(app, `${prefix}-monitoring`, {
 new LogAnalyzerStack(app, `${prefix}-log-analyzer`, {
   env,
   stage,
-  settingsTable: database.settingsTable,
+  awsInsightsTable: database.awsInsightsTable,
   plansTable: database.plansTable,
 });

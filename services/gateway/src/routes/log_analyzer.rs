@@ -111,7 +111,7 @@ pub async fn create_connection(
     state
         .dynamo
         .put_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(&state.config.aws_insights_table_name)
         .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(&conn_id))
         .item("role_arn", attr_s(&body.role_arn))
@@ -153,7 +153,7 @@ pub async fn list_connections(
     let result = state
         .dynamo
         .query()
-        .table_name(&state.config.settings_table_name)
+        .table_name(&state.config.aws_insights_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("AWS_CONN#"))
@@ -239,7 +239,7 @@ pub async fn update_connection(
     let mut update = state
         .dynamo
         .update_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(&state.config.aws_insights_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .update_expression(format!("SET {}", update_expr.join(", ")))
@@ -278,7 +278,7 @@ pub async fn delete_connection(
     state
         .dynamo
         .delete_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(&state.config.aws_insights_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .send()
@@ -308,7 +308,7 @@ pub async fn test_connection(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(&state.config.aws_insights_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .send()
@@ -347,7 +347,7 @@ pub async fn test_connection(
             let _ = state
                 .dynamo
                 .update_item()
-                .table_name(&state.config.settings_table_name)
+                .table_name(&state.config.aws_insights_table_name)
                 .key("pk", attr_s(&claims.team_id))
                 .key("sk", attr_s(&sk))
                 .update_expression("SET #s = :s, updated_at = :t")
@@ -368,7 +368,7 @@ pub async fn test_connection(
             let _ = state
                 .dynamo
                 .update_item()
-                .table_name(&state.config.settings_table_name)
+                .table_name(&state.config.aws_insights_table_name)
                 .key("pk", attr_s(&claims.team_id))
                 .key("sk", attr_s(&sk))
                 .update_expression("SET #s = :s, updated_at = :t, last_error = :e")
@@ -399,7 +399,7 @@ pub async fn discover_log_groups(
     let item = state
         .dynamo
         .get_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(&state.config.aws_insights_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .send()
@@ -546,7 +546,7 @@ pub async fn list_recommendations(
     let result = state
         .dynamo
         .query()
-        .table_name(&state.config.settings_table_name)
+        .table_name(&state.config.aws_insights_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
         .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":prefix", attr_s("REC#"))
@@ -604,7 +604,7 @@ pub async fn create_plan_from_recommendation(
     let result = state
         .dynamo
         .get_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(&state.config.aws_insights_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .send()
@@ -668,7 +668,7 @@ pub async fn create_plan_from_recommendation(
     let _ = state
         .dynamo
         .update_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(&state.config.aws_insights_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .update_expression("SET #s = :s, plan_id = :pid, updated_at = :t")
@@ -703,7 +703,7 @@ pub async fn dismiss_recommendation(
     state
         .dynamo
         .update_item()
-        .table_name(&state.config.settings_table_name)
+        .table_name(&state.config.aws_insights_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
         .update_expression("SET #s = :s, updated_at = :t, dismissed_by = :u")

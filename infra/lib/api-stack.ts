@@ -29,6 +29,7 @@ interface ApiStackProps extends cdk.StackProps {
   billingTable: dynamodb.TableV2;
   bannersTable: dynamodb.TableV2;
   mcpConfigsTable: dynamodb.TableV2;
+  awsInsightsTable: dynamodb.TableV2;
   waitlistTable: dynamodb.TableV2;
   bucket: s3.Bucket;
 }
@@ -278,6 +279,7 @@ export class ApiStack extends cdk.Stack {
         JIRA_CONFIG_TABLE_NAME: props.jiraConfigTable.tableName,
         REPOS_TABLE_NAME: props.reposTable.tableName,
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
+        AWS_INSIGHTS_TABLE_NAME: props.awsInsightsTable.tableName,
         MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
         INFRA_TABLE_NAME: props.infraTable.tableName,
         BILLING_TABLE_NAME: props.billingTable.tableName,
@@ -322,6 +324,7 @@ export class ApiStack extends cdk.Stack {
     props.jiraConfigTable.grantReadWriteData(this.gatewayFunction);
     props.reposTable.grantReadWriteData(this.gatewayFunction);
     props.settingsTable.grantReadWriteData(this.gatewayFunction);
+    props.awsInsightsTable.grantReadWriteData(this.gatewayFunction);
     props.infraTable.grantReadWriteData(this.gatewayFunction);
     props.billingTable.grantReadWriteData(this.gatewayFunction);
     props.bannersTable.grantReadData(this.gatewayFunction);

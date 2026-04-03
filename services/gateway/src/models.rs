@@ -15,6 +15,7 @@ pub struct Config {
     pub jira_config_table_name: String,
     pub repos_table_name: String,
     pub settings_table_name: String,
+    pub aws_insights_table_name: String,
     pub infra_table_name: String,
     pub billing_table_name: String,
     pub banners_table_name: String,
@@ -58,6 +59,8 @@ impl Config {
             repos_table_name: std::env::var("REPOS_TABLE_NAME").expect("REPOS_TABLE_NAME required"),
             settings_table_name: std::env::var("SETTINGS_TABLE_NAME")
                 .expect("SETTINGS_TABLE_NAME required"),
+            aws_insights_table_name: std::env::var("AWS_INSIGHTS_TABLE_NAME")
+                .expect("AWS_INSIGHTS_TABLE_NAME required"),
             infra_table_name: std::env::var("INFRA_TABLE_NAME").expect("INFRA_TABLE_NAME required"),
             billing_table_name: std::env::var("BILLING_TABLE_NAME")
                 .expect("BILLING_TABLE_NAME required"),

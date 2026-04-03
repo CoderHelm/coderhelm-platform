@@ -23,13 +23,13 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-SETTINGS_TABLE = os.environ.get("SETTINGS_TABLE_NAME", "coderhelm-prod-settings")
+AWS_INSIGHTS_TABLE = os.environ.get("AWS_INSIGHTS_TABLE_NAME", "coderhelm-prod-aws-insights")
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-6")
 CODERHELM_ACCOUNT_ID = os.environ.get("CODERHELM_ACCOUNT_ID", "REDACTED_AWS_ACCOUNT_ID")
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 
 dynamodb = boto3.resource("dynamodb")
-settings_table = dynamodb.Table(SETTINGS_TABLE)
+aws_insights_table = dynamodb.Table(AWS_INSIGHTS_TABLE)
 bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
 sts_client = boto3.client("sts")
 
@@ -189,7 +189,7 @@ def scan_aws_connections():
         if last_key:
             scan_kwargs["ExclusiveStartKey"] = last_key
 
-        resp = settings_table.scan(**scan_kwargs)
+        resp = aws_insights_table.scan(**scan_kwargs)
 
         for item in resp.get("Items", []):
             connections.append(
@@ -472,7 +472,7 @@ def store_recommendation(team_id, account_id, rec):
 
     # Query existing recs with same hash
     try:
-        existing = settings_table.query(
+        existing = aws_insights_table.query(
             KeyConditionExpression="pk = :pk AND begins_with(sk, :prefix)",
             FilterExpression="error_hash = :hash AND #s <> :dismissed",
             ExpressionAttributeNames={"#s": "status"},
@@ -492,7 +492,7 @@ def store_recommendation(team_id, account_id, rec):
     # Store new recommendation
     try:
         ttl_epoch = int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp())
-        settings_table.put_item(
+        aws_insights_table.put_item(
             Item={
                 "pk": team_id,
                 "sk": sk,
@@ -529,7 +529,7 @@ def update_connection_status(team_id, account_id, status, error_msg=None):
             update_expr += ", last_error = :e"
             expr_values[":e"] = error_msg[:500]
 
-        settings_table.update_item(
+        aws_insights_table.update_item(
             Key={"pk": team_id, "sk": f"AWS_CONN#{account_id}"},
             UpdateExpression=update_expr,
             ExpressionAttributeNames={"#s": "status"},

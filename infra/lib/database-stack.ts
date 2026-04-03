@@ -24,6 +24,7 @@ export class DatabaseStack extends cdk.Stack {
   public readonly billingTable: dynamodb.TableV2;
   public readonly bannersTable: dynamodb.TableV2;
   public readonly mcpConfigsTable: dynamodb.TableV2;
+  public readonly awsInsightsTable: dynamodb.TableV2;
   public readonly waitlistTable: dynamodb.TableV2;
   public readonly tracesTable: dynamodb.TableV2;
   public readonly checkpointsTable: dynamodb.TableV2;
@@ -366,6 +367,29 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
+    // AWS Insights table: AWS connections + log analyzer recommendations
+    // PK = team_id, SK = AWS_CONN#{account_id} or REC#{ulid}
+    // Separated from settings to isolate cross-account IAM data
+    // ──────────────────────────────────────────────
+    this.awsInsightsTable = new dynamodb.TableV2(this, "AwsInsightsTable", {
+      tableName: `coderhelm-${props.stage}-aws-insights`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      timeToLiveAttribute: "ttl",
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // ──────────────────────────────────────────────
     // MCP Configs table: plugin enable/disable state + encrypted credentials
     // PK = team_id, SK = PLUGIN#{plugin_id}
     // Separated from settings to isolate secret material
@@ -549,6 +573,9 @@ export class DatabaseStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, "McpConfigsTableName", {
       value: this.mcpConfigsTable.tableName,
+    });
+    new cdk.CfnOutput(this, "AwsInsightsTableName", {
+      value: this.awsInsightsTable.tableName,
     });
     new cdk.CfnOutput(this, "WaitlistTableName", {
       value: this.waitlistTable.tableName,
