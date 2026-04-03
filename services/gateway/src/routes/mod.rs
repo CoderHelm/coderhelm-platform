@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod banners;
 pub mod billing;
+pub mod github;
 pub mod github_webhook;
 pub mod infrastructure;
 pub mod jira_webhook;

@@ -519,14 +519,100 @@ async fn handle_installation(
                 .unwrap_or("unknown");
             info!(
                 installation_id,
-                org, "GitHub App installed — will be linked when user connects via OAuth"
+                org, "GitHub App installed"
             );
-            // No team creation here. The link is established when the user
-            // connects GitHub from the dashboard (OAuth callback writes
-            // github_installation_id to the teams table).
-            //
-            // If a team is already linked (reinstall), sync repos.
-            if let Some(team_id) = resolve_team_by_installation(state, installation_id).await {
+
+            // Check if a team is already linked (reinstall scenario)
+            let team_id = if let Some(tid) = resolve_team_by_installation(state, installation_id).await {
+                Some(tid)
+            } else {
+                // Try to auto-link: look up the installing user's github_id in the users table
+                let sender_id = payload["sender"]["id"].as_u64();
+                if let Some(github_id) = sender_id {
+                    let found = state
+                        .dynamo
+                        .query()
+                        .table_name(&state.config.users_table_name)
+                        .index_name("gsi1")
+                        .key_condition_expression("gsi1pk = :gpk")
+                        .expression_attribute_values(
+                            ":gpk",
+                            attr_s(&format!("GHUSER#{github_id}")),
+                        )
+                        .limit(1)
+                        .send()
+                        .await
+                        .ok()
+                        .and_then(|r| r.items().first().cloned());
+
+                    if let Some(user_item) = found {
+                        let tid = user_item
+                            .get("pk")
+                            .and_then(|v| v.as_s().ok())
+                            .map(|s| s.to_string());
+
+                        if let Some(ref tid) = tid {
+                            let now = chrono::Utc::now().to_rfc3339();
+                            // Link in teams table
+                            let _ = state
+                                .dynamo
+                                .update_item()
+                                .table_name(&state.config.teams_table_name)
+                                .key("team_id", attr_s(tid))
+                                .key("sk", attr_s("META"))
+                                .update_expression(
+                                    "SET github_installation_id = :iid, github_org = :org, updated_at = :now",
+                                )
+                                .expression_attribute_values(
+                                    ":iid",
+                                    aws_sdk_dynamodb::types::AttributeValue::N(
+                                        installation_id.to_string(),
+                                    ),
+                                )
+                                .expression_attribute_values(":org", attr_s(org))
+                                .expression_attribute_values(":now", attr_s(&now))
+                                .send()
+                                .await;
+
+                            // Link in main table
+                            let _ = state
+                                .dynamo
+                                .update_item()
+                                .table_name(&state.config.table_name)
+                                .key("pk", attr_s(tid))
+                                .key("sk", attr_s("META"))
+                                .update_expression(
+                                    "SET github_install_id = :iid, updated_at = :now",
+                                )
+                                .expression_attribute_values(
+                                    ":iid",
+                                    aws_sdk_dynamodb::types::AttributeValue::N(
+                                        installation_id.to_string(),
+                                    ),
+                                )
+                                .expression_attribute_values(":now", attr_s(&now))
+                                .send()
+                                .await;
+
+                            info!(
+                                installation_id,
+                                org,
+                                team_id = tid.as_str(),
+                                github_id,
+                                "Auto-linked GitHub installation via webhook sender"
+                            );
+                        }
+                        tid
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            // Sync repos if we have a linked team
+            if let Some(team_id) = team_id {
                 let mut repos = extract_repos_from_installation(payload);
                 if repos.is_empty() {
                     repos = fetch_installation_repos(state, installation_id).await;
@@ -572,6 +658,8 @@ async fn handle_installation(
 
             // Find the team linked to this installation and remove the link
             if let Some(team_id) = resolve_team_by_installation(state, installation_id).await {
+                let now = chrono::Utc::now().to_rfc3339();
+                // Remove from teams table
                 let _ = state
                     .dynamo
                     .update_item()
@@ -581,11 +669,23 @@ async fn handle_installation(
                     .update_expression(
                         "REMOVE github_installation_id, github_org SET updated_at = :t",
                     )
-                    .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+                    .expression_attribute_values(":t", attr_s(&now))
                     .send()
                     .await;
 
-                info!(team_id, "GitHub installation unlinked from team");
+                // Remove from main table
+                let _ = state
+                    .dynamo
+                    .update_item()
+                    .table_name(&state.config.table_name)
+                    .key("pk", attr_s(&team_id))
+                    .key("sk", attr_s("META"))
+                    .update_expression("REMOVE github_install_id SET updated_at = :t")
+                    .expression_attribute_values(":t", attr_s(&now))
+                    .send()
+                    .await;
+
+                info!(team_id, "GitHub installation unlinked from team (both tables)");
             }
 
             Ok(StatusCode::OK)

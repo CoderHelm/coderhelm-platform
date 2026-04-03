@@ -142,6 +142,15 @@ async fn main() -> Result<(), Error> {
         )
         .route("/stats", get(routes::api::get_stats))
         .route("/stats/history", get(routes::api::get_stats_history))
+        // GitHub App installation
+        .route(
+            "/github/link-installation",
+            post(routes::github::link_installation),
+        )
+        .route(
+            "/github/installation-status",
+            get(routes::github::installation_status),
+        )
         .route(
             "/notifications",
             get(routes::api::get_notification_prefs).put(routes::api::update_notification_prefs),
