@@ -41,10 +41,10 @@ INSIGHTS_QUERIES = [
         "description": "Lambda function errors and timeouts",
         "log_group_pattern": "/aws/lambda/",
         "query": (
-            "fields @timestamp, @message, @logStream "
+            "fields @timestamp, @message, @logStream, @logGroup "
             "| filter @message like /(?i)(error|exception|timeout|task timed out|out of memory|runtime exited)/ "
             "| filter @message not like /(?i)(info|debug|warn.*deprecat)/ "
-            "| stats count() as error_count by @logStream "
+            "| stats count() as error_count by @logGroup, @logStream "
             "| sort error_count desc "
             "| limit 20"
         ),
@@ -54,9 +54,9 @@ INSIGHTS_QUERIES = [
         "description": "API Gateway 5xx errors",
         "log_group_pattern": "api-gateway",
         "query": (
-            "fields @timestamp, @message "
+            "fields @timestamp, @message, @logGroup "
             "| filter @message like /\" 5\\d{2} \"/ "
-            "| stats count() as error_count by @message "
+            "| stats count() as error_count by @logGroup, @message "
             "| sort error_count desc "
             "| limit 20"
         ),
@@ -66,9 +66,9 @@ INSIGHTS_QUERIES = [
         "description": "ECS task crashes and OOM kills",
         "log_group_pattern": "/ecs/",
         "query": (
-            "fields @timestamp, @message, @logStream "
+            "fields @timestamp, @message, @logStream, @logGroup "
             "| filter @message like /(?i)(oom|killed|signal|exit code [^0]|panic|fatal|segfault)/ "
-            "| stats count() as crash_count by @logStream "
+            "| stats count() as crash_count by @logGroup, @logStream "
             "| sort crash_count desc "
             "| limit 20"
         ),
@@ -78,10 +78,10 @@ INSIGHTS_QUERIES = [
         "description": "General application errors across all log groups",
         "log_group_pattern": None,  # matches any
         "query": (
-            "fields @timestamp, @message "
+            "fields @timestamp, @message, @logGroup "
             "| filter @message like /(?i)(ERROR|FATAL|CRITICAL|UnhandledPromiseRejection|Traceback)/ "
             "| filter @message not like /(?i)(healthcheck|ping|OPTIONS)/ "
-            "| stats count() as error_count by @message "
+            "| stats count() as error_count by @logGroup, @message "
             "| sort error_count desc "
             "| limit 20"
         ),
@@ -270,6 +270,9 @@ def analyze_connection(conn):
         logger.info(f"No errors found for {team_id}/{account_id}")
         return 0
 
+    # Reorganize results grouped by log group
+    all_results = group_results_by_log_group(all_results)
+
     # Check for secrets/tokens in raw results and create advisory if found
     raw_text = json.dumps(all_results, default=str)
     secrets_found = 0
@@ -401,7 +404,7 @@ def analyze_with_bedrock(query_results, account_id):
 
     prompt = f"""You are an AWS infrastructure expert analyzing CloudWatch Logs error summaries for AWS account {account_id}.
 
-Below are aggregated error patterns from CloudWatch Logs Insights queries. Each section has a query name, the log groups searched, and the error patterns found.
+Below are aggregated error patterns from CloudWatch Logs Insights queries, grouped by log group. Each log group section contains the queries that found errors and their results.
 
 <error_summaries>
 {context}
@@ -557,6 +560,47 @@ def ulid_now():
     rand_part = "".join(random.choices(alphabet, k=16))
 
     return ts_part + rand_part
+
+
+def group_results_by_log_group(all_results):
+    """Reorganize query results so they are grouped by log group."""
+    grouped = {}  # log_group_name -> list of {query_name, description, results}
+
+    for entry in all_results:
+        query_name = entry["query_name"]
+        description = entry["description"]
+        log_groups_in_batch = entry.get("log_groups", [])
+
+        # Split results by @logGroup field if present
+        per_group = {}  # log_group -> [rows]
+        ungrouped = []
+        for row in entry.get("results", []):
+            lg = row.get("@logGroup")
+            if lg:
+                per_group.setdefault(lg, []).append(row)
+            else:
+                ungrouped.append(row)
+
+        # Add grouped rows
+        for lg, rows in per_group.items():
+            grouped.setdefault(lg, []).append(
+                {"query_name": query_name, "description": description, "results": rows}
+            )
+
+        # If no @logGroup field was returned, fall back to batch log groups
+        if ungrouped:
+            key = ", ".join(log_groups_in_batch[:3])
+            if len(log_groups_in_batch) > 3:
+                key += f" (+{len(log_groups_in_batch) - 3} more)"
+            grouped.setdefault(key or "unknown", []).append(
+                {"query_name": query_name, "description": description, "results": ungrouped}
+            )
+
+    # Convert to a list format for the prompt
+    return [
+        {"log_group": lg, "queries": queries}
+        for lg, queries in sorted(grouped.items())
+    ]
 
 
 def chunk_list(lst, chunk_size):

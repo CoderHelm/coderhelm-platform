@@ -219,6 +219,12 @@ async fn run_passes(
     usage: &mut TokenUsage,
     start: &std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Resolve installation_id: if 0 (e.g. Jira-sourced tickets), look it up from team META
+    if msg.installation_id == 0 {
+        msg.installation_id = lookup_team_installation_id(state, &msg.team_id).await?;
+        info!(run_id, installation_id = msg.installation_id, "Resolved installation_id from team META");
+    }
+
     // Initialize GitHub client for this team
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
@@ -1443,6 +1449,32 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 
 fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
+}
+
+/// Look up the GitHub App installation_id from the team META record.
+async fn lookup_team_installation_id(
+    state: &WorkerState,
+    team_id: &str,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s("META"))
+        .projection_expression("github_install_id")
+        .send()
+        .await?;
+
+    result
+        .item()
+        .and_then(|i| i.get("github_install_id"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .filter(|&id| id > 0)
+        .ok_or_else(|| {
+            format!("No github_install_id found for team {team_id}").into()
+        })
 }
 
 /// Post a comment on a Jira ticket via the Forge web trigger.
