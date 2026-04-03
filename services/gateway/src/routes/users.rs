@@ -494,14 +494,17 @@ pub async fn mfa_setup(
         .send()
         .await
         .map_err(|e| {
-            error!("MFA setup auth failed: {e}");
+            error!("MFA setup auth failed: {e:?}");
             StatusCode::UNAUTHORIZED
         })?;
 
     let access_token = auth_result
         .authentication_result()
         .and_then(|r| r.access_token())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .ok_or_else(|| {
+            error!("MFA setup: no access_token in auth result, challenge={:?}", auth_result.challenge_name());
+            StatusCode::UNAUTHORIZED
+        })?;
 
     let result = state
         .cognito
@@ -510,7 +513,7 @@ pub async fn mfa_setup(
         .send()
         .await
         .map_err(|e| {
-            error!("MFA setup failed: {e}");
+            error!("MFA setup failed: {e:?}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -551,14 +554,17 @@ pub async fn mfa_verify_setup(
         .send()
         .await
         .map_err(|e| {
-            error!("MFA verify auth failed: {e}");
+            error!("MFA verify auth failed: {e:?}");
             StatusCode::UNAUTHORIZED
         })?;
 
     let access_token = auth_result
         .authentication_result()
         .and_then(|r| r.access_token())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .ok_or_else(|| {
+            error!("MFA verify: no access_token in auth result, challenge={:?}", auth_result.challenge_name());
+            StatusCode::UNAUTHORIZED
+        })?;
 
     // Verify the TOTP token
     let mut req = state
@@ -574,7 +580,7 @@ pub async fn mfa_verify_setup(
     }
 
     req.send().await.map_err(|e| {
-        error!("MFA verification failed: {e}");
+        error!("MFA verification failed: {e:?}");
         StatusCode::BAD_REQUEST
     })?;
 
