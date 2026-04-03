@@ -592,7 +592,7 @@ async fn handle_jira_comment(
         .expression_attribute_values(":tid", attr_s(team_id))
         .expression_attribute_values(":ticket", attr_s(ticket_key))
         .scan_index_forward(false)
-        .limit(1)
+        .limit(50)
         .send()
         .await
         .map_err(|e| {
