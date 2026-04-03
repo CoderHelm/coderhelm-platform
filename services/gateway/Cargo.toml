@@ -56,3 +56,4 @@ rand = "0.9"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
+md5 = "0.7"

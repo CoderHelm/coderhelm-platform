@@ -469,6 +469,7 @@ const CATALOG: &[PluginDef] = &[
 // ── Handlers ────────────────────────────────────────────────────────
 
 /// Sync the plugin catalog JSON to S3 so other Lambdas can load it.
+/// Only writes if the content has changed (compares MD5 with existing ETag).
 pub async fn sync_catalog_to_s3(state: &AppState) {
     let catalog_json = match serde_json::to_vec(&json!({ "plugins": CATALOG })) {
         Ok(v) => v,
@@ -480,6 +481,18 @@ pub async fn sync_catalog_to_s3(state: &AppState) {
 
     let bucket = &state.config.bucket_name;
     let key = "config/mcp-catalog.json";
+
+    // Check if the existing object matches — skip write if unchanged
+    let local_md5 = format!("{:x}", md5::compute(&catalog_json));
+    if let Ok(head) = state.s3.head_object().bucket(bucket).key(key).send().await {
+        if let Some(etag) = head.e_tag() {
+            let etag_clean = etag.trim_matches('"');
+            if etag_clean == local_md5 {
+                info!("Plugin catalog unchanged, skipping S3 sync");
+                return;
+            }
+        }
+    }
 
     if let Err(e) = state
         .s3

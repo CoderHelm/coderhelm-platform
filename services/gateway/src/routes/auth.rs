@@ -1411,9 +1411,10 @@ pub async fn join_waitlist(
     }
 
     // Basic email regex validation
-    let email_re =
-        regex::Regex::new(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$").unwrap();
-    if !email_re.is_match(&email) {
+    static EMAIL_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$").unwrap()
+    });
+    if !EMAIL_RE.is_match(&email) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "Invalid email format" })),

@@ -36,8 +36,10 @@ pub struct UpdateConnectionRequest {
 
 /// Validate that role_arn matches expected format: arn:aws:iam::<12-digit>:role/CoderHelmLogReader
 fn validate_role_arn(arn: &str) -> Result<&str, StatusCode> {
-    let re = regex::Regex::new(r"^arn:aws:iam::\d{12}:role/CoderHelmLogReader$").unwrap();
-    if re.is_match(arn) {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^arn:aws:iam::\d{12}:role/CoderHelmLogReader$").unwrap()
+    });
+    if RE.is_match(arn) {
         Ok(arn)
     } else {
         warn!(

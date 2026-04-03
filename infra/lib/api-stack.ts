@@ -261,7 +261,7 @@ export class ApiStack extends cdk.Stack {
       architecture: lambda.Architecture.ARM_64,
       handler: "bootstrap",
       code: lambda.Code.fromAsset(gatewayAssetPath),
-      memorySize: 128,
+      memorySize: 256,
       timeout: cdk.Duration.seconds(30),
       logGroup: gatewayLogGroup,
       environment: {
@@ -435,6 +435,15 @@ export class ApiStack extends cdk.Stack {
         allowCredentials: true,
       },
     });
+
+    // Stage-level throttling: 1000 req/sec burst, 500 req/sec sustained
+    const defaultStage = httpApi.defaultStage?.node.defaultChild as cdk.aws_apigatewayv2.CfnStage;
+    if (defaultStage) {
+      defaultStage.defaultRouteSettings = {
+        throttlingBurstLimit: 1000,
+        throttlingRateLimit: 500,
+      };
+    }
 
     const lambdaIntegration =
       new integrations.HttpLambdaIntegration(
