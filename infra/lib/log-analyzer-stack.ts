@@ -78,7 +78,7 @@ export class LogAnalyzerStack extends cdk.Stack {
         actions: ["sts:AssumeRole"],
         resources: ["arn:aws:iam::*:role/CoderHelmLogReader"],
         conditions: {
-          StringEquals: {
+          StringLike: {
             "sts:ExternalId": "*",
           },
         },
