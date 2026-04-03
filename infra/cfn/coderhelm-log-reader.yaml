@@ -24,7 +24,7 @@ Resources:
       RoleName: CoderHelmLogReader
       Description: >
         Read-only role for Coderhelm to query CloudWatch Logs.
-        No data is stored — only error summaries are returned to Coderhelm.
+        No data is stored - only error summaries are returned to Coderhelm.
       MaxSessionDuration: 3600
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
