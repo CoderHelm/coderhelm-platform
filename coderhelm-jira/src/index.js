@@ -49,15 +49,50 @@ exports.handler = async (event, context) => {
 
     const commentBody = typeof comment.body === "string" ? comment.body : JSON.stringify(comment.body || "");
 
+    // Fetch full issue fields so the worker gets the current description
+    let fields = {};
+    if (issue.id) {
+      try {
+        const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,project`);
+        if (res.ok) {
+          const full = await res.json();
+          fields = full.fields || {};
+        }
+      } catch (e) {
+        console.log(`Error fetching issue fields for comment on ${issue.key}: ${e.message}`);
+      }
+    }
+
+    const labels = (fields.labels || []).map((l) => (typeof l === "string" ? l : l.name || ""));
+
+    // Extract repo from label if present (coderhelm:owner/repo)
+    const repoLabel = labels.find((l) => l.startsWith("coderhelm:"));
+    let commentRepoOwner, commentRepoName;
+    if (repoLabel) {
+      [commentRepoOwner, commentRepoName] = repoLabel.replace("coderhelm:", "").split("/");
+    }
+
     const payload = {
       webhookEvent: "jira:comment_created",
-      issue: { key: issue.key, id: issue.id },
+      issue: {
+        key: issue.key,
+        id: issue.id,
+        fields: {
+          summary: fields.summary,
+          description: fields.description,
+          labels: labels,
+          assignee: fields.assignee,
+          project: fields.project,
+        },
+      },
       comment: {
         id: comment.id,
         body: commentBody,
         author: { displayName: authorName },
       },
       coderhelm: {
+        repo_owner: commentRepoOwner || undefined,
+        repo_name: commentRepoName || undefined,
         team_id: config.teamId,
         forge_secret: config.forgeSecret,
       },

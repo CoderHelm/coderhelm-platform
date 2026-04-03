@@ -674,26 +674,35 @@ async fn handle_jira_comment(
         ("", "")
     };
 
+    let title = run_item
+        .get("title")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
     match run_status {
         // Failed or needs_input run — retry by re-queuing the ticket
         "failed" | "needs_input" => {
-            let title = run_item
-                .get("title")
-                .and_then(|v| v.as_s().ok())
-                .map(|s| s.as_str())
-                .unwrap_or("");
-
-            // Include the new comment as additional context in the body
-            let body = run_item
-                .get("body")
-                .and_then(|v| v.as_s().ok())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
+            // Use the current ticket description from the payload (re-fetched by Forge)
+            // instead of the stale body from the previous run
+            let raw_description = issue
+                .get("fields")
+                .and_then(|f| f.get("description"))
+                .or_else(|| issue.get("description"));
+            let fresh_body = match raw_description {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => extract_adf_text(other),
+                None => run_item
+                    .get("body")
+                    .and_then(|v| v.as_s().ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+            };
 
             let extended_body = if comment_body.is_empty() {
-                body
+                fresh_body
             } else {
-                format!("{body}\n\n---\n\n**Additional context (from Jira comment by {comment_author}):**\n\n{comment_body}")
+                format!("{fresh_body}\n\n---\n\n**Additional context (from Jira comment by {comment_author}):**\n\n{comment_body}")
             };
 
             let message = WorkerMessage::Ticket(TicketMessage {
@@ -713,7 +722,19 @@ async fn handle_jira_comment(
                 team_id,
                 ticket_key, run_id, run_status, "Retrying Jira run after comment"
             );
-            send_to_queue(state, &state.config.ticket_queue_url, &message).await
+            let result = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+            let repo_display = format!("{repo_owner}/{repo_name}");
+            log_jira_event(
+                state,
+                team_id,
+                "comment_retry",
+                ticket_key,
+                title,
+                if result.is_ok() { "reprocessing" } else { "error" },
+                Some(&repo_display),
+            )
+            .await;
+            result
         }
         // Completed run with PR — send feedback
         "completed" if pr_number > 0 => {
@@ -733,7 +754,20 @@ async fn handle_jira_comment(
                 team_id,
                 ticket_key, run_id, "Sending feedback for Jira comment on completed run"
             );
-            send_to_queue(state, &state.config.feedback_queue_url, &message).await
+            let result =
+                send_to_queue(state, &state.config.feedback_queue_url, &message).await;
+            let repo_display = format!("{repo_owner}/{repo_name}");
+            log_jira_event(
+                state,
+                team_id,
+                "comment_feedback",
+                ticket_key,
+                title,
+                if result.is_ok() { "feedback" } else { "error" },
+                Some(&repo_display),
+            )
+            .await;
+            result
         }
         // Running/queued — don't reprocess
         "running" | "queued" => {
@@ -741,6 +775,16 @@ async fn handle_jira_comment(
                 ticket_key,
                 run_status, "Ignoring Jira comment — run already in progress"
             );
+            log_jira_event(
+                state,
+                team_id,
+                "comment_skipped",
+                ticket_key,
+                title,
+                "skipped",
+                None,
+            )
+            .await;
             Ok(StatusCode::OK)
         }
         _ => {
@@ -844,6 +888,15 @@ pub async fn list_jira_events(
     let events: Vec<serde_json::Value> = result
         .items()
         .iter()
+        .filter(|item| {
+            // Skip dedup lock records (DEDUP#jira#...)
+            let eid = item
+                .get("event_id")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            !eid.starts_with("DEDUP#")
+        })
         .map(|item| {
             let s = |key: &str| -> &str {
                 item.get(key)

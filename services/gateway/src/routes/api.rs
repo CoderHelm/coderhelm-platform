@@ -694,7 +694,7 @@ pub async fn retry_run(
         .and_then(|v| v.as_s().ok())
         .map(|s| s.as_str())
         .unwrap_or("");
-    if status != "failed" {
+    if !matches!(status, "failed" | "needs_input" | "cancelled") {
         return Err(StatusCode::BAD_REQUEST);
     }
 
