@@ -296,6 +296,7 @@ export class ApiStack extends cdk.Stack {
         COGNITO_CLIENT_ID: userPoolClient.userPoolClientId,
         COGNITO_DOMAIN: userPoolDomain.domainName,
         RUST_LOG: "info",
+        TRACES_TABLE_NAME: `coderhelm-${props.stage}-traces`,
       },
     });
 
@@ -307,10 +308,12 @@ export class ApiStack extends cdk.Stack {
     const runsTable = dynamodb.TableV2.fromTableName(this, "RunsTableRef", `coderhelm-${props.stage}-runs`);
     const analyticsTable = dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `coderhelm-${props.stage}-analytics`);
     const jiraEventsTable = dynamodb.TableV2.fromTableName(this, "JiraEventsTableRef", `coderhelm-${props.stage}-jira-events`);
+    const tracesTable = dynamodb.TableV2.fromTableName(this, "TracesTableRef", `coderhelm-${props.stage}-traces`);
     teamsTable.grantReadWriteData(this.gatewayFunction);
     runsTable.grantReadWriteData(this.gatewayFunction);
     analyticsTable.grantReadData(this.gatewayFunction);
     jiraEventsTable.grantReadWriteData(this.gatewayFunction);
+    tracesTable.grantReadData(this.gatewayFunction);
 
     props.eventsTable.grantReadWriteData(this.gatewayFunction);
     props.usersTable.grantReadWriteData(this.gatewayFunction);

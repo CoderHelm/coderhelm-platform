@@ -201,7 +201,7 @@ pub struct ReviewComment {
 }
 
 /// Token usage tracking with prompt cache metrics.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,

@@ -119,6 +119,24 @@ pub async fn converse(
                 format!("Reached the maximum number of steps ({MAX_TURNS}) without finishing. The issue may need more detail or a narrower scope.").into()
             );
         }
+
+        // Progress note every 10 turns to keep the LLM focused
+        if turns > 1 && turns % 10 == 0 {
+            info!(turns, "Injecting progress note at turn {turns}");
+            let remaining = MAX_TURNS - turns;
+            let note = format!(
+                "[SYSTEM NOTE] You have used {turns} of {MAX_TURNS} tool-use turns. {remaining} turns remaining. \
+                 Focus on completing the task efficiently. If you are stuck, summarize what you have done and provide your best answer."
+            );
+            messages.push(
+                Message::builder()
+                    .role(ConversationRole::User)
+                    .content(ContentBlock::Text(note))
+                    .build()
+                    .unwrap(),
+            );
+        }
+
         // Send with automatic retry for transient Bedrock errors (5xx, throttling).
         let response = 'send: {
             for attempt in 0..3u32 {

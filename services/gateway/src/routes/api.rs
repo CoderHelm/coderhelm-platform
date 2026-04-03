@@ -542,6 +542,50 @@ pub async fn get_run(
     })))
 }
 
+/// GET /api/runs/:run_id/traces — fetch per-pass trace records for a run.
+pub async fn get_run_traces(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    if state.config.traces_table_name.is_empty() {
+        return Ok(Json(json!({ "traces": [] })));
+    }
+
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.traces_table_name)
+        .key_condition_expression("team_id = :tid AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":tid", attr_s(&claims.team_id))
+        .expression_attribute_values(":prefix", attr_s(&format!("RUN#{run_id}#PASS#")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query traces: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let traces: Vec<Value> = result
+        .items()
+        .iter()
+        .map(|item| {
+            json!({
+                "pass": item.get("pass").and_then(|v| v.as_s().ok()),
+                "duration_ms": item.get("duration_ms").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
+                "input_tokens": item.get("input_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
+                "output_tokens": item.get("output_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
+                "cache_read_tokens": item.get("cache_read_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
+                "cache_write_tokens": item.get("cache_write_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
+                "error": item.get("error").and_then(|v| v.as_s().ok()),
+                "timestamp": item.get("timestamp").and_then(|v| v.as_s().ok()),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "traces": traces })))
+}
+
 /// GET /api/runs/:run_id/openspec — fetch the four openspec files from S3.
 pub async fn get_run_openspec(
     State(state): State<Arc<AppState>>,

@@ -100,6 +100,7 @@ async fn main() -> Result<(), Error> {
         )
         .route("/runs", get(routes::api::list_runs))
         .route("/runs/:run_id", get(routes::api::get_run))
+        .route("/runs/:run_id/traces", get(routes::api::get_run_traces))
         .route("/runs/:run_id/openspec", get(routes::api::get_run_openspec))
         .route("/runs/:run_id/retry", post(routes::api::retry_run))
         .route("/runs/:run_id/re-review", post(routes::api::re_review_run))

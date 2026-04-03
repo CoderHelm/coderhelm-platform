@@ -324,13 +324,21 @@ async fn run_passes(
     // --- Pass 1: Triage ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "triage").await?;
+    let pass_start = std::time::Instant::now();
+    let usage_before = usage.clone();
     let triage_result = triage::run(state, msg, &github, usage).await?;
+    write_pass_trace(state, &msg.team_id, run_id, "triage", pass_start, &usage_before, usage, None).await;
+    save_checkpoint(state, &msg.team_id, run_id, "triage", "", 0, usage).await;
     info!(run_id, "Triage complete");
 
     // --- Pass 2: Plan ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "plan").await?;
+    let pass_start = std::time::Instant::now();
+    let usage_before = usage.clone();
     let plan_result = plan::run(state, msg, &github, &triage_result, usage).await?;
+    write_pass_trace(state, &msg.team_id, run_id, "plan", pass_start, &usage_before, usage, None).await;
+    save_checkpoint(state, &msg.team_id, run_id, "plan", "", 0, usage).await;
     info!(run_id, "Plan complete");
 
     // --- Check: already done? ---
@@ -600,6 +608,8 @@ async fn run_passes(
         }
     }
 
+    let pass_start = std::time::Instant::now();
+    let usage_before = usage.clone();
     let impl_result = implement::run(
         state,
         msg,
@@ -612,6 +622,8 @@ async fn run_passes(
         usage,
     )
     .await?;
+    write_pass_trace(state, &msg.team_id, run_id, "implement", pass_start, &usage_before, usage, None).await;
+    save_checkpoint(state, &msg.team_id, run_id, "implement", &branch_name, 0, usage).await;
     info!(
         run_id,
         files = impl_result.files_modified.len(),
@@ -686,7 +698,10 @@ async fn run_passes(
         // Test gate: wait for CI if configured
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "test").await?;
+        let pass_start = std::time::Instant::now();
+        let usage_before = usage.clone();
         let test_result = test::run(state, msg, &github, &branch_name).await?;
+        write_pass_trace(state, &msg.team_id, run_id, &format!("test:{cycle}"), pass_start, &usage_before, usage, None).await;
         if !test_result.passed {
             info!(run_id, cycle, "CI failed, feeding back to implement");
             if cycle < max_review_cycles {
@@ -707,6 +722,8 @@ async fn run_passes(
         // Review
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "review").await?;
+        let pass_start = std::time::Instant::now();
+        let usage_before = usage.clone();
         let review_result = review::run(
             state,
             msg,
@@ -717,6 +734,8 @@ async fn run_passes(
             usage,
         )
         .await?;
+        write_pass_trace(state, &msg.team_id, run_id, &format!("review:{cycle}"), pass_start, &usage_before, usage, None).await;
+        save_checkpoint(state, &msg.team_id, run_id, "review", &branch_name, cycle as u8, usage).await;
         info!(run_id, cycle, passed = review_result.passed, "Review cycle complete");
 
         if review_result.passed || cycle == max_review_cycles {
@@ -744,7 +763,11 @@ async fn run_passes(
     // --- Security Audit (after review loop, before PR) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "security").await?;
+    let pass_start = std::time::Instant::now();
+    let usage_before = usage.clone();
     let security_result = security::run(state, msg, &github, &branch_name, usage).await?;
+    write_pass_trace(state, &msg.team_id, run_id, "security", pass_start, &usage_before, usage, None).await;
+    save_checkpoint(state, &msg.team_id, run_id, "security", &branch_name, 0, usage).await;
     info!(run_id, passed = security_result.passed, "Security audit complete");
 
     if !security_result.passed {
@@ -779,6 +802,8 @@ async fn run_passes(
     // --- Pass 6: Create PR ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "pr").await?;
+    let pass_start = std::time::Instant::now();
+    let usage_before = usage.clone();
     let pr_result = pr::run(
         state,
         msg,
@@ -789,6 +814,7 @@ async fn run_passes(
         usage,
     )
     .await?;
+    write_pass_trace(state, &msg.team_id, run_id, "pr", pass_start, &usage_before, usage, None).await;
     info!(run_id, pr_url = %pr_result.pr_url, "PR created");
 
     // Update run record with final state
