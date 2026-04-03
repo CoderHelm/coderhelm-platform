@@ -502,7 +502,10 @@ pub async fn mfa_setup(
         .authentication_result()
         .and_then(|r| r.access_token())
         .ok_or_else(|| {
-            error!("MFA setup: no access_token in auth result, challenge={:?}", auth_result.challenge_name());
+            error!(
+                "MFA setup: no access_token in auth result, challenge={:?}",
+                auth_result.challenge_name()
+            );
             StatusCode::UNAUTHORIZED
         })?;
 
@@ -562,7 +565,10 @@ pub async fn mfa_verify_setup(
         .authentication_result()
         .and_then(|r| r.access_token())
         .ok_or_else(|| {
-            error!("MFA verify: no access_token in auth result, challenge={:?}", auth_result.challenge_name());
+            error!(
+                "MFA verify: no access_token in auth result, challenge={:?}",
+                auth_result.challenge_name()
+            );
             StatusCode::UNAUTHORIZED
         })?;
 

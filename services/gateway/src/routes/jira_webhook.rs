@@ -410,14 +410,29 @@ async fn process_jira_payload(
         .table_name(&state.config.jira_events_table_name)
         .item("team_id", attr_s(team_id))
         .item("event_id", attr_s(&dedup_key))
-        .item("expires_at", aws_sdk_dynamodb::types::AttributeValue::N(dedup_ttl))
+        .item(
+            "expires_at",
+            aws_sdk_dynamodb::types::AttributeValue::N(dedup_ttl),
+        )
         .condition_expression("attribute_not_exists(team_id)")
         .send()
         .await;
 
     if dedup_result.is_err() {
-        info!(ticket_key, "Skipping — duplicate Forge event (dedup lock exists)");
-        log_jira_event(state, team_id, event_type, ticket_key, &title, "duplicate", None).await;
+        info!(
+            ticket_key,
+            "Skipping — duplicate Forge event (dedup lock exists)"
+        );
+        log_jira_event(
+            state,
+            team_id,
+            event_type,
+            ticket_key,
+            &title,
+            "duplicate",
+            None,
+        )
+        .await;
         return Ok(StatusCode::OK);
     }
 
