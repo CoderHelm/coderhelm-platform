@@ -222,7 +222,11 @@ async fn run_passes(
     // Resolve installation_id: if 0 (e.g. Jira-sourced tickets), look it up from team META
     if msg.installation_id == 0 {
         msg.installation_id = lookup_team_installation_id(state, &msg.team_id).await?;
-        info!(run_id, installation_id = msg.installation_id, "Resolved installation_id from team META");
+        info!(
+            run_id,
+            installation_id = msg.installation_id,
+            "Resolved installation_id from team META"
+        );
     }
 
     // Initialize GitHub client for this team
@@ -1472,9 +1476,7 @@ async fn lookup_team_installation_id(
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse::<u64>().ok())
         .filter(|&id| id > 0)
-        .ok_or_else(|| {
-            format!("No github_install_id found for team {team_id}").into()
-        })
+        .ok_or_else(|| format!("No github_install_id found for team {team_id}").into())
 }
 
 /// Post a comment on a Jira ticket via the Forge web trigger.
