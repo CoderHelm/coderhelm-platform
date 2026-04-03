@@ -6,10 +6,6 @@ use crate::WorkerState;
 
 /// Notification event types that trigger emails.
 pub enum EmailEvent {
-    Welcome {
-        org: String,
-        repo_count: usize,
-    },
     RunComplete {
         run_id: String,
         title: String,
@@ -38,11 +34,6 @@ pub async fn send_notification(
     event: EmailEvent,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (template_suffix, pref_field, template_data) = match &event {
-        EmailEvent::Welcome { org, repo_count } => (
-            "welcome",
-            "", // always send welcome — no preference toggle
-            json!({ "org": org, "repo_count": repo_count }).to_string(),
-        ),
         EmailEvent::RunComplete {
             run_id,
             title,

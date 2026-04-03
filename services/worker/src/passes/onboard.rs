@@ -1,7 +1,6 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{error, info, warn};
 
-use crate::clients::email::{self, EmailEvent};
 use crate::clients::github::GitHubClient;
 use crate::models::OnboardMessage;
 use crate::WorkerState;
