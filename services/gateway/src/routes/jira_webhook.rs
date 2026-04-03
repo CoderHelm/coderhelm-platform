@@ -284,15 +284,40 @@ async fn process_jira_payload(
         .unwrap_or("")
         .to_string();
 
-    let body_text = match issue
+    let raw_description = issue
         .get("fields")
         .and_then(|f| f.get("description"))
-        .or_else(|| issue.get("description"))
-    {
+        .or_else(|| issue.get("description"));
+
+    let desc_type = match raw_description {
+        Some(Value::String(_)) => "string",
+        Some(Value::Object(_)) => "object(ADF)",
+        Some(Value::Null) => "null",
+        Some(_) => "other",
+        None => "none",
+    };
+
+    info!(
+        team_id,
+        ticket_key = issue.get("key").and_then(|v| v.as_str()).unwrap_or("?"),
+        has_fields = issue.get("fields").is_some(),
+        has_description = raw_description.is_some(),
+        description_type = desc_type,
+        "Jira ticket description debug"
+    );
+
+    let body_text = match raw_description {
         Some(Value::String(s)) => s.clone(),
         Some(other) => extract_adf_text(other),
         None => String::new(),
     };
+
+    info!(
+        team_id,
+        body_len = body_text.len(),
+        body_preview = &body_text[..body_text.len().min(200)],
+        "Jira ticket body extracted"
+    );
 
     let ticket_key = issue
         .get("key")
