@@ -422,14 +422,14 @@ pub async fn change_password(
     Extension(claims): Extension<Claims>,
     Json(body): Json<ChangePasswordRequest>,
 ) -> Result<Json<Value>, StatusCode> {
-    // First authenticate with current password to get access token
+    // Verify current password via initiate_auth (succeeds even if MFA challenge is returned)
     let hash = cognito_secret_hash(
         &state.cognito_client_secret,
         &claims.email,
         &state.config.cognito_client_id,
     );
 
-    let auth_result = state
+    state
         .cognito
         .initiate_auth()
         .client_id(&state.config.cognito_client_id)
@@ -444,18 +444,14 @@ pub async fn change_password(
             StatusCode::UNAUTHORIZED
         })?;
 
-    let access_token = auth_result
-        .authentication_result()
-        .and_then(|r| r.access_token())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    // Change password
+    // Use admin API to set the new password (works regardless of MFA status)
     state
         .cognito
-        .change_password()
-        .access_token(access_token)
-        .previous_password(&body.current_password)
-        .proposed_password(&body.new_password)
+        .admin_set_user_password()
+        .user_pool_id(&state.config.cognito_user_pool_id)
+        .username(&claims.email)
+        .password(&body.new_password)
+        .permanent(true)
         .send()
         .await
         .map_err(|e| {
