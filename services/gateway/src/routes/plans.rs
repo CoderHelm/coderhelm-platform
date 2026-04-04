@@ -1134,6 +1134,30 @@ Note: Each task will go through Coderhelm's full pipeline: OpenSpec generation
 (proposal, design, tasks, spec documents), then implementation. Plan accordingly —
 each task becomes a full engineering effort with its own spec and PR."#;
 
+/// POST /api/plans/chat/token — Issue a short-lived JWT for the streaming endpoint.
+/// The frontend calls this before opening the SSE stream to stream.coderhelm.com.
+pub async fn stream_token(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    // Mint a short-lived token (5 minutes) scoped for streaming
+    let token = crate::auth::jwt::create_token(
+        &claims.sub,
+        &claims.team_id,
+        &claims.email,
+        &claims.role,
+        claims.github_login.as_deref(),
+        &state.secrets.jwt_secret,
+        300, // 5 minutes
+    )
+    .map_err(|e| {
+        error!("Failed to create stream token: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(json!({ "token": token })))
+}
+
 /// POST /api/plans/chat — AI-powered plan generation chat.
 pub async fn plan_chat(
     State(state): State<Arc<AppState>>,
@@ -1146,30 +1170,34 @@ pub async fn plan_chat(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Load org context to give the AI awareness of available repos
-    let org_context = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s("AGENTS#GLOBAL"))
-        .send()
-        .await
+    // Load org context, repo list, log analyzer flag, and enabled plugins in parallel
+    let (org_context_result, repo_list_result, allow_plan_log_analyzer, enabled_plugins) = tokio::join!(
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&claims.team_id))
+            .key("sk", attr_s("AGENTS#GLOBAL"))
+            .send(),
+        state
+            .dynamo
+            .query()
+            .table_name(&state.config.repos_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":pk", attr_s(&claims.team_id))
+            .expression_attribute_values(":prefix", attr_s("REPO#"))
+            .send(),
+        load_allow_plan_log_analyzer(&state, &claims.team_id),
+        load_enabled_plugins(&state, &claims.team_id),
+    );
+
+    let org_context = org_context_result
         .ok()
         .and_then(|r| r.item().cloned())
         .and_then(|i| i.get("content").and_then(|v| v.as_s().ok()).cloned())
         .unwrap_or_default();
 
-    // Load the list of repos the user has connected
-    let repo_list: Vec<String> = state
-        .dynamo
-        .query()
-        .table_name(&state.config.repos_table_name)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.team_id))
-        .expression_attribute_values(":prefix", attr_s("REPO#"))
-        .send()
-        .await
+    let repo_list: Vec<String> = repo_list_result
         .ok()
         .map(|r| {
             r.items()
@@ -1189,16 +1217,12 @@ pub async fn plan_chat(
         })
         .unwrap_or_default();
 
-    // Optional AWS Log Analyzer context for planning (off by default).
-    let allow_plan_log_analyzer = load_allow_plan_log_analyzer(&state, &claims.team_id).await;
+    // Conditionally load log analyzer context (depends on allow_plan_log_analyzer result)
     let log_analyzer_context = if allow_plan_log_analyzer {
         Some(load_log_analyzer_context(&state, &claims.team_id).await)
     } else {
         None
     };
-
-    // Load enabled plugins (MCP servers) for this team
-    let enabled_plugins = load_enabled_plugins(&state, &claims.team_id).await;
 
     // Build system prompt with org context and repo list
     let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
@@ -1251,14 +1275,22 @@ pub async fn plan_chat(
     let mut mcp_tools: Vec<McpToolDef> = Vec::new();
     let mcp_proxy_fn = &state.config.mcp_proxy_function_name;
     if !mcp_proxy_fn.is_empty() {
-        for (server_id, has_creds, _) in &enabled_plugins {
-            if !has_creds {
-                continue;
-            }
-            if let Some(cache) =
-                load_mcp_tool_cache(&state.s3, &state.config.bucket_name, server_id).await
-            {
-                for tool in cache {
+        let cache_futures: Vec<_> = enabled_plugins
+            .iter()
+            .filter(|(_, has_creds, _)| *has_creds)
+            .map(|(server_id, _, _)| {
+                let s3 = &state.s3;
+                let bucket = &state.config.bucket_name;
+                async move {
+                    let cache = load_mcp_tool_cache(s3, bucket, server_id).await;
+                    (server_id.clone(), cache)
+                }
+            })
+            .collect();
+        let caches = futures::future::join_all(cache_futures).await;
+        for (server_id, cache) in caches {
+            if let Some(tools) = cache {
+                for tool in tools {
                     mcp_tools.push(McpToolDef {
                         server_id: server_id.clone(),
                         name: tool["name"].as_str().unwrap_or("").to_string(),
@@ -1356,13 +1388,11 @@ pub async fn plan_chat(
         let output_message = match response.output() {
             Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg.clone(),
             _ => {
-                track_chat_tokens(
-                    &state,
-                    &claims.team_id,
-                    total_input_tokens,
-                    total_output_tokens,
-                )
-                .await;
+                let state_clone = state.clone();
+                let team_id_clone = claims.team_id.clone();
+                tokio::spawn(async move {
+                    track_chat_tokens(&state_clone, &team_id_clone, total_input_tokens, total_output_tokens).await;
+                });
                 return Ok(Json(json!({ "content": "" })));
             }
         };
@@ -1396,40 +1426,49 @@ pub async fn plan_chat(
                 })
                 .unwrap_or_default();
 
-            track_chat_tokens(
-                &state,
-                &claims.team_id,
-                total_input_tokens,
-                total_output_tokens,
-            )
-            .await;
+            {
+                let state_clone = state.clone();
+                let team_id_clone = claims.team_id.clone();
+                tokio::spawn(async move {
+                    track_chat_tokens(&state_clone, &team_id_clone, total_input_tokens, total_output_tokens).await;
+                });
+            }
             let servers: Vec<&str> = mcp_servers_used.iter().map(|s| s.as_str()).collect();
             return Ok(Json(json!({ "content": text, "mcp_servers": servers })));
         }
 
-        // Execute MCP tool calls via proxy Lambda
-        let mut tool_results = Vec::new();
-        for tool_use in &tool_uses {
-            let full_name = tool_use.name();
+        // Execute MCP tool calls via proxy Lambda (in parallel)
+        let tool_futures: Vec<_> = tool_uses.iter().map(|tool_use| {
+            let full_name = tool_use.name().to_string();
             let input: Value = document_to_json(tool_use.input());
-
-            let result = if let Some((server_id, tool_name)) = full_name.split_once("__") {
-                mcp_servers_used.insert(server_id.to_string());
-                // Find plugin credentials and invoke MCP proxy
-                match invoke_mcp_tool(&state, &claims.team_id, server_id, tool_name, &input).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        warn!(tool = full_name, error = %e, "MCP tool call failed");
-                        json!(format!("Error: {e}"))
+            let tool_use_id = tool_use.tool_use_id().to_string();
+            let state_ref = &state;
+            let team_id_ref = &claims.team_id;
+            async move {
+                let result = if let Some((server_id, tool_name)) = full_name.split_once("__") {
+                    match invoke_mcp_tool(state_ref, team_id_ref, server_id, tool_name, &input).await {
+                        Ok(result) => (Some(server_id.to_string()), result),
+                        Err(e) => {
+                            warn!(tool = full_name.as_str(), error = %e, "MCP tool call failed");
+                            (Some(server_id.to_string()), json!(format!("Error: {e}")))
+                        }
                     }
-                }
-            } else {
-                json!(format!("Unknown tool: {full_name}"))
-            };
+                } else {
+                    (None, json!(format!("Unknown tool: {full_name}")))
+                };
+                (tool_use_id, result.0, result.1)
+            }
+        }).collect();
+        let tool_results_raw = futures::future::join_all(tool_futures).await;
 
+        let mut tool_results = Vec::new();
+        for (tool_use_id, server_id, result) in tool_results_raw {
+            if let Some(sid) = server_id {
+                mcp_servers_used.insert(sid);
+            }
             tool_results.push(aws_sdk_bedrockruntime::types::ContentBlock::ToolResult(
                 aws_sdk_bedrockruntime::types::ToolResultBlock::builder()
-                    .tool_use_id(tool_use.tool_use_id())
+                    .tool_use_id(tool_use_id)
                     .content(aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(
                         serde_json::to_string(&result).unwrap_or_default(),
                     ))
@@ -1469,18 +1508,503 @@ pub async fn plan_chat(
         })
         .unwrap_or_default();
 
-    track_chat_tokens(
-        &state,
-        &claims.team_id,
-        total_input_tokens,
-        total_output_tokens,
-    )
-    .await;
+    {
+        let state_clone = state.clone();
+        let team_id_clone = claims.team_id.clone();
+        tokio::spawn(async move {
+            track_chat_tokens(&state_clone, &team_id_clone, total_input_tokens, total_output_tokens).await;
+        });
+    }
     let servers: Vec<&str> = mcp_servers_used.iter().map(|s| s.as_str()).collect();
     Ok(Json(json!({ "content": text, "mcp_servers": servers })))
 }
 
-/// Track plan chat token usage in analytics.
+// ---------------------------------------------------------------------------
+// Streaming variant: POST /api/plans/chat/stream → SSE
+// ---------------------------------------------------------------------------
+
+/// Send a single SSE event formatted as `event: {type}\ndata: {json}\n\n`.
+fn sse_event(event_type: &str, data: Value) -> Result<axum::response::sse::Event, std::convert::Infallible> {
+    Ok(axum::response::sse::Event::default()
+        .event(event_type)
+        .data(serde_json::to_string(&data).unwrap_or_default()))
+}
+
+pub async fn plan_chat_stream(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<
+    axum::response::sse::Sse<std::pin::Pin<Box<dyn futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send>>>,
+    StatusCode,
+> {
+    // Validate Bearer token (issued by /api/plans/chat/token)
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let claims = crate::auth::jwt::validate_token(token, &state.secrets.jwt_secret)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let messages_input = body["messages"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
+    if messages_input.is_empty() || messages_input.len() > 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // --- Same context loading as plan_chat (parallelized) ---
+    let (org_context_result, repo_list_result, allow_plan_log_analyzer, enabled_plugins) = tokio::join!(
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&claims.team_id))
+            .key("sk", attr_s("AGENTS#GLOBAL"))
+            .send(),
+        state
+            .dynamo
+            .query()
+            .table_name(&state.config.repos_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":pk", attr_s(&claims.team_id))
+            .expression_attribute_values(":prefix", attr_s("REPO#"))
+            .send(),
+        load_allow_plan_log_analyzer(&state, &claims.team_id),
+        load_enabled_plugins(&state, &claims.team_id),
+    );
+
+    let org_context = org_context_result
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .and_then(|i| i.get("content").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default();
+
+    let repo_list: Vec<String> = repo_list_result
+        .ok()
+        .map(|r| {
+            r.items()
+                .iter()
+                .filter(|item| {
+                    item.get("enabled")
+                        .and_then(|v| v.as_bool().ok())
+                        .copied()
+                        .unwrap_or(false)
+                })
+                .filter_map(|item| {
+                    item.get("repo_name")
+                        .and_then(|v| v.as_s().ok())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let log_analyzer_context = if allow_plan_log_analyzer {
+        Some(load_log_analyzer_context(&state, &claims.team_id).await)
+    } else {
+        None
+    };
+
+    let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
+    if !org_context.is_empty() {
+        system_prompt.push_str(&format!(
+            "\n\nThe user's organization context:\n{org_context}"
+        ));
+    }
+    if !repo_list.is_empty() {
+        system_prompt.push_str(&format!(
+            "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}",
+            repo_list
+                .iter()
+                .map(|r| format!("- {r}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if !enabled_plugins.is_empty() {
+        let plugin_lines: Vec<String> = enabled_plugins
+            .iter()
+            .map(|(id, has_creds, custom_prompt)| {
+                let mut line = if *has_creds {
+                    format!("- {id} (connected)")
+                } else {
+                    format!("- {id} (enabled, needs credentials)")
+                };
+                if let Some(prompt) = custom_prompt {
+                    line.push_str(&format!(" — {prompt}"));
+                }
+                line
+            })
+            .collect();
+        system_prompt.push_str(&format!(
+            "\n\nYou have tool-call access to the following MCP servers right now. \
+             Use them proactively when the user asks about anything these servers \
+             could answer:\n{}",
+            plugin_lines.join("\n")
+        ));
+    }
+    if let Some(context) = log_analyzer_context.filter(|c| !c.is_empty()) {
+        system_prompt.push_str(&format!(
+            "\n\nAWS Log Analyzer context:\n{context}"
+        ));
+    }
+
+    // Load MCP tool definitions
+    let mut mcp_tools: Vec<McpToolDef> = Vec::new();
+    let mcp_proxy_fn = &state.config.mcp_proxy_function_name;
+    if !mcp_proxy_fn.is_empty() {
+        let cache_futures: Vec<_> = enabled_plugins
+            .iter()
+            .filter(|(_, has_creds, _)| *has_creds)
+            .map(|(server_id, _, _)| {
+                let s3 = &state.s3;
+                let bucket = &state.config.bucket_name;
+                async move {
+                    let cache = load_mcp_tool_cache(s3, bucket, server_id).await;
+                    (server_id.clone(), cache)
+                }
+            })
+            .collect();
+        let caches = futures::future::join_all(cache_futures).await;
+        for (server_id, cache) in caches {
+            if let Some(tools) = cache {
+                for tool in tools {
+                    mcp_tools.push(McpToolDef {
+                        server_id: server_id.clone(),
+                        name: tool["name"].as_str().unwrap_or("").to_string(),
+                        description: tool["description"].as_str().unwrap_or("").to_string(),
+                        input_schema: tool["inputSchema"].clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Convert messages to Bedrock format
+    let mut bedrock_messages = Vec::new();
+    for msg in messages_input {
+        let role_str = msg["role"].as_str().unwrap_or("user");
+        let content = msg["content"].as_str().unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+        let role = match role_str {
+            "assistant" => aws_sdk_bedrockruntime::types::ConversationRole::Assistant,
+            _ => aws_sdk_bedrockruntime::types::ConversationRole::User,
+        };
+        let message = aws_sdk_bedrockruntime::types::Message::builder()
+            .role(role)
+            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(
+                content.to_string(),
+            ))
+            .build()
+            .map_err(|e| {
+                error!("Failed to build Bedrock message: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        bedrock_messages.push(message);
+    }
+
+    let tool_config = if !mcp_tools.is_empty() {
+        let specs: Vec<aws_sdk_bedrockruntime::types::Tool> = mcp_tools
+            .iter()
+            .map(|t| {
+                aws_sdk_bedrockruntime::types::Tool::ToolSpec(
+                    aws_sdk_bedrockruntime::types::ToolSpecification::builder()
+                        .name(format!("{}__{}", t.server_id, t.name))
+                        .description(&t.description)
+                        .input_schema(aws_sdk_bedrockruntime::types::ToolInputSchema::Json(
+                            json_to_document(&t.input_schema),
+                        ))
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        Some(
+            aws_sdk_bedrockruntime::types::ToolConfiguration::builder()
+                .set_tools(Some(specs))
+                .build()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+
+    // Move everything into the streaming task
+    let team_id = claims.team_id.clone();
+    let model_id = state.config.model_id.clone();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::response::sse::Event, std::convert::Infallible>>(64);
+
+    // Spawn the agentic streaming loop
+    tokio::spawn(async move {
+        let max_turns = 5;
+        let mut total_input_tokens: u64 = 0;
+        let mut total_output_tokens: u64 = 0;
+        let mut mcp_servers_used: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for turn in 0..max_turns {
+            // Build request — use converse_stream for streaming
+            let mut req = state
+                .bedrock
+                .converse_stream()
+                .model_id(&model_id)
+                .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
+                    system_prompt.clone(),
+                ))
+                .set_messages(Some(bedrock_messages.clone()));
+
+            if let Some(ref tc) = tool_config {
+                req = req.tool_config(tc.clone());
+            }
+
+            let response = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Bedrock converse_stream failed: {e}");
+                    let _ = tx.send(sse_event("error", json!({ "message": format!("AI service error: {e}") }))).await;
+                    return;
+                }
+            };
+
+            let mut event_stream = response.stream;
+
+            // Track content blocks for tool use detection
+            let mut current_tool_uses: Vec<(String, String, String)> = Vec::new(); // (tool_use_id, name, input_json)
+            let mut active_tool_id = String::new();
+            let mut active_tool_name = String::new();
+            let mut active_tool_input = String::new();
+            let mut stop_reason_is_tool_use = false;
+
+            // Process stream events
+            loop {
+                match event_stream.recv().await {
+                    Ok(Some(event)) => {
+                        match event {
+                            aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockStart(e) => {
+                                if let Some(start) = e.start() {
+                                    match start {
+                                        aws_sdk_bedrockruntime::types::ContentBlockStart::ToolUse(tu) => {
+                                            active_tool_id = tu.tool_use_id().to_string();
+                                            active_tool_name = tu.name().to_string();
+                                            active_tool_input.clear();
+
+                                            let (server, display_name) = if active_tool_name.contains("__") {
+                                                let parts: Vec<&str> = active_tool_name.splitn(2, "__").collect();
+                                                (Some(parts[0].to_string()), parts[1].to_string())
+                                            } else {
+                                                (None, active_tool_name.clone())
+                                            };
+
+                                            let mut data = json!({
+                                                "id": active_tool_id,
+                                                "name": display_name,
+                                            });
+                                            if let Some(s) = &server {
+                                                data["server"] = json!(s);
+                                            }
+                                            let _ = tx.send(sse_event("tool_start", data)).await;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockDelta(e) => {
+                                if let Some(delta) = e.delta() {
+                                    match delta {
+                                        aws_sdk_bedrockruntime::types::ContentBlockDelta::Text(text) => {
+                                            let _ = tx.send(sse_event("text_delta", json!({ "text": text }))).await;
+                                        }
+                                        aws_sdk_bedrockruntime::types::ContentBlockDelta::ToolUse(tu) => {
+                                            let input = tu.input();
+                                            active_tool_input.push_str(input);
+                                            let _ = tx.send(sse_event("tool_input_delta", json!({
+                                                "id": active_tool_id,
+                                                "partial_json": input,
+                                            }))).await;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockStop(_) => {
+                                if !active_tool_id.is_empty() {
+                                    current_tool_uses.push((
+                                        active_tool_id.clone(),
+                                        active_tool_name.clone(),
+                                        active_tool_input.clone(),
+                                    ));
+                                    active_tool_id.clear();
+                                    active_tool_name.clear();
+                                    active_tool_input.clear();
+                                }
+                            }
+                            aws_sdk_bedrockruntime::types::ConverseStreamOutput::MessageStop(e) => {
+                                let reason = e.stop_reason();
+                                    stop_reason_is_tool_use = matches!(
+                                        reason,
+                                        aws_sdk_bedrockruntime::types::StopReason::ToolUse
+                                    );
+                            }
+                            aws_sdk_bedrockruntime::types::ConverseStreamOutput::Metadata(e) => {
+                                if let Some(usage) = e.usage() {
+                                    total_input_tokens += usage.input_tokens() as u64;
+                                    total_output_tokens += usage.output_tokens() as u64;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        error!("Stream error: {e}");
+                        let _ = tx.send(sse_event("error", json!({ "message": format!("Stream error: {e}") }))).await;
+                        return;
+                    }
+                }
+            }
+
+            // If no tool use, we're done
+            if !stop_reason_is_tool_use || current_tool_uses.is_empty() {
+                let _ = tx.send(sse_event("usage", json!({
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "turns": turn + 1,
+                }))).await;
+                let _ = tx.send(sse_event("done", json!({}))).await;
+
+                let state_clone = state.clone();
+                let team_id_clone = team_id.clone();
+                tokio::spawn(async move {
+                    track_chat_tokens(&state_clone, &team_id_clone, total_input_tokens, total_output_tokens).await;
+                });
+                return;
+            }
+
+            // Build assistant message with text + tool use blocks for conversation history
+            let mut assistant_blocks: Vec<aws_sdk_bedrockruntime::types::ContentBlock> = Vec::new();
+            // We don't have the text from streaming readily, but Bedrock needs the assistant message
+            // in the history. We reconstruct it from the tool uses.
+            for (tu_id, tu_name, tu_input) in &current_tool_uses {
+                let input_doc: Document = match serde_json::from_str::<Value>(tu_input) {
+                    Ok(v) => json_to_document(&v),
+                    Err(_) => Document::Object(Default::default()),
+                };
+                assistant_blocks.push(aws_sdk_bedrockruntime::types::ContentBlock::ToolUse(
+                    aws_sdk_bedrockruntime::types::ToolUseBlock::builder()
+                        .tool_use_id(tu_id)
+                        .name(tu_name)
+                        .input(input_doc)
+                        .build()
+                        .unwrap(),
+                ));
+            }
+
+            let assistant_msg = aws_sdk_bedrockruntime::types::Message::builder()
+                .role(aws_sdk_bedrockruntime::types::ConversationRole::Assistant)
+                .set_content(Some(assistant_blocks))
+                .build()
+                .unwrap();
+            bedrock_messages.push(assistant_msg);
+
+            // Execute MCP tool calls in parallel and build tool results
+            let tool_futures: Vec<_> = current_tool_uses.iter().map(|(tu_id, tu_name, tu_input)| {
+                let input: Value = serde_json::from_str(tu_input).unwrap_or(json!({}));
+                let state_ref = &state;
+                let team_id_ref = &team_id;
+                let tu_id = tu_id.clone();
+                let tu_name = tu_name.clone();
+                async move {
+                    let (server_id_opt, result) = if let Some((server_id, tool_name)) = tu_name.split_once("__") {
+                        match invoke_mcp_tool(state_ref, team_id_ref, server_id, tool_name, &input).await {
+                            Ok(result) => (Some(server_id.to_string()), result),
+                            Err(e) => {
+                                warn!(tool = tu_name.as_str(), error = %e, "MCP tool call failed");
+                                (Some(server_id.to_string()), json!(format!("Error: {e}")))
+                            }
+                        }
+                    } else {
+                        (None, json!(format!("Unknown tool: {tu_name}")))
+                    };
+                    (tu_id, tu_name, server_id_opt, result)
+                }
+            }).collect();
+            let tool_results_raw = futures::future::join_all(tool_futures).await;
+
+            let mut tool_results = Vec::new();
+            for (tu_id, tu_name, server_id_opt, result) in tool_results_raw {
+                if let Some(sid) = server_id_opt {
+                    mcp_servers_used.insert(sid);
+                    let summary = summarize_tool_result(&result);
+                    let _ = tx.send(sse_event("tool_result", json!({
+                        "id": tu_id,
+                        "status": "success",
+                        "summary": summary,
+                    }))).await;
+                } else {
+                    let _ = tx.send(sse_event("tool_result", json!({
+                        "id": tu_id,
+                        "status": "error",
+                        "summary": format!("Unknown tool: {tu_name}"),
+                    }))).await;
+                }
+
+                tool_results.push(aws_sdk_bedrockruntime::types::ContentBlock::ToolResult(
+                    aws_sdk_bedrockruntime::types::ToolResultBlock::builder()
+                        .tool_use_id(tu_id.as_str())
+                        .content(aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(
+                            serde_json::to_string(&result).unwrap_or_default(),
+                        ))
+                        .build()
+                        .unwrap(),
+                ));
+            }
+
+            bedrock_messages.push(
+                aws_sdk_bedrockruntime::types::Message::builder()
+                    .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
+                    .set_content(Some(tool_results))
+                    .build()
+                    .unwrap(),
+            );
+
+            info!(turn = turn + 1, "Streaming plan chat tool use turn complete");
+        }
+
+        // Hit max turns
+        let _ = tx.send(sse_event("usage", json!({
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "turns": max_turns,
+        }))).await;
+        let _ = tx.send(sse_event("done", json!({}))).await;
+        let state_clone = state.clone();
+        let team_id_clone = team_id.clone();
+        tokio::spawn(async move {
+            track_chat_tokens(&state_clone, &team_id_clone, total_input_tokens, total_output_tokens).await;
+        });
+    });
+
+    let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send>> =
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+    Ok(axum::response::sse::Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text(""),
+    ))
+}
+
+/// Produce a short summary of a tool result for the UI.
+fn summarize_tool_result(result: &Value) -> String {
+    let s = result.to_string();
+    if s.len() <= 80 {
+        s
+    } else {
+        format!("{}…", &s[..77])
+    }
+}
 async fn track_chat_tokens(state: &AppState, team_id: &str, input_tokens: u64, output_tokens: u64) {
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     for period in &[month.as_str(), "ALL_TIME"] {

@@ -9,6 +9,7 @@ import { MonitoringStack } from "../lib/monitoring-stack";
 import { EmailStack } from "../lib/email-stack";
 import { BillingStack } from "../lib/billing-stack";
 import { LogAnalyzerStack } from "../lib/log-analyzer-stack";
+import { StreamingStack } from "../lib/streaming-stack";
 
 const app = new cdk.App();
 
@@ -116,4 +117,18 @@ new LogAnalyzerStack(app, `${prefix}-log-analyzer`, {
   stage,
   awsInsightsTable: database.awsInsightsTable,
   plansTable: database.plansTable,
+});
+
+// --- Streaming (SSE via Lambda Function URL + Web Adapter) ---
+
+new StreamingStack(app, `${prefix}-streaming`, {
+  env,
+  stage,
+  table: database.table,
+  plansTable: database.plansTable,
+  reposTable: database.reposTable,
+  settingsTable: database.settingsTable,
+  mcpConfigsTable: database.mcpConfigsTable,
+  bucket: storage.bucket,
+  mcpProxyFunction: api.mcpProxyFunction,
 });

@@ -265,6 +265,8 @@ async fn main() -> Result<(), Error> {
             get(routes::plans::list_plans).post(routes::plans::create_plan),
         )
         .route("/plans/chat", post(routes::plans::plan_chat))
+        .route("/plans/chat/stream", post(routes::plans::plan_chat_stream))
+        .route("/plans/chat/token", post(routes::plans::stream_token))
         .route(
             "/plans/:plan_id",
             get(routes::plans::get_plan)
