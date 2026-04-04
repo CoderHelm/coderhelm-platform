@@ -173,9 +173,9 @@ pub async fn run(
     };
     let opts = llm::ConverseOptions {
         max_turns: match complexity {
-            "simple" => 15,
-            "medium" => 30,
-            _ => 40,
+            "simple" => 25,
+            "medium" => 35,
+            _ => 50,
         },
         max_tokens: 16384,
     };
