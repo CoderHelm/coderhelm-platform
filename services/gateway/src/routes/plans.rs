@@ -1082,6 +1082,488 @@ fn task_from_item(
     })
 }
 
+// ─── Plan Templates ───────────────────────────────────────────────────
+
+fn validate_template_id(id: &str) -> Result<(), StatusCode> {
+    if id.is_empty() || id.len() > 30 || !id.chars().all(|c| c.is_alphanumeric()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+fn template_from_item(
+    item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> Value {
+    let tags: Value = item
+        .get("tags")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(json!([]));
+
+    let task_count = item
+        .get("task_templates")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    json!({
+        "template_id": item.get("template_id").and_then(|v| v.as_s().ok()),
+        "title": item.get("title").and_then(|v| v.as_s().ok()),
+        "description": item.get("description").and_then(|v| v.as_s().ok()),
+        "category": item.get("category").and_then(|v| v.as_s().ok()),
+        "tags": tags,
+        "task_count": task_count,
+        "usage_count": item.get("usage_count").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
+        "created_by": item.get("created_by").and_then(|v| v.as_s().ok()),
+        "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
+    })
+}
+
+fn template_full_from_item(
+    item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> Value {
+    let tags: Value = item
+        .get("tags")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(json!([]));
+
+    let task_templates: Value = item
+        .get("task_templates")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(json!([]));
+
+    json!({
+        "template_id": item.get("template_id").and_then(|v| v.as_s().ok()),
+        "title": item.get("title").and_then(|v| v.as_s().ok()),
+        "description": item.get("description").and_then(|v| v.as_s().ok()),
+        "category": item.get("category").and_then(|v| v.as_s().ok()),
+        "tags": tags,
+        "task_templates": task_templates,
+        "usage_count": item.get("usage_count").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
+        "created_by": item.get("created_by").and_then(|v| v.as_s().ok()),
+        "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
+        "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
+    })
+}
+
+/// GET /api/plans/templates — list templates for the team (paginated).
+pub async fn list_templates(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, StatusCode> {
+    let limit: i32 = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
+        .min(100);
+
+    let mut query = state
+        .dynamo
+        .query()
+        .table_name(&state.config.plans_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
+        .expression_attribute_values(":prefix", attr_s("TEMPLATE#"))
+        .scan_index_forward(false)
+        .limit(limit);
+
+    if let Some(cursor) = params.get("cursor").filter(|c| !c.is_empty()) {
+        let lek = std::collections::HashMap::from([
+            ("pk".to_string(), attr_s(&claims.team_id)),
+            ("sk".to_string(), attr_s(cursor)),
+        ]);
+        query = query.set_exclusive_start_key(Some(lek));
+    }
+
+    let result = query.send().await.map_err(|e| {
+        error!("Failed to query templates: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let templates: Vec<Value> = result.items().iter().map(template_from_item).collect();
+
+    let next_cursor = result
+        .last_evaluated_key()
+        .and_then(|k| k.get("sk"))
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.to_string());
+
+    Ok(Json(json!({
+        "templates": templates,
+        "next_cursor": next_cursor,
+    })))
+}
+
+/// POST /api/plans/templates — create a new template.
+pub async fn create_template(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_active_subscription(&state, &claims.team_id).await?;
+
+    let title = body["title"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    if title.is_empty() || title.len() > 200 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let description = body["description"].as_str().unwrap_or("");
+    let category = body["category"].as_str().unwrap_or("");
+
+    let tags_json = body["tags"]
+        .as_array()
+        .map(|arr| {
+            let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+            serde_json::to_string(&strs).unwrap_or_else(|_| "[]".to_string())
+        })
+        .unwrap_or_else(|| "[]".to_string());
+
+    let task_templates_json = body["task_templates"]
+        .as_array()
+        .map(|arr| serde_json::to_string(arr).unwrap_or_else(|_| "[]".to_string()))
+        .unwrap_or_else(|| "[]".to_string());
+
+    let template_id = ulid::Ulid::new().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let sk = format!("TEMPLATE#{template_id}");
+
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.plans_table_name)
+        .item("pk", attr_s(&claims.team_id))
+        .item("sk", attr_s(&sk))
+        .item("template_id", attr_s(&template_id))
+        .item("title", attr_s(title))
+        .item("description", attr_s(description))
+        .item("category", attr_s(category))
+        .item("tags", attr_s(&tags_json))
+        .item("task_templates", attr_s(&task_templates_json))
+        .item("usage_count", attr_n(0))
+        .item("created_by", attr_s(&claims.display_name()))
+        .item("created_at", attr_s(&now))
+        .item("updated_at", attr_s(&now))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to create template: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(json!({ "template_id": template_id })))
+}
+
+/// POST /api/plans/templates/from-plan/:plan_id — create a template from an existing plan.
+pub async fn create_template_from_plan(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(plan_id): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_active_subscription(&state, &claims.team_id).await?;
+    validate_plan_id(&plan_id)?;
+
+    // Fetch the plan + tasks
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.plans_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
+        .expression_attribute_values(":prefix", attr_s(&format!("PLAN#{plan_id}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query plan for template: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let items = result.items();
+    if items.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let mut plan_title = String::new();
+    let mut plan_description = String::new();
+    let mut task_templates: Vec<Value> = Vec::new();
+
+    for item in items {
+        let sk = item
+            .get("sk")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        if sk.contains("#TASK#") {
+            let task = json!({
+                "title": item.get("title").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+                "description": item.get("description").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+                "acceptance_criteria": item.get("acceptance_criteria").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+                "repo": item.get("repo").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+                "order": item.get("task_order").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
+            });
+            task_templates.push(task);
+        } else {
+            plan_title = item
+                .get("title")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            plan_description = item
+                .get("description")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+        }
+    }
+
+    // Sort tasks by order
+    task_templates.sort_by_key(|t| t["order"].as_u64().unwrap_or(0));
+
+    // Allow body overrides
+    let title = body["title"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or(plan_title);
+    if title.is_empty() || title.len() > 200 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let description = body["description"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or(plan_description);
+    let category = body["category"].as_str().unwrap_or("");
+
+    let tags_json = body["tags"]
+        .as_array()
+        .map(|arr| {
+            let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+            serde_json::to_string(&strs).unwrap_or_else(|_| "[]".to_string())
+        })
+        .unwrap_or_else(|| "[]".to_string());
+
+    let task_templates_json =
+        serde_json::to_string(&task_templates).unwrap_or_else(|_| "[]".to_string());
+
+    let template_id = ulid::Ulid::new().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let sk = format!("TEMPLATE#{template_id}");
+
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.plans_table_name)
+        .item("pk", attr_s(&claims.team_id))
+        .item("sk", attr_s(&sk))
+        .item("template_id", attr_s(&template_id))
+        .item("title", attr_s(&title))
+        .item("description", attr_s(&description))
+        .item("category", attr_s(category))
+        .item("tags", attr_s(&tags_json))
+        .item("task_templates", attr_s(&task_templates_json))
+        .item("usage_count", attr_n(0))
+        .item("created_by", attr_s(&claims.display_name()))
+        .item("created_at", attr_s(&now))
+        .item("updated_at", attr_s(&now))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to create template from plan: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(json!({ "template_id": template_id })))
+}
+
+/// GET /api/plans/templates/:template_id — get full template including task_templates.
+pub async fn get_template(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(template_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    validate_template_id(&template_id)?;
+
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.plans_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&format!("TEMPLATE#{template_id}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to get template: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(template_full_from_item(item)))
+}
+
+/// DELETE /api/plans/templates/:template_id — delete a template.
+pub async fn delete_template(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(template_id): axum::extract::Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    validate_template_id(&template_id)?;
+
+    state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.plans_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&format!("TEMPLATE#{template_id}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to delete template: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(StatusCode::OK)
+}
+
+/// POST /api/plans/templates/:template_id/use — create a plan from a template.
+pub async fn use_template(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(template_id): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    super::billing::require_active_subscription(&state, &claims.team_id).await?;
+    validate_template_id(&template_id)?;
+
+    // Fetch the template
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.plans_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&format!("TEMPLATE#{template_id}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to get template for use: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
+
+    let tmpl_title = item
+        .get("title")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let tmpl_description = item
+        .get("description")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let task_templates: Vec<Value> = item
+        .get("task_templates")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    // Allow body overrides
+    let title = body["title"].as_str().unwrap_or(&tmpl_title);
+    let description = body["description"].as_str().unwrap_or(&tmpl_description);
+    let repo = body["repo"].as_str().unwrap_or("");
+    let destination = match body["destination"].as_str() {
+        Some("jira") => "jira",
+        _ => "github",
+    };
+
+    // Create the plan
+    let plan_id = ulid::Ulid::new().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let plan_sk = format!("PLAN#{plan_id}");
+
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.plans_table_name)
+        .item("pk", attr_s(&claims.team_id))
+        .item("sk", attr_s(&plan_sk))
+        .item("plan_id", attr_s(&plan_id))
+        .item("title", attr_s(title))
+        .item("description", attr_s(description))
+        .item("repo", attr_s(repo))
+        .item("destination", attr_s(destination))
+        .item("status", attr_s("draft"))
+        .item("task_count", attr_n(task_templates.len()))
+        .item("created_at", attr_s(&now))
+        .item("updated_at", attr_s(&now))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to create plan from template: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Create tasks from task_templates
+    for (i, task) in task_templates.iter().enumerate() {
+        let task_title = task["title"].as_str().unwrap_or("Untitled task");
+        let task_desc = task["description"].as_str().unwrap_or("");
+        let task_criteria = task["acceptance_criteria"].as_str().unwrap_or("");
+        let task_repo = task["repo"].as_str().unwrap_or(repo);
+        let order = task["order"].as_u64().unwrap_or(i as u64);
+        let task_id = ulid::Ulid::new().to_string();
+        let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
+
+        let mut put = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.plans_table_name)
+            .item("pk", attr_s(&claims.team_id))
+            .item("sk", attr_s(&task_sk))
+            .item("plan_id", attr_s(&plan_id))
+            .item("task_id", attr_s(&task_id))
+            .item("title", attr_s(task_title))
+            .item("description", attr_s(task_desc))
+            .item("acceptance_criteria", attr_s(task_criteria))
+            .item("status", attr_s("draft"))
+            .item("task_order", attr_n(order))
+            .item("created_at", attr_s(&now));
+
+        if !task_repo.is_empty() {
+            put = put.item("repo", attr_s(task_repo));
+        }
+        if !destination.is_empty() {
+            put = put.item("destination", attr_s(destination));
+        }
+
+        put.send().await.map_err(|e| {
+            error!("Failed to create task from template: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    // Increment usage_count on the template
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.plans_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&format!("TEMPLATE#{template_id}")))
+        .update_expression("ADD usage_count :one")
+        .expression_attribute_values(":one", attr_n(1))
+        .send()
+        .await
+        .ok();
+
+    // Track plan usage
+    track_plan_usage(&state, &claims.team_id).await;
+
+    Ok(Json(json!({ "plan_id": plan_id })))
+}
+
 // ─── Plan Chat ────────────────────────────────────────────────────────
 
 const PLAN_CHAT_SYSTEM: &str = r#"You are a planning assistant for Coderhelm, an autonomous AI coding agent.
@@ -1120,6 +1602,8 @@ When generating the final plan, output it in this EXACT JSON format inside a cod
 Rules:
 - A plan can span MULTIPLE repositories. The top-level "repo" is the primary repo.
 - Each task has its own optional "repo" field — use it when a task targets a different repo than the top-level one.
+- When the user's request spans multiple repositories (e.g., frontend and backend), create separate tasks targeting each repo using the "repo" field.
+- Each task in the plan can target a different repo. Use this to create cross-repo plans.
 - Tasks should be independently implementable (one PR each)
 - Order matters — Coderhelm works on them sequentially
 - Each task title should be a GitHub issue title (imperative, max 60 chars)
@@ -1266,7 +1750,7 @@ pub async fn plan_chat(
         // Limit to 50 repos to keep prompt size reasonable
         let repos_for_prompt: Vec<_> = repo_list.iter().take(50).collect();
         system_prompt.push_str(&format!(
-            "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}",
+            "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}\n\nIf the user's request involves changes across multiple repos, set the \"repo\" field on each task to the appropriate repository. For example, a frontend + backend change should produce separate tasks each targeting its own repo.",
             repos_for_prompt
                 .iter()
                 .map(|r| format!("- {r}"))
@@ -1687,7 +2171,7 @@ pub async fn plan_chat_stream(
         // Limit to 50 repos to keep prompt size reasonable
         let repos_for_prompt: Vec<_> = repo_list.iter().take(50).collect();
         system_prompt.push_str(&format!(
-            "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}",
+            "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}\n\nIf the user's request involves changes across multiple repos, set the \"repo\" field on each task to the appropriate repository. For example, a frontend + backend change should produce separate tasks each targeting its own repo.",
             repos_for_prompt
                 .iter()
                 .map(|r| format!("- {r}"))

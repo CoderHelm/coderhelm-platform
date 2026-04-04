@@ -273,6 +273,23 @@ async fn main() -> Result<(), Error> {
         .route("/plans/chat", post(routes::plans::plan_chat))
         .route("/plans/chat/stream", post(routes::plans::plan_chat_stream))
         .route("/plans/chat/token", post(routes::plans::stream_token))
+        // Template endpoints (must be before /plans/:plan_id to avoid wildcard capture)
+        .route(
+            "/plans/templates",
+            get(routes::plans::list_templates).post(routes::plans::create_template),
+        )
+        .route(
+            "/plans/templates/from-plan/:plan_id",
+            post(routes::plans::create_template_from_plan),
+        )
+        .route(
+            "/plans/templates/:template_id",
+            get(routes::plans::get_template).delete(routes::plans::delete_template),
+        )
+        .route(
+            "/plans/templates/:template_id/use",
+            post(routes::plans::use_template),
+        )
         .route(
             "/plans/:plan_id",
             get(routes::plans::get_plan)
