@@ -61,7 +61,10 @@ pub async fn run(
         &tools,
         &executor,
         usage,
-        llm::ConverseOptions { max_turns: 10, max_tokens: 4096 },
+        llm::ConverseOptions {
+            max_turns: 10,
+            max_tokens: 4096,
+        },
     )
     .await?;
 

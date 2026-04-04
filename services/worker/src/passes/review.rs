@@ -71,7 +71,10 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
         &tools,
         &executor,
         usage,
-        llm::ConverseOptions { max_turns: 15, max_tokens: 8192 },
+        llm::ConverseOptions {
+            max_turns: 15,
+            max_tokens: 8192,
+        },
     )
     .await?;
     info!("Review result: {}", &response[..response.len().min(200)]);

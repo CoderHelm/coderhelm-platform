@@ -62,7 +62,8 @@ pub async fn run(
     );
 
     let complexity_guidance = match triage.complexity.as_str() {
-        "simple" => r#"## Complexity: SIMPLE (1-3 files)
+        "simple" => {
+            r#"## Complexity: SIMPLE (1-3 files)
 
 This is a simple change. Be extremely efficient:
 - Use 1-2 `search_code` calls to locate the relevant file(s)
@@ -70,22 +71,27 @@ This is a simple change. Be extremely efficient:
 - Do NOT call `read_tree` or browse the project structure
 - Do NOT read unrelated files "for context"
 - You should need 3-5 tool calls total, then output the plan
-- The plan should have 1-2 tasks maximum"#,
-        "medium" => r#"## Complexity: MEDIUM (4-10 files)
+- The plan should have 1-2 tasks maximum"#
+        }
+        "medium" => {
+            r#"## Complexity: MEDIUM (4-10 files)
 
 This is a medium-sized change. Be efficient:
 - Start with `search_code` to find relevant files and symbols
 - Use `read_file_lines` for targeted reads instead of whole files
 - Only call `read_tree` if you need to understand module structure
 - You should need 5-10 tool calls total
-- The plan should have 2-4 tasks"#,
-        _ => r#"## Complexity: COMPLEX (10+ files)
+- The plan should have 2-4 tasks"#
+        }
+        _ => {
+            r#"## Complexity: COMPLEX (10+ files)
 
 This is a complex change. Research thoroughly but stay focused:
 - Start with `search_code` and `read_tree` to understand the relevant modules
 - Use `read_file_lines` for targeted reads
 - Map out the affected code paths before planning
-- The plan should have 3-6 tasks"#,
+- The plan should have 3-6 tasks"#
+        }
     };
 
     let prompt = format!(

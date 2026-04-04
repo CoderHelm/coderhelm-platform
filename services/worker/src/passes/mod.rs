@@ -365,7 +365,13 @@ async fn run_passes(
     )
     .await;
     save_checkpoint(state, &msg.team_id, run_id, "triage", "", 0, usage).await;
-    add_progress_note(state, &msg.team_id, run_id, &format!("Triaged as {} complexity", triage_result.complexity)).await;
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!("Triaged as {} complexity", triage_result.complexity),
+    )
+    .await;
     info!(run_id, "Triage complete");
 
     // --- Resolve external references via MCP tools ---
@@ -383,7 +389,15 @@ async fn run_passes(
     update_pass(state, &msg.team_id, run_id, "plan").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let plan_result = plan::run(state, msg, &github, &triage_result, &repo_instructions, usage).await?;
+    let plan_result = plan::run(
+        state,
+        msg,
+        &github,
+        &triage_result,
+        &repo_instructions,
+        usage,
+    )
+    .await?;
     write_pass_trace(
         state,
         &msg.team_id,
@@ -640,7 +654,13 @@ async fn run_passes(
             .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, "main")
             .await?;
         info!(run_id, branch = %branch_name, "Created working branch");
-        add_progress_note(state, &msg.team_id, run_id, &format!("Created branch {}", branch_name)).await;
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!("Created branch {}", branch_name),
+        )
+        .await;
 
         // Commit openspec to the repo branch if enabled (default: on)
         let commit_openspec = load_workflow_setting(state, &msg.team_id, "commit_openspec").await;
@@ -764,7 +784,10 @@ async fn run_passes(
             state,
             &msg.team_id,
             run_id,
-            &format!("Implemented changes across {} file(s)", result.files_modified.len()),
+            &format!(
+                "Implemented changes across {} file(s)",
+                result.files_modified.len()
+            ),
         )
         .await;
 
@@ -950,7 +973,11 @@ async fn run_passes(
             state,
             &msg.team_id,
             run_id,
-            if review_result.passed { "Code review passed" } else { "Code review found issues, re-implementing" },
+            if review_result.passed {
+                "Code review passed"
+            } else {
+                "Code review found issues, re-implementing"
+            },
         )
         .await;
 
@@ -982,16 +1009,17 @@ async fn run_passes(
     update_pass(state, &msg.team_id, run_id, "security").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let security_result = match security::run(state, msg, &github, &branch_name, &repo_instructions, usage).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(run_id, error = %e, "Security pass errored, proceeding");
-            security::SecurityResult {
-                passed: true,
-                summary: format!("Security error: {e}"),
+    let security_result =
+        match security::run(state, msg, &github, &branch_name, &repo_instructions, usage).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(run_id, error = %e, "Security pass errored, proceeding");
+                security::SecurityResult {
+                    passed: true,
+                    summary: format!("Security error: {e}"),
+                }
             }
-        }
-    };
+        };
     write_pass_trace(
         state,
         &msg.team_id,
@@ -1022,7 +1050,11 @@ async fn run_passes(
         state,
         &msg.team_id,
         run_id,
-        if security_result.passed { "Security audit passed" } else { "Security issues found, fixing" },
+        if security_result.passed {
+            "Security audit passed"
+        } else {
+            "Security issues found, fixing"
+        },
     )
     .await;
 
@@ -1051,16 +1083,18 @@ async fn run_passes(
         // Re-audit once
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "security").await?;
-        let retry = match security::run(state, msg, &github, &branch_name, &repo_instructions, usage).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(run_id, error = %e, "Security retry errored, proceeding");
-                security::SecurityResult {
-                    passed: true,
-                    summary: format!("Security error: {e}"),
+        let retry =
+            match security::run(state, msg, &github, &branch_name, &repo_instructions, usage).await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(run_id, error = %e, "Security retry errored, proceeding");
+                    security::SecurityResult {
+                        passed: true,
+                        summary: format!("Security error: {e}"),
+                    }
                 }
-            }
-        };
+            };
         if !retry.passed {
             warn!(
                 run_id,
@@ -1104,7 +1138,13 @@ async fn run_passes(
     )
     .await;
     info!(run_id, pr_url = %pr_result.pr_url, "PR created");
-    add_progress_note(state, &msg.team_id, run_id, &format!("PR created: #{}", pr_result.pr_number)).await;
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!("PR created: #{}", pr_result.pr_number),
+    )
+    .await;
 
     // Update run record with final state
     let duration = start.elapsed().as_secs();
@@ -1211,12 +1251,7 @@ async fn update_pass(
 }
 
 /// Append a timestamped progress note to the run record for live activity display.
-async fn add_progress_note(
-    state: &WorkerState,
-    team_id: &str,
-    run_id: &str,
-    message: &str,
-) {
+async fn add_progress_note(state: &WorkerState, team_id: &str, run_id: &str, message: &str) {
     let now = chrono::Utc::now().to_rfc3339();
     let entry = aws_sdk_dynamodb::types::AttributeValue::M(std::collections::HashMap::from([
         ("message".to_string(), attr_s(message)),
