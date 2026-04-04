@@ -23,6 +23,7 @@ pub async fn run(
     rules: &[String],
     repo_instructions: &str,
     review_feedback: Option<&str>,
+    complexity: &str,
     usage: &mut TokenUsage,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
@@ -165,14 +166,29 @@ pub async fn run(
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    llm::converse(
+    // Route simple issues to Sonnet, medium/complex to Opus
+    let model_id = match complexity {
+        "simple" => &state.config.light_model_id,
+        _ => &state.config.model_id,
+    };
+    let opts = llm::ConverseOptions {
+        max_turns: match complexity {
+            "simple" => 15,
+            "medium" => 30,
+            _ => 40,
+        },
+        max_tokens: 16384,
+    };
+
+    llm::converse_with_opts(
         state,
-        &state.config.model_id,
+        model_id,
         &full_system,
         &mut messages,
         &tools,
         &executor,
         usage,
+        opts,
     )
     .await?;
 

@@ -84,7 +84,7 @@ Rules:
 
     let response = llm::converse(
         state,
-        &state.config.model_id,
+        &state.config.light_model_id,
         &system,
         &mut messages,
         &tools,

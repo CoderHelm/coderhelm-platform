@@ -2134,7 +2134,13 @@ pub async fn plan_chat(
             .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
                 system_prompt.clone(),
             ))
-            .set_messages(Some(bedrock_messages.clone()));
+            .set_messages(Some(bedrock_messages.clone()))
+            .inference_config(
+                aws_sdk_bedrockruntime::types::InferenceConfiguration::builder()
+                    .max_tokens(4096)
+                    .temperature(0.7)
+                    .build(),
+            );
 
         if let Some(ref tc) = tool_config {
             req = req.tool_config(tc.clone());
@@ -2601,7 +2607,13 @@ pub async fn plan_chat_stream(
                 .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
                     system_prompt.clone(),
                 ))
-                .set_messages(Some(bedrock_messages.clone()));
+                .set_messages(Some(bedrock_messages.clone()))
+                .inference_config(
+                    aws_sdk_bedrockruntime::types::InferenceConfiguration::builder()
+                        .max_tokens(4096)
+                        .temperature(0.7)
+                        .build(),
+                );
 
             if let Some(ref tc) = tool_config {
                 req = req.tool_config(tc.clone());

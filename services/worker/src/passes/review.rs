@@ -73,7 +73,7 @@ If everything looks good, start your response with "LGTM" followed by a brief su
 
     let response = llm::converse(
         state,
-        &state.config.model_id,
+        &state.config.light_model_id,
         &system,
         &mut messages,
         &tools,

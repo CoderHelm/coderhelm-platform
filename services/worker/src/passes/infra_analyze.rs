@@ -613,7 +613,7 @@ async fn call_bedrock(
 
     let response = crate::agent::llm::converse_with_retry(
         &state.bedrock,
-        &state.config.model_id,
+        &state.config.light_model_id,
         vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
             SYSTEM.to_string(),
         )],
@@ -677,7 +677,7 @@ async fn call_bedrock_retry(
 
     let response = crate::agent::llm::converse_with_retry(
         &state.bedrock,
-        &state.config.model_id,
+        &state.config.light_model_id,
         vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
             SYSTEM.to_string(),
         )],

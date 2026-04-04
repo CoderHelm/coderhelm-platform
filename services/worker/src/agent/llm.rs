@@ -1,6 +1,6 @@
 use aws_sdk_bedrockruntime::types::{
-    CachePointBlock, ContentBlock, ConversationRole, Message, SystemContentBlock, Tool,
-    ToolConfiguration, ToolInputSchema, ToolSpecification,
+    CachePointBlock, ContentBlock, ConversationRole, InferenceConfiguration, Message,
+    SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolSpecification,
 };
 use aws_smithy_types::Document;
 use serde_json::{json, Value};
@@ -90,8 +90,22 @@ fn document_to_json(doc: &Document) -> Value {
 /// Call the LLM via Bedrock Converse API with tool use loop.
 /// Uses prompt caching: a CachePoint is placed after the system prompt
 /// so Bedrock caches it across calls within the same session/model.
-/// Maximum tool-use turns per converse() call to prevent runaway token spend.
-const MAX_TURNS: usize = 40;
+const DEFAULT_MAX_TURNS: usize = 40;
+
+/// Options for controlling the converse loop.
+pub struct ConverseOptions {
+    pub max_turns: usize,
+    pub max_tokens: i32,
+}
+
+impl Default for ConverseOptions {
+    fn default() -> Self {
+        Self {
+            max_turns: DEFAULT_MAX_TURNS,
+            max_tokens: 16384,
+        }
+    }
+}
 
 pub async fn converse(
     state: &WorkerState,
@@ -102,8 +116,26 @@ pub async fn converse(
     tool_executor: &dyn ToolExecutor,
     usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    converse_with_opts(state, model_id, system_prompt, messages, tools, tool_executor, usage, ConverseOptions::default()).await
+}
+
+pub async fn converse_with_opts(
+    state: &WorkerState,
+    model_id: &str,
+    system_prompt: &str,
+    messages: &mut Vec<Message>,
+    tools: &[ToolDefinition],
+    tool_executor: &dyn ToolExecutor,
+    usage: &mut TokenUsage,
+    opts: ConverseOptions,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let tool_config = build_tool_config(tools);
     let mut turns: usize = 0;
+    let max_turns = opts.max_turns;
+
+    let inference_config = InferenceConfiguration::builder()
+        .max_tokens(opts.max_tokens)
+        .build();
 
     // Build the cache point block once — reused every turn.
     let cache_point = CachePointBlock::builder()
@@ -113,19 +145,19 @@ pub async fn converse(
 
     loop {
         turns += 1;
-        if turns > MAX_TURNS {
-            warn!("Hit max turn limit ({MAX_TURNS}), forcing completion");
+        if turns > max_turns {
+            warn!("Hit max turn limit ({max_turns}), forcing completion");
             return Err(
-                format!("Reached the maximum number of steps ({MAX_TURNS}) without finishing. The issue may need more detail or a narrower scope.").into()
+                format!("Reached the maximum number of steps ({max_turns}) without finishing. The issue may need more detail or a narrower scope.").into()
             );
         }
 
         // Progress note every 10 turns to keep the LLM focused
         if turns > 1 && turns.is_multiple_of(10) {
             info!(turns, "Injecting progress note at turn {turns}");
-            let remaining = MAX_TURNS - turns;
+            let remaining = max_turns - turns;
             let note = format!(
-                "[SYSTEM NOTE] You have used {turns} of {MAX_TURNS} tool-use turns. {remaining} turns remaining. \
+                "[SYSTEM NOTE] You have used {turns} of {max_turns} tool-use turns. {remaining} turns remaining. \
                  Focus on completing the task efficiently. If you are stuck, summarize what you have done and provide your best answer."
             );
             messages.push(
@@ -145,7 +177,8 @@ pub async fn converse(
                     .converse()
                     .model_id(model_id)
                     .system(SystemContentBlock::Text(system_prompt.to_string()))
-                    .system(SystemContentBlock::CachePoint(cache_point.clone()));
+                    .system(SystemContentBlock::CachePoint(cache_point.clone()))
+                    .inference_config(inference_config.clone());
 
                 for msg in messages.iter() {
                     req = req.messages(msg.clone());

@@ -726,6 +726,7 @@ async fn run_passes(
             &rules,
             &repo_instructions,
             None,
+            &triage_result.complexity,
             usage,
         )
         .await?;
@@ -869,6 +870,7 @@ async fn run_passes(
                     Some(&format!(
                         "CI tests failed. Fix the failures:\n\n{test_feedback}"
                     )),
+                    &triage_result.complexity,
                     usage,
                 )
                 .await?;
@@ -950,6 +952,7 @@ async fn run_passes(
             &rules,
             &repo_instructions,
             Some(&review_result.summary),
+            &triage_result.complexity,
             usage,
         )
         .await?;
@@ -1014,6 +1017,7 @@ async fn run_passes(
                 "Security audit found vulnerabilities. Fix ALL of the following:\n\n{}",
                 security_result.summary
             )),
+            &triage_result.complexity,
             usage,
         )
         .await?;

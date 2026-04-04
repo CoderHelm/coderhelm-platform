@@ -231,7 +231,7 @@ async fn onboard_repo(
 
     let response = crate::agent::llm::converse_with_retry(
         &state.bedrock,
-        &state.config.model_id,
+        &state.config.light_model_id,
         vec![
             aws_sdk_bedrockruntime::types::SystemContentBlock::Text(system),
             aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
@@ -363,7 +363,7 @@ async fn generate_voice_md(
 
     let response = crate::agent::llm::converse_with_retry(
         &state.bedrock,
-        &state.config.model_id,
+        &state.config.light_model_id,
         vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
             system.to_string(),
         )],
@@ -426,7 +426,7 @@ async fn generate_global_context(
 
     let response = crate::agent::llm::converse_with_retry(
         &state.bedrock,
-        &state.config.model_id,
+        &state.config.light_model_id,
         vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
             system.to_string(),
         )],
