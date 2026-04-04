@@ -58,6 +58,9 @@ pub async fn run(
 Title: {title}
 Summary: {summary}
 
+## Original Issue Body
+{body}
+
 ## Instructions
 
 Research the codebase using the `read_tree`, `read_file`, and `list_directory` tools to
@@ -115,6 +118,7 @@ After researching, output the four files using this exact format:
 ```"#,
         title = msg.title,
         summary = triage.summary,
+        body = msg.body,
     );
 
     let mut tools = read_only_tools();
