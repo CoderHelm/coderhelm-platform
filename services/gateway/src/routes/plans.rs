@@ -1259,9 +1259,20 @@ pub async fn plan_chat(
         system_prompt.push_str(&format!(
             "\n\nYou have tool-call access to the following MCP servers right now. \
              You can invoke their tools directly during this conversation to look up \
-             information, search documents, read pages, or query external services. \
-             Use them proactively when the user asks about anything these servers \
-             could answer (e.g. read a Notion doc, search Figma designs, check Sentry errors):\n{}",
+             information, search documents, read pages, or query external services.\n\
+             \n\
+             IMPORTANT — Proactive tool use:\n\
+             - BEFORE generating a plan, search connected tools for relevant context. \
+             If Notion is connected, search for docs related to the user's request \
+             (specs, config values, API keys references, design docs, requirements).\n\
+             - If the user mentions anything that might be documented (IDs, credentials, \
+             config, specs, designs, tickets), search the connected tools first.\n\
+             - Don't ask the user for information that might already exist in their \
+             connected tools — look it up yourself.\n\
+             - When you find relevant context, incorporate it into the plan tasks \
+             (e.g. specific IDs, endpoints, file paths, design references).\n\
+             \n\
+             Connected servers:\n{}",
             plugin_lines.join("\n")
         ));
     }
@@ -1639,8 +1650,21 @@ pub async fn plan_chat_stream(
             .collect();
         system_prompt.push_str(&format!(
             "\n\nYou have tool-call access to the following MCP servers right now. \
-             Use them proactively when the user asks about anything these servers \
-             could answer:\n{}",
+             You can invoke their tools directly during this conversation to look up \
+             information, search documents, read pages, or query external services.\n\
+             \n\
+             IMPORTANT — Proactive tool use:\n\
+             - BEFORE generating a plan, search connected tools for relevant context. \
+             If Notion is connected, search for docs related to the user's request \
+             (specs, config values, API keys references, design docs, requirements).\n\
+             - If the user mentions anything that might be documented (IDs, credentials, \
+             config, specs, designs, tickets), search the connected tools first.\n\
+             - Don't ask the user for information that might already exist in their \
+             connected tools — look it up yourself.\n\
+             - When you find relevant context, incorporate it into the plan tasks \
+             (e.g. specific IDs, endpoints, file paths, design references).\n\
+             \n\
+             Connected servers:\n{}",
             plugin_lines.join("\n")
         ));
     }
