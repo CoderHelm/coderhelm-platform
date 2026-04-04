@@ -78,7 +78,7 @@ export class FrontendStack extends cdk.Stack {
           },
           contentSecurityPolicy: {
             contentSecurityPolicy:
-              "default-src 'self'; script-src 'self' 'unsafe-inline' https://js.stripe.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https://api.coderhelm.com https://stream.coderhelm.com https://api.stripe.com; frame-src https://js.stripe.com; font-src 'self'",
+              "default-src 'self'; script-src 'self' 'unsafe-inline' https://js.stripe.com https://www.googletagmanager.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https://api.coderhelm.com https://stream.coderhelm.com https://api.stripe.com https://www.google-analytics.com https://analytics.google.com https://www.googletagmanager.com; frame-src https://js.stripe.com; font-src 'self'",
             override: true,
           },
         },
