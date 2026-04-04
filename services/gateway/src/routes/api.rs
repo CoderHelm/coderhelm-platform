@@ -776,6 +776,22 @@ pub async fn retry_run(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // Mark the old run as retried so it can't be retried again
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&claims.team_id))
+        .key("run_id", attr_s(&run_id))
+        .update_expression("SET #status = :s, status_run_id = :sri, updated_at = :t")
+        .expression_attribute_names("#status", "status")
+        .expression_attribute_values(":s", attr_s("retried"))
+        .expression_attribute_values(":sri", attr_s(&format!("retried#{run_id}")))
+        .expression_attribute_values(":t", attr_s(&now))
+        .send()
+        .await;
+
     info!(run_id, "Run retried — dispatched to SQS");
 
     Ok(Json(json!({ "status": "retrying" })))
