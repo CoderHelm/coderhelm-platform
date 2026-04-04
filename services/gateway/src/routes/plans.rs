@@ -2134,6 +2134,14 @@ pub async fn plan_chat(
             .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
                 system_prompt.clone(),
             ))
+            .system(
+                aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
+                    aws_sdk_bedrockruntime::types::CachePointBlock::builder()
+                        .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
+                        .build()
+                        .unwrap(),
+                ),
+            )
             .set_messages(Some(bedrock_messages.clone()))
             .inference_config(
                 aws_sdk_bedrockruntime::types::InferenceConfiguration::builder()
@@ -2607,6 +2615,14 @@ pub async fn plan_chat_stream(
                 .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
                     system_prompt.clone(),
                 ))
+                .system(
+                    aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
+                        aws_sdk_bedrockruntime::types::CachePointBlock::builder()
+                            .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
+                            .build()
+                            .unwrap(),
+                    ),
+                )
                 .set_messages(Some(bedrock_messages.clone()))
                 .inference_config(
                     aws_sdk_bedrockruntime::types::InferenceConfiguration::builder()

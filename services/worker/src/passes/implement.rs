@@ -48,16 +48,30 @@ pub async fn run(
         None => String::new(),
     };
 
+    // Extract file paths mentioned in backticks from plan tasks
+    let file_paths = extract_file_paths(&plan.tasks);
+    let files_hint = if !file_paths.is_empty() && complexity == "simple" {
+        format!(
+            "\n\n## Target Files\nThe plan references these files — go directly to them:\n{}",
+            file_paths
+                .iter()
+                .map(|p| format!("- `{p}`"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    } else {
+        String::new()
+    };
+
     let prompt = if complexity == "simple" {
         format!(
             r#"Implement for issue #{number}: {title}
 
 ## Tasks
-{tasks}{feedback}
+{tasks}{files_hint}{feedback}
 
 ## Instructions — SIMPLE CHANGE
-The plan already tells you which file(s) to edit. Go DIRECTLY to them.
-- Do NOT call `read_tree` or browse the repo structure.
+Go DIRECTLY to the target files listed above.
 - Use `read_file_lines` on the exact section, make the change with `write_file`, done.
 - You should need 2-5 tool calls total.
 - Only implement the listed tasks. Do not add extras.
@@ -65,6 +79,7 @@ The plan already tells you which file(s) to edit. Go DIRECTLY to them.
             number = msg.issue_number,
             title = msg.title,
             tasks = plan.tasks,
+            files_hint = files_hint,
             feedback = feedback_section,
         )
     } else {
@@ -469,7 +484,13 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .github
                     .search_code(&self.owner, &self.repo, query)
                     .await?;
-                let lines: Vec<String> = results
+                // Cap search results to avoid dumping too many tokens
+                let capped = if results.len() > 15 {
+                    &results[..15]
+                } else {
+                    &results
+                };
+                let lines: Vec<String> = capped
                     .iter()
                     .map(|r| {
                         if r.matches.is_empty() {
@@ -479,7 +500,15 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                         }
                     })
                     .collect();
-                Ok(json!(lines.join("\n---\n")))
+                let mut output = lines.join("\n---\n");
+                if results.len() > 15 {
+                    output.push_str(&format!(
+                        "\n\n... ({} more results not shown, {} total)",
+                        results.len() - 15,
+                        results.len()
+                    ));
+                }
+                Ok(json!(output))
             }
             "list_directory" => {
                 let path = input
@@ -662,4 +691,30 @@ impl<'a> ToolExecutor for CombinedWriteToolExecutor<'a> {
         // Fall through to write tools
         self.write_executor.execute(name, input).await
     }
+}
+
+/// Extract file paths from backtick-quoted strings in plan tasks.
+/// Matches patterns like `path/to/file.ext` that look like file paths.
+fn extract_file_paths(tasks: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cap in tasks.split('`').enumerate() {
+        // Odd indices are inside backticks
+        if cap.0 % 2 == 1 {
+            let candidate = cap.1.trim();
+            // Must contain a slash or dot-extension, and no spaces
+            if !candidate.is_empty()
+                && !candidate.contains(' ')
+                && (candidate.contains('/') || candidate.contains('.'))
+                && candidate.contains('.')
+                && !candidate.starts_with('-')
+                && !candidate.starts_with("http")
+            {
+                if seen.insert(candidate.to_string()) {
+                    paths.push(candidate.to_string());
+                }
+            }
+        }
+    }
+    paths
 }
