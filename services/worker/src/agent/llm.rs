@@ -116,7 +116,17 @@ pub async fn converse(
     tool_executor: &dyn ToolExecutor,
     usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    converse_with_opts(state, model_id, system_prompt, messages, tools, tool_executor, usage, ConverseOptions::default()).await
+    converse_with_opts(
+        state,
+        model_id,
+        system_prompt,
+        messages,
+        tools,
+        tool_executor,
+        usage,
+        ConverseOptions::default(),
+    )
+    .await
 }
 
 pub async fn converse_with_opts(
