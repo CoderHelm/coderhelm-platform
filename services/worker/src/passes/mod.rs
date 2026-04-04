@@ -814,7 +814,7 @@ async fn run_passes(
                 {
                     warn!(run_id, error = %e, "Failed to comment on issue about empty implementation");
                 }
-                return Err("Could not determine what changes to make — commented on issue asking for clarification".into());
+                return Err(raw_clarification.into());
             } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
                 if let Err(e) = post_jira_comment(
                     state,
@@ -828,9 +828,9 @@ async fn run_passes(
                 {
                     warn!(run_id, error = %e, "Failed to comment on Jira ticket about empty implementation");
                 }
-                return Err("Could not determine what changes to make — commented on ticket asking for clarification".into());
+                return Err(raw_clarification.into());
             }
-            return Err("Could not determine what changes to make — please add more detail to the ticket (which files to change, expected behavior, relevant code snippets)".into());
+            return Err(raw_clarification.into());
         }
 
         // Mark all tasks as done in S3 openspec so retries/dashboard see progress
