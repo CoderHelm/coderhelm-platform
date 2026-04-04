@@ -1224,6 +1224,37 @@ pub async fn plan_chat(
         None
     };
 
+    // Load MCP tool definitions from S3 cache for enabled plugins with credentials
+    let mut mcp_tools: Vec<McpToolDef> = Vec::new();
+    let mcp_proxy_fn = &state.config.mcp_proxy_function_name;
+    if !mcp_proxy_fn.is_empty() {
+        let cache_futures: Vec<_> = enabled_plugins
+            .iter()
+            .filter(|(_, has_creds, _)| *has_creds)
+            .map(|(server_id, _, _)| {
+                let s3 = &state.s3;
+                let bucket = &state.config.bucket_name;
+                async move {
+                    let cache = load_mcp_tool_cache(s3, bucket, server_id).await;
+                    (server_id.clone(), cache)
+                }
+            })
+            .collect();
+        let caches = futures::future::join_all(cache_futures).await;
+        for (server_id, cache) in caches {
+            if let Some(tools) = cache {
+                for tool in tools {
+                    mcp_tools.push(McpToolDef {
+                        server_id: server_id.clone(),
+                        name: tool["name"].as_str().unwrap_or("").to_string(),
+                        description: tool["description"].as_str().unwrap_or("").to_string(),
+                        input_schema: tool["inputSchema"].clone(),
+                    });
+                }
+            }
+        }
+    }
+
     // Build system prompt with org context and repo list
     let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
     if !org_context.is_empty() {
@@ -1232,24 +1263,24 @@ pub async fn plan_chat(
         ));
     }
     if !repo_list.is_empty() {
+        // Limit to 50 repos to keep prompt size reasonable
+        let repos_for_prompt: Vec<_> = repo_list.iter().take(50).collect();
         system_prompt.push_str(&format!(
             "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}",
-            repo_list
+            repos_for_prompt
                 .iter()
                 .map(|r| format!("- {r}"))
                 .collect::<Vec<_>>()
                 .join("\n")
         ));
     }
-    if !enabled_plugins.is_empty() {
+    // Only add MCP instructions if there are tools available
+    if !mcp_tools.is_empty() {
         let plugin_lines: Vec<String> = enabled_plugins
             .iter()
-            .map(|(id, has_creds, custom_prompt)| {
-                let mut line = if *has_creds {
-                    format!("- {id} (connected)")
-                } else {
-                    format!("- {id} (enabled, needs credentials)")
-                };
+            .filter(|(_, has_creds, _)| *has_creds)
+            .map(|(id, _, custom_prompt)| {
+                let mut line = format!("- {id} (connected)");
                 if let Some(prompt) = custom_prompt {
                     line.push_str(&format!(" — {prompt}"));
                 }
@@ -1280,37 +1311,6 @@ pub async fn plan_chat(
         system_prompt.push_str(&format!(
             "\n\nAWS Log Analyzer context (enabled in workflow settings):\n{context}"
         ));
-    }
-
-    // Load MCP tool definitions from S3 cache for enabled plugins with credentials
-    let mut mcp_tools: Vec<McpToolDef> = Vec::new();
-    let mcp_proxy_fn = &state.config.mcp_proxy_function_name;
-    if !mcp_proxy_fn.is_empty() {
-        let cache_futures: Vec<_> = enabled_plugins
-            .iter()
-            .filter(|(_, has_creds, _)| *has_creds)
-            .map(|(server_id, _, _)| {
-                let s3 = &state.s3;
-                let bucket = &state.config.bucket_name;
-                async move {
-                    let cache = load_mcp_tool_cache(s3, bucket, server_id).await;
-                    (server_id.clone(), cache)
-                }
-            })
-            .collect();
-        let caches = futures::future::join_all(cache_futures).await;
-        for (server_id, cache) in caches {
-            if let Some(tools) = cache {
-                for tool in tools {
-                    mcp_tools.push(McpToolDef {
-                        server_id: server_id.clone(),
-                        name: tool["name"].as_str().unwrap_or("").to_string(),
-                        description: tool["description"].as_str().unwrap_or("").to_string(),
-                        input_schema: tool["inputSchema"].clone(),
-                    });
-                }
-            }
-        }
     }
 
     // Convert messages to Bedrock format
@@ -1646,62 +1646,7 @@ pub async fn plan_chat_stream(
         None
     };
 
-    let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
-    if !org_context.is_empty() {
-        system_prompt.push_str(&format!(
-            "\n\nThe user's organization context:\n{org_context}"
-        ));
-    }
-    if !repo_list.is_empty() {
-        system_prompt.push_str(&format!(
-            "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}",
-            repo_list
-                .iter()
-                .map(|r| format!("- {r}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-    if !enabled_plugins.is_empty() {
-        let plugin_lines: Vec<String> = enabled_plugins
-            .iter()
-            .map(|(id, has_creds, custom_prompt)| {
-                let mut line = if *has_creds {
-                    format!("- {id} (connected)")
-                } else {
-                    format!("- {id} (enabled, needs credentials)")
-                };
-                if let Some(prompt) = custom_prompt {
-                    line.push_str(&format!(" — {prompt}"));
-                }
-                line
-            })
-            .collect();
-        system_prompt.push_str(&format!(
-            "\n\nYou have tool-call access to the following MCP servers right now. \
-             You can invoke their tools directly during this conversation to look up \
-             information, search documents, read pages, or query external services.\n\
-             \n\
-             IMPORTANT — Proactive tool use:\n\
-             - BEFORE generating a plan, search connected tools for relevant context. \
-             If Notion is connected, search for docs related to the user's request \
-             (specs, config values, API keys references, design docs, requirements).\n\
-             - If the user mentions anything that might be documented (IDs, credentials, \
-             config, specs, designs, tickets), search the connected tools first.\n\
-             - Don't ask the user for information that might already exist in their \
-             connected tools — look it up yourself.\n\
-             - When you find relevant context, incorporate it into the plan tasks \
-             (e.g. specific IDs, endpoints, file paths, design references).\n\
-             \n\
-             Connected servers:\n{}",
-            plugin_lines.join("\n")
-        ));
-    }
-    if let Some(context) = log_analyzer_context.filter(|c| !c.is_empty()) {
-        system_prompt.push_str(&format!("\n\nAWS Log Analyzer context:\n{context}"));
-    }
-
-    // Load MCP tool definitions
+    // Load MCP tool definitions (before building system prompt so we can check if tools exist)
     let mut mcp_tools: Vec<McpToolDef> = Vec::new();
     let mcp_proxy_fn = &state.config.mcp_proxy_function_name;
     if !mcp_proxy_fn.is_empty() {
@@ -1730,6 +1675,61 @@ pub async fn plan_chat_stream(
                 }
             }
         }
+    }
+
+    let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
+    if !org_context.is_empty() {
+        system_prompt.push_str(&format!(
+            "\n\nThe user's organization context:\n{org_context}"
+        ));
+    }
+    if !repo_list.is_empty() {
+        // Limit to 50 repos to keep prompt size reasonable
+        let repos_for_prompt: Vec<_> = repo_list.iter().take(50).collect();
+        system_prompt.push_str(&format!(
+            "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}",
+            repos_for_prompt
+                .iter()
+                .map(|r| format!("- {r}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    // Only add MCP instructions if there are tools available
+    if !mcp_tools.is_empty() {
+        let plugin_lines: Vec<String> = enabled_plugins
+            .iter()
+            .filter(|(_, has_creds, _)| *has_creds)
+            .map(|(id, _, custom_prompt)| {
+                let mut line = format!("- {id} (connected)");
+                if let Some(prompt) = custom_prompt {
+                    line.push_str(&format!(" — {prompt}"));
+                }
+                line
+            })
+            .collect();
+        system_prompt.push_str(&format!(
+            "\n\nYou have tool-call access to the following MCP servers right now. \
+             You can invoke their tools directly during this conversation to look up \
+             information, search documents, read pages, or query external services.\n\
+             \n\
+             IMPORTANT — Proactive tool use:\n\
+             - BEFORE generating a plan, search connected tools for relevant context. \
+             If Notion is connected, search for docs related to the user's request \
+             (specs, config values, API keys references, design docs, requirements).\n\
+             - If the user mentions anything that might be documented (IDs, credentials, \
+             config, specs, designs, tickets), search the connected tools first.\n\
+             - Don't ask the user for information that might already exist in their \
+             connected tools — look it up yourself.\n\
+             - When you find relevant context, incorporate it into the plan tasks \
+             (e.g. specific IDs, endpoints, file paths, design references).\n\
+             \n\
+             Connected servers:\n{}",
+            plugin_lines.join("\n")
+        ));
+    }
+    if let Some(context) = log_analyzer_context.filter(|c| !c.is_empty()) {
+        system_prompt.push_str(&format!("\n\nAWS Log Analyzer context:\n{context}"));
     }
 
     // Convert messages to Bedrock format

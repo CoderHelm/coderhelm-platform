@@ -62,7 +62,7 @@ export class StreamingStack extends cdk.Stack {
       architecture: lambda.Architecture.ARM_64,
       handler: "bootstrap",
       code: lambda.Code.fromAsset(gatewayAssetPath),
-      memorySize: 512,
+      memorySize: 1024,
       timeout: cdk.Duration.minutes(5),
       logGroup,
       layers: [webAdapterLayer],

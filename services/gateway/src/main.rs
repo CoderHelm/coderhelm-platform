@@ -55,17 +55,21 @@ async fn main() -> Result<(), Error> {
 
     let config = models::Config::from_env();
 
-    // Fetch Cognito client secret for SECRET_HASH computation
-    let cognito_client_secret = cognito
-        .describe_user_pool_client()
-        .user_pool_id(&config.cognito_user_pool_id)
-        .client_id(&config.cognito_client_id)
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.user_pool_client)
-        .and_then(|c| c.client_secret)
-        .unwrap_or_default();
+    // Only needed for the main gateway, not the streaming Lambda
+    let cognito_client_secret = if std::env::var("STREAMING_MODE").is_ok() {
+        String::new()
+    } else {
+        cognito
+            .describe_user_pool_client()
+            .user_pool_id(&config.cognito_user_pool_id)
+            .client_id(&config.cognito_client_id)
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.user_pool_client)
+            .and_then(|c| c.client_secret)
+            .unwrap_or_default()
+    };
 
     let state = Arc::new(AppState {
         dynamo,
@@ -81,8 +85,10 @@ async fn main() -> Result<(), Error> {
         cognito_client_secret,
     });
 
-    // Sync MCP server catalog to S3 on cold start
-    routes::plugins::sync_catalog_to_s3(&state).await;
+    // Sync MCP server catalog to S3 on cold start (skip for streaming Lambda)
+    if std::env::var("STREAMING_MODE").is_err() {
+        routes::plugins::sync_catalog_to_s3(&state).await;
+    }
 
     // Build router
     // Protected API routes — require valid JWT with team scoping
