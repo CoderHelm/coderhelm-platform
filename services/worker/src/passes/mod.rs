@@ -835,7 +835,10 @@ async fn run_passes(
             Ok(r) => r,
             Err(e) => {
                 warn!(run_id, error = %e, "Test pass errored, proceeding without test results");
-                test::TestResult { passed: true, output: Some(format!("Test pass error: {e}")) }
+                test::TestResult {
+                    passed: true,
+                    output: Some(format!("Test pass error: {e}")),
+                }
             }
         };
         write_pass_trace(
@@ -896,7 +899,10 @@ async fn run_passes(
             Ok(r) => r,
             Err(e) => {
                 warn!(run_id, error = %e, "Review pass errored, proceeding");
-                review::ReviewResult { passed: true, summary: format!("Review error: {e}") }
+                review::ReviewResult {
+                    passed: true,
+                    summary: format!("Review error: {e}"),
+                }
             }
         };
         write_pass_trace(
@@ -958,7 +964,10 @@ async fn run_passes(
         Ok(r) => r,
         Err(e) => {
             warn!(run_id, error = %e, "Security pass errored, proceeding");
-            security::SecurityResult { passed: true, summary: format!("Security error: {e}") }
+            security::SecurityResult {
+                passed: true,
+                summary: format!("Security error: {e}"),
+            }
         }
     };
     write_pass_trace(
@@ -1016,7 +1025,10 @@ async fn run_passes(
             Ok(r) => r,
             Err(e) => {
                 warn!(run_id, error = %e, "Security retry errored, proceeding");
-                security::SecurityResult { passed: true, summary: format!("Security error: {e}") }
+                security::SecurityResult {
+                    passed: true,
+                    summary: format!("Security error: {e}"),
+                }
             }
         };
         if !retry.passed {
