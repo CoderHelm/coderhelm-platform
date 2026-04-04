@@ -46,6 +46,7 @@ pub mod onboard;
 mod plan;
 pub mod plan_execute;
 mod pr;
+mod resolve;
 mod review;
 mod security;
 mod test;
@@ -364,6 +365,16 @@ async fn run_passes(
     .await;
     save_checkpoint(state, &msg.team_id, run_id, "triage", "", 0, usage).await;
     info!(run_id, "Triage complete");
+
+    // --- Resolve external references via MCP tools ---
+    let mut triage_result = triage_result;
+    if !mcp_plugins.is_empty() && !state.config.mcp_proxy_function_name.is_empty() {
+        let external_context = resolve::run(state, msg, &mcp_plugins, usage).await;
+        if !external_context.is_empty() {
+            triage_result.summary.push_str(&external_context);
+            info!(run_id, "Resolved external references via MCP");
+        }
+    }
 
     // --- Pass 2: Plan ---
     check_cancelled(state, &msg.team_id, run_id).await?;
