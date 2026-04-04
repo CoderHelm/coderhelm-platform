@@ -65,7 +65,7 @@ pub async fn run(
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let final_text = llm::converse(
+    let final_text = llm::converse_with_opts(
         state,
         &state.config.light_model_id,
         &system,
@@ -73,6 +73,7 @@ pub async fn run(
         &tools,
         &executor,
         usage,
+        llm::ConverseOptions { max_turns: 10, max_tokens: 4096 },
     )
     .await?;
 

@@ -206,7 +206,16 @@ After researching, output the four files using this exact format:
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let response = llm::converse(
+    let plan_opts = llm::ConverseOptions {
+        max_turns: match triage.complexity.as_str() {
+            "simple" => 15,
+            "medium" => 25,
+            _ => 40,
+        },
+        max_tokens: 8192,
+    };
+
+    let response = llm::converse_with_opts(
         state,
         &state.config.light_model_id,
         &full_system,
@@ -214,6 +223,7 @@ After researching, output the four files using this exact format:
         &tools,
         &executor,
         usage,
+        plan_opts,
     )
     .await?;
 

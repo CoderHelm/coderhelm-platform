@@ -71,7 +71,7 @@ If everything looks good, start your response with "LGTM" followed by a brief su
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let response = llm::converse(
+    let response = llm::converse_with_opts(
         state,
         &state.config.light_model_id,
         &system,
@@ -79,6 +79,7 @@ If everything looks good, start your response with "LGTM" followed by a brief su
         &tools,
         &executor,
         usage,
+        llm::ConverseOptions { max_turns: 15, max_tokens: 8192 },
     )
     .await?;
     info!("Review result: {}", &response[..response.len().min(200)]);
