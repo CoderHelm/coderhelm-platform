@@ -319,6 +319,14 @@ async fn main() -> Result<(), Error> {
             post(routes::plans::approve_all_and_execute),
         )
         .route(
+            "/plans/:plan_id/openspec",
+            get(routes::plans::get_plan_openspec),
+        )
+        .route(
+            "/plans/:plan_id/openspec/generate",
+            post(routes::plans::generate_plan_openspec),
+        )
+        .route(
             "/infrastructure",
             get(routes::infrastructure::get_infrastructure),
         )

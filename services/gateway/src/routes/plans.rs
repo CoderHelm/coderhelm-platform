@@ -1082,6 +1082,220 @@ fn task_from_item(
     })
 }
 
+// ─── Plan Openspec ────────────────────────────────────────────────────
+
+/// POST /api/plans/:plan_id/openspec/generate — generate openspec markdown files from plan data.
+pub async fn generate_plan_openspec(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(plan_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    validate_plan_id(&plan_id)?;
+
+    // Fetch plan + tasks (same query as get_plan)
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.plans_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
+        .expression_attribute_values(":prefix", attr_s(&format!("PLAN#{plan_id}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to query plan for openspec: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let items = result.items();
+    if items.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let mut plan_data: Option<Value> = None;
+    let mut tasks: Vec<Value> = Vec::new();
+
+    for item in items {
+        let sk = item
+            .get("sk")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        if sk.contains("#TASK#") {
+            tasks.push(task_from_item(item));
+        } else {
+            plan_data = Some(plan_from_item(item));
+        }
+    }
+
+    let plan = plan_data.ok_or(StatusCode::NOT_FOUND)?;
+    tasks.sort_by_key(|t| t["order"].as_u64().unwrap_or(0));
+
+    let title = plan["title"].as_str().unwrap_or("Untitled Plan");
+    let description = plan["description"].as_str().unwrap_or("");
+    let repo = plan["repo"].as_str().unwrap_or("");
+    let destination = plan["destination"].as_str().unwrap_or("github");
+    let task_count = tasks.len();
+
+    // Generate proposal.md
+    let mut proposal = format!(
+        "# Proposal: {title}\n\n## Summary\n{description}\n\n## Scope\n- Repository: {repo}\n- Tasks: {task_count}\n- Destination: {destination}\n\n## Task Breakdown\n"
+    );
+    for t in &tasks {
+        let t_title = t["title"].as_str().unwrap_or("");
+        let t_desc = t["description"].as_str().unwrap_or("");
+        proposal.push_str(&format!("### {t_title}\n{t_desc}\n\n"));
+    }
+
+    // Generate design.md
+    let mut design = format!(
+        "# Technical Design: {title}\n\n## Overview\n{description}\n\n## Changes by Repository\n"
+    );
+    let mut repos_map: std::collections::BTreeMap<String, Vec<&Value>> =
+        std::collections::BTreeMap::new();
+    for t in &tasks {
+        let t_repo = t["repo"].as_str().unwrap_or(repo).to_string();
+        repos_map.entry(t_repo).or_default().push(t);
+    }
+    for (r, repo_tasks) in &repos_map {
+        let r_label = if r.is_empty() {
+            "(default)"
+        } else {
+            r.as_str()
+        };
+        design.push_str(&format!("### {r_label}\n"));
+        for t in repo_tasks {
+            let t_title = t["title"].as_str().unwrap_or("");
+            design.push_str(&format!("- {t_title}\n"));
+        }
+        design.push('\n');
+    }
+    design.push_str("## Task Dependencies\n");
+    let mut has_deps = false;
+    for t in &tasks {
+        if let Some(dep) = t["depends_on"].as_str().filter(|s| !s.is_empty()) {
+            let t_title = t["title"].as_str().unwrap_or("");
+            let dep_title = tasks
+                .iter()
+                .find(|d| d["task_id"].as_str() == Some(dep))
+                .and_then(|d| d["title"].as_str())
+                .unwrap_or(dep);
+            design.push_str(&format!("- **{t_title}** depends on **{dep_title}**\n"));
+            has_deps = true;
+        }
+    }
+    if !has_deps {
+        design.push_str("No explicit task dependencies.\n");
+    }
+
+    // Generate tasks.md
+    let mut tasks_md = format!("# Task Checklist: {title}\n\n");
+    for t in &tasks {
+        let t_title = t["title"].as_str().unwrap_or("");
+        let t_repo = t["repo"].as_str().unwrap_or(repo);
+        let t_desc = t["description"].as_str().unwrap_or("");
+        let t_ac = t["acceptance_criteria"].as_str().unwrap_or("");
+        tasks_md.push_str(&format!("- [ ] **{t_title}** ({t_repo})\n"));
+        if !t_desc.is_empty() {
+            tasks_md.push_str(&format!("  {t_desc}\n"));
+        }
+        if !t_ac.is_empty() {
+            tasks_md.push_str(&format!("  Acceptance: {t_ac}\n"));
+        }
+        tasks_md.push('\n');
+    }
+
+    // Generate spec.md
+    let mut spec = format!("# Acceptance Specification: {title}\n\n");
+    for t in &tasks {
+        let t_ac = t["acceptance_criteria"].as_str().unwrap_or("");
+        if !t_ac.is_empty() {
+            let t_title = t["title"].as_str().unwrap_or("");
+            spec.push_str(&format!("## {t_title}\n\n### Criteria\n{t_ac}\n\n"));
+        }
+    }
+
+    // Store in S3
+    let prefix = format!("teams/{}/plans/{plan_id}/openspec", claims.team_id);
+    let bucket = &state.config.bucket_name;
+    let files = [
+        ("proposal.md", proposal),
+        ("design.md", design),
+        ("tasks.md", tasks_md),
+        ("spec.md", spec),
+    ];
+
+    for (name, content) in &files {
+        let key = format!("{prefix}/{name}");
+        state
+            .s3
+            .put_object()
+            .bucket(bucket)
+            .key(&key)
+            .body(content.clone().into_bytes().into())
+            .content_type("text/markdown")
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to upload openspec {name}: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
+
+    // Update plan with openspec_generated_at timestamp
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.plans_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&format!("PLAN#{plan_id}")))
+        .update_expression("SET openspec_generated_at = :ts")
+        .expression_attribute_values(":ts", attr_s(&now))
+        .send()
+        .await
+        .map_err(|e| {
+            warn!("Failed to update openspec_generated_at: {e}");
+        });
+
+    info!(plan_id = %plan_id, team_id = %claims.team_id, "Openspec generated for plan");
+
+    Ok(Json(json!({
+        "files": ["proposal.md", "design.md", "tasks.md", "spec.md"]
+    })))
+}
+
+/// GET /api/plans/:plan_id/openspec — fetch the four openspec files from S3.
+pub async fn get_plan_openspec(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(plan_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    validate_plan_id(&plan_id)?;
+
+    let prefix = format!("teams/{}/plans/{plan_id}/openspec", claims.team_id);
+    let bucket = &state.config.bucket_name;
+
+    let mut files = serde_json::Map::new();
+    for name in &["proposal.md", "design.md", "tasks.md", "spec.md"] {
+        let key = format!("{prefix}/{name}");
+        if let Ok(output) = state.s3.get_object().bucket(bucket).key(&key).send().await {
+            if let Ok(bytes) = output.body.collect().await {
+                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                    files.insert(name.replace(".md", ""), Value::String(text));
+                }
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Json(Value::Object(files)))
+}
+
 // ─── Plan Templates ───────────────────────────────────────────────────
 
 fn validate_template_id(id: &str) -> Result<(), StatusCode> {
@@ -1654,8 +1868,14 @@ pub async fn plan_chat(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Load org context, repo list, log analyzer flag, and enabled plugins in parallel
-    let (org_context_result, repo_list_result, allow_plan_log_analyzer, enabled_plugins) = tokio::join!(
+    // Load org context, repo list, log analyzer flag, enabled plugins, and templates in parallel
+    let (
+        org_context_result,
+        repo_list_result,
+        allow_plan_log_analyzer,
+        enabled_plugins,
+        tmpl_result,
+    ) = tokio::join!(
         state
             .dynamo
             .get_item()
@@ -1673,6 +1893,15 @@ pub async fn plan_chat(
             .send(),
         load_allow_plan_log_analyzer(&state, &claims.team_id),
         load_enabled_plugins(&state, &claims.team_id),
+        state
+            .dynamo
+            .query()
+            .table_name(&state.config.plans_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":pk", attr_s(&claims.team_id))
+            .expression_attribute_values(":prefix", attr_s("TEMPLATE#"))
+            .limit(10)
+            .send(),
     );
 
     let org_context = org_context_result
@@ -1696,6 +1925,24 @@ pub async fn plan_chat(
                     item.get("repo_name")
                         .and_then(|v| v.as_s().ok())
                         .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let template_lines: Vec<String> = tmpl_result
+        .ok()
+        .map(|r| {
+            r.items()
+                .iter()
+                .filter_map(|item| {
+                    let title = item.get("title")?.as_s().ok()?;
+                    let desc = item
+                        .get("description")
+                        .and_then(|v| v.as_s().ok())
+                        .unwrap_or(&String::new())
+                        .clone();
+                    Some(format!("- {title}: {desc}"))
                 })
                 .collect()
         })
@@ -1795,6 +2042,11 @@ pub async fn plan_chat(
         system_prompt.push_str(&format!(
             "\n\nAWS Log Analyzer context (enabled in workflow settings):\n{context}"
         ));
+    }
+    if !template_lines.is_empty() {
+        system_prompt.push_str("\n\nThe team has these plan templates available:\n");
+        system_prompt.push_str(&template_lines.join("\n"));
+        system_prompt.push_str("\nIf the user's request matches a template pattern, mention it and ask if they'd like to use it as a starting point.");
     }
 
     // Convert messages to Bedrock format
@@ -2078,7 +2330,13 @@ pub async fn plan_chat_stream(
     }
 
     // --- Same context loading as plan_chat (parallelized) ---
-    let (org_context_result, repo_list_result, allow_plan_log_analyzer, enabled_plugins) = tokio::join!(
+    let (
+        org_context_result,
+        repo_list_result,
+        allow_plan_log_analyzer,
+        enabled_plugins,
+        tmpl_result,
+    ) = tokio::join!(
         state
             .dynamo
             .get_item()
@@ -2096,6 +2354,15 @@ pub async fn plan_chat_stream(
             .send(),
         load_allow_plan_log_analyzer(&state, &claims.team_id),
         load_enabled_plugins(&state, &claims.team_id),
+        state
+            .dynamo
+            .query()
+            .table_name(&state.config.plans_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":pk", attr_s(&claims.team_id))
+            .expression_attribute_values(":prefix", attr_s("TEMPLATE#"))
+            .limit(10)
+            .send(),
     );
 
     let org_context = org_context_result
@@ -2119,6 +2386,24 @@ pub async fn plan_chat_stream(
                     item.get("repo_name")
                         .and_then(|v| v.as_s().ok())
                         .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let template_lines: Vec<String> = tmpl_result
+        .ok()
+        .map(|r| {
+            r.items()
+                .iter()
+                .filter_map(|item| {
+                    let title = item.get("title")?.as_s().ok()?;
+                    let desc = item
+                        .get("description")
+                        .and_then(|v| v.as_s().ok())
+                        .unwrap_or(&String::new())
+                        .clone();
+                    Some(format!("- {title}: {desc}"))
                 })
                 .collect()
         })
@@ -2214,6 +2499,11 @@ pub async fn plan_chat_stream(
     }
     if let Some(context) = log_analyzer_context.filter(|c| !c.is_empty()) {
         system_prompt.push_str(&format!("\n\nAWS Log Analyzer context:\n{context}"));
+    }
+    if !template_lines.is_empty() {
+        system_prompt.push_str("\n\nThe team has these plan templates available:\n");
+        system_prompt.push_str(&template_lines.join("\n"));
+        system_prompt.push_str("\nIf the user's request matches a template pattern, mention it and ask if they'd like to use it as a starting point.");
     }
 
     // Convert messages to Bedrock format
