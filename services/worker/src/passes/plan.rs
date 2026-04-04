@@ -77,16 +77,15 @@ dashboard/src/components/google-analytics.tsx"). Still output proposal.md, desig
 spec.md normally.
 
 **CRITICAL — Ambiguous values:** If the issue asks to change, update, or replace a value
-(an ID, URL, API key, config value, version number, etc.) but does NOT specify what the new
-value should be:
-1. First, check if the issue references any external URLs (Notion pages, docs, etc.) that
-   might contain the value. If you have MCP tools available (e.g. Notion), use them to fetch
-   the referenced page and extract the value before giving up.
-2. Only if the value truly cannot be determined after checking all referenced sources, set
-   tasks.md to EXACTLY `CLARIFICATION_NEEDED: <what is missing>` where `<what is missing>`
-   describes the information the issue must provide (e.g. "The issue asks to update the GTM ID
-   but does not specify the new ID to use"). Still output proposal.md, design.md, and spec.md
-   normally.
+(an ID, URL, API key, config value, version number, etc.) but does NOT include the new
+value directly in the issue title or body:
+1. **YOU MUST** check the issue body for any referenced URLs (Notion pages, Google Docs, wikis,
+   links of any kind). If you find ANY URL, you MUST call the appropriate MCP tool to fetch
+   that page and extract the value BEFORE doing anything else. Do NOT skip this step.
+2. Also search the codebase for the current value to understand context.
+3. Only after you have attempted ALL of the above and still cannot determine the value,
+   set tasks.md to EXACTLY `CLARIFICATION_NEEDED: <what is missing>`. This should be rare
+   because most issues include the value either directly or via a linked page.
 
 Otherwise, generate four openspec files:
 
