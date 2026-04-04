@@ -97,6 +97,13 @@ export class WorkerStack extends cdk.Stack {
     const analyticsTable = dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `coderhelm-${props.stage}-analytics`);
     teamsTable.grantReadWriteData(this.workerFunction);
     runsTable.grantReadWriteData(this.workerFunction);
+    // fromTableName doesn't know about GSIs, so grant index access explicitly
+    this.workerFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:Query"],
+        resources: [`arn:aws:dynamodb:${this.region}:${this.account}:table/coderhelm-${props.stage}-runs/index/*`],
+      })
+    );
     analyticsTable.grantReadWriteData(this.workerFunction);
 
     props.usersTable.grantReadData(this.workerFunction);

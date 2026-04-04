@@ -320,6 +320,12 @@ export class ApiStack extends cdk.Stack {
       })
     );
     runsTable.grantReadWriteData(this.gatewayFunction);
+    this.gatewayFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:Query"],
+        resources: [`arn:aws:dynamodb:${this.region}:${this.account}:table/coderhelm-${props.stage}-runs/index/*`],
+      })
+    );
     analyticsTable.grantReadData(this.gatewayFunction);
     jiraEventsTable.grantReadWriteData(this.gatewayFunction);
     tracesTable.grantReadData(this.gatewayFunction);
