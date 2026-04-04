@@ -1089,36 +1089,7 @@ async fn run_passes(
     )
     .await?;
 
-    // Post success comment only for GitHub-sourced tickets.
-    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        let raw_comment = format!(
-            "✅ **Coderhelm completed this ticket**\n\n**PR**: {}\n**Files**: {} modified\n\n[View run →](https://app.coderhelm.com/runs/detail?id={})",
-            pr_result.pr_url,
-            impl_result.files_modified.len(),
-            run_id,
-        );
-        let comment = formatter::format_with_voice(state, &voice, &raw_comment, usage).await;
-        github
-            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
-            .await?;
-    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-        let raw_comment = format!(
-            "PR: {}\nFiles: {} modified\n\nView run → https://app.coderhelm.com/runs/detail?id={}",
-            pr_result.pr_url,
-            impl_result.files_modified.len(),
-            run_id,
-        );
-        let comment = formatter::format_with_voice(state, &voice, &raw_comment, usage).await;
-        let _ = post_jira_comment(
-            state,
-            &msg.team_id,
-            &msg.ticket_id,
-            &comment,
-            "success",
-            "Completed",
-        )
-        .await;
-    }
+    // No completion comment on the issue — the PR itself links back via "Closes #N".
 
     Ok(())
 }
