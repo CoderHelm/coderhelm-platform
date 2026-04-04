@@ -484,13 +484,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .github
                     .search_code(&self.owner, &self.repo, query)
                     .await?;
-                // Cap search results to avoid dumping too many tokens
-                let capped = if results.len() > 15 {
-                    &results[..15]
-                } else {
-                    &results
-                };
-                let lines: Vec<String> = capped
+                let lines: Vec<String> = results
                     .iter()
                     .map(|r| {
                         if r.matches.is_empty() {
@@ -500,15 +494,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                         }
                     })
                     .collect();
-                let mut output = lines.join("\n---\n");
-                if results.len() > 15 {
-                    output.push_str(&format!(
-                        "\n\n... ({} more results not shown, {} total)",
-                        results.len() - 15,
-                        results.len()
-                    ));
-                }
-                Ok(json!(output))
+                Ok(json!(lines.join("\n---\n")))
             }
             "list_directory" => {
                 let path = input
