@@ -203,7 +203,7 @@ The plan already tells you which file(s) to edit. Go DIRECTLY to them.
     };
     let opts = llm::ConverseOptions {
         max_turns: match complexity {
-            "simple" => 10,
+            "simple" => 25,
             "medium" => 35,
             _ => 50,
         },
