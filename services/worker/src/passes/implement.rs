@@ -54,8 +54,9 @@ pub async fn run(
 {spec}{feedback}
 
 ## Instructions
+- **EFFICIENCY FIRST**: Use `search_code` to find the exact files and lines before reading anything. Never call `read_tree` or `read_file` on large files when `search_code` + `read_file_lines` would suffice.
 - Implement each unchecked task (`- [ ]`) one at a time, in order.
-- For each task: read the relevant files, understand the pattern, write the code.
+- For each task: search for the relevant code, read only the lines you need, write the change.
 - Use `batch_write` for atomic multi-file changes when a task touches multiple files.
 - Follow existing code patterns exactly (imports, naming, structure, test style).
 - Ensure the implementation satisfies all acceptance criteria listed above.

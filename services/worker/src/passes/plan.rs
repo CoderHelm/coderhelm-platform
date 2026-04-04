@@ -63,8 +63,10 @@ Summary: {summary}
 
 ## Instructions
 
-Research the codebase using the `read_tree`, `read_file`, and `list_directory` tools to
-understand the existing patterns.
+Research the codebase efficiently. **Start with `search_code`** to find relevant files and symbols
+before reading anything. Use `read_file_lines` for targeted reads instead of `read_file` on whole files.
+Only call `read_tree` if you genuinely need the full project structure. Be surgical: a config ID change
+should need 2-3 tool calls, not 20.
 
 **CRITICAL — Verify before planning:** Before generating a plan, check if the requested change
 is ALREADY in place in the codebase. Read the relevant files and compare their current state
