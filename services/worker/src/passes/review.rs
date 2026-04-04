@@ -40,19 +40,11 @@ Use the `get_diff` tool to see all changes compared to main. Then review for:
 2. **Completeness** — Are all tasks implemented? Any missing pieces?
 3. **Convention compliance** — Does it follow the repo's patterns (naming, imports, structure)?
 4. **Obvious bugs** — Null checks, off-by-one, missing error handling, typos?
-5. **Security** — Any injection risks, exposed secrets, unsafe operations?
-6. **Must-rules** — If must-rules are listed in the system prompt, verify every rule is respected.
-7. **Regressions** — Does the change remove or break existing working functionality? Watch for:
-   - Hardcoded values replaced with env vars or config WITHOUT a fallback to the original value
-   - Features that silently stop working if a new env var / config is not set
-   - Default behavior changes that could break production
+5. **Must-rules** — If must-rules are listed in the system prompt, verify every rule is respected.
+6. **Regressions** — Does the change break existing functionality? Watch for hardcoded values replaced without fallbacks.
 
-If you find issues, start your response with "ISSUES_FOUND:" followed by a detailed list of every issue with:
-- File path and line range
-- Description of the problem
-- Suggested fix
-
-If everything looks good, start your response with "LGTM" followed by a brief summary."#,
+If you find issues, start with "ISSUES_FOUND:" followed by a list with file path, problem, and suggested fix.
+If everything looks good, start with "LGTM" followed by a brief summary."#,
         number = msg.issue_number,
         title = msg.title,
     );

@@ -22,35 +22,21 @@ pub async fn run(
     let instructions_block = super::format_instructions_block(repo_instructions);
     let system = format!(
         "You are a security audit agent for the {owner}/{repo} repository. \
-         You are READ-ONLY — you cannot modify files. Your job is to review the diff \
-         for security vulnerabilities using the OWASP Top 10 and supply chain best practices.\n\n\
-         ## Security Checklist\n\
-         1. **Injection (A03):** SQL/NoSQL/OS command/log injection via unsanitized input\n\
-         2. **Broken Access Control (A01):** Missing auth checks, IDOR, privilege escalation, CORS\n\
-         3. **Cryptographic Failures (A02):** Hardcoded secrets, weak hashing, insecure random\n\
-         4. **Security Misconfiguration (A05):** Debug mode, default creds, verbose errors\n\
-         5. **Vulnerable Components (A06):** New dependencies — flag for review, typosquatting, unpinned versions\n\
-         6. **SSRF (A10):** User-controlled URLs in fetch/http requests, missing allowlisting\n\
-         7. **XSS (A07):** dangerouslySetInnerHTML, innerHTML, missing output encoding\n\
-         8. **Insecure Deserialization:** JSON.parse on untrusted input, prototype pollution\n\
-         9. **Sensitive Data Exposure:** Logging PII/tokens, credentials in errors\n\
-         10. **DoS:** ReDoS, unbound resource consumption, missing rate limiting\n\
-         11. **Rust-specific:** unsafe blocks, .unwrap() on user input, raw pointers\n\
-         12. **JS/TS-specific:** eval(), child_process without sanitization, prototype pollution{instructions_block}",
+         You are READ-ONLY. Review the diff for OWASP Top 10 vulnerabilities, \
+         supply chain risks (typosquatting, unpinned deps), and language-specific issues \
+         (unsafe blocks, eval, prototype pollution, hardcoded secrets).{instructions_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
 
     let prompt = "Review the diff for security vulnerabilities. Use get_diff to see all changes, \
-         then read any files you need for context.\n\n\
+         then read only the specific functions referenced in the diff if you need surrounding context.\n\n\
          Output format:\n\
-         - If no security issues: start your final message with `SECURITY_PASS`\n\
-         - If issues found: start your final message with `SECURITY_FAIL` followed by:\n\n\
-         ## Security Issues Found\n\n\
+         - If no security issues: start with `SECURITY_PASS`\n\
+         - If issues found: start with `SECURITY_FAIL` followed by:\n\n\
          ### [CRITICAL/HIGH/MEDIUM/LOW] — Issue Title\n\
          - **File:** path/to/file:line\n\
          - **Category:** OWASP category\n\
-         - **Description:** What the issue is\n\
          - **Remediation:** How to fix it"
         .to_string();
 

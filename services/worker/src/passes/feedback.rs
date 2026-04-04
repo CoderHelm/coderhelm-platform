@@ -91,20 +91,11 @@ pub async fn run(
 
     let system = format!(
         "You are a feedback agent for the {owner}/{repo} repository. \
-         You respond to reviewer comments on pull requests using tools to read and write files \
+         You respond to reviewer comments on pull requests by reading and writing files \
          directly to the PR branch. \
-         Treat each review thread as a conversation — the reviewer may ask follow-up questions \
-         or request additional changes after your reply. Be conversational and collaborative. \
-         If a comment asks a question, read the relevant code and answer it clearly. \
-         If a comment requests a code change, you MUST use write_file or batch_write \
-         to actually commit the change — do NOT describe what changes should be made without making them. \
-         After pushing the change, write a short confirmation as your reply \
-         (e.g. \"Done — hardcoded the measurement ID.\"). \
-         Your final text output will be posted directly as a GitHub comment — \
-         write it as a natural reply to the reviewer. \
-         Never include meta-commentary like 'Response to Review Comments', \
-         'Comment #1', 'Now I have the full context', or any internal reasoning. \
-         Just answer directly as if you are talking to the reviewer.{voice_block}",
+         If a comment requests a code change, use write_file or batch_write to commit it, \
+         then confirm briefly. If a comment asks a question, read the code and answer clearly. \
+         Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
@@ -116,33 +107,20 @@ pub async fn run(
 {comments}
 
 ## Instructions
-For each comment, decide whether it is:
-- **A question** (e.g. "why did you do X?", "what does this do?", "could this cause Y?") — answer it with a clear, concise explanation. Read the relevant code first if needed.
-- **A change request** (e.g. "use X instead", "add error handling", "this should be Y") — read the relevant file, fix the code using write_file or batch_write, and push the change. NEVER describe a code change in text without actually making it first.
+For each comment:
+- **Question** — read the relevant code, answer concisely
+- **Change request** — fix the code with write_file/batch_write, then confirm (e.g. "Done — added error handling.")
 
-Some comments may be prefixed with `[username]:` — these are earlier messages in the same thread provided for context. Do not reply to context messages; only reply to the reviewer's latest comment in each thread. Use the context to understand what was discussed previously.
+Context messages prefixed with `[username]:` are for background only — reply only to the reviewer's latest comment in each thread.
 
-Your output will be posted directly as GitHub comments — one reply per review comment thread. Write concise, direct replies. Do NOT include:
-- Headings like "Response to Review Comments" or "Comment #1"
-- Meta-commentary like "Now I have the full context" or "Let me explain"
-- Numbered comment references — just answer naturally
-- Internal reasoning or deliberation — only post the final answer
-
-Use proper GitHub markdown in replies: backticks for code, triple-backtick blocks for multi-line code, and keep replies short (1-3 sentences for confirmations).
-
-If there are multiple NEW comments to reply to (not counting context messages), write a separate reply for each one in the same order they appear above. \
-Separate each reply with exactly this marker on its own line:
----SPLIT---
-Each section will be posted as a separate reply to the corresponding comment thread.
-If there is only one comment to reply to, do NOT include ---SPLIT--- at all.
+If multiple comments, write a separate reply for each, separated by `---SPLIT---` on its own line.
 
 Rules:
-- Address every comment. Don't skip any.
-- For code changes, follow the reviewer's suggestions exactly unless they conflict with the codebase conventions.
-- Don't make unrelated changes beyond what the reviewer asked for.
-- When you make a code change (create, edit, or delete a file), briefly confirm what you did (e.g. "Done — deleted `SETUP.md`." or "Updated — added error handling to `handler.rs`.").
-- If the reviewer asks about the spec, design, or proposal, check for openspec files under `openspec/` and update them if needed.
-- Keep answers concise but helpful."#,
+- Address every comment
+- Follow the reviewer's suggestions exactly unless they conflict with codebase conventions
+- Don't make unrelated changes
+- Use GitHub markdown (backticks for code, triple-backtick for blocks)
+- Keep replies short (1-3 sentences for confirmations)"#,
         pr_number = msg.pr_number,
         comments = formatted,
     );

@@ -194,11 +194,9 @@ After researching, output the four files using this exact format:
             .map(|p| format!("- {}", p.server_id))
             .collect();
         full_system.push_str(&format!(
-            "\n\nYou have tool-call access to the following MCP servers. \
-             Use them proactively to look up information referenced in the issue \
-             (e.g. read a Notion page, search Figma designs, check Sentry errors). \
-             If the issue description contains URLs or references to external sources, \
-             fetch them before making any decisions:\n{}",
+            "\n\nYou have tool-call access to these MCP servers. \
+             Only use them if the issue description contains URLs or explicit references \
+             to external sources:\n{}",
             plugin_lines.join("\n")
         ));
     }

@@ -119,11 +119,8 @@ pub async fn run(
             .map(|p| format!("- {}", p.server_id))
             .collect();
         full_system.push_str(&format!(
-            "\n\nYou have tool-call access to the following MCP servers. \
-             Use them proactively to look up information referenced in the issue \
-             (e.g. read a Notion page, search Figma designs, check Sentry errors). \
-             If the issue or plan references URLs or external sources, fetch them \
-             before implementing:\n{}",
+            "\n\nYou have tool-call access to these MCP servers. \
+             Only use them if the issue or plan explicitly references URLs or external resources:\n{}",
             plugin_lines.join("\n")
         ));
     }

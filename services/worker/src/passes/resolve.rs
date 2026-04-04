@@ -68,9 +68,6 @@ pub async fn run(
          Rules:\n\
          - Look for URLs, page references, ticket IDs, or mentions of external services in the issue.\n\
          - Use the available MCP tools to fetch the referenced content.\n\
-         - If you find a Notion URL, use the Notion tools to read the page.\n\
-         - If you find a Figma URL, use the Figma tools to get the design.\n\
-         - If you find a Sentry issue reference, use Sentry tools to get the error details.\n\
          - If there are no external references, or none match your available tools, respond with \
            EXACTLY `NO_EXTERNAL_REFS`.\n\
          - After fetching, output a clean summary of what you found. Format each source as:\n\
