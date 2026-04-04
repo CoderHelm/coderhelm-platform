@@ -46,9 +46,17 @@ pub async fn run(
             });
         }
 
-        let check_data = github
+        let check_data = match github
             .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, branch)
-            .await?;
+            .await
+        {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("Failed to poll check runs: {e}, retrying...");
+                tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                continue;
+            }
+        };
 
         let check_runs = check_data["check_runs"]
             .as_array()

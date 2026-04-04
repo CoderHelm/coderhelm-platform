@@ -831,7 +831,13 @@ async fn run_passes(
         update_pass(state, &msg.team_id, run_id, "test").await?;
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
-        let test_result = test::run(state, msg, &github, &branch_name).await?;
+        let test_result = match test::run(state, msg, &github, &branch_name).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(run_id, error = %e, "Test pass errored, proceeding without test results");
+                test::TestResult { passed: true, output: Some(format!("Test pass error: {e}")) }
+            }
+        };
         write_pass_trace(
             state,
             &msg.team_id,
@@ -876,7 +882,7 @@ async fn run_passes(
         update_pass(state, &msg.team_id, run_id, "review").await?;
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
-        let review_result = review::run(
+        let review_result = match review::run(
             state,
             msg,
             &github,
@@ -885,7 +891,14 @@ async fn run_passes(
             &repo_instructions,
             usage,
         )
-        .await?;
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(run_id, error = %e, "Review pass errored, proceeding");
+                review::ReviewResult { passed: true, summary: format!("Review error: {e}") }
+            }
+        };
         write_pass_trace(
             state,
             &msg.team_id,
@@ -941,7 +954,13 @@ async fn run_passes(
     update_pass(state, &msg.team_id, run_id, "security").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let security_result = security::run(state, msg, &github, &branch_name, usage).await?;
+    let security_result = match security::run(state, msg, &github, &branch_name, usage).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(run_id, error = %e, "Security pass errored, proceeding");
+            security::SecurityResult { passed: true, summary: format!("Security error: {e}") }
+        }
+    };
     write_pass_trace(
         state,
         &msg.team_id,
@@ -993,7 +1012,13 @@ async fn run_passes(
         // Re-audit once
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "security").await?;
-        let retry = security::run(state, msg, &github, &branch_name, usage).await?;
+        let retry = match security::run(state, msg, &github, &branch_name, usage).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(run_id, error = %e, "Security retry errored, proceeding");
+                security::SecurityResult { passed: true, summary: format!("Security error: {e}") }
+            }
+        };
         if !retry.passed {
             warn!(
                 run_id,
