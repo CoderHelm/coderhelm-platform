@@ -499,7 +499,10 @@ pub async fn mfa_setup(
         })?;
 
     // If Cognito returns a challenge (e.g. SOFTWARE_TOKEN_MFA), user already has MFA enabled
-    let access_token = match auth_result.authentication_result().and_then(|r| r.access_token()) {
+    let access_token = match auth_result
+        .authentication_result()
+        .and_then(|r| r.access_token())
+    {
         Some(token) => token.to_string(),
         None => {
             // User already has MFA enabled — return 409 Conflict

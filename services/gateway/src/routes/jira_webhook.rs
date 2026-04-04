@@ -730,7 +730,11 @@ async fn handle_jira_comment(
                 "comment_retry",
                 ticket_key,
                 title,
-                if result.is_ok() { "reprocessing" } else { "error" },
+                if result.is_ok() {
+                    "reprocessing"
+                } else {
+                    "error"
+                },
                 Some(&repo_display),
             )
             .await;
@@ -754,8 +758,7 @@ async fn handle_jira_comment(
                 team_id,
                 ticket_key, run_id, "Sending feedback for Jira comment on completed run"
             );
-            let result =
-                send_to_queue(state, &state.config.feedback_queue_url, &message).await;
+            let result = send_to_queue(state, &state.config.feedback_queue_url, &message).await;
             let repo_display = format!("{repo_owner}/{repo_name}");
             log_jira_event(
                 state,
