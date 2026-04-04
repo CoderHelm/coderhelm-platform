@@ -1402,7 +1402,13 @@ pub async fn plan_chat(
                 let state_clone = state.clone();
                 let team_id_clone = claims.team_id.clone();
                 tokio::spawn(async move {
-                    track_chat_tokens(&state_clone, &team_id_clone, total_input_tokens, total_output_tokens).await;
+                    track_chat_tokens(
+                        &state_clone,
+                        &team_id_clone,
+                        total_input_tokens,
+                        total_output_tokens,
+                    )
+                    .await;
                 });
                 return Ok(Json(json!({ "content": "" })));
             }
@@ -1441,7 +1447,13 @@ pub async fn plan_chat(
                 let state_clone = state.clone();
                 let team_id_clone = claims.team_id.clone();
                 tokio::spawn(async move {
-                    track_chat_tokens(&state_clone, &team_id_clone, total_input_tokens, total_output_tokens).await;
+                    track_chat_tokens(
+                        &state_clone,
+                        &team_id_clone,
+                        total_input_tokens,
+                        total_output_tokens,
+                    )
+                    .await;
                 });
             }
             let servers: Vec<&str> = mcp_servers_used.iter().map(|s| s.as_str()).collect();
@@ -1523,7 +1535,13 @@ pub async fn plan_chat(
         let state_clone = state.clone();
         let team_id_clone = claims.team_id.clone();
         tokio::spawn(async move {
-            track_chat_tokens(&state_clone, &team_id_clone, total_input_tokens, total_output_tokens).await;
+            track_chat_tokens(
+                &state_clone,
+                &team_id_clone,
+                total_input_tokens,
+                total_output_tokens,
+            )
+            .await;
         });
     }
     let servers: Vec<&str> = mcp_servers_used.iter().map(|s| s.as_str()).collect();
@@ -1535,7 +1553,10 @@ pub async fn plan_chat(
 // ---------------------------------------------------------------------------
 
 /// Send a single SSE event formatted as `event: {type}\ndata: {json}\n\n`.
-fn sse_event(event_type: &str, data: Value) -> Result<axum::response::sse::Event, std::convert::Infallible> {
+fn sse_event(
+    event_type: &str,
+    data: Value,
+) -> Result<axum::response::sse::Event, std::convert::Infallible> {
     Ok(axum::response::sse::Event::default()
         .event(event_type)
         .data(serde_json::to_string(&data).unwrap_or_default()))
@@ -1546,7 +1567,15 @@ pub async fn plan_chat_stream(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<
-    axum::response::sse::Sse<std::pin::Pin<Box<dyn futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send>>>,
+    axum::response::sse::Sse<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<axum::response::sse::Event, std::convert::Infallible>,
+                    > + Send,
+            >,
+        >,
+    >,
     StatusCode,
 > {
     // Validate Bearer token (issued by /api/plans/chat/token)
@@ -1669,9 +1698,7 @@ pub async fn plan_chat_stream(
         ));
     }
     if let Some(context) = log_analyzer_context.filter(|c| !c.is_empty()) {
-        system_prompt.push_str(&format!(
-            "\n\nAWS Log Analyzer context:\n{context}"
-        ));
+        system_prompt.push_str(&format!("\n\nAWS Log Analyzer context:\n{context}"));
     }
 
     // Load MCP tool definitions
@@ -1760,14 +1787,17 @@ pub async fn plan_chat_stream(
     let team_id = claims.team_id.clone();
     let model_id = state.config.model_id.clone();
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::response::sse::Event, std::convert::Infallible>>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >(64);
 
     // Spawn the agentic streaming loop
     tokio::spawn(async move {
         let max_turns = 5;
         let mut total_input_tokens: u64 = 0;
         let mut total_output_tokens: u64 = 0;
-        let mut mcp_servers_used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut mcp_servers_used: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for turn in 0..max_turns {
             // Build request — use converse_stream for streaming
@@ -1788,7 +1818,12 @@ pub async fn plan_chat_stream(
                 Ok(r) => r,
                 Err(e) => {
                     error!("Bedrock converse_stream failed: {e}");
-                    let _ = tx.send(sse_event("error", json!({ "message": format!("AI service error: {e}") }))).await;
+                    let _ = tx
+                        .send(sse_event(
+                            "error",
+                            json!({ "message": format!("AI service error: {e}") }),
+                        ))
+                        .await;
                     return;
                 }
             };
@@ -1805,86 +1840,110 @@ pub async fn plan_chat_stream(
             // Process stream events
             loop {
                 match event_stream.recv().await {
-                    Ok(Some(event)) => {
-                        match event {
-                            aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockStart(e) => {
-                                if let Some(start) = e.start() {
-                                    match start {
-                                        aws_sdk_bedrockruntime::types::ContentBlockStart::ToolUse(tu) => {
-                                            active_tool_id = tu.tool_use_id().to_string();
-                                            active_tool_name = tu.name().to_string();
-                                            active_tool_input.clear();
+                    Ok(Some(event)) => match event {
+                        aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockStart(
+                            e,
+                        ) => {
+                            if let Some(start) = e.start() {
+                                match start {
+                                    aws_sdk_bedrockruntime::types::ContentBlockStart::ToolUse(
+                                        tu,
+                                    ) => {
+                                        active_tool_id = tu.tool_use_id().to_string();
+                                        active_tool_name = tu.name().to_string();
+                                        active_tool_input.clear();
 
-                                            let (server, display_name) = if active_tool_name.contains("__") {
-                                                let parts: Vec<&str> = active_tool_name.splitn(2, "__").collect();
+                                        let (server, display_name) =
+                                            if active_tool_name.contains("__") {
+                                                let parts: Vec<&str> =
+                                                    active_tool_name.splitn(2, "__").collect();
                                                 (Some(parts[0].to_string()), parts[1].to_string())
                                             } else {
                                                 (None, active_tool_name.clone())
                                             };
 
-                                            let mut data = json!({
-                                                "id": active_tool_id,
-                                                "name": display_name,
-                                            });
-                                            if let Some(s) = &server {
-                                                data["server"] = json!(s);
-                                            }
-                                            let _ = tx.send(sse_event("tool_start", data)).await;
+                                        let mut data = json!({
+                                            "id": active_tool_id,
+                                            "name": display_name,
+                                        });
+                                        if let Some(s) = &server {
+                                            data["server"] = json!(s);
                                         }
-                                        _ => {}
+                                        let _ = tx.send(sse_event("tool_start", data)).await;
                                     }
+                                    _ => {}
                                 }
                             }
-                            aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockDelta(e) => {
-                                if let Some(delta) = e.delta() {
-                                    match delta {
-                                        aws_sdk_bedrockruntime::types::ContentBlockDelta::Text(text) => {
-                                            let _ = tx.send(sse_event("text_delta", json!({ "text": text }))).await;
-                                        }
-                                        aws_sdk_bedrockruntime::types::ContentBlockDelta::ToolUse(tu) => {
-                                            let input = tu.input();
-                                            active_tool_input.push_str(input);
-                                            let _ = tx.send(sse_event("tool_input_delta", json!({
-                                                "id": active_tool_id,
-                                                "partial_json": input,
-                                            }))).await;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockStop(_) => {
-                                if !active_tool_id.is_empty() {
-                                    current_tool_uses.push((
-                                        active_tool_id.clone(),
-                                        active_tool_name.clone(),
-                                        active_tool_input.clone(),
-                                    ));
-                                    active_tool_id.clear();
-                                    active_tool_name.clear();
-                                    active_tool_input.clear();
-                                }
-                            }
-                            aws_sdk_bedrockruntime::types::ConverseStreamOutput::MessageStop(e) => {
-                                let reason = e.stop_reason();
-                                    stop_reason_is_tool_use = matches!(
-                                        reason,
-                                        aws_sdk_bedrockruntime::types::StopReason::ToolUse
-                                    );
-                            }
-                            aws_sdk_bedrockruntime::types::ConverseStreamOutput::Metadata(e) => {
-                                if let Some(usage) = e.usage() {
-                                    total_input_tokens += usage.input_tokens() as u64;
-                                    total_output_tokens += usage.output_tokens() as u64;
-                                }
-                            }
-                            _ => {}
                         }
-                    }
+                        aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockDelta(
+                            e,
+                        ) => {
+                            if let Some(delta) = e.delta() {
+                                match delta {
+                                    aws_sdk_bedrockruntime::types::ContentBlockDelta::Text(
+                                        text,
+                                    ) => {
+                                        let _ = tx
+                                            .send(sse_event("text_delta", json!({ "text": text })))
+                                            .await;
+                                    }
+                                    aws_sdk_bedrockruntime::types::ContentBlockDelta::ToolUse(
+                                        tu,
+                                    ) => {
+                                        let input = tu.input();
+                                        active_tool_input.push_str(input);
+                                        let _ = tx
+                                            .send(sse_event(
+                                                "tool_input_delta",
+                                                json!({
+                                                    "id": active_tool_id,
+                                                    "partial_json": input,
+                                                }),
+                                            ))
+                                            .await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockStop(
+                            _,
+                        ) => {
+                            if !active_tool_id.is_empty() {
+                                current_tool_uses.push((
+                                    active_tool_id.clone(),
+                                    active_tool_name.clone(),
+                                    active_tool_input.clone(),
+                                ));
+                                active_tool_id.clear();
+                                active_tool_name.clear();
+                                active_tool_input.clear();
+                            }
+                        }
+                        aws_sdk_bedrockruntime::types::ConverseStreamOutput::MessageStop(e) => {
+                            let reason = e.stop_reason();
+                            stop_reason_is_tool_use = matches!(
+                                reason,
+                                aws_sdk_bedrockruntime::types::StopReason::ToolUse
+                            );
+                        }
+                        aws_sdk_bedrockruntime::types::ConverseStreamOutput::Metadata(e) => {
+                            if let Some(usage) = e.usage() {
+                                total_input_tokens += usage.input_tokens() as u64;
+                                total_output_tokens += usage.output_tokens() as u64;
+                            }
+                        }
+                        _ => {}
+                    },
                     Ok(None) => break,
                     Err(e) => {
                         error!("Stream error: {e}");
-                        let _ = tx.send(sse_event("error", json!({ "message": format!("Stream error: {e}") }))).await;
+                        let _ = tx
+                            .send(sse_event(
+                                "error",
+                                json!({ "message": format!("Stream error: {e}") }),
+                            ))
+                            .await;
                         return;
                     }
                 }
@@ -1892,17 +1951,28 @@ pub async fn plan_chat_stream(
 
             // If no tool use, we're done
             if !stop_reason_is_tool_use || current_tool_uses.is_empty() {
-                let _ = tx.send(sse_event("usage", json!({
-                    "input_tokens": total_input_tokens,
-                    "output_tokens": total_output_tokens,
-                    "turns": turn + 1,
-                }))).await;
+                let _ = tx
+                    .send(sse_event(
+                        "usage",
+                        json!({
+                            "input_tokens": total_input_tokens,
+                            "output_tokens": total_output_tokens,
+                            "turns": turn + 1,
+                        }),
+                    ))
+                    .await;
                 let _ = tx.send(sse_event("done", json!({}))).await;
 
                 let state_clone = state.clone();
                 let team_id_clone = team_id.clone();
                 tokio::spawn(async move {
-                    track_chat_tokens(&state_clone, &team_id_clone, total_input_tokens, total_output_tokens).await;
+                    track_chat_tokens(
+                        &state_clone,
+                        &team_id_clone,
+                        total_input_tokens,
+                        total_output_tokens,
+                    )
+                    .await;
                 });
                 return;
             }
@@ -1962,17 +2032,27 @@ pub async fn plan_chat_stream(
                 if let Some(sid) = server_id_opt {
                     mcp_servers_used.insert(sid);
                     let summary = summarize_tool_result(&result);
-                    let _ = tx.send(sse_event("tool_result", json!({
-                        "id": tu_id,
-                        "status": "success",
-                        "summary": summary,
-                    }))).await;
+                    let _ = tx
+                        .send(sse_event(
+                            "tool_result",
+                            json!({
+                                "id": tu_id,
+                                "status": "success",
+                                "summary": summary,
+                            }),
+                        ))
+                        .await;
                 } else {
-                    let _ = tx.send(sse_event("tool_result", json!({
-                        "id": tu_id,
-                        "status": "error",
-                        "summary": format!("Unknown tool: {tu_name}"),
-                    }))).await;
+                    let _ = tx
+                        .send(sse_event(
+                            "tool_result",
+                            json!({
+                                "id": tu_id,
+                                "status": "error",
+                                "summary": format!("Unknown tool: {tu_name}"),
+                            }),
+                        ))
+                        .await;
                 }
 
                 tool_results.push(aws_sdk_bedrockruntime::types::ContentBlock::ToolResult(
@@ -1994,25 +2074,43 @@ pub async fn plan_chat_stream(
                     .unwrap(),
             );
 
-            info!(turn = turn + 1, "Streaming plan chat tool use turn complete");
+            info!(
+                turn = turn + 1,
+                "Streaming plan chat tool use turn complete"
+            );
         }
 
         // Hit max turns
-        let _ = tx.send(sse_event("usage", json!({
-            "input_tokens": total_input_tokens,
-            "output_tokens": total_output_tokens,
-            "turns": max_turns,
-        }))).await;
+        let _ = tx
+            .send(sse_event(
+                "usage",
+                json!({
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "turns": max_turns,
+                }),
+            ))
+            .await;
         let _ = tx.send(sse_event("done", json!({}))).await;
         let state_clone = state.clone();
         let team_id_clone = team_id.clone();
         tokio::spawn(async move {
-            track_chat_tokens(&state_clone, &team_id_clone, total_input_tokens, total_output_tokens).await;
+            track_chat_tokens(
+                &state_clone,
+                &team_id_clone,
+                total_input_tokens,
+                total_output_tokens,
+            )
+            .await;
         });
     });
 
-    let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send>> =
-        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let stream: std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
+                + Send,
+        >,
+    > = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
     Ok(axum::response::sse::Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
