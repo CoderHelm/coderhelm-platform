@@ -862,8 +862,27 @@ pub async fn force_run_task(
         .map(|s| s.as_str())
         .unwrap_or("");
 
-    if status != "waiting" {
+    if status != "waiting" && status != "failed" {
         return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Reset task status to "waiting" so the worker picks it up
+    if status == "failed" {
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.plans_table_name)
+            .key("pk", attr_s(&claims.team_id))
+            .key("sk", attr_s(&task_sk))
+            .update_expression("SET #s = :s")
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_values(":s", attr_s("waiting"))
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to reset task status: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
     }
 
     // Send PlanTaskContinue message to the worker
