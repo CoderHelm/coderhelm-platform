@@ -111,6 +111,20 @@ pub async fn run(
 
     // Add MCP context to system prompt
     let mut full_system = system.clone();
+    if !loaded_mcp_plugins.is_empty() {
+        let plugin_lines: Vec<String> = loaded_mcp_plugins
+            .iter()
+            .map(|p| format!("- {}", p.server_id))
+            .collect();
+        full_system.push_str(&format!(
+            "\n\nYou have tool-call access to the following MCP servers. \
+             Use them proactively to look up information referenced in the issue \
+             (e.g. read a Notion page, search Figma designs, check Sentry errors). \
+             If the issue or plan references URLs or external sources, fetch them \
+             before implementing:\n{}",
+            plugin_lines.join("\n")
+        ));
+    }
     for plugin in &loaded_mcp_plugins {
         if let Some(ref prompt) = plugin.custom_prompt {
             full_system.push_str(&format!(

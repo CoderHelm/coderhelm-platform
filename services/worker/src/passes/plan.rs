@@ -78,11 +78,15 @@ spec.md normally.
 
 **CRITICAL — Ambiguous values:** If the issue asks to change, update, or replace a value
 (an ID, URL, API key, config value, version number, etc.) but does NOT specify what the new
-value should be, do NOT guess or infer the value from other files, websites, or context.
-Set tasks.md to EXACTLY `CLARIFICATION_NEEDED: <what is missing>` where `<what is missing>`
-describes the information the issue must provide (e.g. "The issue asks to update the GTM ID
-but does not specify the new ID to use"). Still output proposal.md, design.md, and spec.md
-normally.
+value should be:
+1. First, check if the issue references any external URLs (Notion pages, docs, etc.) that
+   might contain the value. If you have MCP tools available (e.g. Notion), use them to fetch
+   the referenced page and extract the value before giving up.
+2. Only if the value truly cannot be determined after checking all referenced sources, set
+   tasks.md to EXACTLY `CLARIFICATION_NEEDED: <what is missing>` where `<what is missing>`
+   describes the information the issue must provide (e.g. "The issue asks to update the GTM ID
+   but does not specify the new ID to use"). Still output proposal.md, design.md, and spec.md
+   normally.
 
 Otherwise, generate four openspec files:
 
@@ -157,6 +161,20 @@ After researching, output the four files using this exact format:
 
     // Add MCP context to system prompt if we have active plugins
     let mut full_system = system.clone();
+    if !loaded_mcp_plugins.is_empty() {
+        let plugin_lines: Vec<String> = loaded_mcp_plugins
+            .iter()
+            .map(|p| format!("- {}", p.server_id))
+            .collect();
+        full_system.push_str(&format!(
+            "\n\nYou have tool-call access to the following MCP servers. \
+             Use them proactively to look up information referenced in the issue \
+             (e.g. read a Notion page, search Figma designs, check Sentry errors). \
+             If the issue description contains URLs or references to external sources, \
+             fetch them before making any decisions:\n{}",
+            plugin_lines.join("\n")
+        ));
+    }
     for plugin in &loaded_mcp_plugins {
         if let Some(ref prompt) = plugin.custom_prompt {
             full_system.push_str(&format!(
