@@ -206,7 +206,8 @@ pub async fn orchestrate_ticket(
             error!(run_id, error = %e, "Orchestration failed");
             let sanitized = sanitize_error(&err_msg);
             fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
-            return Err(e);
+            // Return Ok so SQS does not retry the message and flip status back to running
+            return Ok(());
         }
     }
 
