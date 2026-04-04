@@ -129,6 +129,7 @@ pub async fn converse(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn converse_with_opts(
     state: &WorkerState,
     model_id: &str,
