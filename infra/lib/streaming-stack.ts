@@ -141,7 +141,7 @@ export class StreamingStack extends cdk.Stack {
         allowedOrigins: props.stage === "prod"
           ? ["https://app.coderhelm.com", "https://coderhelm.com"]
           : ["http://localhost:3000", "http://localhost:3001"],
-        allowedMethods: [lambda.HttpMethod.POST, lambda.HttpMethod.OPTIONS],
+        allowedMethods: [lambda.HttpMethod.POST],
         allowedHeaders: ["Content-Type", "Authorization", "Cookie"],
         allowCredentials: true,
         maxAge: cdk.Duration.hours(1),
