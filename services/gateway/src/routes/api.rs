@@ -557,6 +557,15 @@ pub async fn get_run(
                 }))
             }).collect::<Vec<_>>()
         }),
+        "progress_notes": item.get("progress_notes").and_then(|v| v.as_l().ok()).map(|list| {
+            list.iter().filter_map(|entry| {
+                let m = entry.as_m().ok()?;
+                Some(json!({
+                    "message": m.get("message").and_then(|v| v.as_s().ok()),
+                    "timestamp": m.get("timestamp").and_then(|v| v.as_s().ok()),
+                }))
+            }).collect::<Vec<_>>()
+        }),
     })))
 }
 

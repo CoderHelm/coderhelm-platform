@@ -365,6 +365,7 @@ async fn run_passes(
     )
     .await;
     save_checkpoint(state, &msg.team_id, run_id, "triage", "", 0, usage).await;
+    add_progress_note(state, &msg.team_id, run_id, &format!("Triaged as {} complexity", triage_result.complexity)).await;
     info!(run_id, "Triage complete");
 
     // --- Resolve external references via MCP tools ---
@@ -395,6 +396,7 @@ async fn run_passes(
     )
     .await;
     save_checkpoint(state, &msg.team_id, run_id, "plan", "", 0, usage).await;
+    add_progress_note(state, &msg.team_id, run_id, "Plan generated").await;
     info!(run_id, "Plan complete");
 
     // --- Check: already done? ---
@@ -638,6 +640,7 @@ async fn run_passes(
             .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, "main")
             .await?;
         info!(run_id, branch = %branch_name, "Created working branch");
+        add_progress_note(state, &msg.team_id, run_id, &format!("Created branch {}", branch_name)).await;
 
         // Commit openspec to the repo branch if enabled (default: on)
         let commit_openspec = load_workflow_setting(state, &msg.team_id, "commit_openspec").await;
@@ -757,6 +760,13 @@ async fn run_passes(
             files = result.files_modified.len(),
             "Implement complete"
         );
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!("Implemented changes across {} file(s)", result.files_modified.len()),
+        )
+        .await;
 
         // If no files were changed, comment on the issue and bail — don't open an empty PR
         if result.files_modified.is_empty() {
@@ -856,6 +866,7 @@ async fn run_passes(
         .await;
         if !test_result.passed {
             info!(run_id, cycle, "CI failed, feeding back to implement");
+            add_progress_note(state, &msg.team_id, run_id, "CI tests failed, fixing").await;
             if cycle < max_review_cycles {
                 check_cancelled(state, &msg.team_id, run_id).await?;
                 update_pass(state, &msg.team_id, run_id, "implement").await?;
@@ -935,6 +946,13 @@ async fn run_passes(
             passed = review_result.passed,
             "Review cycle complete"
         );
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            if review_result.passed { "Code review passed" } else { "Code review found issues, re-implementing" },
+        )
+        .await;
 
         if review_result.passed || cycle == max_review_cycles {
             break;
@@ -1000,6 +1018,13 @@ async fn run_passes(
         passed = security_result.passed,
         "Security audit complete"
     );
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        if security_result.passed { "Security audit passed" } else { "Security issues found, fixing" },
+    )
+    .await;
 
     if !security_result.passed {
         // One remediation cycle: implement fixes, then re-audit
@@ -1079,6 +1104,7 @@ async fn run_passes(
     )
     .await;
     info!(run_id, pr_url = %pr_result.pr_url, "PR created");
+    add_progress_note(state, &msg.team_id, run_id, &format!("PR created: #{}", pr_result.pr_number)).await;
 
     // Update run record with final state
     let duration = start.elapsed().as_secs();
@@ -1182,6 +1208,34 @@ async fn update_pass(
         .send()
         .await?;
     Ok(())
+}
+
+/// Append a timestamped progress note to the run record for live activity display.
+async fn add_progress_note(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    message: &str,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = aws_sdk_dynamodb::types::AttributeValue::M(std::collections::HashMap::from([
+        ("message".to_string(), attr_s(message)),
+        ("timestamp".to_string(), attr_s(&now)),
+    ]));
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET progress_notes = list_append(if_not_exists(progress_notes, :empty), :entry), updated_at = :t",
+        )
+        .expression_attribute_values(":entry", aws_sdk_dynamodb::types::AttributeValue::L(vec![entry]))
+        .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]))
+        .expression_attribute_values(":t", attr_s(&now))
+        .send()
+        .await;
 }
 
 /// Check if a run has been cancelled by the user via the dashboard.
@@ -1724,9 +1778,9 @@ pub fn truncate_content(content: &str, path: &str) -> String {
 }
 
 /// Truncate file tree output to limit token usage on large repos.
-/// Keeps first 2000 entries.
+/// Keeps first 500 entries.
 pub fn truncate_tree(paths: &[&str]) -> String {
-    const MAX_ENTRIES: usize = 2000;
+    const MAX_ENTRIES: usize = 500;
     if paths.len() <= MAX_ENTRIES {
         return paths.join("\n");
     }

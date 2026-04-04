@@ -27,7 +27,13 @@ pub async fn run(
     usage: &mut TokenUsage,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
-    let instructions_block = super::format_instructions_block(repo_instructions);
+    // Trim repo instructions for simple issues to reduce per-turn token cost
+    let trimmed_instructions = if complexity == "simple" && repo_instructions.len() > 2000 {
+        &repo_instructions[..repo_instructions[..2000].rfind('\n').unwrap_or(2000)]
+    } else {
+        repo_instructions
+    };
+    let instructions_block = super::format_instructions_block(trimmed_instructions);
     let system = format!(
         "You are an implementation agent for the {owner}/{repo} repository. \
          Implement each task from the checklist. Follow existing code patterns exactly.{rules_block}{instructions_block}",
@@ -42,8 +48,28 @@ pub async fn run(
         None => String::new(),
     };
 
-    let prompt = format!(
-        r#"Implement the following tasks for issue #{number}: {title}
+    let prompt = if complexity == "simple" {
+        format!(
+            r#"Implement for issue #{number}: {title}
+
+## Tasks
+{tasks}{feedback}
+
+## Instructions — SIMPLE CHANGE
+The plan already tells you which file(s) to edit. Go DIRECTLY to them.
+- Do NOT call `read_tree` or browse the repo structure.
+- Use `read_file_lines` on the exact section, make the change with `write_file`, done.
+- You should need 2-5 tool calls total.
+- Only implement the listed tasks. Do not add extras.
+- After implementing, output a one-line summary."#,
+            number = msg.issue_number,
+            title = msg.title,
+            tasks = plan.tasks,
+            feedback = feedback_section,
+        )
+    } else {
+        format!(
+            r#"Implement the following tasks for issue #{number}: {title}
 
 ## Tasks
 {tasks}
@@ -55,23 +81,30 @@ pub async fn run(
 {spec}{feedback}
 
 ## Instructions
-- **EFFICIENCY FIRST**: Use `search_code` to find the exact files and lines before reading anything. Never call `read_tree` or `read_file` on large files when `search_code` + `read_file_lines` would suffice.
+- Use `search_code` to find exact files and lines before reading. Prefer `read_file_lines` over `read_file`.
 - Implement each unchecked task (`- [ ]`) one at a time, in order.
-- For each task: search for the relevant code, read only the lines you need, write the change.
-- Use `batch_write` for atomic multi-file changes when a task touches multiple files.
+- Use `batch_write` for atomic multi-file changes.
 - Follow existing code patterns exactly (imports, naming, structure, test style).
-- Ensure the implementation satisfies all acceptance criteria listed above.
-- After implementing all tasks, output a summary of what was done.
+- After implementing all tasks, output a summary.
 - Only implement the listed tasks. Do not add extras."#,
-        number = msg.issue_number,
-        title = msg.title,
-        tasks = plan.tasks,
-        design = plan.design,
-        spec = plan.spec,
-        feedback = feedback_section,
-    );
+            number = msg.issue_number,
+            title = msg.title,
+            tasks = plan.tasks,
+            design = plan.design,
+            spec = plan.spec,
+            feedback = feedback_section,
+        )
+    };
 
-    let mut tools = all_tools();
+    let mut tools = if complexity == "simple" {
+        // Simple issues: no read_tree or list_directory — plan already says which files to edit
+        all_tools()
+            .into_iter()
+            .filter(|t| t.name != "read_tree" && t.name != "list_directory")
+            .collect()
+    } else {
+        all_tools()
+    };
 
     // Load MCP plugins and their cached tool schemas
     let mcp_table = if state.config.mcp_configs_table_name.is_empty() {
@@ -170,7 +203,7 @@ pub async fn run(
     };
     let opts = llm::ConverseOptions {
         max_turns: match complexity {
-            "simple" => 25,
+            "simple" => 10,
             "medium" => 35,
             _ => 50,
         },
