@@ -21,7 +21,7 @@ pub async fn resolve_team_by_installation(
     state: &AppState,
     installation_id: u64,
 ) -> Option<String> {
-    let result = state
+    let result = match state
         .dynamo
         .query()
         .table_name(&state.config.teams_table_name)
@@ -34,7 +34,13 @@ pub async fn resolve_team_by_installation(
         .limit(1)
         .send()
         .await
-        .ok()?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(installation_id, error = %e, "Failed to query teams table for installation");
+            return None;
+        }
+    };
 
     result
         .items()
