@@ -16,8 +16,10 @@ pub async fn run(
     msg: &TicketMessage,
     github: &GitHubClient,
     branch: &str,
+    repo_instructions: &str,
     usage: &mut TokenUsage,
 ) -> Result<SecurityResult, Box<dyn std::error::Error + Send + Sync>> {
+    let instructions_block = super::format_instructions_block(repo_instructions);
     let system = format!(
         "You are a security audit agent for the {owner}/{repo} repository. \
          You are READ-ONLY — you cannot modify files. Your job is to review the diff \
@@ -34,7 +36,7 @@ pub async fn run(
          9. **Sensitive Data Exposure:** Logging PII/tokens, credentials in errors\n\
          10. **DoS:** ReDoS, unbound resource consumption, missing rate limiting\n\
          11. **Rust-specific:** unsafe blocks, .unwrap() on user input, raw pointers\n\
-         12. **JS/TS-specific:** eval(), child_process without sanitization, prototype pollution",
+         12. **JS/TS-specific:** eval(), child_process without sanitization, prototype pollution{instructions_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );

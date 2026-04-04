@@ -382,7 +382,7 @@ async fn run_passes(
     update_pass(state, &msg.team_id, run_id, "plan").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let plan_result = plan::run(state, msg, &github, &triage_result, usage).await?;
+    let plan_result = plan::run(state, msg, &github, &triage_result, &repo_instructions, usage).await?;
     write_pass_trace(
         state,
         &msg.team_id,
@@ -964,7 +964,7 @@ async fn run_passes(
     update_pass(state, &msg.team_id, run_id, "security").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let security_result = match security::run(state, msg, &github, &branch_name, usage).await {
+    let security_result = match security::run(state, msg, &github, &branch_name, &repo_instructions, usage).await {
         Ok(r) => r,
         Err(e) => {
             warn!(run_id, error = %e, "Security pass errored, proceeding");
@@ -1026,7 +1026,7 @@ async fn run_passes(
         // Re-audit once
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "security").await?;
-        let retry = match security::run(state, msg, &github, &branch_name, usage).await {
+        let retry = match security::run(state, msg, &github, &branch_name, &repo_instructions, usage).await {
             Ok(r) => r,
             Err(e) => {
                 warn!(run_id, error = %e, "Security retry errored, proceeding");

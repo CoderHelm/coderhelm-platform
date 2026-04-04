@@ -20,6 +20,7 @@ pub async fn run(
     msg: &TicketMessage,
     github: &GitHubClient,
     triage: &super::triage::TriageResult,
+    repo_instructions: &str,
     usage: &mut TokenUsage,
 ) -> Result<PlanResult, Box<dyn std::error::Error + Send + Sync>> {
     // Fetch all enabled repos for this team so the planner can explore cross-repo
@@ -41,15 +42,51 @@ pub async fn run(
             .join("\n")
     };
 
+    let instructions_block = if repo_instructions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n## Repository Context (AGENTS.md)\nUse this to understand the repo structure and conventions. \
+             This should reduce or eliminate the need to browse the file tree:\n\n{repo_instructions}"
+        )
+    };
+
     let system = format!(
         "You are a planning agent for the {owner}/{repo} repository. \
          Research the codebase using the provided tools, then generate an implementation plan.\n\n\
          You have access to these repos:\n{repos_list}\n\n\
          All tools default to {owner}/{repo} when the `repo` parameter is omitted. \
-         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).",
+         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{instructions_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
+
+    let complexity_guidance = match triage.complexity.as_str() {
+        "simple" => r#"## Complexity: SIMPLE (1-3 files)
+
+This is a simple change. Be extremely efficient:
+- Use 1-2 `search_code` calls to locate the relevant file(s)
+- Use `read_file_lines` on the specific section you need, NOT whole files
+- Do NOT call `read_tree` or browse the project structure
+- Do NOT read unrelated files "for context"
+- You should need 3-5 tool calls total, then output the plan
+- The plan should have 1-2 tasks maximum"#,
+        "medium" => r#"## Complexity: MEDIUM (4-10 files)
+
+This is a medium-sized change. Be efficient:
+- Start with `search_code` to find relevant files and symbols
+- Use `read_file_lines` for targeted reads instead of whole files
+- Only call `read_tree` if you need to understand module structure
+- You should need 5-10 tool calls total
+- The plan should have 2-4 tasks"#,
+        _ => r#"## Complexity: COMPLEX (10+ files)
+
+This is a complex change. Research thoroughly but stay focused:
+- Start with `search_code` and `read_tree` to understand the relevant modules
+- Use `read_file_lines` for targeted reads
+- Map out the affected code paths before planning
+- The plan should have 3-6 tasks"#,
+    };
 
     let prompt = format!(
         r#"Generate an implementation plan (openspec) for this issue.
@@ -61,36 +98,20 @@ Summary: {summary}
 ## Original Issue Body
 {body}
 
-## Instructions
+{complexity_guidance}
 
-Research the codebase efficiently. **Start with `search_code`** to find relevant files and symbols
-before reading anything. Use `read_file_lines` for targeted reads instead of `read_file` on whole files.
-Only call `read_tree` if you genuinely need the full project structure. Be surgical: a config ID change
-should need 2-3 tool calls, not 20.
+## Research Instructions
 
-**CRITICAL — Verify before planning:** Before generating a plan, check if the requested change
-is ALREADY in place in the codebase. Read the relevant files and compare their current state
-against what the issue asks for. Examples of already-done work:
-- A value the issue asks to set is already that value
-- A feature the issue describes already exists and works as specified
-- A bug the issue reports is already fixed in the current code
-- A config the issue asks to add is already present
+**Start with `search_code`** to find relevant files and symbols before reading anything.
+Use `read_file_lines` for targeted reads instead of `read_file` on whole files.
 
-If the change is already done, set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reason>` where
-`<reason>` is a one-line explanation (e.g. "The GA measurement ID is already G-NR69JM4TK2 in
-dashboard/src/components/google-analytics.tsx"). Still output proposal.md, design.md, and
-spec.md normally.
+**Verify before planning:** Check if the requested change is ALREADY in place. If it is,
+set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reason>`.
 
-**Ambiguous values:** If the issue asks to change, update, or replace a specific value
-(an ID, URL, API key, config value, version number, etc.) but does NOT include the new
-value directly in the issue title or body:
-1. Check if the issue body contains any URLs (Notion pages, Google Docs, wikis). If it does,
-   call the appropriate MCP tool to fetch ONLY those specific pages and extract the value.
-2. Do NOT proactively search external tools (Notion, etc.) unless a URL is present in the issue.
-3. Also search the codebase for the current value to understand context.
-3. Only after you have attempted ALL of the above and still cannot determine the value,
-   set tasks.md to EXACTLY `CLARIFICATION_NEEDED: <what is missing>`. This should be rare
-   because most issues include the value either directly or via a linked page.
+**Ambiguous values:** If the issue asks to change a value but does NOT include the new value:
+1. Check if the issue body contains URLs. If so, call the appropriate MCP tool to fetch them.
+2. Do NOT proactively search external tools unless a URL is present.
+3. If you cannot determine the value, set tasks.md to `CLARIFICATION_NEEDED: <what is missing>`.
 
 Otherwise, generate four openspec files:
 
@@ -121,6 +142,7 @@ After researching, output the four files using this exact format:
         title = msg.title,
         summary = triage.summary,
         body = msg.body,
+        complexity_guidance = complexity_guidance,
     );
 
     let mut tools = read_only_tools();
