@@ -442,5 +442,14 @@ async fn main() -> Result<(), Error> {
         ))
         .with_state(state);
 
-    run(app).await
+    // In streaming mode the Lambda Web Adapter proxies requests to port 8080,
+    // so we run a plain TCP server instead of the Lambda Runtime API handler.
+    if std::env::var("STREAMING_MODE").is_ok() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+        tracing::info!("Streaming mode: listening on 0.0.0.0:8080");
+        axum::serve(listener, app).await?;
+        Ok(())
+    } else {
+        run(app).await
+    }
 }
