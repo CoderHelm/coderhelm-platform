@@ -81,13 +81,13 @@ If the change is already done, set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reas
 dashboard/src/components/google-analytics.tsx"). Still output proposal.md, design.md, and
 spec.md normally.
 
-**CRITICAL — Ambiguous values:** If the issue asks to change, update, or replace a value
+**Ambiguous values:** If the issue asks to change, update, or replace a specific value
 (an ID, URL, API key, config value, version number, etc.) but does NOT include the new
 value directly in the issue title or body:
-1. **YOU MUST** check the issue body for any referenced URLs (Notion pages, Google Docs, wikis,
-   links of any kind). If you find ANY URL, you MUST call the appropriate MCP tool to fetch
-   that page and extract the value BEFORE doing anything else. Do NOT skip this step.
-2. Also search the codebase for the current value to understand context.
+1. Check if the issue body contains any URLs (Notion pages, Google Docs, wikis). If it does,
+   call the appropriate MCP tool to fetch ONLY those specific pages and extract the value.
+2. Do NOT proactively search external tools (Notion, etc.) unless a URL is present in the issue.
+3. Also search the codebase for the current value to understand context.
 3. Only after you have attempted ALL of the above and still cannot determine the value,
    set tasks.md to EXACTLY `CLARIFICATION_NEEDED: <what is missing>`. This should be rare
    because most issues include the value either directly or via a linked page.
