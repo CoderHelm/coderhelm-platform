@@ -1844,35 +1844,30 @@ pub async fn plan_chat_stream(
                         aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockStart(
                             e,
                         ) => {
-                            if let Some(start) = e.start() {
-                                match start {
-                                    aws_sdk_bedrockruntime::types::ContentBlockStart::ToolUse(
-                                        tu,
-                                    ) => {
-                                        active_tool_id = tu.tool_use_id().to_string();
-                                        active_tool_name = tu.name().to_string();
-                                        active_tool_input.clear();
+                            if let Some(
+                                aws_sdk_bedrockruntime::types::ContentBlockStart::ToolUse(tu),
+                            ) = e.start()
+                            {
+                                active_tool_id = tu.tool_use_id().to_string();
+                                active_tool_name = tu.name().to_string();
+                                active_tool_input.clear();
 
-                                        let (server, display_name) =
-                                            if active_tool_name.contains("__") {
-                                                let parts: Vec<&str> =
-                                                    active_tool_name.splitn(2, "__").collect();
-                                                (Some(parts[0].to_string()), parts[1].to_string())
-                                            } else {
-                                                (None, active_tool_name.clone())
-                                            };
+                                let (server, display_name) = if active_tool_name.contains("__") {
+                                    let parts: Vec<&str> =
+                                        active_tool_name.splitn(2, "__").collect();
+                                    (Some(parts[0].to_string()), parts[1].to_string())
+                                } else {
+                                    (None, active_tool_name.clone())
+                                };
 
-                                        let mut data = json!({
-                                            "id": active_tool_id,
-                                            "name": display_name,
-                                        });
-                                        if let Some(s) = &server {
-                                            data["server"] = json!(s);
-                                        }
-                                        let _ = tx.send(sse_event("tool_start", data)).await;
-                                    }
-                                    _ => {}
+                                let mut data = json!({
+                                    "id": active_tool_id,
+                                    "name": display_name,
+                                });
+                                if let Some(s) = &server {
+                                    data["server"] = json!(s);
                                 }
+                                let _ = tx.send(sse_event("tool_start", data)).await;
                             }
                         }
                         aws_sdk_bedrockruntime::types::ConverseStreamOutput::ContentBlockDelta(
