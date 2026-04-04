@@ -312,6 +312,13 @@ export class ApiStack extends cdk.Stack {
     const jiraEventsTable = dynamodb.TableV2.fromTableName(this, "JiraEventsTableRef", `coderhelm-${props.stage}-jira-events`);
     const tracesTable = dynamodb.TableV2.fromTableName(this, "TracesTableRef", `coderhelm-${props.stage}-traces`);
     teamsTable.grantReadWriteData(this.gatewayFunction);
+    // fromTableName doesn't know about GSIs, so grant index access explicitly
+    this.gatewayFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:Query"],
+        resources: [`arn:aws:dynamodb:${this.region}:${this.account}:table/coderhelm-${props.stage}-teams/index/*`],
+      })
+    );
     runsTable.grantReadWriteData(this.gatewayFunction);
     analyticsTable.grantReadData(this.gatewayFunction);
     jiraEventsTable.grantReadWriteData(this.gatewayFunction);
