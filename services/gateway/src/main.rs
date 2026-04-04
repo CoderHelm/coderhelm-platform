@@ -271,7 +271,6 @@ async fn main() -> Result<(), Error> {
             get(routes::plans::list_plans).post(routes::plans::create_plan),
         )
         .route("/plans/chat", post(routes::plans::plan_chat))
-        .route("/plans/chat/stream", post(routes::plans::plan_chat_stream))
         .route("/plans/chat/token", post(routes::plans::stream_token))
         // Template endpoints (must be before /plans/:plan_id to avoid wildcard capture)
         .route(
@@ -427,6 +426,11 @@ async fn main() -> Result<(), Error> {
             get(|| async {
                 axum::Json(serde_json::json!({ "service": "coderhelm", "status": "ok" }))
             }),
+        )
+        // Streaming endpoint uses Bearer JWT, not cookies — must be outside require_auth
+        .route(
+            "/api/plans/chat/stream",
+            post(routes::plans::plan_chat_stream),
         )
         .nest("/webhooks", webhook_routes)
         .route(
