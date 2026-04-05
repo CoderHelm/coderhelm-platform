@@ -53,6 +53,14 @@ pub async fn run(
         return String::new();
     }
 
+    // Quick pre-check: skip the resolve agent entirely if the ticket has no
+    // URLs, external service mentions, or reference patterns. This avoids
+    // burning an LLM call + multiple MCP searches on purely code-focused tickets.
+    if !has_external_references(&msg.title, &msg.body) {
+        info!("No external references detected in ticket — skipping resolve pass");
+        return String::new();
+    }
+
     let plugin_lines: Vec<String> = loaded_plugins
         .iter()
         .map(|p| {
@@ -160,4 +168,43 @@ impl<'a> ToolExecutor for McpOnlyExecutor<'a> {
         )
         .await
     }
+}
+
+/// Fast heuristic check: does the ticket body contain URLs, external service
+/// mentions, or reference patterns that MCP tools could resolve?
+fn has_external_references(title: &str, body: &str) -> bool {
+    let text = format!("{title} {body}").to_lowercase();
+
+    // URLs (http, https, or common shorteners)
+    if text.contains("http://") || text.contains("https://") || text.contains("www.") {
+        return true;
+    }
+
+    // Common external service mentions
+    let services = [
+        "notion",
+        "figma",
+        "sentry",
+        "jira",
+        "linear",
+        "confluence",
+        "asana",
+        "slack",
+        "datadog",
+        "pagerduty",
+        "opsgenie",
+    ];
+    for svc in &services {
+        if text.contains(svc) {
+            return true;
+        }
+    }
+
+    // Reference patterns: ticket IDs, page IDs, etc.
+    // e.g. PROJ-123, #123 (already handled by GitHub), notion.so/xxx
+    let has_ticket_id = text.split_whitespace().any(|w| {
+        w.len() > 3 && w.contains('-') && w.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+    });
+
+    has_ticket_id
 }
