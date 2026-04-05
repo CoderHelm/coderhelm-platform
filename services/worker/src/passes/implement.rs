@@ -687,10 +687,9 @@ fn extract_file_paths(tasks: &str) -> Vec<String> {
                 && candidate.contains('.')
                 && !candidate.starts_with('-')
                 && !candidate.starts_with("http")
+                && seen.insert(candidate.to_string())
             {
-                if seen.insert(candidate.to_string()) {
-                    paths.push(candidate.to_string());
-                }
+                paths.push(candidate.to_string());
             }
         }
     }

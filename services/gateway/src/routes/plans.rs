@@ -122,7 +122,7 @@ pub async fn create_plan(
         let server_list: Vec<aws_sdk_dynamodb::types::AttributeValue> = servers
             .iter()
             .filter_map(|s| s.as_str())
-            .map(|s| attr_s(s))
+            .map(attr_s)
             .collect();
         if !server_list.is_empty() {
             put = put.item(

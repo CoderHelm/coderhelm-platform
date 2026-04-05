@@ -13,6 +13,7 @@ pub struct ReviewResult {
     pub summary: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     state: &WorkerState,
     msg: &TicketMessage,
