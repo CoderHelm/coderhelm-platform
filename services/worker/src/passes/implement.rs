@@ -63,50 +63,42 @@ pub async fn run(
         String::new()
     };
 
+    let openspec_block = super::format_openspec_block(plan);
+
     let prompt = if complexity == "simple" {
         format!(
             r#"Implement for issue #{number}: {title}
-
-## Tasks
-{tasks}{files_hint}{feedback}
+{openspec}{files_hint}{feedback}
 
 ## Instructions — SIMPLE CHANGE
-Go DIRECTLY to the target files listed above.
+Go DIRECTLY to the target files listed in the OpenSpec.
 - Use `read_file_lines` on the exact section, make the change with `write_file`, done.
 - You should need 2-5 tool calls total.
 - Only implement the listed tasks. Do not add extras.
 - After implementing, output a one-line summary."#,
             number = msg.issue_number,
             title = msg.title,
-            tasks = plan.tasks,
+            openspec = openspec_block,
             files_hint = files_hint,
             feedback = feedback_section,
         )
     } else {
         format!(
             r#"Implement the following tasks for issue #{number}: {title}
-
-## Tasks
-{tasks}
-
-## Design
-{design}
-
-## Acceptance Criteria
-{spec}{feedback}
+{openspec}{feedback}
 
 ## Instructions
 - Use `search_code` to find exact files and lines before reading. Prefer `read_file_lines` over `read_file`.
-- Implement each unchecked task (`- [ ]`) one at a time, in order.
+- Implement each unchecked task (`- [ ]`) in the Tasks section, one at a time, in order.
+- Refer to the Design section for which files to modify and patterns to follow.
+- Validate your changes against the Acceptance Criteria.
 - Use `batch_write` for atomic multi-file changes.
 - Follow existing code patterns exactly (imports, naming, structure, test style).
 - After implementing all tasks, output a summary.
 - Only implement the listed tasks. Do not add extras."#,
             number = msg.issue_number,
             title = msg.title,
-            tasks = plan.tasks,
-            design = plan.design,
-            spec = plan.spec,
+            openspec = openspec_block,
             feedback = feedback_section,
         )
     };

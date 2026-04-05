@@ -4,6 +4,7 @@ use tracing::info;
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
+use crate::passes::plan::PlanResult;
 use crate::WorkerState;
 
 /// Structured result from the review pass.
@@ -16,6 +17,7 @@ pub async fn run(
     state: &WorkerState,
     msg: &TicketMessage,
     github: &GitHubClient,
+    plan: &PlanResult,
     branch: &str,
     rules: &[String],
     repo_instructions: &str,
@@ -25,28 +27,31 @@ pub async fn run(
     let instructions_block = super::format_instructions_block(repo_instructions);
     let system = format!(
         "You are a code review agent for the {owner}/{repo} repository. \
-         Review the diff for correctness, completeness, conventions, bugs, and security. \
+         Review the diff against the OpenSpec to verify correctness and completeness. \
          You are READ-ONLY — you cannot modify files. Report issues for the implementation agent to fix.{rules_block}{instructions_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
 
+    let openspec_block = super::format_openspec_block(plan);
     let prompt = format!(
         r#"Review the implementation for issue #{number}: {title}
-
+{openspec}
 Use the `get_diff` tool to see all changes compared to main. Then review for:
 
-1. **Correctness** — Does the code do what the issue asks? Any logic errors?
-2. **Completeness** — Are all tasks implemented? Any missing pieces?
-3. **Convention compliance** — Does it follow the repo's patterns (naming, imports, structure)?
-4. **Obvious bugs** — Null checks, off-by-one, missing error handling, typos?
-5. **Must-rules** — If must-rules are listed in the system prompt, verify every rule is respected.
-6. **Regressions** — Does the change break existing functionality? Watch for hardcoded values replaced without fallbacks.
+1. **Task completeness** — Verify every task in the Tasks section is addressed by the diff. Flag any missed tasks.
+2. **Design adherence** — Does the implementation follow the patterns and approach described in the Design section?
+3. **Acceptance criteria** — Are the Given/When/Then scenarios in the Acceptance Criteria satisfied?
+4. **Scope compliance** — Does the diff stay within the Proposal's scope boundaries? Flag anything that goes beyond scope.
+5. **Correctness** — Any logic errors, null checks, off-by-one, missing error handling, typos?
+6. **Convention compliance** — Does it follow the repo's patterns (naming, imports, structure)?
+7. **Must-rules** — If must-rules are listed in the system prompt, verify every rule is respected.
 
 If you find issues, start with "ISSUES_FOUND:" followed by a list with file path, problem, and suggested fix.
 If everything looks good, start with "LGTM" followed by a brief summary."#,
         number = msg.issue_number,
         title = msg.title,
+        openspec = openspec_block,
     );
 
     // Read-only tool set — no write_file or batch_write

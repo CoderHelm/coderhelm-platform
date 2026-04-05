@@ -926,6 +926,7 @@ async fn run_passes(
             state,
             msg,
             &github,
+            &plan_result,
             &branch_name,
             &rules,
             &repo_instructions,
@@ -1009,17 +1010,26 @@ async fn run_passes(
     update_pass(state, &msg.team_id, run_id, "security").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let security_result =
-        match security::run(state, msg, &github, &branch_name, &repo_instructions, usage).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(run_id, error = %e, "Security pass errored, proceeding");
-                security::SecurityResult {
-                    passed: true,
-                    summary: format!("Security error: {e}"),
-                }
+    let security_result = match security::run(
+        state,
+        msg,
+        &github,
+        &plan_result,
+        &branch_name,
+        &repo_instructions,
+        usage,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(run_id, error = %e, "Security pass errored, proceeding");
+            security::SecurityResult {
+                passed: true,
+                summary: format!("Security error: {e}"),
             }
-        };
+        }
+    };
     write_pass_trace(
         state,
         &msg.team_id,
@@ -1083,18 +1093,26 @@ async fn run_passes(
         // Re-audit once
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "security").await?;
-        let retry =
-            match security::run(state, msg, &github, &branch_name, &repo_instructions, usage).await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(run_id, error = %e, "Security retry errored, proceeding");
-                    security::SecurityResult {
-                        passed: true,
-                        summary: format!("Security error: {e}"),
-                    }
+        let retry = match security::run(
+            state,
+            msg,
+            &github,
+            &plan_result,
+            &branch_name,
+            &repo_instructions,
+            usage,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(run_id, error = %e, "Security retry errored, proceeding");
+                security::SecurityResult {
+                    passed: true,
+                    summary: format!("Security error: {e}"),
                 }
-            };
+            }
+        };
         if !retry.passed {
             warn!(
                 run_id,
@@ -1730,6 +1748,32 @@ pub fn format_rules_block(rules: &[String]) -> String {
         String::from("\n\n## Must-Rules (MANDATORY — violating any of these is a failure)\n");
     for rule in rules {
         block.push_str(&format!("- {rule}\n"));
+    }
+    block
+}
+
+/// Format the full OpenSpec as a single context block for downstream passes.
+pub fn format_openspec_block(plan: &plan::PlanResult) -> String {
+    let mut block = String::from("\n\n## OpenSpec\n");
+    if !plan.proposal.is_empty() {
+        block.push_str("### Proposal\n");
+        block.push_str(&plan.proposal);
+        block.push('\n');
+    }
+    if !plan.design.is_empty() {
+        block.push_str("\n### Design\n");
+        block.push_str(&plan.design);
+        block.push('\n');
+    }
+    if !plan.tasks.is_empty() {
+        block.push_str("\n### Tasks\n");
+        block.push_str(&plan.tasks);
+        block.push('\n');
+    }
+    if !plan.spec.is_empty() {
+        block.push_str("\n### Acceptance Criteria\n");
+        block.push_str(&plan.spec);
+        block.push('\n');
     }
     block
 }

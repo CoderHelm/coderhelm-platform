@@ -4,6 +4,7 @@ use tracing::info;
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
+use crate::passes::plan::PlanResult;
 use crate::WorkerState;
 
 pub struct SecurityResult {
@@ -15,6 +16,7 @@ pub async fn run(
     state: &WorkerState,
     msg: &TicketMessage,
     github: &GitHubClient,
+    plan: &PlanResult,
     branch: &str,
     repo_instructions: &str,
     usage: &mut TokenUsage,
@@ -29,16 +31,25 @@ pub async fn run(
         repo = msg.repo_name,
     );
 
-    let prompt = "Review the diff for security vulnerabilities. Use get_diff to see all changes, \
-         then read only the specific functions referenced in the diff if you need surrounding context.\n\n\
-         Output format:\n\
-         - If no security issues: start with `SECURITY_PASS`\n\
-         - If issues found: start with `SECURITY_FAIL` followed by:\n\n\
-         ### [CRITICAL/HIGH/MEDIUM/LOW] — Issue Title\n\
-         - **File:** path/to/file:line\n\
-         - **Category:** OWASP category\n\
-         - **Remediation:** How to fix it"
-        .to_string();
+    let openspec_block = super::format_openspec_block(plan);
+    let prompt = format!(
+        r#"Review the diff for security vulnerabilities.
+{openspec}
+Use `get_diff` to see all changes, then read specific functions if you need surrounding context.
+
+Focus your analysis on the attack surfaces introduced by the changes described in the OpenSpec above.
+Check that the implementation doesn't introduce vulnerabilities that conflict with the intended scope.
+
+Output format:
+- If no security issues: start with `SECURITY_PASS`
+- If issues found: start with `SECURITY_FAIL` followed by:
+
+### [CRITICAL/HIGH/MEDIUM/LOW] — Issue Title
+- **File:** path/to/file:line
+- **Category:** OWASP category
+- **Remediation:** How to fix it"#,
+        openspec = openspec_block,
+    );
 
     let tools = security_tools();
     let executor = SecurityToolExecutor {
