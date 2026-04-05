@@ -6,6 +6,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 mod agent;
 mod clients;
+pub mod memory;
 mod models;
 mod passes;
 

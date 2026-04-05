@@ -1,6 +1,7 @@
 use crate::agent::mcp;
 use crate::clients::email::{self, EmailEvent};
 use crate::clients::github::GitHubClient;
+use crate::memory::AgentMemory;
 use crate::models::{TicketMessage, TicketSource, TokenUsage};
 use crate::WorkerState;
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -347,6 +348,24 @@ async fn run_passes(
         info!(run_id, last_pass, branch, cycle, "Found checkpoint for run");
     }
 
+    // --- Open agent memory (non-blocking: falls back to stateless if unavailable) ---
+    let mut agent_memory = AgentMemory::open(
+        state,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+    )
+    .await;
+    let memory_context = agent_memory
+        .as_mut()
+        .map(|mem| {
+            mem.recall_context(
+                &format!("{} {} {}", msg.title, msg.body, msg.repo_name),
+                5,
+            )
+        })
+        .unwrap_or_default();
+
     // --- Pass 1: Triage ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "triage").await?;
@@ -382,6 +401,13 @@ async fn run_passes(
             triage_result.summary.push_str(&external_context);
             info!(run_id, "Resolved external references via MCP");
         }
+    }
+
+    // Inject agent memory context into triage summary
+    if !memory_context.is_empty() {
+        triage_result.summary.push_str("\n\n");
+        triage_result.summary.push_str(&memory_context);
+        info!(run_id, "Injected agent memory context");
     }
 
     // --- Pass 2: Plan ---
@@ -859,6 +885,7 @@ async fn run_passes(
     // --- Pass 4: Test + Review loop (max 3 cycles) ---
     let review_loop_enabled = load_workflow_setting(state, &msg.team_id, "review_loop").await;
     let max_review_cycles: usize = if review_loop_enabled { 3 } else { 1 };
+    let mut review_passed = true;
 
     for cycle in 1..=max_review_cycles {
         // Test gate: wait for CI if configured
@@ -983,6 +1010,16 @@ async fn run_passes(
         .await;
 
         if review_result.passed || cycle == max_review_cycles {
+            review_passed = review_result.passed;
+            // Store review findings in agent memory
+            if let Some(ref mut mem) = agent_memory {
+                if !review_result.passed {
+                    mem.store_review_finding(&format!(
+                        "Review found issues on run {run_id}: {}",
+                        review_result.summary
+                    ));
+                }
+            }
             break;
         }
 
@@ -1121,6 +1158,16 @@ async fn run_passes(
         }
     }
 
+    // Store security findings in agent memory
+    if let Some(ref mut mem) = agent_memory {
+        if !security_result.passed {
+            mem.store_security_finding(&format!(
+                "Security audit found issues on run {run_id}: {}",
+                security_result.summary
+            ));
+        }
+    }
+
     // --- Resolve conflicts with main ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     match pr::resolve_conflicts(state, msg, &github, &branch_name, usage).await {
@@ -1179,6 +1226,21 @@ async fn run_passes(
     .await?;
 
     // No completion comment on the issue — the PR itself links back via "Closes #N".
+
+    // Store run summary and close agent memory
+    if let Some(mut mem) = agent_memory {
+        mem.store_run_summary(&format!(
+            "Completed run {run_id} for issue '{}'. Created PR #{}. Files modified: {}. Review: {}. Security: {}.",
+            msg.title,
+            pr_result.pr_number,
+            impl_result.files_modified.len(),
+            if review_passed { "passed" } else { "issues found" },
+            if security_result.passed { "passed" } else { "issues found" },
+        ));
+        if let Err(e) = mem.close_and_upload(state).await {
+            warn!(run_id, error = %e, "Failed to persist agent memory");
+        }
+    }
 
     Ok(())
 }

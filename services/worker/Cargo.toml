@@ -36,6 +36,14 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Agent memory
+mentedb = "0.2"
+mentedb-core = "0.2"
+mentedb-embedding = "0.2"
+uuid = { version = "1", features = ["v4"] }
+flate2 = "1"
+tar = "0.4"
+
 # Utils
 ulid = "1"
 thiserror = "2"
