@@ -262,18 +262,17 @@ async fn run_passes(
     let repo_instructions = load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
 
     // Post "working on it" comment only for GitHub-sourced tickets.
+    let mut progress_comment_id: Option<u64> = None;
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        github
+        let resp = github
             .create_issue_comment(
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.issue_number,
-                &format!(
-                    "🔄 **Coderhelm is working on this**\n\n| Phase | Status |\n|-------|--------|\n| Triage | 🔄 In progress |\n| Plan | ⏳ Pending |\n| Implement | ⏳ Pending |\n| Review | ⏳ Pending |\n| PR | ⏳ Pending |\n\n[View run →](https://app.coderhelm.com/runs/detail?id={})",
-                    run_id,
-                ),
+                &format_progress("triage", run_id),
             )
             .await?;
+        progress_comment_id = resp["id"].as_u64();
     }
 
     // --- Auto-resolve repo for Jira tickets with bare "coderhelm" label ---
@@ -382,13 +381,24 @@ async fn run_passes(
     )
     .await;
     info!(run_id, "Triage complete");
+    update_progress_comment(
+        &github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        progress_comment_id,
+        "plan",
+        run_id,
+    )
+    .await;
 
     // --- Resolve external references via MCP tools ---
     let mut triage_result = triage_result;
+    let mut used_mcp_ids: Vec<String> = Vec::new();
     if !mcp_plugins.is_empty() && !state.config.mcp_proxy_function_name.is_empty() {
         let external_context = resolve::run(state, msg, &mcp_plugins, usage).await;
         if !external_context.is_empty() {
             triage_result.summary.push_str(&external_context);
+            used_mcp_ids = mcp_server_ids.clone();
             info!(run_id, "Resolved external references via MCP");
         }
     }
@@ -428,6 +438,15 @@ async fn run_passes(
     save_checkpoint(state, &msg.team_id, run_id, "plan", "", 0, usage).await;
     add_progress_note(state, &msg.team_id, run_id, "Plan generated").await;
     info!(run_id, "Plan complete");
+    update_progress_comment(
+        &github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        progress_comment_id,
+        "implement",
+        run_id,
+    )
+    .await;
 
     // --- Check: already done? ---
     if plan_result.tasks.starts_with("NO_CHANGES_NEEDED:") {
@@ -493,7 +512,7 @@ async fn run_passes(
             .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
             .expression_attribute_values(
                 ":mcp",
-                AttributeValue::L(mcp_server_ids.iter().map(|s| attr_s(s)).collect()),
+                AttributeValue::L(used_mcp_ids.iter().map(|s| attr_s(s)).collect()),
             )
             .send()
             .await;
@@ -596,7 +615,7 @@ async fn run_passes(
             .expression_attribute_values(":sri", attr_s(&format!("needs_input#{run_id}")))
             .expression_attribute_values(
                 ":mcp",
-                AttributeValue::L(mcp_server_ids.iter().map(|s| attr_s(s)).collect()),
+                AttributeValue::L(used_mcp_ids.iter().map(|s| attr_s(s)).collect()),
             )
             .send()
             .await;
@@ -873,6 +892,15 @@ async fn run_passes(
     };
 
     // --- Pass 4: Test + Review loop (max 3 cycles) ---
+    update_progress_comment(
+        &github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        progress_comment_id,
+        "review",
+        run_id,
+    )
+    .await;
     let review_loop_enabled = load_workflow_setting(state, &msg.team_id, "review_loop").await;
     let max_review_cycles: usize = if review_loop_enabled { 3 } else { 1 };
     let mut review_passed = true;
@@ -1167,6 +1195,15 @@ async fn run_passes(
     }
 
     // --- Pass 6: Create PR ---
+    update_progress_comment(
+        &github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        progress_comment_id,
+        "pr",
+        run_id,
+    )
+    .await;
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "pr").await?;
     let pass_start = std::time::Instant::now();
@@ -1209,7 +1246,7 @@ async fn run_passes(
         run_id,
         &pr_result,
         &impl_result,
-        &mcp_server_ids,
+        &used_mcp_ids,
         usage,
         duration,
     )
@@ -2248,4 +2285,42 @@ async fn load_checkpoint(
         .and_then(|n| n.parse::<u8>().ok())
         .unwrap_or(0);
     Some((last_pass, branch, review_cycle))
+}
+
+/// Build the progress comment body for the GitHub issue.
+fn format_progress(current_phase: &str, run_id: &str) -> String {
+    let phases = ["triage", "plan", "implement", "review", "pr"];
+    let labels = ["Triage", "Plan", "Implement", "Review", "PR"];
+    let current_idx = phases.iter().position(|p| *p == current_phase);
+
+    let mut rows = String::new();
+    for (i, label) in labels.iter().enumerate() {
+        let status = match current_idx {
+            Some(ci) if i < ci => "✅ Done",
+            Some(ci) if i == ci => "🔄 In progress",
+            _ => "⏳ Pending",
+        };
+        rows.push_str(&format!("| {label} | {status} |\n"));
+    }
+
+    format!(
+        "🔄 **Coderhelm is working on this**\n\n| Phase | Status |\n|-------|--------|\n{rows}\n[View run →](https://app.coderhelm.com/runs/detail?id={run_id})"
+    )
+}
+
+/// Update the progress comment on the GitHub issue.
+async fn update_progress_comment(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+    comment_id: Option<u64>,
+    phase: &str,
+    run_id: &str,
+) {
+    if let Some(cid) = comment_id {
+        let body = format_progress(phase, run_id);
+        if let Err(e) = github.edit_issue_comment(owner, repo, cid, &body).await {
+            tracing::warn!(error = %e, "Failed to update progress comment");
+        }
+    }
 }

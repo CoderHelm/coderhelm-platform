@@ -670,9 +670,7 @@ pub async fn approve_task(
         .table_name(&state.config.plans_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&plan_sk))
-        .update_expression(
-            "SET #st = :s, executed_at = :now, executed_by = :by, updated_at = :now",
-        )
+        .update_expression("SET #st = :s, executed_at = :now, executed_by = :by, updated_at = :now")
         .expression_attribute_names("#st", "status")
         .expression_attribute_values(":s", attr_s("executing"))
         .expression_attribute_values(":now", attr_s(&now))
@@ -703,10 +701,7 @@ pub async fn approve_task(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(
-        plan_id,
-        task_id, "Task approved and dispatched to worker"
-    );
+    info!(plan_id, task_id, "Task approved and dispatched to worker");
 
     Ok(Json(json!({ "dispatched": true, "task_id": task_id })))
 }

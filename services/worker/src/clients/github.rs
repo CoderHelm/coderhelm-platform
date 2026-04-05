@@ -542,6 +542,18 @@ impl GitHubClient {
         self.post(&url, &serde_json::json!({"body": body})).await
     }
 
+    /// Edit an existing issue comment by comment ID.
+    pub async fn edit_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/issues/comments/{comment_id}");
+        self.patch(&url, &serde_json::json!({"body": body})).await
+    }
+
     // ─── Pull requests ─────────────────────────────────────────
 
     /// Get a single pull request.
