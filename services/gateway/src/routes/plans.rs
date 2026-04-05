@@ -101,7 +101,7 @@ pub async fn create_plan(
     let now = chrono::Utc::now().to_rfc3339();
     let sk = format!("PLAN#{plan_id}");
 
-    state
+    let mut put = state
         .dynamo
         .put_item()
         .table_name(&state.config.plans_table_name)
@@ -115,13 +115,27 @@ pub async fn create_plan(
         .item("status", attr_s("draft"))
         .item("task_count", attr_n(0))
         .item("created_at", attr_s(&now))
-        .item("updated_at", attr_s(&now))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to create plan: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .item("updated_at", attr_s(&now));
+
+    // Store which MCP servers were used during chat planning
+    if let Some(servers) = body["mcp_servers"].as_array() {
+        let server_list: Vec<aws_sdk_dynamodb::types::AttributeValue> = servers
+            .iter()
+            .filter_map(|s| s.as_str())
+            .map(|s| attr_s(s))
+            .collect();
+        if !server_list.is_empty() {
+            put = put.item(
+                "mcp_servers",
+                aws_sdk_dynamodb::types::AttributeValue::L(server_list),
+            );
+        }
+    }
+
+    put.send().await.map_err(|e| {
+        error!("Failed to create plan: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Create tasks if provided inline
     if let Some(tasks) = body["tasks"].as_array() {
@@ -1056,6 +1070,16 @@ fn validate_plan_id(id: &str) -> Result<(), StatusCode> {
 fn plan_from_item(
     item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
 ) -> Value {
+    let mcp_servers: Vec<&str> = item
+        .get("mcp_servers")
+        .and_then(|v| v.as_l().ok())
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_s().ok().map(|s| s.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     json!({
         "plan_id": item.get("plan_id").and_then(|v| v.as_s().ok()),
         "title": item.get("title").and_then(|v| v.as_s().ok()),
@@ -1066,6 +1090,7 @@ fn plan_from_item(
         "tokens_in": item.get("total_tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "tokens_out": item.get("total_tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "destination": item.get("destination").and_then(|v| v.as_s().ok()),
+        "mcp_servers": if mcp_servers.is_empty() { Value::Null } else { json!(mcp_servers) },
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
         "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
         "executed_at": item.get("executed_at").and_then(|v| v.as_s().ok()),
@@ -1808,10 +1833,8 @@ When the user describes what they want to build, you should:
 3. Never ask more than 2 clarifying questions before generating a plan.
 
 CRITICAL — Conversation continuity:
-- When the user adds new requirements or follow-up messages, ALWAYS incorporate ALL previous requests from the entire conversation into the updated plan.
-- If the user said "update X on dashboard" and then "update Y on landing page", the next plan MUST include BOTH tasks.
+- When the user adds new requirements or follow-up messages, incorporate ALL previous requests into the updated plan.
 - Never forget or drop earlier requests. The plan should be the complete, cumulative result of everything discussed.
-- When regenerating a plan, re-read the full conversation and include every distinct request as a task.
 
 When generating the final plan, output it in this EXACT JSON format inside a code fence:
 
@@ -1833,10 +1856,7 @@ When generating the final plan, output it in this EXACT JSON format inside a cod
 ```
 
 Rules:
-- A plan can span MULTIPLE repositories. The top-level "repo" is the primary repo.
-- Each task has its own optional "repo" field — use it when a task targets a different repo than the top-level one.
-- When the user's request spans multiple repositories (e.g., frontend and backend), create separate tasks targeting each repo using the "repo" field.
-- Each task in the plan can target a different repo. Use this to create cross-repo plans.
+- A plan can span MULTIPLE repositories. The top-level "repo" is the primary repo. Each task has an optional "repo" field for targeting a different repo.
 - Tasks should be independently implementable (one PR each)
 - Order matters — Coderhelm works on them sequentially
 - Each task title should be a GitHub issue title (imperative, max 60 chars)
@@ -1875,18 +1895,42 @@ pub async fn stream_token(
     Ok(Json(json!({ "token": token })))
 }
 
-/// POST /api/plans/chat — AI-powered plan generation chat.
-pub async fn plan_chat(
-    State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
-    Json(body): Json<Value>,
-) -> Result<Json<Value>, StatusCode> {
-    let messages_input = body["messages"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
-
-    if messages_input.is_empty() || messages_input.len() > 20 {
-        return Err(StatusCode::BAD_REQUEST);
+/// Strip ```json...``` code blocks from a chat message, keeping surrounding text.
+/// Used to trim stale plan JSONs from older assistant messages.
+fn strip_plan_json(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut pos = 0;
+    while let Some(start) = content[pos..].find("```json") {
+        let abs_start = pos + start;
+        result.push_str(&content[pos..abs_start]);
+        if let Some(end) = content[abs_start + 7..].find("```") {
+            let abs_end = abs_start + 7 + end + 3;
+            result.push_str("[plan updated]");
+            pos = abs_end;
+        } else {
+            // Unclosed fence — keep as-is
+            result.push_str(&content[abs_start..]);
+            return result;
+        }
     }
+    result.push_str(&content[pos..]);
+    result
+}
 
+/// Shared context for plan chat — loaded once, used by both streaming and non-streaming.
+struct PlanChatContext {
+    system_prompt: String,
+    bedrock_messages: Vec<aws_sdk_bedrockruntime::types::Message>,
+    tool_config: Option<aws_sdk_bedrockruntime::types::ToolConfiguration>,
+}
+
+/// Load all context needed for plan chat (DynamoDB, S3, prompt assembly, message conversion).
+/// Shared between `plan_chat` and `plan_chat_stream` to eliminate duplication.
+async fn load_plan_chat_context(
+    state: &AppState,
+    team_id: &str,
+    messages_input: &[Value],
+) -> Result<PlanChatContext, StatusCode> {
     // Load org context, repo list, log analyzer flag, enabled plugins, and templates in parallel
     let (
         org_context_result,
@@ -1899,7 +1943,7 @@ pub async fn plan_chat(
             .dynamo
             .get_item()
             .table_name(&state.config.settings_table_name)
-            .key("pk", attr_s(&claims.team_id))
+            .key("pk", attr_s(team_id))
             .key("sk", attr_s("AGENTS#GLOBAL"))
             .send(),
         state
@@ -1907,17 +1951,18 @@ pub async fn plan_chat(
             .query()
             .table_name(&state.config.repos_table_name)
             .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-            .expression_attribute_values(":pk", attr_s(&claims.team_id))
+            .expression_attribute_values(":pk", attr_s(team_id))
             .expression_attribute_values(":prefix", attr_s("REPO#"))
+            .limit(50)
             .send(),
-        load_allow_plan_log_analyzer(&state, &claims.team_id),
-        load_enabled_plugins(&state, &claims.team_id),
+        load_allow_plan_log_analyzer(state, team_id),
+        load_enabled_plugins(state, team_id),
         state
             .dynamo
             .query()
             .table_name(&state.config.plans_table_name)
             .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-            .expression_attribute_values(":pk", attr_s(&claims.team_id))
+            .expression_attribute_values(":pk", attr_s(team_id))
             .expression_attribute_values(":prefix", attr_s("TEMPLATE#"))
             .limit(10)
             .send(),
@@ -1967,14 +2012,14 @@ pub async fn plan_chat(
         })
         .unwrap_or_default();
 
-    // Conditionally load log analyzer context (depends on allow_plan_log_analyzer result)
+    // Conditionally load log analyzer context
     let log_analyzer_context = if allow_plan_log_analyzer {
-        Some(load_log_analyzer_context(&state, &claims.team_id).await)
+        Some(load_log_analyzer_context(state, team_id).await)
     } else {
         None
     };
 
-    // Load MCP tool definitions from S3 cache for enabled plugins with credentials
+    // Load MCP tool definitions from S3 cache
     let mut mcp_tools: Vec<McpToolDef> = Vec::new();
     let mcp_proxy_fn = &state.config.mcp_proxy_function_name;
     if !mcp_proxy_fn.is_empty() {
@@ -2005,26 +2050,27 @@ pub async fn plan_chat(
         }
     }
 
-    // Build system prompt with org context and repo list
+    // Build system prompt
     let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
     if !org_context.is_empty() {
-        system_prompt.push_str(&format!(
-            "\n\nThe user's organization context:\n{org_context}"
-        ));
+        // Cap org_context to avoid prompt bloat
+        let capped = if org_context.len() > 2000 {
+            &org_context[..org_context[..2000].rfind('\n').unwrap_or(2000)]
+        } else {
+            &org_context
+        };
+        system_prompt.push_str(&format!("\n\nThe user's organization context:\n{capped}"));
     }
     if !repo_list.is_empty() {
-        // Limit to 50 repos to keep prompt size reasonable
-        let repos_for_prompt: Vec<_> = repo_list.iter().take(50).collect();
         system_prompt.push_str(&format!(
-            "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}\n\nIf the user's request involves changes across multiple repos, set the \"repo\" field on each task to the appropriate repository. For example, a frontend + backend change should produce separate tasks each targeting its own repo.",
-            repos_for_prompt
+            "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}\n\nFor cross-repo changes, set the \"repo\" field on each task to the appropriate repository.",
+            repo_list
                 .iter()
                 .map(|r| format!("- {r}"))
                 .collect::<Vec<_>>()
                 .join("\n")
         ));
     }
-    // Only add MCP instructions if there are tools available
     if !mcp_tools.is_empty() {
         let plugin_lines: Vec<String> = enabled_plugins
             .iter()
@@ -2068,23 +2114,29 @@ pub async fn plan_chat(
         system_prompt.push_str("\nIf the user's request matches a template pattern, mention it and ask if they'd like to use it as a starting point.");
     }
 
-    // Convert messages to Bedrock format
+    // Convert messages to Bedrock format with history trimming:
+    // Strip plan JSON blocks from older assistant messages to reduce token waste.
     let mut bedrock_messages = Vec::new();
-    for msg in messages_input {
+    let msg_count = messages_input.len();
+    for (i, msg) in messages_input.iter().enumerate() {
         let role_str = msg["role"].as_str().unwrap_or("user");
-        let content = msg["content"].as_str().unwrap_or("");
-        if content.is_empty() {
+        let raw_content = msg["content"].as_str().unwrap_or("");
+        if raw_content.is_empty() {
             continue;
         }
+        // Trim plan JSON from older assistant messages (keep the latest intact)
+        let content = if role_str == "assistant" && i < msg_count.saturating_sub(1) {
+            strip_plan_json(raw_content)
+        } else {
+            raw_content.to_string()
+        };
         let role = match role_str {
             "assistant" => aws_sdk_bedrockruntime::types::ConversationRole::Assistant,
             _ => aws_sdk_bedrockruntime::types::ConversationRole::User,
         };
         let message = aws_sdk_bedrockruntime::types::Message::builder()
             .role(role)
-            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(
-                content.to_string(),
-            ))
+            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(content))
             .build()
             .map_err(|e| {
                 error!("Failed to build Bedrock message: {e}");
@@ -2120,6 +2172,28 @@ pub async fn plan_chat(
         None
     };
 
+    Ok(PlanChatContext {
+        system_prompt,
+        bedrock_messages,
+        tool_config,
+    })
+}
+
+/// POST /api/plans/chat — AI-powered plan generation chat.
+pub async fn plan_chat(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let messages_input = body["messages"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
+
+    if messages_input.is_empty() || messages_input.len() > 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input).await?;
+    let mut bedrock_messages = ctx.bedrock_messages;
+
     // Agentic loop — up to 5 tool-use turns for plan chat (gateway has 30s timeout)
     let max_turns = 5;
     let mut total_input_tokens: u64 = 0;
@@ -2132,7 +2206,7 @@ pub async fn plan_chat(
             .converse()
             .model_id(&state.config.model_id)
             .system(aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
-                system_prompt.clone(),
+                ctx.system_prompt.clone(),
             ))
             .system(
                 aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
@@ -2150,7 +2224,7 @@ pub async fn plan_chat(
                     .build(),
             );
 
-        if let Some(ref tc) = tool_config {
+        if let Some(ref tc) = ctx.tool_config {
             req = req.tool_config(tc.clone());
         }
 
@@ -2362,237 +2436,14 @@ pub async fn plan_chat_stream(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // --- Same context loading as plan_chat (parallelized) ---
-    let (
-        org_context_result,
-        repo_list_result,
-        allow_plan_log_analyzer,
-        enabled_plugins,
-        tmpl_result,
-    ) = tokio::join!(
-        state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", attr_s(&claims.team_id))
-            .key("sk", attr_s("AGENTS#GLOBAL"))
-            .send(),
-        state
-            .dynamo
-            .query()
-            .table_name(&state.config.repos_table_name)
-            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-            .expression_attribute_values(":pk", attr_s(&claims.team_id))
-            .expression_attribute_values(":prefix", attr_s("REPO#"))
-            .send(),
-        load_allow_plan_log_analyzer(&state, &claims.team_id),
-        load_enabled_plugins(&state, &claims.team_id),
-        state
-            .dynamo
-            .query()
-            .table_name(&state.config.plans_table_name)
-            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-            .expression_attribute_values(":pk", attr_s(&claims.team_id))
-            .expression_attribute_values(":prefix", attr_s("TEMPLATE#"))
-            .limit(10)
-            .send(),
-    );
-
-    let org_context = org_context_result
-        .ok()
-        .and_then(|r| r.item().cloned())
-        .and_then(|i| i.get("content").and_then(|v| v.as_s().ok()).cloned())
-        .unwrap_or_default();
-
-    let repo_list: Vec<String> = repo_list_result
-        .ok()
-        .map(|r| {
-            r.items()
-                .iter()
-                .filter(|item| {
-                    item.get("enabled")
-                        .and_then(|v| v.as_bool().ok())
-                        .copied()
-                        .unwrap_or(false)
-                })
-                .filter_map(|item| {
-                    item.get("repo_name")
-                        .and_then(|v| v.as_s().ok())
-                        .map(|s| s.to_string())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let template_lines: Vec<String> = tmpl_result
-        .ok()
-        .map(|r| {
-            r.items()
-                .iter()
-                .filter_map(|item| {
-                    let title = item.get("title")?.as_s().ok()?;
-                    let desc = item
-                        .get("description")
-                        .and_then(|v| v.as_s().ok())
-                        .unwrap_or(&String::new())
-                        .clone();
-                    Some(format!("- {title}: {desc}"))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let log_analyzer_context = if allow_plan_log_analyzer {
-        Some(load_log_analyzer_context(&state, &claims.team_id).await)
-    } else {
-        None
-    };
-
-    // Load MCP tool definitions (before building system prompt so we can check if tools exist)
-    let mut mcp_tools: Vec<McpToolDef> = Vec::new();
-    let mcp_proxy_fn = &state.config.mcp_proxy_function_name;
-    if !mcp_proxy_fn.is_empty() {
-        let cache_futures: Vec<_> = enabled_plugins
-            .iter()
-            .filter(|(_, has_creds, _)| *has_creds)
-            .map(|(server_id, _, _)| {
-                let s3 = &state.s3;
-                let bucket = &state.config.bucket_name;
-                async move {
-                    let cache = load_mcp_tool_cache(s3, bucket, server_id).await;
-                    (server_id.clone(), cache)
-                }
-            })
-            .collect();
-        let caches = futures::future::join_all(cache_futures).await;
-        for (server_id, cache) in caches {
-            if let Some(tools) = cache {
-                for tool in tools {
-                    mcp_tools.push(McpToolDef {
-                        server_id: server_id.clone(),
-                        name: tool["name"].as_str().unwrap_or("").to_string(),
-                        description: tool["description"].as_str().unwrap_or("").to_string(),
-                        input_schema: tool["inputSchema"].clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
-    if !org_context.is_empty() {
-        system_prompt.push_str(&format!(
-            "\n\nThe user's organization context:\n{org_context}"
-        ));
-    }
-    if !repo_list.is_empty() {
-        // Limit to 50 repos to keep prompt size reasonable
-        let repos_for_prompt: Vec<_> = repo_list.iter().take(50).collect();
-        system_prompt.push_str(&format!(
-            "\n\nAvailable repositories (use these exact names for the \"repo\" field):\n{}\n\nIf the user's request involves changes across multiple repos, set the \"repo\" field on each task to the appropriate repository. For example, a frontend + backend change should produce separate tasks each targeting its own repo.",
-            repos_for_prompt
-                .iter()
-                .map(|r| format!("- {r}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-    // Only add MCP instructions if there are tools available
-    if !mcp_tools.is_empty() {
-        let plugin_lines: Vec<String> = enabled_plugins
-            .iter()
-            .filter(|(_, has_creds, _)| *has_creds)
-            .map(|(id, _, custom_prompt)| {
-                let mut line = format!("- {id} (connected)");
-                if let Some(prompt) = custom_prompt {
-                    line.push_str(&format!(" — {prompt}"));
-                }
-                line
-            })
-            .collect();
-        system_prompt.push_str(&format!(
-            "\n\nYou have tool-call access to the following MCP servers right now. \
-             You can invoke their tools directly during this conversation to look up \
-             information, search documents, read pages, or query external services.\n\
-             \n\
-             IMPORTANT — Proactive tool use:\n\
-             - BEFORE generating a plan, search connected tools for relevant context. \
-             If Notion is connected, search for docs related to the user's request \
-             (specs, config values, API keys references, design docs, requirements).\n\
-             - If the user mentions anything that might be documented (IDs, credentials, \
-             config, specs, designs, tickets), search the connected tools first.\n\
-             - Don't ask the user for information that might already exist in their \
-             connected tools — look it up yourself.\n\
-             - When you find relevant context, incorporate it into the plan tasks \
-             (e.g. specific IDs, endpoints, file paths, design references).\n\
-             \n\
-             Connected servers:\n{}",
-            plugin_lines.join("\n")
-        ));
-    }
-    if let Some(context) = log_analyzer_context.filter(|c| !c.is_empty()) {
-        system_prompt.push_str(&format!("\n\nAWS Log Analyzer context:\n{context}"));
-    }
-    if !template_lines.is_empty() {
-        system_prompt.push_str("\n\nThe team has these plan templates available:\n");
-        system_prompt.push_str(&template_lines.join("\n"));
-        system_prompt.push_str("\nIf the user's request matches a template pattern, mention it and ask if they'd like to use it as a starting point.");
-    }
-
-    // Convert messages to Bedrock format
-    let mut bedrock_messages = Vec::new();
-    for msg in messages_input {
-        let role_str = msg["role"].as_str().unwrap_or("user");
-        let content = msg["content"].as_str().unwrap_or("");
-        if content.is_empty() {
-            continue;
-        }
-        let role = match role_str {
-            "assistant" => aws_sdk_bedrockruntime::types::ConversationRole::Assistant,
-            _ => aws_sdk_bedrockruntime::types::ConversationRole::User,
-        };
-        let message = aws_sdk_bedrockruntime::types::Message::builder()
-            .role(role)
-            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(
-                content.to_string(),
-            ))
-            .build()
-            .map_err(|e| {
-                error!("Failed to build Bedrock message: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-        bedrock_messages.push(message);
-    }
-
-    let tool_config = if !mcp_tools.is_empty() {
-        let specs: Vec<aws_sdk_bedrockruntime::types::Tool> = mcp_tools
-            .iter()
-            .map(|t| {
-                aws_sdk_bedrockruntime::types::Tool::ToolSpec(
-                    aws_sdk_bedrockruntime::types::ToolSpecification::builder()
-                        .name(format!("{}__{}", t.server_id, t.name))
-                        .description(&t.description)
-                        .input_schema(aws_sdk_bedrockruntime::types::ToolInputSchema::Json(
-                            json_to_document(&t.input_schema),
-                        ))
-                        .build()
-                        .unwrap(),
-                )
-            })
-            .collect();
-        Some(
-            aws_sdk_bedrockruntime::types::ToolConfiguration::builder()
-                .set_tools(Some(specs))
-                .build()
-                .unwrap(),
-        )
-    } else {
-        None
-    };
+    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input).await?;
+    let mut bedrock_messages = ctx.bedrock_messages;
 
     // Move everything into the streaming task
     let team_id = claims.team_id.clone();
     let model_id = state.config.model_id.clone();
+    let system_prompt = ctx.system_prompt;
+    let tool_config = ctx.tool_config;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<
         Result<axum::response::sse::Event, std::convert::Infallible>,
