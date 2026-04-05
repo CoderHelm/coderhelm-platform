@@ -46,8 +46,15 @@ pub async fn download_memory(
             );
         }
         Err(e) => {
-            let err_str = format!("{e}");
-            if err_str.contains("NoSuchKey") || err_str.contains("404") {
+            // Check for NoSuchKey (first run — no snapshot exists yet)
+            let is_not_found = e
+                .as_service_error()
+                .map(|se| se.is_no_such_key())
+                .unwrap_or(false)
+                || format!("{e}").contains("NoSuchKey")
+                || format!("{e}").contains("404");
+
+            if is_not_found {
                 info!(key = %key, "No existing memory snapshot (first run for this repo)");
             } else {
                 warn!(key = %key, error = %e, "Failed to download memory snapshot");
