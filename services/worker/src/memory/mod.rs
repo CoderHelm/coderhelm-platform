@@ -135,7 +135,9 @@ impl AgentMemory {
             return String::new();
         }
 
-        let mut context = String::from("## Agent Memory\nRelevant learnings from past runs on this repository:\n\n");
+        let mut context = String::from(
+            "## Agent Memory\nRelevant learnings from past runs on this repository:\n\n",
+        );
         for (id, score) in &results {
             if let Ok(node) = self.db.get_memory(*id) {
                 let type_label = match node.memory_type {
@@ -146,19 +148,17 @@ impl AgentMemory {
                     MemoryType::Episodic => "📝 Note",
                     MemoryType::Reasoning => "💡 Reasoning",
                 };
-                context.push_str(&format!("- **{type_label}** (relevance: {score:.2}): {}\n", node.content));
+                context.push_str(&format!(
+                    "- **{type_label}** (relevance: {score:.2}): {}\n",
+                    node.content
+                ));
             }
         }
         context
     }
 
     /// Store a new learning from this run.
-    pub fn store_learning(
-        &mut self,
-        content: &str,
-        memory_type: MemoryType,
-        tags: Vec<String>,
-    ) {
+    pub fn store_learning(&mut self, content: &str, memory_type: MemoryType, tags: Vec<String>) {
         // Generate embedding
         let embedding = match self.db.embed_text(content) {
             Ok(Some(emb)) => emb,
@@ -172,12 +172,7 @@ impl AgentMemory {
             }
         };
 
-        let mut node = MemoryNode::new(
-            AgentId::nil(),
-            memory_type,
-            content.to_string(),
-            embedding,
-        );
+        let mut node = MemoryNode::new(AgentId::nil(), memory_type, content.to_string(), embedding);
         node.tags = tags;
         node.confidence = 0.9;
 
@@ -263,10 +258,7 @@ impl AgentMemory {
                 &self.local_dir,
             )
             .await?;
-            info!(
-                memories = memory_count,
-                "Persisted agent memory to S3"
-            );
+            info!(memories = memory_count, "Persisted agent memory to S3");
         }
 
         // Release lock

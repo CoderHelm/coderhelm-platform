@@ -349,21 +349,11 @@ async fn run_passes(
     }
 
     // --- Open agent memory (non-blocking: falls back to stateless if unavailable) ---
-    let mut agent_memory = AgentMemory::open(
-        state,
-        &msg.team_id,
-        &msg.repo_owner,
-        &msg.repo_name,
-    )
-    .await;
+    let mut agent_memory =
+        AgentMemory::open(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
     let memory_context = agent_memory
         .as_mut()
-        .map(|mem| {
-            mem.recall_context(
-                &format!("{} {} {}", msg.title, msg.body, msg.repo_name),
-                5,
-            )
-        })
+        .map(|mem| mem.recall_context(&format!("{} {} {}", msg.title, msg.body, msg.repo_name), 5))
         .unwrap_or_default();
 
     // --- Pass 1: Triage ---

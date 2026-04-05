@@ -26,9 +26,7 @@ pub async fn acquire_lock(
         .item("locked_at", AttributeValue::N(now.to_string()))
         .item("expires_at", AttributeValue::N(expires_at.to_string()))
         // Only succeed if: no lock exists OR existing lock has expired
-        .condition_expression(
-            "attribute_not_exists(pk) OR expires_at < :now",
-        )
+        .condition_expression("attribute_not_exists(pk) OR expires_at < :now")
         .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
         .send()
         .await;

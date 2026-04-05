@@ -67,9 +67,8 @@ async fn embed_with_bedrock(
         .await
         .map_err(|e| MenteError::Storage(format!("Bedrock embedding error: {e}")))?;
 
-    let body: serde_json::Value =
-        serde_json::from_slice(response.body().as_ref())
-            .map_err(|e| MenteError::Serialization(format!("Failed to parse Bedrock response: {e}")))?;
+    let body: serde_json::Value = serde_json::from_slice(response.body().as_ref())
+        .map_err(|e| MenteError::Serialization(format!("Failed to parse Bedrock response: {e}")))?;
 
     let embedding: Vec<f32> = body
         .get("embedding")

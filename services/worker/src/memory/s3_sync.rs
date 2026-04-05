@@ -25,9 +25,7 @@ pub async fn download_memory(
     repo_name: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let key = memory_key(team_id, repo_owner, repo_name);
-    let local_dir = PathBuf::from(format!(
-        "/tmp/mentedb/{team_id}/{repo_owner}/{repo_name}"
-    ));
+    let local_dir = PathBuf::from(format!("/tmp/mentedb/{team_id}/{repo_owner}/{repo_name}"));
 
     // Clean up any leftover from previous invocation
     if local_dir.exists() {
