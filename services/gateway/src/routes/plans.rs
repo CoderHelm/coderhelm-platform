@@ -629,12 +629,12 @@ pub async fn delete_task(
     Ok(StatusCode::OK)
 }
 
-/// POST /api/plans/:plan_id/tasks/:task_id/approve — approve a task for execution.
+/// POST /api/plans/:plan_id/tasks/:task_id/approve — approve a task and immediately dispatch it.
 pub async fn approve_task(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<Json<Value>, StatusCode> {
     super::billing::require_active_subscription(&state, &claims.team_id).await?;
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
@@ -642,6 +642,7 @@ pub async fn approve_task(
     let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
     let now = chrono::Utc::now().to_rfc3339();
 
+    // 1. Mark task as approved
     state
         .dynamo
         .update_item()
@@ -661,7 +662,53 @@ pub async fn approve_task(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok(StatusCode::OK)
+    // 2. Mark plan as executing (idempotent — may already be executing)
+    let plan_sk = format!("PLAN#{plan_id}");
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.plans_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&plan_sk))
+        .update_expression(
+            "SET #st = :s, executed_at = :now, executed_by = :by, updated_at = :now",
+        )
+        .expression_attribute_names("#st", "status")
+        .expression_attribute_values(":s", attr_s("executing"))
+        .expression_attribute_values(":now", attr_s(&now))
+        .expression_attribute_values(":by", attr_s(&claims.display_name()))
+        .send()
+        .await;
+
+    // 3. Immediately dispatch this single task to the worker
+    let plan_msg = WorkerMessage::PlanExecute(PlanExecuteMessage {
+        team_id: claims.team_id.clone(),
+        plan_id: plan_id.clone(),
+        triggered_by: claims.display_name(),
+        tasks: vec![task_id.clone()],
+    });
+
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(serde_json::to_string(&plan_msg).map_err(|e| {
+            error!("Failed to serialize plan message: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to send task to queue: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(
+        plan_id,
+        task_id, "Task approved and dispatched to worker"
+    );
+
+    Ok(Json(json!({ "dispatched": true, "task_id": task_id })))
 }
 
 /// POST /api/plans/:plan_id/tasks/:task_id/reject — reject a task.
