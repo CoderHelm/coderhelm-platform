@@ -9,10 +9,13 @@ use mentedb_core::types::AgentId;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
+use self::embedder::embed_async;
+
 /// Wraps a MenteDB instance with S3 sync and DynamoDB locking.
 /// Provides a simple API for worker passes to store and recall memories.
 pub struct AgentMemory {
     db: MenteDb,
+    bedrock: aws_sdk_bedrockruntime::Client,
     local_dir: PathBuf,
     team_id: String,
     repo_owner: String,
@@ -92,6 +95,7 @@ impl AgentMemory {
                 );
                 Some(Self {
                     db,
+                    bedrock: state.bedrock.clone(),
                     local_dir,
                     team_id: team_id.to_string(),
                     repo_owner: repo_owner.to_string(),
@@ -117,10 +121,13 @@ impl AgentMemory {
 
     /// Recall relevant memories for a given query text.
     /// Returns formatted context suitable for injection into prompts.
-    pub fn recall_context(&mut self, query: &str, k: usize) -> String {
-        let embedding = match self.db.embed_text(query) {
-            Ok(Some(emb)) => emb,
-            _ => return String::new(),
+    pub async fn recall_context(&mut self, query: &str, k: usize) -> String {
+        let embedding = match embed_async(&self.bedrock, query).await {
+            Ok(emb) => emb,
+            Err(e) => {
+                warn!(error = %e, "Failed to embed recall query");
+                return String::new();
+            }
         };
 
         let results = match self.db.recall_similar(&embedding, k) {
@@ -158,14 +165,15 @@ impl AgentMemory {
     }
 
     /// Store a new learning from this run.
-    pub fn store_learning(&mut self, content: &str, memory_type: MemoryType, tags: Vec<String>) {
-        // Generate embedding
-        let embedding = match self.db.embed_text(content) {
-            Ok(Some(emb)) => emb,
-            Ok(None) => {
-                warn!("No embedder configured, skipping memory storage");
-                return;
-            }
+    pub async fn store_learning(
+        &mut self,
+        content: &str,
+        memory_type: MemoryType,
+        tags: Vec<String>,
+    ) {
+        // Generate embedding via async Bedrock call
+        let embedding = match embed_async(&self.bedrock, content).await {
+            Ok(emb) => emb,
             Err(e) => {
                 warn!(error = %e, "Failed to embed memory content");
                 return;
@@ -184,7 +192,7 @@ impl AgentMemory {
     }
 
     /// Store a review finding.
-    pub fn store_review_finding(&mut self, finding: &str) {
+    pub async fn store_review_finding(&mut self, finding: &str) {
         self.store_learning(
             finding,
             MemoryType::Semantic,
@@ -192,11 +200,12 @@ impl AgentMemory {
                 "review".to_string(),
                 format!("repo:{}/{}", self.repo_owner, self.repo_name),
             ],
-        );
+        )
+        .await;
     }
 
     /// Store a security finding.
-    pub fn store_security_finding(&mut self, finding: &str) {
+    pub async fn store_security_finding(&mut self, finding: &str) {
         self.store_learning(
             finding,
             MemoryType::Semantic,
@@ -204,11 +213,12 @@ impl AgentMemory {
                 "security".to_string(),
                 format!("repo:{}/{}", self.repo_owner, self.repo_name),
             ],
-        );
+        )
+        .await;
     }
 
     /// Store an anti-pattern (something that went wrong).
-    pub fn store_anti_pattern(&mut self, description: &str) {
+    pub async fn store_anti_pattern(&mut self, description: &str) {
         self.store_learning(
             description,
             MemoryType::AntiPattern,
@@ -216,11 +226,12 @@ impl AgentMemory {
                 "anti-pattern".to_string(),
                 format!("repo:{}/{}", self.repo_owner, self.repo_name),
             ],
-        );
+        )
+        .await;
     }
 
     /// Store a run summary as episodic memory.
-    pub fn store_run_summary(&mut self, summary: &str) {
+    pub async fn store_run_summary(&mut self, summary: &str) {
         self.store_learning(
             summary,
             MemoryType::Episodic,
@@ -228,7 +239,8 @@ impl AgentMemory {
                 "run-summary".to_string(),
                 format!("repo:{}/{}", self.repo_owner, self.repo_name),
             ],
-        );
+        )
+        .await;
     }
 
     /// Flush, close, upload to S3, and release the lock.

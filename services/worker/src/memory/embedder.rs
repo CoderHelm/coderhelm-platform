@@ -45,6 +45,14 @@ impl EmbeddingProvider for BedrockEmbedder {
     }
 }
 
+/// Async embedding function for use from async contexts (avoids block_on panic).
+pub async fn embed_async(
+    client: &aws_sdk_bedrockruntime::Client,
+    text: &str,
+) -> MenteResult<Vec<f32>> {
+    embed_with_bedrock(client, "amazon.titan-embed-text-v2:0", text).await
+}
+
 async fn embed_with_bedrock(
     client: &aws_sdk_bedrockruntime::Client,
     model_id: &str,

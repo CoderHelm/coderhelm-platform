@@ -350,10 +350,13 @@ async fn run_passes(
     // --- Open agent memory (non-blocking: falls back to stateless if unavailable) ---
     let mut agent_memory =
         AgentMemory::open(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
-    let memory_context = agent_memory
-        .as_mut()
-        .map(|mem| mem.recall_context(&format!("{} {} {}", msg.title, msg.body, msg.repo_name), 5))
-        .unwrap_or_default();
+    let memory_context = match agent_memory.as_mut() {
+        Some(mem) => {
+            mem.recall_context(&format!("{} {} {}", msg.title, msg.body, msg.repo_name), 5)
+                .await
+        }
+        None => String::new(),
+    };
 
     // --- Pass 1: Triage ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -1035,7 +1038,8 @@ async fn run_passes(
                     mem.store_review_finding(&format!(
                         "Review found issues on run {run_id}: {}",
                         review_result.summary
-                    ));
+                    ))
+                    .await;
                 }
             }
             break;
@@ -1182,7 +1186,8 @@ async fn run_passes(
             mem.store_security_finding(&format!(
                 "Security audit found issues on run {run_id}: {}",
                 security_result.summary
-            ));
+            ))
+            .await;
         }
     }
 
@@ -1263,7 +1268,8 @@ async fn run_passes(
             impl_result.files_modified.len(),
             if review_passed { "passed" } else { "issues found" },
             if security_result.passed { "passed" } else { "issues found" },
-        ));
+        ))
+        .await;
         if let Err(e) = mem.close_and_upload(state).await {
             warn!(run_id, error = %e, "Failed to persist agent memory");
         }
