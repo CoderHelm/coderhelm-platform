@@ -217,6 +217,38 @@ pub async fn converse_with_opts(
                             tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                             continue;
                         }
+                        // Fallback: if heavy model fails, retry once with light model
+                        if transient && model_id != state.config.light_model_id {
+                            warn!(
+                                from = model_id,
+                                to = %state.config.light_model_id,
+                                "Heavy model unavailable after retries, falling back to light model"
+                            );
+                            let mut fallback_req = state
+                                .bedrock
+                                .converse()
+                                .model_id(&state.config.light_model_id)
+                                .system(SystemContentBlock::Text(system_prompt.to_string()))
+                                .system(SystemContentBlock::CachePoint(cache_point.clone()))
+                                .inference_config(inference_config.clone());
+                            for msg in messages.iter() {
+                                fallback_req = fallback_req.messages(msg.clone());
+                            }
+                            if !tools.is_empty() {
+                                fallback_req = fallback_req.tool_config(tool_config.clone());
+                            }
+                            match fallback_req.send().await {
+                                Ok(resp) => break 'send resp,
+                                Err(fallback_err) => {
+                                    let msg = format!(
+                                        "Both models failed. Primary ({}): {e:#}. Fallback ({}): {fallback_err:#}",
+                                        model_id, state.config.light_model_id
+                                    );
+                                    error!("{msg}");
+                                    return Err(msg.into());
+                                }
+                            }
+                        }
                         let msg = format!("Bedrock converse error (model={model_id}): {e:#}");
                         error!("{msg}");
                         return Err(msg.into());
