@@ -76,15 +76,12 @@ jobs:
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::REDACTED_AWS_ACCOUNT_ID:role/coderhelm-github-deploy
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Build MCP Proxy
         working-directory: lambda/mcp-proxy
         run: npm ci && npm run build
-
-      - name: Stripe setup (idempotent)
-        run: bash scripts/setup-stripe.sh
 
       - working-directory: infra
         run: npm ci
@@ -93,6 +90,6 @@ jobs:
         env:
           GATEWAY_ZIP: ${{ github.workspace }}/artifacts/gateway.zip
           WORKER_ZIP: ${{ github.workspace }}/artifacts/worker.zip
-          CDK_DEFAULT_ACCOUNT: "REDACTED_AWS_ACCOUNT_ID"
+          CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
           CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
           MODEL_ID: us.anthropic.claude-opus-4-6-v1

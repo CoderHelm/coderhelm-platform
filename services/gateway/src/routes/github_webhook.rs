@@ -7,7 +7,6 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use super::billing::{FREE_TIER_TOKENS, INCLUDED_TOKENS, OVERAGE_PER_1K_TOKENS_CENTS};
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
     CiFixMessage, FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo,
@@ -1246,7 +1245,30 @@ fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValu
 
 /// Check whether this team has budget remaining. Returns Some(reason) if blocked.
 pub async fn check_run_budget(state: &AppState, team_id: &str) -> Option<String> {
-    // 1. Read current month's token usage from analytics
+    // 1. Read configured token limit from settings
+    let limit = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s("SETTINGS#TOKEN_LIMIT"))
+        .send()
+        .await
+        .ok()?;
+
+    let max_tokens: u64 = limit
+        .item()
+        .and_then(|i| i.get("max_tokens"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    // 0 = unlimited
+    if max_tokens == 0 {
+        return None;
+    }
+
+    // 2. Read current month's token usage from analytics
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     let analytics = state
         .dynamo
@@ -1274,80 +1296,16 @@ pub async fn check_run_budget(state: &AppState, team_id: &str) -> Option<String>
 
     let total_tokens = tokens_in + tokens_out;
 
-    // 2. Read billing record (subscription status)
-    let billing = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.billing_table_name)
-        .key("pk", attr_s(team_id))
-        .key("sk", attr_s("BILLING"))
-        .send()
-        .await
-        .ok()?;
-
-    let sub_status = billing
-        .item()
-        .and_then(|i| i.get("subscription_status"))
-        .and_then(|v| v.as_s().ok())
-        .map(|s| s.as_str())
-        .unwrap_or("none");
-
-    let is_pro = sub_status == "active";
-
-    // Free tier: hard limit at 500K tokens
-    if !is_pro && total_tokens >= FREE_TIER_TOKENS {
+    if total_tokens >= max_tokens {
+        let limit_label = if max_tokens >= 1_000_000 {
+            format!("{}M", max_tokens / 1_000_000)
+        } else {
+            format!("{}K", max_tokens / 1_000)
+        };
         return Some(format!(
-            "You've used all **{}K free tokens** this month. \
-             [Upgrade to Pro](https://app.coderhelm.com/billing) for 5M tokens/month.",
-            FREE_TIER_TOKENS / 1000,
+            "You've used all **{limit_label}** tokens this month. \
+             Increase your token limit in [Settings → Token Limit](https://app.coderhelm.com/settings/budget) to continue.",
         ));
-    }
-
-    // Pro tier: check budget cap
-    if is_pro {
-        let budget = state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", attr_s(team_id))
-            .key("sk", attr_s("SETTINGS#BUDGET"))
-            .send()
-            .await
-            .ok()?;
-
-        let max_budget_cents = budget
-            .item()
-            .and_then(|i| i.get("max_budget_cents"))
-            .and_then(|v| v.as_n().ok())
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or(0);
-
-        if total_tokens >= INCLUDED_TOKENS {
-            // Calculate current overage spend
-            let overage_tokens = total_tokens.saturating_sub(INCLUDED_TOKENS);
-            let overage_1k = overage_tokens / 1000;
-            let overage_spend = overage_1k * OVERAGE_PER_1K_TOKENS_CENTS;
-
-            if max_budget_cents == 0 {
-                // No budget set — block overage runs
-                let included_label = if INCLUDED_TOKENS >= 1_000_000 {
-                    format!("{}M", INCLUDED_TOKENS / 1_000_000)
-                } else {
-                    format!("{}K", INCLUDED_TOKENS / 1_000)
-                };
-                return Some(format!(
-                    "You've used all **{included_label}** included tokens this month. \
-                     Set an overage budget in [Settings → Budget](https://app.coderhelm.com/settings/budget) to continue.",
-                ));
-            } else if overage_spend >= max_budget_cents {
-                return Some(format!(
-                    "Monthly overage budget of **${:.2}** reached (current overage: **${:.2}**). \
-                     Adjust your budget in [Settings](https://app.coderhelm.com/settings/budget).",
-                    max_budget_cents as f64 / 100.0,
-                    overage_spend as f64 / 100.0,
-                ));
-            }
-        }
     }
 
     None

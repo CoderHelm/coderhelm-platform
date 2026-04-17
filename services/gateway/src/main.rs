@@ -207,50 +207,8 @@ async fn main() -> Result<(), Error> {
             "/settings/workflow",
             get(routes::api::get_workflow_settings).put(routes::api::update_workflow_settings),
         )
-        // Billing endpoints
-        .route("/billing", get(routes::billing::get_billing))
-        .route(
-            "/billing/portal",
-            post(routes::billing::create_portal_session),
-        )
-        .route(
-            "/billing/subscribe",
-            post(routes::billing::create_subscription),
-        )
-        .route(
-            "/billing/cancel",
-            post(routes::billing::cancel_subscription),
-        )
-        .route(
-            "/billing/reactivate",
-            post(routes::billing::reactivate_subscription),
-        )
-        .route(
-            "/billing/payment-method",
-            post(routes::billing::create_setup_intent),
-        )
-        .route(
-            "/billing/payment-methods",
-            get(routes::billing::list_payment_methods),
-        )
-        .route(
-            "/billing/payment-methods/:pm_id",
-            delete(routes::billing::delete_payment_method),
-        )
-        .route(
-            "/billing/payment-methods/:pm_id/default",
-            put(routes::billing::set_default_payment_method),
-        )
-        .route(
-            "/billing/customer",
-            get(routes::billing::get_billing_customer),
-        )
-        .route("/billing/email", put(routes::billing::update_billing_email))
-        .route("/billing/invoices", get(routes::billing::list_invoices))
-        .route(
-            "/billing/invoices/:invoice_id/pdf",
-            get(routes::billing::download_invoice_pdf),
-        )
+        // Usage
+        .route("/usage", get(routes::api::get_usage))
         // Banners
         .route("/banners", get(routes::banners::list_banners))
         // Account management
@@ -397,8 +355,7 @@ async fn main() -> Result<(), Error> {
     let webhook_routes = Router::new()
         .route("/github", post(routes::github_webhook::handle))
         .route("/jira/:token", post(routes::jira_webhook::handle))
-        .route("/jira", post(routes::jira_webhook::handle_forge))
-        .route("/stripe", post(routes::stripe_webhook::handle));
+        .route("/jira", post(routes::jira_webhook::handle_forge));
 
     // Auth routes (public, rate-limited)
     let auth_routes = Router::new()

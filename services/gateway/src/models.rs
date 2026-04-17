@@ -17,12 +17,10 @@ pub struct Config {
     pub settings_table_name: String,
     pub aws_insights_table_name: String,
     pub infra_table_name: String,
-    pub billing_table_name: String,
     pub banners_table_name: String,
     pub mcp_configs_table_name: String,
     pub waitlist_table_name: String,
     pub bucket_name: String,
-    pub invoice_bucket_name: String,
     pub ticket_queue_url: String,
     pub ci_fix_queue_url: String,
     pub feedback_queue_url: String,
@@ -62,16 +60,12 @@ impl Config {
             aws_insights_table_name: std::env::var("AWS_INSIGHTS_TABLE_NAME")
                 .expect("AWS_INSIGHTS_TABLE_NAME required"),
             infra_table_name: std::env::var("INFRA_TABLE_NAME").expect("INFRA_TABLE_NAME required"),
-            billing_table_name: std::env::var("BILLING_TABLE_NAME")
-                .expect("BILLING_TABLE_NAME required"),
             banners_table_name: std::env::var("BANNERS_TABLE_NAME")
                 .expect("BANNERS_TABLE_NAME required"),
             mcp_configs_table_name: std::env::var("MCP_CONFIGS_TABLE_NAME").unwrap_or_default(),
             waitlist_table_name: std::env::var("WAITLIST_TABLE_NAME")
                 .expect("WAITLIST_TABLE_NAME required"),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
-            invoice_bucket_name: std::env::var("INVOICE_BUCKET_NAME")
-                .unwrap_or_else(|_| "coderhelm-prod-invoices".to_string()),
             ticket_queue_url: std::env::var("TICKET_QUEUE_URL").expect("TICKET_QUEUE_URL required"),
             ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").expect("CI_FIX_QUEUE_URL required"),
             feedback_queue_url: std::env::var("FEEDBACK_QUEUE_URL")
@@ -109,16 +103,6 @@ pub struct Secrets {
     pub google_client_secret: Option<String>,
     #[serde(default)]
     pub jira_webhook_secret: Option<String>,
-    #[serde(default)]
-    pub stripe_webhook_secret: Option<String>,
-    #[serde(default)]
-    pub stripe_secret_key: Option<String>,
-    #[serde(default)]
-    pub stripe_publishable_key: Option<String>,
-    #[serde(default)]
-    pub stripe_price_id: Option<String>,
-    #[serde(default)]
-    pub stripe_overage_price_id: Option<String>,
 }
 
 impl Secrets {

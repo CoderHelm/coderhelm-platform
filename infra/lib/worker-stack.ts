@@ -18,7 +18,6 @@ interface WorkerStackProps extends cdk.StackProps {
   reposTable: dynamodb.TableV2;
   settingsTable: dynamodb.TableV2;
   infraTable: dynamodb.TableV2;
-  billingTable: dynamodb.TableV2;
   mcpConfigsTable: dynamodb.TableV2;
   tracesTable: dynamodb.TableV2;
   checkpointsTable: dynamodb.TableV2;
@@ -77,7 +76,6 @@ export class WorkerStack extends cdk.Stack {
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
         MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
         INFRA_TABLE_NAME: props.infraTable.tableName,
-        BILLING_TABLE_NAME: props.billingTable.tableName,
         TRACES_TABLE_NAME: props.tracesTable.tableName,
         CHECKPOINTS_TABLE_NAME: props.checkpointsTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
@@ -115,7 +113,6 @@ export class WorkerStack extends cdk.Stack {
     props.settingsTable.grantReadWriteData(this.workerFunction);
     props.mcpConfigsTable.grantReadData(this.workerFunction);
     props.infraTable.grantReadWriteData(this.workerFunction);
-    props.billingTable.grantReadWriteData(this.workerFunction);
     props.tracesTable.grantReadWriteData(this.workerFunction);
     props.checkpointsTable.grantReadWriteData(this.workerFunction);
     props.bucket.grantReadWrite(this.workerFunction);

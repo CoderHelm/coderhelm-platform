@@ -2796,7 +2796,6 @@ pub async fn regenerate_repo(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
 
@@ -2838,7 +2837,7 @@ pub async fn regenerate_repo(
     Ok(Json(json!({ "status": "regenerating" })))
 }
 
-/// GET /api/settings/budget — get monthly budget cap.
+/// GET /api/settings/budget — get token limit.
 pub async fn get_budget(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -2848,73 +2847,119 @@ pub async fn get_budget(
         .get_item()
         .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s("SETTINGS#BUDGET"))
+        .key("sk", attr_s("SETTINGS#TOKEN_LIMIT"))
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to fetch budget: {e}");
+            error!("Failed to fetch token limit: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let max_budget_cents = result
+    let max_tokens = result
         .item()
-        .and_then(|i| i.get("max_budget_cents"))
+        .and_then(|i| i.get("max_tokens"))
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0); // 0 = no cap
+        .unwrap_or(0); // 0 = unlimited
 
-    Ok(Json(json!({ "max_budget_cents": max_budget_cents })))
+    Ok(Json(json!({ "max_tokens": max_tokens })))
 }
 
-/// PUT /api/settings/budget — set monthly budget cap.
-/// Only allowed for users with an active subscription (overage doesn't apply to free tier).
+/// PUT /api/settings/budget — set monthly token limit.
 pub async fn update_budget(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
-    // Block free-tier users from setting a budget cap
-    let billing = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s("BILLING"))
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned());
-
-    let subscription_status = billing
-        .as_ref()
-        .and_then(|i| i.get("subscription_status"))
-        .and_then(|v| v.as_s().ok())
-        .map_or("none", |v| v);
-
-    if subscription_status != "active" {
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    let max_budget_cents = body["max_budget_cents"].as_u64().unwrap_or(0);
+    let max_tokens = body["max_tokens"].as_u64().unwrap_or(0);
 
     state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
         .item("pk", attr_s(&claims.team_id))
-        .item("sk", attr_s("SETTINGS#BUDGET"))
+        .item("sk", attr_s("SETTINGS#TOKEN_LIMIT"))
         .item(
-            "max_budget_cents",
-            aws_sdk_dynamodb::types::AttributeValue::N(max_budget_cents.to_string()),
+            "max_tokens",
+            aws_sdk_dynamodb::types::AttributeValue::N(max_tokens.to_string()),
         )
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to update budget: {e}");
+            error!("Failed to update token limit: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     Ok(StatusCode::OK)
+}
+
+/// GET /api/usage — token usage for the current month + configured limit.
+pub async fn get_usage(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+
+    let (analytics_result, limit_result) = tokio::join!(
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.analytics_table_name)
+            .key("team_id", attr_s(&claims.team_id))
+            .key("period", attr_s(&month))
+            .send(),
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&claims.team_id))
+            .key("sk", attr_s("SETTINGS#TOKEN_LIMIT"))
+            .send()
+    );
+
+    let analytics = analytics_result.map_err(|e| {
+        error!("Failed to read analytics: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let limit = limit_result.map_err(|e| {
+        error!("Failed to read token limit: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let tokens_in: u64 = analytics
+        .item()
+        .and_then(|i| i.get("total_tokens_in"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let tokens_out: u64 = analytics
+        .item()
+        .and_then(|i| i.get("total_tokens_out"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let total_runs: u64 = analytics
+        .item()
+        .and_then(|i| i.get("total_runs"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    let max_tokens: u64 = limit
+        .item()
+        .and_then(|i| i.get("max_tokens"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    Ok(Json(json!({
+        "month": month,
+        "total_tokens": tokens_in + tokens_out,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "total_runs": total_runs,
+        "max_tokens": max_tokens,
+    })))
 }
 
 /// GET /api/settings/workflow — get workflow preferences.
@@ -3276,7 +3321,6 @@ pub async fn reset_account(
         &state.config.repos_table_name,
         &state.config.settings_table_name,
         &state.config.infra_table_name,
-        &state.config.billing_table_name,
     ];
 
     for table in &tables {

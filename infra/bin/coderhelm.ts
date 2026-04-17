@@ -7,7 +7,6 @@ import { ApiStack } from "../lib/api-stack";
 import { WorkerStack } from "../lib/worker-stack";
 import { MonitoringStack } from "../lib/monitoring-stack";
 import { EmailStack } from "../lib/email-stack";
-import { BillingStack } from "../lib/billing-stack";
 import { LogAnalyzerStack } from "../lib/log-analyzer-stack";
 import { StreamingStack } from "../lib/streaming-stack";
 
@@ -47,7 +46,6 @@ const api = new ApiStack(app, `${prefix}-api`, {
   reposTable: database.reposTable,
   settingsTable: database.settingsTable,
   infraTable: database.infraTable,
-  billingTable: database.billingTable,
   bannersTable: database.bannersTable,
   mcpConfigsTable: database.mcpConfigsTable,
   awsInsightsTable: database.awsInsightsTable,
@@ -65,7 +63,6 @@ const worker = new WorkerStack(app, `${prefix}-worker`, {
   reposTable: database.reposTable,
   settingsTable: database.settingsTable,
   infraTable: database.infraTable,
-  billingTable: database.billingTable,
   mcpConfigsTable: database.mcpConfigsTable,
   tracesTable: database.tracesTable,
   checkpointsTable: database.checkpointsTable,
@@ -84,20 +81,6 @@ new EmailStack(app, `${prefix}-email`, {
   gatewayFunction: api.gatewayFunction,
   workerFunction: worker.workerFunction,
 });
-
-// --- Billing ---
-
-const billing = new BillingStack(app, `${prefix}-billing`, {
-  env,
-  stage,
-  gatewayFunction: api.gatewayFunction,
-});
-
-// Inject invoice bucket name into gateway environment
-api.gatewayFunction.addEnvironment(
-  "INVOICE_BUCKET_NAME",
-  billing.invoiceBucket.bucketName
-);
 
 // --- Monitoring ---
 

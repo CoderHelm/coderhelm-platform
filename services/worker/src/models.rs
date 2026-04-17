@@ -12,7 +12,6 @@ pub struct Config {
     pub repos_table_name: String,
     pub settings_table_name: String,
     pub infra_table_name: String,
-    pub billing_table_name: String,
     pub mcp_configs_table_name: String,
     pub traces_table_name: String,
     pub checkpoints_table_name: String,
@@ -42,8 +41,6 @@ impl Config {
             settings_table_name: std::env::var("SETTINGS_TABLE_NAME")
                 .expect("SETTINGS_TABLE_NAME required"),
             infra_table_name: std::env::var("INFRA_TABLE_NAME").expect("INFRA_TABLE_NAME required"),
-            billing_table_name: std::env::var("BILLING_TABLE_NAME")
-                .expect("BILLING_TABLE_NAME required"),
             mcp_configs_table_name: std::env::var("MCP_CONFIGS_TABLE_NAME").unwrap_or_default(),
             traces_table_name: std::env::var("TRACES_TABLE_NAME").unwrap_or_default(),
             checkpoints_table_name: std::env::var("CHECKPOINTS_TABLE_NAME").unwrap_or_default(),
@@ -66,8 +63,6 @@ impl Config {
 pub struct Secrets {
     pub github_app_id: String,
     pub github_private_key: String,
-    #[serde(default)]
-    pub stripe_secret_key: Option<String>,
 }
 
 impl Secrets {

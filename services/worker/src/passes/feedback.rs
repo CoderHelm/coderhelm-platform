@@ -349,10 +349,6 @@ Rules:
             .await?;
     }
 
-    // Report token overage to Stripe
-    let total_tokens = usage.input_tokens + usage.output_tokens;
-    crate::clients::billing::report_token_overage(state, &msg.team_id, total_tokens).await;
-
     Ok(())
 }
 

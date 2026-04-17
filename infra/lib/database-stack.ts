@@ -21,7 +21,6 @@ export class DatabaseStack extends cdk.Stack {
   public readonly reposTable: dynamodb.TableV2;
   public readonly settingsTable: dynamodb.TableV2;
   public readonly infraTable: dynamodb.TableV2;
-  public readonly billingTable: dynamodb.TableV2;
   public readonly bannersTable: dynamodb.TableV2;
   public readonly mcpConfigsTable: dynamodb.TableV2;
   public readonly awsInsightsTable: dynamodb.TableV2;
@@ -71,13 +70,6 @@ export class DatabaseStack extends cdk.Stack {
       sortKey: { name: "gsi1sk", type: dynamodb.AttributeType.STRING },
     });
 
-    // GSI2: Look up teams by stripe_customer_id (for Stripe webhooks)
-    this.table.addGlobalSecondaryIndex({
-      indexName: "gsi2",
-      partitionKey: { name: "gsi2pk", type: dynamodb.AttributeType.STRING },
-      sortKey: { name: "gsi2sk", type: dynamodb.AttributeType.STRING },
-    });
-
     // ──────────────────────────────────────────────
     // Teams table: team records with connection metadata
     // PK = team_id (TEAM#<nanoid>), SK = META | CONNECTION#github | etc.
@@ -106,15 +98,6 @@ export class DatabaseStack extends cdk.Stack {
       partitionKey: {
         name: "github_installation_id",
         type: dynamodb.AttributeType.NUMBER,
-      },
-    });
-
-    // GSI: Look up team by Stripe customer ID (for Stripe webhooks)
-    this.teamsTable.addGlobalSecondaryIndex({
-      indexName: "stripe-customer-index",
-      partitionKey: {
-        name: "stripe_customer_id",
-        type: dynamodb.AttributeType.STRING,
       },
     });
 
@@ -181,8 +164,7 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
-    // Events table: ephemeral Stripe data
-    // STRIPE_EVENTS idempotency, PAYMENT#, INVOICE#, STRIPE# mapping
+    // Events table: ephemeral event data
     // TTL auto-cleanup for transient records
     // ──────────────────────────────────────────────
     this.eventsTable = new dynamodb.TableV2(this, "EventsTable", {
@@ -450,27 +432,6 @@ export class DatabaseStack extends cdk.Stack {
     });
 
     // ──────────────────────────────────────────────
-    // Billing table: subscription & payment data
-    // PK = team_id, SK = BILLING
-    // ──────────────────────────────────────────────
-    this.billingTable = new dynamodb.TableV2(this, "BillingTable", {
-      tableName: `coderhelm-${props.stage}-billing-data`,
-      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
-      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
-      billing: dynamodb.Billing.onDemand(),
-      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
-        this.encryptionKey
-      ),
-      pointInTimeRecoverySpecification: {
-        pointInTimeRecoveryEnabled: true,
-      },
-      deletionProtection: isProd,
-      removalPolicy: isProd
-        ? cdk.RemovalPolicy.RETAIN
-        : cdk.RemovalPolicy.DESTROY,
-    });
-
-    // ──────────────────────────────────────────────
     // Banners table: dynamic UI banners
     // PK = scope (BANNER#GLOBAL or BANNER#<team_id>), SK = banner_id
     // ──────────────────────────────────────────────
@@ -564,9 +525,6 @@ export class DatabaseStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, "InfraTableName", {
       value: this.infraTable.tableName,
-    });
-    new cdk.CfnOutput(this, "BillingTableName", {
-      value: this.billingTable.tableName,
     });
     new cdk.CfnOutput(this, "BannersTableName", {
       value: this.bannersTable.tableName,

@@ -157,12 +157,6 @@ pub async fn orchestrate_ticket(
 
     info!(run_id, ticket_id = %msg.ticket_id, "Orchestration started");
 
-    // Block processing if subscription is past_due (unpaid invoices)
-    if !is_subscription_allowed(state, &msg.team_id).await {
-        warn!(run_id, team_id = %msg.team_id, "Skipping ticket: subscription not active");
-        return Ok(());
-    }
-
     // Dedup: skip if another run for this ticket is already in progress
     if is_ticket_already_running(state, &msg).await {
         warn!(
@@ -544,9 +538,6 @@ async fn run_passes(
                 .await;
         }
 
-        // Report token usage for billing
-        let total_tokens = usage.input_tokens + usage.output_tokens;
-        crate::clients::billing::report_token_overage(state, &msg.team_id, total_tokens).await;
         return Ok(());
     }
 
@@ -647,9 +638,6 @@ async fn run_passes(
                 .await;
         }
 
-        // Report token usage for billing
-        let total_tokens = usage.input_tokens + usage.output_tokens;
-        crate::clients::billing::report_token_overage(state, &msg.team_id, total_tokens).await;
         return Ok(());
     }
 
@@ -1517,10 +1505,6 @@ async fn complete_run(
         .send()
         .await?;
 
-    // Report token overage to Stripe (after analytics are updated)
-    let total_tokens = usage.input_tokens + usage.output_tokens;
-    crate::clients::billing::report_token_overage(state, &msg.team_id, total_tokens).await;
-
     // Send run-complete notification
     let duration_str = format!("{}m {}s", duration / 60, duration % 60);
     let tokens_str = if total_tokens >= 1_000_000 {
@@ -2118,31 +2102,6 @@ async fn load_workflow_setting(state: &WorkerState, team_id: &str, key: &str) ->
             .unwrap_or(false),
         Err(_) => false,
     }
-}
-
-/// Check if team subscription allows processing (active or free).
-async fn is_subscription_allowed(state: &WorkerState, team_id: &str) -> bool {
-    let status = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.billing_table_name)
-        .key("pk", AttributeValue::S(team_id.to_string()))
-        .key("sk", AttributeValue::S("BILLING".to_string()))
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned())
-        .and_then(|item| {
-            item.get("subscription_status")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-        })
-        .unwrap_or_default();
-
-    matches!(
-        status.as_str(),
-        "" | "none" | "active" | "free" | "trialing"
-    )
 }
 
 /// Write a per-pass trace record to the traces table.

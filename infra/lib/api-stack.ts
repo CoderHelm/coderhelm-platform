@@ -26,7 +26,6 @@ interface ApiStackProps extends cdk.StackProps {
   reposTable: dynamodb.TableV2;
   settingsTable: dynamodb.TableV2;
   infraTable: dynamodb.TableV2;
-  billingTable: dynamodb.TableV2;
   bannersTable: dynamodb.TableV2;
   mcpConfigsTable: dynamodb.TableV2;
   awsInsightsTable: dynamodb.TableV2;
@@ -282,7 +281,6 @@ export class ApiStack extends cdk.Stack {
         AWS_INSIGHTS_TABLE_NAME: props.awsInsightsTable.tableName,
         MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
         INFRA_TABLE_NAME: props.infraTable.tableName,
-        BILLING_TABLE_NAME: props.billingTable.tableName,
         BANNERS_TABLE_NAME: props.bannersTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
         WAITLIST_TABLE_NAME: props.waitlistTable.tableName,
@@ -339,7 +337,6 @@ export class ApiStack extends cdk.Stack {
     props.settingsTable.grantReadWriteData(this.gatewayFunction);
     props.awsInsightsTable.grantReadWriteData(this.gatewayFunction);
     props.infraTable.grantReadWriteData(this.gatewayFunction);
-    props.billingTable.grantReadWriteData(this.gatewayFunction);
     props.bannersTable.grantReadData(this.gatewayFunction);
     props.mcpConfigsTable.grantReadWriteData(this.gatewayFunction);
     props.waitlistTable.grantReadWriteData(this.gatewayFunction);
@@ -488,12 +485,6 @@ export class ApiStack extends cdk.Stack {
 
     httpApi.addRoutes({
       path: "/integrations/jira/forge-register",
-      methods: [apigatewayv2.HttpMethod.POST],
-      integration: lambdaIntegration,
-    });
-
-    httpApi.addRoutes({
-      path: "/webhooks/stripe",
       methods: [apigatewayv2.HttpMethod.POST],
       integration: lambdaIntegration,
     });
