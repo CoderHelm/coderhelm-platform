@@ -153,6 +153,7 @@ pub async fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn onboard_repo(
     state: &WorkerState,
     github: &GitHubClient,

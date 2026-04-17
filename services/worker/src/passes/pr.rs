@@ -87,7 +87,7 @@ Return ONLY the markdown body text."#,
     let body_text = provider::converse(
         state,
         provider,
-        &model_id,
+        model_id,
         &system,
         &mut messages,
         &[],
@@ -272,7 +272,7 @@ pub async fn resolve_conflicts(
         let merged_content = provider::converse(
             state,
             provider,
-            &model_id,
+            model_id,
             &system,
             &mut messages,
             &[],

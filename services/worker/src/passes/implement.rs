@@ -226,7 +226,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     provider::converse(
         state,
         provider,
-        &model_id,
+        model_id,
         &full_system,
         &mut messages,
         &tools,

@@ -156,7 +156,7 @@ Rules:
     let response = provider::converse(
         state,
         &provider,
-        &model_id,
+        model_id,
         &system,
         &mut messages,
         &tools,

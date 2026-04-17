@@ -64,7 +64,7 @@ fn sanitize_error(msg: &str) -> String {
             "Anthropic API error",
             "An error occurred during processing",
         )
-        .replace("service temporarily unavailable", "service temporarily unavailable");
+;
     // Collapse extra whitespace
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }

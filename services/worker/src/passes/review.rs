@@ -79,7 +79,7 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
     let response = provider::converse(
         state,
         provider,
-        &model_id,
+        model_id,
         &system,
         &mut messages,
         &tools,

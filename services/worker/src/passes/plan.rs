@@ -266,7 +266,7 @@ After researching, output the four files using this exact format:
     let response = provider::converse(
         state,
         provider,
-        &model_id,
+        model_id,
         &full_system,
         &mut messages,
         &tools,
