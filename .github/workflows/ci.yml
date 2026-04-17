@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -14,12 +12,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  gateway:
-    name: Gateway (Rust)
+  rust:
+    name: Rust (workspace)
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: services/gateway
+        working-directory: services
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,26 +25,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: services/gateway
-      - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
-
-  worker:
-    name: Worker (Rust)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: services/worker
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: services/worker
-      - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+          workspaces: services
+          cache-on-failure: true
+      - run: cargo fmt --check --all
+      - run: cargo clippy --workspace -- -D warnings
 
   mcp-proxy:
     name: MCP Proxy (Node)
