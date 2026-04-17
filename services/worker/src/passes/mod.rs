@@ -326,19 +326,39 @@ async fn run_passes(
             if repos.is_empty() {
                 return Err("No enabled repos found for team — cannot auto-pick repo".into());
             }
-            if repos.len() == 1 {
-                // Single repo — no need to triage
-                let (owner, name) = repos[0].split_once('/').unwrap_or(("", ""));
-                msg.repo_owner = owner.to_string();
-                msg.repo_name = name.to_string();
-                info!(run_id, repo = %repos[0], "Auto-selected single repo");
+
+            // Check for explicit Jira project → repo mapping first
+            let project_key = msg.ticket_id.split('-').next().unwrap_or("");
+            let mapped_repo = if !project_key.is_empty() {
+                lookup_jira_project_repo(state, &msg.team_id, project_key).await
             } else {
-                // Multiple repos — ask triage to pick
-                let selected = triage::select_repo(state, msg, &repos, &provider, usage).await?;
-                let (owner, name) = selected.split_once('/').unwrap_or(("", ""));
-                msg.repo_owner = owner.to_string();
-                msg.repo_name = name.to_string();
-                info!(run_id, repo = %selected, "Triage selected repo");
+                None
+            };
+
+            if let Some(ref repo) = mapped_repo {
+                if repos.iter().any(|r| r == repo) {
+                    let (owner, name) = repo.split_once('/').unwrap_or(("", ""));
+                    msg.repo_owner = owner.to_string();
+                    msg.repo_name = name.to_string();
+                    info!(run_id, repo = %repo, project_key, "Repo from Jira project mapping");
+                } else {
+                    warn!(run_id, repo = %repo, project_key, "Mapped repo not in enabled list, falling back to LLM");
+                }
+            }
+
+            if msg.repo_owner.is_empty() {
+                if repos.len() == 1 {
+                    let (owner, name) = repos[0].split_once('/').unwrap_or(("", ""));
+                    msg.repo_owner = owner.to_string();
+                    msg.repo_name = name.to_string();
+                    info!(run_id, repo = %repos[0], "Auto-selected single repo");
+                } else {
+                    let selected = triage::select_repo(state, msg, &repos, &provider, usage).await?;
+                    let (owner, name) = selected.split_once('/').unwrap_or(("", ""));
+                    msg.repo_owner = owner.to_string();
+                    msg.repo_name = name.to_string();
+                    info!(run_id, repo = %selected, "Triage LLM selected repo");
+                }
             }
             // Update run record with resolved repo
             let resolved_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
@@ -2591,4 +2611,28 @@ async fn check_token_usage_warning(state: &WorkerState, team_id: &str, _usage: &
             error!("Failed to send token warning email: {e}");
         }
     }
+}
+
+/// Look up Jira project → repo mapping from DynamoDB.
+async fn lookup_jira_project_repo(
+    state: &WorkerState,
+    team_id: &str,
+    project_key: &str,
+) -> Option<String> {
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.jira_config_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&format!("JIRA#PROJECT#{project_key}")))
+        .send()
+        .await
+        .ok()?
+        .item?;
+
+    result
+        .get("repo")
+        .and_then(|v| v.as_s().ok())
+        .filter(|s| !s.is_empty())
+        .cloned()
 }

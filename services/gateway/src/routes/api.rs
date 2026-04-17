@@ -1759,7 +1759,12 @@ pub async fn get_jira_config(
                 .and_then(|v| v.as_bool().ok())
                 .copied()
                 .unwrap_or(false);
-            Some(json!({ "key": key, "name": name, "enabled": enabled }))
+            let repo = item
+                .get("repo")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            Some(json!({ "key": key, "name": name, "enabled": enabled, "repo": repo }))
         })
         .collect();
 
@@ -1842,15 +1847,22 @@ pub async fn update_jira_projects(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        state
+        let repo = proj.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+
+        let mut put = state
             .dynamo
             .put_item()
             .table_name(&state.config.jira_config_table_name)
             .item("pk", attr_s(&claims.team_id))
             .item("sk", attr_s(&format!("JIRA#PROJECT#{key}")))
             .item("project_name", attr_s(name))
-            .item("enabled", AttributeValue::Bool(enabled))
-            .send()
+            .item("enabled", AttributeValue::Bool(enabled));
+
+        if !repo.is_empty() {
+            put = put.item("repo", attr_s(repo));
+        }
+
+        put.send()
             .await
             .map_err(|e| {
                 error!("Failed to save Jira project {key}: {e}");

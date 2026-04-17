@@ -113,8 +113,13 @@ pub async fn select_repo(
     provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let system = "You are a repo-selection agent. Given a Jira ticket, repository descriptions, \
-                  and a list of repositories, pick the single best repository for this work. \
+    let system = "You are a repo-selection agent. Given a Jira ticket and a list of repositories, \
+                  pick the single best repository for implementation. \
+                  Rules: \
+                  1. Match by primary purpose — feature/bug tickets go to the repo that OWNS the feature area. \
+                  2. Data/analytics/ETL repos are for data pipeline work, NOT for application features. \
+                  3. If the ticket mentions specific services, APIs, or integrations, pick the repo that implements them. \
+                  4. When unsure, prefer application/API repos over infrastructure/data repos. \
                   Return ONLY the repo in owner/name format.";
 
     let repo_list = repos
