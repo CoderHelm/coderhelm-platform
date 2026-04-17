@@ -114,6 +114,7 @@ export class WorkerStack extends cdk.Stack {
     props.settingsTable.grantReadWriteData(this.workerFunction);
     props.mcpConfigsTable.grantReadData(this.workerFunction);
     props.infraTable.grantReadWriteData(this.workerFunction);
+    props.billingTable.grantReadWriteData(this.workerFunction); // Retained for CF migration
     props.tracesTable.grantReadWriteData(this.workerFunction);
     props.checkpointsTable.grantReadWriteData(this.workerFunction);
     props.bucket.grantReadWrite(this.workerFunction);

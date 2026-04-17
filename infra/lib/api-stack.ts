@@ -338,6 +338,7 @@ export class ApiStack extends cdk.Stack {
     props.settingsTable.grantReadWriteData(this.gatewayFunction);
     props.awsInsightsTable.grantReadWriteData(this.gatewayFunction);
     props.infraTable.grantReadWriteData(this.gatewayFunction);
+    props.billingTable.grantReadWriteData(this.gatewayFunction); // Retained for CF migration
     props.bannersTable.grantReadData(this.gatewayFunction);
     props.mcpConfigsTable.grantReadWriteData(this.gatewayFunction);
     props.waitlistTable.grantReadWriteData(this.gatewayFunction);
