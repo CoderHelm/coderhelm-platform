@@ -113,14 +113,15 @@ pub async fn select_repo(
     provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let system = "You are a repo-selection agent. Given a Jira ticket and a list of repositories, \
-                  pick the single best repository for implementation. \
+    let system = "You are a repo-selection agent. Given a Jira ticket and a list of repositories \
+                  with descriptions, pick the single best repository for implementation. \
                   Rules: \
-                  1. Match by primary purpose — feature/bug tickets go to the repo that OWNS the feature area. \
-                  2. Data/analytics/ETL repos are for data pipeline work, NOT for application features. \
-                  3. If the ticket mentions specific services, APIs, or integrations, pick the repo that implements them. \
-                  4. When unsure, prefer application/API repos over infrastructure/data repos. \
-                  Return ONLY the repo in owner/name format.";
+                  1. Read the repository descriptions carefully — match the ticket to the repo that OWNS that feature area. \
+                  2. Data/analytics/ETL/pipeline repos (e.g. airflow, dbt) are ONLY for data pipeline work, NOT for application features or API integrations. \
+                  3. If the ticket mentions specific services, APIs, SDKs, or integrations (e.g. Adyen, Exerp API, billing), pick the repo that implements or calls those services — typically an API/backend repo, not a data repo. \
+                  4. Terraform/infrastructure repos are ONLY for infra changes (IAM, networking, deployment config). \
+                  5. When unsure, prefer application/API repos over data or infrastructure repos. \
+                  Think step by step: (1) what is this ticket about, (2) which repo owns that area, (3) return ONLY the repo in owner/name format.";
 
     let repo_list = repos
         .iter()
@@ -149,7 +150,12 @@ Description:
 ## Available repositories
 {repo_list}
 
-Return ONLY the repository in `owner/name` format. No explanation."#,
+Think step by step:
+1. What is this ticket about? (one sentence)
+2. Which repo owns that feature area based on the descriptions above?
+3. Why is it NOT any of the other repos?
+
+Then on the LAST line, return ONLY the repository in `owner/name` format."#,
         ticket_id = msg.ticket_id,
         title = msg.title,
         body = msg.body,
@@ -171,13 +177,27 @@ Return ONLY the repository in `owner/name` format. No explanation."#,
         &NoOpExecutor,
         usage,
         llm::ConverseOptions {
-            max_turns: 40,
-            max_tokens: 16384,
+            max_turns: 1,
+            max_tokens: 512,
         },
     )
     .await?;
 
-    let selected = response.trim().trim_matches('`').trim().to_string();
+    // Extract repo from the last non-empty line (reasoning comes before it)
+    let last_line = response
+        .trim()
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .trim_matches('`')
+        .trim()
+        .to_string();
+
+    info!(response = %response.trim(), parsed = %last_line, "Triage repo selection reasoning");
+
+    let selected = last_line;
 
     // Validate the selection is in our list
     if repos.contains(&selected) {
