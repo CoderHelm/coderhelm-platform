@@ -1,6 +1,8 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{error, info, warn};
 
+use crate::agent::anthropic::{self, AnthropicClient};
+use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{OnboardMessage, TokenUsage};
 use crate::WorkerState;
@@ -16,6 +18,14 @@ pub async fn run(
         repos = msg.repos.len(),
         "Starting onboard"
     );
+
+    // Load team's Anthropic API key (required)
+    let provider = ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+    )
+    .await?;
 
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
@@ -43,6 +53,7 @@ pub async fn run(
             &msg.team_id,
             &global_instructions,
             &repo_instructions,
+            &provider,
             usage,
         )
         .await
@@ -106,12 +117,12 @@ pub async fn run(
             }
         }
 
-        // Use Bedrock to generate a proper org-level summary
+        // Use Anthropic to generate a proper org-level summary
         let global_content = if !repo_summaries.is_empty() {
-            match generate_global_context(state, &enabled_repos, &repo_summaries, usage).await {
+            match generate_global_context(state, &provider, &enabled_repos, &repo_summaries, usage).await {
                 Ok(content) => content,
                 Err(e) => {
-                    warn!(error = %e, "Failed to generate global context via Bedrock, using fallback");
+                    warn!(error = %e, "Failed to generate global context via Anthropic, using fallback");
                     fallback_global_context(&enabled_repos)
                 }
             }
@@ -149,6 +160,7 @@ async fn onboard_repo(
     team_id: &str,
     global_instructions: &str,
     repo_instructions: &str,
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let full_name = format!("{}/{}", repo.owner, repo.name);
@@ -203,8 +215,8 @@ async fn onboard_repo(
          1. Project overview (1-2 sentences). CRITICAL: Describe what THIS SPECIFIC REPO does — its unique role, what it deploys, what it serves. \
             Do NOT describe the overall product/organization. \
             BAD: 'Coderhelm is an AI coding platform...' \
-            GOOD: 'Next.js dashboard that provides billing, repo management, and infrastructure visualization for the Coderhelm platform.' \
-            GOOD: 'Rust Lambda backend (gateway + worker) that processes GitHub webhooks, runs AI agents, and manages billing via Stripe.'\n\
+            GOOD: 'Next.js dashboard that provides repo management and infrastructure visualization for the Coderhelm platform.' \
+            GOOD: 'Rust Lambda backend (gateway + worker) that processes GitHub webhooks and runs AI agents.'\n\
          2. Tech stack and key dependencies\n\
          3. Directory structure with brief descriptions\n\
          4. Build and test commands\n\
@@ -224,41 +236,16 @@ async fn onboard_repo(
         ));
     }
 
-    let messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
-        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(
-            repo_context,
-        ))
-        .build()
-        .map_err(|e| format!("Failed to build message: {e}"))?];
-
-    let response = crate::agent::llm::converse_with_retry(
-        &state.bedrock,
-        &state.config.light_model_id,
-        vec![
-            aws_sdk_bedrockruntime::types::SystemContentBlock::Text(system),
-            aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
-                aws_sdk_bedrockruntime::types::CachePointBlock::builder()
-                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
-                    .build()
-                    .unwrap(),
-            ),
-        ],
-        messages,
+    let client = AnthropicClient::new(provider.api_key().to_string());
+    let agents_md = anthropic::converse_simple(
+        &client,
+        provider.primary_model_id(),
+        &system,
+        &repo_context,
+        usage,
     )
     .await
-    .map_err(|e| format!("Bedrock converse failed: {e:#}"))?;
-
-    if let Some(u) = response.usage() {
-        usage.add(
-            u.input_tokens() as u64,
-            u.output_tokens() as u64,
-            u.cache_read_input_tokens().unwrap_or(0) as u64,
-            u.cache_write_input_tokens().unwrap_or(0) as u64,
-        );
-    }
-
-    let agents_md = extract_text_from_response(&response)?;
+    .map_err(|e| format!("Anthropic converse failed: {e:#}"))?;
 
     // Store AGENTS.md in DynamoDB (not committed to repo)
     let agents_sk = format!("AGENTS#REPO#{full_name}");
@@ -280,28 +267,11 @@ async fn onboard_repo(
     info!(repo = %full_name, "Stored AGENTS.md in DynamoDB");
 
     // Generate and store VOICE.md in DynamoDB
-    if let Err(e) = generate_voice_md(state, github, repo, team_id, usage).await {
+    if let Err(e) = generate_voice_md(state, github, repo, team_id, provider, usage).await {
         warn!(repo = %full_name, error = %e, "Failed to generate VOICE.md");
     }
 
     Ok(())
-}
-
-fn extract_text_from_response(
-    response: &aws_sdk_bedrockruntime::operation::converse::ConverseOutput,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let output = response.output().ok_or("No output from Bedrock")?;
-    match output {
-        aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg) => {
-            for block in msg.content() {
-                if let aws_sdk_bedrockruntime::types::ContentBlock::Text(text) = block {
-                    return Ok(text.clone());
-                }
-            }
-            Err("No text in response".into())
-        }
-        _ => Err("Unexpected output type".into()),
-    }
 }
 
 async fn generate_voice_md(
@@ -309,6 +279,7 @@ async fn generate_voice_md(
     github: &GitHubClient,
     repo: &crate::models::OnboardRepo,
     team_id: &str,
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let full_name = format!("{}/{}", repo.owner, repo.name);
@@ -368,38 +339,15 @@ async fn generate_voice_md(
         samples = samples.join("\n\n")
     );
 
-    let messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
-        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
-        .build()
-        .map_err(|e| format!("Failed to build message: {e}"))?];
-
-    let response = crate::agent::llm::converse_with_retry(
-        &state.bedrock,
-        &state.config.light_model_id,
-        vec![
-            aws_sdk_bedrockruntime::types::SystemContentBlock::Text(system.to_string()),
-            aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
-                aws_sdk_bedrockruntime::types::CachePointBlock::builder()
-                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
-                    .build()
-                    .unwrap(),
-            ),
-        ],
-        messages,
+    let client = AnthropicClient::new(provider.api_key().to_string());
+    let voice_md = anthropic::converse_simple(
+        &client,
+        provider.primary_model_id(),
+        system,
+        &prompt,
+        usage,
     )
     .await?;
-
-    if let Some(u) = response.usage() {
-        usage.add(
-            u.input_tokens() as u64,
-            u.output_tokens() as u64,
-            u.cache_read_input_tokens().unwrap_or(0) as u64,
-            u.cache_write_input_tokens().unwrap_or(0) as u64,
-        );
-    }
-
-    let voice_md = extract_text_from_response(&response)?;
 
     // Store VOICE.md in DynamoDB (not committed to repo)
     let voice_sk = format!("VOICE#REPO#{full_name}");
@@ -421,9 +369,10 @@ async fn generate_voice_md(
     Ok(())
 }
 
-/// Use Bedrock to generate a meaningful org-level context that explains how repos relate.
+/// Use Anthropic to generate a meaningful org-level context that explains how repos relate.
 async fn generate_global_context(
-    state: &WorkerState,
+    _state: &WorkerState,
+    provider: &ModelProvider,
     repo_names: &[String],
     repo_summaries: &[String],
     usage: &mut TokenUsage,
@@ -447,41 +396,18 @@ async fn generate_global_context(
         repo_summaries.join("\n\n")
     );
 
-    let messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
-        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
-        .build()
-        .map_err(|e| format!("Failed to build message: {e}"))?];
-
-    let response = crate::agent::llm::converse_with_retry(
-        &state.bedrock,
-        &state.config.light_model_id,
-        vec![
-            aws_sdk_bedrockruntime::types::SystemContentBlock::Text(system.to_string()),
-            aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
-                aws_sdk_bedrockruntime::types::CachePointBlock::builder()
-                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
-                    .build()
-                    .unwrap(),
-            ),
-        ],
-        messages,
+    let client = AnthropicClient::new(provider.api_key().to_string());
+    anthropic::converse_simple(
+        &client,
+        provider.primary_model_id(),
+        system,
+        &prompt,
+        usage,
     )
-    .await?;
-
-    if let Some(u) = response.usage() {
-        usage.add(
-            u.input_tokens() as u64,
-            u.output_tokens() as u64,
-            u.cache_read_input_tokens().unwrap_or(0) as u64,
-            u.cache_write_input_tokens().unwrap_or(0) as u64,
-        );
-    }
-
-    extract_text_from_response(&response)
+    .await
 }
 
-/// Fallback when Bedrock call fails — simple list without AI enrichment.
+/// Fallback when Anthropic call fails — simple list without AI enrichment.
 fn fallback_global_context(repo_names: &[String]) -> String {
     let entries: Vec<String> = repo_names
         .iter()

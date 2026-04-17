@@ -88,7 +88,6 @@ export class StreamingStack extends cdk.Stack {
         JIRA_CONFIG_TABLE_NAME: `${prefix}-jira-config`,
         AWS_INSIGHTS_TABLE_NAME: `${prefix}-aws-insights`,
         INFRA_TABLE_NAME: `${prefix}-infra`,
-        BILLING_TABLE_NAME: `${prefix}-billing-data`,
         BANNERS_TABLE_NAME: `${prefix}-banners`,
         WAITLIST_TABLE_NAME: `${prefix}-waitlist`,
         BUCKET_NAME: props.bucket.bucketName,

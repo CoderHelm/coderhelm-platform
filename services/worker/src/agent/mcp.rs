@@ -65,7 +65,7 @@ pub async fn load_tool_cache(
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Convert MCP tool schemas to Bedrock ToolDefinitions, prefixed with the server id
+/// Convert MCP tool schemas to ToolDefinitions, prefixed with the server id
 /// to avoid name collisions (e.g. `sentry__list_issues`).
 pub fn to_tool_definitions(server_id: &str, tools: &[McpToolSchema]) -> Vec<ToolDefinition> {
     tools

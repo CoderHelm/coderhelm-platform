@@ -204,15 +204,15 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         mcp_proxy_function_name: &state.config.mcp_proxy_function_name,
     };
 
-    let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
-        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
-        .build()?];
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![serde_json::json!({"type": "text", "text": prompt})],
+    )];
 
     // Route simple issues to primary (Sonnet), medium/complex to heavy (Opus)
     let model_id = match complexity {
-        "simple" => provider.primary_model_id(&state.config.light_model_id),
-        _ => provider.heavy_model_id(&state.config.model_id),
+        "simple" => provider.primary_model_id(),
+        _ => provider.heavy_model_id(),
     };
     let opts = llm::ConverseOptions {
         max_turns: match complexity {

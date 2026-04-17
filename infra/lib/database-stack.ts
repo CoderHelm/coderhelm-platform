@@ -526,6 +526,18 @@ export class DatabaseStack extends cdk.Stack {
     new cdk.CfnOutput(this, "InfraTableName", {
       value: this.infraTable.tableName,
     });
+    // Retained temporarily — CF export still referenced by previously deployed stacks.
+    // Safe to remove after one successful deploy cycle.
+    const billingTable = new dynamodb.TableV2(this, "BillingTable", {
+      tableName: `coderhelm-${props.stage}-billing-data`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    new cdk.CfnOutput(this, "BillingTableName", {
+      value: billingTable.tableName,
+    });
     new cdk.CfnOutput(this, "BannersTableName", {
       value: this.bannersTable.tableName,
     });

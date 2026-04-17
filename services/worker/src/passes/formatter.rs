@@ -26,7 +26,7 @@ pub async fn format_with_voice(
     );
 
     let user_msg = format!("Rewrite this text:\n\n{raw_text}");
-    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let model_id = provider.primary_model_id();
 
     match provider::converse_simple(state, provider, &model_id, &system, &user_msg, usage).await {
         Ok(text) => text,

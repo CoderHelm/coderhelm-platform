@@ -102,17 +102,16 @@ pub async fn run(
         mcp_proxy_function_name: &state.config.mcp_proxy_function_name,
     };
 
-    let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
-        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
-        .build()
-        .unwrap()];
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![serde_json::json!({"type": "text", "text": prompt})],
+    )];
 
-    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let model_id = provider.primary_model_id();
     let response = match provider::converse(
         state,
         provider,
-        &model_id,
+        model_id,
         &system,
         &mut messages,
         &tools,

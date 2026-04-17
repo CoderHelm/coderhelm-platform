@@ -39,11 +39,11 @@ impl FileCache {
     }
 }
 
-/// Strip internal model IDs, Bedrock details, and service names from error messages
+/// Strip internal model IDs and service names from error messages
 /// so they are safe to display to users.
 fn sanitize_error(msg: &str) -> String {
     let mut s = msg.to_string();
-    // Remove (model=us.anthropic.claude-...) patterns
+    // Remove (model=claude-...) patterns
     while let Some(start) = s.find("(model=") {
         if let Some(end) = s[start..].find(')') {
             s.replace_range(start..start + end + 1, "");
@@ -53,19 +53,18 @@ fn sanitize_error(msg: &str) -> String {
     }
     // Remove model IDs
     let patterns = [
-        "us.anthropic.claude-opus-4-6-v1",
-        "us.anthropic.claude-sonnet-4-6",
-        "us.anthropic.claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+        "claude-sonnet-4-20250514",
     ];
     for p in &patterns {
         s = s.replace(p, "");
     }
     s = s
         .replace(
-            "Bedrock converse error",
+            "Anthropic API error",
             "An error occurred during processing",
         )
-        .replace("service error", "service temporarily unavailable");
+        .replace("service temporarily unavailable", "service temporarily unavailable");
     // Collapse extra whitespace
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -258,13 +257,13 @@ async fn run_passes(
         );
     }
 
-    // Load team's model provider settings (Bedrock or Anthropic)
+    // Load team's Anthropic API key (required)
     let provider = crate::agent::provider::ModelProvider::load_for_team(
         &state.dynamo,
         &state.config.settings_table_name,
         &msg.team_id,
     )
-    .await;
+    .await?;
 
     // File read cache shared across passes to avoid redundant GitHub fetches
     let file_cache = FileCache::new();
@@ -1342,7 +1341,7 @@ async fn run_passes(
             if review_passed { "passed" } else { "issues found" },
             if security_result.passed { "passed" } else { "issues found" },
         );
-        mem.extract_from_conversation(&conversation_summary, provider.api_key())
+        mem.extract_from_conversation(&conversation_summary, Some(provider.api_key()))
             .await;
 
         if let Err(e) = mem.close_and_upload(state).await {

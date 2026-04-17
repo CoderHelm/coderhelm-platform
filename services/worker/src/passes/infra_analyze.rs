@@ -1,6 +1,8 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{info, warn};
 
+use crate::agent::anthropic::{self, AnthropicClient};
+use crate::agent::provider::ModelProvider;
 use crate::models::{InfraAnalyzeMessage, TokenUsage};
 use crate::WorkerState;
 
@@ -316,9 +318,16 @@ pub async fn run(
         return Ok(());
     }
 
-    // 3. Call Bedrock to analyze and generate diagram + findings
+    // 3. Call Anthropic to analyze and generate diagram + findings
+    let provider = ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+    )
+    .await?;
+
     let code_context = format_code_context(&infra_code);
-    let response = call_bedrock(state, &code_context, usage).await?;
+    let response = call_anthropic(&provider, &code_context, usage).await?;
 
     // 4. Parse response
     let (diagram, findings_json) = parse_response(&response);
@@ -328,7 +337,7 @@ pub async fn run(
         Some(d) if validate_diagram(d).is_err() => {
             let errs = validate_diagram(d).unwrap_err();
             warn!(team_id = %msg.team_id, errors = %errs, "Diagram validation failed, retrying");
-            let retry = call_bedrock_retry(state, &code_context, d, &errs, usage).await?;
+            let retry = call_anthropic_retry(&provider, &code_context, d, &errs, usage).await?;
             let (retry_diagram, retry_findings) = parse_response(&retry);
             let rd = retry_diagram.unwrap_or_default();
             let rf =
@@ -598,8 +607,8 @@ fn format_code_context(infra_code: &[(String, String)]) -> String {
         .join("\n\n")
 }
 
-async fn call_bedrock(
-    state: &WorkerState,
+async fn call_anthropic(
+    provider: &ModelProvider,
     code_context: &str,
     usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -607,133 +616,43 @@ async fn call_bedrock(
         "Analyze this infrastructure code and generate the diagram and findings:\n\n{code_context}"
     );
 
-    let messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
-        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
-        .build()
-        .map_err(|e| format!("Failed to build message: {e}"))?];
-
-    let response = crate::agent::llm::converse_with_retry(
-        &state.bedrock,
-        &state.config.light_model_id,
-        vec![
-            aws_sdk_bedrockruntime::types::SystemContentBlock::Text(SYSTEM.to_string()),
-            aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
-                aws_sdk_bedrockruntime::types::CachePointBlock::builder()
-                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
-                    .build()
-                    .unwrap(),
-            ),
-        ],
-        messages,
+    let client = AnthropicClient::new(provider.api_key().to_string());
+    anthropic::converse_simple(
+        &client,
+        provider.primary_model_id(),
+        SYSTEM,
+        &prompt,
+        usage,
     )
-    .await?;
-
-    if let Some(u) = response.usage() {
-        usage.add(
-            u.input_tokens() as u64,
-            u.output_tokens() as u64,
-            u.cache_read_input_tokens().unwrap_or(0) as u64,
-            u.cache_write_input_tokens().unwrap_or(0) as u64,
-        );
-    }
-
-    let text = match response.output() {
-        Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg
-            .content()
-            .iter()
-            .find_map(|block| {
-                if let aws_sdk_bedrockruntime::types::ContentBlock::Text(t) = block {
-                    Some(t.clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default(),
-        _ => String::new(),
-    };
-
-    Ok(text)
+    .await
 }
 
-/// Retry Bedrock with the original diagram and validation errors as feedback.
-async fn call_bedrock_retry(
-    state: &WorkerState,
+/// Retry Anthropic with the original diagram and validation errors as feedback.
+async fn call_anthropic_retry(
+    provider: &ModelProvider,
     code_context: &str,
     bad_diagram: &str,
     errors: &str,
     usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let prompt = format!(
-        "Analyze this infrastructure code and generate the diagram and findings:\n\n{code_context}"
-    );
-    let fix_prompt = format!(
-        "Your previous diagram had syntax errors:\n{errors}\n\nHere was the broken diagram:\n```mermaid\n{bad_diagram}\n```\n\nFix ALL errors and regenerate. Rules: groups need (icon) before [label], no slashes in labels, NO -->|text| or <-- or subgraph. MAX 8-10 services in 3 groups (edge, compute, data) flowing left to right. Use junctions for 3+ edges from one port."
+        "Analyze this infrastructure code and generate the diagram and findings:\n\n{code_context}\n\n\
+         Your previous diagram had syntax errors:\n{errors}\n\n\
+         Here was the broken diagram:\n```mermaid\n{bad_diagram}\n```\n\n\
+         Fix ALL errors and regenerate. Rules: groups need (icon) before [label], no slashes in labels, \
+         NO -->|text| or <-- or subgraph. MAX 8-10 services in 3 groups (edge, compute, data) flowing left to right. \
+         Use junctions for 3+ edges from one port."
     );
 
-    let messages = vec![
-        aws_sdk_bedrockruntime::types::Message::builder()
-            .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
-            .build()
-            .map_err(|e| format!("Failed to build message: {e}"))?,
-        aws_sdk_bedrockruntime::types::Message::builder()
-            .role(aws_sdk_bedrockruntime::types::ConversationRole::Assistant)
-            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(format!(
-                "```mermaid\n{bad_diagram}\n```"
-            )))
-            .build()
-            .map_err(|e| format!("Failed to build message: {e}"))?,
-        aws_sdk_bedrockruntime::types::Message::builder()
-            .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(
-                fix_prompt,
-            ))
-            .build()
-            .map_err(|e| format!("Failed to build message: {e}"))?,
-    ];
-
-    let response = crate::agent::llm::converse_with_retry(
-        &state.bedrock,
-        &state.config.light_model_id,
-        vec![
-            aws_sdk_bedrockruntime::types::SystemContentBlock::Text(SYSTEM.to_string()),
-            aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
-                aws_sdk_bedrockruntime::types::CachePointBlock::builder()
-                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
-                    .build()
-                    .unwrap(),
-            ),
-        ],
-        messages,
+    let client = AnthropicClient::new(provider.api_key().to_string());
+    anthropic::converse_simple(
+        &client,
+        provider.primary_model_id(),
+        SYSTEM,
+        &prompt,
+        usage,
     )
-    .await?;
-
-    if let Some(u) = response.usage() {
-        usage.add(
-            u.input_tokens() as u64,
-            u.output_tokens() as u64,
-            u.cache_read_input_tokens().unwrap_or(0) as u64,
-            u.cache_write_input_tokens().unwrap_or(0) as u64,
-        );
-    }
-
-    let text = match response.output() {
-        Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg
-            .content()
-            .iter()
-            .find_map(|block| {
-                if let aws_sdk_bedrockruntime::types::ContentBlock::Text(t) = block {
-                    Some(t.clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default(),
-        _ => String::new(),
-    };
-
-    Ok(text)
+    .await
 }
 
 fn parse_response(response: &str) -> (Option<String>, Option<String>) {

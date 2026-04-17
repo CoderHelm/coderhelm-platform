@@ -78,12 +78,12 @@ Return ONLY the markdown body text."#,
         diff_summary = diff_summary,
     );
 
-    let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
-        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
-        .build()?];
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![serde_json::json!({"type": "text", "text": prompt})],
+    )];
 
-    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let model_id = provider.primary_model_id();
     let body_text = provider::converse(
         state,
         provider,
@@ -263,12 +263,12 @@ pub async fn resolve_conflicts(
             "Merge these two versions of `{path}`.\n\n## main version\n```\n{main_capped}\n```\n\n## branch version (our changes — prefer these)\n```\n{branch_capped}\n```\n\nReturn the merged file content. Prefer the branch version when changes conflict directly.",
         );
 
-        let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
-            .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-            .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
-            .build()?];
+        let mut messages = vec![(
+        "user".to_string(),
+        vec![serde_json::json!({"type": "text", "text": prompt})],
+    )];
 
-        let model_id = provider.primary_model_id(&state.config.light_model_id);
+        let model_id = provider.primary_model_id();
         let merged_content = provider::converse(
             state,
             provider,

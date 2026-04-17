@@ -20,7 +20,6 @@ pub struct AppState {
     pub sqs: aws_sdk_sqs::Client,
     pub ses: aws_sdk_sesv2::Client,
     pub s3: aws_sdk_s3::Client,
-    pub bedrock: aws_sdk_bedrockruntime::Client,
     pub cognito: aws_sdk_cognitoidentityprovider::Client,
     pub lambda: aws_sdk_lambda::Client,
     pub http: reqwest::Client,
@@ -43,7 +42,6 @@ async fn main() -> Result<(), Error> {
     let sqs = aws_sdk_sqs::Client::new(&aws_config);
     let ses = aws_sdk_sesv2::Client::new(&aws_config);
     let s3 = aws_sdk_s3::Client::new(&aws_config);
-    let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
     let cognito = aws_sdk_cognitoidentityprovider::Client::new(&aws_config);
     let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
@@ -76,7 +74,6 @@ async fn main() -> Result<(), Error> {
         sqs,
         ses,
         s3,
-        bedrock,
         cognito,
         lambda: lambda_client,
         http: reqwest::Client::new(),

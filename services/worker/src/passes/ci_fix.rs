@@ -16,13 +16,13 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut usage = TokenUsage::default();
 
-    // Load team's model provider settings
+    // Load team's Anthropic API key (required)
     let provider = ModelProvider::load_for_team(
         &state.dynamo,
         &state.config.settings_table_name,
         &msg.team_id,
     )
-    .await;
+    .await?;
 
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
@@ -87,12 +87,12 @@ Rules:
         branch: &msg.branch,
     };
 
-    let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
-        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
-        .build()?];
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![serde_json::json!({"type": "text", "text": prompt})],
+    )];
 
-    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let model_id = provider.primary_model_id();
     let response = provider::converse(
         state,
         &provider,

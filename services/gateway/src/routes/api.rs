@@ -3073,7 +3073,7 @@ pub async fn get_model_provider(
 
     let Some(item) = result.item() else {
         return Ok(Json(json!({
-            "provider": "bedrock",
+            "provider": "anthropic",
             "api_key_masked": null,
             "primary_model": null,
             "heavy_model": null,
@@ -3084,7 +3084,7 @@ pub async fn get_model_provider(
         .get("provider")
         .and_then(|v| v.as_s().ok())
         .cloned()
-        .unwrap_or_else(|| "bedrock".to_string());
+        .unwrap_or_else(|| "anthropic".to_string());
 
     let api_key_masked = item.get("api_key").and_then(|v| v.as_s().ok()).map(|key| {
         if key.len() > 4 {
@@ -3109,35 +3109,13 @@ pub async fn get_model_provider(
     })))
 }
 
-/// PUT /api/settings/model-provider — configure model provider.
+/// PUT /api/settings/model-provider — configure Anthropic API key and models.
 pub async fn update_model_provider(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    let provider = body["provider"].as_str().unwrap_or("bedrock");
-
-    if provider != "anthropic" && provider != "bedrock" {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Reverting to bedrock just deletes the custom provider row.
-    if provider == "bedrock" {
-        state
-            .dynamo
-            .delete_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", attr_s(&claims.team_id))
-            .key("sk", attr_s("SETTINGS#MODEL_PROVIDER"))
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to delete model provider settings: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-        return Ok(Json(json!({ "status": "ok", "provider": "bedrock" })));
-    }
+    let provider = "anthropic";
 
     let api_key_from_body = body["api_key"].as_str().map(|s| s.to_string());
     let primary_model = body["primary_model"]
@@ -3221,7 +3199,7 @@ pub async fn update_model_provider(
     Ok(Json(json!({ "status": "ok", "provider": "anthropic" })))
 }
 
-/// DELETE /api/settings/model-provider — revert to default Bedrock provider.
+/// DELETE /api/settings/model-provider — remove API key configuration.
 pub async fn delete_model_provider(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,

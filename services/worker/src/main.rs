@@ -14,7 +14,7 @@ pub struct WorkerState {
     pub dynamo: aws_sdk_dynamodb::Client,
     pub s3: aws_sdk_s3::Client,
     pub ses: aws_sdk_sesv2::Client,
-    pub bedrock: aws_sdk_bedrockruntime::Client,
+    pub bedrock: aws_sdk_bedrockruntime::Client, // Used for Titan embeddings only (not LLM)
     pub lambda: aws_sdk_lambda::Client,
     pub http: reqwest::Client,
     pub config: models::Config,

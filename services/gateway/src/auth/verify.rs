@@ -34,54 +34,6 @@ pub fn verify_jira_signature(secret: &str, body: &[u8], signature_header: &str) 
     verify_github_signature(secret, body, signature_header)
 }
 
-/// Verify Stripe webhook signature.
-/// Uses Stripe's `t=timestamp,v1=signature` format in Stripe-Signature header.
-#[allow(dead_code)]
-pub fn verify_stripe_signature(
-    secret: &str,
-    body: &[u8],
-    signature_header: &str,
-    tolerance_secs: u64,
-) -> bool {
-    let mut timestamp: Option<&str> = None;
-    let mut signatures: Vec<&str> = Vec::new();
-
-    for part in signature_header.split(',') {
-        if let Some(t) = part.strip_prefix("t=") {
-            timestamp = Some(t);
-        } else if let Some(v) = part.strip_prefix("v1=") {
-            signatures.push(v);
-        }
-    }
-
-    let Some(ts_str) = timestamp else {
-        return false;
-    };
-    let Ok(ts) = ts_str.parse::<u64>() else {
-        return false;
-    };
-
-    // Check timestamp tolerance
-    let now = chrono::Utc::now().timestamp() as u64;
-    if now.abs_diff(ts) > tolerance_secs {
-        return false;
-    }
-
-    // Compute expected signature: HMAC-SHA256(secret, "timestamp.body")
-    let signed_payload = format!("{ts_str}.");
-    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
-        return false;
-    };
-    mac.update(signed_payload.as_bytes());
-    mac.update(body);
-    let computed = hex::encode(mac.finalize().into_bytes());
-
-    // Check if any v1 signature matches
-    signatures
-        .iter()
-        .any(|sig| computed.as_bytes().ct_eq(sig.as_bytes()).into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

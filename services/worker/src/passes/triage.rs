@@ -55,16 +55,16 @@ Rules:
         body = msg.body,
     );
 
-    let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
-        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
-        .build()?];
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![serde_json::json!({"type": "text", "text": prompt})],
+    )];
 
-    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let model_id = provider.primary_model_id();
     let response = provider::converse(
         state,
         provider,
-        &model_id,
+        model_id,
         system,
         &mut messages,
         &[],
@@ -150,16 +150,16 @@ Return ONLY the repository in `owner/name` format. No explanation."#,
         body = msg.body,
     );
 
-    let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
-        .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
-        .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
-        .build()?];
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![serde_json::json!({"type": "text", "text": prompt})],
+    )];
 
-    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let model_id = provider.primary_model_id();
     let response = provider::converse(
         state,
         provider,
-        &model_id,
+        model_id,
         system,
         &mut messages,
         &[],
