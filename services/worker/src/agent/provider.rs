@@ -58,12 +58,12 @@ impl ModelProvider {
             .get("primary_model")
             .and_then(|v| v.as_s().ok())
             .cloned()
-            .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
         let heavy_model = item
             .get("heavy_model")
             .and_then(|v| v.as_s().ok())
             .cloned()
-            .unwrap_or_else(|| "claude-opus-4-20250514".to_string());
+            .unwrap_or_else(|| "claude-opus-4-7".to_string());
 
         info!(team_id, "Loaded Anthropic provider");
         Ok(Self {

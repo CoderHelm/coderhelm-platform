@@ -76,7 +76,7 @@ impl Config {
             ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")
                 .unwrap_or_else(|_| "coderhelm-prod".to_string()),
             model_id: std::env::var("MODEL_ID")
-                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
+                .unwrap_or_else(|_| "claude-sonnet-4-6".to_string()),
             cognito_user_pool_id: std::env::var("COGNITO_USER_POOL_ID")
                 .expect("COGNITO_USER_POOL_ID required"),
             cognito_client_id: std::env::var("COGNITO_CLIENT_ID")

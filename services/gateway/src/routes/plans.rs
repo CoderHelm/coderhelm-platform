@@ -1948,6 +1948,69 @@ fn strip_plan_json(content: &str) -> String {
     result
 }
 
+/// Enable MCP tools only when the latest user message explicitly asks for external/tool context.
+fn should_enable_plan_mcp_tools(messages_input: &[Value]) -> bool {
+    let last_user = messages_input
+        .iter()
+        .rev()
+        .find(|m| m["role"].as_str() == Some("user"))
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if last_user.is_empty() {
+        return false;
+    }
+
+    // Multi-word triggers matched via simple substring (low false-positive risk)
+    let phrase_triggers = ["from docs", "search docs"];
+    if phrase_triggers.iter().any(|t| last_user.contains(t)) {
+        return true;
+    }
+
+    // Single-word triggers matched with word boundaries to avoid false positives
+    // (e.g. "notion" as a common English word)
+    let word_triggers = [
+        "mcp",
+        "notion",
+        "linear",
+        "sentry",
+        "figma",
+        "vercel",
+        "posthog",
+        "gitlab",
+        "neon",
+        "turso",
+        "snyk",
+        "launchdarkly",
+        "mongodb",
+        "grafana",
+        "redis",
+        "upstash",
+        "sanity",
+    ];
+
+    word_triggers.iter().any(|t| {
+        // Find all occurrences and check word boundaries
+        let bytes = last_user.as_bytes();
+        let tbytes = t.as_bytes();
+        let mut start = 0;
+        while let Some(pos) = last_user[start..].find(t) {
+            let abs = start + pos;
+            let before_ok =
+                abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+            let after_pos = abs + tbytes.len();
+            let after_ok =
+                after_pos >= bytes.len() || !bytes[after_pos].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs + 1;
+        }
+        false
+    })
+}
+
 /// Shared context for plan chat — loaded once, used by both streaming and non-streaming.
 struct PlanChatContext {
     system_prompt: String,
@@ -1962,6 +2025,8 @@ async fn load_plan_chat_context(
     team_id: &str,
     messages_input: &[Value],
 ) -> Result<PlanChatContext, StatusCode> {
+    let enable_mcp_tools = should_enable_plan_mcp_tools(messages_input);
+
     // Load org context, repo list, log analyzer flag, enabled plugins, and templates in parallel
     let (
         org_context_result,
@@ -2053,7 +2118,7 @@ async fn load_plan_chat_context(
     // Load MCP tool definitions from S3 cache
     let mut mcp_tools: Vec<McpToolDef> = Vec::new();
     let mcp_proxy_fn = &state.config.mcp_proxy_function_name;
-    if !mcp_proxy_fn.is_empty() {
+    if enable_mcp_tools && !mcp_proxy_fn.is_empty() {
         let cache_futures: Vec<_> = enabled_plugins
             .iter()
             .filter(|(_, has_creds, _)| *has_creds)
@@ -2116,19 +2181,9 @@ async fn load_plan_chat_context(
             .collect();
         system_prompt.push_str(&format!(
             "\n\nYou have tool-call access to the following MCP servers right now. \
-             You can invoke their tools directly during this conversation to look up \
-             information, search documents, read pages, or query external services.\n\
-             \n\
-             IMPORTANT — Proactive tool use:\n\
-             - BEFORE generating a plan, search connected tools for relevant context. \
-             If Notion is connected, search for docs related to the user's request \
-             (specs, config values, API keys references, design docs, requirements).\n\
-             - If the user mentions anything that might be documented (IDs, credentials, \
-             config, specs, designs, tickets), search the connected tools first.\n\
-             - Don't ask the user for information that might already exist in their \
-             connected tools — look it up yourself.\n\
-             - When you find relevant context, incorporate it into the plan tasks \
-             (e.g. specific IDs, endpoints, file paths, design references).\n\
+             Use tools ONLY when the user explicitly asks to use MCP/tools or requests \
+             information from an external connected system.\n\
+             Do NOT call tools by default for normal planning requests.\n\
              \n\
              Connected servers:\n{}",
             plugin_lines.join("\n")
@@ -2228,7 +2283,7 @@ pub async fn plan_chat(
         .and_then(|item| item.get("primary_model"))
         .and_then(|v| v.as_s().ok())
         .cloned()
-        .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
     // Agentic loop — up to 5 tool-use turns for plan chat (gateway has 30s timeout)
     let max_turns = 5;
@@ -2359,10 +2414,11 @@ pub async fn plan_chat(
             if let Some(sid) = server_id {
                 mcp_servers_used.insert(sid);
             }
+            let model_result = compact_tool_result_for_model(&result);
             tool_results.push(json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
-                "content": serde_json::to_string(&result).unwrap_or_default()
+                "content": model_result
             }));
         }
 
@@ -2659,7 +2715,7 @@ async fn run_anthropic_stream(
             } else {
                 json!(format!("Unknown tool: {tu_name}"))
             };
-            let result_str = serde_json::to_string(&result).unwrap_or_default();
+            let result_str = compact_tool_result_for_model(&result);
             let summary = summarize_tool_result(&result);
             let _ = tx
                 .send(sse_event(
@@ -2767,7 +2823,7 @@ pub async fn plan_chat_stream(
         .and_then(|item| item.get("primary_model"))
         .and_then(|v| v.as_s().ok())
         .cloned()
-        .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
     // Move everything into the streaming task
     let team_id = claims.team_id.clone();
@@ -2818,11 +2874,22 @@ pub async fn plan_chat_stream(
 /// Produce a short summary of a tool result for the UI.
 fn summarize_tool_result(result: &Value) -> String {
     let s = result.to_string();
-    if s.len() <= 80 {
+    if s.len() <= 120 {
         s
     } else {
-        format!("{}…", &s[..77])
+        format!("{}…", s.chars().take(117).collect::<String>())
     }
+}
+
+/// Keep tool results compact before feeding back into the model to avoid runaway context growth.
+fn compact_tool_result_for_model(result: &Value) -> String {
+    let s = result.to_string();
+    let max_chars = 3000usize;
+    if s.chars().count() <= max_chars {
+        return s;
+    }
+    let truncated: String = s.chars().take(max_chars).collect();
+    format!("{truncated}… [truncated]")
 }
 async fn track_chat_tokens(
     state: &AppState,
