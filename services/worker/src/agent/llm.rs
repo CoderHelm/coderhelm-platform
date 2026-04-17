@@ -51,7 +51,7 @@ pub async fn converse_with_retry(
     unreachable!()
 }
 
-fn json_to_document(val: &Value) -> Document {
+pub fn json_to_document(val: &Value) -> Document {
     match val {
         Value::Null => Document::Null,
         Value::Bool(b) => Document::Bool(*b),
@@ -68,7 +68,7 @@ fn json_to_document(val: &Value) -> Document {
     }
 }
 
-fn document_to_json(doc: &Document) -> Value {
+pub fn document_to_json(doc: &Document) -> Value {
     match doc {
         Document::Null => Value::Null,
         Document::Bool(b) => Value::Bool(*b),

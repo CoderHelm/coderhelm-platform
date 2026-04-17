@@ -2,6 +2,8 @@ use tracing::info;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::agent::mcp;
+use crate::agent::provider;
+use crate::agent::provider::ModelProvider;
 use crate::models::{TicketMessage, TokenUsage};
 use crate::WorkerState;
 
@@ -15,6 +17,7 @@ pub async fn run(
     state: &WorkerState,
     msg: &TicketMessage,
     mcp_plugins: &[mcp::McpPlugin],
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> String {
     // Load MCP tool schemas
@@ -105,14 +108,20 @@ pub async fn run(
         .build()
         .unwrap()];
 
-    let response = match llm::converse(
+    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let response = match provider::converse(
         state,
-        &state.config.light_model_id,
+        provider,
+        &model_id,
         &system,
         &mut messages,
         &tools,
         &executor,
         usage,
+        llm::ConverseOptions {
+            max_turns: 40,
+            max_tokens: 16384,
+        },
     )
     .await
     {

@@ -226,6 +226,14 @@ async fn run_passes(
         );
     }
 
+    // Load team's model provider settings (Bedrock or Anthropic)
+    let provider = crate::agent::provider::ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+    )
+    .await;
+
     // Initialize GitHub client for this team
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
@@ -284,7 +292,7 @@ async fn run_passes(
                 info!(run_id, repo = %repos[0], "Auto-selected single repo");
             } else {
                 // Multiple repos — ask triage to pick
-                let selected = triage::select_repo(state, msg, &repos, usage).await?;
+                let selected = triage::select_repo(state, msg, &repos, &provider, usage).await?;
                 let (owner, name) = selected.split_once('/').unwrap_or(("", ""));
                 msg.repo_owner = owner.to_string();
                 msg.repo_name = name.to_string();
@@ -357,7 +365,7 @@ async fn run_passes(
     update_pass(state, &msg.team_id, run_id, "triage").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let triage_result = triage::run(state, msg, &github, usage).await?;
+    let triage_result = triage::run(state, msg, &github, &provider, usage).await?;
     write_pass_trace(
         state,
         &msg.team_id,
@@ -392,7 +400,7 @@ async fn run_passes(
     let mut triage_result = triage_result;
     let mut used_mcp_ids: Vec<String> = Vec::new();
     if !mcp_plugins.is_empty() && !state.config.mcp_proxy_function_name.is_empty() {
-        let external_context = resolve::run(state, msg, &mcp_plugins, usage).await;
+        let external_context = resolve::run(state, msg, &mcp_plugins, &provider, usage).await;
         if !external_context.is_empty() {
             triage_result.summary.push_str(&external_context);
             used_mcp_ids = mcp_server_ids.clone();
@@ -418,6 +426,7 @@ async fn run_passes(
         &github,
         &triage_result,
         &repo_instructions,
+        &provider,
         usage,
     )
     .await?;
@@ -457,10 +466,12 @@ async fn run_passes(
         let raw_github = format!(
             "✅ **No changes needed**\n\n{reason}\n\nThe codebase already satisfies what this issue asks for."
         );
-        let github_comment = formatter::format_with_voice(state, &voice, &raw_github, usage).await;
+        let github_comment =
+            formatter::format_with_voice(state, &voice, &raw_github, &provider, usage).await;
         let raw_jira =
             format!("{reason}\n\nThe codebase already satisfies what this issue asks for.");
-        let jira_comment = formatter::format_with_voice(state, &voice, &raw_jira, usage).await;
+        let jira_comment =
+            formatter::format_with_voice(state, &voice, &raw_jira, &provider, usage).await;
 
         if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
             let _ = github
@@ -556,11 +567,13 @@ async fn run_passes(
         let raw_github = format!(
             "❓ **Clarification needed**\n\n{detail}\n\nPlease update the issue with the missing details and re-trigger the run."
         );
-        let github_comment = formatter::format_with_voice(state, &voice, &raw_github, usage).await;
+        let github_comment =
+            formatter::format_with_voice(state, &voice, &raw_github, &provider, usage).await;
         let raw_jira = format!(
             "{detail}\n\nPlease update the issue with the missing details and comment to re-trigger."
         );
-        let jira_comment = formatter::format_with_voice(state, &voice, &raw_jira, usage).await;
+        let jira_comment =
+            formatter::format_with_voice(state, &voice, &raw_jira, &provider, usage).await;
 
         if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
             let _ = github
@@ -777,6 +790,7 @@ async fn run_passes(
             &repo_instructions,
             None,
             &triage_result.complexity,
+            &provider,
             usage,
         )
         .await?;
@@ -827,7 +841,8 @@ async fn run_passes(
                  - Any relevant code snippets or error messages?\n\n\
                  Please add more context and I'll try again.";
             let clarification =
-                formatter::format_with_voice(state, &voice, raw_clarification, usage).await;
+                formatter::format_with_voice(state, &voice, raw_clarification, &provider, usage)
+                    .await;
             if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
                 if let Err(e) = github
                     .create_issue_comment(
@@ -942,6 +957,7 @@ async fn run_passes(
                         "CI tests failed. Fix the failures:\n\n{test_feedback}"
                     )),
                     &triage_result.complexity,
+                    &provider,
                     usage,
                 )
                 .await?;
@@ -966,6 +982,7 @@ async fn run_passes(
             &branch_name,
             &rules,
             &repo_instructions,
+            &provider,
             usage,
         )
         .await
@@ -1047,6 +1064,7 @@ async fn run_passes(
             &repo_instructions,
             Some(&review_result.summary),
             &triage_result.complexity,
+            &provider,
             usage,
         )
         .await?;
@@ -1064,6 +1082,7 @@ async fn run_passes(
         &plan_result,
         &branch_name,
         &repo_instructions,
+        &provider,
         usage,
     )
     .await
@@ -1133,6 +1152,7 @@ async fn run_passes(
                 security_result.summary
             )),
             &triage_result.complexity,
+            &provider,
             usage,
         )
         .await?;
@@ -1147,6 +1167,7 @@ async fn run_passes(
             &plan_result,
             &branch_name,
             &repo_instructions,
+            &provider,
             usage,
         )
         .await
@@ -1181,7 +1202,7 @@ async fn run_passes(
 
     // --- Resolve conflicts with main ---
     check_cancelled(state, &msg.team_id, run_id).await?;
-    match pr::resolve_conflicts(state, msg, &github, &branch_name, usage).await {
+    match pr::resolve_conflicts(state, msg, &github, &branch_name, &provider, usage).await {
         Ok(true) => info!(run_id, "Resolved merge conflicts with main"),
         Ok(false) => {}
         Err(e) => warn!(run_id, error = %e, "Conflict resolution failed, proceeding with PR"),
@@ -1208,6 +1229,7 @@ async fn run_passes(
         &branch_name,
         &plan_result,
         &voice,
+        &provider,
         usage,
     )
     .await?;

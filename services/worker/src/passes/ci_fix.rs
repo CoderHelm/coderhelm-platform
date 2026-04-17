@@ -2,6 +2,8 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
+use crate::agent::provider;
+use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{CiFixMessage, TokenUsage};
 use crate::WorkerState;
@@ -13,6 +15,14 @@ pub async fn run(
     msg: CiFixMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut usage = TokenUsage::default();
+
+    // Load team's model provider settings
+    let provider = ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+    )
+    .await;
 
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
@@ -82,14 +92,20 @@ Rules:
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let response = llm::converse(
+    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let response = provider::converse(
         state,
-        &state.config.light_model_id,
+        &provider,
+        &model_id,
         &system,
         &mut messages,
         &tools,
         &executor,
         &mut usage,
+        llm::ConverseOptions {
+            max_turns: 40,
+            max_tokens: 16384,
+        },
     )
     .await?;
 

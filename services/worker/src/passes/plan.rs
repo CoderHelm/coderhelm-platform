@@ -3,6 +3,8 @@ use tracing::info;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::agent::mcp;
+use crate::agent::provider;
+use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
 use crate::WorkerState;
@@ -21,6 +23,7 @@ pub async fn run(
     github: &GitHubClient,
     triage: &super::triage::TriageResult,
     repo_instructions: &str,
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<PlanResult, Box<dyn std::error::Error + Send + Sync>> {
     // Fetch all enabled repos for this team so the planner can explore cross-repo
@@ -241,9 +244,11 @@ After researching, output the four files using this exact format:
         max_tokens: 8192,
     };
 
-    let response = llm::converse_with_opts(
+    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let response = provider::converse(
         state,
-        &state.config.light_model_id,
+        provider,
+        &model_id,
         &full_system,
         &mut messages,
         &tools,

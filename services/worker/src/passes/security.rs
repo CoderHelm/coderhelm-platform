@@ -2,6 +2,8 @@ use serde_json::json;
 use tracing::info;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
+use crate::agent::provider;
+use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
 use crate::passes::plan::PlanResult;
@@ -19,6 +21,7 @@ pub async fn run(
     plan: &PlanResult,
     branch: &str,
     repo_instructions: &str,
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<SecurityResult, Box<dyn std::error::Error + Send + Sync>> {
     let instructions_block = super::format_instructions_block(repo_instructions);
@@ -64,9 +67,11 @@ Output format:
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let final_text = llm::converse_with_opts(
+    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let final_text = provider::converse(
         state,
-        &state.config.light_model_id,
+        provider,
+        &model_id,
         &system,
         &mut messages,
         &tools,

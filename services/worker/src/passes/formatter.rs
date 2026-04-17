@@ -1,7 +1,7 @@
-use aws_sdk_bedrockruntime::types::{ContentBlock, ConversationRole, Message, SystemContentBlock};
 use tracing::warn;
 
-use crate::agent::llm;
+use crate::agent::provider;
+use crate::agent::provider::ModelProvider;
 use crate::models::TokenUsage;
 use crate::WorkerState;
 
@@ -11,6 +11,7 @@ pub async fn format_with_voice(
     state: &WorkerState,
     voice: &str,
     raw_text: &str,
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> String {
     if voice.is_empty() || raw_text.is_empty() {
@@ -24,36 +25,11 @@ pub async fn format_with_voice(
          Team voice instructions:\n{voice}"
     );
 
-    let messages = vec![Message::builder()
-        .role(ConversationRole::User)
-        .content(ContentBlock::Text(format!(
-            "Rewrite this text:\n\n{raw_text}"
-        )))
-        .build()
-        .unwrap()];
+    let user_msg = format!("Rewrite this text:\n\n{raw_text}");
+    let model_id = provider.primary_model_id(&state.config.light_model_id);
 
-    match llm::converse_with_retry(
-        &state.bedrock,
-        &state.config.light_model_id,
-        vec![SystemContentBlock::Text(system)],
-        messages,
-    )
-    .await
-    {
-        Ok(response) => {
-            // Track usage
-            if let Some(u) = response.usage() {
-                usage.add(u.input_tokens() as u64, u.output_tokens() as u64, 0, 0);
-            }
-            // Extract text from response
-            response
-                .output()
-                .and_then(|o| o.as_message().ok())
-                .and_then(|m| m.content().first())
-                .and_then(|c| c.as_text().ok())
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| raw_text.to_string())
-        }
+    match provider::converse_simple(state, provider, &model_id, &system, &user_msg, usage).await {
+        Ok(text) => text,
         Err(e) => {
             warn!(error = %e, "Formatter failed, using raw text");
             raw_text.to_string()

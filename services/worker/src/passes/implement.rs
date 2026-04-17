@@ -4,6 +4,8 @@ use tracing::warn;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::agent::mcp;
+use crate::agent::provider;
+use crate::agent::provider::ModelProvider;
 use crate::clients::github::{FileOp, GitHubClient};
 use crate::models::{TicketMessage, TokenUsage};
 use crate::passes::plan::PlanResult;
@@ -24,6 +26,7 @@ pub async fn run(
     repo_instructions: &str,
     review_feedback: Option<&str>,
     complexity: &str,
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
@@ -203,10 +206,10 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    // Route simple issues to Sonnet, medium/complex to Opus
+    // Route simple issues to primary (Sonnet), medium/complex to heavy (Opus)
     let model_id = match complexity {
-        "simple" => &state.config.light_model_id,
-        _ => &state.config.model_id,
+        "simple" => provider.primary_model_id(&state.config.light_model_id),
+        _ => provider.heavy_model_id(&state.config.model_id),
     };
     let opts = llm::ConverseOptions {
         max_turns: match complexity {
@@ -217,9 +220,10 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         max_tokens: 16384,
     };
 
-    llm::converse_with_opts(
+    provider::converse(
         state,
-        model_id,
+        provider,
+        &model_id,
         &full_system,
         &mut messages,
         &tools,

@@ -3046,6 +3046,202 @@ pub async fn update_workflow_settings(
     Ok(StatusCode::OK)
 }
 
+/// Allowed model IDs for the Anthropic provider.
+const ALLOWED_MODELS: &[&str] = &[
+    "claude-sonnet-4-20250514",
+    "claude-opus-4-20250514",
+    "claude-haiku-4-5-20250514",
+];
+
+/// GET /api/settings/model-provider — get model provider configuration.
+pub async fn get_model_provider(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s("SETTINGS#MODEL_PROVIDER"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch model provider settings: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let Some(item) = result.item() else {
+        return Ok(Json(json!({
+            "provider": "bedrock",
+            "api_key_masked": null,
+            "primary_model": null,
+            "heavy_model": null,
+        })));
+    };
+
+    let provider = item
+        .get("provider")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_else(|| "bedrock".to_string());
+
+    let api_key_masked = item.get("api_key").and_then(|v| v.as_s().ok()).map(|key| {
+        if key.len() > 4 {
+            format!("sk-ant-...{}", &key[key.len() - 4..])
+        } else {
+            "****".to_string()
+        }
+    });
+
+    let primary_model = item
+        .get("primary_model")
+        .and_then(|v| v.as_s().ok())
+        .cloned();
+
+    let heavy_model = item.get("heavy_model").and_then(|v| v.as_s().ok()).cloned();
+
+    Ok(Json(json!({
+        "provider": provider,
+        "api_key_masked": api_key_masked,
+        "primary_model": primary_model,
+        "heavy_model": heavy_model,
+    })))
+}
+
+/// PUT /api/settings/model-provider — configure model provider.
+pub async fn update_model_provider(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let provider = body["provider"].as_str().unwrap_or("bedrock");
+
+    if provider != "anthropic" && provider != "bedrock" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Reverting to bedrock just deletes the custom provider row.
+    if provider == "bedrock" {
+        state
+            .dynamo
+            .delete_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&claims.team_id))
+            .key("sk", attr_s("SETTINGS#MODEL_PROVIDER"))
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to delete model provider settings: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        return Ok(Json(json!({ "status": "ok", "provider": "bedrock" })));
+    }
+
+    let api_key_from_body = body["api_key"].as_str().map(|s| s.to_string());
+    let primary_model = body["primary_model"]
+        .as_str()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let heavy_model = body["heavy_model"]
+        .as_str()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    if !ALLOWED_MODELS.contains(&primary_model) || !ALLOWED_MODELS.contains(&heavy_model) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // If no new key provided, try to reuse existing one
+    let api_key = if let Some(key) = api_key_from_body {
+        key
+    } else {
+        let existing = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&claims.team_id))
+            .key("sk", attr_s("SETTINGS#MODEL_PROVIDER"))
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to fetch existing model provider: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        existing
+            .item()
+            .and_then(|item| item.get("api_key"))
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .ok_or(StatusCode::BAD_REQUEST)?
+    };
+
+    // Validate the API key by making a minimal test call to Anthropic.
+    let client = reqwest::Client::new();
+    let test_resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": primary_model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Anthropic validation request failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if !test_resp.status().is_success() {
+        return Ok(Json(json!({ "error": "Invalid API key" })));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(&claims.team_id))
+        .item("sk", attr_s("SETTINGS#MODEL_PROVIDER"))
+        .item("provider", attr_s(provider))
+        .item("api_key", attr_s(&api_key))
+        .item("primary_model", attr_s(primary_model))
+        .item("heavy_model", attr_s(heavy_model))
+        .item("updated_at", attr_s(&now))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to save model provider settings: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(json!({ "status": "ok", "provider": "anthropic" })))
+}
+
+/// DELETE /api/settings/model-provider — revert to default Bedrock provider.
+pub async fn delete_model_provider(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<StatusCode, StatusCode> {
+    state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s("SETTINGS#MODEL_PROVIDER"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to delete model provider settings: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(StatusCode::OK)
+}
+
 /// GET /api/health — system health check (stale runs, DLQ depth, queue depths).
 pub async fn health(
     State(state): State<Arc<AppState>>,

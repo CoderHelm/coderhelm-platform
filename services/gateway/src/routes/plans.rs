@@ -84,7 +84,6 @@ pub async fn create_plan(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     let title = body["title"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
     let description = body["description"].as_str().unwrap_or("");
     let repo = body["repo"].as_str().unwrap_or("");
@@ -635,7 +634,6 @@ pub async fn approve_task(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
 
@@ -746,7 +744,6 @@ pub async fn approve_all_and_execute(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     validate_plan_id(&plan_id)?;
 
     let result = state
@@ -892,7 +889,6 @@ pub async fn force_run_task(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
 
@@ -972,7 +968,6 @@ pub async fn execute_plan(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     validate_plan_id(&plan_id)?;
 
     // Get plan + all tasks
@@ -1504,8 +1499,6 @@ pub async fn create_template(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.team_id).await?;
-
     let title = body["title"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
     if title.is_empty() || title.len() > 200 {
         return Err(StatusCode::BAD_REQUEST);
@@ -1564,7 +1557,6 @@ pub async fn create_template_from_plan(
     axum::extract::Path(plan_id): axum::extract::Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     validate_plan_id(&plan_id)?;
 
     // Fetch the plan + tasks
@@ -1735,7 +1727,6 @@ pub async fn use_template(
     axum::extract::Path(template_id): axum::extract::Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    super::billing::require_active_subscription(&state, &claims.team_id).await?;
     validate_template_id(&template_id)?;
 
     // Fetch the template
@@ -2447,6 +2438,399 @@ fn sse_event(
         .data(serde_json::to_string(&data).unwrap_or_default()))
 }
 
+/// Anthropic SSE streaming for plan chat (when team uses direct API key).
+#[allow(clippy::too_many_arguments)]
+async fn run_anthropic_stream(
+    state: &Arc<AppState>,
+    tx: &tokio::sync::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,
+    api_key: &str,
+    model_id: &str,
+    system_prompt: &str,
+    tool_config: &Option<aws_sdk_bedrockruntime::types::ToolConfiguration>,
+    bedrock_messages: &mut Vec<aws_sdk_bedrockruntime::types::Message>,
+    team_id: &str,
+) {
+    use futures::StreamExt;
+
+    let http = reqwest::Client::new();
+    let max_turns = 5;
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+
+    // Convert Bedrock messages to Anthropic format
+    fn bedrock_msg_to_json(msg: &aws_sdk_bedrockruntime::types::Message) -> Value {
+        let role = match msg.role() {
+            aws_sdk_bedrockruntime::types::ConversationRole::Assistant => "assistant",
+            _ => "user",
+        };
+        let content: Vec<Value> = msg
+            .content()
+            .iter()
+            .filter_map(|block| match block {
+                aws_sdk_bedrockruntime::types::ContentBlock::Text(t) => {
+                    Some(json!({"type": "text", "text": t}))
+                }
+                aws_sdk_bedrockruntime::types::ContentBlock::ToolUse(tu) => Some(json!({
+                    "type": "tool_use",
+                    "id": tu.tool_use_id(),
+                    "name": tu.name(),
+                    "input": crate::routes::plans::doc_to_json(tu.input())
+                })),
+                aws_sdk_bedrockruntime::types::ContentBlock::ToolResult(tr) => {
+                    let text: String = tr.content().iter().filter_map(|c| {
+                        if let aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(t) = c { Some(t.as_str()) } else { None }
+                    }).collect::<Vec<_>>().join("\n");
+                    let mut obj = json!({"type": "tool_result", "tool_use_id": tr.tool_use_id(), "content": text});
+                    if tr.status() == Some(&aws_sdk_bedrockruntime::types::ToolResultStatus::Error) {
+                        obj["is_error"] = json!(true);
+                    }
+                    Some(obj)
+                }
+                _ => None,
+            })
+            .collect();
+        json!({"role": role, "content": content})
+    }
+
+    // Convert Bedrock tool config to Anthropic tools
+    let tools: Vec<Value> = tool_config
+        .as_ref()
+        .map(|tc| {
+            tc.tools()
+                .iter()
+                .filter_map(|t| {
+                    if let aws_sdk_bedrockruntime::types::Tool::ToolSpec(spec) = t {
+                        Some(json!({
+                            "name": spec.name(),
+                            "description": spec.description().unwrap_or(""),
+                            "input_schema": spec.input_schema().map(|s| {
+                                if let aws_sdk_bedrockruntime::types::ToolInputSchema::Json(doc) = s {
+                                    doc_to_json(doc)
+                                } else {
+                                    json!({})
+                                }
+                            }).unwrap_or(json!({}))
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for turn in 0..max_turns {
+        let api_messages: Vec<Value> = bedrock_messages.iter().map(bedrock_msg_to_json).collect();
+
+        let mut body = json!({
+            "model": model_id,
+            "max_tokens": 4096,
+            "stream": true,
+            "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+            "messages": api_messages,
+            "temperature": 0.7
+        });
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
+
+        let resp = match http
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "prompt-caching-2024-07-31")
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                error!("Anthropic stream error ({status}): {body}");
+                let _ = tx
+                    .send(sse_event(
+                        "error",
+                        json!({"message": format!("Anthropic API error: {status}")}),
+                    ))
+                    .await;
+                return;
+            }
+            Err(e) => {
+                error!("Anthropic stream request failed: {e}");
+                let _ = tx
+                    .send(sse_event(
+                        "error",
+                        json!({"message": format!("AI service error: {e}")}),
+                    ))
+                    .await;
+                return;
+            }
+        };
+
+        // Process SSE stream from Anthropic
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+        let mut assistant_text = String::new();
+        let mut tool_uses: Vec<(String, String, String)> = Vec::new(); // (id, name, input_json)
+        let mut active_tool_id = String::new();
+        let mut active_tool_name = String::new();
+        let mut active_tool_input = String::new();
+        let mut stop_reason = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(line_end) = buffer.find('\n') {
+                let line = buffer[..line_end].trim().to_string();
+                buffer = buffer[line_end + 1..].to_string();
+
+                if !line.starts_with("data: ") {
+                    continue;
+                }
+                let data = &line[6..];
+                if data == "[DONE]" {
+                    break;
+                }
+
+                let event: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                match event["type"].as_str() {
+                    Some("content_block_start") => {
+                        if let Some(cb) = event.get("content_block") {
+                            if cb["type"].as_str() == Some("tool_use") {
+                                active_tool_id = cb["id"].as_str().unwrap_or("").to_string();
+                                active_tool_name = cb["name"].as_str().unwrap_or("").to_string();
+                                active_tool_input.clear();
+                                let _ = tx
+                                    .send(sse_event(
+                                        "tool_start",
+                                        json!({"name": &active_tool_name}),
+                                    ))
+                                    .await;
+                            }
+                        }
+                    }
+                    Some("content_block_delta") => {
+                        if let Some(delta) = event.get("delta") {
+                            match delta["type"].as_str() {
+                                Some("text_delta") => {
+                                    if let Some(text) = delta["text"].as_str() {
+                                        assistant_text.push_str(text);
+                                        let _ =
+                                            tx.send(sse_event("text", json!({"text": text}))).await;
+                                    }
+                                }
+                                Some("input_json_delta") => {
+                                    if let Some(partial) = delta["partial_json"].as_str() {
+                                        active_tool_input.push_str(partial);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some("content_block_stop") => {
+                        if !active_tool_id.is_empty() {
+                            tool_uses.push((
+                                active_tool_id.clone(),
+                                active_tool_name.clone(),
+                                active_tool_input.clone(),
+                            ));
+                            active_tool_id.clear();
+                            active_tool_name.clear();
+                            active_tool_input.clear();
+                        }
+                    }
+                    Some("message_delta") => {
+                        if let Some(sr) = event["delta"]["stop_reason"].as_str() {
+                            stop_reason = sr.to_string();
+                        }
+                        if let Some(u) = event.get("usage") {
+                            total_output_tokens += u["output_tokens"].as_u64().unwrap_or(0);
+                        }
+                    }
+                    Some("message_start") => {
+                        if let Some(u) = event.get("message").and_then(|m| m.get("usage")) {
+                            total_input_tokens += u["input_tokens"].as_u64().unwrap_or(0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Build assistant message content for conversation state
+        let mut assistant_content: Vec<aws_sdk_bedrockruntime::types::ContentBlock> = Vec::new();
+        if !assistant_text.is_empty() {
+            assistant_content.push(aws_sdk_bedrockruntime::types::ContentBlock::Text(
+                assistant_text.clone(),
+            ));
+        }
+        for (tu_id, tu_name, tu_input) in &tool_uses {
+            let input_doc = json_str_to_document(tu_input);
+            if let Ok(tu) = aws_sdk_bedrockruntime::types::ToolUseBlock::builder()
+                .tool_use_id(tu_id.as_str())
+                .name(tu_name.as_str())
+                .input(input_doc)
+                .build()
+            {
+                assistant_content.push(aws_sdk_bedrockruntime::types::ContentBlock::ToolUse(tu));
+            }
+        }
+        if !assistant_content.is_empty() {
+            if let Ok(msg) = aws_sdk_bedrockruntime::types::Message::builder()
+                .role(aws_sdk_bedrockruntime::types::ConversationRole::Assistant)
+                .set_content(Some(assistant_content))
+                .build()
+            {
+                bedrock_messages.push(msg);
+            }
+        }
+
+        if stop_reason != "tool_use" || tool_uses.is_empty() {
+            let _ = tx
+                .send(sse_event(
+                    "usage",
+                    json!({
+                        "input_tokens": total_input_tokens,
+                        "output_tokens": total_output_tokens,
+                        "turns": turn + 1,
+                    }),
+                ))
+                .await;
+            let _ = tx.send(sse_event("done", json!({}))).await;
+            let state_c = state.clone();
+            let tid = team_id.to_string();
+            tokio::spawn(async move {
+                track_chat_tokens(&state_c, &tid, total_input_tokens, total_output_tokens).await;
+            });
+            return;
+        }
+
+        // Execute tools
+        let mut tool_results: Vec<aws_sdk_bedrockruntime::types::ContentBlock> = Vec::new();
+        for (tu_id, tu_name, tu_input_str) in &tool_uses {
+            let input: Value = serde_json::from_str(tu_input_str).unwrap_or(json!({}));
+            let _ = tx
+                .send(sse_event(
+                    "tool_call",
+                    json!({"name": tu_name, "input": input}),
+                ))
+                .await;
+
+            let result = if let Some((server_id, tool_name)) = tu_name.split_once("__") {
+                match invoke_mcp_tool(state, team_id, server_id, tool_name, &input).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(tool = tu_name.as_str(), error = %e, "MCP tool call failed");
+                        json!(format!("Error: {e}"))
+                    }
+                }
+            } else {
+                json!(format!("Unknown tool: {tu_name}"))
+            };
+            let result_str = serde_json::to_string(&result).unwrap_or_default();
+            let summary = summarize_tool_result(&result);
+            let _ = tx
+                .send(sse_event(
+                    "tool_result",
+                    json!({"name": tu_name, "summary": summary}),
+                ))
+                .await;
+
+            tool_results.push(aws_sdk_bedrockruntime::types::ContentBlock::ToolResult(
+                aws_sdk_bedrockruntime::types::ToolResultBlock::builder()
+                    .tool_use_id(tu_id.as_str())
+                    .content(aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(
+                        result_str,
+                    ))
+                    .build()
+                    .unwrap(),
+            ));
+        }
+
+        if let Ok(msg) = aws_sdk_bedrockruntime::types::Message::builder()
+            .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
+            .set_content(Some(tool_results))
+            .build()
+        {
+            bedrock_messages.push(msg);
+        }
+        info!(
+            turn = turn + 1,
+            "Anthropic streaming tool use turn complete"
+        );
+    }
+
+    // Hit max turns
+    let _ = tx
+        .send(sse_event(
+            "usage",
+            json!({
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "turns": max_turns,
+            }),
+        ))
+        .await;
+    let _ = tx.send(sse_event("done", json!({}))).await;
+    let state_c = state.clone();
+    let tid = team_id.to_string();
+    tokio::spawn(async move {
+        track_chat_tokens(&state_c, &tid, total_input_tokens, total_output_tokens).await;
+    });
+}
+
+/// Convert Document to JSON Value (for tool inputs)
+fn doc_to_json(doc: &Document) -> Value {
+    match doc {
+        Document::Null => Value::Null,
+        Document::Bool(b) => Value::Bool(*b),
+        Document::Number(n) => json!(n.to_f64_lossy()),
+        Document::String(s) => Value::String(s.clone()),
+        Document::Array(arr) => Value::Array(arr.iter().map(doc_to_json).collect()),
+        Document::Object(obj) => {
+            let map: serde_json::Map<String, Value> = obj
+                .iter()
+                .map(|(k, v)| (k.clone(), doc_to_json(v)))
+                .collect();
+            Value::Object(map)
+        }
+    }
+}
+
+/// Parse a JSON string into a Document (for tool inputs from Anthropic SSE)
+fn json_str_to_document(s: &str) -> Document {
+    let val: Value = serde_json::from_str(s).unwrap_or(Value::Null);
+    json_val_to_document(&val)
+}
+
+fn json_val_to_document(val: &Value) -> Document {
+    match val {
+        Value::Null => Document::Null,
+        Value::Bool(b) => Document::Bool(*b),
+        Value::Number(n) => {
+            Document::Number(aws_smithy_types::Number::Float(n.as_f64().unwrap_or(0.0)))
+        }
+        Value::String(s) => Document::String(s.clone()),
+        Value::Array(arr) => Document::Array(arr.iter().map(json_val_to_document).collect()),
+        Value::Object(obj) => Document::Object(
+            obj.iter()
+                .map(|(k, v)| (k.clone(), json_val_to_document(v)))
+                .collect(),
+        ),
+    }
+}
+
 pub async fn plan_chat_stream(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -2481,9 +2865,45 @@ pub async fn plan_chat_stream(
     let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input).await?;
     let mut bedrock_messages = ctx.bedrock_messages;
 
+    // Load team's model provider settings
+    let provider_result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s("SETTINGS#MODEL_PROVIDER"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned());
+
+    let is_anthropic = provider_result
+        .as_ref()
+        .and_then(|item| item.get("provider"))
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s == "anthropic")
+        .unwrap_or(false);
+
+    let anthropic_api_key = provider_result
+        .as_ref()
+        .and_then(|item| item.get("api_key"))
+        .and_then(|v| v.as_s().ok())
+        .cloned();
+
+    let anthropic_model = provider_result
+        .as_ref()
+        .and_then(|item| item.get("primary_model"))
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+
     // Move everything into the streaming task
     let team_id = claims.team_id.clone();
-    let model_id = state.config.model_id.clone();
+    let model_id = if is_anthropic {
+        anthropic_model.clone()
+    } else {
+        state.config.model_id.clone()
+    };
     let system_prompt = ctx.system_prompt;
     let tool_config = ctx.tool_config;
 
@@ -2493,6 +2913,30 @@ pub async fn plan_chat_stream(
 
     // Spawn the agentic streaming loop
     tokio::spawn(async move {
+        if is_anthropic {
+            if let Some(ref api_key) = anthropic_api_key {
+                run_anthropic_stream(
+                    &state,
+                    &tx,
+                    api_key,
+                    &model_id,
+                    &system_prompt,
+                    &tool_config,
+                    &mut bedrock_messages,
+                    &team_id,
+                )
+                .await;
+            } else {
+                let _ = tx
+                    .send(sse_event(
+                        "error",
+                        json!({ "message": "Anthropic API key not configured" }),
+                    ))
+                    .await;
+            }
+            return;
+        }
+
         let max_turns = 5;
         let mut total_input_tokens: u64 = 0;
         let mut total_output_tokens: u64 = 0;

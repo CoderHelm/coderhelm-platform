@@ -2,6 +2,8 @@ use serde_json::json;
 use tracing::info;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
+use crate::agent::provider;
+use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
 use crate::passes::plan::PlanResult;
@@ -22,6 +24,7 @@ pub async fn run(
     branch: &str,
     rules: &[String],
     repo_instructions: &str,
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<ReviewResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
@@ -69,9 +72,11 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let response = llm::converse_with_opts(
+    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let response = provider::converse(
         state,
-        &state.config.light_model_id,
+        provider,
+        &model_id,
         &system,
         &mut messages,
         &tools,

@@ -1,6 +1,7 @@
 use tracing::{info, warn};
 
-use crate::agent::llm;
+use crate::agent::provider::ModelProvider;
+use crate::agent::{llm, provider};
 use crate::clients::github::{FileOp, GitHubClient};
 use crate::models::{TicketMessage, TicketSource, TokenUsage};
 use crate::passes::plan::PlanResult;
@@ -21,6 +22,7 @@ pub async fn run(
     branch: &str,
     plan: &PlanResult,
     voice: &str,
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<PrResult, Box<dyn std::error::Error + Send + Sync>> {
     // Get diff for body summary
@@ -80,14 +82,20 @@ Return ONLY the markdown body text."#,
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let body_text = llm::converse(
+    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let body_text = provider::converse(
         state,
-        &state.config.light_model_id,
+        provider,
+        &model_id,
         &system,
         &mut messages,
         &[],
         &super::triage::NoOpExecutor,
         usage,
+        llm::ConverseOptions {
+            max_turns: 40,
+            max_tokens: 16384,
+        },
     )
     .await?;
 
@@ -166,6 +174,7 @@ pub async fn resolve_conflicts(
     msg: &TicketMessage,
     github: &GitHubClient,
     branch: &str,
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // Try to merge main into the feature branch
@@ -241,14 +250,20 @@ pub async fn resolve_conflicts(
             .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
             .build()?];
 
-        let merged_content = llm::converse(
+        let model_id = provider.primary_model_id(&state.config.light_model_id);
+        let merged_content = provider::converse(
             state,
-            &state.config.light_model_id,
+            provider,
+            &model_id,
             &system,
             &mut messages,
             &[],
             &super::triage::NoOpExecutor,
             usage,
+            llm::ConverseOptions {
+                max_turns: 40,
+                max_tokens: 16384,
+            },
         )
         .await?;
 

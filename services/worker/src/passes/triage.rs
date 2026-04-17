@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::agent::llm;
+use crate::agent::provider::ModelProvider;
+use crate::agent::{llm, provider};
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
 use crate::WorkerState;
@@ -19,6 +20,7 @@ pub async fn run(
     state: &WorkerState,
     msg: &TicketMessage,
     _github: &GitHubClient,
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<TriageResult, Box<dyn std::error::Error + Send + Sync>> {
     let system = "You are a ticket triage agent for a GitHub issue. \
@@ -58,14 +60,20 @@ Rules:
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let response = llm::converse(
+    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let response = provider::converse(
         state,
-        &state.config.light_model_id,
+        provider,
+        &model_id,
         system,
         &mut messages,
         &[],
         &NoOpExecutor,
         usage,
+        llm::ConverseOptions {
+            max_turns: 40,
+            max_tokens: 16384,
+        },
     )
     .await?;
 
@@ -102,6 +110,7 @@ pub async fn select_repo(
     state: &WorkerState,
     msg: &TicketMessage,
     repos: &[String],
+    provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let system = "You are a repo-selection agent. Given a Jira ticket, repository descriptions, \
@@ -146,14 +155,20 @@ Return ONLY the repository in `owner/name` format. No explanation."#,
         .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(prompt))
         .build()?];
 
-    let response = llm::converse(
+    let model_id = provider.primary_model_id(&state.config.light_model_id);
+    let response = provider::converse(
         state,
-        &state.config.light_model_id,
+        provider,
+        &model_id,
         system,
         &mut messages,
         &[],
         &NoOpExecutor,
         usage,
+        llm::ConverseOptions {
+            max_turns: 40,
+            max_tokens: 16384,
+        },
     )
     .await?;
 

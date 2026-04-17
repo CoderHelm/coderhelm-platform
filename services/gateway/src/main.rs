@@ -207,6 +207,13 @@ async fn main() -> Result<(), Error> {
             "/settings/workflow",
             get(routes::api::get_workflow_settings).put(routes::api::update_workflow_settings),
         )
+        // Model provider settings
+        .route(
+            "/settings/model-provider",
+            get(routes::api::get_model_provider)
+                .put(routes::api::update_model_provider)
+                .delete(routes::api::delete_model_provider),
+        )
         // Usage
         .route("/usage", get(routes::api::get_usage))
         // Banners
