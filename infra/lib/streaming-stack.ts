@@ -92,7 +92,7 @@ export class StreamingStack extends cdk.Stack {
         WAITLIST_TABLE_NAME: `${prefix}-waitlist`,
         BUCKET_NAME: props.bucket.bucketName,
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
-        MODEL_ID: "us.anthropic.claude-sonnet-4-6",
+        MODEL_ID: "claude-sonnet-4-20250514",
         MCP_PROXY_FUNCTION_NAME: props.mcpProxyFunction.functionName,
         // Unused by streaming but required by shared binary
         TICKET_QUEUE_URL: "unused",

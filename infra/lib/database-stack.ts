@@ -21,6 +21,7 @@ export class DatabaseStack extends cdk.Stack {
   public readonly reposTable: dynamodb.TableV2;
   public readonly settingsTable: dynamodb.TableV2;
   public readonly infraTable: dynamodb.TableV2;
+  public readonly billingTable: dynamodb.TableV2;
   public readonly bannersTable: dynamodb.TableV2;
   public readonly mcpConfigsTable: dynamodb.TableV2;
   public readonly awsInsightsTable: dynamodb.TableV2;
@@ -528,7 +529,7 @@ export class DatabaseStack extends cdk.Stack {
     });
     // Retained temporarily — CF export still referenced by previously deployed stacks.
     // Safe to remove after one successful deploy cycle.
-    const billingTable = new dynamodb.TableV2(this, "BillingTable", {
+    this.billingTable = new dynamodb.TableV2(this, "BillingTable", {
       tableName: `coderhelm-${props.stage}-billing-data`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
@@ -536,7 +537,7 @@ export class DatabaseStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
     new cdk.CfnOutput(this, "BillingTableName", {
-      value: billingTable.tableName,
+      value: this.billingTable.tableName,
     });
     new cdk.CfnOutput(this, "BannersTableName", {
       value: this.bannersTable.tableName,

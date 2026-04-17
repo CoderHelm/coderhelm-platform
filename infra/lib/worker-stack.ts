@@ -18,6 +18,7 @@ interface WorkerStackProps extends cdk.StackProps {
   reposTable: dynamodb.TableV2;
   settingsTable: dynamodb.TableV2;
   infraTable: dynamodb.TableV2;
+  billingTable: dynamodb.TableV2; // Retained — cross-stack ref still needed for CF migration
   mcpConfigsTable: dynamodb.TableV2;
   tracesTable: dynamodb.TableV2;
   checkpointsTable: dynamodb.TableV2;
@@ -80,8 +81,8 @@ export class WorkerStack extends cdk.Stack {
         CHECKPOINTS_TABLE_NAME: props.checkpointsTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
-        MODEL_ID: process.env.MODEL_ID || "us.anthropic.claude-opus-4-6-v1",
-        LIGHT_MODEL_ID: process.env.LIGHT_MODEL_ID || "us.anthropic.claude-sonnet-4-6",
+        MODEL_ID: process.env.MODEL_ID || "claude-sonnet-4-20250514",
+        LIGHT_MODEL_ID: process.env.LIGHT_MODEL_ID || "claude-sonnet-4-20250514",
         SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
         RUST_LOG: "info",

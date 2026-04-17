@@ -26,6 +26,7 @@ interface ApiStackProps extends cdk.StackProps {
   reposTable: dynamodb.TableV2;
   settingsTable: dynamodb.TableV2;
   infraTable: dynamodb.TableV2;
+  billingTable: dynamodb.TableV2; // Retained — cross-stack ref still needed for CF migration
   bannersTable: dynamodb.TableV2;
   mcpConfigsTable: dynamodb.TableV2;
   awsInsightsTable: dynamodb.TableV2;
@@ -291,7 +292,7 @@ export class ApiStack extends cdk.Stack {
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
-        MODEL_ID: "us.anthropic.claude-sonnet-4-6",
+        MODEL_ID: "claude-sonnet-4-20250514",
         COGNITO_USER_POOL_ID: userPool.userPoolId,
         COGNITO_CLIENT_ID: userPoolClient.userPoolClientId,
         COGNITO_DOMAIN: userPoolDomain.domainName,
