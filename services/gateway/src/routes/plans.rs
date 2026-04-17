@@ -2173,6 +2173,14 @@ async fn load_plan_chat_context(
         })
         .collect();
 
+    info!(
+        team_id = team_id,
+        tools_count = tools.len(),
+        mcp_plugins = enabled_plugins.len(),
+        messages_count = api_messages.len(),
+        "load_plan_chat_context: context loaded"
+    );
+
     Ok(PlanChatContext {
         system_prompt,
         messages: api_messages,
@@ -2440,6 +2448,13 @@ async fn run_anthropic_stream(
     let mut cache_read_tokens: u64 = 0;
     let mut cache_write_tokens: u64 = 0;
 
+    info!(
+        model = model_id,
+        tools = tools.len(),
+        messages = messages.len(),
+        "run_anthropic_stream: starting agentic loop"
+    );
+
     for turn in 0..max_turns {
         let mut body = json!({
             "model": model_id,
@@ -2463,7 +2478,10 @@ async fn run_anthropic_stream(
             .send()
             .await
         {
-            Ok(r) if r.status().is_success() => r,
+            Ok(r) if r.status().is_success() => {
+                info!(turn = turn, "run_anthropic_stream: Anthropic returned 200");
+                r
+            }
             Ok(r) => {
                 let status = r.status();
                 let body = r.text().await.unwrap_or_default();
@@ -2610,6 +2628,14 @@ async fn run_anthropic_stream(
         }
 
         if stop_reason != "tool_use" || tool_uses.is_empty() {
+            info!(
+                turn = turn + 1,
+                stop_reason = %stop_reason,
+                text_len = assistant_text.len(),
+                input_tokens = total_input_tokens,
+                output_tokens = total_output_tokens,
+                "run_anthropic_stream: finished"
+            );
             let _ = tx
                 .send(sse_event(
                     "usage",
@@ -2742,17 +2768,39 @@ pub async fn plan_chat_stream(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .ok_or_else(|| {
+            warn!("plan_chat_stream: missing or invalid Authorization header");
+            StatusCode::UNAUTHORIZED
+        })?;
 
     let claims = crate::auth::jwt::validate_token(token, &state.secrets.jwt_secret)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        .map_err(|e| {
+            warn!("plan_chat_stream: JWT validation failed: {e}");
+            StatusCode::UNAUTHORIZED
+        })?;
 
-    let messages_input = body["messages"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
+    let messages_input = body["messages"].as_array().ok_or_else(|| {
+        warn!("plan_chat_stream: missing messages array in body");
+        StatusCode::BAD_REQUEST
+    })?;
     if messages_input.is_empty() || messages_input.len() > 20 {
+        warn!(
+            count = messages_input.len(),
+            "plan_chat_stream: invalid message count"
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input).await?;
+    info!(
+        team_id = %claims.team_id,
+        message_count = messages_input.len(),
+        "plan_chat_stream: starting"
+    );
+
+    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input).await.map_err(|s| {
+        error!(status = %s, team_id = %claims.team_id, "plan_chat_stream: load_plan_chat_context failed");
+        s
+    })?;
     let mut api_messages = ctx.messages;
 
     // Load team's Anthropic API key (required)
@@ -2789,6 +2837,14 @@ pub async fn plan_chat_stream(
         Result<axum::response::sse::Event, std::convert::Infallible>,
     >(64);
 
+    info!(
+        team_id = %team_id,
+        model = %model_id,
+        tools_count = tools.len(),
+        has_api_key = anthropic_api_key.is_some(),
+        "plan_chat_stream: spawning streaming task"
+    );
+
     // Spawn the agentic streaming loop
     tokio::spawn(async move {
         if let Some(ref api_key) = anthropic_api_key {
@@ -2804,6 +2860,7 @@ pub async fn plan_chat_stream(
             )
             .await;
         } else {
+            warn!(team_id = %team_id, "plan_chat_stream: no Anthropic API key configured");
             let _ = tx
                 .send(sse_event(
                     "error",
