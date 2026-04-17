@@ -2859,6 +2859,7 @@ fn json_val_to_document(val: &Value) -> Document {
     }
 }
 
+#[allow(clippy::collapsible_match)]
 pub async fn plan_chat_stream(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
