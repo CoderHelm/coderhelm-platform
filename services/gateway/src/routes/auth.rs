@@ -862,7 +862,7 @@ pub async fn github_callback(
             .send()
             .await;
 
-        // Link GitHub installations to the user's team in the teams table
+        // Link GitHub installations to the user's team in both tables
         for (inst_id, org) in &all_installations {
             let _ = state
                 .dynamo
@@ -872,6 +872,25 @@ pub async fn github_callback(
                 .key("sk", attr_s("META"))
                 .update_expression(
                     "SET github_installation_id = :iid, github_org = :org, updated_at = :now",
+                )
+                .expression_attribute_values(
+                    ":iid",
+                    aws_sdk_dynamodb::types::AttributeValue::N(inst_id.to_string()),
+                )
+                .expression_attribute_values(":org", attr_s(org))
+                .expression_attribute_values(":now", attr_s(&now))
+                .send()
+                .await;
+
+            // Also write to main table for worker compatibility
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.table_name)
+                .key("pk", attr_s(&claims.team_id))
+                .key("sk", attr_s("META"))
+                .update_expression(
+                    "SET github_install_id = :iid, github_org = :org, updated_at = :now",
                 )
                 .expression_attribute_values(
                     ":iid",
@@ -1111,6 +1130,25 @@ pub async fn github_callback(
             .key("sk", attr_s("META"))
             .update_expression(
                 "SET github_installation_id = :iid, github_org = :org, updated_at = :now",
+            )
+            .expression_attribute_values(
+                ":iid",
+                aws_sdk_dynamodb::types::AttributeValue::N(inst_id.to_string()),
+            )
+            .expression_attribute_values(":org", attr_s(org))
+            .expression_attribute_values(":now", attr_s(&now))
+            .send()
+            .await;
+
+        // Also write to main table for worker compatibility
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.table_name)
+            .key("pk", attr_s(&team_id))
+            .key("sk", attr_s("META"))
+            .update_expression(
+                "SET github_install_id = :iid, github_org = :org, updated_at = :now",
             )
             .expression_attribute_values(
                 ":iid",
