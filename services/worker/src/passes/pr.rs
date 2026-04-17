@@ -13,6 +13,7 @@ pub struct PrResult {
     pub pr_url: String,
     pub branch: String,
     pub draft: bool,
+    pub node_id: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -133,8 +134,7 @@ Return ONLY the markdown body text."#,
         title.push_str("...");
     }
 
-    // Create draft PR
-    // Create PR (not draft — ready for review immediately)
+    // Create draft PR — CI triggers on PR creation, and we'll mark it ready after tests/review pass
     let pr_data = github
         .create_pull_request(
             &msg.repo_owner,
@@ -143,7 +143,7 @@ Return ONLY the markdown body text."#,
             &full_body,
             branch,
             "main",
-            false,
+            true,
         )
         .await?;
 
@@ -156,6 +156,11 @@ Return ONLY the markdown body text."#,
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let node_id = pr_data
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     info!(pr_number, pr_url = %pr_url, "PR created");
 
@@ -163,7 +168,8 @@ Return ONLY the markdown body text."#,
         pr_number,
         pr_url,
         branch: branch.to_string(),
-        draft: false,
+        draft: true,
+        node_id,
     })
 }
 

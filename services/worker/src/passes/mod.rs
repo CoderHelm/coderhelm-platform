@@ -940,6 +940,50 @@ async fn run_passes(
         result
     };
 
+    // --- Create Draft PR (triggers CI before test pass) ---
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "pr").await?;
+
+    // Resolve conflicts with main before PR
+    match pr::resolve_conflicts(state, msg, &github, &branch_name, &provider, usage).await {
+        Ok(true) => info!(run_id, "Resolved merge conflicts with main"),
+        Ok(false) => {}
+        Err(e) => warn!(run_id, error = %e, "Conflict resolution failed, proceeding"),
+    }
+
+    let pass_start = std::time::Instant::now();
+    let usage_before = usage.clone();
+    let pr_result = pr::run(
+        state,
+        msg,
+        &github,
+        &branch_name,
+        &plan_result,
+        &voice,
+        &provider,
+        usage,
+    )
+    .await?;
+    write_pass_trace(
+        state,
+        &msg.team_id,
+        run_id,
+        "pr",
+        pass_start,
+        &usage_before,
+        usage,
+        None,
+    )
+    .await;
+    info!(run_id, pr_url = %pr_result.pr_url, "Draft PR created");
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!("Draft PR created: #{}", pr_result.pr_number),
+    )
+    .await;
+
     // --- Pass 4: Test + Review loop (max 3 cycles) ---
     update_progress_comment(
         &github,
@@ -1249,56 +1293,20 @@ async fn run_passes(
         }
     }
 
-    // --- Resolve conflicts with main ---
+    // --- Mark PR ready for review ---
     check_cancelled(state, &msg.team_id, run_id).await?;
-    match pr::resolve_conflicts(state, msg, &github, &branch_name, &provider, usage).await {
-        Ok(true) => info!(run_id, "Resolved merge conflicts with main"),
-        Ok(false) => {}
-        Err(e) => warn!(run_id, error = %e, "Conflict resolution failed, proceeding with PR"),
+    match github
+        .mark_pr_ready(&pr_result.node_id)
+        .await
+    {
+        Ok(_) => info!(run_id, pr_number = pr_result.pr_number, "PR marked ready for review"),
+        Err(e) => warn!(run_id, error = %e, "Failed to mark PR ready, it remains as draft"),
     }
-
-    // --- Pass 6: Create PR ---
-    update_progress_comment(
-        &github,
-        &msg.repo_owner,
-        &msg.repo_name,
-        progress_comment_id,
-        "pr",
-        run_id,
-    )
-    .await;
-    check_cancelled(state, &msg.team_id, run_id).await?;
-    update_pass(state, &msg.team_id, run_id, "pr").await?;
-    let pass_start = std::time::Instant::now();
-    let usage_before = usage.clone();
-    let pr_result = pr::run(
-        state,
-        msg,
-        &github,
-        &branch_name,
-        &plan_result,
-        &voice,
-        &provider,
-        usage,
-    )
-    .await?;
-    write_pass_trace(
-        state,
-        &msg.team_id,
-        run_id,
-        "pr",
-        pass_start,
-        &usage_before,
-        usage,
-        None,
-    )
-    .await;
-    info!(run_id, pr_url = %pr_result.pr_url, "PR created");
     add_progress_note(
         state,
         &msg.team_id,
         run_id,
-        &format!("PR created: #{}", pr_result.pr_number),
+        &format!("PR ready for review: #{}", pr_result.pr_number),
     )
     .await;
 
