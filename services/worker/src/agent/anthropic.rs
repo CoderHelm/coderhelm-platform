@@ -191,7 +191,7 @@ pub async fn converse_tool_loop(
         }
 
         // Progress note every 10 turns
-        if turns > 1 && turns % 10 == 0 {
+        if turns > 1 && (turns % 5 == 0 || turns == max_turns - 2) {
             info!(turns, "Injecting progress note at turn {turns}");
             let remaining = max_turns - turns;
             let note = format!(

@@ -8,7 +8,7 @@ use crate::clients::github::GitHubClient;
 use crate::models::{CiFixMessage, TokenUsage};
 use crate::WorkerState;
 
-const MAX_LOG_CHARS: usize = 30_000;
+const MAX_LOG_CHARS: usize = 15_000;
 
 pub async fn run(
     state: &WorkerState,

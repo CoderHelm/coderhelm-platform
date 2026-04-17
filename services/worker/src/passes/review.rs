@@ -37,7 +37,7 @@ pub async fn run(
         repo = msg.repo_name,
     );
 
-    let openspec_block = super::format_openspec_block(plan);
+    let openspec_block = super::format_openspec_summary(plan);
     let prompt = format!(
         r#"Review the implementation for issue #{number}: {title}
 {openspec}

@@ -1909,6 +1909,29 @@ pub fn format_rules_block(rules: &[String]) -> String {
 }
 
 /// Format the full OpenSpec as a single context block for downstream passes.
+/// Compact OpenSpec summary for review/security passes.
+/// Only includes proposal and acceptance criteria (skips design/tasks detail).
+pub fn format_openspec_summary(plan: &plan::PlanResult) -> String {
+    let mut block = String::from("\n\n## OpenSpec Summary\n");
+    if !plan.proposal.is_empty() {
+        block.push_str("### Proposal\n");
+        // Cap proposal at 2KB
+        if plan.proposal.len() > 2000 {
+            block.push_str(&plan.proposal[..plan.proposal[..2000].rfind('\n').unwrap_or(2000)]);
+            block.push_str("\n... (truncated)\n");
+        } else {
+            block.push_str(&plan.proposal);
+            block.push('\n');
+        }
+    }
+    if !plan.spec.is_empty() {
+        block.push_str("\n### Acceptance Criteria\n");
+        block.push_str(&plan.spec);
+        block.push('\n');
+    }
+    block
+}
+
 pub fn format_openspec_block(plan: &plan::PlanResult) -> String {
     let mut block = String::from("\n\n## OpenSpec\n");
     if !plan.proposal.is_empty() {

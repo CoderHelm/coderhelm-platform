@@ -34,7 +34,7 @@ pub async fn run(
         repo = msg.repo_name,
     );
 
-    let openspec_block = super::format_openspec_block(plan);
+    let openspec_block = super::format_openspec_summary(plan);
     let prompt = format!(
         r#"Review the diff for security vulnerabilities.
 {openspec}
@@ -159,7 +159,31 @@ impl ToolExecutor for SecurityToolExecutor<'_> {
                     .github
                     .get_diff(self.owner, self.repo, "main", self.branch)
                     .await?;
-                Ok(json!(diff))
+                let files = diff.get("files").and_then(|v| v.as_array());
+                if let Some(files) = files {
+                    let mut lines = Vec::new();
+                    for f in files {
+                        let filename = f.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+                        let status = f.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        let adds = f.get("additions").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let dels = f.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0);
+                        lines.push(format!("{filename} ({status}, +{adds}/-{dels})"));
+                        if let Some(patch) = f.get("patch").and_then(|v| v.as_str()) {
+                            let truncated = if patch.len() > 4000 {
+                                format!(
+                                    "{}... (truncated, use read_file for full content)",
+                                    &patch[..4000]
+                                )
+                            } else {
+                                patch.to_string()
+                            };
+                            lines.push(truncated);
+                        }
+                    }
+                    Ok(json!(lines.join("\n")))
+                } else {
+                    Ok(json!("No changes compared to main."))
+                }
             }
             "read_file" => {
                 let path = input

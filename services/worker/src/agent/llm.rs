@@ -164,7 +164,7 @@ pub async fn converse_with_opts(
         }
 
         // Progress note every 10 turns to keep the LLM focused
-        if turns > 1 && turns.is_multiple_of(10) {
+        if turns > 1 && (turns.is_multiple_of(5) || turns == max_turns - 2) {
             info!(turns, "Injecting progress note at turn {turns}");
             let remaining = max_turns - turns;
             let note = format!(

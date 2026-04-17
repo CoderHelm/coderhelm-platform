@@ -238,11 +238,28 @@ pub async fn resolve_conflicts(
             continue;
         }
 
+        // Cap file contents at 16KB to control token usage
+        let cap = |s: &str, label: &str| -> String {
+            if s.len() > 16_000 {
+                let cut = s[..16_000].rfind('\n').unwrap_or(16_000);
+                format!(
+                    "{}... (truncated — {} is {} bytes)",
+                    &s[..cut],
+                    label,
+                    s.len()
+                )
+            } else {
+                s.to_string()
+            }
+        };
+        let main_capped = cap(&main_content, &format!("main:{path}"));
+        let branch_capped = cap(&branch_content, &format!("branch:{path}"));
+
         // Use LLM to resolve the conflict
         let system = "You are a merge conflict resolver. Given two versions of a file (main and branch), produce the merged file that incorporates both sets of changes. Return ONLY the merged file content, no explanations or markdown fences.".to_string();
 
         let prompt = format!(
-            "Merge these two versions of `{path}`.\n\n## main version\n```\n{main_content}\n```\n\n## branch version (our changes — prefer these)\n```\n{branch_content}\n```\n\nReturn the merged file content. Prefer the branch version when changes conflict directly.",
+            "Merge these two versions of `{path}`.\n\n## main version\n```\n{main_capped}\n```\n\n## branch version (our changes — prefer these)\n```\n{branch_capped}\n```\n\nReturn the merged file content. Prefer the branch version when changes conflict directly.",
         );
 
         let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
