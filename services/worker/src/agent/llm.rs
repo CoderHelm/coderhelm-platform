@@ -107,6 +107,7 @@ impl Default for ConverseOptions {
     }
 }
 
+#[allow(dead_code)]
 pub async fn converse(
     state: &WorkerState,
     model_id: &str,

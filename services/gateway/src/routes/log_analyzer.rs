@@ -491,7 +491,7 @@ pub async fn discover_log_groups(
 
 /// GET /api/aws-connections/cfn-url — get CloudFormation quick-create URL
 pub async fn get_cfn_url(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
     if !is_admin_or_owner(&claims.role) {

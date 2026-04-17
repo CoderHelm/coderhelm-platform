@@ -2446,6 +2446,7 @@ fn sse_event(
 
 /// Anthropic SSE streaming for plan chat (when team uses direct API key).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::collapsible_match)]
 async fn run_anthropic_stream(
     state: &Arc<AppState>,
     tx: &tokio::sync::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,

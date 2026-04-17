@@ -157,6 +157,7 @@ pub async fn converse_simple(
 }
 
 /// Agentic tool-use loop. Equivalent to `converse_with_opts` for Bedrock.
+#[allow(clippy::too_many_arguments)]
 pub async fn converse_tool_loop(
     client: &AnthropicClient,
     model_id: &str,
@@ -191,7 +192,7 @@ pub async fn converse_tool_loop(
         }
 
         // Progress note every 10 turns
-        if turns > 1 && (turns % 5 == 0 || turns == max_turns - 2) {
+        if turns > 1 && (turns.is_multiple_of(5) || turns == max_turns - 2) {
             info!(turns, "Injecting progress note at turn {turns}");
             let remaining = max_turns - turns;
             let note = format!(
@@ -402,7 +403,7 @@ fn extract_text(
 }
 
 /// Compact old tool results to reclaim context space.
-fn compact_messages(messages: &mut Vec<(String, Vec<Value>)>, keep_last: usize) {
+fn compact_messages(messages: &mut [(String, Vec<Value>)], keep_last: usize) {
     let total = messages.len();
     if total <= keep_last * 2 {
         return;

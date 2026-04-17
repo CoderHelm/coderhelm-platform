@@ -10,9 +10,10 @@ use super::anthropic::{self, AnthropicClient};
 use super::llm::{self, ToolDefinition, ToolExecutor};
 
 /// Which model provider a team uses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "provider")]
 pub enum ModelProvider {
+    #[default]
     #[serde(rename = "bedrock")]
     Bedrock,
     #[serde(rename = "anthropic")]
@@ -21,12 +22,6 @@ pub enum ModelProvider {
         primary_model: String,
         heavy_model: String,
     },
-}
-
-impl Default for ModelProvider {
-    fn default() -> Self {
-        Self::Bedrock
-    }
 }
 
 impl ModelProvider {
@@ -122,6 +117,7 @@ impl ModelProvider {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_anthropic(&self) -> bool {
         matches!(self, Self::Anthropic { .. })
     }
@@ -130,6 +126,7 @@ impl ModelProvider {
 /// Unified converse call that dispatches to Bedrock or Anthropic.
 /// For Bedrock, delegates to existing `llm::converse_with_opts`.
 /// For Anthropic, uses the Messages API client.
+#[allow(clippy::too_many_arguments)]
 pub async fn converse(
     state: &crate::WorkerState,
     provider: &ModelProvider,

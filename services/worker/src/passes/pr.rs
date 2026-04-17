@@ -15,6 +15,7 @@ pub struct PrResult {
     pub draft: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     state: &WorkerState,
     msg: &TicketMessage,
