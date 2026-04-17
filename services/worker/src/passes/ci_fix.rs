@@ -79,12 +79,18 @@ Rules:
         logs = logs,
     );
 
+    let base_branch = github
+        .get_default_branch(&msg.repo_owner, &msg.repo_name)
+        .await
+        .unwrap_or_else(|_| "main".to_string());
+
     let tools = ci_fix_tools();
     let executor = CiFixToolExecutor {
         github: &github,
         owner: &msg.repo_owner,
         repo: &msg.repo_name,
         branch: &msg.branch,
+        base_branch,
     };
 
     let mut messages = vec![(
@@ -245,6 +251,7 @@ struct CiFixToolExecutor<'a> {
     owner: &'a str,
     repo: &'a str,
     branch: &'a str,
+    base_branch: String,
 }
 
 #[async_trait::async_trait]
@@ -258,7 +265,7 @@ impl<'a> ToolExecutor for CiFixToolExecutor<'a> {
             "get_diff" => {
                 let diff = self
                     .github
-                    .get_diff(self.owner, self.repo, "main", self.branch)
+                    .get_diff(self.owner, self.repo, &self.base_branch, self.branch)
                     .await?;
                 let files = diff.get("files").and_then(|v| v.as_array());
                 if let Some(files) = files {

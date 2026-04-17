@@ -195,6 +195,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             owner: msg.repo_owner.clone(),
             repo: msg.repo_name.clone(),
             branch: branch.to_string(),
+            base_branch: msg.base_branch.clone(),
             files_modified: std::sync::Mutex::new(HashSet::new()),
             task_tracker: &task_tracker,
             file_cache,
@@ -420,6 +421,7 @@ struct WriteToolExecutor<'a> {
     owner: String,
     repo: String,
     branch: String,
+    base_branch: String,
     files_modified: std::sync::Mutex<HashSet<String>>,
     task_tracker: &'a TaskTracker,
     file_cache: &'a FileCache,
@@ -623,7 +625,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
             "get_diff" => {
                 let diff = self
                     .github
-                    .get_diff(&self.owner, &self.repo, "main", &self.branch)
+                    .get_diff(&self.owner, &self.repo, &self.base_branch, &self.branch)
                     .await?;
                 let files = diff.get("files").and_then(|v| v.as_array());
                 if let Some(files) = files {

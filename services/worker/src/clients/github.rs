@@ -183,6 +183,22 @@ impl GitHubClient {
 
     // ─── Tree / File reads ──────────────────────────────────────
 
+    /// Get the repository's default branch name.
+    pub async fn get_default_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}");
+        let data = self.get(&url).await?;
+        let branch = data
+            .get("default_branch")
+            .and_then(|v| v.as_str())
+            .unwrap_or("main")
+            .to_string();
+        Ok(branch)
+    }
+
     /// Get the full recursive file tree.
     pub async fn get_tree(
         &self,

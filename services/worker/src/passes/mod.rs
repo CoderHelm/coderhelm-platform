@@ -384,6 +384,22 @@ async fn run_passes(
         }
     }
 
+    // Look up the repo's default branch (main, master, develop, etc.)
+    let default_branch = match github
+        .get_default_branch(&msg.repo_owner, &msg.repo_name)
+        .await
+    {
+        Ok(branch) => {
+            info!(run_id, branch = %branch, "Resolved default branch");
+            branch
+        }
+        Err(e) => {
+            warn!(run_id, error = %e, "Failed to get default branch, falling back to 'main'");
+            "main".to_string()
+        }
+    };
+    msg.base_branch = default_branch;
+
     // Load enabled MCP plugins once for this run
     let mcp_table = if state.config.mcp_configs_table_name.is_empty() {
         &state.config.settings_table_name
@@ -729,7 +745,7 @@ async fn run_passes(
         update_pass(state, &msg.team_id, run_id, "implement").await?;
 
         let diff_json = github
-            .get_diff(&msg.repo_owner, &msg.repo_name, "main", &branch_name)
+            .get_diff(&msg.repo_owner, &msg.repo_name, &msg.base_branch, &branch_name)
             .await?;
         let files_modified: Vec<String> = diff_json["files"]
             .as_array()
@@ -752,7 +768,7 @@ async fn run_passes(
 
         // Create working branch first
         github
-            .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, "main")
+            .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, &msg.base_branch)
             .await?;
         info!(run_id, branch = %branch_name, "Created working branch");
         add_progress_note(
@@ -803,6 +819,7 @@ async fn run_passes(
             &github,
             &msg.repo_owner,
             &msg.repo_name,
+            &msg.base_branch,
             state,
             &msg.team_id,
         )
@@ -2162,6 +2179,7 @@ async fn validate_plan(
     github: &GitHubClient,
     repo_owner: &str,
     repo_name: &str,
+    base_branch: &str,
     state: &WorkerState,
     team_id: &str,
 ) -> PlanValidation {
@@ -2217,7 +2235,7 @@ async fn validate_plan(
         let sample: Vec<&String> = mentioned_files.iter().take(10).collect();
         let mut missing = Vec::new();
         for path in &sample {
-            match github.read_file(repo_owner, repo_name, path, "main").await {
+            match github.read_file(repo_owner, repo_name, path, base_branch).await {
                 Ok(_) => {}
                 Err(_) => missing.push(path.to_string()),
             }

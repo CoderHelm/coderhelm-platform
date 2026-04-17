@@ -60,6 +60,19 @@ pub async fn run(
         {
             Ok(()) => {
                 set_onboard_status(state, &msg.team_id, &full_name, "ready", None).await;
+                // Store default branch for use by worker runs
+                if !repo.default_branch.is_empty() {
+                    let _ = state
+                        .dynamo
+                        .update_item()
+                        .table_name(&state.config.repos_table_name)
+                        .key("pk", aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()))
+                        .key("sk", aws_sdk_dynamodb::types::AttributeValue::S(format!("REPO#{full_name}")))
+                        .update_expression("SET default_branch = :b")
+                        .expression_attribute_values(":b", aws_sdk_dynamodb::types::AttributeValue::S(repo.default_branch.clone()))
+                        .send()
+                        .await;
+                }
             }
             Err(e) => {
                 error!(repo = %full_name, error = %e, "Failed to onboard repo");

@@ -29,7 +29,7 @@ pub async fn run(
 ) -> Result<PrResult, Box<dyn std::error::Error + Send + Sync>> {
     // Get diff for body summary
     let diff = github
-        .get_diff(&msg.repo_owner, &msg.repo_name, "main", branch)
+        .get_diff(&msg.repo_owner, &msg.repo_name, &msg.base_branch, branch)
         .await?;
     let diff_summary = format_diff_summary(&diff);
 
@@ -142,7 +142,7 @@ Return ONLY the markdown body text."#,
             &title,
             &full_body,
             branch,
-            "main",
+            &msg.base_branch,
             true,
         )
         .await?;
@@ -186,11 +186,11 @@ pub async fn resolve_conflicts(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // Try to merge main into the feature branch
     let merged = github
-        .merge_branch(&msg.repo_owner, &msg.repo_name, branch, "main")
+        .merge_branch(&msg.repo_owner, &msg.repo_name, branch, &msg.base_branch)
         .await?;
 
     if merged {
-        info!(branch, "Branch is up-to-date with main (no conflicts)");
+        info!(branch, "Branch is up-to-date with base (no conflicts)");
         return Ok(false);
     }
 
@@ -198,7 +198,7 @@ pub async fn resolve_conflicts(
     info!(branch, "Merge conflicts detected, resolving with LLM");
 
     let diff = github
-        .get_diff(&msg.repo_owner, &msg.repo_name, "main", branch)
+        .get_diff(&msg.repo_owner, &msg.repo_name, &msg.base_branch, branch)
         .await?;
 
     let files = diff
@@ -227,11 +227,11 @@ pub async fn resolve_conflicts(
 
         // Read the file from both branches
         let main_content = match github
-            .read_file(&msg.repo_owner, &msg.repo_name, path, "main")
+            .read_file(&msg.repo_owner, &msg.repo_name, path, &msg.base_branch)
             .await
         {
             Ok(c) => c,
-            Err(_) => continue, // file doesn't exist on main, skip
+            Err(_) => continue, // file doesn't exist on base branch, skip
         };
         let branch_content = match github
             .read_file(&msg.repo_owner, &msg.repo_name, path, branch)
@@ -324,7 +324,7 @@ pub async fn resolve_conflicts(
 
     // Verify the merge now succeeds
     let retry = github
-        .merge_branch(&msg.repo_owner, &msg.repo_name, branch, "main")
+        .merge_branch(&msg.repo_owner, &msg.repo_name, branch, &msg.base_branch)
         .await?;
 
     if !retry {

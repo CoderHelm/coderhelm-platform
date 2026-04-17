@@ -241,6 +241,7 @@ After researching, output the four files using this exact format:
             github,
             default_owner: &msg.repo_owner,
             default_repo: &msg.repo_name,
+            base_branch: &msg.base_branch,
             allowed_repos: &team_repos,
         },
         mcp_plugins: &loaded_mcp_plugins,
@@ -407,6 +408,7 @@ struct ReadOnlyToolExecutor<'a> {
     github: &'a GitHubClient,
     default_owner: &'a str,
     default_repo: &'a str,
+    base_branch: &'a str,
     allowed_repos: &'a [String],
 }
 
@@ -446,7 +448,7 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let (owner, repo) = self.resolve_repo(input)?;
-        let branch = "main";
+        let branch = &self.base_branch;
         match name {
             "read_tree" => {
                 let tree = self.github.get_tree(&owner, &repo, branch).await?;

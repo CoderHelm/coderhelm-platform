@@ -63,6 +63,7 @@ Output format:
         owner: &msg.repo_owner,
         repo: &msg.repo_name,
         branch,
+        base_branch: &msg.base_branch,
         file_cache,
     };
 
@@ -148,6 +149,7 @@ struct SecurityToolExecutor<'a> {
     owner: &'a str,
     repo: &'a str,
     branch: &'a str,
+    base_branch: &'a str,
     file_cache: &'a FileCache,
 }
 
@@ -162,7 +164,7 @@ impl ToolExecutor for SecurityToolExecutor<'_> {
             "get_diff" => {
                 let diff = self
                     .github
-                    .get_diff(self.owner, self.repo, "main", self.branch)
+                    .get_diff(self.owner, self.repo, self.base_branch, self.branch)
                     .await?;
                 let files = diff.get("files").and_then(|v| v.as_array());
                 if let Some(files) = files {

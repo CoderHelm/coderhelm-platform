@@ -145,6 +145,12 @@ pub struct TicketMessage {
     pub repo_name: String,
     pub issue_number: u64,
     pub sender: String,
+    #[serde(default = "default_branch")]
+    pub base_branch: String,
+}
+
+fn default_branch() -> String {
+    "main".to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug)]

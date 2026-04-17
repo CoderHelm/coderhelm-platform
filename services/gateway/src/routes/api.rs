@@ -2032,32 +2032,75 @@ pub async fn update_repo(
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let enabled = body["enabled"].as_bool().unwrap_or(true);
-
-    let mut put = state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.repos_table_name)
-        .item("pk", attr_s(&claims.team_id))
-        .item("sk", attr_s(&format!("REPO#{repo}")))
-        .item("repo_name", attr_s(&repo))
-        .item(
-            "enabled",
-            aws_sdk_dynamodb::types::AttributeValue::Bool(enabled),
-        )
-        .item("ticket_source", attr_s("github"));
+    let now = chrono::Utc::now().to_rfc3339();
 
     if enabled {
-        put = put.item("onboard_status", attr_s("pending"));
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.repos_table_name)
+            .key("pk", attr_s(&claims.team_id))
+            .key("sk", attr_s(&format!("REPO#{repo}")))
+            .update_expression(
+                "SET enabled = :e, ticket_source = :ts, repo_name = :rn, onboard_status = :os, updated_at = :ua",
+            )
+            .expression_attribute_values(":e", AttributeValue::Bool(true))
+            .expression_attribute_values(":ts", attr_s("github"))
+            .expression_attribute_values(":rn", attr_s(&repo))
+            .expression_attribute_values(":os", attr_s("pending"))
+            .expression_attribute_values(":ua", attr_s(&now))
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to update repo: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    } else {
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.repos_table_name)
+            .key("pk", attr_s(&claims.team_id))
+            .key("sk", attr_s(&format!("REPO#{repo}")))
+            .update_expression("SET enabled = :e, updated_at = :ua")
+            .expression_attribute_values(":e", AttributeValue::Bool(false))
+            .expression_attribute_values(":ua", attr_s(&now))
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to update repo: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
     }
-
-    put.send().await.map_err(|e| {
-        error!("Failed to update repo: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
 
     // When enabling a repo, trigger onboarding to generate voice, instructions, etc.
     if enabled {
         let installation_id = get_team_installation_id(&state, &claims.team_id).await?;
+
+        // Fetch actual default branch from GitHub API
+        let default_branch = match crate::auth::github_app::get_installation_token(&state, installation_id).await {
+            Ok(token) => {
+                let url = format!("https://api.github.com/repos/{owner}/{name}");
+                match state
+                    .http
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Accept", "application/vnd.github+json")
+                    .header("User-Agent", "Coderhelm-bot")
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp
+                        .json::<Value>()
+                        .await
+                        .ok()
+                        .and_then(|v| v["default_branch"].as_str().map(String::from))
+                        .unwrap_or_else(|| "main".to_string()),
+                    Err(_) => "main".to_string(),
+                }
+            }
+            Err(_) => "main".to_string(),
+        };
 
         let message = WorkerMessage::Onboard(OnboardMessage {
             team_id: claims.team_id.clone(),
@@ -2065,7 +2108,7 @@ pub async fn update_repo(
             repos: vec![OnboardRepo {
                 owner: owner.clone(),
                 name: name.clone(),
-                default_branch: "main".to_string(),
+                default_branch,
             }],
         });
 
