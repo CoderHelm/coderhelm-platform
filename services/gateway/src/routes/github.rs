@@ -81,18 +81,19 @@ pub async fn link_installation(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Write to main table (github_install_id) for sync_repos compatibility
+    // Write to main table (github_install_id + github_org) for sync_repos compatibility
     state
         .dynamo
         .update_item()
         .table_name(&state.config.table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s("META"))
-        .update_expression("SET github_install_id = :iid, updated_at = :now")
+        .update_expression("SET github_install_id = :iid, github_org = :org, updated_at = :now")
         .expression_attribute_values(
             ":iid",
             aws_sdk_dynamodb::types::AttributeValue::N(installation_id.to_string()),
         )
+        .expression_attribute_values(":org", attr_s(&org_login))
         .expression_attribute_values(":now", attr_s(&now))
         .send()
         .await

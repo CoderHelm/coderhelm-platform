@@ -272,9 +272,28 @@ architecture-beta
 □ 6 well-placed nodes with clean lines > 12 tangled nodes
 
 ━━━ FINDINGS RULES ━━━
-- Only error and warning severity. No info-level notes.
-- Focus on actionable security risks, reliability gaps, or cost issues.
-- Categories: security, reliability, cost, performance.
+
+ACCURACY IS PARAMOUNT. A false positive is worse than a missed finding.
+
+Before generating ANY finding, you MUST verify:
+1. Cross-reference ALL provided files. If file A imports/references something from file B,
+   check file B before claiming it is missing or misconfigured.
+2. If a file is TRUNCATED (marked with "FILE TRUNCATED"), NEVER claim that something is
+   missing from that file — the missing item may exist in the truncated portion.
+3. For "not instantiated" or "not used" findings, search ALL entry-point files (bin/*.ts,
+   app.py, main.go, etc.) for the construct name before flagging.
+4. For CDK/Pulumi/Terraform, verify that a resource is actually missing by checking both
+   the definition file AND the composition/app file.
+
+Severity levels:
+- error: Will cause deployment failure or data loss if deployed as-is.
+- warning: Security risk, reliability gap, or cost concern that should be addressed.
+- Do NOT emit info-level findings.
+
+Categories: security, reliability, cost, performance.
+
+Quality over quantity — emit fewer, high-confidence findings rather than many speculative ones.
+If you are not at least 90% confident a finding is valid, do NOT include it.
 "#;
 
 pub async fn run(
@@ -569,7 +588,7 @@ async fn collect_infra_code(
             }
         }
 
-        if found.len() >= 15 {
+        if found.len() >= 30 {
             break;
         }
     }
@@ -581,10 +600,19 @@ fn format_code_context(infra_code: &[(String, String)]) -> String {
     infra_code
         .iter()
         .map(|(path, content)| {
-            let trimmed = if content.len() > 4000 {
-                &content[..4000]
+            // Add line numbers for cross-referencing
+            let numbered: String = content
+                .lines()
+                .enumerate()
+                .map(|(i, line)| format!("{:4}| {line}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (display, truncated) = if numbered.len() > 40_000 {
+                // Find a safe newline boundary
+                let boundary = numbered[..40_000].rfind('\n').unwrap_or(40_000);
+                (&numbered[..boundary], true)
             } else {
-                content
+                (numbered.as_str(), false)
             };
             let lang = if path.ends_with(".ts") {
                 "typescript"
@@ -601,7 +629,12 @@ fn format_code_context(infra_code: &[(String, String)]) -> String {
             } else {
                 ""
             };
-            format!("### {path}\n```{lang}\n{trimmed}\n```")
+            let suffix = if truncated {
+                "\n// ... FILE TRUNCATED — remaining content not shown, do NOT flag missing items that may appear later in this file ..."
+            } else {
+                ""
+            };
+            format!("### {path}\n```{lang}\n{display}{suffix}\n```")
         })
         .collect::<Vec<_>>()
         .join("\n\n")

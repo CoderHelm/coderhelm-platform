@@ -663,7 +663,7 @@ pub async fn google_callback(
         (tid, uid, r)
     } else {
         // New user — create personal team
-        let tid = format!("TEAM#{cognito_sub}");
+        let tid = format!("TEAM#{}", ulid::Ulid::new().to_string().to_lowercase());
         let uid = format!("USER#{cognito_sub}");
         let now = chrono::Utc::now().to_rfc3339();
 

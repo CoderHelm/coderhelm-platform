@@ -1518,7 +1518,7 @@ async fn complete_run(
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
-             tokens_in = :ti, tokens_out = :to, cost_usd = :c, \
+             tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri, files_modified = :fm, \
              repo = :repo, team_repo = :tr, mcp_servers = :mcp",
@@ -1541,6 +1541,8 @@ async fn complete_run(
         .expression_attribute_values(":b", attr_s(&pr.branch))
         .expression_attribute_values(":ti", attr_n(usage.input_tokens))
         .expression_attribute_values(":to", attr_n(usage.output_tokens))
+        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
         .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
@@ -1812,7 +1814,12 @@ async fn lookup_team_installation_id(
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse::<u64>().ok())
         .filter(|&id| id > 0)
-        .ok_or_else(|| format!("No github_install_id found for team {team_id}").into())
+        .ok_or_else(|| {
+            format!(
+                "GitHub App is not installed for this team. Please install it at https://github.com/apps/coderhelm/installations/new"
+            )
+            .into()
+        })
 }
 
 /// Post a comment on a Jira ticket via the Forge web trigger.
