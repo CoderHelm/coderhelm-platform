@@ -814,6 +814,7 @@ async fn run_passes(
         }
 
         // --- Plan Validation (deterministic, no LLM) ---
+        let team_repos = plan::fetch_team_repos(state, &msg.team_id).await;
         let plan_warnings = validate_plan(
             &plan_result,
             &github,
@@ -822,8 +823,56 @@ async fn run_passes(
             &msg.base_branch,
             state,
             &msg.team_id,
+            &team_repos,
         )
         .await;
+
+        // If plan files exist in a different repo, switch before implement
+        if let Some(ref better_repo) = plan_warnings.switch_repo {
+            let (new_owner, new_name) = better_repo.split_once('/').unwrap_or(("", ""));
+            if !new_owner.is_empty() && !new_name.is_empty() {
+                warn!(
+                    run_id,
+                    from = %format!("{}/{}", msg.repo_owner, msg.repo_name),
+                    to = %better_repo,
+                    "Switching repo — plan files found in different repo"
+                );
+                msg.repo_owner = new_owner.to_string();
+                msg.repo_name = new_name.to_string();
+
+                // Re-resolve default branch for new repo
+                msg.base_branch = github
+                    .get_default_branch(&msg.repo_owner, &msg.repo_name)
+                    .await
+                    .unwrap_or_else(|_| "main".to_string());
+
+                // Update run record
+                let resolved_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+                let _ = state
+                    .dynamo
+                    .update_item()
+                    .table_name(&state.config.runs_table_name)
+                    .key("team_id", attr_s(&msg.team_id))
+                    .key("run_id", attr_s(run_id))
+                    .update_expression("SET repo = :r, team_repo = :tr")
+                    .expression_attribute_values(":r", attr_s(&resolved_repo))
+                    .expression_attribute_values(
+                        ":tr",
+                        attr_s(&format!("{}#{}", msg.team_id, resolved_repo)),
+                    )
+                    .send()
+                    .await;
+
+                add_progress_note(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    &format!("Switched to {} (plan files matched)", resolved_repo),
+                )
+                .await;
+            }
+        }
+
         if plan_warnings.blocked {
             let warning_text = plan_warnings.warnings.join("\n");
             let comment = format!(
@@ -2171,6 +2220,8 @@ pub(crate) async fn load_content(state: &WorkerState, team_id: &str, sk: &str) -
 struct PlanValidation {
     warnings: Vec<String>,
     blocked: bool,
+    /// If triage picked the wrong repo, this suggests the correct one (owner/name).
+    switch_repo: Option<String>,
 }
 
 /// Deterministic plan validation — catches bad plans before the expensive Implement pass.
@@ -2182,9 +2233,11 @@ async fn validate_plan(
     base_branch: &str,
     state: &WorkerState,
     team_id: &str,
+    team_repos: &[String],
 ) -> PlanValidation {
     let mut warnings = Vec::new();
     let mut blocked = false;
+    let mut switch_repo: Option<String> = None;
 
     // Extract file paths from plan text (design + tasks)
     let plan_text = format!("{}\n{}", plan.design, plan.tasks);
@@ -2251,10 +2304,42 @@ async fn validate_plan(
                 missing.len(),
                 missing.join(", "),
             ));
+
+            // Check if these files exist in another enabled repo (triage may have picked wrong)
+            let current_repo = format!("{repo_owner}/{repo_name}");
+            let other_repos: Vec<&String> = team_repos
+                .iter()
+                .filter(|r| *r != &current_repo)
+                .collect();
+
+            for candidate in &other_repos {
+                let parts: Vec<&str> = candidate.splitn(2, '/').collect();
+                if parts.len() != 2 {
+                    continue;
+                }
+                let (c_owner, c_name) = (parts[0], parts[1]);
+                let mut found = 0usize;
+                for path in &missing {
+                    if github.read_file(c_owner, c_name, path, "HEAD").await.is_ok() {
+                        found += 1;
+                    }
+                }
+                if found > missing.len() / 2 {
+                    info!(
+                        current = %current_repo,
+                        candidate = %candidate,
+                        found,
+                        missing = missing.len(),
+                        "Plan files found in different repo — suggesting switch"
+                    );
+                    switch_repo = Some(candidate.to_string());
+                    break;
+                }
+            }
         }
     }
 
-    PlanValidation { warnings, blocked }
+    PlanValidation { warnings, blocked, switch_repo }
 }
 
 /// Load a numeric workflow setting from SETTINGS#WORKFLOW.
