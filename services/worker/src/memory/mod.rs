@@ -243,6 +243,55 @@ impl AgentMemory {
         .await;
     }
 
+    /// Extract and store memories from a conversation summary using LLM extraction.
+    /// Uses the team's Anthropic API key if available, otherwise skips extraction.
+    pub async fn extract_from_conversation(
+        &mut self,
+        conversation_summary: &str,
+        api_key: Option<&str>,
+    ) {
+        let api_key = match api_key {
+            Some(k) if !k.is_empty() => k,
+            _ => {
+                info!("No API key for extraction, skipping LLM memory extraction");
+                return;
+            }
+        };
+
+        let config = mentedb_extraction::ExtractionConfig::anthropic(api_key);
+        let provider = match mentedb_extraction::HttpExtractionProvider::new(config.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "Failed to create extraction provider");
+                return;
+            }
+        };
+
+        let pipeline = mentedb_extraction::ExtractionPipeline::new(provider, config);
+        match pipeline
+            .extract_from_conversation(conversation_summary)
+            .await
+        {
+            Ok(memories) => {
+                info!(
+                    count = memories.len(),
+                    "Extracted memories from conversation"
+                );
+                for extracted in memories {
+                    let mem_type = mentedb_extraction::map_extraction_type_to_memory_type(
+                        &extracted.memory_type,
+                    );
+                    let tags = extracted.tags.clone();
+                    self.store_learning(&extracted.content, mem_type, tags)
+                        .await;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "LLM memory extraction failed, continuing without");
+            }
+        }
+    }
+
     /// Flush, close, upload to S3, and release the lock.
     pub async fn close_and_upload(
         mut self,

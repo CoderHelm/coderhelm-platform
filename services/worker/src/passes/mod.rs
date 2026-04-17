@@ -1,5 +1,5 @@
 use crate::agent::mcp;
-use crate::clients::email::{self, EmailEvent};
+use crate::clients::email;
 use crate::clients::github::GitHubClient;
 use crate::memory::AgentMemory;
 use crate::models::{TicketMessage, TicketSource, TokenUsage};
@@ -1280,6 +1280,21 @@ async fn run_passes(
             if security_result.passed { "passed" } else { "issues found" },
         ))
         .await;
+
+        // LLM-powered memory extraction (uses team's Anthropic key if available)
+        let conversation_summary =
+            format!(
+            "Issue: {}\nDescription: {}\nFiles modified: {:?}\nPR #{}\nReview: {}\nSecurity: {}",
+            msg.title,
+            msg.body.chars().take(2000).collect::<String>(),
+            impl_result.files_modified,
+            pr_result.pr_number,
+            if review_passed { "passed" } else { "issues found" },
+            if security_result.passed { "passed" } else { "issues found" },
+        );
+        mem.extract_from_conversation(&conversation_summary, provider.api_key())
+            .await;
+
         if let Err(e) = mem.close_and_upload(state).await {
             warn!(run_id, error = %e, "Failed to persist agent memory");
         }
@@ -1527,33 +1542,8 @@ async fn complete_run(
         .send()
         .await?;
 
-    // Send run-complete notification
-    let duration_str = format!("{}m {}s", duration / 60, duration % 60);
-    let total_tokens = usage.input_tokens + usage.output_tokens;
-    let tokens_str = if total_tokens >= 1_000_000 {
-        format!("{:.1}M", total_tokens as f64 / 1_000_000.0)
-    } else if total_tokens >= 1_000 {
-        format!("{:.1}k", total_tokens as f64 / 1_000.0)
-    } else {
-        total_tokens.to_string()
-    };
-    if let Err(e) = email::send_notification(
-        state,
-        &msg.team_id,
-        EmailEvent::RunComplete {
-            run_id: run_id.to_string(),
-            title: msg.title.clone(),
-            repo: format!("{}/{}", msg.repo_owner, msg.repo_name),
-            pr_url: pr.pr_url.clone(),
-            files_modified: impl_result.files_modified.len(),
-            duration: duration_str,
-            tokens: tokens_str,
-        },
-    )
-    .await
-    {
-        error!("Failed to send run-complete email: {e}");
-    }
+    // Check token usage against limit and send warning if needed
+    check_token_usage_warning(state, &msg.team_id, usage).await;
 
     Ok(())
 }
@@ -1617,21 +1607,8 @@ async fn fail_run(
             .await;
     }
 
-    // Send run-failed notification
-    if let Err(e) = email::send_notification(
-        state,
-        &msg.team_id,
-        EmailEvent::RunFailed {
-            run_id: run_id.to_string(),
-            title: msg.title.clone(),
-            repo: format!("{}/{}", msg.repo_owner, msg.repo_name),
-            error: error_msg[..error_msg.len().min(200)].to_string(),
-        },
-    )
-    .await
-    {
-        error!("Failed to send run-failed email: {e}");
-    }
+    // Check token usage against limit and send warning if needed
+    check_token_usage_warning(state, &msg.team_id, usage).await;
 
     // Comment on the GitHub issue so the user knows the run failed
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
@@ -2309,6 +2286,153 @@ async fn update_progress_comment(
         let body = format_progress(phase, run_id);
         if let Err(e) = github.edit_issue_comment(owner, repo, cid, &body).await {
             tracing::warn!(error = %e, "Failed to update progress comment");
+        }
+    }
+}
+
+async fn check_token_usage_warning(state: &WorkerState, team_id: &str, _usage: &TokenUsage) {
+    use crate::clients::email::EmailEvent;
+
+    // Get team's token limit
+    let limit = match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("SETTINGS#TOKEN_LIMIT".to_string()),
+        )
+        .send()
+        .await
+    {
+        Ok(r) => r
+            .item()
+            .and_then(|item| item.get("max_tokens"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0),
+        Err(_) => return,
+    };
+
+    if limit == 0 {
+        return;
+    }
+
+    // Get current month usage from analytics
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    let total_used = match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.analytics_table_name)
+        .key(
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
+        )
+        .key(
+            "period",
+            aws_sdk_dynamodb::types::AttributeValue::S(month.clone()),
+        )
+        .send()
+        .await
+    {
+        Ok(r) => {
+            let item = r.item();
+            let ti = item
+                .and_then(|i| i.get("total_tokens_in"))
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            let to = item
+                .and_then(|i| i.get("total_tokens_out"))
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            ti + to
+        }
+        Err(_) => return,
+    };
+
+    let usage_pct = ((total_used as f64 / limit as f64) * 100.0) as u8;
+
+    // Check if we already sent a warning this month (prevent spamming)
+    let warning_sk = format!(
+        "TOKEN_WARNING#{}#{}",
+        month,
+        if usage_pct >= 100 { "100" } else { "80" }
+    );
+    let already_sent = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S(warning_sk.clone()),
+        )
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .is_some();
+
+    if already_sent {
+        return;
+    }
+
+    fn format_tokens(n: u64) -> String {
+        if n >= 1_000_000 {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        } else if n >= 1_000 {
+            format!("{:.1}K", n as f64 / 1_000.0)
+        } else {
+            n.to_string()
+        }
+    }
+
+    let event = if usage_pct >= 100 {
+        Some(EmailEvent::TokenLimitReached {
+            month: month.clone(),
+            used_tokens: format_tokens(total_used),
+            limit_tokens: format_tokens(limit),
+        })
+    } else if usage_pct >= 80 {
+        Some(EmailEvent::TokenWarning80 {
+            month: month.clone(),
+            used_tokens: format_tokens(total_used),
+            limit_tokens: format_tokens(limit),
+            usage_pct,
+        })
+    } else {
+        None
+    };
+
+    if let Some(event) = event {
+        // Mark warning as sent
+        let _ = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.settings_table_name)
+            .item(
+                "pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
+            )
+            .item("sk", aws_sdk_dynamodb::types::AttributeValue::S(warning_sk))
+            .item(
+                "sent_at",
+                aws_sdk_dynamodb::types::AttributeValue::S(chrono::Utc::now().to_rfc3339()),
+            )
+            .send()
+            .await;
+
+        if let Err(e) = email::send_notification(state, team_id, event).await {
+            error!("Failed to send token warning email: {e}");
         }
     }
 }

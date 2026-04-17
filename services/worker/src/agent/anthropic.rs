@@ -126,6 +126,7 @@ pub async fn converse_simple(
     model_id: &str,
     system: &str,
     user_message: &str,
+    usage: &mut crate::models::TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let request = MessagesRequest {
         model: model_id.to_string(),
@@ -144,6 +145,12 @@ pub async fn converse_simple(
     };
 
     let resp = send_request(client, &request).await?;
+    usage.add(
+        resp.usage.input_tokens,
+        resp.usage.output_tokens,
+        resp.usage.cache_read_input_tokens,
+        resp.usage.cache_creation_input_tokens,
+    );
     extract_text(&resp.content)
 }
 

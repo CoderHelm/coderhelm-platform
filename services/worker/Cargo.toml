@@ -37,9 +37,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Agent memory
-mentedb = "0.2"
-mentedb-core = "0.2"
-mentedb-embedding = "0.2"
+mentedb = "0.5"
+mentedb-core = "0.5"
+mentedb-embedding = "0.5"
+mentedb-extraction = "0.5"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
 tar = "0.4"

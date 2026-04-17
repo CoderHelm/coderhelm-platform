@@ -220,7 +220,7 @@ pub async fn converse_simple(
         }
         ModelProvider::Anthropic { api_key, .. } => {
             let client = AnthropicClient::new(api_key.clone());
-            anthropic::converse_simple(&client, model_id, system_prompt, user_message).await
+            anthropic::converse_simple(&client, model_id, system_prompt, user_message, usage).await
         }
     }
 }

@@ -6,20 +6,16 @@ use crate::WorkerState;
 
 /// Notification event types that trigger emails.
 pub enum EmailEvent {
-    RunComplete {
-        run_id: String,
-        title: String,
-        repo: String,
-        pr_url: String,
-        files_modified: usize,
-        duration: String,
-        tokens: String,
+    TokenWarning80 {
+        month: String,
+        used_tokens: String,
+        limit_tokens: String,
+        usage_pct: u8,
     },
-    RunFailed {
-        run_id: String,
-        title: String,
-        repo: String,
-        error: String,
+    TokenLimitReached {
+        month: String,
+        used_tokens: String,
+        limit_tokens: String,
     },
 }
 
@@ -34,41 +30,33 @@ pub async fn send_notification(
     event: EmailEvent,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (template_suffix, pref_field, template_data) = match &event {
-        EmailEvent::RunComplete {
-            run_id,
-            title,
-            repo,
-            pr_url,
-            files_modified,
-            duration,
-            tokens,
+        EmailEvent::TokenWarning80 {
+            month,
+            used_tokens,
+            limit_tokens,
+            usage_pct,
         } => (
-            "run-complete",
-            "email_run_complete",
+            "token-warning",
+            "email_token_warning",
             json!({
-                "run_id": run_id,
-                "title": title,
-                "repo": repo,
-                "pr_url": pr_url,
-                "files_modified": files_modified,
-                "duration": duration,
-                "tokens": tokens,
+                "month": month,
+                "used_tokens": used_tokens,
+                "limit_tokens": limit_tokens,
+                "usage_pct": usage_pct,
             })
             .to_string(),
         ),
-        EmailEvent::RunFailed {
-            run_id,
-            title,
-            repo,
-            error,
+        EmailEvent::TokenLimitReached {
+            month,
+            used_tokens,
+            limit_tokens,
         } => (
-            "run-failed",
-            "email_run_failed",
+            "token-limit-reached",
+            "email_token_warning",
             json!({
-                "run_id": run_id,
-                "title": title,
-                "repo": repo,
-                "error": error,
+                "month": month,
+                "used_tokens": used_tokens,
+                "limit_tokens": limit_tokens,
             })
             .to_string(),
         ),
