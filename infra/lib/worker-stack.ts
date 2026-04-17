@@ -77,6 +77,7 @@ export class WorkerStack extends cdk.Stack {
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
         MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
         INFRA_TABLE_NAME: props.infraTable.tableName,
+        BILLING_TABLE_NAME: props.billingTable.tableName, // Retained for CF migration
         TRACES_TABLE_NAME: props.tracesTable.tableName,
         CHECKPOINTS_TABLE_NAME: props.checkpointsTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,

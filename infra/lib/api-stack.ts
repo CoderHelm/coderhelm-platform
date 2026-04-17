@@ -282,6 +282,7 @@ export class ApiStack extends cdk.Stack {
         AWS_INSIGHTS_TABLE_NAME: props.awsInsightsTable.tableName,
         MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
         INFRA_TABLE_NAME: props.infraTable.tableName,
+        BILLING_TABLE_NAME: props.billingTable.tableName, // Retained for CF migration
         BANNERS_TABLE_NAME: props.bannersTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
         WAITLIST_TABLE_NAME: props.waitlistTable.tableName,
