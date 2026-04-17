@@ -2414,7 +2414,11 @@ pub async fn plan_chat(
             if let Some(sid) = server_id {
                 mcp_servers_used.insert(sid);
             }
-            let model_result = compact_tool_result_for_model(&result);
+            let model_result = if is_empty_tool_result(&result) {
+                "No results found.".to_string()
+            } else {
+                compact_tool_result_for_model(&result)
+            };
             tool_results.push(json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
@@ -2586,10 +2590,11 @@ async fn run_anthropic_stream(
                                 active_tool_id = cb["id"].as_str().unwrap_or("").to_string();
                                 active_tool_name = cb["name"].as_str().unwrap_or("").to_string();
                                 active_tool_input.clear();
+                                let server = active_tool_name.split("__").next().unwrap_or("").to_string();
                                 let _ = tx
                                     .send(sse_event(
                                         "tool_start",
-                                        json!({"name": &active_tool_name}),
+                                        json!({"id": &active_tool_id, "name": &active_tool_name, "server": server}),
                                     ))
                                     .await;
                             }
@@ -2700,7 +2705,7 @@ async fn run_anthropic_stream(
             let _ = tx
                 .send(sse_event(
                     "tool_call",
-                    json!({"name": tu_name, "input": input}),
+                    json!({"id": tu_id, "name": tu_name, "input": input}),
                 ))
                 .await;
 
@@ -2715,12 +2720,23 @@ async fn run_anthropic_stream(
             } else {
                 json!(format!("Unknown tool: {tu_name}"))
             };
-            let result_str = compact_tool_result_for_model(&result);
-            let summary = summarize_tool_result(&result);
+            let is_error = result.as_str().map(|s| s.starts_with("Error:")).unwrap_or(false);
+            let is_empty = is_empty_tool_result(&result);
+            let result_str = if is_empty {
+                "No results found.".to_string()
+            } else {
+                compact_tool_result_for_model(&result)
+            };
+            let summary = if is_empty {
+                "No results found".to_string()
+            } else {
+                summarize_tool_result(&result)
+            };
+            let status = if is_error { "error" } else { "success" };
             let _ = tx
                 .send(sse_event(
                     "tool_result",
-                    json!({"name": tu_name, "summary": summary}),
+                    json!({"id": tu_id, "name": tu_name, "status": status, "summary": summary}),
                 ))
                 .await;
 
@@ -2869,6 +2885,24 @@ pub async fn plan_chat_stream(
             .interval(std::time::Duration::from_secs(15))
             .text(""),
     ))
+}
+
+/// Check if a tool result is effectively empty (no meaningful data returned).
+fn is_empty_tool_result(result: &Value) -> bool {
+    // Notion-style: {"object":"list","results":[]}
+    if let Some(arr) = result.get("results").and_then(|v| v.as_array()) {
+        if arr.is_empty() {
+            return true;
+        }
+    }
+    // Generic empty array/object or null
+    match result {
+        Value::Null => true,
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        Value::String(s) => s.is_empty() || s == "null" || s == "[]" || s == "{}",
+        _ => false,
+    }
 }
 
 /// Produce a short summary of a tool result for the UI.
