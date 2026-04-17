@@ -888,6 +888,34 @@ pub async fn github_callback(
                 team_id = %claims.team_id,
                 "Linked GitHub installation to team"
             );
+
+            // Sync repos from the installation (only add repos not already present)
+            let repos = super::github_webhook::fetch_installation_repos(&state, *inst_id).await;
+            for repo in &repos {
+                let full = format!("{}/{}", repo.owner, repo.name);
+                let _ = state
+                    .dynamo
+                    .put_item()
+                    .table_name(&state.config.repos_table_name)
+                    .item("pk", attr_s(&claims.team_id))
+                    .item("sk", attr_s(&format!("REPO#{full}")))
+                    .item("repo_name", attr_s(&full))
+                    .item(
+                        "enabled",
+                        aws_sdk_dynamodb::types::AttributeValue::Bool(false),
+                    )
+                    .item("ticket_source", attr_s("github"))
+                    .item("created_at", attr_s(&now))
+                    .condition_expression("attribute_not_exists(pk)")
+                    .send()
+                    .await;
+            }
+            info!(
+                installation_id = inst_id,
+                repos_synced = repos.len(),
+                team_id = %claims.team_id,
+                "Synced repos for connected GitHub installation"
+            );
         }
 
         // Re-issue JWT with github_login (keep the user's existing team)
