@@ -498,16 +498,28 @@ async fn run_passes(
     update_pass(state, &msg.team_id, run_id, "plan").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let plan_result = plan::run(
-        state,
-        msg,
-        &github,
-        &triage_result,
-        &repo_instructions,
-        &provider,
-        usage,
-    )
-    .await?;
+
+    // Try to reuse existing plan from S3 (same ticket, no changes)
+    let existing_plan = load_existing_plan(state, &msg.team_id, &msg.ticket_id).await;
+    let plan_result = if let Some(plan) = existing_plan {
+        // Reuse if plan has content AND has unchecked tasks (not a completed plan from a previous run)
+        let has_unchecked = plan.tasks.contains("- [ ]");
+        if !plan.tasks.is_empty() && !plan.design.is_empty() && has_unchecked {
+            info!(run_id, "Reusing existing plan from S3 — ticket unchanged");
+            add_progress_note(state, &msg.team_id, run_id, "Reused existing plan").await;
+            plan
+        } else {
+            plan::run(
+                state, msg, &github, &triage_result, &repo_instructions, &provider, usage,
+            )
+            .await?
+        }
+    } else {
+        plan::run(
+            state, msg, &github, &triage_result, &repo_instructions, &provider, usage,
+        )
+        .await?
+    };
     write_pass_trace(
         state,
         &msg.team_id,
@@ -2738,4 +2750,48 @@ async fn lookup_jira_project_repo(
         .and_then(|v| v.as_s().ok())
         .filter(|s| !s.is_empty())
         .cloned()
+}
+
+/// Load an existing plan from S3 if one was already generated for this ticket.
+/// Returns None if no plan exists or any file is missing.
+async fn load_existing_plan(
+    state: &WorkerState,
+    team_id: &str,
+    ticket_id: &str,
+) -> Option<plan::PlanResult> {
+    let prefix = format!(
+        "teams/{}/runs/{}/openspec",
+        team_id,
+        ticket_id.to_lowercase()
+    );
+
+    let mut files = std::collections::HashMap::new();
+    for name in &["proposal.md", "design.md", "tasks.md", "spec.md"] {
+        let key = format!("{prefix}/{name}");
+        match state
+            .s3
+            .get_object()
+            .bucket(&state.config.bucket_name)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(output) => {
+                let bytes = output.body.collect().await.ok()?;
+                let text = String::from_utf8(bytes.to_vec()).ok()?;
+                if text.trim().is_empty() {
+                    return None;
+                }
+                files.insert(*name, text);
+            }
+            Err(_) => return None,
+        }
+    }
+
+    Some(plan::PlanResult {
+        proposal: files.remove("proposal.md").unwrap_or_default(),
+        design: files.remove("design.md").unwrap_or_default(),
+        tasks: files.remove("tasks.md").unwrap_or_default(),
+        spec: files.remove("spec.md").unwrap_or_default(),
+    })
 }
