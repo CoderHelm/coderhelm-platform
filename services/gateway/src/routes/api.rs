@@ -289,7 +289,7 @@ pub async fn switch_team(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let cookie = format!(
-        "coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
     );
 
     Ok((

@@ -1507,6 +1507,7 @@ async fn complete_run(
 
     // Send run-complete notification
     let duration_str = format!("{}m {}s", duration / 60, duration % 60);
+    let total_tokens = usage.input_tokens + usage.output_tokens;
     let tokens_str = if total_tokens >= 1_000_000 {
         format!("{:.1}M", total_tokens as f64 / 1_000_000.0)
     } else if total_tokens >= 1_000 {
