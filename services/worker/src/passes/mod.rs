@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
 use crate::agent::mcp;
 use crate::clients::email;
 use crate::clients::github::GitHubClient;
@@ -6,6 +10,34 @@ use crate::models::{TicketMessage, TicketSource, TokenUsage};
 use crate::WorkerState;
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{error, info, warn};
+
+/// In-memory file read cache shared across passes within a single run.
+/// Avoids re-fetching the same files from GitHub when review/security
+/// re-reads files that implement already loaded.
+#[derive(Clone, Default)]
+pub struct FileCache {
+    inner: Arc<RwLock<HashMap<String, String>>>,
+}
+
+impl FileCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn get(&self, key: &str) -> Option<String> {
+        self.inner.read().await.get(key).cloned()
+    }
+
+    pub async fn insert(&self, key: String, value: String) {
+        self.inner.write().await.insert(key, value);
+    }
+
+    pub async fn remove(&self, key: &str) {
+        self.inner.write().await.remove(key);
+    }
+}
 
 /// Strip internal model IDs, Bedrock details, and service names from error messages
 /// so they are safe to display to users.
@@ -233,6 +265,9 @@ async fn run_passes(
         &msg.team_id,
     )
     .await;
+
+    // File read cache shared across passes to avoid redundant GitHub fetches
+    let file_cache = FileCache::new();
 
     // Pre-run budget gate: reject if monthly token limit exceeded
     if let Some(reason) = check_budget_exceeded(state, &msg.team_id).await {
@@ -800,6 +835,7 @@ async fn run_passes(
             &triage_result.complexity,
             &provider,
             usage,
+            &file_cache,
         )
         .await?;
         write_pass_trace(
@@ -967,6 +1003,7 @@ async fn run_passes(
                     &triage_result.complexity,
                     &provider,
                     usage,
+                    &file_cache,
                 )
                 .await?;
                 continue; // Re-test on next cycle
@@ -992,6 +1029,7 @@ async fn run_passes(
             &repo_instructions,
             &provider,
             usage,
+            &file_cache,
         )
         .await
         {
@@ -1074,6 +1112,7 @@ async fn run_passes(
             &triage_result.complexity,
             &provider,
             usage,
+            &file_cache,
         )
         .await?;
     }
@@ -1092,6 +1131,7 @@ async fn run_passes(
         &repo_instructions,
         &provider,
         usage,
+        &file_cache,
     )
     .await
     {
@@ -1162,6 +1202,7 @@ async fn run_passes(
             &triage_result.complexity,
             &provider,
             usage,
+            &file_cache,
         )
         .await?;
 
@@ -1177,6 +1218,7 @@ async fn run_passes(
             &repo_instructions,
             &provider,
             usage,
+            &file_cache,
         )
         .await
         {

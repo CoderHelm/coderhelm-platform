@@ -9,6 +9,7 @@ use crate::agent::provider::ModelProvider;
 use crate::clients::github::{FileOp, GitHubClient};
 use crate::models::{TicketMessage, TokenUsage};
 use crate::passes::plan::PlanResult;
+use crate::passes::FileCache;
 use crate::WorkerState;
 
 pub struct ImplementResult {
@@ -28,6 +29,7 @@ pub async fn run(
     complexity: &str,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
+    file_cache: &FileCache,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
     // Trim repo instructions for simple issues to reduce per-turn token cost
@@ -195,6 +197,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             branch: branch.to_string(),
             files_modified: std::sync::Mutex::new(HashSet::new()),
             task_tracker: &task_tracker,
+            file_cache,
         },
         mcp_plugins: &loaded_mcp_plugins,
         lambda: &state.lambda,
@@ -419,6 +422,7 @@ struct WriteToolExecutor<'a> {
     branch: String,
     files_modified: std::sync::Mutex<HashSet<String>>,
     task_tracker: &'a TaskTracker,
+    file_cache: &'a FileCache,
 }
 
 #[async_trait::async_trait]
@@ -446,10 +450,17 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
-                let content = self
-                    .github
-                    .read_file(&self.owner, &self.repo, path, &self.branch)
-                    .await?;
+                let cache_key = format!("{}:{}", self.branch, path);
+                let content = if let Some(cached) = self.file_cache.get(&cache_key).await {
+                    cached
+                } else {
+                    let fetched = self
+                        .github
+                        .read_file(&self.owner, &self.repo, path, &self.branch)
+                        .await?;
+                    self.file_cache.insert(cache_key, fetched.clone()).await;
+                    fetched
+                };
                 Ok(json!(super::truncate_content(&content, path)))
             }
             "read_file_lines" => {
@@ -539,6 +550,9 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     )
                     .await?;
                 self.files_modified.lock().unwrap().insert(path.to_string());
+                self.file_cache
+                    .remove(&format!("{}:{}", self.branch, path))
+                    .await;
                 self.task_tracker.mark_files_done(&[path]).await;
                 Ok(json!(format!("Wrote {path}")))
             }
@@ -575,6 +589,9 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                         });
                     }
                     self.files_modified.lock().unwrap().insert(path.to_string());
+                    self.file_cache
+                        .remove(&format!("{}:{}", self.branch, path))
+                        .await;
                 }
                 if ops.is_empty() {
                     return Ok(json!(format!(

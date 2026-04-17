@@ -7,6 +7,7 @@ use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
 use crate::passes::plan::PlanResult;
+use crate::passes::FileCache;
 use crate::WorkerState;
 
 /// Structured result from the review pass.
@@ -26,6 +27,7 @@ pub async fn run(
     repo_instructions: &str,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
+    file_cache: &FileCache,
 ) -> Result<ReviewResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
     let instructions_block = super::format_instructions_block(repo_instructions);
@@ -65,6 +67,7 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
         owner: &msg.repo_owner,
         repo: &msg.repo_name,
         branch,
+        file_cache,
     };
 
     let mut messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
@@ -158,6 +161,7 @@ struct ReviewToolExecutor<'a> {
     owner: &'a str,
     repo: &'a str,
     branch: &'a str,
+    file_cache: &'a FileCache,
 }
 
 #[async_trait::async_trait]
@@ -201,10 +205,17 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
-                let content = self
-                    .github
-                    .read_file(self.owner, self.repo, path, self.branch)
-                    .await?;
+                let cache_key = format!("{}:{}", self.branch, path);
+                let content = if let Some(cached) = self.file_cache.get(&cache_key).await {
+                    cached
+                } else {
+                    let fetched = self
+                        .github
+                        .read_file(self.owner, self.repo, path, self.branch)
+                        .await?;
+                    self.file_cache.insert(cache_key, fetched.clone()).await;
+                    fetched
+                };
                 Ok(json!(super::truncate_content(&content, path)))
             }
             "read_file_lines" => {

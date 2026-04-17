@@ -272,21 +272,21 @@ pub async fn converse_with_opts(
             let model_limit: u64 = 200_000;
             let context_pct = input_tokens as f64 / model_limit as f64;
 
-            if context_pct > 0.90 {
+            if context_pct > 0.80 {
                 // Tier 3: Emergency — clear all tool results except last 3 turns
                 info!(
                     "Context at {:.0}%, emergency compaction (clearing all but last 3 turns)",
                     context_pct * 100.0
                 );
                 clear_old_tool_results(messages, 3);
-            } else if context_pct > 0.75 {
+            } else if context_pct > 0.60 {
                 // Tier 2: Aggressive — clear tool results older than last 5 turns
                 info!(
                     "Context at {:.0}%, clearing old tool results (keeping last 5 turns)",
                     context_pct * 100.0
                 );
                 clear_old_tool_results(messages, 5);
-            } else if context_pct > 0.60 {
+            } else if context_pct > 0.40 {
                 // Tier 1: Gentle — clear tool results older than last 8 turns
                 clear_old_tool_results(messages, 8);
             }

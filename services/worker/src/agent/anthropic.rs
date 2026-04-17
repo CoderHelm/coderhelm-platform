@@ -247,19 +247,19 @@ pub async fn converse_tool_loop(
         let input_tokens = response.usage.input_tokens;
         let model_limit: u64 = 200_000;
         let context_pct = input_tokens as f64 / model_limit as f64;
-        if context_pct > 0.90 {
+        if context_pct > 0.80 {
             info!(
                 "Context at {:.0}%, emergency compaction",
                 context_pct * 100.0
             );
             compact_messages(messages, 3);
-        } else if context_pct > 0.75 {
+        } else if context_pct > 0.60 {
             info!(
                 "Context at {:.0}%, aggressive compaction",
                 context_pct * 100.0
             );
             compact_messages(messages, 5);
-        } else if context_pct > 0.60 {
+        } else if context_pct > 0.40 {
             compact_messages(messages, 8);
         }
 
