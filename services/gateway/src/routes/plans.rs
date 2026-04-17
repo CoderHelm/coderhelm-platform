@@ -1948,69 +1948,6 @@ fn strip_plan_json(content: &str) -> String {
     result
 }
 
-/// Enable MCP tools only when the latest user message explicitly asks for external/tool context.
-fn should_enable_plan_mcp_tools(messages_input: &[Value]) -> bool {
-    let last_user = messages_input
-        .iter()
-        .rev()
-        .find(|m| m["role"].as_str() == Some("user"))
-        .and_then(|m| m["content"].as_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    if last_user.is_empty() {
-        return false;
-    }
-
-    // Multi-word triggers matched via simple substring (low false-positive risk)
-    let phrase_triggers = ["from docs", "search docs"];
-    if phrase_triggers.iter().any(|t| last_user.contains(t)) {
-        return true;
-    }
-
-    // Single-word triggers matched with word boundaries to avoid false positives
-    // (e.g. "notion" as a common English word)
-    let word_triggers = [
-        "mcp",
-        "notion",
-        "linear",
-        "sentry",
-        "figma",
-        "vercel",
-        "posthog",
-        "gitlab",
-        "neon",
-        "turso",
-        "snyk",
-        "launchdarkly",
-        "mongodb",
-        "grafana",
-        "redis",
-        "upstash",
-        "sanity",
-    ];
-
-    word_triggers.iter().any(|t| {
-        // Find all occurrences and check word boundaries
-        let bytes = last_user.as_bytes();
-        let tbytes = t.as_bytes();
-        let mut start = 0;
-        while let Some(pos) = last_user[start..].find(t) {
-            let abs = start + pos;
-            let before_ok =
-                abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
-            let after_pos = abs + tbytes.len();
-            let after_ok =
-                after_pos >= bytes.len() || !bytes[after_pos].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                return true;
-            }
-            start = abs + 1;
-        }
-        false
-    })
-}
-
 /// Shared context for plan chat — loaded once, used by both streaming and non-streaming.
 struct PlanChatContext {
     system_prompt: String,
@@ -2025,7 +1962,6 @@ async fn load_plan_chat_context(
     team_id: &str,
     messages_input: &[Value],
 ) -> Result<PlanChatContext, StatusCode> {
-    let enable_mcp_tools = should_enable_plan_mcp_tools(messages_input);
 
     // Load org context, repo list, log analyzer flag, enabled plugins, and templates in parallel
     let (
@@ -2115,10 +2051,10 @@ async fn load_plan_chat_context(
         None
     };
 
-    // Load MCP tool definitions from S3 cache
+    // Load MCP tool definitions from S3 cache (always load — let the model decide when to use them)
     let mut mcp_tools: Vec<McpToolDef> = Vec::new();
     let mcp_proxy_fn = &state.config.mcp_proxy_function_name;
-    if enable_mcp_tools && !mcp_proxy_fn.is_empty() {
+    if !mcp_proxy_fn.is_empty() {
         let cache_futures: Vec<_> = enabled_plugins
             .iter()
             .filter(|(_, has_creds, _)| *has_creds)
@@ -2180,10 +2116,13 @@ async fn load_plan_chat_context(
             })
             .collect();
         system_prompt.push_str(&format!(
-            "\n\nYou have tool-call access to the following MCP servers right now. \
-             Use tools ONLY when the user explicitly asks to use MCP/tools or requests \
-             information from an external connected system.\n\
-             Do NOT call tools by default for normal planning requests.\n\
+            "\n\nYou have tool-call access to the following MCP servers.\n\
+             IMPORTANT tool-use rules:\n\
+             - Only call a tool when the user's request genuinely requires external data \
+             (e.g. \"pull the tasks from Notion\", \"check Sentry for errors\").\n\
+             - NEVER call tools on greetings, general planning questions, or when the user \
+             has not referenced an external system.\n\
+             - If a tool returns no results, do NOT retry — tell the user and continue planning.\n\
              \n\
              Connected servers:\n{}",
             plugin_lines.join("\n")
