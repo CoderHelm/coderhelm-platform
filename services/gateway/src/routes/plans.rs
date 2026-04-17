@@ -2564,7 +2564,7 @@ async fn run_anthropic_stream(
                                     if let Some(text) = delta["text"].as_str() {
                                         assistant_text.push_str(text);
                                         let _ =
-                                            tx.send(sse_event("text", json!({"text": text}))).await;
+                                            tx.send(sse_event("text_delta", json!({"text": text}))).await;
                                     }
                                 }
                                 Some("input_json_delta") => {
