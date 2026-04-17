@@ -1,7 +1,7 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{info, warn};
 
-use crate::models::InfraAnalyzeMessage;
+use crate::models::{InfraAnalyzeMessage, TokenUsage};
 use crate::WorkerState;
 
 /// System prompt for infra analysis.
@@ -278,6 +278,7 @@ architecture-beta
 pub async fn run(
     state: &WorkerState,
     msg: InfraAnalyzeMessage,
+    usage: &mut TokenUsage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. Get team to find installation_id + repos
     let team = get_team(state, &msg.team_id).await?;
@@ -317,7 +318,7 @@ pub async fn run(
 
     // 3. Call Bedrock to analyze and generate diagram + findings
     let code_context = format_code_context(&infra_code);
-    let response = call_bedrock(state, &code_context).await?;
+    let response = call_bedrock(state, &code_context, usage).await?;
 
     // 4. Parse response
     let (diagram, findings_json) = parse_response(&response);
@@ -327,7 +328,7 @@ pub async fn run(
         Some(d) if validate_diagram(d).is_err() => {
             let errs = validate_diagram(d).unwrap_err();
             warn!(team_id = %msg.team_id, errors = %errs, "Diagram validation failed, retrying");
-            let retry = call_bedrock_retry(state, &code_context, d, &errs).await?;
+            let retry = call_bedrock_retry(state, &code_context, d, &errs, usage).await?;
             let (retry_diagram, retry_findings) = parse_response(&retry);
             let rd = retry_diagram.unwrap_or_default();
             let rf =
@@ -600,6 +601,7 @@ fn format_code_context(infra_code: &[(String, String)]) -> String {
 async fn call_bedrock(
     state: &WorkerState,
     code_context: &str,
+    usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let prompt = format!(
         "Analyze this infrastructure code and generate the diagram and findings:\n\n{code_context}"
@@ -614,12 +616,27 @@ async fn call_bedrock(
     let response = crate::agent::llm::converse_with_retry(
         &state.bedrock,
         &state.config.light_model_id,
-        vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
-            SYSTEM.to_string(),
-        )],
+        vec![
+            aws_sdk_bedrockruntime::types::SystemContentBlock::Text(SYSTEM.to_string()),
+            aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
+                aws_sdk_bedrockruntime::types::CachePointBlock::builder()
+                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
+                    .build()
+                    .unwrap(),
+            ),
+        ],
         messages,
     )
     .await?;
+
+    if let Some(u) = response.usage() {
+        usage.add(
+            u.input_tokens() as u64,
+            u.output_tokens() as u64,
+            u.cache_read_input_tokens().unwrap_or(0) as u64,
+            u.cache_write_input_tokens().unwrap_or(0) as u64,
+        );
+    }
 
     let text = match response.output() {
         Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg
@@ -645,6 +662,7 @@ async fn call_bedrock_retry(
     code_context: &str,
     bad_diagram: &str,
     errors: &str,
+    usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let prompt = format!(
         "Analyze this infrastructure code and generate the diagram and findings:\n\n{code_context}"
@@ -678,12 +696,27 @@ async fn call_bedrock_retry(
     let response = crate::agent::llm::converse_with_retry(
         &state.bedrock,
         &state.config.light_model_id,
-        vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
-            SYSTEM.to_string(),
-        )],
+        vec![
+            aws_sdk_bedrockruntime::types::SystemContentBlock::Text(SYSTEM.to_string()),
+            aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
+                aws_sdk_bedrockruntime::types::CachePointBlock::builder()
+                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
+                    .build()
+                    .unwrap(),
+            ),
+        ],
         messages,
     )
     .await?;
+
+    if let Some(u) = response.usage() {
+        usage.add(
+            u.input_tokens() as u64,
+            u.output_tokens() as u64,
+            u.cache_read_input_tokens().unwrap_or(0) as u64,
+            u.cache_write_input_tokens().unwrap_or(0) as u64,
+        );
+    }
 
     let text = match response.output() {
         Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => msg

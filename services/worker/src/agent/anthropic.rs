@@ -133,7 +133,9 @@ pub async fn converse_simple(
         max_tokens: 16384,
         system: vec![SystemBlock::Text {
             text: system.to_string(),
-            cache_control: None,
+            cache_control: Some(CacheControl {
+                r#type: "ephemeral".to_string(),
+            }),
         }],
         messages: vec![ApiMessage {
             role: "user".to_string(),

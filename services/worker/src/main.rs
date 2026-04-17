@@ -125,7 +125,8 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
             }
             models::WorkerMessage::Onboard(msg) => {
                 info!(team_id = %msg.team_id, repos = msg.repos.len(), "Processing onboard");
-                if let Err(e) = passes::onboard::run(&state, msg).await {
+                let mut usage = models::TokenUsage::default();
+                if let Err(e) = passes::onboard::run(&state, msg, &mut usage).await {
                     error!("Onboard failed: {e}");
                 }
             }
@@ -150,7 +151,8 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
             models::WorkerMessage::InfraAnalyze(msg) => {
                 info!(team_id = %msg.team_id, "Analyzing infrastructure");
                 let team_id = msg.team_id.clone();
-                if let Err(e) = passes::infra_analyze::run(&state, msg).await {
+                let mut usage = models::TokenUsage::default();
+                if let Err(e) = passes::infra_analyze::run(&state, msg, &mut usage).await {
                     error!("Infra analyze failed: {e}");
                     // Store failed status so the dashboard can show the error
                     let now = chrono::Utc::now().to_rfc3339();

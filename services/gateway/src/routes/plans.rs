@@ -2283,6 +2283,8 @@ pub async fn plan_chat(
                         &team_id_clone,
                         total_input_tokens,
                         total_output_tokens,
+                        0,
+                        0,
                     )
                     .await;
                 });
@@ -2328,6 +2330,8 @@ pub async fn plan_chat(
                         &team_id_clone,
                         total_input_tokens,
                         total_output_tokens,
+                        0,
+                        0,
                     )
                     .await;
                 });
@@ -2416,6 +2420,8 @@ pub async fn plan_chat(
                 &team_id_clone,
                 total_input_tokens,
                 total_output_tokens,
+                0,
+                0,
             )
             .await;
         });
@@ -2456,6 +2462,8 @@ async fn run_anthropic_stream(
     let max_turns = 5;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    let mut cache_read_tokens: u64 = 0;
+    let mut cache_write_tokens: u64 = 0;
 
     // Convert Bedrock messages to Anthropic format
     fn bedrock_msg_to_json(msg: &aws_sdk_bedrockruntime::types::Message) -> Value {
@@ -2661,6 +2669,9 @@ async fn run_anthropic_stream(
                     Some("message_start") => {
                         if let Some(u) = event.get("message").and_then(|m| m.get("usage")) {
                             total_input_tokens += u["input_tokens"].as_u64().unwrap_or(0);
+                            cache_read_tokens += u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                            cache_write_tokens +=
+                                u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                         }
                     }
                     _ => {}
@@ -2711,7 +2722,15 @@ async fn run_anthropic_stream(
             let state_c = state.clone();
             let tid = team_id.to_string();
             tokio::spawn(async move {
-                track_chat_tokens(&state_c, &tid, total_input_tokens, total_output_tokens).await;
+                track_chat_tokens(
+                    &state_c,
+                    &tid,
+                    total_input_tokens,
+                    total_output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                )
+                .await;
             });
             return;
         }
@@ -2786,7 +2805,15 @@ async fn run_anthropic_stream(
     let state_c = state.clone();
     let tid = team_id.to_string();
     tokio::spawn(async move {
-        track_chat_tokens(&state_c, &tid, total_input_tokens, total_output_tokens).await;
+        track_chat_tokens(
+            &state_c,
+            &tid,
+            total_input_tokens,
+            total_output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        )
+        .await;
     });
 }
 
@@ -2940,6 +2967,8 @@ pub async fn plan_chat_stream(
         let max_turns = 5;
         let mut total_input_tokens: u64 = 0;
         let mut total_output_tokens: u64 = 0;
+        let mut cache_read_tokens: u64 = 0;
+        let mut cache_write_tokens: u64 = 0;
         let mut mcp_servers_used: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
@@ -3084,6 +3113,10 @@ pub async fn plan_chat_stream(
                             if let Some(usage) = e.usage() {
                                 total_input_tokens += usage.input_tokens() as u64;
                                 total_output_tokens += usage.output_tokens() as u64;
+                                cache_read_tokens +=
+                                    usage.cache_read_input_tokens().unwrap_or(0) as u64;
+                                cache_write_tokens +=
+                                    usage.cache_write_input_tokens().unwrap_or(0) as u64;
                             }
                         }
                         _ => {}
@@ -3124,6 +3157,8 @@ pub async fn plan_chat_stream(
                         &team_id_clone,
                         total_input_tokens,
                         total_output_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
                     )
                     .await;
                 });
@@ -3253,6 +3288,8 @@ pub async fn plan_chat_stream(
                 &team_id_clone,
                 total_input_tokens,
                 total_output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
             )
             .await;
         });
@@ -3280,7 +3317,14 @@ fn summarize_tool_result(result: &Value) -> String {
         format!("{}…", &s[..77])
     }
 }
-async fn track_chat_tokens(state: &AppState, team_id: &str, input_tokens: u64, output_tokens: u64) {
+async fn track_chat_tokens(
+    state: &AppState,
+    team_id: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+) {
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     for period in &[month.as_str(), "ALL_TIME"] {
         let _ = state
@@ -3289,9 +3333,13 @@ async fn track_chat_tokens(state: &AppState, team_id: &str, input_tokens: u64, o
             .table_name(&state.config.analytics_table_name)
             .key("team_id", attr_s(team_id))
             .key("period", attr_s(period))
-            .update_expression("ADD total_tokens_in :tin, total_tokens_out :tout")
+            .update_expression(
+                "ADD total_tokens_in :tin, total_tokens_out :tout, cache_read_tokens :cr, cache_write_tokens :cw",
+            )
             .expression_attribute_values(":tin", attr_n(input_tokens))
             .expression_attribute_values(":tout", attr_n(output_tokens))
+            .expression_attribute_values(":cr", attr_n(cache_read_tokens))
+            .expression_attribute_values(":cw", attr_n(cache_write_tokens))
             .send()
             .await;
     }

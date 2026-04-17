@@ -2,13 +2,14 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{error, info, warn};
 
 use crate::clients::github::GitHubClient;
-use crate::models::OnboardMessage;
+use crate::models::{OnboardMessage, TokenUsage};
 use crate::WorkerState;
 
 /// Run onboard pass: analyze each repo and commit .coderhelm/AGENTS.md.
 pub async fn run(
     state: &WorkerState,
     msg: OnboardMessage,
+    usage: &mut TokenUsage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
         team_id = %msg.team_id,
@@ -42,6 +43,7 @@ pub async fn run(
             &msg.team_id,
             &global_instructions,
             &repo_instructions,
+            usage,
         )
         .await
         {
@@ -106,7 +108,7 @@ pub async fn run(
 
         // Use Bedrock to generate a proper org-level summary
         let global_content = if !repo_summaries.is_empty() {
-            match generate_global_context(state, &enabled_repos, &repo_summaries).await {
+            match generate_global_context(state, &enabled_repos, &repo_summaries, usage).await {
                 Ok(content) => content,
                 Err(e) => {
                     warn!(error = %e, "Failed to generate global context via Bedrock, using fallback");
@@ -147,6 +149,7 @@ async fn onboard_repo(
     team_id: &str,
     global_instructions: &str,
     repo_instructions: &str,
+    usage: &mut TokenUsage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let full_name = format!("{}/{}", repo.owner, repo.name);
     info!(repo = %full_name, "Onboarding repo");
@@ -246,6 +249,15 @@ async fn onboard_repo(
     .await
     .map_err(|e| format!("Bedrock converse failed: {e:#}"))?;
 
+    if let Some(u) = response.usage() {
+        usage.add(
+            u.input_tokens() as u64,
+            u.output_tokens() as u64,
+            u.cache_read_input_tokens().unwrap_or(0) as u64,
+            u.cache_write_input_tokens().unwrap_or(0) as u64,
+        );
+    }
+
     let agents_md = extract_text_from_response(&response)?;
 
     // Store AGENTS.md in DynamoDB (not committed to repo)
@@ -268,7 +280,7 @@ async fn onboard_repo(
     info!(repo = %full_name, "Stored AGENTS.md in DynamoDB");
 
     // Generate and store VOICE.md in DynamoDB
-    if let Err(e) = generate_voice_md(state, github, repo, team_id).await {
+    if let Err(e) = generate_voice_md(state, github, repo, team_id, usage).await {
         warn!(repo = %full_name, error = %e, "Failed to generate VOICE.md");
     }
 
@@ -297,6 +309,7 @@ async fn generate_voice_md(
     github: &GitHubClient,
     repo: &crate::models::OnboardRepo,
     team_id: &str,
+    usage: &mut TokenUsage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let full_name = format!("{}/{}", repo.owner, repo.name);
 
@@ -364,12 +377,27 @@ async fn generate_voice_md(
     let response = crate::agent::llm::converse_with_retry(
         &state.bedrock,
         &state.config.light_model_id,
-        vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
-            system.to_string(),
-        )],
+        vec![
+            aws_sdk_bedrockruntime::types::SystemContentBlock::Text(system.to_string()),
+            aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
+                aws_sdk_bedrockruntime::types::CachePointBlock::builder()
+                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
+                    .build()
+                    .unwrap(),
+            ),
+        ],
         messages,
     )
     .await?;
+
+    if let Some(u) = response.usage() {
+        usage.add(
+            u.input_tokens() as u64,
+            u.output_tokens() as u64,
+            u.cache_read_input_tokens().unwrap_or(0) as u64,
+            u.cache_write_input_tokens().unwrap_or(0) as u64,
+        );
+    }
 
     let voice_md = extract_text_from_response(&response)?;
 
@@ -398,6 +426,7 @@ async fn generate_global_context(
     state: &WorkerState,
     repo_names: &[String],
     repo_summaries: &[String],
+    usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let system = "You generate a concise Organization Agent Context document. \
                   Given summaries of each repository, produce a markdown document that:\n\
@@ -427,12 +456,27 @@ async fn generate_global_context(
     let response = crate::agent::llm::converse_with_retry(
         &state.bedrock,
         &state.config.light_model_id,
-        vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
-            system.to_string(),
-        )],
+        vec![
+            aws_sdk_bedrockruntime::types::SystemContentBlock::Text(system.to_string()),
+            aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
+                aws_sdk_bedrockruntime::types::CachePointBlock::builder()
+                    .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
+                    .build()
+                    .unwrap(),
+            ),
+        ],
         messages,
     )
     .await?;
+
+    if let Some(u) = response.usage() {
+        usage.add(
+            u.input_tokens() as u64,
+            u.output_tokens() as u64,
+            u.cache_read_input_tokens().unwrap_or(0) as u64,
+            u.cache_write_input_tokens().unwrap_or(0) as u64,
+        );
+    }
 
     extract_text_from_response(&response)
 }

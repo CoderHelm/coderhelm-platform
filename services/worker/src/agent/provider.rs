@@ -193,9 +193,15 @@ pub async fn converse_simple(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     match provider {
         ModelProvider::Bedrock => {
-            let system_blocks = vec![aws_sdk_bedrockruntime::types::SystemContentBlock::Text(
-                system_prompt.to_string(),
-            )];
+            let system_blocks = vec![
+                aws_sdk_bedrockruntime::types::SystemContentBlock::Text(system_prompt.to_string()),
+                aws_sdk_bedrockruntime::types::SystemContentBlock::CachePoint(
+                    aws_sdk_bedrockruntime::types::CachePointBlock::builder()
+                        .r#type(aws_sdk_bedrockruntime::types::CachePointType::Default)
+                        .build()
+                        .unwrap(),
+                ),
+            ];
             let messages = vec![aws_sdk_bedrockruntime::types::Message::builder()
                 .role(aws_sdk_bedrockruntime::types::ConversationRole::User)
                 .content(aws_sdk_bedrockruntime::types::ContentBlock::Text(
@@ -207,7 +213,12 @@ pub async fn converse_simple(
                 llm::converse_with_retry(&state.bedrock, model_id, system_blocks, messages).await?;
             // Track usage
             if let Some(u) = response.usage() {
-                usage.add(u.input_tokens() as u64, u.output_tokens() as u64, 0, 0);
+                usage.add(
+                    u.input_tokens() as u64,
+                    u.output_tokens() as u64,
+                    u.cache_read_input_tokens().unwrap_or(0) as u64,
+                    u.cache_write_input_tokens().unwrap_or(0) as u64,
+                );
             }
             // Extract text
             response

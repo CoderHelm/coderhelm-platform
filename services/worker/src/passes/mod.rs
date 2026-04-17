@@ -234,6 +234,14 @@ async fn run_passes(
     )
     .await;
 
+    // Pre-run budget gate: reject if monthly token limit exceeded
+    if let Some(reason) = check_budget_exceeded(state, &msg.team_id).await {
+        warn!(run_id, team_id = %msg.team_id, %reason, "Run rejected: budget exceeded");
+        let duration = start.elapsed().as_secs();
+        fail_run(state, msg, run_id, &reason, usage, duration).await;
+        return Err(reason.into());
+    }
+
     // Initialize GitHub client for this team
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
@@ -1546,6 +1554,75 @@ async fn complete_run(
     check_token_usage_warning(state, &msg.team_id, usage).await;
 
     Ok(())
+}
+
+/// Check if the team has exceeded their configured monthly token limit.
+/// Returns Some(reason) if exceeded, None if within budget or no limit set.
+async fn check_budget_exceeded(state: &WorkerState, team_id: &str) -> Option<String> {
+    // Load token limit
+    let limit = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("SETTINGS#TOKEN_LIMIT".to_string()),
+        )
+        .send()
+        .await
+        .ok()?
+        .item()
+        .and_then(|item| item.get("max_tokens").cloned())
+        .and_then(|v| v.as_n().ok().cloned())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    if limit == 0 {
+        return None; // No limit configured
+    }
+
+    // Load current month usage
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    let total_used = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.analytics_table_name)
+        .key(
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
+        )
+        .key("period", aws_sdk_dynamodb::types::AttributeValue::S(month))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .map(|item| {
+            let ti = item
+                .get("total_tokens_in")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            let to = item
+                .get("total_tokens_out")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            ti + to
+        })
+        .unwrap_or(0);
+
+    if total_used >= limit {
+        Some(format!(
+            "Monthly token limit exceeded ({} / {} tokens). Increase your limit in Settings → AI Models.",
+            total_used, limit
+        ))
+    } else {
+        None
+    }
 }
 
 async fn fail_run(
