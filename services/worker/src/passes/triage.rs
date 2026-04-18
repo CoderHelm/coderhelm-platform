@@ -106,6 +106,9 @@ impl llm::ToolExecutor for NoOpExecutor {
 }
 
 /// Select the best repo for a Jira ticket when no explicit repo mapping is provided.
+/// NOTE: Currently unused — repo selection is handled by project mapping + validate_plan.
+/// Kept for potential future use as a fallback.
+#[allow(dead_code)]
 pub async fn select_repo(
     state: &WorkerState,
     msg: &TicketMessage,
