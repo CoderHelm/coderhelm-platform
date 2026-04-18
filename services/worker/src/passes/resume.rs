@@ -65,12 +65,16 @@ pub async fn run(
     // Determine what happened
     let has_ci_pass = events.iter().any(|e| e.event_type == "ci_passed");
     let has_ci_fail = events.iter().any(|e| e.event_type == "ci_failed");
+    let has_review_feedback = events
+        .iter()
+        .any(|e| e.event_type == "pr_review" || e.event_type == "pr_comment");
 
     info!(
         run_id = msg.run_id,
         event_count = events.len(),
         has_ci_pass,
         has_ci_fail,
+        has_review_feedback,
         "Processing resume events"
     );
 
@@ -330,8 +334,21 @@ pub async fn run(
             "Fix pushed, back to awaiting_ci for next CI run"
         );
     } else if has_ci_pass {
-        // CI passed — run review
-        info!(run_id = msg.run_id, "CI passed — running review");
+        // CI passed — run review (include any PR review/comment feedback)
+        let review_feedback = collect_review_feedback(&events);
+        let repo_instructions = if review_feedback.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "## Human Review Feedback\nThe following feedback was left on the PR. Address these comments:\n\n{}",
+                review_feedback
+            )
+        };
+        info!(
+            run_id = msg.run_id,
+            feedback_len = review_feedback.len(),
+            "CI passed — running review"
+        );
         super::update_pass(state, &msg.team_id, &msg.run_id, "review").await?;
 
         let plan_result = plan::PlanResult {
@@ -351,7 +368,7 @@ pub async fn run(
             &plan_result,
             &branch,
             &[],
-            "",
+            &repo_instructions,
             &provider,
             &mut usage,
             &file_cache,
@@ -553,6 +570,26 @@ fn collect_ci_failure_info(events: &[RunEvent]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn collect_review_feedback(events: &[RunEvent]) -> String {
+    events
+        .iter()
+        .filter(|e| e.event_type == "pr_review" || e.event_type == "pr_comment")
+        .map(|e| {
+            if e.event_type == "pr_review" {
+                let reviewer = e.payload["reviewer"].as_str().unwrap_or("unknown");
+                let state = e.payload["review_state"].as_str().unwrap_or("");
+                let body = e.payload["review_body"].as_str().unwrap_or("");
+                format!("@{reviewer} ({state}):\n{body}")
+            } else {
+                let commenter = e.payload["commenter"].as_str().unwrap_or("unknown");
+                let body = e.payload["body"].as_str().unwrap_or("");
+                format!("@{commenter}:\n{body}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n")
 }
 
 async fn load_usage_from_checkpoint(

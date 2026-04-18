@@ -288,6 +288,19 @@ async fn handle_issue_comment(
                 return Ok(StatusCode::OK);
             }
 
+            // Write event for resume flow
+            write_run_event(
+                state,
+                &run_id,
+                "pr_comment",
+                &serde_json::json!({
+                    "commenter": commenter,
+                    "body": body,
+                    "pr_number": pr_number,
+                }),
+            )
+            .await;
+
             info!(pr_number, commenter, "PR comment → feedback queue");
             let message = WorkerMessage::Feedback(FeedbackMessage {
                 team_id: team_id.to_string(),
@@ -489,8 +502,24 @@ async fn handle_pr_review(
         return Ok(StatusCode::OK);
     }
 
-    // The review body is the top-level comment; individual line comments
-    // will be fetched by the worker using the review_id via GitHub API.
+    // Write event to events table for the resume flow
+    let review_body = payload["review"]["body"].as_str().unwrap_or("").to_string();
+    let review_id = payload["review"]["id"].as_u64().unwrap_or(0);
+    write_run_event(
+        state,
+        &run_id,
+        "pr_review",
+        &serde_json::json!({
+            "review_state": review_state,
+            "reviewer": reviewer,
+            "review_id": review_id,
+            "review_body": review_body,
+            "pr_number": pr_number,
+        }),
+    )
+    .await;
+
+    // Also send to feedback queue for immediate processing
     let message = WorkerMessage::Feedback(FeedbackMessage {
         team_id: team_id.to_string(),
         installation_id,
@@ -498,8 +527,8 @@ async fn handle_pr_review(
         repo_owner: owner.to_string(),
         repo_name: name.to_string(),
         pr_number,
-        review_id: payload["review"]["id"].as_u64().unwrap_or(0),
-        review_body: payload["review"]["body"].as_str().unwrap_or("").to_string(),
+        review_id,
+        review_body,
         comments: vec![],
     });
 
@@ -1171,6 +1200,32 @@ async fn send_to_queue(
 
     info!("Dispatched to SQS");
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Write a run event to the events table for the resume flow.
+async fn write_run_event(state: &AppState, run_id: &str, event_type: &str, payload: &serde_json::Value) {
+    if state.config.events_table_name.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now();
+    let event_sk = format!("EVENT#{}#{}", now.format("%Y%m%dT%H%M%S%.3fZ"), event_type);
+
+    if let Err(e) = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.events_table_name)
+        .item("pk", attr_s(&format!("RUN#{run_id}")))
+        .item("sk", attr_s(&event_sk))
+        .item("event_type", attr_s(event_type))
+        .item("payload", attr_s(&payload.to_string()))
+        .item("processed", aws_sdk_dynamodb::types::AttributeValue::Bool(false))
+        .item("created_at", attr_s(&now.to_rfc3339()))
+        .item("expires_at", attr_n(now.timestamp() as u64 + 30 * 86400))
+        .send()
+        .await
+    {
+        error!("Failed to write run event: {e}");
+    }
 }
 
 /// After a PR merges, check if the merged run's issue belongs to a plan task.
