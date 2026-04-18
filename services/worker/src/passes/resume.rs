@@ -258,6 +258,7 @@ pub async fn run(
             tasks: String::new(),
             spec: String::new(),
             design: String::new(),
+            repo_tasks: vec![],
         };
         let file_cache = FileCache::default();
 
@@ -356,6 +357,7 @@ pub async fn run(
             tasks: String::new(),
             spec: String::new(),
             design: String::new(),
+            repo_tasks: vec![],
         };
         let file_cache = FileCache::default();
 

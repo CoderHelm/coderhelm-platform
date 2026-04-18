@@ -15,6 +15,16 @@ pub struct PlanResult {
     pub design: String,
     pub tasks: String,
     pub spec: String,
+    /// Per-repo task breakdown. Empty = single-repo (use msg.repo_owner/repo_name).
+    pub repo_tasks: Vec<RepoTasks>,
+}
+
+/// Tasks scoped to a specific repo for multi-repo orchestration.
+#[derive(Clone, Debug)]
+pub struct RepoTasks {
+    pub owner: String,
+    pub name: String,
+    pub tasks: String,
 }
 
 pub async fn run(
@@ -131,6 +141,15 @@ Otherwise, generate four openspec files:
    Tasks should be atomic and ordered. Include the full file path from the repo root in every task. \
 Only include tasks that can be accomplished by writing code (creating files, editing files, updating config). \
 Do NOT include manual verification tasks, post-deploy checks, browser testing, or anything requiring human interaction.
+
+   **Multi-repo:** If the issue requires changes in MORE THAN ONE repo, group tasks under `## owner/repo` headers:
+   ```
+   ## owner/repo-a
+   - [ ] src/file.rs: Change something
+   ## owner/repo-b
+   - [ ] src/other.ts: Change something else
+   ```
+   Only use multi-repo headers when changes span 2+ repos. For single-repo issues, omit headers.
 4. **spec.md** — Acceptance criteria as Given/When/Then scenarios
 
 After researching, output the four files using this exact format:
@@ -330,12 +349,64 @@ fn parse_openspec_files(response: &str) -> PlanResult {
         }
     }
 
+    let tasks_content = contents[2].clone();
+    let repo_tasks = parse_repo_tasks(&tasks_content);
+
     PlanResult {
         proposal: contents.remove(0),
         design: contents.remove(0),
         tasks: contents.remove(0),
         spec: contents.remove(0),
+        repo_tasks,
     }
+}
+
+/// Parse `## owner/repo` headers in tasks.md for multi-repo support.
+/// Returns empty vec if no repo headers found (single-repo mode).
+fn parse_repo_tasks(tasks: &str) -> Vec<RepoTasks> {
+    let mut result = Vec::new();
+    let mut current_owner = String::new();
+    let mut current_name = String::new();
+    let mut current_tasks = String::new();
+
+    for line in tasks.lines() {
+        if let Some(repo_str) = line.strip_prefix("## ") {
+            // Save previous repo if any
+            if !current_owner.is_empty() {
+                result.push(RepoTasks {
+                    owner: current_owner.clone(),
+                    name: current_name.clone(),
+                    tasks: current_tasks.trim().to_string(),
+                });
+            }
+            // Parse owner/name
+            let repo_str = repo_str.trim();
+            if let Some((owner, name)) = repo_str.split_once('/') {
+                current_owner = owner.to_string();
+                current_name = name.to_string();
+                current_tasks = String::new();
+            }
+        } else if !current_owner.is_empty() {
+            current_tasks.push_str(line);
+            current_tasks.push('\n');
+        }
+    }
+
+    // Save last repo
+    if !current_owner.is_empty() && !current_tasks.trim().is_empty() {
+        result.push(RepoTasks {
+            owner: current_owner,
+            name: current_name,
+            tasks: current_tasks.trim().to_string(),
+        });
+    }
+
+    // Only return multi-repo if we found 2+ repos
+    if result.len() < 2 {
+        return vec![];
+    }
+
+    result
 }
 
 // ─── Read-only tools for plan pass ──────────────────────────

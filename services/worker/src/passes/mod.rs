@@ -26,6 +26,15 @@ pub struct FileCache {
     inner: Arc<RwLock<HashMap<String, String>>>,
 }
 
+/// Result of a per-repo implement→security→PR cycle (multi-repo support).
+struct RepoPrResult {
+    owner: String,
+    name: String,
+    branch: String,
+    pr_number: u64,
+    pr_url: String,
+}
+
 impl FileCache {
     pub fn new() -> Self {
         Self {
@@ -958,6 +967,169 @@ async fn run_passes(
             }
         }
 
+        // --- Multi-repo path ---
+        if !plan_result.repo_tasks.is_empty() {
+            info!(
+                run_id,
+                repo_count = plan_result.repo_tasks.len(),
+                "Multi-repo plan detected, running per-repo pipeline"
+            );
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("Multi-repo plan: {} repos", plan_result.repo_tasks.len()),
+            )
+            .await;
+
+            let mut pr_results: Vec<RepoPrResult> = Vec::new();
+
+            for repo_task in &plan_result.repo_tasks {
+                let repo_branch = format!(
+                    "coderhelm/{}-{}",
+                    msg.ticket_id.to_lowercase(),
+                    repo_task.name.to_lowercase()
+                );
+
+                // Override msg repo for this iteration
+                let mut repo_msg = msg.clone();
+                repo_msg.repo_owner = repo_task.owner.clone();
+                repo_msg.repo_name = repo_task.name.clone();
+
+                // Resolve base branch for this repo
+                repo_msg.base_branch = github
+                    .get_default_branch(&repo_task.owner, &repo_task.name)
+                    .await
+                    .unwrap_or_else(|_| "main".to_string());
+
+                // Load repo-specific instructions
+                let repo_instr = load_repo_instructions(
+                    &github, &repo_task.owner, &repo_task.name,
+                ).await;
+
+                match run_repo_pipeline(
+                    state,
+                    &repo_msg,
+                    &github,
+                    &plan_result,
+                    &repo_task.tasks,
+                    &repo_branch,
+                    &repo_msg.base_branch,
+                    &rules,
+                    &repo_instr,
+                    &triage_result.complexity,
+                    &voice,
+                    &provider,
+                    usage,
+                    &file_cache,
+                    &start,
+                    run_id,
+                    &mut agent_memory,
+                )
+                .await
+                {
+                    Ok(pr) => pr_results.push(pr),
+                    Err(e) => {
+                        warn!(
+                            run_id,
+                            repo = %format!("{}/{}", repo_task.owner, repo_task.name),
+                            error = %e,
+                            "Repo pipeline failed, continuing with other repos"
+                        );
+                        add_progress_note(
+                            state,
+                            &msg.team_id,
+                            run_id,
+                            &format!("Failed for {}/{}: {}", repo_task.owner, repo_task.name, e),
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            if pr_results.is_empty() {
+                return Err("Multi-repo pipeline produced no PRs".into());
+            }
+
+            // Save checkpoint + set awaiting_ci with all PRs
+            save_checkpoint(state, &msg.team_id, run_id, "pr", &pr_results[0].branch, 0, usage).await;
+
+            let duration = start.elapsed().as_secs();
+            let now = chrono::Utc::now().to_rfc3339();
+            let cost = usage.estimated_cost();
+
+            // Build PR list attributes
+            let pr_urls: Vec<AttributeValue> = pr_results.iter().map(|p| attr_s(&p.pr_url)).collect();
+            let pr_numbers: Vec<AttributeValue> = pr_results.iter().map(|p| attr_n(p.pr_number)).collect();
+            let branches: Vec<AttributeValue> = pr_results.iter().map(|p| attr_s(&p.branch)).collect();
+
+            // Store first PR as primary for backward compat, plus full lists
+            state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key("team_id", attr_s(&msg.team_id))
+                .key("run_id", attr_s(run_id))
+                .update_expression(
+                    "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
+                     pr_urls = :prs, pr_numbers = :pns, branches = :bs, \
+                     repo = :repo, team_repo = :tr, \
+                     tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
+                     cost_usd = :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
+                     status_run_id = :sri, mcp_servers = :mcp",
+                )
+                .expression_attribute_names("#status", "status")
+                .expression_attribute_values(":s", attr_s("awaiting_ci"))
+                .expression_attribute_values(":pr", attr_s(&pr_results[0].pr_url))
+                .expression_attribute_values(":pn", attr_n(pr_results[0].pr_number))
+                .expression_attribute_values(":b", attr_s(&pr_results[0].branch))
+                .expression_attribute_values(":prs", AttributeValue::L(pr_urls))
+                .expression_attribute_values(":pns", AttributeValue::L(pr_numbers))
+                .expression_attribute_values(":bs", AttributeValue::L(branches))
+                .expression_attribute_values(":repo", attr_s(&format!("{}/{}", msg.repo_owner, msg.repo_name)))
+                .expression_attribute_values(":tr", attr_s(&format!("{}#{}/{}", msg.team_id, msg.repo_owner, msg.repo_name)))
+                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+                .expression_attribute_values(":to", attr_n(usage.output_tokens))
+                .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+                .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+                .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+                .expression_attribute_values(":d", attr_n(duration))
+                .expression_attribute_values(":t", attr_s(&now))
+                .expression_attribute_values(":cp", attr_s("awaiting_ci"))
+                .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+                .expression_attribute_values(
+                    ":mcp",
+                    AttributeValue::L(used_mcp_ids.iter().map(|id| attr_s(id)).collect()),
+                )
+                .send()
+                .await?;
+
+            info!(
+                run_id,
+                pr_count = pr_results.len(),
+                "Multi-repo run set to awaiting_ci"
+            );
+
+            if let Some(mut mem) = agent_memory {
+                let pr_summary = pr_results
+                    .iter()
+                    .map(|p| format!("PR #{} ({}/{})", p.pr_number, p.owner, p.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                mem.store_run_summary(&format!(
+                    "Run {run_id} created multi-repo PRs: {pr_summary}. Awaiting CI.",
+                ))
+                .await;
+                if let Err(e) = mem.close_and_upload(state).await {
+                    warn!(run_id, error = %e, "Failed to persist agent memory");
+                }
+            }
+
+            return Ok(());
+        }
+
+        // --- Single-repo path (existing) ---
+
         // Write final repo to run record (after validate_plan may have switched it)
         let final_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
         let _ = state
@@ -1373,6 +1545,185 @@ async fn run_passes(
     }
 
     Ok(())
+}
+
+/// Run implement → security → PR for a single repo.
+/// Returns a RepoPrResult with the created PR info.
+#[allow(clippy::too_many_arguments)]
+async fn run_repo_pipeline(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    github: &GitHubClient,
+    plan_result: &plan::PlanResult,
+    repo_tasks: &str,
+    branch_name: &str,
+    base_branch: &str,
+    rules: &[String],
+    repo_instructions: &str,
+    complexity: &str,
+    voice: &str,
+    provider: &crate::agent::provider::ModelProvider,
+    usage: &mut TokenUsage,
+    file_cache: &FileCache,
+    start: &Instant,
+    run_id: &str,
+    agent_memory: &mut Option<AgentMemory>,
+) -> Result<RepoPrResult, Box<dyn std::error::Error + Send + Sync>> {
+    let repo_owner = &msg.repo_owner;
+    let repo_name = &msg.repo_name;
+
+    // Create working branch
+    github
+        .create_branch(repo_owner, repo_name, branch_name, base_branch)
+        .await?;
+    info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), branch = %branch_name, "Created working branch");
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!("Created branch {} on {}/{}", branch_name, repo_owner, repo_name),
+    )
+    .await;
+
+    // Build a per-repo plan with overridden tasks
+    let repo_plan = plan::PlanResult {
+        proposal: plan_result.proposal.clone(),
+        design: plan_result.design.clone(),
+        tasks: repo_tasks.to_string(),
+        spec: plan_result.spec.clone(),
+        repo_tasks: vec![],
+    };
+
+    // --- Implement ---
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "implement").await?;
+
+    let pass_start = std::time::Instant::now();
+    let usage_before = usage.clone();
+    let impl_result = implement::run(
+        state,
+        msg,
+        github,
+        &repo_plan,
+        branch_name,
+        rules,
+        repo_instructions,
+        None,
+        complexity,
+        provider,
+        usage,
+        file_cache,
+    )
+    .await?;
+    write_pass_trace(state, &msg.team_id, run_id, "implement", pass_start, &usage_before, usage, None).await;
+    save_checkpoint(state, &msg.team_id, run_id, "implement", branch_name, 0, usage).await;
+
+    info!(
+        run_id,
+        repo = %format!("{repo_owner}/{repo_name}"),
+        files = impl_result.files_modified.len(),
+        "Implement complete"
+    );
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!("Implemented {} file(s) in {}/{}", impl_result.files_modified.len(), repo_owner, repo_name),
+    )
+    .await;
+
+    if impl_result.files_modified.is_empty() {
+        return Err(format!(
+            "No files modified in {}/{}. The issue may need more detail.",
+            repo_owner, repo_name
+        ).into());
+    }
+
+    // --- Security Audit ---
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "security").await?;
+    let pass_start = std::time::Instant::now();
+    let usage_before = usage.clone();
+    let security_result = match security::run(
+        state, msg, github, &repo_plan, branch_name, repo_instructions, provider, usage, file_cache,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(run_id, error = %e, "Security pass errored, proceeding");
+            security::SecurityResult { passed: true, summary: format!("Security error: {e}") }
+        }
+    };
+    write_pass_trace(state, &msg.team_id, run_id, "security", pass_start, &usage_before, usage, None).await;
+    save_checkpoint(state, &msg.team_id, run_id, "security", branch_name, 0, usage).await;
+
+    info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), passed = security_result.passed, "Security audit complete");
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        if security_result.passed { "Security audit passed" } else { "Security issues found, fixing" },
+    )
+    .await;
+
+    // Security remediation
+    if !security_result.passed {
+        if has_time_for_remediation(start) {
+            info!(run_id, "Running security remediation");
+            check_cancelled(state, &msg.team_id, run_id).await?;
+            implement::run(
+                state, msg, github, &repo_plan, branch_name, rules, repo_instructions,
+                Some(&format!("Security audit found vulnerabilities. Fix ALL of the following:\n\n{}", security_result.summary)),
+                complexity, provider, usage, file_cache,
+            )
+            .await?;
+        } else {
+            warn!(run_id, "Skipping security remediation — not enough time");
+        }
+    }
+
+    // Store security findings in memory
+    if let Some(ref mut mem) = agent_memory {
+        if !security_result.passed {
+            mem.store_security_finding(&format!(
+                "Security audit found issues on {}/{}: {}", repo_owner, repo_name, security_result.summary
+            ))
+            .await;
+        }
+    }
+
+    // --- Create Draft PR ---
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "pr").await?;
+
+    match pr::resolve_conflicts(state, msg, github, branch_name, provider, usage).await {
+        Ok(true) => info!(run_id, "Resolved merge conflicts"),
+        Ok(false) => {}
+        Err(e) => warn!(run_id, error = %e, "Conflict resolution failed, proceeding"),
+    }
+
+    let pass_start = std::time::Instant::now();
+    let usage_before = usage.clone();
+    let pr_result = pr::run(state, msg, github, branch_name, &repo_plan, voice, provider, usage).await?;
+    write_pass_trace(state, &msg.team_id, run_id, "pr", pass_start, &usage_before, usage, None).await;
+
+    info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), pr_url = %pr_result.pr_url, "Draft PR created");
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!("Draft PR #{} created for {}/{}", pr_result.pr_number, repo_owner, repo_name),
+    )
+    .await;
+
+    Ok(RepoPrResult {
+        owner: repo_owner.to_string(),
+        name: repo_name.to_string(),
+        branch: branch_name.to_string(),
+        pr_number: pr_result.pr_number,
+        pr_url: pr_result.pr_url,
+    })
 }
 
 async fn create_run_record(
@@ -2713,5 +3064,6 @@ async fn load_existing_plan(
         design: files.remove("design.md").unwrap_or_default(),
         tasks: files.remove("tasks.md").unwrap_or_default(),
         spec: files.remove("spec.md").unwrap_or_default(),
+        repo_tasks: vec![],
     })
 }

@@ -144,7 +144,7 @@ pub struct ResumeMessage {
     pub installation_id: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TicketMessage {
     pub team_id: String,
     pub installation_id: u64,
@@ -164,7 +164,7 @@ fn default_branch() -> String {
     "main".to_string()
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum TicketSource {
     Github,
