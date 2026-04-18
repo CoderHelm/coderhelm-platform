@@ -290,7 +290,7 @@ After researching, output the four files using this exact format:
             "medium" => 8,
             _ => 12,
         },
-        max_tokens: 8192,
+        max_tokens: 16384,
     };
 
     let model_id = provider.primary_model_id();
