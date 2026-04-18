@@ -3293,8 +3293,8 @@ pub async fn health(
     let mut checks: Vec<Value> = Vec::new();
     let mut status = "healthy";
 
-    // 1. Crashed runs — "running" for over 10 minutes (worker likely died)
-    let crash_cutoff = (now - chrono::Duration::minutes(10)).to_rfc3339();
+    // 1. Crashed runs — "running" for over 20 minutes (worker likely died or timed out)
+    let crash_cutoff = (now - chrono::Duration::minutes(20)).to_rfc3339();
     if let Ok(result) = state
         .dynamo
         .query()
@@ -3313,11 +3313,34 @@ pub async fn health(
             .items()
             .iter()
             .map(|item| {
+                let run_id = item.get("run_id").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default();
+                // Auto-mark crashed runs as timed_out
+                let dynamo = state.dynamo.clone();
+                let table = state.config.runs_table_name.clone();
+                let tid = claims.team_id.clone();
+                let rid = run_id.clone();
+                tokio::spawn(async move {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let _ = dynamo
+                        .update_item()
+                        .table_name(&table)
+                        .key("team_id", attr_s(&tid))
+                        .key("run_id", attr_s(&rid))
+                        .update_expression("SET #s = :s, error_message = :e, updated_at = :t, status_run_id = :sri")
+                        .expression_attribute_names("#s", "status")
+                        .expression_attribute_values(":s", attr_s("failed"))
+                        .expression_attribute_values(":e", attr_s("Run timed out (worker process was terminated)"))
+                        .expression_attribute_values(":t", attr_s(&now))
+                        .expression_attribute_values(":sri", attr_s(&format!("failed#{rid}")))
+                        .send()
+                        .await;
+                });
                 json!({
-                    "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
+                    "run_id": &run_id,
                     "status": item.get("status").and_then(|v| v.as_s().ok()),
                     "title": item.get("title").and_then(|v| v.as_s().ok()),
                     "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
+                    "auto_fixed": true,
                 })
             })
             .collect();

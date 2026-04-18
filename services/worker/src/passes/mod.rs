@@ -1,6 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
+
+/// Maximum Lambda execution time (15 min). We use this to skip expensive
+/// remediation cycles when we're running low on time.
+const LAMBDA_TIMEOUT_SECS: u64 = 900;
+/// Minimum seconds remaining before we'll start a new implement cycle.
+const MIN_TIME_FOR_REMEDIATION_SECS: u64 = 240; // 4 minutes
 
 use crate::agent::mcp;
 use crate::clients::email;
@@ -67,6 +74,16 @@ fn sanitize_error(msg: &str) -> String {
 ;
     // Collapse extra whitespace
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Returns seconds remaining before the Lambda timeout.
+fn remaining_secs(start: &Instant) -> u64 {
+    LAMBDA_TIMEOUT_SECS.saturating_sub(start.elapsed().as_secs())
+}
+
+/// Whether there's enough time left for an expensive remediation cycle.
+fn has_time_for_remediation(start: &Instant) -> bool {
+    remaining_secs(start) >= MIN_TIME_FOR_REMEDIATION_SECS
 }
 
 pub mod ci_fix;
@@ -201,12 +218,17 @@ pub async fn orchestrate_ticket(
     // Create run record
     create_run_record(state, &msg, &run_id).await?;
 
-    match run_passes(state, &mut msg, &run_id, &mut usage, &start).await {
-        Ok(_) => {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(LAMBDA_TIMEOUT_SECS - 30), // 30s buffer for cleanup
+        run_passes(state, &mut msg, &run_id, &mut usage, &start),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
             let duration = start.elapsed().as_secs();
             info!(run_id, duration, "Orchestration complete");
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let duration = start.elapsed().as_secs();
             let err_msg = e.to_string();
             if err_msg.contains("cancelled by user") {
@@ -234,7 +256,20 @@ pub async fn orchestrate_ticket(
             error!(run_id, error = %e, "Orchestration failed");
             let sanitized = sanitize_error(&err_msg);
             fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
-            // Return Ok so SQS does not retry the message and flip status back to running
+            return Ok(());
+        }
+        Err(_elapsed) => {
+            let duration = start.elapsed().as_secs();
+            warn!(run_id, duration, "Orchestration timed out — Lambda limit approaching");
+            fail_run(
+                state,
+                &msg,
+                &run_id,
+                "Run timed out (exceeded execution time limit). The issue may need a narrower scope.",
+                &usage,
+                duration,
+            )
+            .await;
             return Ok(());
         }
     }
@@ -1146,7 +1181,7 @@ async fn run_passes(
         if !test_result.passed {
             info!(run_id, cycle, "CI failed, feeding back to implement");
             add_progress_note(state, &msg.team_id, run_id, "CI tests failed, fixing").await;
-            if cycle < max_review_cycles {
+            if cycle < max_review_cycles && has_time_for_remediation(&start) {
                 check_cancelled(state, &msg.team_id, run_id).await?;
                 update_pass(state, &msg.team_id, run_id, "implement").await?;
                 let test_feedback = test_result.output.unwrap_or_default();
@@ -1242,8 +1277,11 @@ async fn run_passes(
         )
         .await;
 
-        if review_result.passed || cycle == max_review_cycles {
+        if review_result.passed || cycle == max_review_cycles || !has_time_for_remediation(&start) {
             review_passed = review_result.passed;
+            if !has_time_for_remediation(&start) && !review_result.passed {
+                warn!(run_id, remaining_secs = remaining_secs(&start), "Skipping review remediation — low time");
+            }
             // Store review findings in agent memory
             if let Some(ref mut mem) = agent_memory {
                 if !review_result.passed {
@@ -1344,6 +1382,20 @@ async fn run_passes(
     .await;
 
     if !security_result.passed {
+        if !has_time_for_remediation(&start) {
+            warn!(
+                run_id,
+                remaining_secs = remaining_secs(&start),
+                "Skipping security remediation — not enough time remaining"
+            );
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                "Security issues found but skipping remediation (low time remaining)",
+            )
+            .await;
+        } else {
         // One remediation cycle: implement fixes, then re-audit
         info!(run_id, "Security issues found, running remediation cycle");
         check_cancelled(state, &msg.team_id, run_id).await?;
@@ -1397,6 +1449,7 @@ async fn run_passes(
                 run_id,
                 "Security issues remain after remediation, proceeding with PR"
             );
+        }
         }
     }
 
