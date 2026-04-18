@@ -71,7 +71,7 @@ Rules:
         &NoOpExecutor,
         usage,
         llm::ConverseOptions {
-            max_turns: 40,
+            max_turns: 1,
             max_tokens: 16384,
         },
     )

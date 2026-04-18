@@ -27,7 +27,13 @@ pub async fn run(
     usage: &mut TokenUsage,
     file_cache: &FileCache,
 ) -> Result<SecurityResult, Box<dyn std::error::Error + Send + Sync>> {
-    let instructions_block = super::format_instructions_block(repo_instructions);
+    // Trim repo instructions for the security pass (it only needs high-level context)
+    let trimmed = if repo_instructions.len() > 2000 {
+        &repo_instructions[..repo_instructions[..2000].rfind('\n').unwrap_or(2000)]
+    } else {
+        repo_instructions
+    };
+    let instructions_block = super::format_instructions_block(trimmed);
     let system = format!(
         "You are a security audit agent for the {owner}/{repo} repository. \
          You are READ-ONLY. Review the diff for OWASP Top 10 vulnerabilities, \
@@ -223,10 +229,20 @@ impl ToolExecutor for SecurityToolExecutor<'_> {
                     .get("end_line")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(start as u64 + 100) as usize;
-                let content = self
-                    .github
-                    .read_file_lines(self.owner, self.repo, path, self.branch, start, end)
-                    .await?;
+                // Try slicing from cached full file first
+                let cache_key = format!("{}:{}", self.branch, path);
+                let content = if let Some(cached) = self.file_cache.get(&cache_key).await {
+                    cached
+                        .lines()
+                        .skip(start.saturating_sub(1))
+                        .take(end.saturating_sub(start.saturating_sub(1)))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    self.github
+                        .read_file_lines(self.owner, self.repo, path, self.branch, start, end)
+                        .await?
+                };
                 Ok(json!(content))
             }
             "search_code" => {

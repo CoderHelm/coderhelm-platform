@@ -177,62 +177,71 @@ After researching, output the four files using this exact format:
 
     let mut tools = read_only_tools();
 
-    // Load MCP plugins and their cached tool schemas
-    let mcp_table = if state.config.mcp_configs_table_name.is_empty() {
-        &state.config.settings_table_name
-    } else {
-        &state.config.mcp_configs_table_name
-    };
-    let mcp_plugins =
-        mcp::load_team_plugins(&state.dynamo, mcp_table, &msg.team_id, &super::MCP_CATALOG).await;
+    // Only load MCP plugins if the issue body contains URLs or external references
+    let has_external_refs = msg.body.contains("http://")
+        || msg.body.contains("https://")
+        || msg.body.contains("notion.so")
+        || msg.body.contains("jira")
+        || msg.body.contains("confluence");
 
+    // Load MCP plugins and their cached tool schemas
     let mut loaded_mcp_plugins = Vec::new();
-    for plugin in &mcp_plugins {
-        // Try S3 cache first, then invoke proxy to list tools
-        let schemas = match mcp::load_tool_cache(
-            &state.s3,
-            &state.config.bucket_name,
-            &plugin.server_id,
-        )
-        .await
-        {
-            Some(cache) => cache.tools,
-            None if !state.config.mcp_proxy_function_name.is_empty() => {
-                match mcp::list_tools(&state.lambda, &state.config.mcp_proxy_function_name, plugin)
-                    .await
-                {
-                    Ok(schemas) => schemas,
-                    Err(e) => {
-                        tracing::warn!(server_id = %plugin.server_id, error = %e, "Failed to list MCP tools, skipping");
-                        continue;
+    if has_external_refs {
+        let mcp_table = if state.config.mcp_configs_table_name.is_empty() {
+            &state.config.settings_table_name
+        } else {
+            &state.config.mcp_configs_table_name
+        };
+        let mcp_plugins =
+            mcp::load_team_plugins(&state.dynamo, mcp_table, &msg.team_id, &super::MCP_CATALOG).await;
+
+        for plugin in &mcp_plugins {
+            // Try S3 cache first, then invoke proxy to list tools
+            let schemas = match mcp::load_tool_cache(
+                &state.s3,
+                &state.config.bucket_name,
+                &plugin.server_id,
+            )
+            .await
+            {
+                Some(cache) => cache.tools,
+                None if !state.config.mcp_proxy_function_name.is_empty() => {
+                    match mcp::list_tools(&state.lambda, &state.config.mcp_proxy_function_name, plugin)
+                        .await
+                    {
+                        Ok(schemas) => schemas,
+                        Err(e) => {
+                            tracing::warn!(server_id = %plugin.server_id, error = %e, "Failed to list MCP tools, skipping");
+                            continue;
+                        }
                     }
                 }
-            }
-            _ => continue,
-        };
+                _ => continue,
+            };
 
-        let mcp_tool_defs = mcp::to_tool_definitions(&plugin.server_id, &schemas);
-        tools.extend(mcp_tool_defs);
-        loaded_mcp_plugins.push(plugin.clone());
-    }
-
-    // Filter MCP tools for plan pass — only keep read-only tools
-    tools.retain(|t| {
-        // Keep all built-in tools (no server_id__ prefix)
-        if !t.name.contains("__") {
-            return true;
+            let mcp_tool_defs = mcp::to_tool_definitions(&plugin.server_id, &schemas);
+            tools.extend(mcp_tool_defs);
+            loaded_mcp_plugins.push(plugin.clone());
         }
-        // For MCP tools, only keep read-like operations
-        let tool_name = t.name.split("__").last().unwrap_or(&t.name);
-        tool_name.starts_with("get_")
-            || tool_name.starts_with("list_")
-            || tool_name.starts_with("search_")
-            || tool_name.starts_with("read_")
-            || tool_name.starts_with("query_")
-            || tool_name.starts_with("fetch_")
-            || tool_name.starts_with("find_")
-            || tool_name.starts_with("describe_")
-    });
+
+        // Filter MCP tools for plan pass — only keep read-only tools
+        tools.retain(|t| {
+            // Keep all built-in tools (no server_id__ prefix)
+            if !t.name.contains("__") {
+                return true;
+            }
+            // For MCP tools, only keep read-like operations
+            let tool_name = t.name.split("__").last().unwrap_or(&t.name);
+            tool_name.starts_with("get_")
+                || tool_name.starts_with("list_")
+                || tool_name.starts_with("search_")
+                || tool_name.starts_with("read_")
+                || tool_name.starts_with("query_")
+                || tool_name.starts_with("fetch_")
+                || tool_name.starts_with("find_")
+                || tool_name.starts_with("describe_")
+        });
+    }
 
     // Add MCP context to system prompt if we have active plugins
     let mut full_system = system.clone();

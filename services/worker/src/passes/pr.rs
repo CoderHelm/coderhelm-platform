@@ -95,8 +95,8 @@ Return ONLY the markdown body text."#,
         &super::triage::NoOpExecutor,
         usage,
         llm::ConverseOptions {
-            max_turns: 40,
-            max_tokens: 16384,
+            max_turns: 1,
+            max_tokens: 4096,
         },
     )
     .await?;
