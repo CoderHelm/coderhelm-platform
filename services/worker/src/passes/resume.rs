@@ -276,7 +276,12 @@ pub async fn run(
         let file_cache = FileCache::default();
 
         let feedback = format!(
-            "CI workflow failed. Fix the failures.\n\n\
+            "CI workflow failed on PR #{pr_number} (branch: {branch}). Fix the failures.\n\n\
+             Rules:\n\
+             - Only fix what CI is complaining about. Don't refactor or add features.\n\
+             - If the failure is in a test, fix the code (not the test) unless the test itself is wrong.\n\
+             - If tests need updating because the feature changed behavior intentionally, update the tests.\n\
+             - You may create new test files or edit existing ones if needed.\n\n\
              Failure summary:\n{failure_logs}\n\n\
              Full logs:\n{logs}"
         );
