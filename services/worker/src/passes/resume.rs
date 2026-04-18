@@ -123,8 +123,34 @@ pub async fn run(
         .cloned()
         .unwrap_or_else(|| "main".to_string());
 
-    // Mark run as running for the resume
-    set_run_status(state, &msg.team_id, &msg.run_id, "running", "test").await;
+    // Atomically claim this run: transition awaiting_ci → running.
+    // If another Resume Lambda already claimed it, this fails and we exit.
+    let claim_result = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .update_expression(
+            "SET #s = :new_s, status_run_id = :sri, current_pass = :cp, updated_at = :t",
+        )
+        .condition_expression("#s = :expected")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":expected", attr_s("awaiting_ci"))
+        .expression_attribute_values(":new_s", attr_s("running"))
+        .expression_attribute_values(":sri", attr_s(&format!("running#{}", msg.run_id)))
+        .expression_attribute_values(":cp", attr_s("test"))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await;
+
+    if claim_result.is_err() {
+        info!(
+            run_id = msg.run_id,
+            "Could not claim run (already picked up by another Resume), skipping"
+        );
+        return Ok(());
+    }
 
     // Build a minimal TicketMessage for the implement/review passes
     let ticket_msg = TicketMessage {
@@ -156,9 +182,6 @@ pub async fn run(
     )?;
 
     let mut usage = load_usage_from_checkpoint(state, &msg.team_id, &msg.run_id).await;
-
-    // Mark all events as processed
-    mark_events_processed(state, &msg.run_id, &events).await;
 
     if has_ci_fail && !has_ci_pass {
         // CI failed — try to fix
@@ -447,6 +470,9 @@ pub async fn run(
             .await?;
         }
     }
+
+    // Mark events processed only after all work completes successfully
+    mark_events_processed(state, &msg.run_id, &events).await;
 
     Ok(())
 }

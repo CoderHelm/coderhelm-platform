@@ -982,7 +982,7 @@ async fn find_run_by_branch(
         .expression_attribute_values(":s1", attr_s("awaiting_ci"))
         .expression_attribute_values(":s2", attr_s("running"))
         .scan_index_forward(false) // newest first
-        .limit(1)
+        .limit(50) // filter is post-query, so fetch enough to find a match
         .send()
         .await
         .ok()?;

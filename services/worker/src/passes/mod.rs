@@ -1405,6 +1405,7 @@ async fn create_run_record(
         .item("repo", attr_s(&repo))
         .item("installation_id", attr_n(msg.installation_id))
         .item("issue_number", attr_n(msg.issue_number))
+        .item("base_branch", attr_s(&msg.base_branch))
         .item("tokens_in", attr_n(0))
         .item("tokens_out", attr_n(0))
         .item("cost_usd", attr_n(0))
