@@ -828,10 +828,19 @@ async fn run_passes(
         update_pass(state, &msg.team_id, run_id, "implement").await?;
 
         // --- Re-run detection: check if branch already has an open PR with CI failures ---
-        let existing_pr = github
+        let existing_pr = match github
             .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, &branch_name)
             .await
-            .unwrap_or(None);
+        {
+            Ok(pr) => {
+                info!(run_id, branch = %branch_name, found = pr.is_some(), "Re-run detection: checked for open PR");
+                pr
+            }
+            Err(e) => {
+                warn!(run_id, branch = %branch_name, error = %e, "Re-run detection: failed to check for open PR");
+                None
+            }
+        };
 
         if let Some(ref pr) = existing_pr {
             let pr_number = pr["number"].as_u64().unwrap_or(0);
