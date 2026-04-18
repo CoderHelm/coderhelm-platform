@@ -69,29 +69,27 @@ pub async fn run(
             r#"## Complexity: SIMPLE (1-3 files)
 
 This is a simple change. Be extremely efficient:
-- Use 1-2 `search_code` calls to locate the relevant file(s)
-- Use `read_file_lines` on the specific section you need, NOT whole files
-- Do NOT call `read_tree` or browse the project structure
-- Do NOT read unrelated files "for context"
-- You should need 3-5 tool calls total, then output the plan
+- Use 1-2 `search_code` calls to locate the relevant file(s) and line numbers
+- Use `read_file_lines` on the specific section (max 100 lines), NOT whole files
+- You should need 2-4 tool calls total, then output the plan
 - The plan should have 1-2 tasks maximum"#
         }
         "medium" => {
             r#"## Complexity: MEDIUM (4-10 files)
 
 This is a medium-sized change. Be efficient:
-- Start with `search_code` to find relevant files and symbols
-- Use `read_file_lines` for targeted reads instead of whole files
-- Only call `read_tree` if you need to understand module structure
-- You should need 5-10 tool calls total
+- Start with `search_code` to find relevant files, symbols, and line numbers
+- Use `read_file_lines` for targeted reads (max 100 lines each)
+- You should need 4-8 tool calls total
 - The plan should have 2-4 tasks"#
         }
         _ => {
             r#"## Complexity: COMPLEX (10+ files)
 
 This is a complex change. Research thoroughly but stay focused:
-- Start with `search_code` and `read_tree` to understand the relevant modules
-- Use `read_file_lines` for targeted reads
+- Start with `search_code` to find relevant symbols and entry points
+- Use `list_directory` only if you need to understand a module's structure
+- Use `read_file_lines` for targeted reads (max 100 lines each)
 - Map out the affected code paths before planning
 - The plan should have 3-6 tasks"#
         }
@@ -111,8 +109,10 @@ Summary: {summary}
 
 ## Research Instructions
 
-**Start with `search_code`** to find relevant files and symbols before reading anything.
-Use `read_file_lines` for targeted reads instead of `read_file` on whole files.
+**Start with `search_code`** to find relevant files, symbols, and line numbers.
+Then use `read_file_lines` for targeted reads (max 100 lines per call).
+Do NOT read entire files. Do NOT browse the file tree unless you need module structure.
+Be surgical — search, read the exact lines you need, then output the plan.
 
 **Verify before planning:** Check if the requested change is ALREADY in place. If it is,
 set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reason>`.
@@ -256,9 +256,9 @@ After researching, output the four files using this exact format:
 
     let plan_opts = llm::ConverseOptions {
         max_turns: match triage.complexity.as_str() {
-            "simple" => 15,
-            "medium" => 25,
-            _ => 40,
+            "simple" => 5,
+            "medium" => 8,
+            _ => 12,
         },
         max_tokens: 8192,
     };
@@ -342,56 +342,34 @@ fn read_only_tools() -> Vec<ToolDefinition> {
     let repo_prop = json!({"type": "string", "description": "Repository as owner/name. Omit to use the default (issue) repo."});
     vec![
         ToolDefinition {
-            name: "read_tree".to_string(),
-            description: "Get the full recursive file tree. Call once, then use list_directory for subdirs.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "repo": repo_prop
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "read_file".to_string(),
-            description: "Read a file from a repository. Large files are truncated to ~32KB. Prefer read_file_lines for targeted reads.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File path relative to repo root"},
-                    "repo": repo_prop
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolDefinition {
-            name: "read_file_lines".to_string(),
-            description: "Read specific lines from a file (1-indexed, inclusive). Much cheaper than reading the whole file.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File path relative to repo root"},
-                    "start_line": {"type": "integer", "description": "First line to read (1-indexed)"},
-                    "end_line": {"type": "integer", "description": "Last line to read (inclusive)"},
-                    "repo": repo_prop
-                },
-                "required": ["path", "start_line", "end_line"]
-            }),
-        },
-        ToolDefinition {
             name: "search_code".to_string(),
-            description: "Search for code in a repository by keyword or symbol. Returns matching file paths and text fragments. Use to find definitions instead of reading files.".to_string(),
+            description: "Search for code by keyword, function name, type, or symbol. Returns matching file paths with line numbers and code fragments. Always start here.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query (e.g. function name, type, import)"},
+                    "query": {"type": "string", "description": "Search query (e.g. function name, type, import, error message)"},
                     "repo": repo_prop
                 },
                 "required": ["query"]
             }),
         },
         ToolDefinition {
+            name: "read_file_lines".to_string(),
+            description: "Read specific lines from a file (1-indexed, inclusive). Use search_code first to find the right file and line numbers.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to repo root"},
+                    "start_line": {"type": "integer", "description": "First line to read (1-indexed)"},
+                    "end_line": {"type": "integer", "description": "Last line to read (inclusive, max 100 lines per call)"},
+                    "repo": repo_prop
+                },
+                "required": ["path", "start_line", "end_line"]
+            }),
+        },
+        ToolDefinition {
             name: "list_directory".to_string(),
-            description: "List contents of a directory.".to_string(),
+            description: "List contents of a directory. Use to understand module structure.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -450,23 +428,6 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
         let (owner, repo) = self.resolve_repo(input)?;
         let branch = &self.base_branch;
         match name {
-            "read_tree" => {
-                let tree = self.github.get_tree(&owner, &repo, branch).await?;
-                let paths: Vec<&str> = tree
-                    .iter()
-                    .filter(|e| e.entry_type == "blob")
-                    .map(|e| e.path.as_str())
-                    .collect();
-                Ok(json!(super::truncate_tree(&paths)))
-            }
-            "read_file" => {
-                let path = input
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .ok_or("Missing path")?;
-                let content = self.github.read_file(&owner, &repo, path, branch).await?;
-                Ok(json!(super::truncate_content(&content, path)))
-            }
             "read_file_lines" => {
                 let path = input
                     .get("path")
@@ -480,6 +441,8 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
                     .get("end_line")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(start as u64 + 100) as usize;
+                // Cap at 100 lines per call to limit token usage
+                let end = end.min(start + 100);
                 let content = self
                     .github
                     .read_file_lines(&owner, &repo, path, branch, start, end)

@@ -85,6 +85,8 @@ struct ApiTool {
     name: String,
     description: String,
     input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -171,10 +173,19 @@ pub async fn converse_tool_loop(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let api_tools: Vec<ApiTool> = tools
         .iter()
-        .map(|t| ApiTool {
+        .enumerate()
+        .map(|(i, t)| ApiTool {
             name: t.name.clone(),
             description: t.description.clone(),
             input_schema: t.input_schema.clone(),
+            // Cache breakpoint on the last tool — caches system + all tool defs
+            cache_control: if i == tools.len() - 1 {
+                Some(CacheControl {
+                    r#type: "ephemeral".to_string(),
+                })
+            } else {
+                None
+            },
         })
         .collect();
 
@@ -244,23 +255,23 @@ pub async fn converse_tool_loop(
             response.usage.cache_creation_input_tokens,
         );
 
-        // Context compaction based on input tokens
+        // Context compaction based on input tokens — start early to keep costs down
         let input_tokens = response.usage.input_tokens;
         let model_limit: u64 = 200_000;
         let context_pct = input_tokens as f64 / model_limit as f64;
-        if context_pct > 0.80 {
+        if context_pct > 0.60 {
             info!(
                 "Context at {:.0}%, emergency compaction",
                 context_pct * 100.0
             );
             compact_messages(messages, 3);
-        } else if context_pct > 0.60 {
+        } else if context_pct > 0.40 {
             info!(
                 "Context at {:.0}%, aggressive compaction",
                 context_pct * 100.0
             );
             compact_messages(messages, 5);
-        } else if context_pct > 0.40 {
+        } else if context_pct > 0.25 {
             compact_messages(messages, 8);
         }
 
