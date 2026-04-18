@@ -1148,6 +1148,7 @@ fn task_from_item(
         "issue_number": item.get("issue_number").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "issue_url": item.get("issue_url").and_then(|v| v.as_s().ok()),
         "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
+        "pr_url": item.get("pr_url").and_then(|v| v.as_s().ok()),
         "approved_at": item.get("approved_at").and_then(|v| v.as_s().ok()),
         "approved_by": item.get("approved_by").and_then(|v| v.as_s().ok()),
         "rejected_at": item.get("rejected_at").and_then(|v| v.as_s().ok()),

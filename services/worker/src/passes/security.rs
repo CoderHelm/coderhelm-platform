@@ -26,6 +26,7 @@ pub async fn run(
     provider: &ModelProvider,
     usage: &mut TokenUsage,
     file_cache: &FileCache,
+    _run_id: Option<&str>,
 ) -> Result<SecurityResult, Box<dyn std::error::Error + Send + Sync>> {
     // Trim repo instructions for the security pass (it only needs high-level context)
     let trimmed = if repo_instructions.len() > 2000 {
@@ -92,6 +93,7 @@ Output format:
             max_turns: 10,
             max_tokens: 4096,
         },
+        None,
     )
     .await?;
 

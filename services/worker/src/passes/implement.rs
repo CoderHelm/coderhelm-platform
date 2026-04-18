@@ -30,6 +30,7 @@ pub async fn run(
     provider: &ModelProvider,
     usage: &mut TokenUsage,
     file_cache: &FileCache,
+    run_id: Option<&str>,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
     // Trim repo instructions for simple issues to reduce per-turn token cost
@@ -242,6 +243,39 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         max_tokens: 16384,
     };
 
+    let on_tool: Option<Box<dyn Fn(&str, u64) + Send + Sync>> = if let Some(rid) = run_id {
+        let dynamo = state.dynamo.clone();
+        let table = state.config.runs_table_name.clone();
+        let team = msg.team_id.clone();
+        let rid = rid.to_string();
+        Some(Box::new(move |tool_name: &str, _duration_ms: u64| {
+            let dynamo = dynamo.clone();
+            let table = table.clone();
+            let team = team.clone();
+            let rid = rid.clone();
+            let msg = format!("Tool: {tool_name}");
+            tokio::spawn(async move {
+                let now = chrono::Utc::now().to_rfc3339();
+                let entry = aws_sdk_dynamodb::types::AttributeValue::M(std::collections::HashMap::from([
+                    ("message".to_string(), aws_sdk_dynamodb::types::AttributeValue::S(msg)),
+                    ("timestamp".to_string(), aws_sdk_dynamodb::types::AttributeValue::S(now.clone())),
+                ]));
+                let _ = dynamo.update_item()
+                    .table_name(&table)
+                    .key("team_id", aws_sdk_dynamodb::types::AttributeValue::S(team))
+                    .key("run_id", aws_sdk_dynamodb::types::AttributeValue::S(rid))
+                    .update_expression("SET progress_notes = list_append(if_not_exists(progress_notes, :empty), :entry), updated_at = :t")
+                    .expression_attribute_values(":entry", aws_sdk_dynamodb::types::AttributeValue::L(vec![entry]))
+                    .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]))
+                    .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
+                    .send()
+                    .await;
+            });
+        }))
+    } else {
+        None
+    };
+
     provider::converse(
         state,
         provider,
@@ -252,6 +286,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         &executor,
         usage,
         opts,
+        on_tool.as_ref().map(|b| b.as_ref()),
     )
     .await?;
 

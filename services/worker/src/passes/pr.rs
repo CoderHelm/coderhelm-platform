@@ -98,6 +98,7 @@ Return ONLY the markdown body text."#,
             max_turns: 1,
             max_tokens: 4096,
         },
+        None,
     )
     .await?;
 
@@ -288,6 +289,7 @@ pub async fn resolve_conflicts(
                 max_turns: 40,
                 max_tokens: 16384,
             },
+            None,
         )
         .await?;
 

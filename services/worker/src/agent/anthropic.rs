@@ -173,6 +173,7 @@ pub async fn converse_tool_loop(
     usage: &mut TokenUsage,
     max_turns: usize,
     max_tokens: i32,
+    on_tool_call: Option<&(dyn Fn(&str, u64) + Send + Sync)>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let api_tools: Vec<ApiTool> = tools
         .iter()
@@ -322,6 +323,9 @@ pub async fn converse_tool_loop(
                 Ok(result) => {
                     let duration_ms = tool_start.elapsed().as_millis() as u64;
                     usage.record_tool_call(tool_name, duration_ms);
+                    if let Some(cb) = on_tool_call {
+                        cb(tool_name, duration_ms);
+                    }
                     info!(tool = %tool_name, duration_ms, "Tool completed");
                     tool_results.push(json!({
                         "type": "tool_result",

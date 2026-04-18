@@ -304,6 +304,7 @@ After researching, output the four files using this exact format:
         &executor,
         usage,
         plan_opts,
+        None,
     )
     .await?;
 

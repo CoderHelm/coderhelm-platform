@@ -1162,6 +1162,7 @@ async fn run_passes(
             &provider,
             usage,
             &file_cache,
+            Some(run_id),
         )
         .await?;
         write_pass_trace(
@@ -1282,6 +1283,7 @@ async fn run_passes(
         &provider,
         usage,
         &file_cache,
+        Some(run_id),
     )
     .await
     {
@@ -1366,6 +1368,7 @@ async fn run_passes(
                 &provider,
                 usage,
                 &file_cache,
+                Some(run_id),
             )
             .await?;
 
@@ -1381,6 +1384,7 @@ async fn run_passes(
                 &provider,
                 usage,
                 &file_cache,
+                Some(run_id),
             )
             .await
             {
@@ -1613,6 +1617,7 @@ async fn run_repo_pipeline(
         provider,
         usage,
         file_cache,
+        Some(run_id),
     )
     .await?;
     write_pass_trace(state, &msg.team_id, run_id, "implement", pass_start, &usage_before, usage, None).await;
@@ -1645,7 +1650,7 @@ async fn run_repo_pipeline(
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
     let security_result = match security::run(
-        state, msg, github, &repo_plan, branch_name, repo_instructions, provider, usage, file_cache,
+        state, msg, github, &repo_plan, branch_name, repo_instructions, provider, usage, file_cache, Some(run_id),
     )
     .await
     {
@@ -1675,7 +1680,7 @@ async fn run_repo_pipeline(
             implement::run(
                 state, msg, github, &repo_plan, branch_name, rules, repo_instructions,
                 Some(&format!("Security audit found vulnerabilities. Fix ALL of the following:\n\n{}", security_result.summary)),
-                complexity, provider, usage, file_cache,
+                complexity, provider, usage, file_cache, Some(run_id),
             )
             .await?;
         } else {

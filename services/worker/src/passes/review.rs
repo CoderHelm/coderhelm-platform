@@ -90,6 +90,7 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
             max_turns: 15,
             max_tokens: 8192,
         },
+        None,
     )
     .await?;
     info!("Review result: {}", &response[..response.len().min(200)]);
