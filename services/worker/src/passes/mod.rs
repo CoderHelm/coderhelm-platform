@@ -936,11 +936,19 @@ async fn run_passes(
 
                         // Store PR info on run record and go to awaiting_ci
                         let now = chrono::Utc::now().to_rfc3339();
+                        let cost = usage.estimated_cost();
+                        let duration = start.elapsed().as_secs();
                         let _ = state.dynamo.update_item()
                             .table_name(&state.config.runs_table_name)
                             .key("team_id", attr_s(&msg.team_id))
                             .key("run_id", attr_s(run_id))
-                            .update_expression("SET #s = :s, status_run_id = :sri, current_pass = :cp, pr_number = :pn, pr_url = :pu, branch = :b, updated_at = :t, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :cost")
+                            .update_expression(
+                                "SET #s = :s, status_run_id = :sri, current_pass = :cp, \
+                                 pr_number = :pn, pr_url = :pu, branch = :b, \
+                                 repo = :repo, team_repo = :tr, \
+                                 tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
+                                 cost_usd = :cost, duration_s = :d, updated_at = :t"
+                            )
                             .expression_attribute_names("#s", "status")
                             .expression_attribute_values(":s", attr_s("awaiting_ci"))
                             .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
@@ -948,12 +956,15 @@ async fn run_passes(
                             .expression_attribute_values(":pn", attr_n(pr_number))
                             .expression_attribute_values(":pu", attr_s(&pr_url))
                             .expression_attribute_values(":b", attr_s(&branch_name))
+                            .expression_attribute_values(":repo", attr_s(&format!("{}/{}", msg.repo_owner, msg.repo_name)))
+                            .expression_attribute_values(":tr", attr_s(&format!("{}#{}/{}", msg.team_id, msg.repo_owner, msg.repo_name)))
                             .expression_attribute_values(":t", attr_s(&now))
                             .expression_attribute_values(":ti", attr_n(usage.input_tokens))
                             .expression_attribute_values(":to", attr_n(usage.output_tokens))
                             .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
                             .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                            .expression_attribute_values(":cost", attr_s(&format!("{:.4}", usage.estimated_cost())))
+                            .expression_attribute_values(":cost", attr_n(format!("{:.4}", cost)))
+                            .expression_attribute_values(":d", attr_n(duration))
                             .send()
                             .await;
 
