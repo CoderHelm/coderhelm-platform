@@ -751,6 +751,50 @@ impl GitHubClient {
         Ok(resp.text().await?)
     }
 
+    /// Download logs for a workflow run. GitHub returns a zip; we extract the first
+    /// failed job's log text (or concat all logs if no clear failure).
+    pub async fn get_workflow_run_logs(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: u64,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // First, list jobs for this run and find the failed one(s)
+        let jobs_url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/jobs?filter=latest"
+        );
+        let jobs: serde_json::Value = self.get(&jobs_url).await?;
+        let failed_jobs: Vec<u64> = jobs["jobs"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter(|j| j["conclusion"].as_str() == Some("failure"))
+            .filter_map(|j| j["id"].as_u64())
+            .collect();
+
+        if failed_jobs.is_empty() {
+            return Ok("(no failed jobs found)".to_string());
+        }
+
+        // Download logs for each failed job (typically just 1)
+        let mut all_logs = String::new();
+        for job_id in failed_jobs.iter().take(3) {
+            match self.get_check_run_logs(owner, repo, *job_id).await {
+                Ok(log) => {
+                    if !all_logs.is_empty() {
+                        all_logs.push_str("\n---\n");
+                    }
+                    all_logs.push_str(&log);
+                }
+                Err(e) => {
+                    all_logs.push_str(&format!("(failed to download job {job_id} logs: {e})\n"));
+                }
+            }
+        }
+
+        Ok(all_logs)
+    }
+
     /// List check runs for a git ref (branch name or SHA).
     pub async fn list_check_runs_for_ref(
         &self,

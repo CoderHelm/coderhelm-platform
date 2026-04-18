@@ -15,6 +15,7 @@ pub struct Config {
     pub mcp_configs_table_name: String,
     pub traces_table_name: String,
     pub checkpoints_table_name: String,
+    pub events_table_name: String,
     pub bucket_name: String,
     pub secrets_name: String,
     pub model_id: String,
@@ -44,6 +45,7 @@ impl Config {
             mcp_configs_table_name: std::env::var("MCP_CONFIGS_TABLE_NAME").unwrap_or_default(),
             traces_table_name: std::env::var("TRACES_TABLE_NAME").unwrap_or_default(),
             checkpoints_table_name: std::env::var("CHECKPOINTS_TABLE_NAME").unwrap_or_default(),
+            events_table_name: std::env::var("EVENTS_TABLE_NAME").unwrap_or_default(),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
             secrets_name: std::env::var("SECRETS_NAME")
                 .unwrap_or_else(|_| "coderhelm/prod/secrets".to_string()),
@@ -99,6 +101,8 @@ pub enum WorkerMessage {
     PlanTaskContinue(PlanTaskContinueMessage),
     #[serde(rename = "infra_analyze")]
     InfraAnalyze(InfraAnalyzeMessage),
+    #[serde(rename = "resume")]
+    Resume(ResumeMessage),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -131,6 +135,13 @@ pub struct InfraAnalyzeMessage {
     pub triggered_by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ResumeMessage {
+    pub team_id: String,
+    pub run_id: String,
+    pub installation_id: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -98,8 +98,10 @@ mod pr;
 mod resolve;
 mod review;
 mod security;
+#[allow(dead_code)]
 mod test;
 mod triage;
+pub mod resume;
 
 /// Minimal MCP plugin catalog: (server_id, npx_package, env_mapping).
 /// Kept in sync with the full catalog in gateway/routes/plugins.rs.
@@ -789,7 +791,7 @@ async fn run_passes(
         format!("coderhelm/{}", msg.ticket_id.to_lowercase())
     };
 
-    let impl_result = if can_skip_implement {
+    let _impl_result = if can_skip_implement {
         // Resume: reconstruct impl_result from the existing branch diff
         info!(run_id, branch = %branch_name, "Checkpoint resume: skipping implement pass");
         update_pass(state, &msg.team_id, run_id, "implement").await?;
@@ -1283,244 +1285,88 @@ async fn run_passes(
     )
     .await;
 
-    // --- Pass 4: Test + Review loop (max 3 cycles) ---
-    update_progress_comment(
-        &github,
-        &msg.repo_owner,
-        &msg.repo_name,
-        progress_comment_id,
-        "review",
-        run_id,
-    )
-    .await;
-    let review_loop_enabled = load_workflow_setting(state, &msg.team_id, "review_loop").await;
-    let max_review_cycles: usize = if review_loop_enabled { 3 } else { 1 };
-    let mut review_passed = true;
-
-    for cycle in 1..=max_review_cycles {
-        // Test gate: wait for CI if configured
-        check_cancelled(state, &msg.team_id, run_id).await?;
-        update_pass(state, &msg.team_id, run_id, "test").await?;
-        let pass_start = std::time::Instant::now();
-        let usage_before = usage.clone();
-        let test_result = match test::run(state, msg, &github, &branch_name).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(run_id, error = %e, "Test pass errored, proceeding without test results");
-                test::TestResult {
-                    passed: true,
-                    output: Some(format!("Test pass error: {e}")),
-                }
-            }
-        };
-        write_pass_trace(
-            state,
-            &msg.team_id,
-            run_id,
-            &format!("test:{cycle}"),
-            pass_start,
-            &usage_before,
-            usage,
-            None,
-        )
-        .await;
-        if !test_result.passed {
-            info!(run_id, cycle, "CI failed, feeding back to implement");
-            add_progress_note(state, &msg.team_id, run_id, "CI tests failed, fixing").await;
-            if cycle < max_review_cycles && has_time_for_remediation(&start) {
-                check_cancelled(state, &msg.team_id, run_id).await?;
-                update_pass(state, &msg.team_id, run_id, "implement").await?;
-                let test_feedback = test_result.output.unwrap_or_default();
-                implement::run(
-                    state,
-                    msg,
-                    &github,
-                    &plan_result,
-                    &branch_name,
-                    &rules,
-                    &repo_instructions,
-                    Some(&format!(
-                        "CI tests failed. Fix the failures:\n\n{test_feedback}"
-                    )),
-                    &triage_result.complexity,
-                    &provider,
-                    usage,
-                    &file_cache,
-                )
-                .await?;
-                continue; // Re-test on next cycle
-            }
-            warn!(
-                run_id,
-                "CI still failing after {max_review_cycles} cycles, proceeding"
-            );
-        }
-
-        // Review
-        check_cancelled(state, &msg.team_id, run_id).await?;
-        update_pass(state, &msg.team_id, run_id, "review").await?;
-        let pass_start = std::time::Instant::now();
-        let usage_before = usage.clone();
-        let review_result = match review::run(
-            state,
-            msg,
-            &github,
-            &plan_result,
-            &branch_name,
-            &rules,
-            &repo_instructions,
-            &provider,
-            usage,
-            &file_cache,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(run_id, error = %e, "Review pass errored, proceeding");
-                review::ReviewResult {
-                    passed: true,
-                    summary: format!("Review error: {e}"),
-                }
-            }
-        };
-        write_pass_trace(
-            state,
-            &msg.team_id,
-            run_id,
-            &format!("review:{cycle}"),
-            pass_start,
-            &usage_before,
-            usage,
-            None,
-        )
-        .await;
-        save_checkpoint(
-            state,
-            &msg.team_id,
-            run_id,
-            "review",
-            &branch_name,
-            cycle as u8,
-            usage,
-        )
-        .await;
-        info!(
-            run_id,
-            cycle,
-            passed = review_result.passed,
-            "Review cycle complete"
-        );
-        add_progress_note(
-            state,
-            &msg.team_id,
-            run_id,
-            if review_result.passed {
-                "Code review passed"
-            } else {
-                "Code review found issues, re-implementing"
-            },
-        )
-        .await;
-
-        if review_result.passed || cycle == max_review_cycles || !has_time_for_remediation(&start) {
-            review_passed = review_result.passed;
-            if !has_time_for_remediation(&start) && !review_result.passed {
-                warn!(run_id, remaining_secs = remaining_secs(&start), "Skipping review remediation — low time");
-            }
-            // Store review findings in agent memory
-            if let Some(ref mut mem) = agent_memory {
-                if !review_result.passed {
-                    mem.store_review_finding(&format!(
-                        "Review found issues on run {run_id}: {}",
-                        review_result.summary
-                    ))
-                    .await;
-                }
-            }
-            break;
-        }
-
-        // Feed review issues back into implement
-        info!(run_id, cycle, "Re-implementing based on review feedback");
-        check_cancelled(state, &msg.team_id, run_id).await?;
-        update_pass(state, &msg.team_id, run_id, "implement").await?;
-        implement::run(
-            state,
-            msg,
-            &github,
-            &plan_result,
-            &branch_name,
-            &rules,
-            &repo_instructions,
-            Some(&review_result.summary),
-            &triage_result.complexity,
-            &provider,
-            usage,
-            &file_cache,
-        )
-        .await?;
-    }
-
-    // --- Mark PR ready for review ---
-    check_cancelled(state, &msg.team_id, run_id).await?;
-    match github
-        .mark_pr_ready(&pr_result.node_id)
-        .await
-    {
-        Ok(_) => info!(run_id, pr_number = pr_result.pr_number, "PR marked ready for review"),
-        Err(e) => warn!(run_id, error = %e, "Failed to mark PR ready, it remains as draft"),
-    }
-    add_progress_note(
+    // Save checkpoint and set awaiting_ci — Lambda returns here.
+    // The webhook-driven resume flow handles CI results and review.
+    save_checkpoint(
         state,
         &msg.team_id,
         run_id,
-        &format!("PR ready for review: #{}", pr_result.pr_number),
+        "pr",
+        &branch_name,
+        0,
+        usage,
     )
     .await;
 
-    // Update run record with final state
+    // Update run record with PR info + awaiting_ci status
     let duration = start.elapsed().as_secs();
-    complete_run(
-        state,
-        msg,
+    let now = chrono::Utc::now().to_rfc3339();
+    let cost = usage.estimated_cost();
+
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
+             tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
+             duration_s = :d, updated_at = :t, current_pass = :cp, \
+             status_run_id = :sri, \
+             repo = :repo, team_repo = :tr, mcp_servers = :mcp",
+        )
+        .expression_attribute_names("#status", "status")
+        .expression_attribute_values(":s", attr_s("awaiting_ci"))
+        .expression_attribute_values(":pr", attr_s(&pr_result.pr_url))
+        .expression_attribute_values(":pn", attr_n(pr_result.pr_number))
+        .expression_attribute_values(
+            ":repo",
+            attr_s(&format!("{}/{}", msg.repo_owner, msg.repo_name)),
+        )
+        .expression_attribute_values(
+            ":tr",
+            attr_s(&format!(
+                "{}#{}/{}",
+                msg.team_id, msg.repo_owner, msg.repo_name
+            )),
+        )
+        .expression_attribute_values(":b", attr_s(&branch_name))
+        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+        .expression_attribute_values(":to", attr_n(usage.output_tokens))
+        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+        .expression_attribute_values(":d", attr_n(duration))
+        .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":cp", attr_s("awaiting_ci"))
+        .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+        .expression_attribute_values(
+            ":mcp",
+            AttributeValue::L(
+                used_mcp_ids
+                    .iter()
+                    .map(|id| attr_s(id))
+                    .collect(),
+            ),
+        )
+        .send()
+        .await?;
+
+    info!(
         run_id,
-        &pr_result,
-        &impl_result,
-        &used_mcp_ids,
-        usage,
-        duration,
-    )
-    .await?;
+        pr_number = pr_result.pr_number,
+        "Run set to awaiting_ci — Lambda returning, webhook will trigger resume"
+    );
 
-    // No completion comment on the issue — the PR itself links back via "Closes #N".
-
-    // Store run summary and close agent memory
+    // Store run progress in agent memory
     if let Some(mut mem) = agent_memory {
         mem.store_run_summary(&format!(
-            "Completed run {run_id} for issue '{}'. Created PR #{}. Files modified: {}. Review: {}. Security: {}.",
-            msg.title,
+            "Run {run_id} created draft PR #{} for issue '{}'. Awaiting CI results.",
             pr_result.pr_number,
-            impl_result.files_modified.len(),
-            if review_passed { "passed" } else { "issues found" },
-            if security_result.passed { "passed" } else { "issues found" },
+            msg.title,
         ))
         .await;
-
-        // LLM-powered memory extraction (uses team's Anthropic key if available)
-        let conversation_summary =
-            format!(
-            "Issue: {}\nDescription: {}\nFiles modified: {:?}\nPR #{}\nReview: {}\nSecurity: {}",
-            msg.title,
-            msg.body.chars().take(2000).collect::<String>(),
-            impl_result.files_modified,
-            pr_result.pr_number,
-            if review_passed { "passed" } else { "issues found" },
-            if security_result.passed { "passed" } else { "issues found" },
-        );
-        mem.extract_from_conversation(&conversation_summary, Some(provider.api_key()))
-            .await;
-
         if let Err(e) = mem.close_and_upload(state).await {
             warn!(run_id, error = %e, "Failed to persist agent memory");
         }
@@ -1585,7 +1431,7 @@ async fn create_run_record(
     Ok(())
 }
 
-async fn update_pass(
+pub(crate) async fn update_pass(
     state: &WorkerState,
     team_id: &str,
     run_id: &str,
@@ -1664,7 +1510,7 @@ async fn check_cancelled(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 async fn complete_run(
     state: &WorkerState,
     msg: &TicketMessage,
@@ -1956,11 +1802,11 @@ async fn fail_run(
     }
 }
 
-fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
+pub(crate) fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
 }
 
-fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
+pub(crate) fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
 }
 
@@ -2470,7 +2316,7 @@ async fn load_workflow_setting(state: &WorkerState, team_id: &str, key: &str) ->
 
 /// Write a per-pass trace record to the traces table.
 #[allow(clippy::too_many_arguments)]
-async fn write_pass_trace(
+pub(crate) async fn write_pass_trace(
     state: &WorkerState,
     team_id: &str,
     run_id: &str,
@@ -2550,7 +2396,7 @@ async fn write_pass_trace(
 }
 
 /// Save a checkpoint after a pass completes so runs can resume on Lambda timeout.
-async fn save_checkpoint(
+pub(crate) async fn save_checkpoint(
     state: &WorkerState,
     team_id: &str,
     run_id: &str,

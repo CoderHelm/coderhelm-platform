@@ -22,6 +22,7 @@ interface WorkerStackProps extends cdk.StackProps {
   mcpConfigsTable: dynamodb.TableV2;
   tracesTable: dynamodb.TableV2;
   checkpointsTable: dynamodb.TableV2;
+  eventsTable: dynamodb.TableV2;
   bucket: s3.Bucket;
   ticketQueue: sqs.Queue;
   ciFixQueue: sqs.Queue;
@@ -80,6 +81,7 @@ export class WorkerStack extends cdk.Stack {
         BILLING_TABLE_NAME: props.billingTable.tableName, // Retained for CF migration
         TRACES_TABLE_NAME: props.tracesTable.tableName,
         CHECKPOINTS_TABLE_NAME: props.checkpointsTable.tableName,
+        EVENTS_TABLE_NAME: props.eventsTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         MODEL_ID: process.env.MODEL_ID || "claude-sonnet-4-20250514",
@@ -118,6 +120,7 @@ export class WorkerStack extends cdk.Stack {
     props.billingTable.grantReadWriteData(this.workerFunction); // Retained for CF migration
     props.tracesTable.grantReadWriteData(this.workerFunction);
     props.checkpointsTable.grantReadWriteData(this.workerFunction);
+    props.eventsTable.grantReadWriteData(this.workerFunction);
     props.bucket.grantReadWrite(this.workerFunction);
     secrets.grantRead(this.workerFunction);
 

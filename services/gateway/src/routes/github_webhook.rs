@@ -9,8 +9,8 @@ use tracing::{error, info, warn};
 
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
-    CiFixMessage, FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo,
-    PlanTaskContinueMessage, TicketMessage, TicketSource, WorkerMessage,
+    FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo,
+    PlanTaskContinueMessage, ResumeMessage, TicketMessage, TicketSource, WorkerMessage,
 };
 use crate::AppState;
 
@@ -507,9 +507,9 @@ async fn handle_pr_review(
 }
 
 async fn handle_check_run(
-    state: &AppState,
+    _state: &AppState,
     payload: &Value,
-    installation_id: u64,
+    _installation_id: u64,
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
@@ -522,7 +522,6 @@ async fn handle_check_run(
         return Ok(StatusCode::OK);
     }
 
-    // Only fix CI on our branches
     let branch = payload["check_run"]["check_suite"]["head_branch"]
         .as_str()
         .unwrap_or("");
@@ -530,26 +529,17 @@ async fn handle_check_run(
         return Ok(StatusCode::OK);
     }
 
-    let repo = &payload["repository"];
+    // Individual check_run failures are logged but NOT acted on directly.
+    // The workflow_run completion event handles the aggregate CI result.
+    let check_name = payload["check_run"]["name"].as_str().unwrap_or("unknown");
+    info!(
+        team_id,
+        branch,
+        check_name,
+        "check_run failed — will be handled by workflow_run completion"
+    );
 
-    if let Some(_reason) = check_run_budget(state, team_id).await {
-        info!(team_id, "CI fix skipped — token limit reached");
-        return Ok(StatusCode::OK);
-    }
-
-    let message = WorkerMessage::CiFix(CiFixMessage {
-        team_id: team_id.to_string(),
-        installation_id,
-        run_id: String::new(), // TODO: look up from DynamoDB by branch
-        repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
-        repo_name: repo["name"].as_str().unwrap_or("").to_string(),
-        branch: branch.to_string(),
-        pr_number: 0, // TODO: look up
-        check_run_id: payload["check_run"]["id"].as_u64().unwrap_or(0),
-        attempt: 1,
-    });
-
-    send_to_queue(state, &state.config.ci_fix_queue_url, &message).await
+    Ok(StatusCode::OK)
 }
 
 async fn handle_installation(
@@ -834,12 +824,12 @@ async fn handle_installation_repos(
     send_to_queue(state, &state.config.ticket_queue_url, &onboard).await
 }
 
-/// Handle check_suite events — mark PR ready on success, log failures.
+/// Handle check_suite events — delegated to workflow_run handler.
 async fn handle_check_suite(
-    state: &AppState,
+    _state: &AppState,
     payload: &Value,
-    installation_id: u64,
-    team_id: &str,
+    _installation_id: u64,
+    _team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     if action != "completed" {
@@ -852,45 +842,13 @@ async fn handle_check_suite(
     }
 
     let conclusion = payload["check_suite"]["conclusion"].as_str().unwrap_or("");
-    let repo = &payload["repository"];
-
-    match conclusion {
-        "success" => {
-            // All checks passed — find the open draft PR for this branch and mark it ready
-            let prs = payload["check_suite"]["pull_requests"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            for pr in &prs {
-                let pr_number = pr["number"].as_u64().unwrap_or(0);
-                if pr_number == 0 {
-                    continue;
-                }
-                info!(branch, pr_number, "CI passed — marking PR ready");
-                let message = WorkerMessage::MarkReady(MarkReadyMessage {
-                    team_id: team_id.to_string(),
-                    installation_id,
-                    repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
-                    repo_name: repo["name"].as_str().unwrap_or("").to_string(),
-                    pr_number,
-                });
-                let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
-            }
-            Ok(StatusCode::OK)
-        }
-        "failure" => {
-            info!(
-                branch,
-                "Check suite failed on coderhelm branch — delegating to check_run handler"
-            );
-            // The individual check_run events will handle CI fixes
-            Ok(StatusCode::OK)
-        }
-        _ => Ok(StatusCode::OK),
-    }
+    // All CI result handling is done by the workflow_run event handler.
+    // check_suite just logs for observability.
+    info!(branch, conclusion, "check_suite completed — workflow_run handler will process");
+    Ok(StatusCode::OK)
 }
 
-/// Handle workflow_run events — mark PR ready when CI passes on coderhelm branches.
+/// Handle workflow_run events — write CI events and trigger resume for coderhelm branches.
 async fn handle_workflow_run(
     state: &AppState,
     payload: &Value,
@@ -910,36 +868,131 @@ async fn handle_workflow_run(
 
     let conclusion = wf["conclusion"].as_str().unwrap_or("");
     let repo = &payload["repository"];
+    let repo_owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let repo_name = repo["name"].as_str().unwrap_or("");
+    let workflow_name = wf["name"].as_str().unwrap_or("unknown");
 
-    match conclusion {
-        "success" => {
-            let prs = wf["pull_requests"].as_array().cloned().unwrap_or_default();
-            for pr in &prs {
-                let pr_number = pr["number"].as_u64().unwrap_or(0);
-                if pr_number == 0 {
-                    continue;
+    // Find the run_id for this branch
+    let run_id = match find_run_by_branch(state, team_id, repo_owner, repo_name, branch).await {
+        Some(id) => id,
+        None => {
+            // Fallback: still handle success via MarkReady for backward compat
+            if conclusion == "success" {
+                let prs = wf["pull_requests"].as_array().cloned().unwrap_or_default();
+                for pr in &prs {
+                    let pr_number = pr["number"].as_u64().unwrap_or(0);
+                    if pr_number == 0 { continue; }
+                    info!(branch, pr_number, "CI passed (no run found) — marking PR ready directly");
+                    let message = WorkerMessage::MarkReady(MarkReadyMessage {
+                        team_id: team_id.to_string(),
+                        installation_id,
+                        repo_owner: repo_owner.to_string(),
+                        repo_name: repo_name.to_string(),
+                        pr_number,
+                    });
+                    let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
                 }
-                info!(branch, pr_number, "CI passed — marking PR ready");
-                let message = WorkerMessage::MarkReady(MarkReadyMessage {
-                    team_id: team_id.to_string(),
-                    installation_id,
-                    repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
-                    repo_name: repo["name"].as_str().unwrap_or("").to_string(),
-                    pr_number,
-                });
-                let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
             }
-            Ok(StatusCode::OK)
+            return Ok(StatusCode::OK);
         }
-        "failure" => {
-            info!(
-                branch,
-                "Workflow failed on coderhelm branch — check_run handler will process"
-            );
-            Ok(StatusCode::OK)
-        }
-        _ => Ok(StatusCode::OK),
+    };
+
+    let now = chrono::Utc::now();
+    let event_type = if conclusion == "success" { "ci_passed" } else { "ci_failed" };
+
+    // Write event to events table
+    let event_sk = format!(
+        "EVENT#{}#{}",
+        now.format("%Y%m%dT%H%M%S%.3fZ"),
+        event_type,
+    );
+
+    let mut logs_url = String::new();
+    if let Some(url) = wf.get("logs_url").and_then(|v| v.as_str()) {
+        logs_url = url.to_string();
     }
+
+    let event_payload = serde_json::json!({
+        "conclusion": conclusion,
+        "workflow_name": workflow_name,
+        "branch": branch,
+        "repo_owner": repo_owner,
+        "repo_name": repo_name,
+        "logs_url": logs_url,
+        "workflow_run_id": wf["id"].as_u64().unwrap_or(0),
+    });
+
+    if let Err(e) = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.events_table_name)
+        .item("pk", attr_s(&format!("RUN#{run_id}")))
+        .item("sk", attr_s(&event_sk))
+        .item("event_type", attr_s(event_type))
+        .item("payload", attr_s(&event_payload.to_string()))
+        .item("processed", aws_sdk_dynamodb::types::AttributeValue::Bool(false))
+        .item("created_at", attr_s(&now.to_rfc3339()))
+        .item("expires_at", attr_n(now.timestamp() as u64 + 30 * 86400))
+        .send()
+        .await
+    {
+        error!("Failed to write CI event: {e}");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    info!(
+        run_id,
+        branch,
+        event_type,
+        workflow_name,
+        "CI event recorded — sending Resume"
+    );
+
+    // Send Resume message to kick off the worker
+    let message = WorkerMessage::Resume(ResumeMessage {
+        team_id: team_id.to_string(),
+        run_id: run_id.clone(),
+        installation_id,
+    });
+    let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+
+    Ok(StatusCode::OK)
+}
+
+/// Look up a run by branch name. Queries repo-index GSI and filters for matching branch
+/// with status "awaiting_ci" or "running".
+async fn find_run_by_branch(
+    state: &AppState,
+    team_id: &str,
+    repo_owner: &str,
+    repo_name: &str,
+    branch: &str,
+) -> Option<String> {
+    let team_repo = format!("{team_id}#{repo_owner}/{repo_name}");
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .index_name("repo-index")
+        .key_condition_expression("team_repo = :tr")
+        .filter_expression("branch = :b AND (#s = :s1 OR #s = :s2)")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":tr", attr_s(&team_repo))
+        .expression_attribute_values(":b", attr_s(branch))
+        .expression_attribute_values(":s1", attr_s("awaiting_ci"))
+        .expression_attribute_values(":s2", attr_s("running"))
+        .scan_index_forward(false) // newest first
+        .limit(1)
+        .send()
+        .await
+        .ok()?;
+
+    let items = result.items();
+    items
+        .first()
+        .and_then(|item| item.get("run_id"))
+        .and_then(|v| v.as_s().ok())
+        .cloned()
 }
 
 /// Handle repository events — track renames, deletions, visibility changes.

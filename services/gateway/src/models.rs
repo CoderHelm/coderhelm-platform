@@ -139,6 +139,8 @@ pub enum WorkerMessage {
     PlanTaskContinue(PlanTaskContinueMessage),
     #[serde(rename = "infra_analyze")]
     InfraAnalyze(InfraAnalyzeMessage),
+    #[serde(rename = "resume")]
+    Resume(ResumeMessage),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -171,6 +173,13 @@ pub struct InfraAnalyzeMessage {
     pub triggered_by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ResumeMessage {
+    pub team_id: String,
+    pub run_id: String,
+    pub installation_id: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
