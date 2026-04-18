@@ -57,3 +57,9 @@ regex = "1"
 md5 = "0.7"
 futures = "0.3"
 tokio-stream = "0.1"
+
+# MenteDB (agent memory browsing)
+mentedb = { git = "https://github.com/nambok/mentedb.git", branch = "main" }
+mentedb-core = { git = "https://github.com/nambok/mentedb.git", branch = "main" }
+flate2 = "1"
+tar = "0.4"

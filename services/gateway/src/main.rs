@@ -350,6 +350,16 @@ async fn main() -> Result<(), Error> {
         )
         .route("/plugins/:id/prompt", put(routes::plugins::update_prompt))
         .route("/plugins/:id/test", post(routes::plugins::test_connection))
+        // Memory browser
+        .route("/memories", get(routes::memory::list_memories))
+        .route(
+            "/memories/stats",
+            get(routes::memory::memory_stats),
+        )
+        .route(
+            "/memories/:memory_id",
+            delete(routes::memory::delete_memory),
+        )
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,
