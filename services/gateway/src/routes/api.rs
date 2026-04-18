@@ -528,8 +528,51 @@ pub async fn get_run(
 
     let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
 
+    // Fallback: if run-level tokens are 0/missing, sum from per-pass traces
+    let tokens_in = item.get("tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+    let tokens_out = item.get("tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+    let cache_read = item.get("cache_read_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+    let cache_write = item.get("cache_write_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+    let cost_usd = item.get("cost_usd").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<f64>().ok()).unwrap_or(0.0);
+
+    let (tokens_in, tokens_out, cache_read, cache_write, cost_usd) = if tokens_in == 0 {
+        // Sum from traces as fallback
+        if let Ok(traces) = state
+            .dynamo
+            .query()
+            .table_name(&state.config.traces_table_name)
+            .key_condition_expression("team_id = :tid AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":tid", attr_s(&claims.team_id))
+            .expression_attribute_values(":prefix", attr_s(&format!("RUN#{run_id}#PASS#")))
+            .send()
+            .await
+        {
+            let mut ti: u64 = 0;
+            let mut to: u64 = 0;
+            let mut cr: u64 = 0;
+            let mut cw: u64 = 0;
+            for t in traces.items() {
+                ti += t.get("input_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+                to += t.get("output_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+                cr += t.get("cache_read_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+                cw += t.get("cache_write_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+            }
+            // Estimate cost from traces (use Opus rates as default)
+            let cost = if ti > 0 {
+                let input_rate = 15.0 / 1_000_000.0;
+                let output_rate = 75.0 / 1_000_000.0;
+                (ti as f64 * input_rate) + (to as f64 * output_rate)
+                    + (cr as f64 * input_rate * 0.1) + (cw as f64 * input_rate * 1.25)
+            } else { 0.0 };
+            (ti, to, cr, cw, if cost > 0.0 { cost } else { cost_usd })
+        } else {
+            (tokens_in, tokens_out, cache_read, cache_write, cost_usd)
+        }
+    } else {
+        (tokens_in, tokens_out, cache_read, cache_write, cost_usd)
+    };
+
     Ok(Json(json!({
-        "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
         "status": item.get("status").and_then(|v| v.as_s().ok()),
         "ticket_source": item.get("ticket_source").and_then(|v| v.as_s().ok()),
         "ticket_id": item.get("ticket_id").and_then(|v| v.as_s().ok()),
@@ -539,11 +582,11 @@ pub async fn get_run(
         "pr_url": item.get("pr_url").and_then(|v| v.as_s().ok()),
         "pr_number": item.get("pr_number").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "current_pass": item.get("current_pass").and_then(|v| v.as_s().ok()),
-        "tokens_in": item.get("tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-        "tokens_out": item.get("tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-        "cache_read_tokens": item.get("cache_read_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-        "cache_write_tokens": item.get("cache_write_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-        "cost_usd": item.get("cost_usd").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<f64>().ok()),
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "cost_usd": cost_usd,
         "files_modified": item.get("files_modified").and_then(|v| v.as_l().ok()).map(|list| list.iter().filter_map(|v| v.as_s().ok().map(|s| s.as_str())).collect::<Vec<_>>()),
         "mcp_servers": item.get("mcp_servers").and_then(|v| v.as_l().ok()).map(|list| list.iter().filter_map(|v| v.as_s().ok().map(|s| s.as_str())).collect::<Vec<_>>()),
         "duration_s": item.get("duration_s").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
