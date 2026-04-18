@@ -453,7 +453,7 @@ async fn run_passes(
         !branch.is_empty()
             && matches!(
                 last_pass.as_str(),
-                "implement" | "test" | "review" | "security"
+                "implement" | "security" | "pr" | "test" | "review"
             )
     });
 
@@ -1093,7 +1093,153 @@ async fn run_passes(
         result
     };
 
-    // --- Create Draft PR (triggers CI before test pass) ---
+    // --- Security Audit (before PR — ensures only security-clean code is published) ---
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "security").await?;
+    let pass_start = std::time::Instant::now();
+    let usage_before = usage.clone();
+    let security_result = match security::run(
+        state,
+        msg,
+        &github,
+        &plan_result,
+        &branch_name,
+        &repo_instructions,
+        &provider,
+        usage,
+        &file_cache,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(run_id, error = %e, "Security pass errored, proceeding");
+            security::SecurityResult {
+                passed: true,
+                summary: format!("Security error: {e}"),
+            }
+        }
+    };
+    write_pass_trace(
+        state,
+        &msg.team_id,
+        run_id,
+        "security",
+        pass_start,
+        &usage_before,
+        usage,
+        None,
+    )
+    .await;
+    save_checkpoint(
+        state,
+        &msg.team_id,
+        run_id,
+        "security",
+        &branch_name,
+        0,
+        usage,
+    )
+    .await;
+    info!(
+        run_id,
+        passed = security_result.passed,
+        "Security audit complete"
+    );
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        if security_result.passed {
+            "Security audit passed"
+        } else {
+            "Security issues found, fixing"
+        },
+    )
+    .await;
+
+    if !security_result.passed {
+        if !has_time_for_remediation(&start) {
+            warn!(
+                run_id,
+                remaining_secs = remaining_secs(&start),
+                "Skipping security remediation — not enough time remaining"
+            );
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                "Security issues found but skipping remediation (low time remaining)",
+            )
+            .await;
+        } else {
+            info!(run_id, "Security issues found, running remediation cycle");
+            check_cancelled(state, &msg.team_id, run_id).await?;
+            update_pass(state, &msg.team_id, run_id, "implement").await?;
+            implement::run(
+                state,
+                msg,
+                &github,
+                &plan_result,
+                &branch_name,
+                &rules,
+                &repo_instructions,
+                Some(&format!(
+                    "Security audit found vulnerabilities. Fix ALL of the following:\n\n{}",
+                    security_result.summary
+                )),
+                &triage_result.complexity,
+                &provider,
+                usage,
+                &file_cache,
+            )
+            .await?;
+
+            check_cancelled(state, &msg.team_id, run_id).await?;
+            update_pass(state, &msg.team_id, run_id, "security").await?;
+            let retry = match security::run(
+                state,
+                msg,
+                &github,
+                &plan_result,
+                &branch_name,
+                &repo_instructions,
+                &provider,
+                usage,
+                &file_cache,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(run_id, error = %e, "Security retry errored, proceeding");
+                    security::SecurityResult {
+                        passed: true,
+                        summary: format!("Security error: {e}"),
+                    }
+                }
+            };
+            if !retry.passed {
+                warn!(
+                    run_id,
+                    "Security issues remain after remediation, proceeding with PR"
+                );
+            }
+        }
+    }
+
+    // Store security findings in agent memory
+    if let Some(ref mut mem) = agent_memory {
+        if !security_result.passed {
+            mem.store_security_finding(&format!(
+                "Security audit found issues on run {run_id}: {}",
+                security_result.summary
+            ))
+            .await;
+        }
+    }
+
+    // --- Create Draft PR (triggers CI) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "pr").await?;
 
@@ -1314,154 +1460,6 @@ async fn run_passes(
             &file_cache,
         )
         .await?;
-    }
-
-    // --- Security Audit (after review loop, before PR) ---
-    check_cancelled(state, &msg.team_id, run_id).await?;
-    update_pass(state, &msg.team_id, run_id, "security").await?;
-    let pass_start = std::time::Instant::now();
-    let usage_before = usage.clone();
-    let security_result = match security::run(
-        state,
-        msg,
-        &github,
-        &plan_result,
-        &branch_name,
-        &repo_instructions,
-        &provider,
-        usage,
-        &file_cache,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(run_id, error = %e, "Security pass errored, proceeding");
-            security::SecurityResult {
-                passed: true,
-                summary: format!("Security error: {e}"),
-            }
-        }
-    };
-    write_pass_trace(
-        state,
-        &msg.team_id,
-        run_id,
-        "security",
-        pass_start,
-        &usage_before,
-        usage,
-        None,
-    )
-    .await;
-    save_checkpoint(
-        state,
-        &msg.team_id,
-        run_id,
-        "security",
-        &branch_name,
-        0,
-        usage,
-    )
-    .await;
-    info!(
-        run_id,
-        passed = security_result.passed,
-        "Security audit complete"
-    );
-    add_progress_note(
-        state,
-        &msg.team_id,
-        run_id,
-        if security_result.passed {
-            "Security audit passed"
-        } else {
-            "Security issues found, fixing"
-        },
-    )
-    .await;
-
-    if !security_result.passed {
-        if !has_time_for_remediation(&start) {
-            warn!(
-                run_id,
-                remaining_secs = remaining_secs(&start),
-                "Skipping security remediation — not enough time remaining"
-            );
-            add_progress_note(
-                state,
-                &msg.team_id,
-                run_id,
-                "Security issues found but skipping remediation (low time remaining)",
-            )
-            .await;
-        } else {
-        // One remediation cycle: implement fixes, then re-audit
-        info!(run_id, "Security issues found, running remediation cycle");
-        check_cancelled(state, &msg.team_id, run_id).await?;
-        update_pass(state, &msg.team_id, run_id, "implement").await?;
-        implement::run(
-            state,
-            msg,
-            &github,
-            &plan_result,
-            &branch_name,
-            &rules,
-            &repo_instructions,
-            Some(&format!(
-                "Security audit found vulnerabilities. Fix ALL of the following:\n\n{}",
-                security_result.summary
-            )),
-            &triage_result.complexity,
-            &provider,
-            usage,
-            &file_cache,
-        )
-        .await?;
-
-        // Re-audit once
-        check_cancelled(state, &msg.team_id, run_id).await?;
-        update_pass(state, &msg.team_id, run_id, "security").await?;
-        let retry = match security::run(
-            state,
-            msg,
-            &github,
-            &plan_result,
-            &branch_name,
-            &repo_instructions,
-            &provider,
-            usage,
-            &file_cache,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(run_id, error = %e, "Security retry errored, proceeding");
-                security::SecurityResult {
-                    passed: true,
-                    summary: format!("Security error: {e}"),
-                }
-            }
-        };
-        if !retry.passed {
-            warn!(
-                run_id,
-                "Security issues remain after remediation, proceeding with PR"
-            );
-        }
-        }
-    }
-
-    // Store security findings in agent memory
-    if let Some(ref mut mem) = agent_memory {
-        if !security_result.passed {
-            mem.store_security_finding(&format!(
-                "Security audit found issues on run {run_id}: {}",
-                security_result.summary
-            ))
-            .await;
-        }
     }
 
     // --- Mark PR ready for review ---
