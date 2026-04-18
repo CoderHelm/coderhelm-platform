@@ -36,6 +36,8 @@ struct MessagesRequest {
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ApiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Serialize)]
@@ -146,6 +148,7 @@ pub async fn converse_simple(
             }],
         }],
         tools: None,
+        cache_control: None,
     };
 
     let resp = send_request(client, &request).await?;
@@ -243,6 +246,11 @@ pub async fn converse_tool_loop(
             } else {
                 Some(api_tools.clone())
             },
+            // Auto-cache: caches the entire prefix (tools + system + messages)
+            // up to the last cacheable block. On turn N, all prior turns are cached.
+            cache_control: Some(CacheControl {
+                r#type: "ephemeral".to_string(),
+            }),
         };
 
         let response = send_with_retry(client, &request, model_id).await?;
