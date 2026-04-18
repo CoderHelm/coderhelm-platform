@@ -2161,15 +2161,21 @@ async fn load_plan_chat_context(
         }));
     }
 
-    // Build Anthropic tools from MCP tools
+    // Build Anthropic tools from MCP tools (cache_control on last for prompt caching)
+    let tool_count = mcp_tools.len();
     let tools: Vec<Value> = mcp_tools
         .iter()
-        .map(|t| {
-            json!({
+        .enumerate()
+        .map(|(i, t)| {
+            let mut tool = json!({
                 "name": format!("{}__{}", t.server_id, t.name),
                 "description": t.description,
                 "input_schema": t.input_schema
-            })
+            });
+            if i == tool_count - 1 {
+                tool["cache_control"] = json!({"type": "ephemeral"});
+            }
+            tool
         })
         .collect();
 
