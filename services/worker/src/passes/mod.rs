@@ -319,69 +319,62 @@ async fn run_passes(
         progress_comment_id = resp["id"].as_u64();
     }
 
-    // --- Auto-resolve repo for Jira tickets with bare "coderhelm" label ---
-    if msg.repo_owner.is_empty() || msg.repo_name.is_empty() {
-        if matches!(msg.source, TicketSource::Jira) {
-            let repos = plan::fetch_team_repos(state, &msg.team_id).await;
-            if repos.is_empty() {
-                return Err("No enabled repos found for team — cannot auto-pick repo".into());
-            }
-
-            // Check for explicit Jira project → repo mapping first
-            let project_key = msg.ticket_id.split('-').next().unwrap_or("");
-            let mapped_repo = if !project_key.is_empty() {
-                lookup_jira_project_repo(state, &msg.team_id, project_key).await
-            } else {
-                None
-            };
-
-            if let Some(ref repo) = mapped_repo {
-                if repos.iter().any(|r| r == repo) {
-                    let (owner, name) = repo.split_once('/').unwrap_or(("", ""));
-                    msg.repo_owner = owner.to_string();
-                    msg.repo_name = name.to_string();
-                    info!(run_id, repo = %repo, project_key, "Repo from Jira project mapping");
-                } else {
-                    warn!(run_id, repo = %repo, project_key, "Mapped repo not in enabled list, falling back to LLM");
-                }
-            }
-
-            if msg.repo_owner.is_empty() {
-                if repos.len() == 1 {
-                    let (owner, name) = repos[0].split_once('/').unwrap_or(("", ""));
-                    msg.repo_owner = owner.to_string();
-                    msg.repo_name = name.to_string();
-                    info!(run_id, repo = %repos[0], "Auto-selected single repo");
-                } else {
-                    let selected = triage::select_repo(state, msg, &repos, &provider, usage).await?;
-                    let (owner, name) = selected.split_once('/').unwrap_or(("", ""));
-                    msg.repo_owner = owner.to_string();
-                    msg.repo_name = name.to_string();
-                    info!(run_id, repo = %selected, "Triage LLM selected repo");
-                }
-            }
-            // Update run record with resolved repo
-            let resolved_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
-            if let Err(e) = state
-                .dynamo
-                .update_item()
-                .table_name(&state.config.runs_table_name)
-                .key("team_id", attr_s(&msg.team_id))
-                .key("run_id", attr_s(run_id))
-                .update_expression("SET repo = :r, team_repo = :tr")
-                .expression_attribute_values(":r", attr_s(&resolved_repo))
-                .expression_attribute_values(
-                    ":tr",
-                    attr_s(&format!("{}#{}", msg.team_id, resolved_repo)),
-                )
-                .send()
-                .await
-            {
-                error!(run_id, error = %e, "Failed to update run with resolved repo");
-            }
-        } else {
-            return Err("repo_owner and repo_name are required for GitHub tickets".into());
+    // --- Resolve repo for Jira tickets ---
+    // For Jira: pick a starting repo (project mapping > first enabled repo).
+    // The plan pass explores ALL repos, and validate_plan switches to the
+    // correct one based on where the referenced files actually live.
+    if matches!(msg.source, TicketSource::Jira) {
+        let repos = plan::fetch_team_repos(state, &msg.team_id).await;
+        if repos.is_empty() {
+            return Err("No enabled repos found for team — cannot auto-pick repo".into());
         }
+
+        // Check for explicit Jira project → repo mapping
+        let project_key = msg.ticket_id.split('-').next().unwrap_or("");
+        let mapped_repo = if !project_key.is_empty() {
+            lookup_jira_project_repo(state, &msg.team_id, project_key).await
+        } else {
+            None
+        };
+
+        if let Some(ref repo) = mapped_repo {
+            if repos.iter().any(|r| r == repo) {
+                let (owner, name) = repo.split_once('/').unwrap_or(("", ""));
+                msg.repo_owner = owner.to_string();
+                msg.repo_name = name.to_string();
+                info!(run_id, repo = %repo, project_key, "Repo from Jira project mapping");
+            }
+        }
+
+        // If no mapping (or mapped repo not enabled), just pick first repo as placeholder
+        if msg.repo_owner.is_empty() || !repos.iter().any(|r| r == &format!("{}/{}", msg.repo_owner, msg.repo_name)) {
+            let (owner, name) = repos[0].split_once('/').unwrap_or(("", ""));
+            msg.repo_owner = owner.to_string();
+            msg.repo_name = name.to_string();
+            info!(run_id, repo = %repos[0], "Placeholder repo — plan + validate_plan will determine actual repo");
+        }
+
+        // Update run record
+        let resolved_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+        if let Err(e) = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(&msg.team_id))
+            .key("run_id", attr_s(run_id))
+            .update_expression("SET repo = :r, team_repo = :tr")
+            .expression_attribute_values(":r", attr_s(&resolved_repo))
+            .expression_attribute_values(
+                ":tr",
+                attr_s(&format!("{}#{}", msg.team_id, resolved_repo)),
+            )
+            .send()
+            .await
+        {
+            error!(run_id, error = %e, "Failed to update run with resolved repo");
+        }
+    } else if msg.repo_owner.is_empty() || msg.repo_name.is_empty() {
+        return Err("repo_owner and repo_name are required for GitHub tickets".into());
     }
 
     // Look up the repo's default branch (main, master, develop, etc.)
