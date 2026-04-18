@@ -1406,16 +1406,8 @@ async fn run_passes(
         }
     }
 
-    // Store security findings in agent memory
-    if let Some(ref mut mem) = agent_memory {
-        if !security_result.passed {
-            mem.store_security_finding(&format!(
-                "Security audit found issues on run {run_id}: {}",
-                security_result.summary
-            ))
-            .await;
-        }
-    }
+    // Security findings are already posted as PR review comments and stored in the
+    // run record — no need to duplicate the full audit text into long-term memory.
 
     // --- Create Draft PR (triggers CI) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -1688,15 +1680,8 @@ async fn run_repo_pipeline(
         }
     }
 
-    // Store security findings in memory
-    if let Some(ref mut mem) = agent_memory {
-        if !security_result.passed {
-            mem.store_security_finding(&format!(
-                "Security audit found issues on {}/{}: {}", repo_owner, repo_name, security_result.summary
-            ))
-            .await;
-        }
-    }
+    // Security findings are already posted as PR review comments and stored in the
+    // run record — no need to duplicate the full audit text into long-term memory.
 
     // --- Create Draft PR ---
     check_cancelled(state, &msg.team_id, run_id).await?;
