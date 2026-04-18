@@ -387,8 +387,32 @@ async fn run_passes(
             branch
         }
         Err(e) => {
-            warn!(run_id, error = %e, "Failed to get default branch, falling back to 'main'");
-            "main".to_string()
+            // Check the repos table for a cached default_branch before giving up
+            let cached = state
+                .dynamo
+                .get_item()
+                .table_name(&state.config.repos_table_name)
+                .key("pk", attr_s(&msg.team_id))
+                .key("sk", attr_s(&format!("REPO#{}/{}", msg.repo_owner, msg.repo_name)))
+                .projection_expression("default_branch")
+                .send()
+                .await
+                .ok()
+                .and_then(|r| r.item)
+                .and_then(|item| item.get("default_branch").and_then(|v| v.as_s().ok()).cloned())
+                .filter(|s| !s.is_empty());
+            match cached {
+                Some(branch) => {
+                    warn!(run_id, error = %e, branch = %branch, "GitHub API failed, using cached default_branch");
+                    branch
+                }
+                None => {
+                    return Err(format!(
+                        "Cannot resolve default branch for {}/{}: {e}. Check GitHub installation permissions.",
+                        msg.repo_owner, msg.repo_name
+                    ).into());
+                }
+            }
         }
     };
     msg.base_branch = default_branch;
