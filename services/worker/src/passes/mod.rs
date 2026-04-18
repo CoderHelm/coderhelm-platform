@@ -257,7 +257,7 @@ pub async fn orchestrate_ticket(
                     .expression_attribute_values(":to", attr_n(usage.output_tokens))
                     .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
                     .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                    .expression_attribute_values(":c", attr_s(&format!("{cost:.6}")))
+                    .expression_attribute_values(":c", attr_n(format!("{cost:.4}")))
                     .expression_attribute_values(":d", attr_n(duration))
                     .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
                     .send()
