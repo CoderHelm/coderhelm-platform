@@ -353,26 +353,6 @@ async fn run_passes(
             msg.repo_name = name.to_string();
             info!(run_id, repo = %repos[0], "Placeholder repo — plan + validate_plan will determine actual repo");
         }
-
-        // Update run record
-        let resolved_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
-        if let Err(e) = state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.runs_table_name)
-            .key("team_id", attr_s(&msg.team_id))
-            .key("run_id", attr_s(run_id))
-            .update_expression("SET repo = :r, team_repo = :tr")
-            .expression_attribute_values(":r", attr_s(&resolved_repo))
-            .expression_attribute_values(
-                ":tr",
-                attr_s(&format!("{}#{}", msg.team_id, resolved_repo)),
-            )
-            .send()
-            .await
-        {
-            error!(run_id, error = %e, "Failed to update run with resolved repo");
-        }
     } else if msg.repo_owner.is_empty() || msg.repo_name.is_empty() {
         return Err("repo_owner and repo_name are required for GitHub tickets".into());
     }
@@ -934,6 +914,23 @@ async fn run_passes(
                 warn!(run_id, warning = %w, "Plan validation warning");
             }
         }
+
+        // Write final repo to run record (after validate_plan may have switched it)
+        let final_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(&msg.team_id))
+            .key("run_id", attr_s(run_id))
+            .update_expression("SET repo = :r, team_repo = :tr")
+            .expression_attribute_values(":r", attr_s(&final_repo))
+            .expression_attribute_values(
+                ":tr",
+                attr_s(&format!("{}#{}", msg.team_id, final_repo)),
+            )
+            .send()
+            .await;
 
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
