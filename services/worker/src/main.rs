@@ -190,7 +190,7 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
             models::WorkerMessage::Resume(msg) => {
                 info!(team_id = %msg.team_id, run_id = %msg.run_id, "Resuming run from webhook event");
                 if let Err(e) = passes::resume::run(&state, msg).await {
-                    error!("Resume failed: {e}");
+                    error!("Resume failed: {e:?}");
                 }
             }
         }

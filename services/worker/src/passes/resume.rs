@@ -28,16 +28,22 @@ pub async fn run(
     let start = std::time::Instant::now();
 
     // Load run record
-    let run_record = state
+    info!(run_id = %msg.run_id, table = %state.config.runs_table_name, "Loading run record");
+    let run_record = match state
         .dynamo
         .get_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(&msg.run_id))
         .send()
-        .await?
-        .item
-        .ok_or("Run record not found")?;
+        .await
+    {
+        Ok(resp) => resp.item.ok_or("Run record not found")?,
+        Err(e) => {
+            error!(run_id = %msg.run_id, "Failed to load run record: {e:?}");
+            return Err(format!("{e:?}").into());
+        }
+    };
 
     let status = run_record
         .get("status")
@@ -56,7 +62,14 @@ pub async fn run(
     }
 
     // Load all unprocessed events
-    let events = load_unprocessed_events(state, &msg.run_id).await?;
+    info!(run_id = %msg.run_id, events_table = %state.config.events_table_name, "Loading events");
+    let events = match load_unprocessed_events(state, &msg.run_id).await {
+        Ok(evts) => evts,
+        Err(e) => {
+            error!(run_id = %msg.run_id, "Failed to load events: {e:?}");
+            return Err(e);
+        }
+    };
     if events.is_empty() {
         info!(run_id = msg.run_id, "No unprocessed events, nothing to do");
         return Ok(());
