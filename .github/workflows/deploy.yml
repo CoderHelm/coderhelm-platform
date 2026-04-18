@@ -28,7 +28,7 @@ jobs:
           cache-on-failure: true
       - uses: mlugg/setup-zig@v2
       - name: Install cargo-zigbuild
-        run: pip3 install cargo-zigbuild
+        run: pip3 install --retries 3 --timeout 60 cargo-zigbuild
       # Build both gateway + worker in one invocation — shared deps compiled once
       - name: Build workspace
         working-directory: services
