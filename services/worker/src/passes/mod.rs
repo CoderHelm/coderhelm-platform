@@ -219,9 +219,11 @@ pub async fn orchestrate_ticket(
                     .table_name(&state.config.runs_table_name)
                     .key("team_id", attr_s(&msg.team_id))
                     .key("run_id", attr_s(&run_id))
-                    .update_expression("SET tokens_in = :ti, tokens_out = :to, cost_usd = :c, duration_s = :d, updated_at = :t")
+                    .update_expression("SET tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, duration_s = :d, updated_at = :t")
                     .expression_attribute_values(":ti", attr_n(usage.input_tokens))
                     .expression_attribute_values(":to", attr_n(usage.output_tokens))
+                    .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+                    .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
                     .expression_attribute_values(":c", attr_s(&format!("{cost:.6}")))
                     .expression_attribute_values(":d", attr_n(duration))
                     .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
@@ -592,7 +594,7 @@ async fn run_passes(
             .key("team_id", attr_s(&msg.team_id))
             .key("run_id", attr_s(run_id))
             .update_expression(
-                "SET #status = :s, tokens_in = :ti, tokens_out = :to, cost_usd = :c, \
+                "SET #status = :s, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
                  duration_s = :d, updated_at = :t, current_pass = :cp, \
                  status_run_id = :sri, mcp_servers = :mcp",
             )
@@ -600,6 +602,8 @@ async fn run_passes(
             .expression_attribute_values(":s", attr_s("completed"))
             .expression_attribute_values(":ti", attr_n(usage.input_tokens))
             .expression_attribute_values(":to", attr_n(usage.output_tokens))
+            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
             .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
             .expression_attribute_values(":d", attr_n(duration))
             .expression_attribute_values(":t", attr_s(&now))
@@ -694,7 +698,7 @@ async fn run_passes(
             .key("team_id", attr_s(&msg.team_id))
             .key("run_id", attr_s(run_id))
             .update_expression(
-                "SET #status = :s, tokens_in = :ti, tokens_out = :to, cost_usd = :c, \
+                "SET #status = :s, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
                  duration_s = :d, updated_at = :t, current_pass = :cp, \
                  status_run_id = :sri, mcp_servers = :mcp",
             )
@@ -702,6 +706,8 @@ async fn run_passes(
             .expression_attribute_values(":s", attr_s("needs_input"))
             .expression_attribute_values(":ti", attr_n(usage.input_tokens))
             .expression_attribute_values(":to", attr_n(usage.output_tokens))
+            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
             .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
             .expression_attribute_values(":d", attr_n(duration))
             .expression_attribute_values(":t", attr_s(&now))
@@ -1808,7 +1814,7 @@ async fn fail_run(
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #status = :s, error_message = :err, tokens_in = :ti, \
-             tokens_out = :to, cost_usd = :c, duration_s = :d, \
+             tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, duration_s = :d, \
              updated_at = :t, status_run_id = :sri",
         )
         .expression_attribute_names("#status", "status")
@@ -1816,6 +1822,8 @@ async fn fail_run(
         .expression_attribute_values(":err", attr_s(&error_msg[..error_msg.len().min(500)]))
         .expression_attribute_values(":ti", attr_n(usage.input_tokens))
         .expression_attribute_values(":to", attr_n(usage.output_tokens))
+        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
         .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
