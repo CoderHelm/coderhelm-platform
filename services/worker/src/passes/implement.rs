@@ -84,7 +84,8 @@ pub async fn run(
 
 ## Instructions — SIMPLE CHANGE
 Go DIRECTLY to the target files listed in the OpenSpec.
-- Use `read_file_lines` on the exact section, make the change with `write_file`, done.
+- Use `read_file_lines` on the exact section, make the change with `edit_file`, done.
+- Use `edit_file` for modifying existing files (search/replace). Only use `write_file` for new files.
 - You should need 2-5 tool calls total.
 - Only implement the listed tasks. Do not add extras.
 - After implementing, output a one-line summary."#,
@@ -101,10 +102,11 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 
 ## Instructions
 - Use `search_code` to find exact files and lines before reading. Prefer `read_file_lines` over `read_file`.
+- Use `edit_file` for modifying existing files (search/replace edits). Only use `write_file` for creating new files.
 - Implement each unchecked task (`- [ ]`) in the Tasks section, one at a time, in order.
 - Refer to the Design section for which files to modify and patterns to follow.
 - Validate your changes against the Acceptance Criteria.
-- Use `batch_write` for atomic multi-file changes.
+- Use `batch_write` for atomic multi-file changes (new files or when edit_file won't work).
 - Follow existing code patterns exactly (imports, naming, structure, test style).
 - After implementing all tasks, output a summary.
 - Only implement the listed tasks. Do not add extras."#,
@@ -324,7 +326,7 @@ fn all_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "write_file".to_string(),
-            description: "Create or update a single file. Include sha for updates.".to_string(),
+            description: "Create a NEW file or fully rewrite a small file. For modifying existing files, prefer edit_file (much cheaper).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -334,6 +336,30 @@ fn all_tools() -> Vec<ToolDefinition> {
                     "sha": {"type": "string", "description": "SHA of existing file (required for updates)"}
                 },
                 "required": ["path", "content", "message"]
+            }),
+        },
+        ToolDefinition {
+            name: "edit_file".to_string(),
+            description: "Make targeted edits to an existing file using search/replace. Sends only the changed parts — use this instead of write_file for modifications. Each edit replaces one occurrence of old_text with new_text.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to repo root"},
+                    "edits": {
+                        "type": "array",
+                        "description": "Array of search/replace edits to apply in order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {"type": "string", "description": "Exact text to find (must match uniquely)"},
+                                "new_text": {"type": "string", "description": "Replacement text"}
+                            },
+                            "required": ["old_text", "new_text"]
+                        }
+                    },
+                    "message": {"type": "string", "description": "Commit message"}
+                },
+                "required": ["path", "edits", "message"]
             }),
         },
         ToolDefinition {
@@ -573,6 +599,89 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .await;
                 self.task_tracker.mark_files_done(&[path]).await;
                 Ok(json!(format!("Wrote {path}")))
+            }
+            "edit_file" => {
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing path")?;
+                if is_protected_path(path) {
+                    return Ok(json!(format!(
+                        "Cannot modify {path}: CI/CD workflow files are protected."
+                    )));
+                }
+                let edits = input
+                    .get("edits")
+                    .and_then(|v| v.as_array())
+                    .ok_or("Missing edits array")?;
+                let message = input
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing message")?;
+
+                // Fetch current file content
+                let cache_key = format!("{}:{}", self.branch, path);
+                let mut content = if let Some(cached) = self.file_cache.get(&cache_key).await {
+                    cached
+                } else {
+                    self.github
+                        .read_file(&self.owner, &self.repo, path, &self.branch)
+                        .await?
+                };
+
+                // Apply edits sequentially
+                let mut applied = 0;
+                let mut errors = Vec::new();
+                for edit in edits {
+                    let old_text = edit.get("old_text").and_then(|v| v.as_str()).unwrap_or("");
+                    let new_text = edit.get("new_text").and_then(|v| v.as_str()).unwrap_or("");
+                    if old_text.is_empty() {
+                        errors.push("Empty old_text in edit".to_string());
+                        continue;
+                    }
+                    let count = content.matches(old_text).count();
+                    if count == 0 {
+                        errors.push(format!("old_text not found: {}…", &old_text[..old_text.len().min(60)]));
+                    } else if count > 1 {
+                        errors.push(format!("old_text matched {} times (must be unique): {}…", count, &old_text[..old_text.len().min(60)]));
+                    } else {
+                        content = content.replacen(old_text, new_text, 1);
+                        applied += 1;
+                    }
+                }
+
+                if applied == 0 {
+                    return Ok(json!(format!("No edits applied to {path}: {}", errors.join("; "))));
+                }
+
+                // Write the modified file back
+                // Get sha for update
+                let sha = self.github
+                    .get_file_sha(&self.owner, &self.repo, path, &self.branch)
+                    .await
+                    .ok();
+                self.github
+                    .write_file(
+                        &self.owner,
+                        &self.repo,
+                        path,
+                        &content,
+                        &self.branch,
+                        message,
+                        sha.as_deref(),
+                    )
+                    .await?;
+                self.files_modified.lock().unwrap().insert(path.to_string());
+                self.file_cache
+                    .insert(cache_key, content)
+                    .await;
+                self.task_tracker.mark_files_done(&[path]).await;
+
+                let mut result = format!("Applied {applied} edit(s) to {path}");
+                if !errors.is_empty() {
+                    result.push_str(&format!(". Warnings: {}", errors.join("; ")));
+                }
+                Ok(json!(result))
             }
             "batch_write" => {
                 let message = input

@@ -229,6 +229,22 @@ impl GitHubClient {
         Ok(String::from_utf8(bytes)?)
     }
 
+    /// Get the SHA of a file at a given ref (for update operations).
+    pub async fn get_file_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        let data = self.get(&url).await?;
+        data.get("sha")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "No SHA in response".into())
+    }
+
     /// Read specific line range from a file (1-indexed, inclusive).
     pub async fn read_file_lines(
         &self,

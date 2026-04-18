@@ -263,7 +263,13 @@ pub async fn converse_tool_loop(
             response.usage.cache_creation_input_tokens,
         );
 
-        // Context compaction based on input tokens — start early to keep costs down
+        // Context compaction — aggressively clear old tool results every turn.
+        // The model has already consumed them; keeping them in history is pure token waste.
+        // Keep the last `keep_recent` turn-pairs uncompacted so the model has recent context.
+        let keep_recent = 4; // keep last 4 turn-pairs (~8 messages)
+        compact_messages(messages, keep_recent);
+
+        // Emergency compaction: if context is huge despite per-turn compaction, drop more
         let input_tokens = response.usage.input_tokens;
         let model_limit: u64 = 200_000;
         let context_pct = input_tokens as f64 / model_limit as f64;
@@ -272,15 +278,13 @@ pub async fn converse_tool_loop(
                 "Context at {:.0}%, emergency compaction",
                 context_pct * 100.0
             );
-            compact_messages(messages, 3);
+            compact_messages(messages, 2);
         } else if context_pct > 0.40 {
             info!(
                 "Context at {:.0}%, aggressive compaction",
                 context_pct * 100.0
             );
-            compact_messages(messages, 5);
-        } else if context_pct > 0.25 {
-            compact_messages(messages, 8);
+            compact_messages(messages, 3);
         }
 
         // Serialize response content blocks
@@ -436,8 +440,11 @@ fn compact_messages(messages: &mut [(String, Vec<Value>)], keep_last: usize) {
         for block in content.iter_mut() {
             if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
                 if let Some(c) = block.get("content").and_then(|c| c.as_str()) {
-                    if c.len() > 200 {
-                        block["content"] = json!("[Tool result cleared — see recent context]");
+                    if c.len() > 150 {
+                        // Preserve a brief hint of what was in the result
+                        let hint = &c[..c.len().min(60)];
+                        block["content"] =
+                            json!(format!("[Cleared — {len} chars: {hint}…]", len = c.len(), hint = hint));
                     }
                 }
             }
