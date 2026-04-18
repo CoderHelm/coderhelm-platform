@@ -837,6 +837,20 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// Find an open PR for a specific head branch. Returns None if no open PR exists.
+    pub async fn find_open_pr_for_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/pulls?state=open&head={owner}:{branch}&per_page=1"
+        );
+        let data = self.get(&url).await?;
+        Ok(data.as_array().and_then(|arr| arr.first().cloned()))
+    }
+
     /// List recent commits on a branch.
     pub async fn list_commits(
         &self,

@@ -827,7 +827,148 @@ async fn run_passes(
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "implement").await?;
 
-        // Create working branch first
+        // --- Re-run detection: check if branch already has an open PR with CI failures ---
+        let existing_pr = github
+            .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, &branch_name)
+            .await
+            .unwrap_or(None);
+
+        if let Some(ref pr) = existing_pr {
+            let pr_number = pr["number"].as_u64().unwrap_or(0);
+            let pr_url = pr["html_url"].as_str().unwrap_or("").to_string();
+
+            // Check CI status on this PR's head
+            let checks = github
+                .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
+                .await
+                .unwrap_or_default();
+            let has_ci_failure = checks["check_runs"]
+                .as_array()
+                .map(|runs| runs.iter().any(|r| r["conclusion"].as_str() == Some("failure")))
+                .unwrap_or(false);
+
+            if has_ci_failure {
+                info!(
+                    run_id,
+                    pr_number,
+                    "Re-run detected: existing PR with CI failures — entering CI fix mode"
+                );
+                add_progress_note(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    &format!("Existing PR #{pr_number} has CI failures — fixing"),
+                )
+                .await;
+
+                // Get the failed workflow run logs
+                let failed_run_id = checks["check_runs"]
+                    .as_array()
+                    .and_then(|runs| {
+                        runs.iter()
+                            .filter(|r| r["conclusion"].as_str() == Some("failure"))
+                            .filter_map(|r| {
+                                r["details_url"]
+                                    .as_str()
+                                    .and_then(|u| u.split("/runs/").nth(1))
+                                    .and_then(|s| s.split('/').next())
+                                    .and_then(|s| s.parse::<u64>().ok())
+                            })
+                            .last()
+                    })
+                    .unwrap_or(0);
+
+                let logs = if failed_run_id > 0 {
+                    github
+                        .get_workflow_run_logs(&msg.repo_owner, &msg.repo_name, failed_run_id)
+                        .await
+                        .unwrap_or_else(|_| "(failed to download logs)".to_string())
+                } else {
+                    // Fallback: get logs from the failed check run directly
+                    let job_id = checks["check_runs"]
+                        .as_array()
+                        .and_then(|runs| {
+                            runs.iter()
+                                .find(|r| r["conclusion"].as_str() == Some("failure"))
+                                .and_then(|r| r["id"].as_u64())
+                        })
+                        .unwrap_or(0);
+                    if job_id > 0 {
+                        github
+                            .get_check_run_logs(&msg.repo_owner, &msg.repo_name, job_id)
+                            .await
+                            .unwrap_or_else(|_| "(failed to download logs)".to_string())
+                    } else {
+                        "(no failed check runs found)".to_string()
+                    }
+                };
+
+                let max_log = 15_000;
+                let trimmed_logs = if logs.len() > max_log {
+                    format!("... (truncated)\n{}", &logs[logs.len() - max_log..])
+                } else {
+                    logs
+                };
+
+                let feedback = format!(
+                    "CI workflow failed on PR #{pr_number} (branch: {branch_name}). Fix the failures.\n\n\
+                     Rules:\n\
+                     - Only fix what CI is complaining about. Don't refactor or add features.\n\
+                     - If the failure is in a test, fix the code (not the test) unless the test itself is wrong.\n\
+                     - If tests need updating because the feature changed behavior intentionally, update the tests.\n\
+                     - You may create new test files or edit existing ones if needed.\n\n\
+                     Full logs:\n{trimmed_logs}"
+                );
+
+                let file_cache = FileCache::default();
+                let pass_start = std::time::Instant::now();
+                let usage_before = usage.clone();
+
+                match implement::run(
+                    state, msg, &github, &plan_result, &branch_name, &[], "",
+                    Some(&feedback), "medium", &provider, usage, &file_cache, Some(run_id),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        write_pass_trace(state, &msg.team_id, run_id, "ci_fix", pass_start, &usage_before, usage, None).await;
+                        info!(run_id, files = result.files_modified.len(), "CI fix implemented on re-run");
+
+                        // Store PR info on run record and go to awaiting_ci
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let _ = state.dynamo.update_item()
+                            .table_name(&state.config.runs_table_name)
+                            .key("team_id", attr_s(&msg.team_id))
+                            .key("run_id", attr_s(run_id))
+                            .update_expression("SET #s = :s, status_run_id = :sri, current_pass = :cp, pr_number = :pn, pr_url = :pu, branch = :b, updated_at = :t, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :cost")
+                            .expression_attribute_names("#s", "status")
+                            .expression_attribute_values(":s", attr_s("awaiting_ci"))
+                            .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+                            .expression_attribute_values(":cp", attr_s("awaiting_ci"))
+                            .expression_attribute_values(":pn", attr_n(pr_number))
+                            .expression_attribute_values(":pu", attr_s(&pr_url))
+                            .expression_attribute_values(":b", attr_s(&branch_name))
+                            .expression_attribute_values(":t", attr_s(&now))
+                            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+                            .expression_attribute_values(":to", attr_n(usage.output_tokens))
+                            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+                            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+                            .expression_attribute_values(":cost", attr_s(&format!("{:.4}", usage.estimated_cost())))
+                            .send()
+                            .await;
+
+                        save_checkpoint(state, &msg.team_id, run_id, "pr", &branch_name, 1, usage).await;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(run_id, error = %e, "CI fix on re-run failed, falling through to fresh start");
+                        // Fall through to reset branch and start fresh
+                    }
+                }
+            }
+        }
+
+        // Create working branch (or reset existing one to base)
         github
             .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, &msg.base_branch)
             .await?;
@@ -1563,7 +1704,7 @@ async fn run_repo_pipeline(
     file_cache: &FileCache,
     start: &Instant,
     run_id: &str,
-    agent_memory: &mut Option<AgentMemory>,
+    _agent_memory: &mut Option<AgentMemory>,
 ) -> Result<RepoPrResult, Box<dyn std::error::Error + Send + Sync>> {
     let repo_owner = &msg.repo_owner;
     let repo_name = &msg.repo_name;
