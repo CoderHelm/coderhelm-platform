@@ -827,7 +827,9 @@ async fn run_passes(
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "implement").await?;
 
-        // --- Re-run detection: check if branch already has an open PR with CI failures ---
+        // --- Re-run detection: check if branch already has an open PR ---
+        // Uses the PR's head SHA (not branch name) for check runs, since a previous
+        // retry may have force-reset the branch to base, destroying CI failure evidence.
         let existing_pr = match github
             .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, &branch_name)
             .await
@@ -845,88 +847,151 @@ async fn run_passes(
         if let Some(ref pr) = existing_pr {
             let pr_number = pr["number"].as_u64().unwrap_or(0);
             let pr_url = pr["html_url"].as_str().unwrap_or("").to_string();
+            // Use PR head SHA for check runs — survives branch resets
+            let pr_head_sha = pr["head"]["sha"].as_str().unwrap_or("").to_string();
+            let check_ref = if pr_head_sha.is_empty() { branch_name.clone() } else { pr_head_sha };
 
-            // Check CI status on this PR's head
+            // Check CI status on the PR's head commit
             let checks = github
-                .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
+                .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, &check_ref)
                 .await
                 .unwrap_or_default();
+            let failed_conclusions = ["failure", "action_required", "timed_out", "startup_failure"];
             let has_ci_failure = checks["check_runs"]
                 .as_array()
-                .map(|runs| runs.iter().any(|r| r["conclusion"].as_str() == Some("failure")))
+                .map(|runs| runs.iter().any(|r| {
+                    r["conclusion"].as_str().map_or(false, |c| failed_conclusions.contains(&c))
+                }))
                 .unwrap_or(false);
 
-            if has_ci_failure {
-                info!(
-                    run_id,
-                    pr_number,
-                    "Re-run detected: existing PR with CI failures — entering CI fix mode"
-                );
-                add_progress_note(
-                    state,
-                    &msg.team_id,
-                    run_id,
-                    &format!("Existing PR #{pr_number} has CI failures — fixing"),
-                )
-                .await;
+            // Check for pending review comments on the PR
+            let review_comments = github
+                .get_review_comments(&msg.repo_owner, &msg.repo_name, pr_number)
+                .await
+                .unwrap_or_default();
+            // Filter to unresolved comments not authored by the bot
+            let pending_reviews: Vec<&serde_json::Value> = review_comments
+                .iter()
+                .filter(|c| {
+                    let author = c["user"]["login"].as_str().unwrap_or("");
+                    !author.contains("[bot]") && !author.contains("coderhelm")
+                })
+                .collect();
+            let has_review_feedback = !pending_reviews.is_empty();
 
-                // Get the failed workflow run logs
-                let failed_run_id = checks["check_runs"]
-                    .as_array()
-                    .and_then(|runs| {
-                        runs.iter()
-                            .filter(|r| r["conclusion"].as_str() == Some("failure"))
-                            .filter_map(|r| {
-                                r["details_url"]
-                                    .as_str()
-                                    .and_then(|u| u.split("/runs/").nth(1))
-                                    .and_then(|s| s.split('/').next())
-                                    .and_then(|s| s.parse::<u64>().ok())
-                            })
-                            .last()
-                    })
-                    .unwrap_or(0);
+            info!(
+                run_id, pr_number, has_ci_failure, has_review_feedback,
+                review_count = pending_reviews.len(),
+                check_ref = %check_ref,
+                "Re-run detection: PR status"
+            );
 
-                let logs = if failed_run_id > 0 {
-                    github
-                        .get_workflow_run_logs(&msg.repo_owner, &msg.repo_name, failed_run_id)
-                        .await
-                        .unwrap_or_else(|_| "(failed to download logs)".to_string())
-                } else {
-                    // Fallback: get logs from the failed check run directly
-                    let job_id = checks["check_runs"]
+            if has_ci_failure || has_review_feedback {
+                // Build combined feedback from CI failures and review comments
+                let mut feedback_parts: Vec<String> = Vec::new();
+
+                if has_ci_failure {
+                    add_progress_note(
+                        state,
+                        &msg.team_id,
+                        run_id,
+                        &format!("Existing PR #{pr_number} has CI failures — fixing"),
+                    )
+                    .await;
+
+                    // Get the failed workflow run logs
+                    let failed_run_id = checks["check_runs"]
                         .as_array()
                         .and_then(|runs| {
                             runs.iter()
-                                .find(|r| r["conclusion"].as_str() == Some("failure"))
-                                .and_then(|r| r["id"].as_u64())
+                                .filter(|r| r["conclusion"].as_str().map_or(false, |c| failed_conclusions.contains(&c)))
+                                .filter_map(|r| {
+                                    r["details_url"]
+                                        .as_str()
+                                        .and_then(|u| u.split("/runs/").nth(1))
+                                        .and_then(|s| s.split('/').next())
+                                        .and_then(|s| s.parse::<u64>().ok())
+                                })
+                                .last()
                         })
                         .unwrap_or(0);
-                    if job_id > 0 {
+
+                    let logs = if failed_run_id > 0 {
                         github
-                            .get_check_run_logs(&msg.repo_owner, &msg.repo_name, job_id)
+                            .get_workflow_run_logs(&msg.repo_owner, &msg.repo_name, failed_run_id)
                             .await
                             .unwrap_or_else(|_| "(failed to download logs)".to_string())
                     } else {
-                        "(no failed check runs found)".to_string()
+                        let job_id = checks["check_runs"]
+                            .as_array()
+                            .and_then(|runs| {
+                                runs.iter()
+                                    .find(|r| r["conclusion"].as_str().map_or(false, |c| failed_conclusions.contains(&c)))
+                                    .and_then(|r| r["id"].as_u64())
+                            })
+                            .unwrap_or(0);
+                        if job_id > 0 {
+                            github
+                                .get_check_run_logs(&msg.repo_owner, &msg.repo_name, job_id)
+                                .await
+                                .unwrap_or_else(|_| "(failed to download logs)".to_string())
+                        } else {
+                            "(no failed check runs found)".to_string()
+                        }
+                    };
+
+                    let max_log = 15_000;
+                    let trimmed_logs = if logs.len() > max_log {
+                        format!("... (truncated)\n{}", &logs[logs.len() - max_log..])
+                    } else {
+                        logs
+                    };
+
+                    feedback_parts.push(format!(
+                        "CI workflow failed on PR #{pr_number} (branch: {branch_name}). Fix the failures.\n\n\
+                         Rules:\n\
+                         - Only fix what CI is complaining about. Don't refactor or add features.\n\
+                         - If the failure is in a test, fix the code (not the test) unless the test itself is wrong.\n\
+                         - If tests need updating because the feature changed behavior intentionally, update the tests.\n\
+                         - You may create new test files or edit existing ones if needed.\n\n\
+                         Full logs:\n{trimmed_logs}"
+                    ));
+                }
+
+                if has_review_feedback {
+                    add_progress_note(
+                        state,
+                        &msg.team_id,
+                        run_id,
+                        &format!("Existing PR #{pr_number} has {} review comment(s) — addressing", pending_reviews.len()),
+                    )
+                    .await;
+
+                    let mut review_text = format!(
+                        "PR #{pr_number} has review comments that need to be addressed. \
+                         Fix each comment by making the requested changes.\n\n"
+                    );
+                    for (i, comment) in pending_reviews.iter().enumerate().take(20) {
+                        let path = comment["path"].as_str().unwrap_or("(unknown file)");
+                        let line = comment["line"].as_u64().unwrap_or(0);
+                        let body = comment["body"].as_str().unwrap_or("");
+                        let author = comment["user"]["login"].as_str().unwrap_or("reviewer");
+                        review_text.push_str(&format!(
+                            "Comment {} by @{author} on `{path}`:{line}:\n{body}\n\n",
+                            i + 1
+                        ));
                     }
-                };
+                    feedback_parts.push(review_text);
+                }
 
-                let max_log = 15_000;
-                let trimmed_logs = if logs.len() > max_log {
-                    format!("... (truncated)\n{}", &logs[logs.len() - max_log..])
-                } else {
-                    logs
-                };
+                let feedback = feedback_parts.join("\n---\n\n");
 
-                let feedback = format!(
-                    "CI workflow failed on PR #{pr_number} (branch: {branch_name}). Fix the failures.\n\n\
-                     Rules:\n\
-                     - Only fix what CI is complaining about. Don't refactor or add features.\n\
-                     - If the failure is in a test, fix the code (not the test) unless the test itself is wrong.\n\
-                     - If tests need updating because the feature changed behavior intentionally, update the tests.\n\
-                     - You may create new test files or edit existing ones if needed.\n\n\
-                     Full logs:\n{trimmed_logs}"
+                info!(
+                    run_id,
+                    pr_number,
+                    has_ci_failure,
+                    has_review_feedback,
+                    "Re-run detected: existing PR needs fixes — entering fix mode"
                 );
 
                 let file_cache = FileCache::default();
@@ -942,7 +1007,7 @@ async fn run_passes(
                     Ok(result) => {
                         write_pass_trace(state, &msg.team_id, run_id, "ci_fix", pass_start, &usage_before, usage, None).await;
                         write_conversation_log(state, &msg.team_id, run_id, "ci_fix", &result.conversation_log).await;
-                        info!(run_id, files = result.files_modified.len(), "CI fix implemented on re-run");
+                        info!(run_id, files = result.files_modified.len(), "Fix implemented on re-run");
 
                         // Store PR info on run record and go to awaiting_ci
                         let now = chrono::Utc::now().to_rfc3339();
@@ -982,7 +1047,7 @@ async fn run_passes(
                         return Ok(());
                     }
                     Err(e) => {
-                        warn!(run_id, error = %e, "CI fix on re-run failed, falling through to fresh start");
+                        warn!(run_id, error = %e, "Fix on re-run failed, falling through to fresh start");
                         // Fall through to reset branch and start fresh
                     }
                 }
