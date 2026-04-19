@@ -633,11 +633,15 @@ impl GitHubClient {
         node_id: &str,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let query = serde_json::json!({
-            "query": "mutation($id: ID!) { markPullRequestAsReady(input: { pullRequestId: $id }) { pullRequest { isDraft } } }",
+            "query": "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft } } }",
             "variables": { "id": node_id }
         });
         let url = "https://api.github.com/graphql";
-        self.post(url, &query).await
+        let resp = self.post(url, &query).await?;
+        if let Some(errors) = resp.get("errors") {
+            return Err(format!("GraphQL errors: {}", errors).into());
+        }
+        Ok(resp)
     }
 
     /// Get review comments on a PR.
