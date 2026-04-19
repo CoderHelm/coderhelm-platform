@@ -174,6 +174,7 @@ pub async fn converse_tool_loop(
     max_turns: usize,
     max_tokens: i32,
     on_tool_call: Option<&(dyn Fn(&str, u64) + Send + Sync)>,
+    mut conversation_log: Option<&mut Vec<Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let api_tools: Vec<ApiTool> = tools
         .iter()
@@ -310,6 +311,21 @@ pub async fn converse_tool_loop(
             .collect();
 
         if tool_uses.is_empty() || response.stop_reason.as_deref() == Some("end_turn") {
+            // Log the final assistant response
+            if let Some(ref mut log) = conversation_log {
+                log.push(json!({
+                    "turn": turns,
+                    "role": "assistant",
+                    "content": response.content.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>(),
+                    "usage": {
+                        "input_tokens": response.usage.input_tokens,
+                        "output_tokens": response.usage.output_tokens,
+                        "cache_read": response.usage.cache_read_input_tokens,
+                        "cache_write": response.usage.cache_creation_input_tokens
+                    },
+                    "stop_reason": response.stop_reason
+                }));
+            }
             return extract_text(&response.content);
         }
 
@@ -345,6 +361,41 @@ pub async fn converse_tool_loop(
                     }));
                 }
             }
+        }
+
+        // Log this turn to the conversation log (before compaction loses it)
+        if let Some(ref mut log) = conversation_log {
+            // Log assistant response with tool calls
+            log.push(json!({
+                "turn": turns,
+                "role": "assistant",
+                "content": response.content.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>(),
+                "usage": {
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                    "cache_read": response.usage.cache_read_input_tokens,
+                    "cache_write": response.usage.cache_creation_input_tokens
+                }
+            }));
+            // Log tool results (truncate large outputs to 100KB)
+            let truncated_results: Vec<Value> = tool_results.iter().map(|r| {
+                let mut entry = r.clone();
+                if let Some(content) = entry.get("content").and_then(|c| c.as_str()) {
+                    if content.len() > 102_400 {
+                        entry["content"] = Value::String(format!(
+                            "{}... [truncated, {} bytes total]",
+                            &content[..102_400],
+                            content.len()
+                        ));
+                    }
+                }
+                entry
+            }).collect();
+            log.push(json!({
+                "turn": turns,
+                "role": "tool_results",
+                "content": truncated_results
+            }));
         }
 
         messages.push(("user".to_string(), tool_results));

@@ -122,6 +122,7 @@ pub async fn run(
             max_tokens: 16384,
         },
         None,
+        None,
     )
     .await
     {

@@ -94,6 +94,7 @@ Output format:
             max_tokens: 4096,
         },
         None,
+        None,
     )
     .await?;
 

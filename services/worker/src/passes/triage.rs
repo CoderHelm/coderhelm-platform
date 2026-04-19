@@ -75,6 +75,7 @@ Rules:
             max_tokens: 16384,
         },
         None,
+        None,
     )
     .await?;
 
@@ -184,6 +185,7 @@ Then on the LAST line, return ONLY the repository in `owner/name` format."#,
             max_turns: 1,
             max_tokens: 512,
         },
+        None,
         None,
     )
     .await?;

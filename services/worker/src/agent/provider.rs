@@ -106,6 +106,7 @@ pub async fn converse(
     usage: &mut TokenUsage,
     opts: ConverseOptions,
     on_tool_call: Option<&(dyn Fn(&str, u64) + Send + Sync)>,
+    conversation_log: Option<&mut Vec<serde_json::Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = provider.client();
     anthropic::converse_tool_loop(
@@ -119,6 +120,7 @@ pub async fn converse(
         opts.max_turns,
         opts.max_tokens,
         on_tool_call,
+        conversation_log,
     )
     .await
 }

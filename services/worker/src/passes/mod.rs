@@ -822,7 +822,7 @@ async fn run_passes(
             files = files_modified.len(),
             "Reconstructed files_modified from branch diff"
         );
-        implement::ImplementResult { files_modified }
+        implement::ImplementResult { files_modified, conversation_log: vec![] }
     } else {
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "implement").await?;
@@ -941,6 +941,7 @@ async fn run_passes(
                 {
                     Ok(result) => {
                         write_pass_trace(state, &msg.team_id, run_id, "ci_fix", pass_start, &usage_before, usage, None).await;
+                        write_conversation_log(state, &msg.team_id, run_id, "ci_fix", &result.conversation_log).await;
                         info!(run_id, files = result.files_modified.len(), "CI fix implemented on re-run");
 
                         // Store PR info on run record and go to awaiting_ci
@@ -1352,6 +1353,10 @@ async fn run_passes(
             files = result.files_modified.len(),
             "Implement complete"
         );
+
+        // Save conversation log to S3
+        write_conversation_log(state, &msg.team_id, run_id, "implement", &result.conversation_log).await;
+
         add_progress_note(
             state,
             &msg.team_id,
@@ -1513,7 +1518,7 @@ async fn run_passes(
             info!(run_id, "Security issues found, running remediation cycle");
             check_cancelled(state, &msg.team_id, run_id).await?;
             update_pass(state, &msg.team_id, run_id, "implement").await?;
-            implement::run(
+            let sec_fix_result = implement::run(
                 state,
                 msg,
                 &github,
@@ -1532,6 +1537,7 @@ async fn run_passes(
                 Some(run_id),
             )
             .await?;
+            write_conversation_log(state, &msg.team_id, run_id, "security_fix", &sec_fix_result.conversation_log).await;
 
             check_cancelled(state, &msg.team_id, run_id).await?;
             update_pass(state, &msg.team_id, run_id, "security").await?;
@@ -1774,6 +1780,7 @@ async fn run_repo_pipeline(
     )
     .await?;
     write_pass_trace(state, &msg.team_id, run_id, "implement", pass_start, &usage_before, usage, None).await;
+    write_conversation_log(state, &msg.team_id, run_id, &format!("implement_{repo_owner}_{repo_name}"), &impl_result.conversation_log).await;
     save_checkpoint(state, &msg.team_id, run_id, "implement", branch_name, 0, usage).await;
 
     info!(
@@ -1830,12 +1837,13 @@ async fn run_repo_pipeline(
         if has_time_for_remediation(start) {
             info!(run_id, "Running security remediation");
             check_cancelled(state, &msg.team_id, run_id).await?;
-            implement::run(
+            let sec_fix = implement::run(
                 state, msg, github, &repo_plan, branch_name, rules, repo_instructions,
                 Some(&format!("Security audit found vulnerabilities. Fix ALL of the following:\n\n{}", security_result.summary)),
                 complexity, provider, usage, file_cache, Some(run_id),
             )
             .await?;
+            write_conversation_log(state, &msg.team_id, run_id, &format!("security_fix_{}", branch_name), &sec_fix.conversation_log).await;
         } else {
             warn!(run_id, "Skipping security remediation — not enough time");
         }
@@ -1984,6 +1992,41 @@ async fn add_progress_note(state: &WorkerState, team_id: &str, run_id: &str, mes
         .expression_attribute_values(":t", attr_s(&now))
         .send()
         .await;
+}
+
+/// Write a conversation log to S3 for the agent log viewer.
+async fn write_conversation_log(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    pass_name: &str,
+    log: &[serde_json::Value],
+) {
+    if log.is_empty() {
+        return;
+    }
+    let key = format!("runs/{team_id}/{run_id}/conversation/{pass_name}.json");
+    match serde_json::to_vec(log) {
+        Ok(body) => {
+            if let Err(e) = state
+                .s3
+                .put_object()
+                .bucket(&state.config.bucket_name)
+                .key(&key)
+                .body(body.into())
+                .content_type("application/json")
+                .send()
+                .await
+            {
+                warn!(run_id, pass_name, error = %e, "Failed to write conversation log to S3");
+            } else {
+                info!(run_id, pass_name, entries = log.len(), "Conversation log saved to S3");
+            }
+        }
+        Err(e) => {
+            warn!(run_id, pass_name, error = %e, "Failed to serialize conversation log");
+        }
+    }
 }
 
 /// Check if a run has been cancelled by the user via the dashboard.

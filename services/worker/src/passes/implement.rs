@@ -14,6 +14,7 @@ use crate::WorkerState;
 
 pub struct ImplementResult {
     pub files_modified: Vec<String>,
+    pub conversation_log: Vec<serde_json::Value>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -276,6 +277,8 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         None
     };
 
+    let mut conv_log: Vec<serde_json::Value> = Vec::new();
+
     provider::converse(
         state,
         provider,
@@ -287,6 +290,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         usage,
         opts,
         on_tool.as_ref().map(|b| b.as_ref()),
+        Some(&mut conv_log),
     )
     .await?;
 
@@ -301,6 +305,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 
     Ok(ImplementResult {
         files_modified: files,
+        conversation_log: conv_log,
     })
 }
 

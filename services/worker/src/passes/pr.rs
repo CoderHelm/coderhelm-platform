@@ -99,6 +99,7 @@ Return ONLY the markdown body text."#,
             max_tokens: 4096,
         },
         None,
+        None,
     )
     .await?;
 
@@ -290,6 +291,7 @@ pub async fn resolve_conflicts(
                 max_tokens: 16384,
             },
             None,
+        None,
         )
         .await?;
 

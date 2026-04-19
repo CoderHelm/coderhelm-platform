@@ -661,6 +661,72 @@ pub async fn get_run_traces(
     Ok(Json(json!({ "traces": traces })))
 }
 
+/// GET /api/runs/:run_id/agent-log — fetch conversation logs from S3.
+pub async fn get_agent_log(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    // Verify the run belongs to this team
+    let _ = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&claims.team_id))
+        .key("run_id", attr_s(&run_id))
+        .projection_expression("run_id")
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to verify run ownership for agent-log: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item()
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // List all conversation log files under runs/{team_id}/{run_id}/conversation/
+    let prefix = format!("runs/{}/{}/conversation/", claims.team_id, run_id);
+    let list_result = state
+        .s3
+        .list_objects_v2()
+        .bucket(&state.config.bucket_name)
+        .prefix(&prefix)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to list agent-log objects: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let mut passes: Vec<Value> = Vec::new();
+    for obj in list_result.contents() {
+        let key = obj.key().unwrap_or_default();
+        let pass_name = key
+            .strip_prefix(&prefix)
+            .unwrap_or(key)
+            .trim_end_matches(".json");
+        if let Ok(output) = state
+            .s3
+            .get_object()
+            .bucket(&state.config.bucket_name)
+            .key(key)
+            .send()
+            .await
+        {
+            if let Ok(bytes) = output.body.collect().await {
+                if let Ok(log) = serde_json::from_slice::<Value>(&bytes.into_bytes()) {
+                    passes.push(json!({
+                        "pass": pass_name,
+                        "conversation": log
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(Json(json!({ "passes": passes })))
+}
+
 /// GET /api/runs/:run_id/openspec — fetch the four openspec files from S3.
 pub async fn get_run_openspec(
     State(state): State<Arc<AppState>>,
