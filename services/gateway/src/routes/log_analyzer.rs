@@ -637,11 +637,6 @@ pub async fn create_plan_from_recommendation(
         .and_then(|v| v.as_s().ok())
         .map(|v| v.as_str())
         .unwrap_or("info");
-    let source_account_id = item
-        .get("source_account_id")
-        .and_then(|v| v.as_s().ok())
-        .map(|v| v.as_str())
-        .unwrap_or("");
 
     let mut description = format!(
         "## Log Analysis Finding ({severity})\n\n{summary}\n\n"
