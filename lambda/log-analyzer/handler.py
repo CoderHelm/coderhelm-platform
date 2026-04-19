@@ -294,6 +294,8 @@ def analyze_connection(conn):
 
     if not all_results:
         logger.info(f"No errors found for {team_id}/{account_id}")
+        # Resolve any existing findings since nothing is erroring anymore
+        resolve_stale_recommendations(team_id, account_id, set())
         return 0
 
     # Reorganize results grouped by log group
