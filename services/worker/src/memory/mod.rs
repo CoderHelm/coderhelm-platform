@@ -191,32 +191,6 @@ impl AgentMemory {
         }
     }
 
-    /// Store a review finding.
-    pub async fn store_review_finding(&mut self, finding: &str) {
-        self.store_learning(
-            finding,
-            MemoryType::Semantic,
-            vec![
-                "review".to_string(),
-                format!("repo:{}/{}", self.repo_owner, self.repo_name),
-            ],
-        )
-        .await;
-    }
-
-    /// Store a security finding.
-    pub async fn store_security_finding(&mut self, finding: &str) {
-        self.store_learning(
-            finding,
-            MemoryType::Semantic,
-            vec![
-                "security".to_string(),
-                format!("repo:{}/{}", self.repo_owner, self.repo_name),
-            ],
-        )
-        .await;
-    }
-
     /// Store an anti-pattern (something that went wrong).
     pub async fn store_anti_pattern(&mut self, description: &str) {
         self.store_learning(
