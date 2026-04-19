@@ -908,7 +908,11 @@ pub async fn retry_run(
             .github_login
             .clone()
             .unwrap_or_else(|| claims.email.clone()),
-        image_attachments: vec![],
+        image_attachments: item
+            .get("image_attachments")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default(),
     });
 
     let body = serde_json::to_string(&message).map_err(|e| {
