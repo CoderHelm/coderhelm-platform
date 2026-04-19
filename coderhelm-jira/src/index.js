@@ -14,24 +14,44 @@ exports.handler = async (event, context) => {
     return;
   }
 
-  // Handle comment events — Forge payloads don't include comment data,
-  // so we fetch the latest comment via REST API
+  // Handle comment events
   if (eventType.includes("comment")) {
-    let comment;
-    try {
-      const res = await api
-        .asApp()
-        .requestJira(route`/rest/api/3/issue/${issue.id}/comment?orderBy=-created&maxResults=1`);
-      if (res.ok) {
-        const data = await res.json();
-        comment = (data.comments || [])[0];
-      } else {
-        console.log(`Failed to fetch comments for ${issue.key}: ${res.status}`);
+    // Skip self-generated events (comments posted by this app)
+    if (event.selfGenerated) {
+      console.log(`Skipping self-generated comment on ${issue.key}`);
+      return;
+    }
+
+    // Forge comment events include event.comment with author/body metadata.
+    // Use it directly; fall back to REST API fetch if missing.
+    let comment = event.comment || null;
+    console.log(`Comment event on ${issue.key}: event.comment keys=${comment ? Object.keys(comment).join(",") : "null"}, atlassianId=${event.atlassianId || "none"}`);
+
+    if (!comment || !comment.body) {
+      // Fallback: fetch the specific comment by ID, or latest if no ID
+      const commentId = comment && comment.id;
+      try {
+        let res;
+        if (commentId) {
+          res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}/comment/${commentId}`);
+          if (res.ok) {
+            comment = await res.json();
+          }
+        }
+        if (!commentId || !res || !res.ok) {
+          res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}/comment?orderBy=-created&maxResults=1`);
+          if (res.ok) {
+            const data = await res.json();
+            comment = (data.comments || [])[0];
+          } else {
+            console.log(`Failed to fetch comments for ${issue.key}: ${res.status}`);
+            return;
+          }
+        }
+      } catch (e) {
+        console.log(`Error fetching comments for ${issue.key}: ${e.message}`);
         return;
       }
-    } catch (e) {
-      console.log(`Error fetching comments for ${issue.key}: ${e.message}`);
-      return;
     }
 
     if (!comment) {
