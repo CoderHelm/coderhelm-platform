@@ -1273,15 +1273,6 @@ async fn run_passes(
             );
 
             if let Some(mut mem) = agent_memory {
-                let pr_summary = pr_results
-                    .iter()
-                    .map(|p| format!("PR #{} ({}/{})", p.pr_number, p.owner, p.name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                mem.store_run_summary(&format!(
-                    "Run {run_id} created multi-repo PRs: {pr_summary}. Awaiting CI.",
-                ))
-                .await;
                 if let Err(e) = mem.close_and_upload(state).await {
                     warn!(run_id, error = %e, "Failed to persist agent memory");
                 }
@@ -1694,14 +1685,8 @@ async fn run_passes(
         "Run set to awaiting_ci — Lambda returning, webhook will trigger resume"
     );
 
-    // Store run progress in agent memory
+    // Persist agent memory (without storing useless run summaries)
     if let Some(mut mem) = agent_memory {
-        mem.store_run_summary(&format!(
-            "Run {run_id} created draft PR #{} for issue '{}'. Awaiting CI results.",
-            pr_result.pr_number,
-            msg.title,
-        ))
-        .await;
         if let Err(e) = mem.close_and_upload(state).await {
             warn!(run_id, error = %e, "Failed to persist agent memory");
         }
