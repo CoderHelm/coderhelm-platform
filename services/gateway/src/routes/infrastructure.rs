@@ -1,5 +1,6 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::{extract::State, http::StatusCode, response::Json, Extension};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -105,6 +106,7 @@ pub async fn get_infrastructure(
                 .and_then(|s| serde_json::from_str(s).ok());
 
             let error_msg = item.get("error").and_then(|v| v.as_s().ok()).cloned();
+            let updated_at = item.get("updated_at").and_then(|v| v.as_s().ok()).map(|s| s.as_str());
 
             let suggested_prompt = if has_infra {
                 None
@@ -112,7 +114,7 @@ pub async fn get_infrastructure(
                 Some(default_infra_prompt())
             };
 
-            InfraAnalysis {
+            let mut a = InfraAnalysis {
                 status,
                 has_infra,
                 diagram,
@@ -122,7 +124,9 @@ pub async fn get_infrastructure(
                 cached_at,
                 scanned_repos,
                 error: error_msg,
-            }
+            };
+            apply_pending_timeout(&mut a, updated_at);
+            a
         }
     };
 
@@ -227,7 +231,8 @@ pub async fn get_repo_infrastructure(
                 .and_then(|v| v.as_bool().ok())
                 .copied()
                 .unwrap_or(false);
-            InfraAnalysis {
+            let updated_at = item.get("updated_at").and_then(|v| v.as_s().ok()).map(|s| s.as_str());
+            let mut a = InfraAnalysis {
                 status,
                 has_infra,
                 diagram: item.get("diagram").and_then(|v| v.as_s().ok()).cloned(),
@@ -246,7 +251,9 @@ pub async fn get_repo_infrastructure(
                     .and_then(|v| v.as_s().ok())
                     .and_then(|s| serde_json::from_str(s).ok()),
                 error: item.get("error").and_then(|v| v.as_s().ok()).cloned(),
-            }
+            };
+            apply_pending_timeout(&mut a, updated_at);
+            a
         }
     };
 
@@ -307,6 +314,24 @@ pub async fn refresh_repo_infrastructure(
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
+
+/// If status is `pending` and `updated_at` is more than 5 minutes ago, treat as failed.
+const PENDING_TIMEOUT_SECS: i64 = 5 * 60;
+
+fn apply_pending_timeout(analysis: &mut InfraAnalysis, updated_at: Option<&str>) {
+    if analysis.status != "pending" {
+        return;
+    }
+    if let Some(ts) = updated_at {
+        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
+            let age = Utc::now().signed_duration_since(parsed);
+            if age.num_seconds() > PENDING_TIMEOUT_SECS {
+                analysis.status = "failed".to_string();
+                analysis.error = Some("Analysis timed out".to_string());
+            }
+        }
+    }
+}
 
 fn default_infra_prompt() -> String {
     "Create a production-ready AWS CDK TypeScript stack for a SaaS backend with the following components:\n\n\
