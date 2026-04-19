@@ -306,14 +306,15 @@ async function fetchImageAttachments(fields) {
   const results = [];
   for (const att of imageAttachments.slice(0, maxImages)) {
     try {
-      const res = await api.asApp().requestJira(route`/rest/api/3/attachment/content/${att.id}`, {
-        headers: { Accept: att.mimeType },
-      });
+      console.log(`Downloading attachment ${att.filename} (id=${att.id}, mime=${att.mimeType}, size=${att.size})`);
+      const res = await api.asApp().requestJira(route`/rest/api/3/attachment/content/${att.id}?redirect=false`);
       if (!res.ok) {
-        console.log(`Failed to download attachment ${att.filename}: ${res.status}`);
+        const body = await res.text().catch(() => "");
+        console.log(`Failed to download attachment ${att.filename}: ${res.status} ${body.substring(0, 200)}`);
         continue;
       }
       const buffer = await res.arrayBuffer();
+      console.log(`Downloaded ${att.filename}: ${buffer.byteLength} bytes`);
       const base64 = Buffer.from(buffer).toString("base64");
       results.push({
         filename: att.filename,
