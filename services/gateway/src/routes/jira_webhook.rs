@@ -621,6 +621,7 @@ pub async fn handle_forge(
             .get_item()
             .table_name(&state.config.teams_table_name)
             .key("team_id", attr_s(&team_id))
+            .key("sk", attr_s("META"))
             .send()
             .await
             .ok()
