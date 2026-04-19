@@ -43,6 +43,7 @@ permissions:
     - read:jira-work
     - write:jira-work
     - storage:app
+    - read:attachment:jira
   external:
     fetch:
       backend:

@@ -116,8 +116,10 @@ exports.handler = async (event, context) => {
       if (res.ok) {
         const full = await res.json();
         fields = full.fields || {};
+        console.log(`Issue ${issue.key} fields keys: ${Object.keys(fields).join(", ")}`);
+        console.log(`Issue ${issue.key} attachment field: ${JSON.stringify(fields.attachment?.length ?? "missing")}`);
       } else {
-        console.log(`Failed to fetch issue ${issue.key}: ${res.status}`);
+        console.log(`Failed to fetch issue ${issue.key}: ${res.status} ${await res.text()}`);
       }
     } catch (e) {
       console.log(`Error fetching issue ${issue.key}: ${e.message}`);
@@ -134,6 +136,7 @@ exports.handler = async (event, context) => {
 
   // Download image attachments from the ticket
   const imageAttachments = await fetchImageAttachments(fields);
+  console.log(`Image attachments for ${issue.key}: found=${imageAttachments.length}, raw_attachments=${(fields.attachment || []).length}`);
   if (imageAttachments.length > 0) {
     console.log(`Downloaded ${imageAttachments.length} image attachment(s) for ${issue.key}`);
   }
