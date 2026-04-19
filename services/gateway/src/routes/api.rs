@@ -884,16 +884,20 @@ pub async fn retry_run(
         _ => TicketSource::Github,
     };
 
+    let ticket_id = item
+        .get("ticket_id")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    // Dashboard retry: force-delete existing lock so re-enqueue always succeeds
+    delete_ticket_lock(&state, &claims.team_id, ticket_id).await;
+
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: claims.team_id.clone(),
         installation_id,
         source,
-        ticket_id: item
-            .get("ticket_id")
-            .and_then(|v| v.as_s().ok())
-            .map(|s| s.as_str())
-            .unwrap_or("")
-            .to_string(),
+        ticket_id: ticket_id.to_string(),
         title: item
             .get("title")
             .and_then(|v| v.as_s().ok())
@@ -2659,6 +2663,19 @@ async fn get_team_installation_id(state: &AppState, team_id: &str) -> Result<u64
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
+}
+
+/// Force-delete a ticket lock (used for dashboard retry).
+async fn delete_ticket_lock(state: &AppState, team_id: &str, ticket_id: &str) {
+    let sk = format!("TICKET_LOCK#{ticket_id}");
+    let _ = state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.teams_table_name)
+        .key("team_id", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(sk))
+        .send()
+        .await;
 }
 
 fn attr_bool(val: bool) -> aws_sdk_dynamodb::types::AttributeValue {

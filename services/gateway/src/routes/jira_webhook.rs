@@ -17,6 +17,45 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
 }
 
+/// Try to acquire a ticket-level lock to prevent duplicate concurrent runs.
+/// Returns true if acquired, false if already held by another run.
+/// Fails open on unexpected DDB errors (logs warning and allows through).
+async fn acquire_ticket_lock(state: &AppState, team_id: &str, ticket_id: &str) -> bool {
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    let sk = format!("TICKET_LOCK#{ticket_id}");
+    let now = chrono::Utc::now();
+    let locked_until = (now + chrono::Duration::minutes(15)).to_rfc3339();
+    let now_str = now.to_rfc3339();
+
+    let result = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.teams_table_name)
+        .item("team_id", AttributeValue::S(team_id.to_string()))
+        .item("sk", AttributeValue::S(sk))
+        .item("locked_by", AttributeValue::S("gateway".to_string()))
+        .item("locked_until", AttributeValue::S(locked_until))
+        .item("created_at", AttributeValue::S(now_str.clone()))
+        .condition_expression("attribute_not_exists(sk) OR locked_until < :now")
+        .expression_attribute_values(":now", AttributeValue::S(now_str))
+        .send()
+        .await;
+
+    match result {
+        Ok(_) => true,
+        Err(e) => {
+            if e.to_string().contains("ConditionalCheckFailed") {
+                info!(team_id, ticket_id, "Ticket lock held — skipping duplicate enqueue");
+                false
+            } else {
+                warn!(team_id, ticket_id, error = %e, "Ticket lock check failed — allowing through");
+                true
+            }
+        }
+    }
+}
+
 /// Jira webhook handler — `/webhooks/jira/:token`
 ///
 /// The token is an opaque random string that maps to a team (stored in the jira-tokens table).
@@ -445,6 +484,12 @@ async fn process_jira_payload(
     )
     .await;
 
+    // Acquire ticket lock to prevent duplicate concurrent runs
+    if !acquire_ticket_lock(state, team_id, ticket_key).await {
+        log_jira_event(state, team_id, event_type, ticket_key, &title, "lock_held", None).await;
+        return Ok(StatusCode::OK);
+    }
+
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: team_id.to_string(),
         installation_id,
@@ -728,6 +773,13 @@ async fn handle_jira_comment(
                 sender: comment_author.to_string(),
                 image_attachments: vec![],
             });
+
+            // Acquire ticket lock to prevent duplicate concurrent runs
+            if !acquire_ticket_lock(state, team_id, ticket_key).await {
+                let repo_display = format!("{repo_owner}/{repo_name}");
+                log_jira_event(state, team_id, "comment_retry", ticket_key, title, "lock_held", Some(&repo_display)).await;
+                return Ok(StatusCode::OK);
+            }
 
             info!(
                 team_id,

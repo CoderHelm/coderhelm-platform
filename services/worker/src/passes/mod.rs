@@ -285,12 +285,11 @@ pub async fn orchestrate_ticket(
                     .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
                     .send()
                     .await;
-                return Ok(());
+            } else {
+                error!(run_id, error = %e, "Orchestration failed");
+                let sanitized = sanitize_error(&err_msg);
+                fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
             }
-            error!(run_id, error = %e, "Orchestration failed");
-            let sanitized = sanitize_error(&err_msg);
-            fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
-            return Ok(());
         }
         Err(_elapsed) => {
             let duration = start.elapsed().as_secs();
@@ -304,8 +303,36 @@ pub async fn orchestrate_ticket(
                 duration,
             )
             .await;
-            return Ok(());
         }
+    }
+
+    // Release or extend the ticket lock based on final run status.
+    // If the run went to awaiting_ci, extend the lock (CI may take a while).
+    // Otherwise, release it so new runs can proceed.
+    let is_awaiting_ci = match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&run_id))
+        .projection_expression("#s")
+        .expression_attribute_names("#s", "status")
+        .send()
+        .await
+    {
+        Ok(out) => out
+            .item()
+            .and_then(|i| i.get("status").and_then(|v| v.as_s().ok().cloned()))
+            .map(|s| s == "awaiting_ci")
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+
+    if is_awaiting_ci {
+        info!(run_id, ticket_id = %msg.ticket_id, "Extending ticket lock for CI wait");
+        extend_ticket_lock(state, &msg.team_id, &msg.ticket_id, 30).await;
+    } else {
+        release_ticket_lock(state, &msg.team_id, &msg.ticket_id).await;
     }
 
     Ok(())
@@ -2479,6 +2506,37 @@ pub(crate) fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 
 pub(crate) fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
+}
+
+/// Release a ticket-level lock after a run completes (any terminal state).
+async fn release_ticket_lock(state: &WorkerState, team_id: &str, ticket_id: &str) {
+    let sk = format!("TICKET_LOCK#{ticket_id}");
+    let _ = state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.teams_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("sk", attr_s(&sk))
+        .send()
+        .await;
+}
+
+/// Extend a ticket lock (e.g. when waiting for CI, extend to 30 min).
+async fn extend_ticket_lock(state: &WorkerState, team_id: &str, ticket_id: &str, minutes: i64) {
+    let sk = format!("TICKET_LOCK#{ticket_id}");
+    let locked_until = (chrono::Utc::now() + chrono::Duration::minutes(minutes)).to_rfc3339();
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.teams_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("sk", attr_s(&sk))
+        .update_expression("SET locked_until = :lu, updated_at = :t")
+        .expression_attribute_values(":lu", attr_s(&locked_until))
+        .expression_attribute_values(":t", attr_s(&now))
+        .send()
+        .await;
 }
 
 /// Look up the GitHub App installation_id from the team META record.
