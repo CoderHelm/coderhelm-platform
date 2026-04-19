@@ -10,7 +10,7 @@ use crate::passes::{
 };
 use crate::WorkerState;
 
-const MAX_CI_FIX_CYCLES: usize = 3;
+const MAX_CI_FIX_CYCLES: usize = 10;
 const MAX_LOG_CHARS: usize = 15_000;
 
 #[derive(Debug)]
