@@ -339,10 +339,23 @@ def analyze_connection(conn):
     # Send to Anthropic for analysis
     recommendations = analyze_with_anthropic(all_results, account_id, api_key)
 
+    # Track all error hashes seen this run (for resolution)
+    seen_hashes = set()
+
     # Deduplicate and store
     for rec in recommendations:
+        raw = f"{account_id}:{rec.get('source_log_group', '')}:{rec.get('error_pattern', rec.get('title', ''))}"
+        seen_hashes.add(hashlib.sha256(raw.encode()).hexdigest()[:16])
         if store_recommendation(team_id, account_id, rec):
             new_recs += 1
+
+    # Also track the secrets advisory hash if it was emitted
+    if secrets_found > 0:
+        raw = f"{account_id}:multiple:secrets_in_logs_{account_id}"
+        seen_hashes.add(hashlib.sha256(raw.encode()).hexdigest()[:16])
+
+    # Resolve findings that no longer appear
+    resolve_stale_recommendations(team_id, account_id, seen_hashes)
 
     logger.info(f"{team_id}/{account_id}: {new_recs} new recommendations")
     return new_recs
@@ -505,6 +518,45 @@ Return ONLY the JSON array, no surrounding text."""
     except Exception as e:
         logger.error(f"Anthropic analysis failed: {e}", exc_info=True)
         return []
+
+
+def resolve_stale_recommendations(team_id, account_id, seen_hashes):
+    """Mark recommendations as resolved if their error hash was not seen this run."""
+    try:
+        result = aws_insights_table.query(
+            KeyConditionExpression="pk = :pk AND begins_with(sk, :prefix)",
+            FilterExpression="#s = :pending AND source_account_id = :acct",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":pk": team_id,
+                ":prefix": "REC#",
+                ":pending": "pending",
+                ":acct": account_id,
+            },
+        )
+
+        now = datetime.now(timezone.utc).isoformat()
+        resolved_count = 0
+
+        for item in result.get("Items", []):
+            error_hash = item.get("error_hash", "")
+            if error_hash and error_hash not in seen_hashes:
+                aws_insights_table.update_item(
+                    Key={"pk": team_id, "sk": item["sk"]},
+                    UpdateExpression="SET #s = :s, resolved_at = :t, updated_at = :t",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":s": "resolved",
+                        ":t": now,
+                    },
+                )
+                resolved_count += 1
+
+        if resolved_count:
+            logger.info(f"{team_id}/{account_id}: {resolved_count} recommendations resolved")
+
+    except Exception as e:
+        logger.warning(f"Failed to resolve stale recommendations: {e}")
 
 
 def store_recommendation(team_id, account_id, rec):

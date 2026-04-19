@@ -622,11 +622,44 @@ pub async fn create_plan_from_recommendation(
         .and_then(|v| v.as_s().ok())
         .map(|v| v.as_str())
         .unwrap_or("");
+    let source_log_group = item
+        .get("source_log_group")
+        .and_then(|v| v.as_s().ok())
+        .map(|v| v.as_str())
+        .unwrap_or("");
+    let error_pattern = item
+        .get("error_pattern")
+        .and_then(|v| v.as_s().ok())
+        .map(|v| v.as_str())
+        .unwrap_or("");
+    let severity = item
+        .get("severity")
+        .and_then(|v| v.as_s().ok())
+        .map(|v| v.as_str())
+        .unwrap_or("info");
+    let source_account_id = item
+        .get("source_account_id")
+        .and_then(|v| v.as_s().ok())
+        .map(|v| v.as_str())
+        .unwrap_or("");
 
-    let description = format!(
-        "## Log Analysis Recommendation\n\n{}\n\n### Suggested Action\n\n{}",
-        summary, suggested_action
+    let mut description = format!(
+        "## Log Analysis Finding ({severity})\n\n{summary}\n\n"
     );
+    if !source_log_group.is_empty() {
+        description.push_str(&format!("**Source Log Group:** `{source_log_group}`\n\n"));
+    }
+    if !error_pattern.is_empty() {
+        description.push_str(&format!("**Error Pattern:**\n```\n{error_pattern}\n```\n\n"));
+    }
+    if !source_account_id.is_empty() {
+        description.push_str(&format!("**AWS Account:** `{source_account_id}`\n\n"));
+    }
+    description.push_str(&format!("### Suggested Fix\n\n{suggested_action}\n\n"));
+    description.push_str("### Instructions\n\n");
+    description.push_str("1. Locate the code or configuration causing this error pattern in the source log group above.\n");
+    description.push_str("2. Implement the suggested fix.\n");
+    description.push_str("3. Add error handling or logging improvements to prevent recurrence.\n");
 
     // Create plan via plans table
     let plan_id = ulid::Ulid::new().to_string().to_lowercase();
