@@ -102,7 +102,7 @@ new LogAnalyzerStack(app, `${prefix}-log-analyzer`, {
   env,
   stage,
   awsInsightsTable: database.awsInsightsTable,
-  plansTable: database.plansTable,
+  settingsTable: database.settingsTable,
 });
 
 // --- Streaming (SSE via Lambda Function URL + Web Adapter) ---

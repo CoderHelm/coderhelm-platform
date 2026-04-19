@@ -13,7 +13,7 @@ import * as path from "path";
 interface LogAnalyzerStackProps extends cdk.StackProps {
   stage: string;
   awsInsightsTable: dynamodb.TableV2;
-  plansTable: dynamodb.TableV2;
+  settingsTable: dynamodb.TableV2;
 }
 
 export class LogAnalyzerStack extends cdk.Stack {
@@ -61,7 +61,7 @@ export class LogAnalyzerStack extends cdk.Stack {
       logGroup: analyzerLogGroup,
       environment: {
         AWS_INSIGHTS_TABLE_NAME: props.awsInsightsTable.tableName,
-        PLANS_TABLE_NAME: props.plansTable.tableName,
+        SETTINGS_TABLE_NAME: props.settingsTable.tableName,
         MODEL_ID: "claude-sonnet-4-20250514",
         CODERHELM_ACCOUNT_ID: this.account,
         LOOKBACK_HOURS: "6",
@@ -70,7 +70,7 @@ export class LogAnalyzerStack extends cdk.Stack {
 
     // DynamoDB permissions
     props.awsInsightsTable.grantReadWriteData(analyzerFunction);
-    props.plansTable.grantReadData(analyzerFunction);
+    props.settingsTable.grantReadData(analyzerFunction);
 
     // STS AssumeRole — the analyzer needs to assume roles in customer accounts
     analyzerFunction.addToRolePolicy(

@@ -26,7 +26,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 AWS_INSIGHTS_TABLE = os.environ.get("AWS_INSIGHTS_TABLE_NAME", "coderhelm-prod-aws-insights")
-PLANS_TABLE = os.environ.get("PLANS_TABLE_NAME", "coderhelm-prod-plans")
+SETTINGS_TABLE = os.environ.get("SETTINGS_TABLE_NAME", "coderhelm-prod-settings")
 MODEL_ID = os.environ.get("MODEL_ID", "claude-sonnet-4-20250514")
 CODERHELM_ACCOUNT_ID = os.environ["CODERHELM_ACCOUNT_ID"]
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
@@ -35,7 +35,7 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 dynamodb = boto3.resource("dynamodb")
 aws_insights_table = dynamodb.Table(AWS_INSIGHTS_TABLE)
-plans_table = dynamodb.Table(PLANS_TABLE)
+settings_table = dynamodb.Table(SETTINGS_TABLE)
 sts_client = boto3.client("sts")
 
 # ── Pre-built Insights Queries ──────────────────────────────────
@@ -218,7 +218,7 @@ def scan_aws_connections():
 def get_team_api_key(team_id):
     """Load the team's Anthropic API key from DynamoDB settings."""
     try:
-        resp = plans_table.get_item(
+        resp = settings_table.get_item(
             Key={"pk": team_id, "sk": "SETTINGS#MODEL_PROVIDER"}
         )
         item = resp.get("Item")
