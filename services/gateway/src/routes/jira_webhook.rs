@@ -803,6 +803,57 @@ async fn handle_jira_comment(
             .await;
             result
         }
+        // Completed run without PR — treat like needs_input, re-trigger
+        "completed" if pr_number == 0 => {
+            let raw_description = issue
+                .get("fields")
+                .and_then(|f| f.get("description"))
+                .or_else(|| issue.get("description"));
+            let fresh_body = match raw_description {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => extract_adf_text(other),
+                None => run_item
+                    .get("body")
+                    .and_then(|v| v.as_s().ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+            };
+
+            let extended_body = if comment_body.is_empty() {
+                fresh_body
+            } else {
+                format!("{fresh_body}\n\n---\n\n**Additional context (from Jira comment by {comment_author}):**\n\n{comment_body}")
+            };
+
+            let message = WorkerMessage::Ticket(TicketMessage {
+                team_id: team_id.to_string(),
+                installation_id,
+                source: TicketSource::Jira,
+                ticket_id: ticket_key.to_string(),
+                title: title.to_string(),
+                body: extended_body,
+                repo_owner: repo_owner.to_string(),
+                repo_name: repo_name.to_string(),
+                issue_number: 0,
+                sender: comment_author.to_string(),
+                image_attachments: vec![],
+            });
+
+            if !acquire_ticket_lock(state, team_id, ticket_key).await {
+                let repo_display = format!("{repo_owner}/{repo_name}");
+                log_jira_event(state, team_id, "comment_retry", ticket_key, title, "lock_held", Some(&repo_display)).await;
+                return Ok(StatusCode::OK);
+            }
+
+            info!(
+                team_id,
+                ticket_key, run_id, "Retrying completed run (no PR) after comment"
+            );
+            let result = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+            let repo_display = format!("{repo_owner}/{repo_name}");
+            log_jira_event(state, team_id, "comment_retry", ticket_key, title, if result.is_ok() { "reprocessing" } else { "error" }, Some(&repo_display)).await;
+            result
+        }
         // Completed run with PR — send feedback
         "completed" if pr_number > 0 => {
             let message = WorkerMessage::Feedback(crate::models::FeedbackMessage {
