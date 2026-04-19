@@ -13,7 +13,7 @@ Parameters:
 
   CoderHelmAccountId:
     Type: String
-    Default: "REDACTED_AWS_ACCOUNT_ID"
+    Default: "654654210434"
     Description: The AWS account ID of Coderhelm (do not change this value).
     AllowedPattern: "^\\d{12}$"
 

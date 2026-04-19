@@ -95,7 +95,7 @@ pub async fn create_connection(
         warn!(role_arn = body.role_arn, error = %e, "AssumeRole validation failed");
         return Ok(Json(json!({
             "error": "unable_to_assume_role",
-            "message": "Could not assume the provided role. Make sure the trust policy includes our account ID (REDACTED_AWS_ACCOUNT_ID) and the External ID matches.",
+            "message": "Could not assume the provided role. Make sure the trust policy includes our account ID (654654210434) and the External ID matches.",
             "external_id": external_id,
         })));
     }
@@ -503,7 +503,7 @@ pub async fn get_cfn_url(
     let stack_name = "CoderHelmLogReader";
 
     let cfn_url = format!(
-        "https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?stackName={}&templateURL={}&param_ExternalId={}&param_CoderHelmAccountId=REDACTED_AWS_ACCOUNT_ID",
+        "https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?stackName={}&templateURL={}&param_ExternalId={}&param_CoderHelmAccountId=654654210434",
         stack_name,
         urlencoding::encode(template_url),
         external_id,
