@@ -647,17 +647,14 @@ pub async fn create_plan_from_recommendation(
         "## Log Analysis Finding ({severity})\n\n{summary}\n\n"
     );
     if !source_log_group.is_empty() {
-        description.push_str(&format!("**Source Log Group:** `{source_log_group}`\n\n"));
+        description.push_str(&format!("**Affected Service** (from log group `{source_log_group}`):\nLook for the code that deploys to or runs in this log group.\n\n"));
     }
     if !error_pattern.is_empty() {
         description.push_str(&format!("**Error Pattern:**\n```\n{error_pattern}\n```\n\n"));
     }
-    if !source_account_id.is_empty() {
-        description.push_str(&format!("**AWS Account:** `{source_account_id}`\n\n"));
-    }
     description.push_str(&format!("### Suggested Fix\n\n{suggested_action}\n\n"));
     description.push_str("### Instructions\n\n");
-    description.push_str("1. Locate the code or configuration causing this error pattern in the source log group above.\n");
+    description.push_str("1. Search the codebase for the function/service that produces this error pattern.\n");
     description.push_str("2. Implement the suggested fix.\n");
     description.push_str("3. Add error handling or logging improvements to prevent recurrence.\n");
 
