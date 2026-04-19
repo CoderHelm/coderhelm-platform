@@ -92,6 +92,9 @@ exports.handler = async (event, context) => {
       [commentRepoOwner, commentRepoName] = repoLabel.replace("coderhelm:", "").split("/");
     }
 
+    // Download image attachments from the issue (same as issue-update path)
+    const imageAttachments = await fetchImageAttachments(fields);
+
     const payload = {
       webhookEvent: "jira:comment_created",
       issue: {
@@ -110,6 +113,7 @@ exports.handler = async (event, context) => {
         body: commentBody,
         author: { displayName: authorName },
       },
+      image_attachments: imageAttachments,
       coderhelm: {
         repo_owner: commentRepoOwner || undefined,
         repo_name: commentRepoName || undefined,

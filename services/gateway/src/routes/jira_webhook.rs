@@ -675,6 +675,9 @@ async fn handle_jira_comment(
 
     info!(team_id, ticket_key, comment_author, "Jira comment received");
 
+    // Upload image attachments from the Forge payload (if any)
+    let fresh_images = upload_image_attachments(state, team_id, ticket_key, payload).await;
+
     // Find the most recent run for this ticket
     let runs = state
         .dynamo
@@ -771,11 +774,15 @@ async fn handle_jira_comment(
                 repo_name: repo_name.to_string(),
                 issue_number: 0,
                 sender: comment_author.to_string(),
-                image_attachments: run_item
-                    .get("image_attachments")
-                    .and_then(|v| v.as_s().ok())
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_default(),
+                image_attachments: if !fresh_images.is_empty() {
+                    fresh_images.clone()
+                } else {
+                    run_item
+                        .get("image_attachments")
+                        .and_then(|v| v.as_s().ok())
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_default()
+                },
             });
 
             // Acquire ticket lock to prevent duplicate concurrent runs
@@ -840,11 +847,15 @@ async fn handle_jira_comment(
                 repo_name: repo_name.to_string(),
                 issue_number: 0,
                 sender: comment_author.to_string(),
-                image_attachments: run_item
-                    .get("image_attachments")
-                    .and_then(|v| v.as_s().ok())
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_default(),
+                image_attachments: if !fresh_images.is_empty() {
+                    fresh_images.clone()
+                } else {
+                    run_item
+                        .get("image_attachments")
+                        .and_then(|v| v.as_s().ok())
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_default()
+                },
             });
 
             if !acquire_ticket_lock(state, team_id, ticket_key).await {
