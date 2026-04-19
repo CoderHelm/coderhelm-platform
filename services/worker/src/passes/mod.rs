@@ -28,8 +28,6 @@ pub struct FileCache {
 
 /// Result of a per-repo implement→security→PR cycle (multi-repo support).
 struct RepoPrResult {
-    owner: String,
-    name: String,
     branch: String,
     pr_number: u64,
     pr_url: String,
@@ -1931,8 +1929,6 @@ async fn run_repo_pipeline(
     .await;
 
     Ok(RepoPrResult {
-        owner: repo_owner.to_string(),
-        name: repo_name.to_string(),
         branch: branch_name.to_string(),
         pr_number: pr_result.pr_number,
         pr_url: pr_result.pr_url,
