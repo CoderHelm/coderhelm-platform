@@ -13,7 +13,7 @@ import { StreamingStack } from "../lib/streaming-stack";
 const app = new cdk.App();
 
 const env = {
-  account: process.env.CDK_DEFAULT_ACCOUNT ?? "REDACTED_AWS_ACCOUNT_ID",
+  account: process.env.CDK_DEFAULT_ACCOUNT,
   region: process.env.CDK_DEFAULT_REGION ?? "us-east-1",
 };
 

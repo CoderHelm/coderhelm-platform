@@ -1,30 +1,27 @@
-# Rust
-target/
 
-# Node (CDK)
-node_modules/
-
-# CDK compiled output
-infra/cdk.out/
-infra/**/*.js
-infra/**/*.d.ts
-
-# Environment
+.DS_Store
 .env
 .env.*
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
 .idea/
 .vscode/
-*.swp
 *.swo
-infra/dist/
+*.swp
+# CDK compiled output
+# Environment
+# IDE
+# Node (CDK)
+# OS
+# Rust
 d3ftly-jira/node_modules/
-d3ftly-jira/resources/admin/node_modules/
 d3ftly-jira/resources/admin/build/
+d3ftly-jira/resources/admin/node_modules/
+infra/**/*.d.ts
+infra/**/*.js
+infra/cdk.context.json
+infra/cdk.out/
+infra/dist/
 lambda/mcp-proxy/dist/
 lambda/mcp-proxy/mcp-proxy.zip
+node_modules/
+target/
+Thumbs.db

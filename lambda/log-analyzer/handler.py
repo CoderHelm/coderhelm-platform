@@ -25,7 +25,7 @@ logger.setLevel(logging.INFO)
 
 AWS_INSIGHTS_TABLE = os.environ.get("AWS_INSIGHTS_TABLE_NAME", "coderhelm-prod-aws-insights")
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
-CODERHELM_ACCOUNT_ID = os.environ.get("CODERHELM_ACCOUNT_ID", "REDACTED_AWS_ACCOUNT_ID")
+CODERHELM_ACCOUNT_ID = os.environ["CODERHELM_ACCOUNT_ID"]
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 
 dynamodb = boto3.resource("dynamodb")
