@@ -826,8 +826,9 @@ async fn run_passes(
         update_pass(state, &msg.team_id, run_id, "implement").await?;
 
         // --- Re-run detection: check if branch already has an open PR ---
-        // Uses the PR's head SHA (not branch name) for check runs, since a previous
-        // retry may have force-reset the branch to base, destroying CI failure evidence.
+        // If an open PR exists, we always try to fix it rather than starting fresh.
+        // Previous retries may have force-reset the branch to base, so we also check
+        // for prior runs of the same ticket that were awaiting_ci (evidence of CI failures).
         let existing_pr = match github
             .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, &branch_name)
             .await
@@ -845,9 +846,12 @@ async fn run_passes(
         if let Some(ref pr) = existing_pr {
             let pr_number = pr["number"].as_u64().unwrap_or(0);
             let pr_url = pr["html_url"].as_str().unwrap_or("").to_string();
-            // Use PR head SHA for check runs — survives branch resets
             let pr_head_sha = pr["head"]["sha"].as_str().unwrap_or("").to_string();
-            let check_ref = if pr_head_sha.is_empty() { branch_name.clone() } else { pr_head_sha };
+            let base_sha = pr["base"]["sha"].as_str().unwrap_or("").to_string();
+            let check_ref = if pr_head_sha.is_empty() { branch_name.clone() } else { pr_head_sha.clone() };
+
+            // Detect if the branch was force-reset to base (no diff from base = previous retry wiped it)
+            let branch_is_reset = !pr_head_sha.is_empty() && !base_sha.is_empty() && pr_head_sha == base_sha;
 
             // Check CI status on the PR's head commit
             let checks = github
@@ -867,7 +871,6 @@ async fn run_passes(
                 .get_review_comments(&msg.repo_owner, &msg.repo_name, pr_number)
                 .await
                 .unwrap_or_default();
-            // Filter to unresolved comments not authored by the bot
             let pending_reviews: Vec<&serde_json::Value> = review_comments
                 .iter()
                 .filter(|c| {
@@ -881,6 +884,7 @@ async fn run_passes(
                 run_id, pr_number, has_ci_failure, has_review_feedback,
                 review_count = pending_reviews.len(),
                 check_ref = %check_ref,
+                branch_is_reset,
                 "Re-run detection: PR status"
             );
 
@@ -1052,18 +1056,38 @@ async fn run_passes(
             }
         }
 
-        // Create working branch (or reset existing one to base)
-        github
-            .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, &msg.base_branch)
-            .await?;
-        info!(run_id, branch = %branch_name, "Created working branch");
-        add_progress_note(
-            state,
-            &msg.team_id,
-            run_id,
-            &format!("Created branch {}", branch_name),
-        )
-        .await;
+        // Track whether to skip branch creation (PR exists, just needs fresh implementation)
+        let skip_branch_reset = existing_pr.as_ref().map_or(false, |pr| {
+            let pr_head = pr["head"]["sha"].as_str().unwrap_or("");
+            let base = pr["base"]["sha"].as_str().unwrap_or("");
+            // Branch was reset to base by a previous retry — don't reset again
+            !pr_head.is_empty() && !base.is_empty() && pr_head == base
+        });
+
+        if skip_branch_reset {
+            let pr_number = existing_pr.as_ref().and_then(|p| p["number"].as_u64()).unwrap_or(0);
+            info!(run_id, pr_number, branch = %branch_name, "Skipping branch reset — PR exists, branch already at base");
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("PR #{pr_number} exists — re-implementing on existing branch"),
+            )
+            .await;
+        } else {
+            // Create working branch (or reset existing one to base)
+            github
+                .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, &msg.base_branch)
+                .await?;
+            info!(run_id, branch = %branch_name, "Created working branch");
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("Created branch {}", branch_name),
+            )
+            .await;
+        }
 
         // Commit openspec to the repo branch if enabled (default: on)
         let commit_openspec = load_workflow_setting(state, &msg.team_id, "commit_openspec").await;
