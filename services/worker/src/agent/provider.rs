@@ -105,7 +105,7 @@ pub async fn converse(
     tool_executor: &dyn ToolExecutor,
     usage: &mut TokenUsage,
     opts: ConverseOptions,
-    on_tool_call: Option<&(dyn Fn(&str, u64) + Send + Sync)>,
+    on_tool_call: Option<&(dyn Fn(&str, u64, &str, bool) + Send + Sync)>,
     conversation_log: Option<&mut Vec<serde_json::Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = provider.client();

@@ -724,7 +724,35 @@ pub async fn get_agent_log(
         }
     }
 
-    Ok(Json(json!({ "passes": passes })))
+    // Also fetch live tool_call events from events table
+    let mut live_events: Vec<Value> = Vec::new();
+    if !state.config.events_table_name.is_empty() {
+        if let Ok(result) = state
+            .dynamo
+            .query()
+            .table_name(&state.config.events_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":pk", attr_s(&format!("RUN#{run_id}")))
+            .expression_attribute_values(":prefix", attr_s("TOOL#"))
+            .send()
+            .await
+        {
+            for item in result.items() {
+                let payload_str = item.get("payload").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default();
+                let payload: Value = serde_json::from_str(&payload_str).unwrap_or_default();
+                let timestamp = item.get("timestamp").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default();
+                live_events.push(json!({
+                    "tool": payload.get("tool").and_then(|v| v.as_str()).unwrap_or(""),
+                    "input_summary": payload.get("input_summary").and_then(|v| v.as_str()).unwrap_or(""),
+                    "duration_ms": payload.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "is_error": payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "timestamp": timestamp,
+                }));
+            }
+        }
+    }
+
+    Ok(Json(json!({ "passes": passes, "live_events": live_events })))
 }
 
 /// GET /api/runs/:run_id/openspec — fetch the four openspec files from S3.

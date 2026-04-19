@@ -173,7 +173,7 @@ pub async fn converse_tool_loop(
     usage: &mut TokenUsage,
     max_turns: usize,
     max_tokens: i32,
-    on_tool_call: Option<&(dyn Fn(&str, u64) + Send + Sync)>,
+    on_tool_call: Option<&(dyn Fn(&str, u64, &str, bool) + Send + Sync)>,
     mut conversation_log: Option<&mut Vec<Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let api_tools: Vec<ApiTool> = tools
@@ -340,7 +340,8 @@ pub async fn converse_tool_loop(
                     let duration_ms = tool_start.elapsed().as_millis() as u64;
                     usage.record_tool_call(tool_name, duration_ms);
                     if let Some(cb) = on_tool_call {
-                        cb(tool_name, duration_ms);
+                        let input_summary = truncate_input_summary(tool_input);
+                        cb(tool_name, duration_ms, &input_summary, false);
                     }
                     info!(tool = %tool_name, duration_ms, "Tool completed");
                     tool_results.push(json!({
@@ -352,6 +353,10 @@ pub async fn converse_tool_loop(
                 Err(e) => {
                     let duration_ms = tool_start.elapsed().as_millis() as u64;
                     usage.record_tool_call(tool_name, duration_ms);
+                    if let Some(cb) = on_tool_call {
+                        let input_summary = truncate_input_summary(tool_input);
+                        cb(tool_name, duration_ms, &input_summary, true);
+                    }
                     warn!(tool = %tool_name, error = %e, duration_ms, "Tool execution failed");
                     tool_results.push(json!({
                         "type": "tool_result",
@@ -403,6 +408,22 @@ pub async fn converse_tool_loop(
 }
 
 // --- Internal helpers ---
+
+/// Produce a short summary of tool input for live event display.
+fn truncate_input_summary(input: &Value) -> String {
+    // For common tools, extract the most relevant field
+    let summary = if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+        path.to_string()
+    } else if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
+        format!("pattern: {pattern}")
+    } else if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
+        command.chars().take(200).collect()
+    } else {
+        let s = input.to_string();
+        if s.len() > 200 { format!("{}…", &s[..200]) } else { s }
+    };
+    summary
+}
 
 async fn send_request(
     client: &AnthropicClient,

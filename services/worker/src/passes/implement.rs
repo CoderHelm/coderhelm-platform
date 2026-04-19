@@ -244,33 +244,68 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         max_tokens: 16384,
     };
 
-    let on_tool: Option<Box<dyn Fn(&str, u64) + Send + Sync>> = if let Some(rid) = run_id {
+    let on_tool: Option<Box<dyn Fn(&str, u64, &str, bool) + Send + Sync>> = if let Some(rid) = run_id {
         let dynamo = state.dynamo.clone();
         let table = state.config.runs_table_name.clone();
+        let events_table = state.config.events_table_name.clone();
         let team = msg.team_id.clone();
         let rid = rid.to_string();
-        Some(Box::new(move |tool_name: &str, _duration_ms: u64| {
+        Some(Box::new(move |tool_name: &str, duration_ms: u64, input_summary: &str, is_error: bool| {
             let dynamo = dynamo.clone();
             let table = table.clone();
+            let events_table = events_table.clone();
             let team = team.clone();
             let rid = rid.clone();
-            let msg = format!("Tool: {tool_name}");
+            let tool_name = tool_name.to_string();
+            let input_summary = input_summary.to_string();
             tokio::spawn(async move {
                 let now = chrono::Utc::now().to_rfc3339();
+
+                // Write progress note (existing behavior for timeline)
+                let msg = if input_summary.is_empty() {
+                    format!("Tool: {tool_name}")
+                } else {
+                    format!("Tool: {tool_name} — {}", &input_summary[..input_summary.len().min(100)])
+                };
                 let entry = aws_sdk_dynamodb::types::AttributeValue::M(std::collections::HashMap::from([
                     ("message".to_string(), aws_sdk_dynamodb::types::AttributeValue::S(msg)),
                     ("timestamp".to_string(), aws_sdk_dynamodb::types::AttributeValue::S(now.clone())),
                 ]));
                 let _ = dynamo.update_item()
                     .table_name(&table)
-                    .key("team_id", aws_sdk_dynamodb::types::AttributeValue::S(team))
-                    .key("run_id", aws_sdk_dynamodb::types::AttributeValue::S(rid))
+                    .key("team_id", aws_sdk_dynamodb::types::AttributeValue::S(team.clone()))
+                    .key("run_id", aws_sdk_dynamodb::types::AttributeValue::S(rid.clone()))
                     .update_expression("SET progress_notes = list_append(if_not_exists(progress_notes, :empty), :entry), updated_at = :t")
                     .expression_attribute_values(":entry", aws_sdk_dynamodb::types::AttributeValue::L(vec![entry]))
                     .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]))
-                    .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
+                    .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now.clone()))
                     .send()
                     .await;
+
+                // Write detailed tool event to events table for agent log live view
+                if !events_table.is_empty() {
+                    let ts = chrono::Utc::now().timestamp_millis();
+                    let sk = format!("TOOL#{ts:013}#{tool_name}");
+                    let payload = serde_json::json!({
+                        "tool": tool_name,
+                        "input_summary": input_summary,
+                        "duration_ms": duration_ms,
+                        "is_error": is_error,
+                    });
+                    let _ = dynamo.put_item()
+                        .table_name(&events_table)
+                        .item("pk", aws_sdk_dynamodb::types::AttributeValue::S(format!("RUN#{rid}")))
+                        .item("sk", aws_sdk_dynamodb::types::AttributeValue::S(sk))
+                        .item("event_type", aws_sdk_dynamodb::types::AttributeValue::S("tool_call".to_string()))
+                        .item("payload", aws_sdk_dynamodb::types::AttributeValue::S(payload.to_string()))
+                        .item("processed", aws_sdk_dynamodb::types::AttributeValue::Bool(true))
+                        .item("timestamp", aws_sdk_dynamodb::types::AttributeValue::S(now))
+                        .item("ttl", aws_sdk_dynamodb::types::AttributeValue::N(
+                            (chrono::Utc::now().timestamp() as u64 + 30 * 86400).to_string()
+                        ))
+                        .send()
+                        .await;
+                }
             });
         }))
     } else {
