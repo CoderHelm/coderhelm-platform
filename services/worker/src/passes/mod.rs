@@ -18,6 +18,31 @@ use crate::WorkerState;
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{error, info, warn};
 
+/// Download an image from S3 and return as base64 string.
+pub(crate) async fn download_image_as_base64(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> Option<String> {
+    use base64::Engine;
+    match s3.get_object().bucket(bucket).key(key).send().await {
+        Ok(resp) => match resp.body.collect().await {
+            Ok(bytes) => {
+                let data = bytes.into_bytes();
+                Some(base64::engine::general_purpose::STANDARD.encode(&data))
+            }
+            Err(e) => {
+                warn!(key, error = %e, "Failed to read S3 image body");
+                None
+            }
+        },
+        Err(e) => {
+            warn!(key, error = %e, "Failed to download image from S3");
+            None
+        }
+    }
+}
+
 /// In-memory file read cache shared across passes within a single run.
 /// Avoids re-fetching the same files from GitHub when review/security
 /// re-reads files that implement already loaded.

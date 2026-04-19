@@ -145,6 +145,13 @@ pub struct ResumeMessage {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ImageAttachment {
+    pub s3_key: String,
+    pub media_type: String,
+    pub filename: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TicketMessage {
     pub team_id: String,
     pub installation_id: u64,
@@ -158,6 +165,8 @@ pub struct TicketMessage {
     pub sender: String,
     #[serde(default = "default_branch")]
     pub base_branch: String,
+    #[serde(default)]
+    pub image_attachments: Vec<ImageAttachment>,
 }
 
 fn default_branch() -> String {

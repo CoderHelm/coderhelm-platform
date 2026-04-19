@@ -182,6 +182,13 @@ pub struct ResumeMessage {
     pub installation_id: u64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ImageAttachment {
+    pub s3_key: String,
+    pub media_type: String,
+    pub filename: String,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TicketMessage {
     pub team_id: String,
@@ -194,6 +201,8 @@ pub struct TicketMessage {
     pub repo_name: String,
     pub issue_number: u64,
     pub sender: String,
+    #[serde(default)]
+    pub image_attachments: Vec<ImageAttachment>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -182,6 +182,7 @@ pub async fn run(
         issue_number,
         sender: String::new(),
         base_branch,
+        image_attachments: vec![],
     };
 
     let provider = ModelProvider::load_for_team(

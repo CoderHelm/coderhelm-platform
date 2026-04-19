@@ -279,10 +279,17 @@ After researching, output the four files using this exact format:
         mcp_proxy_function_name: &state.config.mcp_proxy_function_name,
     };
 
-    let mut messages = vec![(
-        "user".to_string(),
-        vec![serde_json::json!({"type": "text", "text": prompt})],
-    )];
+    let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
+    for img in &msg.image_attachments {
+        if let Some(b64) = super::download_image_as_base64(&state.s3, &state.config.bucket_name, &img.s3_key).await {
+            content_blocks.push(serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": img.media_type, "data": b64 }
+            }));
+        }
+    }
+
+    let mut messages = vec![("user".to_string(), content_blocks)];
 
     let plan_opts = llm::ConverseOptions {
         max_turns: match triage.complexity.as_str() {

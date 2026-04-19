@@ -10,7 +10,7 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
-use crate::models::{TicketMessage, TicketSource, WorkerMessage};
+use crate::models::{ImageAttachment, TicketMessage, TicketSource, WorkerMessage};
 use crate::AppState;
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
@@ -436,6 +436,15 @@ async fn process_jira_payload(
         return Ok(StatusCode::OK);
     }
 
+    // Upload image attachments to S3 (sent by Forge as base64)
+    let image_attachments = upload_image_attachments(
+        state,
+        team_id,
+        ticket_key,
+        payload,
+    )
+    .await;
+
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: team_id.to_string(),
         installation_id,
@@ -447,6 +456,7 @@ async fn process_jira_payload(
         repo_name: repo_name.clone(),
         issue_number: 0,
         sender,
+        image_attachments,
     });
 
     let result = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
@@ -716,6 +726,7 @@ async fn handle_jira_comment(
                 repo_name: repo_name.to_string(),
                 issue_number: 0,
                 sender: comment_author.to_string(),
+                image_attachments: vec![],
             });
 
             info!(
@@ -922,6 +933,70 @@ pub async fn list_jira_events(
     Ok(events)
 }
 
+/// Upload base64-encoded image attachments from the Forge payload to S3.
+/// Returns a Vec of ImageAttachment with S3 keys for inclusion in TicketMessage.
+async fn upload_image_attachments(
+    state: &AppState,
+    team_id: &str,
+    ticket_key: &str,
+    payload: &Value,
+) -> Vec<ImageAttachment> {
+    let attachments = match payload.get("image_attachments").and_then(|v| v.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return vec![],
+    };
+
+    let mut results = Vec::new();
+    for att in attachments {
+        let filename = att["filename"].as_str().unwrap_or("image.png");
+        let media_type = att["media_type"].as_str().unwrap_or("image/png");
+        let data_b64 = match att["data_base64"].as_str() {
+            Some(d) => d,
+            None => continue,
+        };
+
+        let data = match base64_decode(data_b64) {
+            Some(d) => d,
+            None => {
+                warn!(team_id, ticket_key, filename, "Failed to decode base64 image attachment");
+                continue;
+            }
+        };
+
+        let safe_team = team_id.replace('#', "_");
+        let s3_key = format!("attachments/{safe_team}/{ticket_key}/{filename}");
+
+        match state
+            .s3
+            .put_object()
+            .bucket(&state.config.bucket_name)
+            .key(&s3_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(data))
+            .content_type(media_type)
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!(team_id, ticket_key, filename, s3_key = %s3_key, "Uploaded image attachment to S3");
+                results.push(ImageAttachment {
+                    s3_key: s3_key.clone(),
+                    media_type: media_type.to_string(),
+                    filename: filename.to_string(),
+                });
+            }
+            Err(e) => {
+                warn!(team_id, ticket_key, filename, error = %e, "Failed to upload image attachment to S3");
+            }
+        }
+    }
+    results
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(input).ok()
+}
+
 /// Extract plain text from Jira Atlassian Document Format (ADF).
 /// ADF is a nested JSON tree with `content` arrays and `text` leaf nodes.
 /// Falls back to raw JSON if the structure is unexpected.
@@ -964,6 +1039,27 @@ fn extract_adf_text_inner(value: &Value, parts: &mut Vec<String>) {
             // Hard break inline node
             if node_type == "hardBreak" {
                 parts.push("\n".to_string());
+                return;
+            }
+            // Media nodes (images/attachments embedded in the description)
+            if node_type == "media" || node_type == "mediaSingle" || node_type == "mediaInline" {
+                let filename = map
+                    .get("attrs")
+                    .and_then(|a| a.get("alt"))
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        map.get("attrs")
+                            .and_then(|a| a.get("id"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .unwrap_or("image");
+                parts.push(format!("[Attached image: {filename}]"));
+                // Recurse into children (mediaSingle wraps a media node)
+                if let Some(Value::Array(children)) = map.get("content") {
+                    for child in children {
+                        extract_adf_text_inner(child, parts);
+                    }
+                }
                 return;
             }
             // Inline card (pasted URLs like Notion links)

@@ -224,6 +224,7 @@ async fn handle_issue_event(
             .as_str()
             .unwrap_or("")
             .to_string(),
+        image_attachments: vec![],
     });
 
     // Check usage limits before dispatching
@@ -341,6 +342,7 @@ async fn handle_issue_comment(
             .as_str()
             .unwrap_or("")
             .to_string(),
+        image_attachments: vec![],
     });
 
     // Check usage limits before dispatching

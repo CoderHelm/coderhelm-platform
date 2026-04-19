@@ -53,7 +53,7 @@ exports.handler = async (event, context) => {
     let fields = {};
     if (issue.id) {
       try {
-        const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,project`);
+        const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,project,attachment`);
         if (res.ok) {
           const full = await res.json();
           fields = full.fields || {};
@@ -112,7 +112,7 @@ exports.handler = async (event, context) => {
   let fields = {};
   if (issue.id) {
     try {
-      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,project`);
+      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,project,attachment`);
       if (res.ok) {
         const full = await res.json();
         fields = full.fields || {};
@@ -132,6 +132,12 @@ exports.handler = async (event, context) => {
     [repoOwner, repoName] = repoLabel.replace("coderhelm:", "").split("/");
   }
 
+  // Download image attachments from the ticket
+  const imageAttachments = await fetchImageAttachments(fields);
+  if (imageAttachments.length > 0) {
+    console.log(`Downloaded ${imageAttachments.length} image attachment(s) for ${issue.key}`);
+  }
+
   // Forward everything to the gateway — it handles label/assignee/project filtering
   const payload = {
     webhookEvent: event.eventType || "jira:issue_assigned",
@@ -146,6 +152,7 @@ exports.handler = async (event, context) => {
         project: fields.project,
       },
     },
+    image_attachments: imageAttachments,
     user: { displayName: (fields.assignee && fields.assignee.displayName) || fields.reporter?.displayName || "jira" },
     coderhelm: {
       repo_owner: repoOwner || undefined,
@@ -278,6 +285,45 @@ exports.addCommentHandler = async (request) => {
     return { statusCode: 500, body: JSON.stringify({ error: e.message }) };
   }
 };
+
+/**
+ * Download image attachments from Jira and return as base64-encoded objects.
+ * Caps at 5 images, 5MB each to keep payload reasonable.
+ */
+async function fetchImageAttachments(fields) {
+  const attachments = fields.attachment || [];
+  const imageTypes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+  const maxImages = 5;
+  const maxSizeBytes = 5 * 1024 * 1024;
+
+  const imageAttachments = attachments.filter(
+    (a) => imageTypes.includes(a.mimeType) && (a.size || 0) <= maxSizeBytes
+  );
+
+  const results = [];
+  for (const att of imageAttachments.slice(0, maxImages)) {
+    try {
+      const res = await api.asApp().requestJira(att.content, {
+        headers: { Accept: att.mimeType },
+      });
+      if (!res.ok) {
+        console.log(`Failed to download attachment ${att.filename}: ${res.status}`);
+        continue;
+      }
+      const buffer = await res.arrayBuffer();
+      const base64 = Buffer.from(buffer).toString("base64");
+      results.push({
+        filename: att.filename,
+        media_type: att.mimeType,
+        data_base64: base64,
+        size: buffer.byteLength,
+      });
+    } catch (e) {
+      console.log(`Error downloading attachment ${att.filename}: ${e.message}`);
+    }
+  }
+  return results;
+}
 
 /**
  * Build ADF (Atlassian Document Format) for a comment.

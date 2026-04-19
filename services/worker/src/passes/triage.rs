@@ -55,10 +55,17 @@ Rules:
         body = msg.body,
     );
 
-    let mut messages = vec![(
-        "user".to_string(),
-        vec![serde_json::json!({"type": "text", "text": prompt})],
-    )];
+    let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
+    for img in &msg.image_attachments {
+        if let Some(b64) = super::download_image_as_base64(&state.s3, &state.config.bucket_name, &img.s3_key).await {
+            content_blocks.push(serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": img.media_type, "data": b64 }
+            }));
+        }
+    }
+
+    let mut messages = vec![("user".to_string(), content_blocks)];
 
     let model_id = provider.primary_model_id();
     let response = provider::converse(
@@ -166,10 +173,17 @@ Then on the LAST line, return ONLY the repository in `owner/name` format."#,
         body = msg.body,
     );
 
-    let mut messages = vec![(
-        "user".to_string(),
-        vec![serde_json::json!({"type": "text", "text": prompt})],
-    )];
+    let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
+    for img in &msg.image_attachments {
+        if let Some(b64) = super::download_image_as_base64(&state.s3, &state.config.bucket_name, &img.s3_key).await {
+            content_blocks.push(serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": img.media_type, "data": b64 }
+            }));
+        }
+    }
+
+    let mut messages = vec![("user".to_string(), content_blocks)];
 
     let model_id = provider.primary_model_id();
     let response = provider::converse(
