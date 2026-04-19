@@ -341,6 +341,12 @@ def analyze_connection(conn):
     # Send to Anthropic for analysis
     recommendations = analyze_with_anthropic(all_results, account_id, api_key)
 
+    # If Anthropic failed (empty response), don't resolve anything —
+    # we can't distinguish "no issues" from "API error"
+    if not recommendations and all_results:
+        logger.warning(f"{team_id}/{account_id}: Anthropic returned no recommendations despite having errors, skipping resolution")
+        return new_recs
+
     # Track all error hashes seen this run (for resolution)
     seen_hashes = set()
 
@@ -525,34 +531,44 @@ Return ONLY the JSON array, no surrounding text."""
 def resolve_stale_recommendations(team_id, account_id, seen_hashes):
     """Mark recommendations as resolved if their error hash was not seen this run."""
     try:
-        result = aws_insights_table.query(
-            KeyConditionExpression="pk = :pk AND begins_with(sk, :prefix)",
-            FilterExpression="#s = :pending AND source_account_id = :acct",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
-                ":pk": team_id,
-                ":prefix": "REC#",
-                ":pending": "pending",
-                ":acct": account_id,
-            },
-        )
-
         now = datetime.now(timezone.utc).isoformat()
         resolved_count = 0
+        last_key = None
 
-        for item in result.get("Items", []):
-            error_hash = item.get("error_hash", "")
-            if error_hash and error_hash not in seen_hashes:
-                aws_insights_table.update_item(
-                    Key={"pk": team_id, "sk": item["sk"]},
-                    UpdateExpression="SET #s = :s, resolved_at = :t, updated_at = :t",
-                    ExpressionAttributeNames={"#s": "status"},
-                    ExpressionAttributeValues={
-                        ":s": "resolved",
-                        ":t": now,
-                    },
-                )
-                resolved_count += 1
+        while True:
+            query_kwargs = {
+                "KeyConditionExpression": "pk = :pk AND begins_with(sk, :prefix)",
+                "FilterExpression": "#s = :pending AND source_account_id = :acct",
+                "ExpressionAttributeNames": {"#s": "status"},
+                "ExpressionAttributeValues": {
+                    ":pk": team_id,
+                    ":prefix": "REC#",
+                    ":pending": "pending",
+                    ":acct": account_id,
+                },
+            }
+            if last_key:
+                query_kwargs["ExclusiveStartKey"] = last_key
+
+            result = aws_insights_table.query(**query_kwargs)
+
+            for item in result.get("Items", []):
+                error_hash = item.get("error_hash", "")
+                if error_hash and error_hash not in seen_hashes:
+                    aws_insights_table.update_item(
+                        Key={"pk": team_id, "sk": item["sk"]},
+                        UpdateExpression="SET #s = :s, resolved_at = :t, updated_at = :t",
+                        ExpressionAttributeNames={"#s": "status"},
+                        ExpressionAttributeValues={
+                            ":s": "resolved",
+                            ":t": now,
+                        },
+                    )
+                    resolved_count += 1
+
+            last_key = result.get("LastEvaluatedKey")
+            if not last_key:
+                break
 
         if resolved_count:
             logger.info(f"{team_id}/{account_id}: {resolved_count} recommendations resolved")
@@ -576,13 +592,14 @@ def store_recommendation(team_id, account_id, rec):
     try:
         existing = aws_insights_table.query(
             KeyConditionExpression="pk = :pk AND begins_with(sk, :prefix)",
-            FilterExpression="error_hash = :hash AND #s <> :dismissed",
+            FilterExpression="error_hash = :hash AND #s IN (:pending, :approved)",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":pk": team_id,
                 ":prefix": "REC#",
                 ":hash": error_hash,
-                ":dismissed": "dismissed",
+                ":pending": "pending",
+                ":approved": "approved",
             },
         )
         if existing.get("Items"):
