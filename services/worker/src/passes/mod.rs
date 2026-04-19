@@ -1337,8 +1337,7 @@ async fn run_passes(
                 "Multi-repo run set to awaiting_ci"
             );
 
-            if let Some(mut mem) = agent_memory {
-                // Multi-repo: conversation logs are per-repo, skip extraction here
+            if let Some(mem) = agent_memory {
                 if let Err(e) = mem.close_and_upload(state).await {
                     warn!(run_id, error = %e, "Failed to persist agent memory");
                 }
