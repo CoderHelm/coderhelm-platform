@@ -788,9 +788,6 @@ async fn handle_installation_repos(
     installation_id: u64,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
-    if action != "added" {
-        return Ok(StatusCode::OK);
-    }
 
     let team_id = match resolve_team_by_installation(state, installation_id).await {
         Some(tid) => tid,
@@ -802,6 +799,33 @@ async fn handle_installation_repos(
             return Ok(StatusCode::OK);
         }
     };
+
+    if action == "removed" {
+        let removed: Vec<String> = payload["repositories_removed"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|r| r["full_name"].as_str().map(|s| s.to_string()))
+            .collect();
+
+        for full_name in &removed {
+            let _ = state
+                .dynamo
+                .delete_item()
+                .table_name(&state.config.repos_table_name)
+                .key("pk", attr_s(&team_id))
+                .key("sk", attr_s(&format!("REPO#{full_name}")))
+                .send()
+                .await;
+            info!(repo = %full_name, "Removed repo (access revoked)");
+        }
+
+        return Ok(StatusCode::OK);
+    }
+
+    if action != "added" {
+        return Ok(StatusCode::OK);
+    }
 
     let repos: Vec<OnboardRepo> = payload["repositories_added"]
         .as_array()
