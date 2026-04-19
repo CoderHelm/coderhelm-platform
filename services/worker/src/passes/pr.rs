@@ -33,6 +33,9 @@ pub async fn run(
         .await?;
     let diff_summary = format_diff_summary(&diff);
 
+    // Check for PR template in the repo
+    let pr_template = fetch_pr_template(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await;
+
     // Generate PR body via LLM
     let voice_block = if voice.is_empty() {
         String::new()
@@ -48,6 +51,24 @@ pub async fn run(
         TicketSource::Jira => msg.ticket_id.clone(),
     };
 
+    let template_block = if let Some(ref tmpl) = pr_template {
+        format!(
+            "\n\n## PR Template\nThe repository has a pull request template. Follow its structure and fill in the sections:\n\n```\n{tmpl}\n```\n\nFill in ALL sections from the template. Replace placeholder text with actual content."
+        )
+    } else {
+        String::new()
+    };
+
+    let instructions = if pr_template.is_some() {
+        "Follow the PR template above. Fill in every section with relevant content from this change. Remove any placeholder/instruction text."
+    } else {
+        "Write a PR description following this structure:\n\n\
+         1. **Problem** — One sentence: what the issue asks for.\n\
+         2. **Changes** — Bolded per-area headers with bullet details. Keep it tight.\n\
+         3. **Risk** — State risk level in bold (**Low**, **Medium**), then why it's safe.\n\
+         4. **Verification** — Numbered steps to verify the change."
+    };
+
     let prompt = format!(
         r#"Write a concise pull request description for ticket {ticket_ref}: {title}
 
@@ -55,15 +76,10 @@ pub async fn run(
 {summary}
 
 ## Files Changed
-{diff_summary}
+{diff_summary}{template_block}
 
 ## Instructions
-Write a PR description following this structure:
-
-1. **Problem** — One sentence: what the issue asks for.
-2. **Changes** — Bolded per-area headers with bullet details. Keep it tight.
-3. **Risk** — State risk level in bold (**Low**, **Medium**), then why it's safe.
-4. **Verification** — Numbered steps to verify the change.
+{instructions}
 
 Rules:
 - Keep it short. Don't pad short changes with long descriptions.
@@ -77,6 +93,8 @@ Return ONLY the markdown body text."#,
         title = msg.title,
         summary = plan.proposal,
         diff_summary = diff_summary,
+        template_block = template_block,
+        instructions = instructions,
     );
 
     let mut messages = vec![(
@@ -123,7 +141,12 @@ Return ONLY the markdown body text."#,
             number = msg.issue_number,
         )
     } else {
-        format!("Source ticket: {}\n\n{clean_body}", msg.ticket_id)
+        // Avoid duplicating "Source ticket:" if it's already in the body
+        if clean_body.contains(&format!("Source ticket: {}", msg.ticket_id)) {
+            clean_body.to_string()
+        } else {
+            format!("Source ticket: {}\n\n{clean_body}", msg.ticket_id)
+        }
     };
 
     // Create PR title
@@ -358,4 +381,30 @@ fn format_diff_summary(diff: &serde_json::Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Try to fetch a PR template from common locations in the repo.
+async fn fetch_pr_template(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    base_branch: &str,
+) -> Option<String> {
+    let paths = [
+        ".github/pull_request_template.md",
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        "pull_request_template.md",
+        "PULL_REQUEST_TEMPLATE.md",
+        "docs/pull_request_template.md",
+    ];
+    for path in &paths {
+        if let Ok(content) = github.read_file(owner, repo, path, base_branch).await {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                info!(owner, repo, path, "Found PR template");
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
