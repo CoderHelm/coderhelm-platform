@@ -1,32 +1,33 @@
 # CoderHelm Platform
 
-Autonomous AI coding agent platform — webhook receiver, AI orchestration worker, and AWS CDK infrastructure.
+Backend services for [CoderHelm](https://coderhelm.com) — the autonomous AI coding agent that turns tickets into pull requests.
 
 ## Architecture
 
 ```
-services/gateway/   API Gateway Lambda — receives GitHub/Jira webhooks, handles OAuth & auth, enqueues jobs to SQS
-services/worker/    Worker Lambda — dequeues jobs from SQS, orchestrates AI passes via Bedrock, and opens GitHub PRs
-infra/              AWS CDK v2 stacks — defines all cloud infrastructure (API Gateway, Lambdas, SQS, DynamoDB, S3, etc.)
-docs/               Additional documentation and integration guides
+services/gateway/    Rust Lambda — GitHub & Jira webhooks, OAuth, REST API, SQS dispatch
+services/worker/     Rust Lambda — AI orchestration (triage → plan → implement → review)
+coderhelm-jira/      Atlassian Forge app — bridges Jira Cloud events to the gateway
+infra/               AWS CDK v2 — all cloud infrastructure (API Gateway, Lambda, SQS, DynamoDB, S3, CloudFront)
+docs/                Integration guides and internal docs
 ```
 
-### Data-Flow Diagram
+### Data Flow
 
 ```
-GitHub webhook event
+GitHub issue / Jira ticket
         │
         ▼
-  Gateway Lambda  ──▶  validates signature & auth
+  Gateway Lambda  ──▶  validates webhook, resolves team & repo, uploads attachments to S3
         │
         ▼
       SQS Queue
         │
         ▼
-  Worker Lambda   ──▶  AI orchestration (Bedrock)
+  Worker Lambda   ──▶  triage → plan → implement → CI check → self-review (Anthropic Claude)
         │
         ▼
-  GitHub PR / comment pushed back to the repository
+  Draft PR opened on GitHub with summary & linked ticket
 ```
 
 ## Prerequisites
