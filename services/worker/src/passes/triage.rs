@@ -26,6 +26,16 @@ pub async fn run(
     let system = "You are a ticket triage agent for a GitHub issue. \
                   Analyze the issue and classify it. Return only valid JSON.";
 
+    let has_images = !msg.image_attachments.is_empty();
+    let image_hint = if has_images {
+        "\n\nIMPORTANT: This ticket includes image attachments (screenshots, mockups, or designs) below. \
+         Treat them as primary context — they may contain UI designs, error messages, architecture diagrams, \
+         or visual specifications that fully describe what needs to be built. \
+         A ticket with a clear title and descriptive images IS clear enough to implement, even if the text body is short or empty."
+    } else {
+        ""
+    };
+
     let prompt = format!(
         r#"Analyze this GitHub issue and return a JSON classification.
 
@@ -35,7 +45,7 @@ Number: #{number}
 Title: {title}
 
 Body:
-{body}
+{body}{image_hint}
 
 ## Instructions
 Return a JSON object with these fields:
@@ -47,12 +57,14 @@ Return a JSON object with these fields:
 
 Rules:
 - If the issue is vague, ambiguous, or missing acceptance criteria, set clarity to "needs_clarification".
+- If attached images clearly show what to build (e.g., a UI mockup, a design, an error to fix), that counts as sufficient context — set clarity to "clear".
 - Return ONLY the JSON object, no other text."#,
         owner = msg.repo_owner,
         repo = msg.repo_name,
         number = msg.issue_number,
         title = msg.title,
         body = msg.body,
+        image_hint = image_hint,
     );
 
     let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];

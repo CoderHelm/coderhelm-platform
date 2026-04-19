@@ -107,6 +107,15 @@ This is a complex change. Research thoroughly but stay focused:
         }
     };
 
+    let has_images = !msg.image_attachments.is_empty();
+    let image_hint = if has_images {
+        "\n\n**Note:** This issue includes image attachments (screenshots, mockups, or designs) below the text. \
+         Study them carefully — they may show UI designs to replicate, error messages to fix, \
+         or visual specifications that define what to build. Use the images as primary context alongside the text."
+    } else {
+        ""
+    };
+
     let prompt = format!(
         r#"Generate an implementation plan (openspec) for this issue.
 
@@ -115,7 +124,7 @@ Title: {title}
 Summary: {summary}
 
 ## Original Issue Body
-{body}
+{body}{image_hint}
 
 {complexity_guidance}
 
