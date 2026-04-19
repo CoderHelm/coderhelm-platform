@@ -567,8 +567,11 @@ async fn run_passes(
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
 
+    // Compute context hash to detect ticket changes (body, images)
+    let context_hash = plan::compute_ticket_context_hash(msg);
+
     // Try to reuse existing plan from S3 (same ticket, no changes)
-    let existing_plan = load_existing_plan(state, &msg.team_id, &msg.ticket_id).await;
+    let existing_plan = load_existing_plan(state, &msg.team_id, &msg.ticket_id, &context_hash).await;
     let plan_result = if let Some(plan) = existing_plan {
         // Reuse if plan has content AND has unchecked tasks (not a completed plan from a previous run)
         let has_unchecked = plan.tasks.contains("- [ ]");
@@ -3328,12 +3331,32 @@ async fn load_existing_plan(
     state: &WorkerState,
     team_id: &str,
     ticket_id: &str,
+    context_hash: &str,
 ) -> Option<plan::PlanResult> {
     let prefix = format!(
         "teams/{}/runs/{}/openspec",
         team_id,
         ticket_id.to_lowercase()
     );
+
+    // Check if ticket context has changed (body, images, etc.)
+    let hash_key = format!("{prefix}/context_hash.txt");
+    if let Ok(output) = state
+        .s3
+        .get_object()
+        .bucket(&state.config.bucket_name)
+        .key(&hash_key)
+        .send()
+        .await
+    {
+        if let Ok(bytes) = output.body.collect().await {
+            let stored_hash = String::from_utf8(bytes.to_vec()).unwrap_or_default();
+            if stored_hash.trim() != context_hash {
+                info!("Ticket context changed (hash mismatch) — forcing re-plan");
+                return None;
+            }
+        }
+    }
 
     let mut files = std::collections::HashMap::new();
     for name in &["proposal.md", "design.md", "tasks.md", "spec.md"] {

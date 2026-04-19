@@ -1,4 +1,6 @@
 use serde_json::json;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use tracing::info;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
@@ -343,6 +345,20 @@ After researching, output the four files using this exact format:
     }
 
     info!("Plan openspec written to S3");
+
+    // Store context hash so we can detect when ticket content changes
+    let context_hash = compute_ticket_context_hash(msg);
+    let hash_key = format!("{prefix}/context_hash.txt");
+    let _ = state
+        .s3
+        .put_object()
+        .bucket(&state.config.bucket_name)
+        .key(&hash_key)
+        .body(context_hash.as_bytes().to_vec().into())
+        .content_type("text/plain")
+        .send()
+        .await;
+
     Ok(files)
 }
 
@@ -652,4 +668,15 @@ impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
         // Fall through to read-only tools
         self.read_only.execute(name, input).await
     }
+}
+
+/// Compute a hash of ticket content (body + image attachment keys) for change detection.
+pub fn compute_ticket_context_hash(msg: &TicketMessage) -> String {
+    let mut hasher = DefaultHasher::new();
+    msg.title.hash(&mut hasher);
+    msg.body.hash(&mut hasher);
+    for img in &msg.image_attachments {
+        img.s3_key.hash(&mut hasher);
+    }
+    format!("{:x}", hasher.finish())
 }
