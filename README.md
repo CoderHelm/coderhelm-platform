@@ -2,6 +2,18 @@
 
 Backend services for [CoderHelm](https://coderhelm.com) — the autonomous AI coding agent that turns tickets into pull requests.
 
+## How it works
+
+1. A developer assigns a GitHub issue or Jira ticket to CoderHelm
+2. The **Gateway** receives the webhook, resolves the team/repo, uploads any image attachments to S3, and enqueues a job
+3. The **Worker** picks up the job and runs a multi-pass AI pipeline:
+   - **Triage** — classifies complexity, selects target repo (with image context if available)
+   - **Plan** — generates a task breakdown using codebase context and MCP tools
+   - **Implement** — writes code, creates/edits files, commits to a feature branch
+   - **CI Check** — waits for GitHub Actions, auto-fixes failures (up to 3 attempts)
+   - **Self-Review** — reviews its own diff, fixes issues before requesting human review
+4. A draft PR is opened with a summary, linked ticket, and progress notes
+
 ## Architecture
 
 ```
@@ -15,10 +27,10 @@ docs/                Integration guides and internal docs
 ### Data Flow
 
 ```
-GitHub issue / Jira ticket
+GitHub issue / Jira ticket (with optional image attachments)
         │
         ▼
-  Gateway Lambda  ──▶  validates webhook, resolves team & repo, uploads attachments to S3
+  Gateway Lambda  ──▶  validates webhook, resolves team & repo, uploads images to S3
         │
         ▼
       SQS Queue
@@ -29,6 +41,19 @@ GitHub issue / Jira ticket
         ▼
   Draft PR opened on GitHub with summary & linked ticket
 ```
+
+## Tech Stack
+
+| Component | Technology |
+|---|---|
+| Gateway & Worker | Rust (async, compiled to ARM64 Lambda) |
+| AI Provider | Anthropic Claude (Opus, Sonnet, Haiku) |
+| Infrastructure | AWS CDK v2 (TypeScript) |
+| Compute | AWS Lambda (ARM64, up to 15 min timeout) |
+| Queue | Amazon SQS (with DLQ) |
+| Storage | Amazon DynamoDB + S3 |
+| Jira Integration | Atlassian Forge (Node.js) |
+| CI/CD | GitHub Actions → CDK deploy |
 
 ## Prerequisites
 
