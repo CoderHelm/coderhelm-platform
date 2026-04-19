@@ -759,6 +759,7 @@ fn rec_from_item(item: &std::collections::HashMap<String, AttributeValue>) -> Op
         "suggested_action": item.get("suggested_action").and_then(|v| v.as_s().ok()),
         "source_log_group": item.get("source_log_group").and_then(|v| v.as_s().ok()),
         "source_account_id": item.get("source_account_id").and_then(|v| v.as_s().ok()),
+        "error_pattern": item.get("error_pattern").and_then(|v| v.as_s().ok()),
         "error_hash": item.get("error_hash").and_then(|v| v.as_s().ok()),
         "error_count": item.get("error_count").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "plan_id": item.get("plan_id").and_then(|v| v.as_s().ok()),
