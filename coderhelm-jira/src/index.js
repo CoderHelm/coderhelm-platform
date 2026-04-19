@@ -303,7 +303,7 @@ async function fetchImageAttachments(fields) {
   const results = [];
   for (const att of imageAttachments.slice(0, maxImages)) {
     try {
-      const res = await api.asApp().requestJira(att.content, {
+      const res = await api.asApp().requestJira(route`/rest/api/3/attachment/content/${att.id}`, {
         headers: { Accept: att.mimeType },
       });
       if (!res.ok) {

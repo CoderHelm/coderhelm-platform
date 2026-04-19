@@ -67,6 +67,8 @@ struct ApiMessage {
 enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -79,6 +81,16 @@ enum ContentBlock {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+enum ImageSource {
+    #[serde(rename = "base64")]
+    Base64 {
+        media_type: String,
+        data: String,
     },
 }
 
