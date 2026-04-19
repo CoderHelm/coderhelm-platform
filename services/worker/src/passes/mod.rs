@@ -572,14 +572,17 @@ async fn run_passes(
 
     // Try to reuse existing plan from S3 (same ticket, no changes)
     let existing_plan = load_existing_plan(state, &msg.team_id, &msg.ticket_id, &context_hash).await;
+    let mut context_changed = existing_plan.is_none();
     let plan_result = if let Some(plan) = existing_plan {
         // Reuse if plan has content AND has unchecked tasks (not a completed plan from a previous run)
         let has_unchecked = plan.tasks.contains("- [ ]");
         if !plan.tasks.is_empty() && !plan.design.is_empty() && has_unchecked {
+            context_changed = false;
             info!(run_id, "Reusing existing plan from S3 — ticket unchanged");
             add_progress_note(state, &msg.team_id, run_id, "Reused existing plan").await;
             plan
         } else {
+            context_changed = true;
             plan::run(
                 state, msg, &github, &triage_result, &repo_instructions, &provider, usage,
             )
@@ -916,7 +919,7 @@ async fn run_passes(
                 "Re-run detection: PR status"
             );
 
-            if has_ci_failure || has_review_feedback {
+            if (has_ci_failure || has_review_feedback) && !context_changed {
                 // Build combined feedback from CI failures and review comments
                 let mut feedback_parts: Vec<String> = Vec::new();
 
@@ -1085,12 +1088,26 @@ async fn run_passes(
         }
 
         // Track whether to skip branch creation (PR exists, just needs fresh implementation)
-        let skip_branch_reset = existing_pr.as_ref().map_or(false, |pr| {
-            let pr_head = pr["head"]["sha"].as_str().unwrap_or("");
-            let base = pr["base"]["sha"].as_str().unwrap_or("");
-            // Branch was reset to base by a previous retry — don't reset again
-            !pr_head.is_empty() && !base.is_empty() && pr_head == base
-        });
+        let skip_branch_reset = if context_changed && existing_pr.is_some() {
+            // Context changed (new description, images, etc.) — force reset branch for clean implementation
+            let pr_number = existing_pr.as_ref().and_then(|p| p["number"].as_u64()).unwrap_or(0);
+            info!(run_id, pr_number, "Context changed — forcing branch reset for fresh implementation");
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("Ticket updated — resetting PR #{pr_number} branch for fresh implementation"),
+            )
+            .await;
+            false
+        } else {
+            existing_pr.as_ref().map_or(false, |pr| {
+                let pr_head = pr["head"]["sha"].as_str().unwrap_or("");
+                let base = pr["base"]["sha"].as_str().unwrap_or("");
+                // Branch was reset to base by a previous retry — don't reset again
+                !pr_head.is_empty() && !base.is_empty() && pr_head == base
+            })
+        };
 
         if skip_branch_reset {
             let pr_number = existing_pr.as_ref().and_then(|p| p["number"].as_u64()).unwrap_or(0);
