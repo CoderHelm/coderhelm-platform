@@ -25,3 +25,4 @@ lambda/mcp-proxy/mcp-proxy.zip
 node_modules/
 target/
 Thumbs.db
+lambda/log-analyzer/__pycache__/
