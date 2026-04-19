@@ -62,7 +62,7 @@ export class LogAnalyzerStack extends cdk.Stack {
       environment: {
         AWS_INSIGHTS_TABLE_NAME: props.awsInsightsTable.tableName,
         PLANS_TABLE_NAME: props.plansTable.tableName,
-        MODEL_ID: "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        MODEL_ID: "claude-sonnet-4-20250514",
         CODERHELM_ACCOUNT_ID: this.account,
         LOOKBACK_HOURS: "6",
       },
@@ -70,7 +70,7 @@ export class LogAnalyzerStack extends cdk.Stack {
 
     // DynamoDB permissions
     props.awsInsightsTable.grantReadWriteData(analyzerFunction);
-    props.plansTable.grantReadWriteData(analyzerFunction);
+    props.plansTable.grantReadData(analyzerFunction);
 
     // STS AssumeRole — the analyzer needs to assume roles in customer accounts
     analyzerFunction.addToRolePolicy(
@@ -82,17 +82,6 @@ export class LogAnalyzerStack extends cdk.Stack {
             "sts:ExternalId": "*",
           },
         },
-      })
-    );
-
-    // Bedrock access for log analysis
-    analyzerFunction.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["bedrock:InvokeModel", "bedrock:Converse"],
-        resources: [
-          `arn:aws:bedrock:*::foundation-model/*`,
-          `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
-        ],
       })
     );
 

@@ -4,7 +4,7 @@ Coderhelm Log Analyzer Lambda
 Triggered by EventBridge every 6 hours. For each team with an AWS connection:
 1. AssumeRole into the customer's account
 2. Run pre-built CloudWatch Logs Insights queries
-3. Send error summaries to Bedrock Claude for analysis
+3. Send error summaries to Anthropic Claude for analysis
 4. Deduplicate and store recommendations in DynamoDB
 
 No raw logs are stored — only error summaries and recommendations.
@@ -16,6 +16,8 @@ import logging
 import os
 import time
 from datetime import datetime, timezone, timedelta
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 import boto3
 from botocore.exceptions import ClientError
@@ -24,13 +26,16 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 AWS_INSIGHTS_TABLE = os.environ.get("AWS_INSIGHTS_TABLE_NAME", "coderhelm-prod-aws-insights")
-MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
+PLANS_TABLE = os.environ.get("PLANS_TABLE_NAME", "coderhelm-prod-plans")
+MODEL_ID = os.environ.get("MODEL_ID", "claude-sonnet-4-20250514")
 CODERHELM_ACCOUNT_ID = os.environ["CODERHELM_ACCOUNT_ID"]
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
 
 dynamodb = boto3.resource("dynamodb")
 aws_insights_table = dynamodb.Table(AWS_INSIGHTS_TABLE)
-bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+plans_table = dynamodb.Table(PLANS_TABLE)
 sts_client = boto3.client("sts")
 
 # ── Pre-built Insights Queries ──────────────────────────────────
@@ -210,6 +215,21 @@ def scan_aws_connections():
     return connections
 
 
+def get_team_api_key(team_id):
+    """Load the team's Anthropic API key from DynamoDB settings."""
+    try:
+        resp = plans_table.get_item(
+            Key={"pk": team_id, "sk": "SETTINGS#MODEL_PROVIDER"}
+        )
+        item = resp.get("Item")
+        if not item:
+            return None
+        return item.get("api_key", "")
+    except Exception as e:
+        logger.warning(f"Failed to load API key for {team_id}: {e}")
+        return None
+
+
 def analyze_connection(conn):
     """Analyze a single AWS connection — AssumeRole, query logs, generate recommendations."""
     team_id = conn["team_id"]
@@ -219,6 +239,12 @@ def analyze_connection(conn):
     region = conn["region"]
 
     logger.info(f"Analyzing {team_id} / account {account_id}")
+
+    # Load team's Anthropic API key
+    api_key = get_team_api_key(team_id)
+    if not api_key:
+        logger.warning(f"No Anthropic API key configured for {team_id}, skipping analysis")
+        return 0
 
     # AssumeRole with 15-minute session (minimum)
     assumed = sts_client.assume_role(
@@ -310,8 +336,8 @@ def analyze_connection(conn):
     else:
         new_recs = 0
 
-    # Send to Bedrock for analysis
-    recommendations = analyze_with_bedrock(all_results, account_id)
+    # Send to Anthropic for analysis
+    recommendations = analyze_with_anthropic(all_results, account_id, api_key)
 
     # Deduplicate and store
     for rec in recommendations:
@@ -390,8 +416,8 @@ def format_query_results(results):
     return lines
 
 
-def analyze_with_bedrock(query_results, account_id):
-    """Send log error summaries to Bedrock Claude for analysis."""
+def analyze_with_anthropic(query_results, account_id, api_key):
+    """Send log error summaries to Anthropic Claude for analysis."""
     # Scrub any secrets/tokens from the data before sending to AI
     scrubbed_results = scrub_query_results(query_results)
 
@@ -435,13 +461,28 @@ Rules:
 Return ONLY the JSON array, no surrounding text."""
 
     try:
-        response = bedrock.converse(
-            modelId=MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 4096, "temperature": 0.1},
+        request_body = json.dumps({
+            "model": MODEL_ID,
+            "max_tokens": 4096,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}],
+        }).encode("utf-8")
+
+        req = Request(
+            ANTHROPIC_API_URL,
+            data=request_body,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": ANTHROPIC_VERSION,
+            },
+            method="POST",
         )
 
-        output_text = response["output"]["message"]["content"][0]["text"]
+        with urlopen(req, timeout=60) as resp:
+            response_data = json.loads(resp.read().decode("utf-8"))
+
+        output_text = response_data["content"][0]["text"]
 
         # Parse JSON from response (handle markdown code blocks)
         output_text = output_text.strip()
@@ -452,13 +493,17 @@ Return ONLY the JSON array, no surrounding text."""
 
         recommendations = json.loads(output_text)
         if not isinstance(recommendations, list):
-            logger.error("Bedrock response was not a JSON array")
+            logger.error("Anthropic response was not a JSON array")
             return []
 
         return recommendations[:10]  # Cap at 10
 
+    except HTTPError as e:
+        error_body = e.read().decode("utf-8") if e.fp else ""
+        logger.error(f"Anthropic API error ({e.code}): {error_body}")
+        return []
     except Exception as e:
-        logger.error(f"Bedrock analysis failed: {e}", exc_info=True)
+        logger.error(f"Anthropic analysis failed: {e}", exc_info=True)
         return []
 
 
