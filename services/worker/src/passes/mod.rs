@@ -800,7 +800,7 @@ async fn run_passes(
         format!("coderhelm/{}", msg.ticket_id.to_lowercase())
     };
 
-    let _impl_result = if can_skip_implement {
+    let impl_result = if can_skip_implement {
         // Resume: reconstruct impl_result from the existing branch diff
         info!(run_id, branch = %branch_name, "Checkpoint resume: skipping implement pass");
         update_pass(state, &msg.team_id, run_id, "implement").await?;
@@ -1338,6 +1338,7 @@ async fn run_passes(
             );
 
             if let Some(mut mem) = agent_memory {
+                // Multi-repo: conversation logs are per-repo, skip extraction here
                 if let Err(e) = mem.close_and_upload(state).await {
                     warn!(run_id, error = %e, "Failed to persist agent memory");
                 }
@@ -1750,8 +1751,12 @@ async fn run_passes(
         "Run set to awaiting_ci — Lambda returning, webhook will trigger resume"
     );
 
-    // Persist agent memory (without storing useless run summaries)
+    // Persist agent memory (extract learnings first)
     if let Some(mut mem) = agent_memory {
+        mem.extract_learnings_from_conversation(
+            &impl_result.conversation_log,
+            provider.api_key(),
+        ).await;
         if let Err(e) = mem.close_and_upload(state).await {
             warn!(run_id, error = %e, "Failed to persist agent memory");
         }

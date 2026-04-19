@@ -204,6 +204,150 @@ impl AgentMemory {
         .await;
     }
 
+    /// Extract and store learnings from a conversation log using a lightweight LLM call.
+    /// Extracts code style preferences, patterns, anti-patterns, and corrections.
+    /// Uses Haiku for speed/cost; called once at end of a successful run.
+    pub async fn extract_learnings_from_conversation(
+        &mut self,
+        conversation_json: &[serde_json::Value],
+        api_key: &str,
+    ) {
+        if conversation_json.is_empty() || api_key.is_empty() {
+            return;
+        }
+
+        // Build a compact summary of the conversation (tool results + assistant text)
+        let mut summary = String::new();
+        let max_summary = 12_000; // keep extraction prompt small
+        for turn in conversation_json {
+            if summary.len() > max_summary {
+                break;
+            }
+            let role = turn["role"].as_str().unwrap_or("");
+            if role == "assistant" {
+                // Extract text blocks from assistant
+                if let Some(content) = turn["content"].as_array() {
+                    for block in content {
+                        if block["type"].as_str() == Some("text") {
+                            if let Some(text) = block["text"].as_str() {
+                                let truncated = if text.len() > 500 { &text[..500] } else { text };
+                                summary.push_str(&format!("[Assistant]: {truncated}\n"));
+                            }
+                        }
+                        if block["type"].as_str() == Some("tool_use") {
+                            let name = block["name"].as_str().unwrap_or("?");
+                            summary.push_str(&format!("[Tool call: {name}]\n"));
+                        }
+                    }
+                }
+            }
+        }
+
+        if summary.len() < 200 {
+            return; // too little content to extract from
+        }
+
+        let extraction_prompt = format!(
+            "Analyze this AI coding agent conversation and extract ONLY genuinely useful learnings about this repository. \
+             Output a JSON array of objects with \"type\" and \"content\" fields.\n\n\
+             Types:\n\
+             - \"style\": Code style preferences (naming conventions, formatting, patterns used)\n\
+             - \"architecture\": Architecture patterns (how modules are organized, key abstractions)\n\
+             - \"procedure\": Build/test/deploy procedures discovered\n\
+             - \"anti_pattern\": Things that went wrong or should be avoided\n\
+             - \"correction\": Wrong assumptions that were corrected during the conversation\n\n\
+             Rules:\n\
+             - Only extract SPECIFIC, ACTIONABLE learnings (not vague observations)\n\
+             - Each learning must be useful for future runs on this same repo\n\
+             - Max 5 learnings. Quality over quantity. Return [] if nothing worth remembering.\n\
+             - Content should be concise (1-2 sentences max)\n\n\
+             Conversation:\n{summary}\n\n\
+             JSON array:"
+        );
+
+        let client = reqwest::Client::new();
+        let resp = match client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "model": "claude-haiku-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": extraction_prompt}],
+            }))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "Memory extraction API call failed");
+                return;
+            }
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "Failed to parse memory extraction response");
+                return;
+            }
+        };
+
+        let text = body["content"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|b| b["text"].as_str())
+            .unwrap_or("");
+
+        // Parse the JSON array from the response (handle markdown fences)
+        let clean = text
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        let learnings: Vec<serde_json::Value> = match serde_json::from_str(clean) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, raw = %clean, "Failed to parse extraction JSON");
+                return;
+            }
+        };
+
+        let repo_tag = format!("repo:{}/{}", self.repo_owner, self.repo_name);
+        let mut stored = 0;
+        for learning in learnings.iter().take(5) {
+            let ltype = learning["type"].as_str().unwrap_or("semantic");
+            let content = match learning["content"].as_str() {
+                Some(c) if !c.is_empty() => c,
+                _ => continue,
+            };
+
+            let (memory_type, tag) = match ltype {
+                "style" => (MemoryType::Semantic, "code-style"),
+                "architecture" => (MemoryType::Semantic, "architecture"),
+                "procedure" => (MemoryType::Procedural, "procedure"),
+                "anti_pattern" => (MemoryType::AntiPattern, "anti-pattern"),
+                "correction" => (MemoryType::Correction, "correction"),
+                _ => (MemoryType::Semantic, "learned"),
+            };
+
+            self.store_learning(
+                content,
+                memory_type,
+                vec![tag.to_string(), repo_tag.clone()],
+            )
+            .await;
+            stored += 1;
+        }
+
+        if stored > 0 {
+            info!(count = stored, "Extracted and stored learnings from conversation");
+        }
+    }
+
     /// Flush, close, upload to S3, and release the lock.
     pub async fn close_and_upload(
         mut self,
