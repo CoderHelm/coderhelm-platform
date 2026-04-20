@@ -3302,8 +3302,8 @@ async fn load_checkpoint(
 
 /// Build the progress comment body for the GitHub issue.
 fn format_progress(current_phase: &str, run_id: &str) -> String {
-    let phases = ["triage", "plan", "implement", "review", "pr"];
-    let labels = ["Triage", "Plan", "Implement", "Review", "PR"];
+    let phases = ["triage", "plan", "implement", "test", "security", "pr"];
+    let labels = ["Triage", "Plan", "Implement", "Test", "Security", "PR"];
     let current_idx = phases.iter().position(|p| *p == current_phase);
 
     let mut rows = String::new();
