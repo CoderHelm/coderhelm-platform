@@ -50,18 +50,13 @@ pub async fn run(
             text.push('\n');
             text.push_str(&c.body);
         }
-        text.to_lowercase()
+        text
     };
 
-    if detect_wrong_repo_signal(&all_text) {
-        info!(run_id = %msg.run_id, "Detected wrong-repo signal in review");
-        let target_repo = extract_target_repo(&all_text, state, &msg).await;
-        if let Some(target) = target_repo {
-            return handle_wrong_repo(state, &github, &msg, &target).await;
-        }
-        // Couldn't determine target repo — fall through to normal feedback
-        // (the agent will reply asking which repo)
-        warn!(run_id = %msg.run_id, "Wrong-repo signal detected but couldn't determine target repo");
+    let team_repos = plan::fetch_team_repos(state, &msg.team_id).await;
+    if let Some(target) = detect_wrong_repo(&all_text, &team_repos, &msg, state).await {
+        info!(run_id = %msg.run_id, target = %target, "LLM confirmed wrong-repo signal");
+        return handle_wrong_repo(state, &github, &msg, &target).await;
     }
 
     // Filter out comments the bot already replied to
@@ -848,41 +843,74 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
     }
 }
 
-/// Detect if any review comment signals "wrong repo".
-fn detect_wrong_repo_signal(text: &str) -> bool {
-    let signals = [
-        "wrong repo",
-        "wrong repository",
-        "different repo",
-        "should be in",
-        "belongs in",
-        "move to",
-        "move this to",
-        "this should go in",
-        "not the right repo",
-        "incorrect repo",
-        "incorrect repository",
-    ];
-    signals.iter().any(|s| text.contains(s))
-}
-
-/// Try to extract the target repo from the review text by matching against the team's enabled repos.
-async fn extract_target_repo(
+/// Use the light model to determine if review comments indicate "wrong repo" and extract target.
+/// Returns Some(target_repo) if confirmed, None otherwise.
+async fn detect_wrong_repo(
     text: &str,
-    state: &WorkerState,
+    team_repos: &[String],
     msg: &FeedbackMessage,
+    state: &WorkerState,
 ) -> Option<String> {
-    let repos = plan::fetch_team_repos(state, &msg.team_id).await;
+    // Quick pre-filter: if none of the other repo names appear in the text, skip the LLM call
     let current = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let other_repos: Vec<&String> = team_repos.iter().filter(|r| *r != &current).collect();
+    let has_repo_mention = other_repos.iter().any(|r| {
+        let short = r.split('/').nth(1).unwrap_or(r);
+        text.to_lowercase().contains(&short.to_lowercase())
+    });
+    if !has_repo_mention {
+        return None;
+    }
 
-    // Try matching repo names (full or short) mentioned in the text
-    for repo in &repos {
-        if repo == &current {
-            continue;
+    let repo_list = other_repos
+        .iter()
+        .map(|r| r.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let provider = ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+    )
+    .await
+    .ok()?;
+
+    let system = "You classify PR review comments. Respond with ONLY one line: either \
+                  `WRONG_REPO: owner/repo` if the reviewer is explicitly requesting this PR be moved \
+                  to a different repository, or `NO` if it's normal code review feedback. \
+                  Only output WRONG_REPO if the reviewer clearly states this work belongs in another repo.";
+
+    let prompt = format!(
+        "Current repo: {current}\nAvailable repos: {repo_list}\n\nReview text:\n{text}"
+    );
+
+    let mut usage = TokenUsage::default();
+    let model_id = provider.primary_model_id();
+    let response = provider::converse_simple(
+        state,
+        &provider,
+        model_id,
+        system,
+        &prompt,
+        &mut usage,
+    )
+    .await
+    .ok()?;
+
+    let trimmed = response.trim();
+    if let Some(repo) = trimmed.strip_prefix("WRONG_REPO:") {
+        let candidate = repo.trim().to_string();
+        // Validate it's in the team's repos
+        if team_repos.contains(&candidate) {
+            return Some(candidate);
         }
-        let short_name = repo.split('/').nth(1).unwrap_or(repo);
-        if text.contains(&short_name.to_lowercase()) {
-            return Some(repo.clone());
+        // Try fuzzy match (short name)
+        let short = candidate.split('/').last().unwrap_or(&candidate);
+        for r in team_repos {
+            if r != &current && r.split('/').nth(1).unwrap_or(r).eq_ignore_ascii_case(short) {
+                return Some(r.clone());
+            }
         }
     }
     None
