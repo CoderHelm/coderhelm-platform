@@ -898,19 +898,19 @@ async fn detect_wrong_repo(
     .await
     .ok()?;
 
-    let trimmed = response.trim();
-    if let Some(repo) = trimmed.strip_prefix("WRONG_REPO:") {
-        let candidate = repo.trim().to_string();
-        // Validate it's in the team's repos
-        if team_repos.contains(&candidate) {
-            return Some(candidate);
+    let response_lower = response.to_lowercase();
+    if !response_lower.contains("wrong_repo") {
+        return None;
+    }
+
+    // LLM confirmed wrong repo — find which repo it mentioned
+    for r in team_repos {
+        if r == &current {
+            continue;
         }
-        // Try fuzzy match (short name)
-        let short = candidate.split('/').last().unwrap_or(&candidate);
-        for r in team_repos {
-            if r != &current && r.split('/').nth(1).unwrap_or(r).eq_ignore_ascii_case(short) {
-                return Some(r.clone());
-            }
+        let short = r.split('/').nth(1).unwrap_or(r);
+        if response_lower.contains(&short.to_lowercase()) || response.contains(r.as_str()) {
+            return Some(r.clone());
         }
     }
     None
