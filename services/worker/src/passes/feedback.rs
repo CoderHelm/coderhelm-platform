@@ -97,6 +97,19 @@ pub async fn run(
 
     let formatted = format_review_comments(&msg.review_body, &comments);
 
+    // On re-review (review_id == 0), check CI status and include failures in the prompt
+    let ci_failure_block = if msg.review_id == 0 {
+        match fetch_ci_failures(&github, &msg, &get_pr_branch(state, &msg).await.unwrap_or_default()).await {
+            Some(logs) => format!(
+                "\n## CI Failures\nThe following CI checks are failing. Fix these issues as well:\n\n```\n{}\n```\n",
+                if logs.len() > 12000 { format!("... (truncated)\n{}", &logs[logs.len() - 12000..]) } else { logs }
+            ),
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
     // Load voice instructions (repo-specific falls back to global)
     let voice = {
         let repo_voice = super::load_content(
@@ -133,11 +146,13 @@ pub async fn run(
 
 ## Review Comments
 {comments}
-
+{ci_failures}
 ## Instructions
 For each comment:
 - **Question** — read the relevant code, answer concisely
 - **Change request** — fix the code with write_file/batch_write, then confirm (e.g. "Done — added error handling.")
+
+If there are CI failures listed above, also fix those — read the failing files, diagnose the issue, and commit a fix.
 
 Context messages prefixed with `[username]:` are for background only — reply only to the reviewer's latest comment in each thread.
 
@@ -151,6 +166,7 @@ Rules:
 - Keep replies short (1-3 sentences for confirmations)"#,
         pr_number = msg.pr_number,
         comments = formatted,
+        ci_failures = ci_failure_block,
     );
 
     // Determine the PR branch — we'll use the run's known branch
@@ -1104,4 +1120,62 @@ async fn handle_wrong_repo(
     );
 
     Ok(())
+}
+
+/// Check CI status for a PR branch. Returns Some(logs) if there are failures, None if CI is green or absent.
+async fn fetch_ci_failures(
+    github: &GitHubClient,
+    msg: &FeedbackMessage,
+    branch: &str,
+) -> Option<String> {
+    if branch.is_empty() {
+        return None;
+    }
+
+    let checks = github
+        .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, branch)
+        .await
+        .ok()?;
+
+    let check_runs = checks["check_runs"].as_array()?;
+    let failed: Vec<&serde_json::Value> = check_runs
+        .iter()
+        .filter(|r| {
+            let conclusion = r["conclusion"].as_str().unwrap_or("");
+            conclusion == "failure" || conclusion == "timed_out"
+        })
+        .collect();
+
+    if failed.is_empty() {
+        return None;
+    }
+
+    // Try to get workflow run logs for the first failed check
+    let workflow_run_id = failed
+        .iter()
+        .filter_map(|r| {
+            r["details_url"]
+                .as_str()
+                .and_then(|u| u.split("/runs/").nth(1))
+                .and_then(|s| s.split('/').next())
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .next()
+        .unwrap_or(0);
+
+    if workflow_run_id > 0 {
+        if let Ok(logs) = github
+            .get_workflow_run_logs(&msg.repo_owner, &msg.repo_name, workflow_run_id)
+            .await
+        {
+            return Some(logs);
+        }
+    }
+
+    // Fallback: just list the failed check names
+    let names: Vec<&str> = failed
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    Some(format!("Failed checks: {}", names.join(", ")))
 }
