@@ -90,7 +90,7 @@ Output format:
         &executor,
         usage,
         llm::ConverseOptions {
-            max_turns: 10,
+            max_turns: 20,
             max_tokens: 4096,
         },
         None,
