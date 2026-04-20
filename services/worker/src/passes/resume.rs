@@ -148,7 +148,7 @@ pub async fn run(
         if any_in_progress {
             // CI still running — send another delayed resume to check again later
             info!(run_id = msg.run_id, "CI still in progress — scheduling re-check");
-            send_delayed_resume(state, &msg, 300).await;
+            send_delayed_resume(state, &msg, 120).await;
             return Ok(());
         }
 
@@ -466,7 +466,7 @@ pub async fn run(
         .await?;
 
         // Schedule a safety-net resume in case the CI webhook is missed
-        send_delayed_resume(state, &msg, 300).await;
+        send_delayed_resume(state, &msg, 120).await;
 
         info!(
             run_id = msg.run_id,
@@ -628,7 +628,7 @@ pub async fn run(
             .await?;
 
             // Schedule a safety-net resume in case the CI webhook is missed
-            send_delayed_resume(state, &msg, 300).await;
+            send_delayed_resume(state, &msg, 120).await;
         }
     }
 

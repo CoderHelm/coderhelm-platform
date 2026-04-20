@@ -1444,7 +1444,7 @@ async fn run_passes(
                     .send_message()
                     .queue_url(&state.config.ci_fix_queue_url)
                     .message_body(resume_body.to_string())
-                    .delay_seconds(300)
+                    .delay_seconds(120)
                     .send()
                     .await;
             }
@@ -1875,7 +1875,7 @@ async fn run_passes(
             .send_message()
             .queue_url(&state.config.ci_fix_queue_url)
             .message_body(resume_body.to_string())
-            .delay_seconds(300)
+            .delay_seconds(120)
             .send()
             .await;
     }
