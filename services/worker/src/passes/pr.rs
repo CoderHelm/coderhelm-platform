@@ -159,35 +159,37 @@ Return ONLY the markdown body text."#,
         title.push_str("...");
     }
 
-    // Create draft PR — CI triggers on PR creation, and we'll mark it ready after tests/review pass
-    let pr_data = github
-        .create_pull_request(
-            &msg.repo_owner,
-            &msg.repo_name,
-            &title,
-            &full_body,
-            branch,
-            &msg.base_branch,
-            true,
-        )
+    // Check if a PR already exists for this branch (e.g. from a re-run or retry)
+    let existing_pr = github
+        .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, branch)
         .await?;
 
-    let pr_number = pr_data
-        .get("number")
-        .and_then(|v| v.as_u64())
-        .ok_or("Missing PR number")?;
-    let pr_url = pr_data
-        .get("html_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let node_id = pr_data
-        .get("node_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let (pr_number, pr_url, node_id) = if let Some(pr_data) = existing_pr {
+        let number = pr_data.get("number").and_then(|v| v.as_u64()).ok_or("Missing PR number")?;
+        let url = pr_data.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let nid = pr_data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        info!(pr_number = number, pr_url = %url, "Using existing PR");
+        (number, url, nid)
+    } else {
+        // Create draft PR — CI triggers on PR creation, and we'll mark it ready after tests/review pass
+        let pr_data = github
+            .create_pull_request(
+                &msg.repo_owner,
+                &msg.repo_name,
+                &title,
+                &full_body,
+                branch,
+                &msg.base_branch,
+                true,
+            )
+            .await?;
 
-    info!(pr_number, pr_url = %pr_url, "PR created");
+        let number = pr_data.get("number").and_then(|v| v.as_u64()).ok_or("Missing PR number")?;
+        let url = pr_data.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let nid = pr_data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        info!(pr_number = number, pr_url = %url, "PR created");
+        (number, url, nid)
+    };
 
     Ok(PrResult {
         pr_number,
