@@ -699,13 +699,14 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
 
                 // Fetch current file content
                 let cache_key = format!("{}:{}", self.branch, path);
-                let mut content = if let Some(cached) = self.file_cache.get(&cache_key).await {
+                let original_content = if let Some(cached) = self.file_cache.get(&cache_key).await {
                     cached
                 } else {
                     self.github
                         .read_file(&self.owner, &self.repo, path, &self.branch)
                         .await?
                 };
+                let mut content = original_content.clone();
 
                 // Apply edits sequentially
                 let mut applied = 0;
@@ -730,6 +731,14 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
 
                 if applied == 0 {
                     return Ok(json!(format!("No edits applied to {path}: {}", errors.join("; "))));
+                }
+
+                // Guardrail: reject edits that break brace balance or delete too much
+                if let Some(problem) = validate_edit_safety(&original_content, &content, path) {
+                    return Ok(json!(format!(
+                        "Edit REJECTED for {path}: {problem}. \
+                         Read the file again and retry with a smaller, more precise edit."
+                    )));
                 }
 
                 // Write the modified file back
@@ -920,4 +929,71 @@ fn extract_file_paths(tasks: &str) -> Vec<String> {
         }
     }
     paths
+}
+
+/// Validates that an edit didn't break brace balance or delete too much code.
+/// Returns `Some(reason)` if the edit should be rejected, `None` if it's safe.
+fn validate_edit_safety(original: &str, edited: &str, path: &str) -> Option<String> {
+    // Only validate code files (JS/TS/JSX/TSX/Java/Kotlin/Rust/Go/C/C++)
+    let code_ext = [
+        ".ts", ".tsx", ".js", ".jsx", ".java", ".kt", ".rs", ".go", ".c", ".cpp", ".cs",
+        ".swift", ".dart", ".rb", ".py",
+    ];
+    if !code_ext.iter().any(|ext| path.ends_with(ext)) {
+        return None;
+    }
+
+    fn brace_balance(s: &str) -> (i32, i32, i32) {
+        let mut curly = 0i32;
+        let mut round = 0i32;
+        let mut square = 0i32;
+        for ch in s.chars() {
+            match ch {
+                '{' => curly += 1,
+                '}' => curly -= 1,
+                '(' => round += 1,
+                ')' => round -= 1,
+                '[' => square += 1,
+                ']' => square -= 1,
+                _ => {}
+            }
+        }
+        (curly, round, square)
+    }
+
+    let (oc, or_, os) = brace_balance(original);
+    let (ec, er, es) = brace_balance(edited);
+
+    // If original was balanced (or close) and edit broke it significantly, reject
+    if (ec - oc).abs() >= 2 {
+        return Some(format!(
+            "curly brace balance changed by {} (was {oc}, now {ec}) — likely missing closing braces",
+            ec - oc
+        ));
+    }
+    if (er - or_).abs() >= 3 {
+        return Some(format!(
+            "parenthesis balance changed by {} — likely missing closing parens",
+            er - or_
+        ));
+    }
+    if (es - os).abs() >= 3 {
+        return Some(format!(
+            "bracket balance changed by {} — likely missing closing brackets",
+            es - os
+        ));
+    }
+
+    // Net deletion guard: if edit removes more than 40% of lines, reject
+    let orig_lines = original.lines().count();
+    let edit_lines = edited.lines().count();
+    if orig_lines > 20 && edit_lines < orig_lines * 60 / 100 {
+        return Some(format!(
+            "edit would delete {:.0}% of the file ({orig_lines} → {edit_lines} lines) — \
+             use smaller, targeted edits instead",
+            (1.0 - edit_lines as f64 / orig_lines as f64) * 100.0
+        ));
+    }
+
+    None
 }
