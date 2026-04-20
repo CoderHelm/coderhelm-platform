@@ -90,6 +90,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - Use `edit_file` for modifying existing files (search/replace). Only use `write_file` for new files.
 - You should need 2-5 tool calls total.
 - Only implement the listed tasks. Do not add extras.
+- NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
 - After implementing, output a one-line summary."#,
             number = msg.issue_number,
             title = msg.title,
@@ -110,6 +111,8 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - Validate your changes against the Acceptance Criteria.
 - Use `batch_write` for atomic multi-file changes (new files or when edit_file won't work).
 - Follow existing code patterns exactly (imports, naming, structure, test style).
+- NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
+- NEVER delete existing functions, methods, or logic unless the task explicitly requires removing them. Modify code, don't gut it.
 - After implementing all tasks, output a summary.
 - Only implement the listed tasks. Do not add extras."#,
             number = msg.issue_number,

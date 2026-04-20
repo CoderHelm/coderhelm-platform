@@ -52,6 +52,8 @@ Use the `get_diff` tool to see all changes compared to main. Then review for:
 5. **Correctness** — Any logic errors, null checks, off-by-one, missing error handling, typos?
 6. **Convention compliance** — Does it follow the repo's patterns (naming, imports, structure)?
 7. **Must-rules** — If must-rules are listed in the system prompt, verify every rule is respected.
+8. **No placeholders** — Flag any TODO, FIXME, REPLACE_ME, stub implementations, or incomplete code left behind.
+9. **No destructive deletions** — If large blocks of existing code were REMOVED without being replaced by equivalent functionality, flag it. The agent should modify code, not gut it.
 
 If you find issues, start with "ISSUES_FOUND:" followed by a list with file path, problem, and suggested fix.
 If everything looks good, start with "LGTM" followed by a brief summary."#,

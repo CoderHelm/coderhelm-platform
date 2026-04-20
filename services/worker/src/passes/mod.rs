@@ -1431,6 +1431,24 @@ async fn run_passes(
                 "Multi-repo run set to awaiting_ci"
             );
 
+            // Schedule a safety-net resume
+            if !state.config.ci_fix_queue_url.is_empty() {
+                let resume_body = serde_json::json!({
+                    "type": "resume",
+                    "team_id": msg.team_id,
+                    "run_id": run_id,
+                    "installation_id": msg.installation_id,
+                });
+                let _ = state
+                    .sqs
+                    .send_message()
+                    .queue_url(&state.config.ci_fix_queue_url)
+                    .message_body(resume_body.to_string())
+                    .delay_seconds(300)
+                    .send()
+                    .await;
+            }
+
             if let Some(mem) = agent_memory {
                 if let Err(e) = mem.close_and_upload(state).await {
                     warn!(run_id, error = %e, "Failed to persist agent memory");
@@ -1843,6 +1861,24 @@ async fn run_passes(
         pr_number = pr_result.pr_number,
         "Run set to awaiting_ci — Lambda returning, webhook will trigger resume"
     );
+
+    // Schedule a safety-net resume in case CI webhook is missed or repo has no CI
+    if !state.config.ci_fix_queue_url.is_empty() {
+        let resume_body = serde_json::json!({
+            "type": "resume",
+            "team_id": msg.team_id,
+            "run_id": run_id,
+            "installation_id": msg.installation_id,
+        });
+        let _ = state
+            .sqs
+            .send_message()
+            .queue_url(&state.config.ci_fix_queue_url)
+            .message_body(resume_body.to_string())
+            .delay_seconds(300)
+            .send()
+            .await;
+    }
 
     // Persist agent memory (extract learnings first)
     if let Some(mut mem) = agent_memory {

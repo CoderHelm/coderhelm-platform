@@ -21,6 +21,7 @@ aws-sdk-bedrockruntime = "1"
 aws-sdk-secretsmanager = "1"
 aws-sdk-sesv2 = "1"
 aws-sdk-lambda = "1"
+aws-sdk-sqs = "1"
 aws-smithy-types = "1"
 
 # HTTP client (GitHub API, Jira API)

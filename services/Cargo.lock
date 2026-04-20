@@ -4488,6 +4488,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-sdk-secretsmanager",
  "aws-sdk-sesv2",
+ "aws-sdk-sqs",
  "aws-smithy-types",
  "aws_lambda_events",
  "base64",

@@ -88,6 +88,7 @@ export class WorkerStack extends cdk.Stack {
         LIGHT_MODEL_ID: process.env.LIGHT_MODEL_ID || "claude-sonnet-4-20250514",
         SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
+        CI_FIX_QUEUE_URL: props.ciFixQueue.queueUrl,
         RUST_LOG: "info",
       },
     });
@@ -154,6 +155,9 @@ export class WorkerStack extends cdk.Stack {
         maxConcurrency: 5,
       })
     );
+
+    // Worker needs to send delayed resume messages back to ci-fix queue
+    props.ciFixQueue.grantSendMessages(this.workerFunction);
 
     this.workerFunction.addEventSource(
       new eventsources.SqsEventSource(props.feedbackQueue, {

@@ -53,6 +53,16 @@ pub async fn run(
 
     // Only resume runs that are awaiting_ci
     if status != "awaiting_ci" {
+        if status == "running" {
+            // Run is still being processed by another invocation.
+            // Return error so SQS retries after visibility timeout.
+            warn!(
+                run_id = msg.run_id,
+                status,
+                "Run is currently running — will retry after visibility timeout"
+            );
+            return Err("Run is running, retry later".into());
+        }
         info!(
             run_id = msg.run_id,
             status,
@@ -71,7 +81,112 @@ pub async fn run(
         }
     };
     if events.is_empty() {
-        info!(run_id = msg.run_id, "No unprocessed events, nothing to do");
+        // No events — webhook may have been missed or repo has no CI.
+        // Check GitHub PR check status directly.
+        info!(run_id = msg.run_id, "No unprocessed events — checking GitHub PR status");
+
+        let repo_owner = run_record
+            .get("repo")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|r| r.split('/').next())
+            .unwrap_or("")
+            .to_string();
+        let repo_name = run_record
+            .get("repo")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|r| r.split('/').nth(1))
+            .unwrap_or("")
+            .to_string();
+        let branch = run_record
+            .get("branch")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default();
+        let pr_number = run_record
+            .get("pr_number")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        if repo_owner.is_empty() || repo_name.is_empty() || branch.is_empty() {
+            info!(run_id = msg.run_id, "Missing repo/branch info, can't check CI");
+            return Ok(());
+        }
+
+        let github = GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            msg.installation_id,
+            &state.http,
+        )?;
+
+        let checks = github
+            .list_check_runs_for_ref(&repo_owner, &repo_name, &branch)
+            .await
+            .unwrap_or(serde_json::json!({"total_count": 0, "check_runs": []}));
+
+        let check_runs: Option<&Vec<Value>> = checks["check_runs"].as_array();
+        let total = checks["total_count"].as_u64().unwrap_or(0);
+
+        if total == 0 {
+            // No CI workflows at all — mark PR ready and complete
+            info!(run_id = msg.run_id, "No CI checks found — marking PR ready and completing");
+            mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+            set_run_complete(state, &msg.team_id, &msg.run_id).await;
+            return Ok(());
+        }
+
+        let any_in_progress = check_runs
+            .map(|runs: &Vec<Value>| {
+                runs.iter().any(|r| {
+                    let status = r["status"].as_str().unwrap_or("");
+                    status == "in_progress" || status == "queued"
+                })
+            })
+            .unwrap_or(false);
+
+        if any_in_progress {
+            // CI still running — send another delayed resume to check again later
+            info!(run_id = msg.run_id, "CI still in progress — scheduling re-check");
+            send_delayed_resume(state, &msg, 300).await;
+            return Ok(());
+        }
+
+        let any_failed = check_runs
+            .map(|runs: &Vec<Value>| {
+                runs.iter().any(|r| {
+                    let conclusion = r["conclusion"].as_str().unwrap_or("");
+                    conclusion == "failure" || conclusion == "timed_out"
+                })
+            })
+            .unwrap_or(false);
+
+        if any_failed {
+            // CI failed but webhook was missed — write a synthetic ci_failed event and re-trigger
+            info!(run_id = msg.run_id, "CI failed (missed webhook) — writing event and re-triggering");
+            let now = chrono::Utc::now();
+            let event_sk = format!("EVENT#{}#ci_failed", now.format("%Y%m%dT%H%M%S%.3fZ"));
+            let _ = state
+                .dynamo
+                .put_item()
+                .table_name(&state.config.events_table_name)
+                .item("pk", attr_s(&format!("RUN#{}", msg.run_id)))
+                .item("sk", attr_s(&event_sk))
+                .item("event_type", attr_s("ci_failed"))
+                .item("payload", attr_s("{}"))
+                .item("processed", AttributeValue::Bool(false))
+                .item("created_at", attr_s(&now.to_rfc3339()))
+                .send()
+                .await;
+            // Re-send resume immediately to process the new event
+            send_delayed_resume(state, &msg, 0).await;
+            return Ok(());
+        }
+
+        // All checks passed but webhook was missed — mark ready and complete
+        info!(run_id = msg.run_id, "CI passed (missed webhook) — marking PR ready and completing");
+        mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+        set_run_complete(state, &msg.team_id, &msg.run_id).await;
         return Ok(());
     }
 
@@ -350,6 +465,9 @@ pub async fn run(
         )
         .await?;
 
+        // Schedule a safety-net resume in case the CI webhook is missed
+        send_delayed_resume(state, &msg, 300).await;
+
         info!(
             run_id = msg.run_id,
             "Fix pushed, back to awaiting_ci for next CI run"
@@ -508,6 +626,9 @@ pub async fn run(
                 start.elapsed().as_secs(),
             )
             .await?;
+
+            // Schedule a safety-net resume in case the CI webhook is missed
+            send_delayed_resume(state, &msg, 300).await;
         }
     }
 
@@ -822,4 +943,51 @@ async fn complete_run_with_status(
 
     info!(run_id, status, "Run completed");
     Ok(())
+}
+
+/// Send a delayed resume message to the CI fix queue.
+/// `delay_seconds` can be 0 (immediate) or up to 900 (15 min, SQS max).
+async fn send_delayed_resume(state: &WorkerState, msg: &ResumeMessage, delay_seconds: i32) {
+    if state.config.ci_fix_queue_url.is_empty() {
+        warn!("CI_FIX_QUEUE_URL not configured — cannot send delayed resume");
+        return;
+    }
+    let body = serde_json::json!({
+        "type": "resume",
+        "team_id": msg.team_id,
+        "run_id": msg.run_id,
+        "installation_id": msg.installation_id,
+    });
+    match state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ci_fix_queue_url)
+        .message_body(body.to_string())
+        .delay_seconds(delay_seconds)
+        .send()
+        .await
+    {
+        Ok(_) => info!(run_id = msg.run_id, delay_seconds, "Delayed resume scheduled"),
+        Err(e) => error!(run_id = msg.run_id, error = %e, "Failed to send delayed resume"),
+    }
+}
+
+/// Mark a run as completed (success) without needing full token usage context.
+async fn set_run_complete(state: &WorkerState, team_id: &str, run_id: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET #s = :s, updated_at = :t, current_pass = :cp, status_run_id = :sri")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", attr_s("success"))
+        .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":cp", attr_s("done"))
+        .expression_attribute_values(":sri", attr_s(&format!("success#{run_id}")))
+        .send()
+        .await;
+    info!(run_id, "Run marked complete (no CI / CI passed)");
 }
