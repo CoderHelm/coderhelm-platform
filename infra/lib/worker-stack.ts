@@ -60,7 +60,7 @@ export class WorkerStack extends cdk.Stack {
       architecture: lambda.Architecture.ARM_64,
       handler: "bootstrap",
       code: lambda.Code.fromAsset(workerAssetPath),
-      memorySize: 512,
+      memorySize: 1024,
       timeout: cdk.Duration.minutes(15),
       ephemeralStorageSize: cdk.Size.mebibytes(1024),
       logGroup: workerLogGroup,

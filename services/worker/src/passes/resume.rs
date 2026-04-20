@@ -54,22 +54,57 @@ pub async fn run(
     // Only resume runs that are awaiting_ci
     if status != "awaiting_ci" {
         if status == "running" {
-            // Run is still being processed by another invocation.
-            // Re-queue with a delay so we check again shortly.
-            warn!(
+            // Check if the run is stale (running but no progress for > 10 min)
+            let updated_at = run_record
+                .get("updated_at")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+            let stale = updated_at
+                .map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds() > 600)
+                .unwrap_or(false);
+
+            if stale {
+                warn!(
+                    run_id = msg.run_id,
+                    "Run stuck in running state for >10min — force-resetting to awaiting_ci"
+                );
+                let _ = state
+                    .dynamo
+                    .update_item()
+                    .table_name(&state.config.runs_table_name)
+                    .key("team_id", attr_s(&msg.team_id))
+                    .key("run_id", attr_s(&msg.run_id))
+                    .update_expression("SET #s = :s, current_pass = :cp, status_run_id = :sri")
+                    .expression_attribute_names("#s", "status")
+                    .expression_attribute_values(":s", attr_s("awaiting_ci"))
+                    .expression_attribute_values(":cp", attr_s("awaiting_ci"))
+                    .expression_attribute_values(
+                        ":sri",
+                        attr_s(&format!("awaiting_ci#{}", msg.run_id)),
+                    )
+                    .send()
+                    .await
+                    .ok();
+                // Fall through to normal resume logic below
+            } else {
+                // Run is still being processed by another invocation.
+                // Re-queue with a delay so we check again shortly.
+                warn!(
+                    run_id = msg.run_id,
+                    status,
+                    "Run is currently running — re-queuing with 30s delay"
+                );
+                send_delayed_resume(state, &msg, 30).await;
+                return Ok(());
+            }
+        } else {
+            info!(
                 run_id = msg.run_id,
                 status,
-                "Run is currently running — re-queuing with 30s delay"
+                "Run not in awaiting_ci status, skipping resume"
             );
-            send_delayed_resume(state, &msg, 30).await;
             return Ok(());
         }
-        info!(
-            run_id = msg.run_id,
-            status,
-            "Run not in awaiting_ci status, skipping resume"
-        );
-        return Ok(());
     }
 
     // Load all unprocessed events
