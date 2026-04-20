@@ -1,11 +1,12 @@
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::agent::provider;
 use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
-use crate::models::{FeedbackMessage, ReviewComment, TokenUsage};
+use crate::models::{FeedbackMessage, ReviewComment, TicketSource, TokenUsage, WorkerMessage};
+use crate::passes::plan;
 use crate::WorkerState;
 
 pub async fn run(
@@ -40,6 +41,28 @@ pub async fn run(
     } else {
         msg.comments.clone()
     };
+
+    // Check for "wrong repo" signal before processing normal feedback.
+    // Combine review body + all comment bodies to detect the signal.
+    let all_text = {
+        let mut text = msg.review_body.clone();
+        for c in &comments {
+            text.push('\n');
+            text.push_str(&c.body);
+        }
+        text.to_lowercase()
+    };
+
+    if detect_wrong_repo_signal(&all_text) {
+        info!(run_id = %msg.run_id, "Detected wrong-repo signal in review");
+        let target_repo = extract_target_repo(&all_text, state, &msg).await;
+        if let Some(target) = target_repo {
+            return handle_wrong_repo(state, &github, &msg, &target).await;
+        }
+        // Couldn't determine target repo — fall through to normal feedback
+        // (the agent will reply asking which repo)
+        warn!(run_id = %msg.run_id, "Wrong-repo signal detected but couldn't determine target repo");
+    }
 
     // Filter out comments the bot already replied to
     let comments = filter_unanswered(&github, &msg, comments).await;
@@ -823,4 +846,198 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
             _ => Err(format!("Unknown tool: {name}").into()),
         }
     }
+}
+
+/// Detect if any review comment signals "wrong repo".
+fn detect_wrong_repo_signal(text: &str) -> bool {
+    let signals = [
+        "wrong repo",
+        "wrong repository",
+        "different repo",
+        "should be in",
+        "belongs in",
+        "move to",
+        "move this to",
+        "this should go in",
+        "not the right repo",
+        "incorrect repo",
+        "incorrect repository",
+    ];
+    signals.iter().any(|s| text.contains(s))
+}
+
+/// Try to extract the target repo from the review text by matching against the team's enabled repos.
+async fn extract_target_repo(
+    text: &str,
+    state: &WorkerState,
+    msg: &FeedbackMessage,
+) -> Option<String> {
+    let repos = plan::fetch_team_repos(state, &msg.team_id).await;
+    let current = format!("{}/{}", msg.repo_owner, msg.repo_name);
+
+    // Try matching repo names (full or short) mentioned in the text
+    for repo in &repos {
+        if repo == &current {
+            continue;
+        }
+        let short_name = repo.split('/').nth(1).unwrap_or(repo);
+        if text.contains(&short_name.to_lowercase()) {
+            return Some(repo.clone());
+        }
+    }
+    None
+}
+
+/// Handle wrong-repo: close current PR, comment, and re-trigger in the correct repo.
+async fn handle_wrong_repo(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &FeedbackMessage,
+    target_repo: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (target_owner, target_name) = target_repo.split_once('/').unwrap_or(("", ""));
+    if target_owner.is_empty() || target_name.is_empty() {
+        return Err("Invalid target repo format".into());
+    }
+
+    // Comment on the PR explaining the move
+    let comment = format!(
+        "🔀 Moving this work to `{target_repo}` as requested. This PR will be closed and a new one will be opened in the correct repository."
+    );
+    let _ = github
+        .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &comment)
+        .await;
+
+    // Close the PR
+    if let Err(e) = github
+        .close_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    {
+        warn!(pr_number = msg.pr_number, error = %e, "Failed to close PR during wrong-repo move");
+    }
+
+    // Load the original run record to get ticket info for re-trigger
+    let run_record = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key(
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
+        )
+        .key(
+            "run_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
+        )
+        .send()
+        .await?
+        .item
+        .ok_or("Run record not found")?;
+
+    let title = run_record
+        .get("title")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    let ticket_id = run_record
+        .get("ticket_id")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    let ticket_source = run_record
+        .get("ticket_source")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_else(|| "github".to_string());
+    let issue_number = run_record
+        .get("issue_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let body = run_record
+        .get("issue_body")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+
+    let source = if ticket_source == "jira" {
+        TicketSource::Jira
+    } else {
+        TicketSource::Github
+    };
+
+    // Send new ticket message to re-trigger in the correct repo
+    let ticket_msg = WorkerMessage::Ticket(crate::models::TicketMessage {
+        team_id: msg.team_id.clone(),
+        installation_id: msg.installation_id,
+        source,
+        ticket_id: ticket_id.clone(),
+        title,
+        body,
+        repo_owner: target_owner.to_string(),
+        repo_name: target_name.to_string(),
+        issue_number,
+        sender: String::new(),
+        base_branch: "main".to_string(),
+        image_attachments: vec![],
+    });
+
+    if state.config.ticket_queue_url.is_empty() {
+        warn!("TICKET_QUEUE_URL not configured — cannot re-trigger in new repo");
+        return Ok(());
+    }
+
+    let body_str = serde_json::to_string(&ticket_msg)?;
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(body_str)
+        .send()
+        .await?;
+
+    // Mark old run as completed with a note
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key(
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
+        )
+        .key(
+            "run_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
+        )
+        .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t, error_message = :em")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(
+            ":s",
+            aws_sdk_dynamodb::types::AttributeValue::S("completed".to_string()),
+        )
+        .expression_attribute_values(
+            ":sri",
+            aws_sdk_dynamodb::types::AttributeValue::S(format!("completed#{}", msg.run_id)),
+        )
+        .expression_attribute_values(
+            ":t",
+            aws_sdk_dynamodb::types::AttributeValue::S(now),
+        )
+        .expression_attribute_values(
+            ":em",
+            aws_sdk_dynamodb::types::AttributeValue::S(format!("Moved to {target_repo}")),
+        )
+        .send()
+        .await;
+
+    info!(
+        run_id = %msg.run_id,
+        from = %format!("{}/{}", msg.repo_owner, msg.repo_name),
+        to = %target_repo,
+        ticket_id = %ticket_id,
+        "Wrong-repo: closed PR and re-triggered in correct repo"
+    );
+
+    Ok(())
 }

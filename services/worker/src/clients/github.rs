@@ -625,6 +625,18 @@ impl GitHubClient {
         .await
     }
 
+    /// Close a pull request.
+    pub async fn close_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}");
+        self.patch(&url, &serde_json::json!({"state": "closed"}))
+            .await
+    }
+
     /// Mark a draft PR as ready for review using the GraphQL API.
     /// The REST `PATCH {"draft": false}` does NOT work — GitHub requires the
     /// `markPullRequestAsReady` GraphQL mutation.

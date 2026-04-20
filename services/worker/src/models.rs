@@ -24,6 +24,7 @@ pub struct Config {
     pub ses_template_prefix: String,
     pub mcp_proxy_function_name: String,
     pub ci_fix_queue_url: String,
+    pub ticket_queue_url: String,
 }
 
 impl Config {
@@ -59,6 +60,7 @@ impl Config {
                 .unwrap_or_else(|_| "coderhelm-prod".to_string()),
             mcp_proxy_function_name: std::env::var("MCP_PROXY_FUNCTION_NAME").unwrap_or_default(),
             ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").unwrap_or_default(),
+            ticket_queue_url: std::env::var("TICKET_QUEUE_URL").unwrap_or_default(),
         }
     }
 }

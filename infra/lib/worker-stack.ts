@@ -89,6 +89,7 @@ export class WorkerStack extends cdk.Stack {
         SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
         CI_FIX_QUEUE_URL: props.ciFixQueue.queueUrl,
+        TICKET_QUEUE_URL: props.ticketQueue.queueUrl,
         RUST_LOG: "info",
       },
     });
@@ -158,6 +159,9 @@ export class WorkerStack extends cdk.Stack {
 
     // Worker needs to send delayed resume messages back to ci-fix queue
     props.ciFixQueue.grantSendMessages(this.workerFunction);
+
+    // Worker needs to re-trigger tickets (e.g. wrong-repo re-routing)
+    props.ticketQueue.grantSendMessages(this.workerFunction);
 
     this.workerFunction.addEventSource(
       new eventsources.SqsEventSource(props.feedbackQueue, {
