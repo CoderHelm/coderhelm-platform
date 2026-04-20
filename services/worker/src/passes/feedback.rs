@@ -163,6 +163,7 @@ Rules:
         owner: &msg.repo_owner,
         repo: &msg.repo_name,
         branch: &branch,
+        files_modified: std::sync::Mutex::new(false),
     };
 
     let mut messages = vec![(
@@ -291,6 +292,10 @@ Rules:
         }
     }
 
+    // If feedback committed code changes, set awaiting_ci so we watch for CI results
+    let code_pushed = *executor.files_modified.lock().unwrap();
+    let final_status = if code_pushed { "awaiting_ci" } else { "completed" };
+
     // Update run record in runs table (including status_run_id for GSI)
     let now = chrono::Utc::now().to_rfc3339();
     state
@@ -325,7 +330,7 @@ Rules:
         )
         .expression_attribute_values(
             ":s",
-            aws_sdk_dynamodb::types::AttributeValue::S("completed".to_string()),
+            aws_sdk_dynamodb::types::AttributeValue::S(final_status.to_string()),
         )
         .expression_attribute_values(
             ":p",
@@ -333,7 +338,7 @@ Rules:
         )
         .expression_attribute_values(
             ":sri",
-            aws_sdk_dynamodb::types::AttributeValue::S(format!("completed#{}", msg.run_id)),
+            aws_sdk_dynamodb::types::AttributeValue::S(format!("{final_status}#{}", msg.run_id)),
         )
         .expression_attribute_values(
             ":entry",
@@ -383,6 +388,27 @@ Rules:
             )
             .send()
             .await?;
+    }
+
+    // If code was pushed, schedule a delayed resume to watch for CI
+    if code_pushed {
+        info!(run_id = %msg.run_id, "Feedback pushed code — scheduling CI check");
+        if !state.config.ci_fix_queue_url.is_empty() {
+            let resume_body = serde_json::json!({
+                "type": "resume",
+                "team_id": msg.team_id,
+                "run_id": msg.run_id,
+                "installation_id": msg.installation_id,
+            });
+            let _ = state
+                .sqs
+                .send_message()
+                .queue_url(&state.config.ci_fix_queue_url)
+                .message_body(resume_body.to_string())
+                .delay_seconds(120)
+                .send()
+                .await;
+        }
     }
 
     Ok(())
@@ -700,6 +726,7 @@ struct FeedbackToolExecutor<'a> {
     owner: &'a str,
     repo: &'a str,
     branch: &'a str,
+    files_modified: std::sync::Mutex<bool>,
 }
 
 #[async_trait::async_trait]
@@ -798,6 +825,7 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                         sha,
                     )
                     .await?;
+                *self.files_modified.lock().unwrap() = true;
                 Ok(json!(format!("Wrote {path}")))
             }
             "batch_write" => {
@@ -832,6 +860,7 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .github
                     .batch_write(self.owner, self.repo, self.branch, message, &ops)
                     .await?;
+                *self.files_modified.lock().unwrap() = true;
                 Ok(json!(format!(
                     "Batch commit {} — {} files",
                     &sha[..8],
