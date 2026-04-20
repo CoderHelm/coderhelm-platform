@@ -966,6 +966,13 @@ async fn handle_wrong_repo(
         TicketSource::Github
     };
 
+    // Load image attachments from the run record (stored as JSON string)
+    let image_attachments: Vec<crate::models::ImageAttachment> = run_record
+        .get("image_attachments")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
     // Send new ticket message to re-trigger in the correct repo
     let ticket_msg = WorkerMessage::Ticket(crate::models::TicketMessage {
         team_id: msg.team_id.clone(),
@@ -979,7 +986,7 @@ async fn handle_wrong_repo(
         issue_number,
         sender: String::new(),
         base_branch: "main".to_string(),
-        image_attachments: vec![],
+        image_attachments,
     });
 
     if state.config.ticket_queue_url.is_empty() {
