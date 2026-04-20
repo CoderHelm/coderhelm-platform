@@ -54,6 +54,9 @@ Use the `get_diff` tool to see all changes compared to main. Then review for:
 7. **Must-rules** — If must-rules are listed in the system prompt, verify every rule is respected.
 8. **No placeholders** — Flag any TODO, FIXME, REPLACE_ME, stub implementations, or incomplete code left behind.
 9. **No destructive deletions** — If large blocks of existing code were REMOVED without being replaced by equivalent functionality, flag it. The agent should modify code, not gut it.
+10. **Syntax integrity** — For every modified file, verify that braces/brackets are balanced and the code would parse. If a file has orphaned catch blocks, dangling braces, or unreachable code after return/throw, it MUST be flagged.
+
+After using `get_diff`, also use `read_file` on any file that had significant changes (>20 lines modified) to verify the full file is syntactically correct. Do NOT skip this step.
 
 If you find issues, start with "ISSUES_FOUND:" followed by a list with file path, problem, and suggested fix.
 If everything looks good, start with "LGTM" followed by a brief summary."#,
@@ -89,7 +92,7 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
         &executor,
         usage,
         llm::ConverseOptions {
-            max_turns: 15,
+            max_turns: 25,
             max_tokens: 8192,
         },
         None,
