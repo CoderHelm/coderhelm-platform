@@ -61,8 +61,25 @@ pub async fn run(
 
     // Filter out comments the bot already replied to
     let comments = filter_unanswered(&github, &msg, comments).await;
-    if comments.is_empty() && msg.review_body.is_empty() {
-        info!(run_id = %msg.run_id, "All comments already answered — skipping feedback");
+
+    // On re-review (review_id == 0), check CI status and include failures in the prompt
+    let ci_failure_block = if msg.review_id == 0 {
+        let branch = get_pr_branch(state, &msg).await.unwrap_or_default();
+        match fetch_ci_failures(&github, &msg, &branch).await {
+            Some(logs) => format!(
+                "\n## CI Failures\nThe following CI checks are failing. Fix these issues as well:\n\n```\n{}\n```\n",
+                if logs.len() > 12000 { format!("... (truncated)\n{}", &logs[logs.len() - 12000..]) } else { logs }
+            ),
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    let has_ci_failures = !ci_failure_block.is_empty();
+
+    if comments.is_empty() && msg.review_body.is_empty() && !has_ci_failures {
+        info!(run_id = %msg.run_id, "All comments already answered and CI green — skipping feedback");
 
         // Reset status back to completed so the run doesn't stay stuck at "running"
         let now = chrono::Utc::now().to_rfc3339();
@@ -96,19 +113,6 @@ pub async fn run(
     }
 
     let formatted = format_review_comments(&msg.review_body, &comments);
-
-    // On re-review (review_id == 0), check CI status and include failures in the prompt
-    let ci_failure_block = if msg.review_id == 0 {
-        match fetch_ci_failures(&github, &msg, &get_pr_branch(state, &msg).await.unwrap_or_default()).await {
-            Some(logs) => format!(
-                "\n## CI Failures\nThe following CI checks are failing. Fix these issues as well:\n\n```\n{}\n```\n",
-                if logs.len() > 12000 { format!("... (truncated)\n{}", &logs[logs.len() - 12000..]) } else { logs }
-            ),
-            None => String::new(),
-        }
-    } else {
-        String::new()
-    };
 
     // Load voice instructions (repo-specific falls back to global)
     let voice = {
