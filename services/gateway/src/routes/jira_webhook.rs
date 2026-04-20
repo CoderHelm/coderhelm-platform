@@ -679,25 +679,41 @@ async fn handle_jira_comment(
     // Upload image attachments from the Forge payload (if any)
     let fresh_images = upload_image_attachments(state, team_id, ticket_key, payload).await;
 
-    // Find the most recent run for this ticket
-    let runs = state
-        .dynamo
-        .query()
-        .table_name(&state.config.runs_table_name)
-        .key_condition_expression("team_id = :tid")
-        .filter_expression("ticket_id = :ticket")
-        .expression_attribute_values(":tid", attr_s(team_id))
-        .expression_attribute_values(":ticket", attr_s(ticket_key))
-        .scan_index_forward(false)
-        .limit(50)
-        .send()
-        .await
-        .map_err(|e| {
+    // Find the most recent run for this ticket.
+    // Paginate because DynamoDB limit applies before filter_expression.
+    let mut run_item_found: Option<std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+    let mut exclusive_start_key: Option<std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+    for _ in 0..10 {
+        let mut q = state
+            .dynamo
+            .query()
+            .table_name(&state.config.runs_table_name)
+            .key_condition_expression("team_id = :tid")
+            .filter_expression("ticket_id = :ticket")
+            .expression_attribute_values(":tid", attr_s(team_id))
+            .expression_attribute_values(":ticket", attr_s(ticket_key))
+            .scan_index_forward(false)
+            .limit(100);
+        if let Some(ref start) = exclusive_start_key {
+            for (k, v) in start {
+                q = q.exclusive_start_key(k.clone(), v.clone());
+            }
+        }
+        let result = q.send().await.map_err(|e| {
             error!("Failed to query runs for Jira comment: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+        if let Some(item) = result.items().first() {
+            run_item_found = Some(item.clone());
+            break;
+        }
+        match result.last_evaluated_key() {
+            Some(lek) => exclusive_start_key = Some(lek.clone()),
+            None => break,
+        }
+    }
 
-    let Some(run_item) = runs.items().first() else {
+    let Some(run_item) = run_item_found.as_ref() else {
         info!(ticket_key, "No runs found for Jira comment — ignoring");
         return Ok(StatusCode::OK);
     };
@@ -906,8 +922,8 @@ async fn handle_jira_comment(
             .await;
             result
         }
-        // Running/queued — don't reprocess
-        "running" | "queued" => {
+        // Running/queued/awaiting_ci — don't reprocess
+        "running" | "queued" | "awaiting_ci" => {
             info!(
                 ticket_key,
                 run_status, "Ignoring Jira comment — run already in progress"

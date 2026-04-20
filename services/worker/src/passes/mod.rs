@@ -1228,6 +1228,14 @@ async fn run_passes(
                     .await
                     .unwrap_or_else(|_| "main".to_string());
 
+                // Create (or reset) the working branch in the new repo
+                if let Err(e) = github
+                    .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, &msg.base_branch)
+                    .await
+                {
+                    warn!(run_id, error = %e, "Failed to create branch in new repo after switch");
+                }
+
                 // Update run record
                 let resolved_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
                 let _ = state
