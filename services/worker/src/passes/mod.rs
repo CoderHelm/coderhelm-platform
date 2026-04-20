@@ -1611,6 +1611,46 @@ async fn run_passes(
         result
     };
 
+    // --- Post-implement syntax validation (multi-repo path) ---
+    let syntax_issues = validate_modified_files(
+        &github, &msg.repo_owner, &msg.repo_name, &branch_name, &impl_result.files_modified,
+    ).await;
+
+    if !syntax_issues.is_empty() {
+        warn!(
+            run_id,
+            issues = syntax_issues.len(),
+            "Syntax validation found issues — running auto-fix"
+        );
+        add_progress_note(
+            state, &msg.team_id, run_id,
+            &format!("Found {} syntax issue(s) — auto-fixing", syntax_issues.len()),
+        ).await;
+
+        let fix_feedback = format!(
+            "CRITICAL: The following files have broken syntax after your edits. \
+             Read each file, fix the syntax errors, and commit the fix. \
+             Do NOT remove existing functionality — only fix the syntax.\n\n{}",
+            syntax_issues.join("\n\n")
+        );
+
+        let fix_plan = plan::PlanResult {
+            proposal: String::new(),
+            tasks: String::new(),
+            spec: String::new(),
+            design: String::new(),
+            repo_tasks: vec![],
+        };
+        let fix_cache = FileCache::default();
+
+        if let Err(e) = implement::run(
+            state, msg, &github, &fix_plan, &branch_name, &[],
+            "", Some(&fix_feedback), "low", &provider, usage, &fix_cache, Some(run_id),
+        ).await {
+            warn!(run_id, error = %e, "Syntax auto-fix failed, proceeding anyway");
+        }
+    }
+
     // --- Security Audit (before PR — ensures only security-clean code is published) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "security").await?;
@@ -1995,6 +2035,48 @@ async fn run_repo_pipeline(
             "No files modified in {}/{}. The issue may need more detail.",
             repo_owner, repo_name
         ).into());
+    }
+
+    // --- Post-implement syntax validation ---
+    // Read each modified code file and check for broken syntax (brace balance, etc.)
+    let syntax_issues = validate_modified_files(
+        github, repo_owner, repo_name, branch_name, &impl_result.files_modified,
+    ).await;
+
+    if !syntax_issues.is_empty() {
+        warn!(
+            run_id,
+            issues = syntax_issues.len(),
+            "Syntax validation found issues — running auto-fix"
+        );
+        add_progress_note(
+            state, &msg.team_id, run_id,
+            &format!("Found {} syntax issue(s) — auto-fixing", syntax_issues.len()),
+        ).await;
+
+        let fix_feedback = format!(
+            "CRITICAL: The following files have broken syntax after your edits. \
+             Read each file, fix the syntax errors, and commit the fix. \
+             Do NOT remove existing functionality — only fix the syntax.\n\n{}",
+            syntax_issues.join("\n\n")
+        );
+
+        // Quick implement pass to fix syntax
+        let fix_plan = plan::PlanResult {
+            proposal: String::new(),
+            tasks: String::new(),
+            spec: String::new(),
+            design: String::new(),
+            repo_tasks: vec![],
+        };
+        let fix_cache = FileCache::default();
+
+        if let Err(e) = implement::run(
+            state, msg, github, &fix_plan, branch_name, &[],
+            "", Some(&fix_feedback), "low", provider, usage, &fix_cache, Some(run_id),
+        ).await {
+            warn!(run_id, error = %e, "Syntax auto-fix failed, proceeding anyway");
+        }
     }
 
     // --- Security Audit ---
@@ -3508,4 +3590,72 @@ async fn load_existing_plan(
         spec: files.remove("spec.md").unwrap_or_default(),
         repo_tasks: vec![],
     })
+}
+
+/// Validate modified files for syntax integrity (brace balance, etc.)
+/// Returns a list of human-readable issue descriptions for any broken files.
+async fn validate_modified_files(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    files: &[String],
+) -> Vec<String> {
+    let code_ext = [
+        ".ts", ".tsx", ".js", ".jsx", ".java", ".kt", ".rs", ".go",
+        ".c", ".cpp", ".cs", ".swift", ".dart",
+    ];
+
+    let mut issues = Vec::new();
+
+    for path in files {
+        if !code_ext.iter().any(|ext| path.ends_with(ext)) {
+            continue;
+        }
+
+        let content = match github.read_file(owner, repo, path, branch).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Brace balance check
+        let mut curly = 0i32;
+        let mut round = 0i32;
+        let mut square = 0i32;
+        for ch in content.chars() {
+            match ch {
+                '{' => curly += 1,
+                '}' => curly -= 1,
+                '(' => round += 1,
+                ')' => round -= 1,
+                '[' => square += 1,
+                ']' => square -= 1,
+                _ => {}
+            }
+        }
+
+        let mut file_issues = Vec::new();
+        if curly != 0 {
+            file_issues.push(format!(
+                "curly braces unbalanced by {curly} ({})",
+                if curly > 0 { format!("{curly} unclosed '{{'") } else { format!("{} extra '}}'", -curly) }
+            ));
+        }
+        if round.abs() >= 2 {
+            file_issues.push(format!("parentheses unbalanced by {round}"));
+        }
+        if square.abs() >= 2 {
+            file_issues.push(format!("brackets unbalanced by {square}"));
+        }
+
+        if !file_issues.is_empty() {
+            issues.push(format!(
+                "**{path}**: {} (file has {} lines)",
+                file_issues.join(", "),
+                content.lines().count()
+            ));
+        }
+    }
+
+    issues
 }
