@@ -55,13 +55,14 @@ pub async fn run(
     if status != "awaiting_ci" {
         if status == "running" {
             // Run is still being processed by another invocation.
-            // Return error so SQS retries after visibility timeout.
+            // Re-queue with a delay so we check again shortly.
             warn!(
                 run_id = msg.run_id,
                 status,
-                "Run is currently running — will retry after visibility timeout"
+                "Run is currently running — re-queuing with 30s delay"
             );
-            return Err("Run is running, retry later".into());
+            send_delayed_resume(state, &msg, 30).await;
+            return Ok(());
         }
         info!(
             run_id = msg.run_id,
