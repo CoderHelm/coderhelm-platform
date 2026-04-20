@@ -1611,43 +1611,35 @@ async fn run_passes(
         result
     };
 
-    // --- Post-implement syntax validation (multi-repo path) ---
-    let syntax_issues = validate_modified_files(
-        &github, &msg.repo_owner, &msg.repo_name, &branch_name, &impl_result.files_modified,
-    ).await;
-
-    if !syntax_issues.is_empty() {
-        warn!(
-            run_id,
-            issues = syntax_issues.len(),
-            "Syntax validation found issues — running auto-fix"
-        );
-        add_progress_note(
-            state, &msg.team_id, run_id,
-            &format!("Found {} syntax issue(s) — auto-fixing", syntax_issues.len()),
+    // --- Adversarial Test (multi-repo path) ---
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    if has_time_for_remediation(start) {
+        update_pass(state, &msg.team_id, run_id, "test").await?;
+        let pass_start = std::time::Instant::now();
+        let usage_before = usage.clone();
+        let test_issues = adversarial_test(
+            state, msg, &github, &plan_result, &branch_name, &provider, usage, &file_cache,
+            &impl_result.files_modified, run_id,
         ).await;
+        write_pass_trace(state, &msg.team_id, run_id, "test", pass_start, &usage_before, usage, None).await;
 
-        let fix_feedback = format!(
-            "CRITICAL: The following files have broken syntax after your edits. \
-             Read each file, fix the syntax errors, and commit the fix. \
-             Do NOT remove existing functionality — only fix the syntax.\n\n{}",
-            syntax_issues.join("\n\n")
-        );
+        if !test_issues.is_empty() {
+            warn!(run_id, "Adversarial test found issues — running auto-fix");
+            add_progress_note(
+                state, &msg.team_id, run_id, "Test found issues — auto-fixing",
+            ).await;
 
-        let fix_plan = plan::PlanResult {
-            proposal: String::new(),
-            tasks: String::new(),
-            spec: String::new(),
-            design: String::new(),
-            repo_tasks: vec![],
-        };
-        let fix_cache = FileCache::default();
-
-        if let Err(e) = implement::run(
-            state, msg, &github, &fix_plan, &branch_name, &[],
-            "", Some(&fix_feedback), "low", &provider, usage, &fix_cache, Some(run_id),
-        ).await {
-            warn!(run_id, error = %e, "Syntax auto-fix failed, proceeding anyway");
+            let fix_plan = plan::PlanResult {
+                proposal: String::new(), tasks: String::new(),
+                spec: String::new(), design: String::new(), repo_tasks: vec![],
+            };
+            let fix_cache = FileCache::default();
+            if let Err(e) = implement::run(
+                state, msg, &github, &fix_plan, &branch_name, &[],
+                "", Some(&test_issues), "low", &provider, usage, &fix_cache, Some(run_id),
+            ).await {
+                warn!(run_id, error = %e, "Test auto-fix failed, proceeding anyway");
+            }
         }
     }
 
@@ -2037,45 +2029,35 @@ async fn run_repo_pipeline(
         ).into());
     }
 
-    // --- Post-implement syntax validation ---
-    // Read each modified code file and check for broken syntax (brace balance, etc.)
-    let syntax_issues = validate_modified_files(
-        github, repo_owner, repo_name, branch_name, &impl_result.files_modified,
-    ).await;
-
-    if !syntax_issues.is_empty() {
-        warn!(
-            run_id,
-            issues = syntax_issues.len(),
-            "Syntax validation found issues — running auto-fix"
-        );
-        add_progress_note(
-            state, &msg.team_id, run_id,
-            &format!("Found {} syntax issue(s) — auto-fixing", syntax_issues.len()),
+    // --- Adversarial Test (catches bugs before security/PR) ---
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    if has_time_for_remediation(start) {
+        update_pass(state, &msg.team_id, run_id, "test").await?;
+        let pass_start = std::time::Instant::now();
+        let usage_before = usage.clone();
+        let test_issues = adversarial_test(
+            state, msg, github, &repo_plan, branch_name, provider, usage, file_cache,
+            &impl_result.files_modified, run_id,
         ).await;
+        write_pass_trace(state, &msg.team_id, run_id, "test", pass_start, &usage_before, usage, None).await;
 
-        let fix_feedback = format!(
-            "CRITICAL: The following files have broken syntax after your edits. \
-             Read each file, fix the syntax errors, and commit the fix. \
-             Do NOT remove existing functionality — only fix the syntax.\n\n{}",
-            syntax_issues.join("\n\n")
-        );
+        if !test_issues.is_empty() {
+            warn!(run_id, "Adversarial test found issues — running auto-fix");
+            add_progress_note(
+                state, &msg.team_id, run_id, "Test found issues — auto-fixing",
+            ).await;
 
-        // Quick implement pass to fix syntax
-        let fix_plan = plan::PlanResult {
-            proposal: String::new(),
-            tasks: String::new(),
-            spec: String::new(),
-            design: String::new(),
-            repo_tasks: vec![],
-        };
-        let fix_cache = FileCache::default();
-
-        if let Err(e) = implement::run(
-            state, msg, github, &fix_plan, branch_name, &[],
-            "", Some(&fix_feedback), "low", provider, usage, &fix_cache, Some(run_id),
-        ).await {
-            warn!(run_id, error = %e, "Syntax auto-fix failed, proceeding anyway");
+            let fix_plan = plan::PlanResult {
+                proposal: String::new(), tasks: String::new(),
+                spec: String::new(), design: String::new(), repo_tasks: vec![],
+            };
+            let fix_cache = FileCache::default();
+            if let Err(e) = implement::run(
+                state, msg, github, &fix_plan, branch_name, &[],
+                "", Some(&test_issues), "low", provider, usage, &fix_cache, Some(run_id),
+            ).await {
+                warn!(run_id, error = %e, "Test auto-fix failed, proceeding anyway");
+            }
         }
     }
 
@@ -3592,70 +3574,114 @@ async fn load_existing_plan(
     })
 }
 
-/// Validate modified files for syntax integrity (brace balance, etc.)
-/// Returns a list of human-readable issue descriptions for any broken files.
-async fn validate_modified_files(
+/// Adversarial test pass — an LLM reads the diff and modified files looking for
+/// bugs, broken syntax, missing error handling, and destructive deletions.
+/// Returns empty string if clean, or a description of issues for the implement agent to fix.
+#[allow(clippy::too_many_arguments)]
+async fn adversarial_test(
+    state: &WorkerState,
+    msg: &TicketMessage,
     github: &crate::clients::github::GitHubClient,
-    owner: &str,
-    repo: &str,
+    plan: &plan::PlanResult,
     branch: &str,
-    files: &[String],
-) -> Vec<String> {
-    let code_ext = [
-        ".ts", ".tsx", ".js", ".jsx", ".java", ".kt", ".rs", ".go",
-        ".c", ".cpp", ".cs", ".swift", ".dart",
-    ];
+    provider: &crate::agent::provider::ModelProvider,
+    usage: &mut TokenUsage,
+    file_cache: &FileCache,
+    files_modified: &[String],
+    run_id: &str,
+) -> String {
+    use crate::agent::llm;
+    use crate::agent::provider;
 
-    let mut issues = Vec::new();
+    let files_list = files_modified.join(", ");
+    let openspec_block = format_openspec_summary(plan);
 
-    for path in files {
-        if !code_ext.iter().any(|ext| path.ends_with(ext)) {
-            continue;
-        }
+    let system = format!(
+        "You are an adversarial code tester for {owner}/{repo}. \
+         Your job is to find REAL bugs that would break the build or cause runtime errors. \
+         You are READ-ONLY — you cannot modify files. You report issues for another agent to fix.",
+        owner = msg.repo_owner,
+        repo = msg.repo_name,
+    );
 
-        let content = match github.read_file(owner, repo, path, branch).await {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+    let prompt = format!(
+        r#"An implementation agent just modified these files: {files_list}
+{openspec}
+Your job: find bugs that WILL break this code. Use `get_diff` to see all changes, then `read_file` on each modified file to verify the FULL file is correct.
 
-        // Brace balance check
-        let mut curly = 0i32;
-        let mut round = 0i32;
-        let mut square = 0i32;
-        for ch in content.chars() {
-            match ch {
-                '{' => curly += 1,
-                '}' => curly -= 1,
-                '(' => round += 1,
-                ')' => round -= 1,
-                '[' => square += 1,
-                ']' => square -= 1,
-                _ => {}
-            }
-        }
+Check for:
+1. **Syntax errors** — unbalanced braces/brackets/parens, orphaned catch/else blocks, unclosed strings or template literals
+2. **Broken imports** — importing symbols that don't exist or were renamed
+3. **Type errors** — wrong argument types, missing required properties, calling methods that don't exist on the type
+4. **Destructive deletions** — code that was REMOVED but not replaced with equivalent functionality (e.g. exported functions, API endpoints, event handlers that vanished)
+5. **Unreachable code** — code after return/throw statements
+6. **Missing error handling** — try without catch, async without await, unhandled promise rejections
 
-        let mut file_issues = Vec::new();
-        if curly != 0 {
-            file_issues.push(format!(
-                "curly braces unbalanced by {curly} ({})",
-                if curly > 0 { format!("{curly} unclosed '{{'") } else { format!("{} extra '}}'", -curly) }
-            ));
-        }
-        if round.abs() >= 2 {
-            file_issues.push(format!("parentheses unbalanced by {round}"));
-        }
-        if square.abs() >= 2 {
-            file_issues.push(format!("brackets unbalanced by {square}"));
-        }
+Do NOT report:
+- Style/formatting issues
+- Performance suggestions
+- Missing tests
+- Anything that's a preference not a bug
 
-        if !file_issues.is_empty() {
-            issues.push(format!(
-                "**{path}**: {} (file has {} lines)",
-                file_issues.join(", "),
-                content.lines().count()
-            ));
+Read EVERY modified file in full. Do not skip any.
+
+If you find issues, respond with "ISSUES_FOUND:" followed by a detailed list with file paths and line numbers.
+If everything is clean, respond with "CLEAN" and nothing else."#,
+        files_list = files_list,
+        openspec = openspec_block,
+    );
+
+    let tools = review::review_tools();
+    let executor = review::ReviewToolExecutor {
+        github,
+        owner: &msg.repo_owner,
+        repo: &msg.repo_name,
+        branch,
+        base_branch: &msg.base_branch,
+        file_cache,
+    };
+
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![serde_json::json!({"type": "text", "text": prompt})],
+    )];
+
+    let model_id = provider.primary_model_id();
+    let response = match provider::converse(
+        state,
+        provider,
+        model_id,
+        &system,
+        &mut messages,
+        &tools,
+        &executor,
+        usage,
+        llm::ConverseOptions {
+            max_turns: 15,
+            max_tokens: 8192,
+        },
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(run_id, error = %e, "Adversarial test errored — skipping");
+            return String::new();
         }
+    };
+
+    tracing::info!(run_id, "Adversarial test result: {}", &response[..response.len().min(200)]);
+
+    if response.starts_with("CLEAN") || !response.contains("ISSUES_FOUND:") {
+        String::new()
+    } else {
+        format!(
+            "CRITICAL: An adversarial tester found the following bugs in your implementation. \
+             Read each file mentioned, verify the issue, and fix it. \
+             Do NOT remove existing functionality — only fix what's broken.\n\n{}",
+            response
+        )
     }
-
-    issues
 }

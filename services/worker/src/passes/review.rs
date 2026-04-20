@@ -108,7 +108,7 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
     })
 }
 
-fn review_tools() -> Vec<ToolDefinition> {
+pub fn review_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "get_diff".to_string(),
@@ -164,13 +164,13 @@ fn review_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-struct ReviewToolExecutor<'a> {
-    github: &'a GitHubClient,
-    owner: &'a str,
-    repo: &'a str,
-    branch: &'a str,
-    base_branch: &'a str,
-    file_cache: &'a FileCache,
+pub struct ReviewToolExecutor<'a> {
+    pub github: &'a GitHubClient,
+    pub owner: &'a str,
+    pub repo: &'a str,
+    pub branch: &'a str,
+    pub base_branch: &'a str,
+    pub file_cache: &'a FileCache,
 }
 
 #[async_trait::async_trait]
