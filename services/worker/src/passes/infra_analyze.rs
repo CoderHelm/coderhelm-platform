@@ -475,6 +475,7 @@ async fn collect_infra_code(
             continue;
         }
         let (owner, repo) = (parts[0], parts[1]);
+        info!(repo_full, "Scanning repo for infrastructure code");
 
         // AWS CDK — detect cdk.json then discover stack files via directory listing
         let cdk_locations = ["", "infra", "infrastructure"];
@@ -543,13 +544,27 @@ async fn collect_infra_code(
         let tf_locations = ["", "infra", "terraform", "infrastructure", "iac", "deploy"];
         let mut tf_found = false;
         for base in &tf_locations {
-            let probe_dir = if base.is_empty() { "." } else { base };
+            let probe_dir = if base.is_empty() { "" } else { *base };
             // Try listing the directory for .tf files
-            if let Ok(entries) = github.list_directory(owner, repo, probe_dir, "HEAD").await {
+            match github.list_directory(owner, repo, probe_dir, "HEAD").await {
+                Err(e) => {
+                    info!(repo_full, dir = probe_dir, error = %e, "Terraform scan: list_directory failed");
+                    continue;
+                }
+                Ok(entries) => {
+                let all_names: Vec<_> = entries.iter().map(|e| format!("{}({})", e.name, e.entry_type)).collect();
+                info!(repo_full, dir = probe_dir, count = entries.len(), files = ?all_names, "Terraform scan: listed directory");
+                // Collect .tf files at this level
                 let tf_entries: Vec<_> = entries
                     .iter()
                     .filter(|e| e.entry_type == "file" && e.name.ends_with(".tf"))
                     .collect();
+                // Also collect subdirectories that might contain .tf files
+                let subdirs: Vec<_> = entries
+                    .iter()
+                    .filter(|e| e.entry_type == "dir")
+                    .collect();
+
                 if !tf_entries.is_empty() {
                     for entry in &tf_entries {
                         if let Ok(c) = github.get_file_content(owner, repo, &entry.path).await {
@@ -582,7 +597,38 @@ async fn collect_infra_code(
                     tf_found = true;
                     break;
                 }
-            }
+
+                // No .tf files at this level — check immediate subdirectories
+                if !tf_found {
+                    for subdir in &subdirs {
+                        if let Ok(sub_entries) = github.list_directory(owner, repo, &subdir.path, "HEAD").await {
+                            let sub_tf: Vec<_> = sub_entries
+                                .iter()
+                                .filter(|e| e.entry_type == "file" && e.name.ends_with(".tf"))
+                                .collect();
+                            if !sub_tf.is_empty() {
+                                for entry in &sub_tf {
+                                    if let Ok(c) = github.get_file_content(owner, repo, &entry.path).await {
+                                        found.push((format!("{repo_full}/{}", entry.path), c));
+                                    }
+                                    if found.len() >= 30 {
+                                        break;
+                                    }
+                                }
+                                tf_found = true;
+                                // Don't break — check other subdirs too
+                            }
+                        }
+                        if found.len() >= 30 {
+                            break;
+                        }
+                    }
+                    if tf_found {
+                        break;
+                    }
+                }
+            } // Ok(entries)
+            } // match
         }
         // Fallback: if no directory listing worked, try known filenames
         if !tf_found {
