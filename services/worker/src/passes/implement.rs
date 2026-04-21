@@ -240,9 +240,9 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     };
     let opts = llm::ConverseOptions {
         max_turns: match complexity {
-            "simple" => 25,
-            "medium" => 35,
-            _ => 50,
+            "simple" => 40,
+            "medium" => 60,
+            _ => 80,
         },
         max_tokens: 16384,
     };

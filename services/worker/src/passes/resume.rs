@@ -485,17 +485,40 @@ pub async fn run(
                 .await;
 
                 if result.files_modified.is_empty() {
-                    warn!(run_id = msg.run_id, "CI fix produced no changes — failing to avoid loop");
-                    set_run_status(state, &msg.team_id, &msg.run_id, "failed", "ci_fix_no_changes", &usage)
-                        .await;
+                    warn!(run_id = msg.run_id, "CI fix produced no changes — completing with PR for human review");
+                    // Don't hard-fail — complete the run and mark PR ready for human review
+                    complete_run_with_status(
+                        state,
+                        &ticket_msg,
+                        &msg.run_id,
+                        "completed",
+                        &pr_url,
+                        pr_number,
+                        &branch,
+                        &usage,
+                        start.elapsed().as_secs(),
+                    )
+                    .await?;
+                    mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
                     return Ok(());
                 }
             }
             Err(e) => {
-                error!(run_id = msg.run_id, error = %e, "CI fix implementation failed");
-                set_run_status(state, &msg.team_id, &msg.run_id, "failed", "implement", &usage)
-                    .await;
-                return Err(e);
+                error!(run_id = msg.run_id, error = %e, "CI fix implementation failed — completing with PR for human review");
+                complete_run_with_status(
+                    state,
+                    &ticket_msg,
+                    &msg.run_id,
+                    "completed",
+                    &pr_url,
+                    pr_number,
+                    &branch,
+                    &usage,
+                    start.elapsed().as_secs(),
+                )
+                .await?;
+                mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                return Ok(());
             }
         }
 

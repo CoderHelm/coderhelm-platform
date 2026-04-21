@@ -13,6 +13,27 @@ pub async fn run(
     state: &WorkerState,
     msg: FeedbackMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Skip feedback for runs that are already completed/failed/cancelled
+    let run_status = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()))
+        .key("run_id", aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()))
+        .projection_expression("#s")
+        .expression_attribute_names("#s", "status")
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .and_then(|item| item.get("status").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default();
+
+    if matches!(run_status.as_str(), "completed" | "failed" | "cancelled") {
+        info!(run_id = %msg.run_id, status = %run_status, "Skipping feedback — run already terminal");
+        return Ok(());
+    }
+
     let mut usage = TokenUsage::default();
 
     // Load team's Anthropic API key (required)
