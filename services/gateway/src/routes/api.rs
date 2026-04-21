@@ -1060,19 +1060,8 @@ pub async fn re_review_run(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    state
-        .sqs
-        .send_message()
-        .queue_url(&state.config.feedback_queue_url)
-        .message_body(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to enqueue re-review: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Reset status back to completed (clear any failed state)
+    // Set status to running BEFORE sending SQS — prevents the feedback handler's
+    // terminal-run guard from seeing stale "completed" status and skipping.
     let now = chrono::Utc::now().to_rfc3339();
     let _ = state
         .dynamo
@@ -1088,6 +1077,18 @@ pub async fn re_review_run(
         .expression_attribute_values(":p", attr_s("feedback"))
         .send()
         .await;
+
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.feedback_queue_url)
+        .message_body(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to enqueue re-review: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     info!(run_id, pr_number, "Re-review dispatched to feedback queue");
     Ok(Json(json!({ "status": "re-reviewing" })))
@@ -3475,14 +3476,14 @@ pub async fn health(
     let mut checks: Vec<Value> = Vec::new();
     let mut status = "healthy";
 
-    // 1. Crashed runs — "running" for over 20 minutes (worker likely died or timed out)
+    // 1. Crashed runs — "running" with no update for over 20 minutes (worker likely died or timed out)
     let crash_cutoff = (now - chrono::Duration::minutes(20)).to_rfc3339();
     if let Ok(result) = state
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
         .key_condition_expression("team_id = :tid")
-        .filter_expression("#s = :running AND created_at < :cutoff")
+        .filter_expression("#s = :running AND updated_at < :cutoff")
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":tid", attr_s(&claims.team_id))
         .expression_attribute_values(":running", attr_s("running"))
