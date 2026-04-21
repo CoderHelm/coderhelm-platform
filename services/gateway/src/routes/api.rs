@@ -893,6 +893,15 @@ pub async fn retry_run(
     // Dashboard retry: force-delete existing lock so re-enqueue always succeeds
     delete_ticket_lock(&state, &claims.team_id, ticket_id).await;
 
+    // For Jira tickets, clear repo_owner/repo_name so the worker's
+    // select_repo LLM can pick the correct repo fresh (the old run
+    // may have been routed to the wrong repo).
+    let (retry_owner, retry_name) = if matches!(source, TicketSource::Jira) {
+        (String::new(), String::new())
+    } else {
+        (parts[0].to_string(), parts[1].to_string())
+    };
+
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: claims.team_id.clone(),
         installation_id,
@@ -905,8 +914,8 @@ pub async fn retry_run(
             .unwrap_or("")
             .to_string(),
         body: String::new(), // body is re-fetched from GitHub by the worker
-        repo_owner: parts[0].to_string(),
-        repo_name: parts[1].to_string(),
+        repo_owner: retry_owner,
+        repo_name: retry_name,
         issue_number,
         sender: claims
             .github_login
