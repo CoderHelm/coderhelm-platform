@@ -2049,20 +2049,32 @@ async fn load_plan_chat_context(
         .unwrap_or_default();
 
     // Get GitHub installation token for codebase tools
-    let github_token = if let Some(installation_id) = team_meta_result
+    let installation_id_opt = team_meta_result
         .ok()
         .and_then(|r| r.item().cloned())
         .and_then(|i| i.get("github_installation_id").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()))
-        .filter(|&id| id > 0)
-    {
+        .filter(|&id| id > 0);
+
+    info!(
+        team_id = team_id,
+        installation_id = ?installation_id_opt,
+        repos = repo_list.len(),
+        "plan chat: loading github token"
+    );
+
+    let github_token = if let Some(installation_id) = installation_id_opt {
         match crate::auth::github_app::get_installation_token(state, installation_id).await {
-            Ok(token) => Some(token),
+            Ok(token) => {
+                info!(team_id = team_id, "plan chat: github token acquired");
+                Some(token)
+            }
             Err(e) => {
-                warn!("Failed to get GitHub installation token for plan chat: {e}");
+                warn!(team_id = team_id, "Failed to get GitHub installation token for plan chat: {e}");
                 None
             }
         }
     } else {
+        warn!(team_id = team_id, "No github_installation_id found for plan chat");
         None
     };
 
@@ -2277,6 +2289,8 @@ async fn load_plan_chat_context(
         tools_count = tools.len(),
         mcp_plugins = enabled_plugins.len(),
         messages_count = api_messages.len(),
+        repos = repo_list.len(),
+        has_github_token = github_token.is_some(),
         "load_plan_chat_context: context loaded"
     );
 
