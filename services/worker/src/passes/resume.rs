@@ -388,8 +388,18 @@ pub async fn run(
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to download workflow logs: {e}");
-                    failure_logs.clone()
+                    warn!("Failed to download workflow logs: {e} — falling back to check run annotations");
+                    // Fallback: fetch annotations from failed check runs (uses checks:read, not actions:read)
+                    match github
+                        .get_check_run_annotations(&repo_owner, &repo_name, &branch)
+                        .await
+                    {
+                        Ok(annotations) if !annotations.is_empty() => {
+                            info!(run_id = msg.run_id, len = annotations.len(), "Got check run annotations as fallback");
+                            format!("{failure_logs}\n\nCheck run annotations:\n{annotations}")
+                        }
+                        _ => failure_logs.clone(),
+                    }
                 }
             }
         } else {

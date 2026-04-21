@@ -1198,7 +1198,17 @@ async fn fetch_ci_failures(
         }
     }
 
-    // Fallback: just list the failed check names
+    // Fallback: check run annotations (uses checks:read, not actions:read)
+    if let Ok(annotations) = github
+        .get_check_run_annotations(&msg.repo_owner, &msg.repo_name, branch)
+        .await
+    {
+        if !annotations.is_empty() {
+            return Some(annotations);
+        }
+    }
+
+    // Last resort: just list the failed check names
     let names: Vec<&str> = failed
         .iter()
         .filter_map(|r| r["name"].as_str())

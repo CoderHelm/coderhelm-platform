@@ -852,6 +852,74 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// Fetch annotations from failed check runs on a branch — useful as fallback
+    /// when workflow logs are inaccessible (403). Annotations contain lint errors,
+    /// test failures, etc. with file paths and line numbers.
+    pub async fn get_check_run_annotations(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let checks = self.list_check_runs_for_ref(owner, repo, branch).await?;
+        let mut all_annotations = String::new();
+
+        for check in checks["check_runs"].as_array().unwrap_or(&vec![]) {
+            let conclusion = check["conclusion"].as_str().unwrap_or("");
+            if conclusion != "failure" {
+                continue;
+            }
+            let check_name = check["name"].as_str().unwrap_or("unknown");
+            let check_id = check["id"].as_u64().unwrap_or(0);
+            if check_id == 0 { continue; }
+
+            // Fetch annotations for this check run
+            let url = format!(
+                "{API_BASE}/repos/{owner}/{repo}/check-runs/{check_id}/annotations?per_page=50"
+            );
+            match self.get(&url).await {
+                Ok(annotations) => {
+                    let ann_array = annotations.as_array().cloned().unwrap_or_default();
+                    if ann_array.is_empty() { continue; }
+                    all_annotations.push_str(&format!("\n--- {check_name} ---\n"));
+                    for ann in &ann_array {
+                        let path = ann["path"].as_str().unwrap_or("");
+                        let start_line = ann["start_line"].as_u64().unwrap_or(0);
+                        let msg = ann["message"].as_str().unwrap_or("");
+                        let level = ann["annotation_level"].as_str().unwrap_or("error");
+                        all_annotations.push_str(
+                            &format!("{level}: {path}:{start_line}: {msg}\n")
+                        );
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        // Also grab the output summary/text from failed checks (often has error details)
+        for check in checks["check_runs"].as_array().unwrap_or(&vec![]) {
+            let conclusion = check["conclusion"].as_str().unwrap_or("");
+            if conclusion != "failure" { continue; }
+            let check_name = check["name"].as_str().unwrap_or("unknown");
+            if let Some(output) = check.get("output") {
+                let summary = output["summary"].as_str().unwrap_or("");
+                let text = output["text"].as_str().unwrap_or("");
+                if !summary.is_empty() || !text.is_empty() {
+                    all_annotations.push_str(&format!("\n--- {check_name} output ---\n"));
+                    if !summary.is_empty() {
+                        all_annotations.push_str(&format!("{summary}\n"));
+                    }
+                    if !text.is_empty() {
+                        let truncated = if text.len() > 3000 { &text[..3000] } else { text };
+                        all_annotations.push_str(&format!("{truncated}\n"));
+                    }
+                }
+            }
+        }
+
+        Ok(all_annotations)
+    }
+
     /// List pull requests (state: "open", "closed", "all").
     pub async fn list_pull_requests(
         &self,

@@ -1014,10 +1014,19 @@ async fn run_passes(
                         .unwrap_or(0);
 
                     let logs = if failed_run_id > 0 {
-                        github
+                        match github
                             .get_workflow_run_logs(&msg.repo_owner, &msg.repo_name, failed_run_id)
                             .await
-                            .unwrap_or_else(|_| "(failed to download logs)".to_string())
+                        {
+                            Ok(l) => l,
+                            Err(_) => {
+                                // Fallback: check run annotations (uses checks:read, not actions:read)
+                                github
+                                    .get_check_run_annotations(&msg.repo_owner, &msg.repo_name, &branch_name)
+                                    .await
+                                    .unwrap_or_else(|_| "(failed to download logs)".to_string())
+                            }
+                        }
                     } else {
                         let job_id = checks["check_runs"]
                             .as_array()
