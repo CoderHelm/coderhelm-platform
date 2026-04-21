@@ -1023,6 +1023,7 @@ async fn find_run_by_branch(
     repo_name: &str,
     branch: &str,
 ) -> Option<String> {
+    // Fast path: query repo-index GSI (works for primary repo)
     let team_repo = format!("{team_id}#{repo_owner}/{repo_name}");
     let result = state
         .dynamo
@@ -1036,14 +1037,43 @@ async fn find_run_by_branch(
         .expression_attribute_values(":b", attr_s(branch))
         .expression_attribute_values(":s1", attr_s("awaiting_ci"))
         .expression_attribute_values(":s2", attr_s("running"))
-        .scan_index_forward(false) // newest first
-        .limit(50) // filter is post-query, so fetch enough to find a match
+        .scan_index_forward(false)
+        .limit(50)
         .send()
         .await
         .ok()?;
 
-    let items = result.items();
-    items
+    if let Some(run_id) = result
+        .items()
+        .first()
+        .and_then(|item| item.get("run_id"))
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+    {
+        return Some(run_id);
+    }
+
+    // Fallback: multi-repo runs store secondary branches in `branches` list.
+    // Query team partition and check if this branch is in the list.
+    let fallback = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("team_id = :tid")
+        .filter_expression("contains(branches, :b) AND (#s = :s1 OR #s = :s2)")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":tid", attr_s(team_id))
+        .expression_attribute_values(":b", attr_s(branch))
+        .expression_attribute_values(":s1", attr_s("awaiting_ci"))
+        .expression_attribute_values(":s2", attr_s("running"))
+        .scan_index_forward(false)
+        .limit(5)
+        .send()
+        .await
+        .ok()?;
+
+    fallback
+        .items()
         .first()
         .and_then(|item| item.get("run_id"))
         .and_then(|v| v.as_s().ok())
@@ -1403,6 +1433,7 @@ async fn lookup_run_by_pr(
     name: &str,
     pr_number: u64,
 ) -> String {
+    // First try the repo-index GSI (fast path — works for primary repo)
     let team_repo = format!("{team_id}#{owner}/{name}");
     let result = state
         .dynamo
@@ -1418,14 +1449,39 @@ async fn lookup_run_by_pr(
         .send()
         .await;
 
-    match result {
+    if let Ok(r) = &result {
+        if let Some(run_id) = r
+            .items()
+            .first()
+            .and_then(|item| item.get("run_id").and_then(|v| v.as_s().ok()).cloned())
+        {
+            return run_id;
+        }
+    }
+
+    // Fallback: multi-repo runs store secondary PRs in pr_numbers list.
+    // Query the team partition and check the list attribute.
+    let fallback = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("team_id = :tid")
+        .filter_expression("contains(pr_numbers, :pn)")
+        .expression_attribute_values(":tid", attr_s(team_id))
+        .expression_attribute_values(":pn", attr_n(pr_number))
+        .scan_index_forward(false)
+        .limit(5)
+        .send()
+        .await;
+
+    match fallback {
         Ok(r) => r
             .items()
             .first()
             .and_then(|item| item.get("run_id").and_then(|v| v.as_s().ok()).cloned())
             .unwrap_or_default(),
         Err(e) => {
-            error!("Failed to query run by PR number: {e}");
+            error!("Failed to query run by PR number (fallback): {e}");
             String::new()
         }
     }
