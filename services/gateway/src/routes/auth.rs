@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::auth::jwt;
+use crate::middleware::auth::SESSION_TTL_SECS;
 use crate::AppState;
 
 /// Compute Cognito SECRET_HASH = Base64(HMAC-SHA256(client_secret, username + client_id))
@@ -710,7 +711,7 @@ pub async fn google_callback(
         &role,
         None,
         &state.secrets.jwt_secret,
-        86400,
+        SESSION_TTL_SECS,
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -721,7 +722,7 @@ pub async fn google_callback(
     };
 
     let cookie = format!(
-        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
     );
 
     Ok((
@@ -945,7 +946,7 @@ pub async fn github_callback(
             &claims.role,
             Some(github_login),
             &state.secrets.jwt_secret,
-            86400,
+            SESSION_TTL_SECS,
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -958,7 +959,7 @@ pub async fn github_callback(
         };
 
         let cookie = format!(
-            "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+            "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
         );
 
         return Ok((
@@ -1204,7 +1205,7 @@ pub async fn github_callback(
         &role,
         Some(github_login),
         &state.secrets.jwt_secret,
-        86400,
+        SESSION_TTL_SECS,
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -1215,7 +1216,7 @@ pub async fn github_callback(
     };
 
     let cookie = format!(
-        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
     );
 
     Ok((
@@ -1418,12 +1419,12 @@ async fn issue_session_from_cognito(
         &role,
         github_login.as_deref(),
         &state.secrets.jwt_secret,
-        86400,
+        SESSION_TTL_SECS,
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let cookie = format!(
-        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
     );
 
     Ok((

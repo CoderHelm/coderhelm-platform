@@ -539,11 +539,58 @@ async fn collect_infra_code(
             }
         }
 
-        // Terraform
-        for tf_path in &["main.tf", "infra/main.tf", "terraform/main.tf"] {
-            if let Ok(content) = github.get_file_content(owner, repo, tf_path).await {
-                found.push((format!("{repo_full}/{tf_path}"), content));
-                break;
+        // Terraform — probe common directories, then list all .tf files
+        let tf_locations = ["", "infra", "terraform", "infrastructure", "iac", "deploy"];
+        let mut tf_found = false;
+        for base in &tf_locations {
+            let probe_dir = if base.is_empty() { "." } else { base };
+            // Try listing the directory for .tf files
+            if let Ok(entries) = github.list_directory(owner, repo, probe_dir, "HEAD").await {
+                let tf_entries: Vec<_> = entries
+                    .iter()
+                    .filter(|e| e.entry_type == "file" && e.name.ends_with(".tf"))
+                    .collect();
+                if !tf_entries.is_empty() {
+                    for entry in &tf_entries {
+                        if let Ok(c) = github.get_file_content(owner, repo, &entry.path).await {
+                            found.push((format!("{repo_full}/{}", entry.path), c));
+                        }
+                        if found.len() >= 30 {
+                            break;
+                        }
+                    }
+                    // Also check for modules/ subdirectory
+                    let modules_dir = if base.is_empty() {
+                        "modules".to_string()
+                    } else {
+                        format!("{base}/modules")
+                    };
+                    if let Ok(mod_entries) = github.list_directory(owner, repo, &modules_dir, "HEAD").await {
+                        for mod_entry in mod_entries.iter().filter(|e| e.entry_type == "dir") {
+                            if let Ok(mod_files) = github.list_directory(owner, repo, &mod_entry.path, "HEAD").await {
+                                for mf in mod_files.iter().filter(|e| e.entry_type == "file" && e.name.ends_with(".tf")) {
+                                    if let Ok(c) = github.get_file_content(owner, repo, &mf.path).await {
+                                        found.push((format!("{repo_full}/{}", mf.path), c));
+                                    }
+                                    if found.len() >= 30 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tf_found = true;
+                    break;
+                }
+            }
+        }
+        // Fallback: if no directory listing worked, try known filenames
+        if !tf_found {
+            for tf_path in &["main.tf", "infra/main.tf", "terraform/main.tf"] {
+                if let Ok(content) = github.get_file_content(owner, repo, tf_path).await {
+                    found.push((format!("{repo_full}/{tf_path}"), content));
+                    break;
+                }
             }
         }
 

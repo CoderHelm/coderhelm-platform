@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::auth::jwt;
+use crate::middleware::auth::SESSION_TTL_SECS;
 use crate::models::{
     Claims, FeedbackMessage, InfraAnalyzeMessage, NotificationPrefs, OnboardMessage, OnboardRepo,
     TicketMessage, TicketSource, WorkerMessage,
@@ -284,12 +285,12 @@ pub async fn switch_team(
         target_role,
         claims.github_login.as_deref(),
         &state.secrets.jwt_secret,
-        86400,
+        SESSION_TTL_SECS,
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let cookie = format!(
-        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"
+        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
     );
 
     Ok((
@@ -3836,5 +3837,213 @@ pub async fn reset_account(
         .await;
 
     info!(team_id = %claims.team_id, "Account data reset complete");
+    Ok(StatusCode::OK)
+}
+
+// ---------------------------------------------------------------------------
+// DLQ Management (owner-only)
+// ---------------------------------------------------------------------------
+
+/// GET /api/dlq — List messages in the dead letter queue
+pub async fn list_dlq_messages(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    if claims.role != "owner" && claims.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if state.config.dlq_url.is_empty() {
+        return Ok(Json(json!({ "messages": [], "count": 0 })));
+    }
+
+    // Receive up to 10 messages (SQS max per call) without deleting them
+    let resp = state
+        .sqs
+        .receive_message()
+        .queue_url(&state.config.dlq_url)
+        .max_number_of_messages(10)
+        .visibility_timeout(0) // Don't hide messages — just peek
+        .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::All)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to receive DLQ messages: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let messages: Vec<Value> = resp
+        .messages()
+        .iter()
+        .map(|m| {
+            let body: Value = m
+                .body()
+                .and_then(|b| serde_json::from_str(b).ok())
+                .unwrap_or_else(|| json!(m.body().unwrap_or("")));
+
+            let sent_at = m
+                .attributes()
+                .and_then(|a| a.get(&aws_sdk_sqs::types::MessageSystemAttributeName::SentTimestamp))
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(|ms| {
+                    chrono::DateTime::from_timestamp(ms / 1000, 0)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+
+            let receive_count = m
+                .attributes()
+                .and_then(|a| {
+                    a.get(
+                        &aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount,
+                    )
+                })
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+
+            let source_queue = m
+                .attributes()
+                .and_then(|a| {
+                    a.get(
+                        &aws_sdk_sqs::types::MessageSystemAttributeName::DeadLetterQueueSourceArn,
+                    )
+                })
+                .cloned()
+                .unwrap_or_default();
+
+            json!({
+                "message_id": m.message_id().unwrap_or(""),
+                "receipt_handle": m.receipt_handle().unwrap_or(""),
+                "body": body,
+                "sent_at": sent_at,
+                "receive_count": receive_count,
+                "source_queue": source_queue,
+            })
+        })
+        .collect();
+
+    let count = messages.len();
+    Ok(Json(json!({ "messages": messages, "count": count })))
+}
+
+/// POST /api/dlq/redrive — Redrive a specific message back to its source queue
+pub async fn redrive_dlq_message(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    if claims.role != "owner" && claims.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let receipt_handle = body["receipt_handle"]
+        .as_str()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let message_body = body.get("body").ok_or(StatusCode::BAD_REQUEST)?;
+
+    // Determine which source queue to send to based on message content
+    let body_str = if message_body.is_string() {
+        message_body.as_str().unwrap_or("").to_string()
+    } else {
+        serde_json::to_string(message_body).unwrap_or_default()
+    };
+
+    let target_queue = if body_str.contains("\"type\":\"ci_fix\"") || body_str.contains("\"type\":\"resume\"") {
+        &state.config.ci_fix_queue_url
+    } else if body_str.contains("\"type\":\"feedback\"") {
+        &state.config.feedback_queue_url
+    } else {
+        &state.config.ticket_queue_url
+    };
+
+    if target_queue.is_empty() {
+        error!("Cannot redrive — target queue URL is empty");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Send to source queue
+    state
+        .sqs
+        .send_message()
+        .queue_url(target_queue)
+        .message_body(&body_str)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to redrive message: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Delete from DLQ
+    state
+        .sqs
+        .delete_message()
+        .queue_url(&state.config.dlq_url)
+        .receipt_handle(receipt_handle)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to delete DLQ message after redrive: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(team_id = %claims.team_id, "DLQ message redriven");
+    Ok(StatusCode::OK)
+}
+
+/// DELETE /api/dlq/:message_id — Delete a single message from the DLQ
+pub async fn delete_dlq_message(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    if claims.role != "owner" && claims.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let receipt_handle = body["receipt_handle"]
+        .as_str()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    state
+        .sqs
+        .delete_message()
+        .queue_url(&state.config.dlq_url)
+        .receipt_handle(receipt_handle)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to delete DLQ message: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(team_id = %claims.team_id, "DLQ message deleted");
+    Ok(StatusCode::OK)
+}
+
+/// POST /api/dlq/purge — Purge all messages from the DLQ
+pub async fn purge_dlq(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<StatusCode, StatusCode> {
+    if claims.role != "owner" && claims.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if state.config.dlq_url.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    state
+        .sqs
+        .purge_queue()
+        .queue_url(&state.config.dlq_url)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to purge DLQ: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    warn!(team_id = %claims.team_id, "DLQ purged");
     Ok(StatusCode::OK)
 }

@@ -9,9 +9,12 @@ use std::sync::Arc;
 use crate::auth::jwt;
 use crate::AppState;
 
+/// Session TTL: 7 days. Used by both token creation and cookie Max-Age.
+pub const SESSION_TTL_SECS: u64 = 604_800;
+
 /// Extract and validate JWT from cookie, inject Claims into request extensions.
-/// JWT secret is loaded from AppState (sourced from Secrets Manager), never from
-/// request extensions or defaults.
+/// Implements a sliding session: if the token is past 50% of its lifetime,
+/// a fresh token + cookie is issued automatically so active users stay logged in.
 pub async fn require_auth(
     State(state): State<Arc<AppState>>,
     mut req: Request,
@@ -29,8 +32,34 @@ pub async fn require_auth(
     let claims = jwt::validate_token(token, &state.secrets.jwt_secret)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    req.extensions_mut().insert(claims);
-    Ok(next.run(req).await)
+    // Check if token needs refresh (sliding session)
+    let now = chrono::Utc::now().timestamp() as u64;
+    let token_age = now.saturating_sub(claims.iat);
+    let needs_refresh = token_age > SESSION_TTL_SECS / 2;
+
+    req.extensions_mut().insert(claims.clone());
+    let mut response = next.run(req).await;
+
+    if needs_refresh {
+        if let Ok(new_token) = jwt::create_token(
+            &claims.sub,
+            &claims.team_id,
+            &claims.email,
+            &claims.role,
+            claims.github_login.as_deref(),
+            &state.secrets.jwt_secret,
+            SESSION_TTL_SECS,
+        ) {
+            let cookie = format!(
+                "__Host-coderhelm_session={new_token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
+            );
+            if let Ok(val) = cookie.parse() {
+                response.headers_mut().append("set-cookie", val);
+            }
+        }
+    }
+
+    Ok(response)
 }
 
 fn extract_cookie<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
