@@ -1954,6 +1954,10 @@ struct PlanChatContext {
     system_prompt: String,
     messages: Vec<Value>,
     tools: Vec<Value>,
+    /// GitHub installation token for codebase tools (None if not available)
+    github_token: Option<String>,
+    /// Repo name → default branch mapping for codebase tools
+    repo_branches: std::collections::HashMap<String, String>,
 }
 
 /// Load all context needed for plan chat (DynamoDB, S3, prompt assembly, message conversion).
@@ -1964,13 +1968,14 @@ async fn load_plan_chat_context(
     messages_input: &[Value],
 ) -> Result<PlanChatContext, StatusCode> {
 
-    // Load org context, repo list, log analyzer flag, enabled plugins, and templates in parallel
+    // Load org context, repo list, log analyzer flag, enabled plugins, templates, and team META in parallel
     let (
         org_context_result,
         repo_list_result,
         allow_plan_log_analyzer,
         enabled_plugins,
         tmpl_result,
+        team_meta_result,
     ) = tokio::join!(
         state
             .dynamo
@@ -1999,6 +2004,15 @@ async fn load_plan_chat_context(
             .expression_attribute_values(":prefix", attr_s("TEMPLATE#"))
             .limit(10)
             .send(),
+        // Load team META for github_installation_id
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.teams_table_name)
+            .key("team_id", attr_s(team_id))
+            .key("sk", attr_s("META"))
+            .projection_expression("github_installation_id")
+            .send(),
     );
 
     let org_context = org_context_result
@@ -2007,6 +2021,7 @@ async fn load_plan_chat_context(
         .and_then(|i| i.get("content").and_then(|v| v.as_s().ok()).cloned())
         .unwrap_or_default();
 
+    let mut repo_branches: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let repo_list: Vec<String> = repo_list_result
         .ok()
         .map(|r| {
@@ -2019,13 +2034,37 @@ async fn load_plan_chat_context(
                         .unwrap_or(false)
                 })
                 .filter_map(|item| {
-                    item.get("repo_name")
+                    let name = item.get("repo_name")
+                        .and_then(|v| v.as_s().ok())
+                        .map(|s| s.to_string())?;
+                    let branch = item.get("default_branch")
                         .and_then(|v| v.as_s().ok())
                         .map(|s| s.to_string())
+                        .unwrap_or_else(|| "main".to_string());
+                    repo_branches.insert(name.clone(), branch);
+                    Some(name)
                 })
                 .collect()
         })
         .unwrap_or_default();
+
+    // Get GitHub installation token for codebase tools
+    let github_token = if let Some(installation_id) = team_meta_result
+        .ok()
+        .and_then(|r| r.item().cloned())
+        .and_then(|i| i.get("github_installation_id").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()))
+        .filter(|&id| id > 0)
+    {
+        match crate::auth::github_app::get_installation_token(state, installation_id).await {
+            Ok(token) => Some(token),
+            Err(e) => {
+                warn!("Failed to get GitHub installation token for plan chat: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let template_lines: Vec<String> = tmpl_result
         .ok()
@@ -2118,16 +2157,29 @@ async fn load_plan_chat_context(
             .collect();
         system_prompt.push_str(&format!(
             "\n\nYou have tool-call access to the following MCP servers.\n\
-             IMPORTANT tool-use rules:\n\
-             - Only call a tool when the user's request genuinely requires external data \
+             CRITICAL tool-use rules for MCP servers:\n\
+             - ONLY call MCP tools when the user EXPLICITLY asks for data from that system \
              (e.g. \"pull the tasks from Notion\", \"check Sentry for errors\").\n\
-             - NEVER call tools on greetings, general planning questions, or when the user \
-             has not referenced an external system.\n\
+             - NEVER call MCP tools on greetings, general planning questions, or messages that \
+             don't specifically mention an external system by name.\n\
+             - NEVER call MCP tools speculatively or \"just in case\" there might be relevant data.\n\
              - If a tool returns no results, do NOT retry — tell the user and continue planning.\n\
              \n\
              Connected servers:\n{}",
             plugin_lines.join("\n")
         ));
+    }
+    if github_token.is_some() && !repo_list.is_empty() {
+        system_prompt.push_str(
+            "\n\nYou have direct access to the team's GitHub repositories via built-in tools:\n\
+             - search_code: Search for code patterns (functions, imports, error handlers, etc.)\n\
+             - read_file: Read specific files\n\
+             - list_directory: Browse repo structure\n\n\
+             USE THESE TOOLS when the user asks about code, architecture, or when you need to \
+             understand the codebase to create a better plan. Don't ask the user to paste code — \
+             look it up yourself. When scoping work, search the codebase to understand what exists \
+             before breaking it into tasks."
+        );
     }
     if let Some(context) = log_analyzer_context.filter(|c| !c.is_empty()) {
         system_prompt.push_str(&format!(
@@ -2162,23 +2214,63 @@ async fn load_plan_chat_context(
         }));
     }
 
-    // Build Anthropic tools from MCP tools (cache_control on last for prompt caching)
-    let tool_count = mcp_tools.len();
-    let tools: Vec<Value> = mcp_tools
+    // Build Anthropic tools from MCP tools + built-in GitHub codebase tools
+    let mut tools: Vec<Value> = mcp_tools
         .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let mut tool = json!({
+        .map(|t| {
+            json!({
                 "name": format!("{}__{}", t.server_id, t.name),
                 "description": t.description,
                 "input_schema": t.input_schema
-            });
-            if i == tool_count - 1 {
-                tool["cache_control"] = json!({"type": "ephemeral"});
-            }
-            tool
+            })
         })
         .collect();
+
+    // Add built-in GitHub codebase tools if we have a valid token
+    if github_token.is_some() && !repo_list.is_empty() {
+        let repo_enum: Vec<Value> = repo_list.iter().map(|r| json!(r)).collect();
+        tools.push(json!({
+            "name": "github__search_code",
+            "description": "Search for code patterns across a repository. Returns matching file paths and line content. Use this to find where functions, classes, imports, or patterns are used.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "Repository (owner/name)", "enum": repo_enum },
+                    "query": { "type": "string", "description": "Search query (e.g. 'NewRelic.recordError', 'catch (error)', 'import { Something }')" }
+                },
+                "required": ["repo", "query"]
+            }
+        }));
+        tools.push(json!({
+            "name": "github__read_file",
+            "description": "Read a file from the repository. Returns the full file content. Use for reading specific files you've found via search or know the path of.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "Repository (owner/name)", "enum": repo_enum },
+                    "path": { "type": "string", "description": "File path (e.g. 'src/utils/errors.ts')" }
+                },
+                "required": ["repo", "path"]
+            }
+        }));
+        tools.push(json!({
+            "name": "github__list_directory",
+            "description": "List files and directories at a path in the repository. Use to explore repo structure.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "Repository (owner/name)", "enum": repo_enum },
+                    "path": { "type": "string", "description": "Directory path (e.g. 'src/services' or '' for root)", "default": "" }
+                },
+                "required": ["repo"]
+            }
+        }));
+    }
+
+    // Add cache_control to last tool for prompt caching
+    if let Some(last) = tools.last_mut() {
+        last["cache_control"] = json!({"type": "ephemeral"});
+    }
 
     info!(
         team_id = team_id,
@@ -2192,6 +2284,8 @@ async fn load_plan_chat_context(
         system_prompt,
         messages: api_messages,
         tools,
+        github_token,
+        repo_branches,
     })
 }
 
@@ -2339,7 +2433,10 @@ pub async fn plan_chat(
             return Ok(Json(json!({ "content": text, "mcp_servers": servers })));
         }
 
-        // Execute MCP tool calls via proxy Lambda (in parallel)
+        // Execute tool calls in parallel (built-in GitHub tools + MCP proxy tools)
+        let github_token_ref = &ctx.github_token;
+        let repo_branches_ref = &ctx.repo_branches;
+        let http_ref = &state.http;
         let tool_futures: Vec<_> = tool_uses.iter().map(|tu| {
             let full_name = tu["name"].as_str().unwrap_or("").to_string();
             let input = tu["input"].clone();
@@ -2348,11 +2445,20 @@ pub async fn plan_chat(
             let team_id_ref = &claims.team_id;
             async move {
                 let result = if let Some((server_id, tool_name)) = full_name.split_once("__") {
-                    match invoke_mcp_tool(state_ref, team_id_ref, server_id, tool_name, &input).await {
-                        Ok(result) => (Some(server_id.to_string()), result),
-                        Err(e) => {
-                            warn!(tool = full_name.as_str(), error = %e, "MCP tool call failed");
-                            (Some(server_id.to_string()), json!(format!("Error: {e}")))
+                    if server_id == "github" {
+                        // Built-in GitHub codebase tool
+                        let output = execute_github_tool(
+                            http_ref, github_token_ref, repo_branches_ref,
+                            tool_name, &input,
+                        ).await;
+                        (Some("github".to_string()), json!(output))
+                    } else {
+                        match invoke_mcp_tool(state_ref, team_id_ref, server_id, tool_name, &input).await {
+                            Ok(result) => (Some(server_id.to_string()), result),
+                            Err(e) => {
+                                warn!(tool = full_name.as_str(), error = %e, "MCP tool call failed");
+                                (Some(server_id.to_string()), json!(format!("Error: {e}")))
+                            }
                         }
                     }
                 } else {
@@ -2445,6 +2551,8 @@ async fn run_anthropic_stream(
     tools: &[Value],
     messages: &mut Vec<Value>,
     team_id: &str,
+    github_token: &Option<String>,
+    repo_branches: &std::collections::HashMap<String, String>,
 ) {
     use futures::StreamExt;
 
@@ -2682,11 +2790,19 @@ async fn run_anthropic_stream(
                 .await;
 
             let result = if let Some((server_id, tool_name)) = tu_name.split_once("__") {
-                match invoke_mcp_tool(state, team_id, server_id, tool_name, &input).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(tool = tu_name.as_str(), error = %e, "MCP tool call failed");
-                        json!(format!("Error: {e}"))
+                if server_id == "github" {
+                    let output = execute_github_tool(
+                        &http, github_token, repo_branches,
+                        tool_name, &input,
+                    ).await;
+                    json!(output)
+                } else {
+                    match invoke_mcp_tool(state, team_id, server_id, tool_name, &input).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(tool = tu_name.as_str(), error = %e, "MCP tool call failed");
+                            json!(format!("Error: {e}"))
+                        }
                     }
                 }
             } else {
@@ -2839,6 +2955,8 @@ pub async fn plan_chat_stream(
     let team_id = claims.team_id.clone();
     let system_prompt = ctx.system_prompt;
     let tools = ctx.tools;
+    let github_token = ctx.github_token;
+    let repo_branches = ctx.repo_branches;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<
         Result<axum::response::sse::Event, std::convert::Infallible>,
@@ -2864,6 +2982,8 @@ pub async fn plan_chat_stream(
                 &tools,
                 &mut api_messages,
                 &team_id,
+                &github_token,
+                &repo_branches,
             )
             .await;
         } else {
@@ -3273,4 +3393,194 @@ async fn invoke_mcp_tool(
     }
 
     Ok(response.get("result").cloned().unwrap_or(json!(null)))
+}
+
+/// Execute a built-in GitHub codebase tool (search_code, read_file, list_directory).
+/// Uses the GitHub REST API directly with the team's installation token.
+async fn execute_github_tool(
+    http: &reqwest::Client,
+    github_token: &Option<String>,
+    repo_branches: &std::collections::HashMap<String, String>,
+    tool_name: &str,
+    input: &Value,
+) -> String {
+    let token = match github_token {
+        Some(t) => t,
+        None => return "Error: GitHub integration not configured for this team.".to_string(),
+    };
+
+    let repo = match input["repo"].as_str() {
+        Some(r) => r,
+        None => return "Error: 'repo' parameter is required.".to_string(),
+    };
+
+    let (owner, name) = match repo.split_once('/') {
+        Some(parts) => parts,
+        None => return format!("Error: invalid repo format '{repo}', expected 'owner/name'."),
+    };
+
+    let default_branch = repo_branches
+        .get(repo)
+        .map(|s| s.as_str())
+        .unwrap_or("main");
+
+    match tool_name {
+        "search_code" => {
+            let query = match input["query"].as_str() {
+                Some(q) => q,
+                None => return "Error: 'query' parameter is required.".to_string(),
+            };
+            github_search_code(http, token, owner, name, query).await
+        }
+        "read_file" => {
+            let path = match input["path"].as_str() {
+                Some(p) => p,
+                None => return "Error: 'path' parameter is required.".to_string(),
+            };
+            github_read_file(http, token, owner, name, path, default_branch).await
+        }
+        "list_directory" => {
+            let path = input["path"].as_str().unwrap_or("");
+            github_list_directory(http, token, owner, name, path, default_branch).await
+        }
+        _ => format!("Error: unknown GitHub tool '{tool_name}'."),
+    }
+}
+
+async fn github_search_code(
+    http: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    name: &str,
+    query: &str,
+) -> String {
+    let search_query = format!("{query} repo:{owner}/{name}");
+    let resp = http
+        .get("https://api.github.com/search/code")
+        .query(&[("q", &search_query), ("per_page", &"20".to_string())])
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github.text-match+json")
+        .header("User-Agent", "Coderhelm-bot")
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            match r.json::<Value>().await {
+                Ok(data) => {
+                    let items = data["items"].as_array().cloned().unwrap_or_default();
+                    if items.is_empty() {
+                        return "No results found.".to_string();
+                    }
+                    let mut output = format!("{} results:\n", items.len());
+                    for item in &items {
+                        let path = item["path"].as_str().unwrap_or("");
+                        output.push_str(&format!("\n## {path}\n"));
+                        if let Some(matches) = item["text_matches"].as_array() {
+                            for m in matches {
+                                if let Some(frag) = m["fragment"].as_str() {
+                                    output.push_str(&format!("```\n{frag}\n```\n"));
+                                }
+                            }
+                        }
+                    }
+                    // Cap output to avoid bloating context
+                    if output.len() > 12000 {
+                        output.truncate(12000);
+                        output.push_str("\n... (truncated)");
+                    }
+                    output
+                }
+                Err(e) => format!("Error parsing search results: {e}"),
+            }
+        }
+        Ok(r) => format!("GitHub API error: {}", r.status()),
+        Err(e) => format!("Request failed: {e}"),
+    }
+}
+
+async fn github_read_file(
+    http: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    name: &str,
+    path: &str,
+    branch: &str,
+) -> String {
+    let url = format!(
+        "https://api.github.com/repos/{owner}/{name}/contents/{path}?ref={branch}"
+    );
+    let resp = http
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github.raw+json")
+        .header("User-Agent", "Coderhelm-bot")
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            match r.text().await {
+                Ok(content) => {
+                    if content.len() > 32000 {
+                        format!("{}... (truncated, {} bytes total)", &content[..32000], content.len())
+                    } else {
+                        content
+                    }
+                }
+                Err(e) => format!("Error reading response: {e}"),
+            }
+        }
+        Ok(r) if r.status().as_u16() == 404 => format!("File not found: {path}"),
+        Ok(r) => format!("GitHub API error: {}", r.status()),
+        Err(e) => format!("Request failed: {e}"),
+    }
+}
+
+async fn github_list_directory(
+    http: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    name: &str,
+    path: &str,
+    branch: &str,
+) -> String {
+    let url = if path.is_empty() {
+        format!("https://api.github.com/repos/{owner}/{name}/contents?ref={branch}")
+    } else {
+        format!("https://api.github.com/repos/{owner}/{name}/contents/{path}?ref={branch}")
+    };
+    let resp = http
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Coderhelm-bot")
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            match r.json::<Value>().await {
+                Ok(Value::Array(items)) => {
+                    let mut output = String::new();
+                    for item in &items {
+                        let name = item["name"].as_str().unwrap_or("");
+                        let item_type = item["type"].as_str().unwrap_or("file");
+                        let icon = if item_type == "dir" { "📁" } else { "📄" };
+                        output.push_str(&format!("{icon} {name}\n"));
+                    }
+                    if output.is_empty() {
+                        "Empty directory.".to_string()
+                    } else {
+                        output
+                    }
+                }
+                Ok(_) => "Path is a file, not a directory. Use read_file instead.".to_string(),
+                Err(e) => format!("Error parsing directory listing: {e}"),
+            }
+        }
+        Ok(r) if r.status().as_u16() == 404 => format!("Directory not found: {path}"),
+        Ok(r) => format!("GitHub API error: {}", r.status()),
+        Err(e) => format!("Request failed: {e}"),
+    }
 }
