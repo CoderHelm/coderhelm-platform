@@ -2784,7 +2784,7 @@ async fn is_ticket_already_running(state: &WorkerState, msg: &TicketMessage) -> 
 }
 
 /// Load must-rules (global + repo-specific) from DynamoDB and merge them.
-async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<String> {
+pub(crate) async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<String> {
     // Hardcoded safety rules that always apply
     let mut rules = vec![
         "Never push directly to the default/main branch. Always create a feature branch."

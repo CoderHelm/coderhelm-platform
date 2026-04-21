@@ -352,6 +352,14 @@ pub async fn run(
 
     let mut usage = load_usage_from_checkpoint(state, &msg.team_id, &msg.run_id).await;
 
+    // Load rules and repo instructions so CI fix / review fix have full context
+    let rules = super::load_rules(state, &ticket_msg).await;
+    let repo_instructions =
+        super::load_repo_instructions(&github, &repo_owner, &repo_name).await;
+
+    // Collect any review feedback (comments on the PR) — useful for both CI fix and review paths
+    let review_feedback = collect_review_feedback(&events);
+
     if has_ci_fail && !has_ci_pass {
         // CI failed — try to fix
         info!(run_id = msg.run_id, "CI failed — attempting fix");
@@ -427,6 +435,13 @@ pub async fn run(
         };
         let file_cache = FileCache::default();
 
+        // Include review feedback if any PR comments arrived alongside CI failure
+        let review_context = if review_feedback.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nPR review comments (also address if relevant):\n{review_feedback}")
+        };
+
         let feedback = format!(
             "CI workflow failed on PR #{pr_number} (branch: {branch}). Fix the failures.\n\n\
              Rules:\n\
@@ -435,7 +450,7 @@ pub async fn run(
              - If tests need updating because the feature changed behavior intentionally, update the tests.\n\
              - You may create new test files or edit existing ones if needed.\n\n\
              Failure summary:\n{failure_logs}\n\n\
-             Full logs:\n{logs}"
+             Full logs:\n{logs}{review_context}"
         );
 
         match implement::run(
@@ -444,8 +459,8 @@ pub async fn run(
             &github,
             &plan_result,
             &branch,
-            &[],
-            "",
+            &rules,
+            &repo_instructions,
             Some(&feedback),
             "medium",
             &provider,
@@ -455,8 +470,8 @@ pub async fn run(
         )
         .await
         {
-            Ok(_) => {
-                info!(run_id = msg.run_id, "CI fix implemented, pushing");
+            Ok(result) => {
+                info!(run_id = msg.run_id, files = result.files_modified.len(), "CI fix implemented");
                 write_pass_trace(
                     state,
                     &msg.team_id,
@@ -468,6 +483,13 @@ pub async fn run(
                     None,
                 )
                 .await;
+
+                if result.files_modified.is_empty() {
+                    warn!(run_id = msg.run_id, "CI fix produced no changes — failing to avoid loop");
+                    set_run_status(state, &msg.team_id, &msg.run_id, "failed", "ci_fix_no_changes")
+                        .await;
+                    return Ok(());
+                }
             }
             Err(e) => {
                 error!(run_id = msg.run_id, error = %e, "CI fix implementation failed");
@@ -510,12 +532,11 @@ pub async fn run(
         );
     } else if has_ci_pass {
         // CI passed — run review (include any PR review/comment feedback)
-        let review_feedback = collect_review_feedback(&events);
-        let repo_instructions = if review_feedback.is_empty() {
-            String::new()
+        let review_repo_instructions = if review_feedback.is_empty() {
+            repo_instructions.clone()
         } else {
             format!(
-                "## Human Review Feedback\nThe following feedback was left on the PR. Address these comments:\n\n{}",
+                "{repo_instructions}\n\n## Human Review Feedback\nThe following feedback was left on the PR. Address these comments:\n\n{}",
                 review_feedback
             )
         };
@@ -543,8 +564,8 @@ pub async fn run(
             &github,
             &plan_result,
             &branch,
-            &[],
-            &repo_instructions,
+            &rules,
+            &review_repo_instructions,
             &provider,
             &mut usage,
             &file_cache,
@@ -604,8 +625,8 @@ pub async fn run(
                 &github,
                 &plan_result,
                 &branch,
-                &[],
-                "",
+                &rules,
+                &repo_instructions,
                 Some(&review_result.summary),
                 "medium",
                 &provider,
@@ -615,7 +636,7 @@ pub async fn run(
             )
             .await
             {
-                Ok(_) => {
+                Ok(result) => {
                     write_pass_trace(
                         state,
                         &msg.team_id,
@@ -627,6 +648,24 @@ pub async fn run(
                         None,
                     )
                     .await;
+
+                    if result.files_modified.is_empty() {
+                        warn!(run_id = msg.run_id, "Review fix produced no changes — completing anyway");
+                        mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                        complete_run_with_status(
+                            state,
+                            &ticket_msg,
+                            &msg.run_id,
+                            "completed",
+                            &pr_url,
+                            pr_number,
+                            &branch,
+                            &usage,
+                            start.elapsed().as_secs(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                 }
                 Err(e) => {
                     error!(run_id = msg.run_id, error = %e, "Review fix implementation failed");
