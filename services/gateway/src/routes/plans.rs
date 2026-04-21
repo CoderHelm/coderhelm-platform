@@ -2367,8 +2367,11 @@ pub async fn plan_chat(
             "max_tokens": 4096,
             "system": [{"type": "text", "text": ctx.system_prompt, "cache_control": {"type": "ephemeral"}}],
             "messages": api_messages,
-            "temperature": 0.7
         });
+        // Opus models don't support temperature
+        if !model_id.contains("opus") {
+            body["temperature"] = json!(0.7);
+        }
         if !ctx.tools.is_empty() {
             body["tools"] = json!(ctx.tools);
         }
@@ -2596,8 +2599,11 @@ async fn run_anthropic_stream(
             "stream": true,
             "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
             "messages": messages,
-            "temperature": 0.7
         });
+        // Opus models don't support temperature
+        if !model_id.contains("opus") {
+            body["temperature"] = json!(0.7);
+        }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
