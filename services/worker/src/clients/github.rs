@@ -199,6 +199,19 @@ impl GitHubClient {
         Ok(branch)
     }
 
+    /// Get the repository's primary language and description from GitHub.
+    pub async fn get_repo_info(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<(Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}");
+        let data = self.get(&url).await?;
+        let language = data.get("language").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let description = data.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+        Ok((language, description))
+    }
+
     /// Get the full recursive file tree.
     pub async fn get_tree(
         &self,

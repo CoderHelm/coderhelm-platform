@@ -10,6 +10,7 @@ const LAMBDA_TIMEOUT_SECS: u64 = 900;
 const MIN_TIME_FOR_REMEDIATION_SECS: u64 = 240; // 4 minutes
 
 use crate::agent::mcp;
+use crate::agent::{llm, provider};
 use crate::clients::email;
 use crate::clients::github::GitHubClient;
 use crate::memory::AgentMemory;
@@ -453,7 +454,7 @@ async fn run_passes(
                 info!(run_id, repo = %repos[0], "Single repo available");
             } else {
                 // Multiple repos — ask LLM to pick based on ticket content
-                match triage::select_repo(state, &msg, &repos, &provider, usage).await {
+                match triage::select_repo(state, &msg, &repos, &github, &provider, usage).await {
                     Ok(selected) => {
                         let (owner, name) = selected.split_once('/').unwrap_or(("", ""));
                         msg.repo_owner = owner.to_string();
@@ -1225,6 +1226,8 @@ async fn run_passes(
             state,
             &msg.team_id,
             &team_repos,
+            &provider,
+            usage,
         )
         .await;
 
@@ -3012,7 +3015,9 @@ struct PlanValidation {
     switch_repo: Option<String>,
 }
 
-/// Deterministic plan validation — catches bad plans before the expensive Implement pass.
+/// Plan validation — catches bad plans before the expensive Implement pass.
+/// Uses deterministic checks (scope, file existence, plan-text mentions) plus
+/// an LLM repo-fit check as a final safety net.
 async fn validate_plan(
     plan: &plan::PlanResult,
     github: &GitHubClient,
@@ -3022,6 +3027,8 @@ async fn validate_plan(
     state: &WorkerState,
     team_id: &str,
     team_repos: &[String],
+    provider: &provider::ModelProvider,
+    usage: &mut TokenUsage,
 ) -> PlanValidation {
     let mut warnings = Vec::new();
     let mut blocked = false;
@@ -3135,16 +3142,26 @@ async fn validate_plan(
         let full_plan = format!("{}\n{}\n{}\n{}", plan.proposal, plan.design, plan.tasks, plan.spec);
         let full_plan_lower = full_plan.to_lowercase();
 
-        // Count mentions of each team repo name in the plan text
+        // Count mentions of each team repo using word-boundary regex to avoid
+        // substring false positives (e.g. "api" matching inside "gangway-api")
         let mut best_candidate: Option<(String, usize)> = None;
-        let current_mentions = full_plan_lower.matches(&repo_name.to_lowercase()).count();
+        let current_name_lower = repo_name.to_lowercase();
+        let current_re = regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(&current_name_lower)))
+            .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
+        let current_mentions = current_re.find_iter(&full_plan_lower).count();
 
         for candidate in team_repos {
             if *candidate == current_repo {
                 continue;
             }
             if let Some((_owner, cand_name)) = candidate.split_once('/') {
-                let cand_mentions = full_plan_lower.matches(&cand_name.to_lowercase()).count();
+                let cand_lower = cand_name.to_lowercase();
+                // First try full owner/name match, then word-bounded name match
+                let full_match_count = full_plan_lower.matches(&candidate.to_lowercase()).count();
+                let name_re = regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(&cand_lower)))
+                    .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
+                let cand_mentions = full_match_count + name_re.find_iter(&full_plan_lower).count();
+
                 // Candidate repo must be mentioned at least 2 times and more than current
                 if cand_mentions >= 2 && cand_mentions > current_mentions {
                     if best_candidate.as_ref().map_or(true, |(_, best)| cand_mentions > *best) {
@@ -3166,92 +3183,131 @@ async fn validate_plan(
         }
     }
 
-    // 4. Tech-stack mismatch — if plan creates files with extensions that don't match the
-    //    current repo's stack, check which team repo does match.
-    //    e.g. plan creates .ts files but current repo is Python → switch to the TS repo.
-    if switch_repo.is_none() && !mentioned_files.is_empty() {
-        let ts_js_count = mentioned_files.iter().filter(|f| {
-            let ext = f.rsplit('.').next().unwrap_or("");
-            matches!(ext, "ts" | "tsx" | "js" | "jsx")
-        }).count();
-        let py_count = mentioned_files.iter().filter(|f| f.ends_with(".py")).count();
-        let rs_count = mentioned_files.iter().filter(|f| f.ends_with(".rs")).count();
+    // 4. LLM repo-fit check — ask the LLM if this plan actually belongs in this repo.
+    //    Uses AGENTS#GLOBAL context, repo description, directory listing, and plan summary
+    //    to detect mismatches that deterministic checks miss (e.g. new files, same language).
+    if switch_repo.is_none() && team_repos.len() > 1 {
+        let current_repo = format!("{repo_owner}/{repo_name}");
 
-        // Determine plan's dominant language
-        let plan_lang = if ts_js_count > py_count && ts_js_count > rs_count {
-            Some("ts")
-        } else if py_count > ts_js_count && py_count > rs_count {
-            Some("py")
-        } else if rs_count > ts_js_count && rs_count > py_count {
-            Some("rs")
-        } else {
-            None
+        // Gather context: AGENTS#GLOBAL + repo info + directory listing
+        let global_agents = load_content(state, team_id, "AGENTS#GLOBAL").await;
+
+        let (current_lang, current_desc) = github.get_repo_info(repo_owner, repo_name).await
+            .unwrap_or((None, None));
+        let current_dirs = match github.list_directory(repo_owner, repo_name, "", base_branch).await {
+            Ok(entries) => entries.iter().take(20).map(|e| e.name.clone()).collect::<Vec<_>>().join(", "),
+            Err(_) => String::new(),
         };
 
-        if let Some(lang) = plan_lang {
-            // Check what language the current repo uses via marker files
-            let current_repo_lang = detect_repo_lang(github, repo_owner, repo_name, base_branch).await;
-            if let Some(ref repo_lang) = current_repo_lang {
-                if repo_lang != lang {
-                    // Current repo language doesn't match plan — find a matching repo
-                    let current_repo = format!("{repo_owner}/{repo_name}");
-                    for candidate in team_repos {
-                        if *candidate == current_repo {
-                            continue;
-                        }
-                        let parts: Vec<&str> = candidate.splitn(2, '/').collect();
-                        if parts.len() != 2 { continue; }
-                        let cand_lang = detect_repo_lang(github, parts[0], parts[1], "HEAD").await;
-                        if cand_lang.as_deref() == Some(lang) {
-                            info!(
-                                current = %current_repo,
-                                candidate = %candidate,
-                                plan_lang = lang,
-                                repo_lang = %repo_lang,
-                                "Tech-stack mismatch — plan is {lang} but repo is {repo_lang}, switching"
-                            );
-                            switch_repo = Some(candidate.clone());
-                            break;
-                        }
+        // Build candidate repo summaries
+        let mut other_repo_info = Vec::new();
+        for candidate in team_repos {
+            if *candidate == current_repo { continue; }
+            let parts: Vec<&str> = candidate.splitn(2, '/').collect();
+            if parts.len() != 2 { continue; }
+            let (cand_lang, cand_desc) = github.get_repo_info(parts[0], parts[1]).await
+                .unwrap_or((None, None));
+            let cand_dirs = match github.list_directory(parts[0], parts[1], "", "HEAD").await {
+                Ok(entries) => entries.iter().take(15).map(|e| e.name.clone()).collect::<Vec<_>>().join(", "),
+                Err(_) => String::new(),
+            };
+            let mut info = format!("  {candidate}");
+            if let Some(l) = cand_lang { info.push_str(&format!(" (lang: {l})")); }
+            if let Some(d) = cand_desc { info.push_str(&format!(" — {d}")); }
+            if !cand_dirs.is_empty() { info.push_str(&format!("\n    files: [{cand_dirs}]")); }
+            other_repo_info.push(info);
+        }
+
+        let plan_summary = format!(
+            "Proposal: {}\nDesign: {}\nTasks: {}",
+            &plan.proposal[..plan.proposal.len().min(500)],
+            &plan.design[..plan.design.len().min(500)],
+            &plan.tasks[..plan.tasks.len().min(500)],
+        );
+
+        let prompt = format!(
+            r#"You are validating whether an implementation plan belongs in the correct repository.
+
+## Current repository: {current_repo}
+Language: {lang}
+Description: {desc}
+Top-level files: [{dirs}]
+
+## Other available repositories:
+{others}
+{agents_section}
+## Plan summary:
+{plan_summary}
+
+## Question
+Does this plan belong in {current_repo}, or should it be in one of the other repositories?
+
+Rules:
+- Consider what each repo is FOR based on its name, description, directory structure, and AGENTS context.
+- Data/ETL/pipeline repos are for data work only, NOT application features.
+- If the plan mentions a specific service or API (e.g. "gangway", "adyen webhook"), match it to the repo that OWNS that code.
+- If the plan clearly belongs in the current repo, respond: CORRECT
+- If it belongs in a different repo, respond: SWITCH owner/name
+
+Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
+            lang = current_lang.as_deref().unwrap_or("unknown"),
+            desc = current_desc.as_deref().unwrap_or("none"),
+            dirs = current_dirs,
+            others = other_repo_info.join("\n"),
+            agents_section = if global_agents.is_empty() {
+                String::new()
+            } else {
+                format!("\n## Repository context (AGENTS#GLOBAL):\n{global_agents}\n")
+            },
+        );
+
+        let system = "You are a repository routing validator. Be precise — only suggest a switch \
+                      if you are confident the plan does NOT belong in the current repo.";
+
+        let mut messages = vec![("user".to_string(), vec![serde_json::json!({"type": "text", "text": prompt})])];
+
+        match provider::converse(
+            state,
+            provider,
+            provider.primary_model_id(),
+            system,
+            &mut messages,
+            &[],
+            &triage::NoOpExecutor,
+            usage,
+            llm::ConverseOptions { max_turns: 1, max_tokens: 128 },
+            None,
+            None,
+        ).await {
+            Ok(response) => {
+                let trimmed: &str = response.trim();
+                if let Some(rest) = trimmed.strip_prefix("SWITCH") {
+                    let clean = rest.trim().trim_matches('`').trim().to_string();
+                    if team_repos.iter().any(|r| r == &clean) {
+                        info!(
+                            current = %current_repo,
+                            suggested = %clean,
+                            "LLM repo-fit check suggests switching repo"
+                        );
+                        switch_repo = Some(clean);
+                    } else {
+                        warn!(
+                            current = %current_repo,
+                            suggested = %clean,
+                            "LLM suggested repo not in team repos, ignoring"
+                        );
                     }
+                } else {
+                    info!(current = %current_repo, "LLM repo-fit check: CORRECT");
                 }
+            }
+            Err(e) => {
+                warn!(error = %e, "LLM repo-fit check failed, proceeding with current repo");
             }
         }
     }
 
     PlanValidation { warnings, blocked, switch_repo }
-}
-
-/// Detect a repo's primary language by checking for marker files.
-/// Returns "ts" for TypeScript/JS, "py" for Python, "rs" for Rust, etc.
-async fn detect_repo_lang(
-    github: &GitHubClient,
-    owner: &str,
-    name: &str,
-    branch: &str,
-) -> Option<String> {
-    // Check for TypeScript/JS markers
-    if github.read_file(owner, name, "tsconfig.json", branch).await.is_ok()
-        || github.read_file(owner, name, "package.json", branch).await.is_ok()
-    {
-        return Some("ts".to_string());
-    }
-    // Check for Python markers
-    if github.read_file(owner, name, "pyproject.toml", branch).await.is_ok()
-        || github.read_file(owner, name, "requirements.txt", branch).await.is_ok()
-        || github.read_file(owner, name, "setup.py", branch).await.is_ok()
-    {
-        return Some("py".to_string());
-    }
-    // Check for Rust markers
-    if github.read_file(owner, name, "Cargo.toml", branch).await.is_ok() {
-        return Some("rs".to_string());
-    }
-    // Check for Go markers
-    if github.read_file(owner, name, "go.mod", branch).await.is_ok() {
-        return Some("go".to_string());
-    }
-    None
 }
 
 /// Load a numeric workflow setting from SETTINGS#WORKFLOW.

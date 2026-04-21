@@ -132,24 +132,48 @@ pub async fn select_repo(
     state: &WorkerState,
     msg: &TicketMessage,
     repos: &[String],
+    github: &GitHubClient,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let system = "You are a repo-selection agent. Given a Jira ticket and a list of repositories \
                   with descriptions, pick the single best repository for implementation. \
                   Rules: \
-                  1. Read the repository descriptions carefully — match the ticket to the repo that OWNS that feature area. \
+                  1. Read the repository descriptions and languages carefully — match the ticket to the repo that OWNS that feature area. \
                   2. Data/analytics/ETL/pipeline repos (e.g. airflow, dbt) are ONLY for data pipeline work, NOT for application features or API integrations. \
                   3. If the ticket mentions specific services, APIs, SDKs, or integrations (e.g. Adyen, Exerp API, billing), pick the repo that implements or calls those services — typically an API/backend repo, not a data repo. \
                   4. Terraform/infrastructure repos are ONLY for infra changes (IAM, networking, deployment config). \
                   5. When unsure, prefer application/API repos over data or infrastructure repos. \
                   Think step by step: (1) what is this ticket about, (2) which repo owns that area, (3) return ONLY the repo in owner/name format.";
 
-    let repo_list = repos
-        .iter()
-        .map(|r| format!("- {r}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Enrich repo list with language, description, and top-level directory from GitHub
+    let mut repo_lines = Vec::new();
+    for r in repos {
+        if let Some((owner, name)) = r.split_once('/') {
+            let (lang, desc) = github.get_repo_info(owner, name).await.unwrap_or((None, None));
+            let top_dirs = match github.list_directory(owner, name, "", "HEAD").await {
+                Ok(entries) => entries
+                    .iter()
+                    .take(20)
+                    .map(|e| e.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                Err(_) => String::new(),
+            };
+            let mut parts = Vec::new();
+            if let Some(l) = lang { parts.push(format!("lang: {l}")); }
+            if let Some(d) = desc { parts.push(d); }
+            if !top_dirs.is_empty() { parts.push(format!("files: [{top_dirs}]")); }
+            if parts.is_empty() {
+                repo_lines.push(format!("- {r}"));
+            } else {
+                repo_lines.push(format!("- {r} — {}", parts.join(" · ")));
+            }
+        } else {
+            repo_lines.push(format!("- {r}"));
+        }
+    }
+    let repo_list = repo_lines.join("\n");
 
     let global_agents = super::load_content(state, &msg.team_id, "AGENTS#GLOBAL").await;
 
