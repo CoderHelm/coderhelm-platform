@@ -2328,8 +2328,13 @@ pub async fn plan_chat(
 
     let model_id = provider_result
         .as_ref()
-        .and_then(|item| item.get("primary_model"))
-        .and_then(|v| v.as_s().ok())
+        .and_then(|item| {
+            // Prefer heavy_model for plan chat (better reasoning for planning)
+            item.get("heavy_model")
+                .and_then(|v| v.as_s().ok())
+                .filter(|s| !s.is_empty())
+                .or_else(|| item.get("primary_model").and_then(|v| v.as_s().ok()))
+        })
         .cloned()
         .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
@@ -2946,8 +2951,13 @@ pub async fn plan_chat_stream(
 
     let model_id = provider_result
         .as_ref()
-        .and_then(|item| item.get("primary_model"))
-        .and_then(|v| v.as_s().ok())
+        .and_then(|item| {
+            // Prefer heavy_model for plan chat (better reasoning for planning)
+            item.get("heavy_model")
+                .and_then(|v| v.as_s().ok())
+                .filter(|s| !s.is_empty())
+                .or_else(|| item.get("primary_model").and_then(|v| v.as_s().ok()))
+        })
         .cloned()
         .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
