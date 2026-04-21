@@ -230,7 +230,10 @@ Rules:
         .filter(|c| c.comment_id.is_some() && !c.is_context)
         .collect();
 
-    if sections.len() == actionable_comments.len() {
+    if actionable_comments.is_empty() {
+        // CI-only fix — the commit diff speaks for itself, no comment needed
+        info!(run_id = %msg.run_id, "CI-only feedback — skipping PR comment (commit is the communication)");
+    } else if sections.len() == actionable_comments.len() {
         // Matched — post each section to its corresponding comment thread
         for (section, comment) in sections.iter().zip(actionable_comments.iter()) {
             let reply = if section.len() > 65000 {
@@ -249,7 +252,7 @@ Rules:
                 .await?;
         }
     } else {
-        // Fallback — post first non-empty section (strip ---SPLIT--- markers)
+        // Fallback — reply to the first review thread
         let reply_text = sections
             .first()
             .map(|s| s.to_string())
@@ -259,8 +262,7 @@ Rules:
         } else {
             reply_text
         };
-        let first_comment_id = actionable_comments.first().and_then(|c| c.comment_id);
-        if let Some(comment_id) = first_comment_id {
+        if let Some(comment_id) = actionable_comments.first().and_then(|c| c.comment_id) {
             github
                 .reply_to_review_comment(
                     &msg.repo_owner,
@@ -269,10 +271,6 @@ Rules:
                     comment_id,
                     &reply,
                 )
-                .await?;
-        } else {
-            github
-                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
                 .await?;
         }
     }
