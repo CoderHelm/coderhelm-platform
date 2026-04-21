@@ -418,9 +418,8 @@ async fn run_passes(
     }
 
     // --- Resolve repo for Jira tickets ---
-    // For Jira: pick a starting repo (project mapping > first enabled repo).
-    // The plan pass explores ALL repos, and validate_plan switches to the
-    // correct one based on where the referenced files actually live.
+    // For Jira: project mapping > LLM select_repo > single repo fallback.
+    // validate_plan is the final safety net (tech-stack + plan-text checks).
     if matches!(msg.source, TicketSource::Jira) {
         let repos = plan::fetch_team_repos(state, &msg.team_id).await;
         if repos.is_empty() {
@@ -444,12 +443,32 @@ async fn run_passes(
             }
         }
 
-        // If no mapping (or mapped repo not enabled), just pick first repo as placeholder
+        // If no mapping (or mapped repo not enabled), use LLM to pick the best repo
         if msg.repo_owner.is_empty() || !repos.iter().any(|r| r == &format!("{}/{}", msg.repo_owner, msg.repo_name)) {
-            let (owner, name) = repos[0].split_once('/').unwrap_or(("", ""));
-            msg.repo_owner = owner.to_string();
-            msg.repo_name = name.to_string();
-            info!(run_id, repo = %repos[0], "Placeholder repo — plan + validate_plan will determine actual repo");
+            if repos.len() == 1 {
+                // Only one repo — no need for LLM
+                let (owner, name) = repos[0].split_once('/').unwrap_or(("", ""));
+                msg.repo_owner = owner.to_string();
+                msg.repo_name = name.to_string();
+                info!(run_id, repo = %repos[0], "Single repo available");
+            } else {
+                // Multiple repos — ask LLM to pick based on ticket content
+                match triage::select_repo(state, &msg, &repos, &provider, usage).await {
+                    Ok(selected) => {
+                        let (owner, name) = selected.split_once('/').unwrap_or(("", ""));
+                        msg.repo_owner = owner.to_string();
+                        msg.repo_name = name.to_string();
+                        info!(run_id, repo = %selected, "LLM selected repo for Jira ticket");
+                    }
+                    Err(e) => {
+                        // Fall back to first repo if LLM fails
+                        let (owner, name) = repos[0].split_once('/').unwrap_or(("", ""));
+                        msg.repo_owner = owner.to_string();
+                        msg.repo_name = name.to_string();
+                        warn!(run_id, error = %e, repo = %repos[0], "LLM repo selection failed, using first repo");
+                    }
+                }
+            }
         }
     } else if msg.repo_owner.is_empty() || msg.repo_name.is_empty() {
         return Err("repo_owner and repo_name are required for GitHub tickets".into());
@@ -3108,7 +3127,131 @@ async fn validate_plan(
         }
     }
 
+    // 3. Plan-text repo mention check — if the plan explicitly names a different team repo
+    //    more than the current one, the planner probably explored and found the right repo
+    //    but triage started in the wrong one (common for Jira tickets).
+    if switch_repo.is_none() {
+        let current_repo = format!("{repo_owner}/{repo_name}");
+        let full_plan = format!("{}\n{}\n{}\n{}", plan.proposal, plan.design, plan.tasks, plan.spec);
+        let full_plan_lower = full_plan.to_lowercase();
+
+        // Count mentions of each team repo name in the plan text
+        let mut best_candidate: Option<(String, usize)> = None;
+        let current_mentions = full_plan_lower.matches(&repo_name.to_lowercase()).count();
+
+        for candidate in team_repos {
+            if *candidate == current_repo {
+                continue;
+            }
+            if let Some((_owner, cand_name)) = candidate.split_once('/') {
+                let cand_mentions = full_plan_lower.matches(&cand_name.to_lowercase()).count();
+                // Candidate repo must be mentioned at least 2 times and more than current
+                if cand_mentions >= 2 && cand_mentions > current_mentions {
+                    if best_candidate.as_ref().map_or(true, |(_, best)| cand_mentions > *best) {
+                        best_candidate = Some((candidate.clone(), cand_mentions));
+                    }
+                }
+            }
+        }
+
+        if let Some((candidate, mentions)) = best_candidate {
+            info!(
+                current = %current_repo,
+                candidate = %candidate,
+                mentions,
+                current_mentions,
+                "Plan text references different repo more often — suggesting switch"
+            );
+            switch_repo = Some(candidate);
+        }
+    }
+
+    // 4. Tech-stack mismatch — if plan creates files with extensions that don't match the
+    //    current repo's stack, check which team repo does match.
+    //    e.g. plan creates .ts files but current repo is Python → switch to the TS repo.
+    if switch_repo.is_none() && !mentioned_files.is_empty() {
+        let ts_js_count = mentioned_files.iter().filter(|f| {
+            let ext = f.rsplit('.').next().unwrap_or("");
+            matches!(ext, "ts" | "tsx" | "js" | "jsx")
+        }).count();
+        let py_count = mentioned_files.iter().filter(|f| f.ends_with(".py")).count();
+        let rs_count = mentioned_files.iter().filter(|f| f.ends_with(".rs")).count();
+
+        // Determine plan's dominant language
+        let plan_lang = if ts_js_count > py_count && ts_js_count > rs_count {
+            Some("ts")
+        } else if py_count > ts_js_count && py_count > rs_count {
+            Some("py")
+        } else if rs_count > ts_js_count && rs_count > py_count {
+            Some("rs")
+        } else {
+            None
+        };
+
+        if let Some(lang) = plan_lang {
+            // Check what language the current repo uses via marker files
+            let current_repo_lang = detect_repo_lang(github, repo_owner, repo_name, base_branch).await;
+            if let Some(ref repo_lang) = current_repo_lang {
+                if repo_lang != lang {
+                    // Current repo language doesn't match plan — find a matching repo
+                    let current_repo = format!("{repo_owner}/{repo_name}");
+                    for candidate in team_repos {
+                        if *candidate == current_repo {
+                            continue;
+                        }
+                        let parts: Vec<&str> = candidate.splitn(2, '/').collect();
+                        if parts.len() != 2 { continue; }
+                        let cand_lang = detect_repo_lang(github, parts[0], parts[1], "HEAD").await;
+                        if cand_lang.as_deref() == Some(lang) {
+                            info!(
+                                current = %current_repo,
+                                candidate = %candidate,
+                                plan_lang = lang,
+                                repo_lang = %repo_lang,
+                                "Tech-stack mismatch — plan is {lang} but repo is {repo_lang}, switching"
+                            );
+                            switch_repo = Some(candidate.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     PlanValidation { warnings, blocked, switch_repo }
+}
+
+/// Detect a repo's primary language by checking for marker files.
+/// Returns "ts" for TypeScript/JS, "py" for Python, "rs" for Rust, etc.
+async fn detect_repo_lang(
+    github: &GitHubClient,
+    owner: &str,
+    name: &str,
+    branch: &str,
+) -> Option<String> {
+    // Check for TypeScript/JS markers
+    if github.read_file(owner, name, "tsconfig.json", branch).await.is_ok()
+        || github.read_file(owner, name, "package.json", branch).await.is_ok()
+    {
+        return Some("ts".to_string());
+    }
+    // Check for Python markers
+    if github.read_file(owner, name, "pyproject.toml", branch).await.is_ok()
+        || github.read_file(owner, name, "requirements.txt", branch).await.is_ok()
+        || github.read_file(owner, name, "setup.py", branch).await.is_ok()
+    {
+        return Some("py".to_string());
+    }
+    // Check for Rust markers
+    if github.read_file(owner, name, "Cargo.toml", branch).await.is_ok() {
+        return Some("rs".to_string());
+    }
+    // Check for Go markers
+    if github.read_file(owner, name, "go.mod", branch).await.is_ok() {
+        return Some("go".to_string());
+    }
+    None
 }
 
 /// Load a numeric workflow setting from SETTINGS#WORKFLOW.
