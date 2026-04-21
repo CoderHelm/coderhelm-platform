@@ -286,6 +286,23 @@ pub async fn orchestrate_ticket(
                     .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
                     .send()
                     .await;
+                // Also update analytics for cancelled runs
+                let month = chrono::Utc::now().format("%Y-%m").to_string();
+                for period in &[month.as_str(), "ALL_TIME"] {
+                    let _ = state
+                        .dynamo
+                        .update_item()
+                        .table_name(&state.config.analytics_table_name)
+                        .key("team_id", attr_s(&msg.team_id))
+                        .key("period", attr_s(period))
+                        .update_expression("ADD total_tokens_in :ti, total_tokens_out :to, cache_read_tokens :crt, cache_write_tokens :cwt")
+                        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+                        .expression_attribute_values(":to", attr_n(usage.output_tokens))
+                        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+                        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+                        .send()
+                        .await;
+                }
             } else {
                 error!(run_id, error = %e, "Orchestration failed");
                 let sanitized = sanitize_error(&err_msg);

@@ -486,14 +486,14 @@ pub async fn run(
 
                 if result.files_modified.is_empty() {
                     warn!(run_id = msg.run_id, "CI fix produced no changes — failing to avoid loop");
-                    set_run_status(state, &msg.team_id, &msg.run_id, "failed", "ci_fix_no_changes")
+                    set_run_status(state, &msg.team_id, &msg.run_id, "failed", "ci_fix_no_changes", &usage)
                         .await;
                     return Ok(());
                 }
             }
             Err(e) => {
                 error!(run_id = msg.run_id, error = %e, "CI fix implementation failed");
-                set_run_status(state, &msg.team_id, &msg.run_id, "failed", "implement")
+                set_run_status(state, &msg.team_id, &msg.run_id, "failed", "implement", &usage)
                     .await;
                 return Err(e);
             }
@@ -883,8 +883,10 @@ async fn set_run_status(
     run_id: &str,
     status: &str,
     current_pass: &str,
+    usage: &TokenUsage,
 ) {
     let now = chrono::Utc::now().to_rfc3339();
+    let cost = usage.estimated_cost();
     let _ = state
         .dynamo
         .update_item()
@@ -892,15 +894,39 @@ async fn set_run_status(
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
         .update_expression(
-            "SET #s = :s, status_run_id = :sri, current_pass = :cp, updated_at = :t",
+            "SET #s = :s, status_run_id = :sri, current_pass = :cp, updated_at = :t, \
+             tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c",
         )
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":s", attr_s(status))
         .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
         .expression_attribute_values(":cp", attr_s(current_pass))
         .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+        .expression_attribute_values(":to", attr_n(usage.output_tokens))
+        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
         .send()
         .await;
+
+    // Update analytics
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    for period in &[month.as_str(), "ALL_TIME"] {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.analytics_table_name)
+            .key("team_id", attr_s(team_id))
+            .key("period", attr_s(period))
+            .update_expression("ADD total_tokens_in :ti, total_tokens_out :to, cache_read_tokens :crt, cache_write_tokens :cwt")
+            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+            .expression_attribute_values(":to", attr_n(usage.output_tokens))
+            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+            .send()
+            .await;
+    }
 }
 
 async fn set_run_awaiting_ci(
@@ -1015,6 +1041,24 @@ async fn complete_run_with_status(
         .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
         .send()
         .await?;
+
+    // Update analytics
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    for period in &[month.as_str(), "ALL_TIME"] {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.analytics_table_name)
+            .key("team_id", attr_s(&msg.team_id))
+            .key("period", attr_s(period))
+            .update_expression("ADD total_tokens_in :ti, total_tokens_out :to, cache_read_tokens :crt, cache_write_tokens :cwt")
+            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+            .expression_attribute_values(":to", attr_n(usage.output_tokens))
+            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+            .send()
+            .await;
+    }
 
     info!(run_id, status, "Run completed");
     Ok(())

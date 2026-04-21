@@ -54,7 +54,7 @@ pub async fn run(
     };
 
     let team_repos = plan::fetch_team_repos(state, &msg.team_id).await;
-    if let Some(target) = detect_wrong_repo(&all_text, &team_repos, &msg, state).await {
+    if let Some(target) = detect_wrong_repo(&all_text, &team_repos, &msg, state, &mut usage).await {
         info!(run_id = %msg.run_id, target = %target, "LLM confirmed wrong-repo signal");
         return handle_wrong_repo(state, &github, &msg, &target).await;
     }
@@ -332,6 +332,8 @@ Rules:
         )
         .update_expression(
             "SET tokens_in = tokens_in + :ti, tokens_out = tokens_out + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :zero) + :crt, \
+             cache_write_tokens = if_not_exists(cache_write_tokens, :zero) + :cwt, \
              updated_at = :t, #s = :s, current_pass = :p, status_run_id = :sri, \
              pass_history = list_append(if_not_exists(pass_history, :empty), :entry)",
         )
@@ -343,6 +345,18 @@ Rules:
         .expression_attribute_values(
             ":to",
             aws_sdk_dynamodb::types::AttributeValue::N(usage.output_tokens.to_string()),
+        )
+        .expression_attribute_values(
+            ":crt",
+            aws_sdk_dynamodb::types::AttributeValue::N(usage.cache_read_tokens.to_string()),
+        )
+        .expression_attribute_values(
+            ":cwt",
+            aws_sdk_dynamodb::types::AttributeValue::N(usage.cache_write_tokens.to_string()),
+        )
+        .expression_attribute_values(
+            ":zero",
+            aws_sdk_dynamodb::types::AttributeValue::N("0".to_string()),
         )
         .expression_attribute_values(
             ":t",
@@ -397,7 +411,7 @@ Rules:
                 "period",
                 aws_sdk_dynamodb::types::AttributeValue::S(period.to_string()),
             )
-            .update_expression("ADD total_tokens_in :ti, total_tokens_out :to")
+            .update_expression("ADD total_tokens_in :ti, total_tokens_out :to, cache_read_tokens :crt, cache_write_tokens :cwt")
             .expression_attribute_values(
                 ":ti",
                 aws_sdk_dynamodb::types::AttributeValue::N(usage.input_tokens.to_string()),
@@ -405,6 +419,14 @@ Rules:
             .expression_attribute_values(
                 ":to",
                 aws_sdk_dynamodb::types::AttributeValue::N(usage.output_tokens.to_string()),
+            )
+            .expression_attribute_values(
+                ":crt",
+                aws_sdk_dynamodb::types::AttributeValue::N(usage.cache_read_tokens.to_string()),
+            )
+            .expression_attribute_values(
+                ":cwt",
+                aws_sdk_dynamodb::types::AttributeValue::N(usage.cache_write_tokens.to_string()),
             )
             .send()
             .await?;
@@ -899,6 +921,7 @@ async fn detect_wrong_repo(
     team_repos: &[String],
     msg: &FeedbackMessage,
     state: &WorkerState,
+    usage: &mut TokenUsage,
 ) -> Option<String> {
     // Quick pre-filter: if none of the other repo names appear in the text, skip the LLM call
     let current = format!("{}/{}", msg.repo_owner, msg.repo_name);
@@ -934,7 +957,6 @@ async fn detect_wrong_repo(
         "Current repo: {current}\nAvailable repos: {repo_list}\n\nReview text:\n{text}"
     );
 
-    let mut usage = TokenUsage::default();
     let model_id = provider.primary_model_id();
     let response = provider::converse_simple(
         state,
@@ -942,7 +964,7 @@ async fn detect_wrong_repo(
         model_id,
         system,
         &prompt,
-        &mut usage,
+        usage,
     )
     .await
     .ok()?;

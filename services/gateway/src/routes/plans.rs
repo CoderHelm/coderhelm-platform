@@ -2386,6 +2386,11 @@ pub async fn plan_chat(
             .await
             .map_err(|e| {
                 error!("Anthropic request failed: {e}");
+                let s = state.clone();
+                let t = claims.team_id.clone();
+                tokio::spawn(async move {
+                    track_chat_tokens(&s, &t, total_input_tokens, total_output_tokens, cache_read_tokens, cache_write_tokens).await;
+                });
                 StatusCode::BAD_GATEWAY
             })?;
 
@@ -2393,11 +2398,21 @@ pub async fn plan_chat(
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             error!("Anthropic API error ({status}): {body}");
+            let s = state.clone();
+            let t = claims.team_id.clone();
+            tokio::spawn(async move {
+                track_chat_tokens(&s, &t, total_input_tokens, total_output_tokens, cache_read_tokens, cache_write_tokens).await;
+            });
             return Err(StatusCode::BAD_GATEWAY);
         }
 
         let response: Value = resp.json().await.map_err(|e| {
             error!("Failed to parse Anthropic response: {e}");
+            let s = state.clone();
+            let t = claims.team_id.clone();
+            tokio::spawn(async move {
+                track_chat_tokens(&s, &t, total_input_tokens, total_output_tokens, cache_read_tokens, cache_write_tokens).await;
+            });
             StatusCode::BAD_GATEWAY
         })?;
 
@@ -2537,8 +2552,8 @@ pub async fn plan_chat(
                 &team_id_clone,
                 total_input_tokens,
                 total_output_tokens,
-                0,
-                0,
+                cache_read_tokens,
+                cache_write_tokens,
             )
             .await;
         });
@@ -2632,6 +2647,7 @@ async fn run_anthropic_stream(
                         json!({"message": format!("Anthropic API error: {status}")}),
                     ))
                     .await;
+                track_chat_tokens(&state, &team_id, total_input_tokens, total_output_tokens, cache_read_tokens, cache_write_tokens).await;
                 return;
             }
             Err(e) => {
@@ -2642,6 +2658,7 @@ async fn run_anthropic_stream(
                         json!({"message": format!("AI service error: {e}")}),
                     ))
                     .await;
+                track_chat_tokens(&state, &team_id, total_input_tokens, total_output_tokens, cache_read_tokens, cache_write_tokens).await;
                 return;
             }
         };

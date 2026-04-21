@@ -140,7 +140,8 @@ Rules:
         )
         .update_expression(
             "SET ci_fix_attempt = :a, tokens_in = tokens_in + :ti, \
-             tokens_out = tokens_out + :to, updated_at = :t",
+             tokens_out = tokens_out + :to, cache_read_tokens = if_not_exists(cache_read_tokens, :zero) + :crt, \
+             cache_write_tokens = if_not_exists(cache_write_tokens, :zero) + :cwt, updated_at = :t",
         )
         .expression_attribute_values(
             ":a",
@@ -154,9 +155,41 @@ Rules:
             ":to",
             aws_sdk_dynamodb::types::AttributeValue::N(usage.output_tokens.to_string()),
         )
-        .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
+        .expression_attribute_values(
+            ":crt",
+            aws_sdk_dynamodb::types::AttributeValue::N(usage.cache_read_tokens.to_string()),
+        )
+        .expression_attribute_values(
+            ":cwt",
+            aws_sdk_dynamodb::types::AttributeValue::N(usage.cache_write_tokens.to_string()),
+        )
+        .expression_attribute_values(
+            ":zero",
+            aws_sdk_dynamodb::types::AttributeValue::N("0".to_string()),
+        )
+        .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now.clone()))
         .send()
         .await?;
+
+    // Update analytics (monthly + all-time)
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    for period in &[month.as_str(), "ALL_TIME"] {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.analytics_table_name)
+            .key("team_id", aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()))
+            .key("period", aws_sdk_dynamodb::types::AttributeValue::S(period.to_string()))
+            .update_expression(
+                "ADD total_tokens_in :ti, total_tokens_out :to, cache_read_tokens :crt, cache_write_tokens :cwt",
+            )
+            .expression_attribute_values(":ti", aws_sdk_dynamodb::types::AttributeValue::N(usage.input_tokens.to_string()))
+            .expression_attribute_values(":to", aws_sdk_dynamodb::types::AttributeValue::N(usage.output_tokens.to_string()))
+            .expression_attribute_values(":crt", aws_sdk_dynamodb::types::AttributeValue::N(usage.cache_read_tokens.to_string()))
+            .expression_attribute_values(":cwt", aws_sdk_dynamodb::types::AttributeValue::N(usage.cache_write_tokens.to_string()))
+            .send()
+            .await;
+    }
 
     Ok(())
 }
