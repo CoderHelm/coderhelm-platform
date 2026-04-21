@@ -69,7 +69,7 @@ pub async fn run(
 2. Read the relevant source files to understand the issue.
 3. Fix the failing code — this is usually a lint error, type error, test failure, or build error.
 4. Use `batch_write` if multiple files need changes.
-5. Output a brief summary of what failed and what you fixed.
+5. Output a one-line summary (e.g. "Fixed 3 lint errors in src/main.ts and src/utils.ts"). Do NOT explain each fix in detail.
 
 Rules:
 - Only fix what the CI is complaining about. Don't refactor or add features.

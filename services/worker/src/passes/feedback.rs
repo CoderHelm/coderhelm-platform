@@ -167,7 +167,7 @@ Rules:
 - Follow the reviewer's suggestions exactly unless they conflict with codebase conventions
 - Don't make unrelated changes
 - Use GitHub markdown (backticks for code, triple-backtick for blocks)
-- Keep replies short (1-3 sentences for confirmations)"#,
+- Keep replies SHORT — 1-2 sentences max. Just say what you did, not what was wrong or why. Example: "Fixed — reformatted to multi-line with trailing comma." Do NOT list every file or explain every change in detail."#,
         pr_number = msg.pr_number,
         comments = formatted,
         ci_failures = ci_failure_block,
