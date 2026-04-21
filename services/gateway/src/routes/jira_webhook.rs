@@ -787,8 +787,8 @@ async fn handle_jira_comment(
                 ticket_id: ticket_key.to_string(),
                 title: title.to_string(),
                 body: extended_body,
-                repo_owner: repo_owner.to_string(),
-                repo_name: repo_name.to_string(),
+                repo_owner: String::new(), // let worker auto-detect via select_repo
+                repo_name: String::new(),
                 issue_number: 0,
                 sender: comment_author.to_string(),
                 image_attachments: if !fresh_images.is_empty() {
@@ -860,8 +860,8 @@ async fn handle_jira_comment(
                 ticket_id: ticket_key.to_string(),
                 title: title.to_string(),
                 body: extended_body,
-                repo_owner: repo_owner.to_string(),
-                repo_name: repo_name.to_string(),
+                repo_owner: String::new(), // let worker auto-detect via select_repo
+                repo_name: String::new(),
                 issue_number: 0,
                 sender: comment_author.to_string(),
                 image_attachments: if !fresh_images.is_empty() {

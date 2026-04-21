@@ -2193,6 +2193,8 @@ async fn create_run_record(
         .item("installation_id", attr_n(msg.installation_id))
         .item("issue_number", attr_n(msg.issue_number))
         .item("base_branch", attr_s(&msg.base_branch))
+        // Store body for Jira tickets so retry can re-use it (GitHub re-fetches from API)
+        .item("ticket_body", attr_s(if matches!(msg.source, TicketSource::Jira) { &msg.body } else { "" }))
         .item(
             "image_attachments",
             AttributeValue::S(

@@ -902,6 +902,16 @@ pub async fn retry_run(
         (parts[0].to_string(), parts[1].to_string())
     };
 
+    // For Jira, restore the ticket body from the run record (GitHub re-fetches from API)
+    let body = if matches!(source, TicketSource::Jira) {
+        item.get("ticket_body")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: claims.team_id.clone(),
         installation_id,
@@ -913,7 +923,7 @@ pub async fn retry_run(
             .map(|s| s.as_str())
             .unwrap_or("")
             .to_string(),
-        body: String::new(), // body is re-fetched from GitHub by the worker
+        body,
         repo_owner: retry_owner,
         repo_name: retry_name,
         issue_number,
