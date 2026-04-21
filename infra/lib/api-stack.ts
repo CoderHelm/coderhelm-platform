@@ -348,6 +348,12 @@ export class ApiStack extends cdk.Stack {
     this.ciFixQueue.grantSendMessages(this.gatewayFunction);
     this.feedbackQueue.grantSendMessages(this.gatewayFunction);
     dlq.grantConsumeMessages(this.gatewayFunction);
+    this.gatewayFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["sqs:PurgeQueue"],
+        resources: [dlq.queueArn],
+      }),
+    );
     secrets.grantRead(this.gatewayFunction);
 
     // STS AssumeRole — gateway validates customer IAM roles on AWS connection setup

@@ -3862,7 +3862,7 @@ pub async fn list_dlq_messages(
         .receive_message()
         .queue_url(&state.config.dlq_url)
         .max_number_of_messages(10)
-        .visibility_timeout(0) // Don't hide messages — just peek
+        .visibility_timeout(120) // Keep receipt handles valid for 2 min
         .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::All)
         .send()
         .await
