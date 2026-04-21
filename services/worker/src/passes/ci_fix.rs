@@ -401,7 +401,14 @@ impl<'a> ToolExecutor for CiFixToolExecutor<'a> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing message")?;
-                let sha = input.get("sha").and_then(|v| v.as_str());
+                let sha = match input.get("sha").and_then(|v| v.as_str()) {
+                    Some(s) => Some(s.to_string()),
+                    None => self
+                        .github
+                        .get_file_sha(self.owner, self.repo, path, self.branch)
+                        .await
+                        .ok(),
+                };
                 self.github
                     .write_file(
                         self.owner,
@@ -410,7 +417,7 @@ impl<'a> ToolExecutor for CiFixToolExecutor<'a> {
                         content,
                         self.branch,
                         message,
-                        sha,
+                        sha.as_deref(),
                     )
                     .await?;
                 Ok(json!(format!("Wrote {path}")))

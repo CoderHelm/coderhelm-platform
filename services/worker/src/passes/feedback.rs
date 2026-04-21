@@ -855,7 +855,15 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing message")?;
-                let sha = input.get("sha").and_then(|v| v.as_str());
+                // Auto-fetch SHA if not provided — Contents API requires it for updates
+                let sha = match input.get("sha").and_then(|v| v.as_str()) {
+                    Some(s) => Some(s.to_string()),
+                    None => self
+                        .github
+                        .get_file_sha(self.owner, self.repo, path, self.branch)
+                        .await
+                        .ok(),
+                };
                 self.github
                     .write_file(
                         self.owner,
@@ -864,7 +872,7 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                         content,
                         self.branch,
                         message,
-                        sha,
+                        sha.as_deref(),
                     )
                     .await?;
                 *self.files_modified.lock().unwrap() = true;
