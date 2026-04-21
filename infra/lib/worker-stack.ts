@@ -64,6 +64,7 @@ export class WorkerStack extends cdk.Stack {
       timeout: cdk.Duration.minutes(15),
       ephemeralStorageSize: cdk.Size.mebibytes(1024),
       logGroup: workerLogGroup,
+      recursiveLoop: lambda.RecursiveLoop.ALLOW,
         environment: {
         STAGE: props.stage,
         MEMORY_ENABLED: "true",
