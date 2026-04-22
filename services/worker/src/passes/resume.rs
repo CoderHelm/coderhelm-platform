@@ -477,6 +477,7 @@ pub async fn run(
             &mut usage,
             &file_cache,
             Some(&msg.run_id),
+            None,
         )
         .await
         {
@@ -666,6 +667,7 @@ pub async fn run(
                 &mut usage,
                 &file_cache,
                 Some(&msg.run_id),
+                None,
             )
             .await
             {

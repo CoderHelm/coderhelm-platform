@@ -312,15 +312,40 @@ pub async fn orchestrate_ticket(
         Err(_elapsed) => {
             let duration = start.elapsed().as_secs();
             warn!(run_id, duration, "Orchestration timed out — Lambda limit approaching");
-            fail_run(
-                state,
-                &msg,
-                &run_id,
-                "Run timed out (exceeded execution time limit). The issue may need a narrower scope.",
-                &usage,
-                duration,
-            )
-            .await;
+
+            // Check if there's partial work on a branch we can salvage as a draft PR
+            let checkpoint = load_checkpoint(state, &msg.team_id, &run_id).await;
+            let salvaged = if let Some((ref last_pass, ref branch, _)) = checkpoint {
+                if !branch.is_empty() && matches!(last_pass.as_str(), "implement" | "security") {
+                    info!(run_id, branch, "Timeout — attempting to salvage partial work as draft PR");
+                    match salvage_timeout_pr(state, &msg, &run_id, branch, &usage, duration).await {
+                        Ok(pr_url) => {
+                            info!(run_id, pr_url, "Salvaged partial work into draft PR");
+                            true
+                        }
+                        Err(e) => {
+                            warn!(run_id, error = %e, "Failed to salvage partial work");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !salvaged {
+                fail_run(
+                    state,
+                    &msg,
+                    &run_id,
+                    "Run timed out (exceeded execution time limit). The issue may need a narrower scope.",
+                    &usage,
+                    duration,
+                )
+                .await;
+            }
         }
     }
 
@@ -383,6 +408,9 @@ async fn run_passes(
 
     // File read cache shared across passes to avoid redundant GitHub fetches
     let file_cache = FileCache::new();
+
+    // Deadline for the implement pass — leave 150s buffer for PR creation + cleanup
+    let implement_deadline = Some(*start + std::time::Duration::from_secs(LAMBDA_TIMEOUT_SECS.saturating_sub(150)));
 
     // Pre-run budget gate: reject if monthly token limit exceeded
     if let Some(reason) = check_budget_exceeded(state, &msg.team_id).await {
@@ -1106,7 +1134,7 @@ async fn run_passes(
 
                 match implement::run(
                     state, msg, &github, &plan_result, &branch_name, &[], "",
-                    Some(&feedback), "medium", &provider, usage, &file_cache, Some(run_id),
+                    Some(&feedback), "medium", &provider, usage, &file_cache, Some(run_id), None,
                 )
                 .await
                 {
@@ -1403,6 +1431,7 @@ async fn run_passes(
                     &start,
                     run_id,
                     &mut agent_memory,
+                    implement_deadline,
                 )
                 .await
                 {
@@ -1550,6 +1579,7 @@ async fn run_passes(
             usage,
             &file_cache,
             Some(run_id),
+            implement_deadline,
         )
         .await?;
         write_pass_trace(
@@ -1684,7 +1714,7 @@ async fn run_passes(
             let fix_cache = FileCache::default();
             if let Err(e) = implement::run(
                 state, msg, &github, &fix_plan, &branch_name, &[],
-                "", Some(&test_issues), "low", &provider, usage, &fix_cache, Some(run_id),
+                "", Some(&test_issues), "low", &provider, usage, &fix_cache, Some(run_id), None,
             ).await {
                 warn!(run_id, error = %e, "Test auto-fix failed, proceeding anyway");
             }
@@ -1792,6 +1822,7 @@ async fn run_passes(
                 usage,
                 &file_cache,
                 Some(run_id),
+                None,
             )
             .await?;
             write_conversation_log(state, &msg.team_id, run_id, "security_fix", &sec_fix_result.conversation_log).await;
@@ -2004,6 +2035,7 @@ async fn run_repo_pipeline(
     start: &Instant,
     run_id: &str,
     _agent_memory: &mut Option<AgentMemory>,
+    implement_deadline: Option<std::time::Instant>,
 ) -> Result<RepoPrResult, Box<dyn std::error::Error + Send + Sync>> {
     let repo_owner = &msg.repo_owner;
     let repo_name = &msg.repo_name;
@@ -2050,6 +2082,7 @@ async fn run_repo_pipeline(
         usage,
         file_cache,
         Some(run_id),
+        implement_deadline,
     )
     .await?;
     write_pass_trace(state, &msg.team_id, run_id, "implement", pass_start, &usage_before, usage, None).await;
@@ -2102,7 +2135,7 @@ async fn run_repo_pipeline(
             let fix_cache = FileCache::default();
             if let Err(e) = implement::run(
                 state, msg, github, &fix_plan, branch_name, &[],
-                "", Some(&test_issues), "low", provider, usage, &fix_cache, Some(run_id),
+                "", Some(&test_issues), "low", provider, usage, &fix_cache, Some(run_id), None,
             ).await {
                 warn!(run_id, error = %e, "Test auto-fix failed, proceeding anyway");
             }
@@ -2145,7 +2178,7 @@ async fn run_repo_pipeline(
             let sec_fix = implement::run(
                 state, msg, github, &repo_plan, branch_name, rules, repo_instructions,
                 Some(&format!("Security audit found vulnerabilities. Fix ALL of the following:\n\n{}", security_result.summary)),
-                complexity, provider, usage, file_cache, Some(run_id),
+                complexity, provider, usage, file_cache, Some(run_id), None,
             )
             .await?;
             write_conversation_log(state, &msg.team_id, run_id, &format!("security_fix_{}", branch_name), &sec_fix.conversation_log).await;
@@ -3303,7 +3336,7 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
             &[],
             &triage::NoOpExecutor,
             usage,
-            llm::ConverseOptions { max_turns: 1, max_tokens: 128 },
+            llm::ConverseOptions { max_turns: 1, max_tokens: 128, deadline: None },
             None,
             None,
         ).await {
@@ -3458,6 +3491,102 @@ pub(crate) async fn write_pass_trace(
     if let Err(e) = req.send().await {
         warn!(error = %e, "Failed to write pass trace for {pass_name}");
     }
+}
+
+/// Salvage partial work from a timed-out run by creating a draft PR.
+/// Returns the PR URL on success.
+async fn salvage_timeout_pr(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    branch: &str,
+    usage: &TokenUsage,
+    duration: u64,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let github = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    )?;
+
+    // Check if there's actually a diff on the branch
+    let diff = github
+        .get_diff(&msg.repo_owner, &msg.repo_name, &msg.base_branch, branch)
+        .await?;
+    let files_changed = diff.get("files").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0);
+    if files_changed == 0 {
+        return Err("No changes on branch to salvage".into());
+    }
+
+    // Check for existing PR
+    let existing = github
+        .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, branch)
+        .await?;
+    let (pr_number, pr_url) = if let Some(pr_data) = existing {
+        let n = pr_data.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+        let u = pr_data.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        (n, u)
+    } else {
+        let title = format!("⚠️ Partial: #{}: {}", msg.issue_number, msg.title);
+        let body = format!(
+            "Closes #{}\n\n\
+             ⚠️ **This implementation is partial** — the agent ran out of time before finishing all tasks.\n\n\
+             Please review what's been done and either:\n\
+             - Complete the remaining work manually, or\n\
+             - Re-trigger the issue for the agent to continue\n",
+            msg.issue_number,
+        );
+        let pr_data = github
+            .create_pull_request(
+                &msg.repo_owner,
+                &msg.repo_name,
+                &title[..title.len().min(72)],
+                &body,
+                branch,
+                &msg.base_branch,
+                true, // draft
+            )
+            .await?;
+        let n = pr_data.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+        let u = pr_data.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        (n, u)
+    };
+
+    // Mark run as completed (not failed) — it produced a PR
+    let now = chrono::Utc::now().to_rfc3339();
+    let cost = usage.estimated_cost();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET #s = :s, status_run_id = :sri, pr_url = :pu, pr_number = :pn, \
+             branch = :b, tokens_in = :ti, tokens_out = :to, \
+             cache_read_tokens = :crt, cache_write_tokens = :cwt, \
+             cost_usd = :c, duration_s = :d, updated_at = :t, \
+             error_message = :err",
+        )
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", attr_s("completed"))
+        .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
+        .expression_attribute_values(":pu", attr_s(&pr_url))
+        .expression_attribute_values(":pn", attr_n(pr_number))
+        .expression_attribute_values(":b", attr_s(branch))
+        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+        .expression_attribute_values(":to", attr_n(usage.output_tokens))
+        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+        .expression_attribute_values(":c", attr_n(format!("{cost:.4}")))
+        .expression_attribute_values(":d", attr_n(duration))
+        .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":err", attr_s("Partial implementation — agent timed out"))
+        .send()
+        .await;
+
+    Ok(pr_url)
 }
 
 /// Save a checkpoint after a pass completes so runs can resume on Lambda timeout.
@@ -3886,6 +4015,7 @@ If everything is clean, respond with "CLEAN" and nothing else."#,
         llm::ConverseOptions {
             max_turns: 15,
             max_tokens: 8192,
+            deadline: None,
         },
         None,
         None,

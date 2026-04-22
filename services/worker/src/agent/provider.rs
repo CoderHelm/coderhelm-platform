@@ -119,6 +119,7 @@ pub async fn converse(
         usage,
         opts.max_turns,
         opts.max_tokens,
+        opts.deadline,
         on_tool_call,
         conversation_log,
     )

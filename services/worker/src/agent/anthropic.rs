@@ -185,6 +185,7 @@ pub async fn converse_tool_loop(
     usage: &mut TokenUsage,
     max_turns: usize,
     max_tokens: i32,
+    deadline: Option<std::time::Instant>,
     on_tool_call: Option<&(dyn Fn(&str, u64, &str, bool) + Send + Sync)>,
     mut conversation_log: Option<&mut Vec<Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -207,6 +208,7 @@ pub async fn converse_tool_loop(
         .collect();
 
     let mut turns: usize = 0;
+    let mut deadline_warned = false;
 
     loop {
         turns += 1;
@@ -217,6 +219,29 @@ pub async fn converse_tool_loop(
                  The issue may need more detail or a narrower scope."
             )
             .into());
+        }
+
+        // Deadline check — if <120s remain, tell the LLM to wrap up
+        if let Some(dl) = deadline {
+            let now = std::time::Instant::now();
+            let remaining = if dl > now { (dl - now).as_secs() } else { 0 };
+            if remaining < 30 {
+                // Hard stop — not enough time even for one more API call
+                warn!("Deadline imminent (<30s), forcing exit");
+                return Ok("(timed out — partial implementation)".to_string());
+            } else if remaining < 120 && !deadline_warned {
+                deadline_warned = true;
+                warn!(remaining, "Approaching deadline — injecting wrap-up message");
+                messages.push((
+                    "user".to_string(),
+                    vec![json!({"type": "text", "text":
+                        "[SYSTEM NOTE — DEADLINE] You are running out of time. \
+                         STOP reading files. Commit any remaining changes NOW with batch_write, \
+                         then output a summary of what you completed and what's left. \
+                         This is your LAST turn."
+                    })],
+                ));
+            }
         }
 
         // Progress note every 10 turns

@@ -32,6 +32,7 @@ pub async fn run(
     usage: &mut TokenUsage,
     file_cache: &FileCache,
     run_id: Option<&str>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
     // Trim repo instructions for simple issues to reduce per-turn token cost
@@ -245,6 +246,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             _ => 80,
         },
         max_tokens: 16384,
+        deadline,
     };
 
     let on_tool: Option<Box<dyn Fn(&str, u64, &str, bool) + Send + Sync>> = if let Some(rid) = run_id {

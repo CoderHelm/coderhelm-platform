@@ -4,6 +4,9 @@ use serde_json::Value;
 pub struct ConverseOptions {
     pub max_turns: usize,
     pub max_tokens: i32,
+    /// Optional deadline (wall-clock Instant). When <120s remain, the loop
+    /// injects a "wrap up now" message and allows one final turn before exiting.
+    pub deadline: Option<std::time::Instant>,
 }
 
 const DEFAULT_MAX_TURNS: usize = 40;
@@ -13,6 +16,7 @@ impl Default for ConverseOptions {
         Self {
             max_turns: DEFAULT_MAX_TURNS,
             max_tokens: 16384,
+            deadline: None,
         }
     }
 }

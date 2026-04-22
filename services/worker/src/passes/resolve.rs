@@ -120,6 +120,7 @@ pub async fn run(
         llm::ConverseOptions {
             max_turns: 40,
             max_tokens: 16384,
+            deadline: None,
         },
         None,
         None,

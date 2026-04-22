@@ -92,6 +92,7 @@ Output format:
         llm::ConverseOptions {
             max_turns: 35,
             max_tokens: 8192,
+            deadline: None,
         },
         None,
         None,

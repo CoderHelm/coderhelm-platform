@@ -94,6 +94,7 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
         llm::ConverseOptions {
             max_turns: 25,
             max_tokens: 8192,
+            deadline: None,
         },
         None,
         None,

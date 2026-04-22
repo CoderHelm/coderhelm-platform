@@ -92,6 +92,7 @@ Rules:
         llm::ConverseOptions {
             max_turns: 1,
             max_tokens: 16384,
+            deadline: None,
         },
         None,
         None,
@@ -232,6 +233,7 @@ Then on the LAST line, return ONLY the repository in `owner/name` format."#,
         llm::ConverseOptions {
             max_turns: 1,
             max_tokens: 512,
+            deadline: None,
         },
         None,
         None,

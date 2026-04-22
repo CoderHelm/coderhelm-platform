@@ -115,6 +115,7 @@ Return ONLY the markdown body text."#,
         llm::ConverseOptions {
             max_turns: 1,
             max_tokens: 4096,
+            deadline: None,
         },
         None,
         None,
@@ -314,6 +315,7 @@ pub async fn resolve_conflicts(
             llm::ConverseOptions {
                 max_turns: 40,
                 max_tokens: 16384,
+                deadline: None,
             },
             None,
         None,
