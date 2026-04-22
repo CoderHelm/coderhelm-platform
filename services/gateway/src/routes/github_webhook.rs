@@ -1003,13 +1003,23 @@ async fn handle_workflow_run(
         "CI event recorded — sending Resume"
     );
 
-    // Send Resume message to kick off the worker
+    // Send Resume message with a delay — CI repos often have multiple workflows
+    // (lint, test, build, deploy) that finish within seconds of each other.
+    // The 60s delay lets them all land as events before the worker picks up.
     let message = WorkerMessage::Resume(ResumeMessage {
         team_id: team_id.to_string(),
         run_id: run_id.clone(),
         installation_id,
     });
-    let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+    let body = serde_json::to_string(&message).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let _ = state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(&body)
+        .delay_seconds(60)
+        .send()
+        .await;
 
     Ok(StatusCode::OK)
 }
