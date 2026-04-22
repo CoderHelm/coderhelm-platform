@@ -6,8 +6,11 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
+import * as events from "aws-cdk-lib/aws-events";
+import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as eventsources from "aws-cdk-lib/aws-lambda-event-sources";
 import { Construct } from "constructs";
+import * as path from "path";
 
 interface WorkerStackProps extends cdk.StackProps {
   stage: string;
@@ -177,5 +180,36 @@ export class WorkerStack extends cdk.Stack {
       "MCP_PROXY_FUNCTION_NAME",
       props.mcpProxyFunction.functionName
     );
+
+    // --- Stuck Run Cleanup Lambda (Python) ---
+    const cleanupLogGroup = new logs.LogGroup(this, "CleanupLogGroup", {
+      logGroupName: `/aws/lambda/${prefix}-stuck-run-cleanup`,
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const cleanupFunction = new lambda.Function(this, "StuckRunCleanup", {
+      functionName: `${prefix}-stuck-run-cleanup`,
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.handler",
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, "../../lambda/stuck-run-cleanup")
+      ),
+      memorySize: 128,
+      timeout: cdk.Duration.seconds(30),
+      logGroup: cleanupLogGroup,
+      environment: {
+        RUNS_TABLE_NAME: `coderhelm-${props.stage}-runs`,
+        MAX_RUN_MINUTES: "20",
+      },
+    });
+
+    runsTable.grantReadWriteData(cleanupFunction);
+
+    new events.Rule(this, "StuckRunCleanupSchedule", {
+      ruleName: `${prefix}-stuck-run-cleanup`,
+      schedule: events.Schedule.rate(cdk.Duration.minutes(10)),
+      targets: [new targets.LambdaFunction(cleanupFunction)],
+    });
   }
 }
