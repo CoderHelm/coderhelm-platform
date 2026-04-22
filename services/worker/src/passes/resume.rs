@@ -458,6 +458,7 @@ pub async fn run(
              - Only fix what CI is complaining about. Don't refactor or add features.\n\
              - If the failure is in a test, fix the code (not the test) unless the test itself is wrong.\n\
              - If tests need updating because the feature changed behavior intentionally, update the tests.\n\
+             - For lint/formatting failures (Prettier, ESLint): read the existing file first, match its style exactly (trailing commas, line length, quote style, indentation). Write the COMPLETE file content.\n\
              - You may create new test files or edit existing ones if needed.\n\n\
              Failure summary:\n{failure_logs}\n\n\
              Full logs:\n{logs}{review_context}"
@@ -544,6 +545,10 @@ pub async fn run(
             &usage,
         )
         .await;
+
+        // Mark events processed BEFORE setting awaiting_ci to prevent a race
+        // where another resume grabs the run and re-processes stale events
+        mark_events_processed(state, &msg.run_id, &events).await;
 
         set_run_awaiting_ci(
             state,
@@ -725,6 +730,7 @@ pub async fn run(
             // Back to awaiting_ci for the next CI run
             save_checkpoint(state, &msg.team_id, &msg.run_id, "pr", &branch, 0, &usage)
                 .await;
+            mark_events_processed(state, &msg.run_id, &events).await;
             set_run_awaiting_ci(
                 state,
                 &ticket_msg,
