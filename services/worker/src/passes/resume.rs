@@ -368,42 +368,52 @@ pub async fn run(
         let failure_logs = collect_ci_failure_info(&events);
 
         // Download actual workflow logs via GitHub API
-        let workflow_run_id = events
+        // Collect all genuinely failed workflow run IDs (skip "skipped" conclusions)
+        let failed_run_ids: Vec<u64> = events
             .iter()
             .filter(|e| e.event_type == "ci_failed")
+            .filter(|e| {
+                let conclusion = e.payload["conclusion"].as_str().unwrap_or("");
+                conclusion == "failure" || conclusion == "timed_out"
+            })
             .filter_map(|e| e.payload["workflow_run_id"].as_u64())
-            .last()
-            .unwrap_or(0);
+            .collect();
 
-        let logs = if workflow_run_id > 0 {
+        let mut all_logs = Vec::new();
+        for wf_run_id in &failed_run_ids {
             match github
-                .get_workflow_run_logs(&repo_owner, &repo_name, workflow_run_id)
+                .get_workflow_run_logs(&repo_owner, &repo_name, *wf_run_id)
                 .await
             {
                 Ok(l) => {
-                    if l.len() > MAX_LOG_CHARS {
-                        format!("... (truncated)\n{}", &l[l.len() - MAX_LOG_CHARS..])
+                    let trimmed = if l.len() > MAX_LOG_CHARS / failed_run_ids.len().max(1) {
+                        format!("... (truncated)\n{}", &l[l.len() - MAX_LOG_CHARS / failed_run_ids.len().max(1)..])
                     } else {
                         l
-                    }
+                    };
+                    all_logs.push(trimmed);
                 }
                 Err(e) => {
-                    warn!("Failed to download workflow logs: {e} — falling back to check run annotations");
-                    // Fallback: fetch annotations from failed check runs (uses checks:read, not actions:read)
-                    match github
-                        .get_check_run_annotations(&repo_owner, &repo_name, &branch)
-                        .await
-                    {
-                        Ok(annotations) if !annotations.is_empty() => {
-                            info!(run_id = msg.run_id, len = annotations.len(), "Got check run annotations as fallback");
-                            format!("{failure_logs}\n\nCheck run annotations:\n{annotations}")
-                        }
-                        _ => failure_logs.clone(),
-                    }
+                    warn!(workflow_run_id = wf_run_id, "Failed to download workflow logs: {e}");
                 }
             }
+        }
+
+        let logs = if !all_logs.is_empty() {
+            all_logs.join("\n\n--- Next workflow ---\n\n")
         } else {
-            failure_logs.clone()
+            // Fallback: fetch annotations from failed check runs (uses checks:read, not actions:read)
+            warn!("No workflow logs available — falling back to check run annotations");
+            match github
+                .get_check_run_annotations(&repo_owner, &repo_name, &branch)
+                .await
+            {
+                Ok(annotations) if !annotations.is_empty() => {
+                    info!(run_id = msg.run_id, len = annotations.len(), "Got check run annotations as fallback");
+                    format!("{failure_logs}\n\nCheck run annotations:\n{annotations}")
+                }
+                _ => failure_logs.clone(),
+            }
         };
 
         // Load checkpoint for review cycle count
