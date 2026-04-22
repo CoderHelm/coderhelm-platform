@@ -469,7 +469,18 @@ async fn collect_infra_code(
 ) -> Vec<(String, String)> {
     let mut found: Vec<(String, String)> = Vec::new();
 
-    for repo_full in repos.iter().take(5) {
+    // Prioritize repos likely to contain infra code (terraform, infra, devops, iac, cdk)
+    let mut sorted_repos: Vec<&String> = repos.iter().collect();
+    sorted_repos.sort_by(|a, b| {
+        let infra_keywords = ["terraform", "infra", "devops", "iac", "cdk", "deploy"];
+        let a_lower = a.to_lowercase();
+        let b_lower = b.to_lowercase();
+        let a_score = infra_keywords.iter().any(|k| a_lower.contains(k));
+        let b_score = infra_keywords.iter().any(|k| b_lower.contains(k));
+        b_score.cmp(&a_score)
+    });
+
+    for repo_full in sorted_repos.iter().take(10) {
         let parts: Vec<&str> = repo_full.splitn(2, '/').collect();
         if parts.len() != 2 {
             continue;
