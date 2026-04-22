@@ -298,6 +298,7 @@ pub async fn test_connection(
     Extension(claims): Extension<Claims>,
     Path(connection_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
     let sk = format!("AWS_CONN#{connection_id}");
 
     let result = state
@@ -712,6 +713,7 @@ pub async fn dismiss_recommendation(
     Extension(claims): Extension<Claims>,
     Path(rec_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+
     let sk = format!("REC#{rec_id}");
     let now = chrono::Utc::now().to_rfc3339();
 

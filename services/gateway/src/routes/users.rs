@@ -59,6 +59,7 @@ pub async fn list_users(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
     let result = state
         .dynamo
         .query()

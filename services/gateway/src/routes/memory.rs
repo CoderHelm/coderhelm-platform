@@ -287,6 +287,9 @@ pub async fn delete_memory(
     Path(memory_id): Path<String>,
     Query(q): Query<DeleteQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if claims.require_role(3).is_err() {
+        return Err((StatusCode::FORBIDDEN, "Admin+ required".into()));
+    }
     let (owner, name) = parse_repo(&q.repo)?;
     let (mut db, dir) =
         open_db(&state.s3, &state.config.bucket_name, &claims.team_id, owner, name).await?;

@@ -273,6 +273,27 @@ impl Claims {
             .clone()
             .unwrap_or_else(|| self.email.clone())
     }
+
+    /// Numeric role level: owner=4, admin=3, billing=2, member=1, viewer=0.
+    pub fn role_level(&self) -> u8 {
+        match self.role.as_str() {
+            "owner" => 4,
+            "admin" => 3,
+            "billing" => 2,
+            "member" => 1,
+            _ => 0,
+        }
+    }
+
+    /// Require minimum role level, return 403 if insufficient.
+    /// Levels: 1=member+, 2=billing+, 3=admin+, 4=owner only.
+    pub fn require_role(&self, min_level: u8) -> Result<(), axum::http::StatusCode> {
+        if self.role_level() >= min_level {
+            Ok(())
+        } else {
+            Err(axum::http::StatusCode::FORBIDDEN)
+        }
+    }
 }
 
 /// DynamoDB item types.

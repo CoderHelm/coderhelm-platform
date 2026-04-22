@@ -817,6 +817,7 @@ pub async fn retry_run(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+
     // Block if token limit exceeded
     if super::github_webhook::check_run_budget(&state, &claims.team_id)
         .await
@@ -983,6 +984,7 @@ pub async fn re_review_run(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+
     // Block if token limit exceeded
     if super::github_webhook::check_run_budget(&state, &claims.team_id)
         .await
@@ -1100,6 +1102,7 @@ pub async fn cancel_run(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+
     let now = chrono::Utc::now().to_rfc3339();
 
     state
@@ -1169,6 +1172,7 @@ pub async fn sync_repos(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
     // Get installation_id from META record
     let meta = state
         .dynamo
@@ -1302,6 +1306,7 @@ pub async fn get_jira_integration_check(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
     let repos_result = state
         .dynamo
         .query()
@@ -1480,6 +1485,7 @@ pub async fn generate_jira_secret(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
     use rand::Rng;
 
     let token: String = rand::rng()
@@ -1589,6 +1595,7 @@ pub async fn delete_jira_secret(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     // Delete token from jira-tokens table first
     let old = load_jira_secret(&state, &claims.team_id).await;
     if let Some((old_token, _)) = old {
@@ -1623,6 +1630,7 @@ pub async fn delete_jira_integration(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(4)?; // owner only
     let tid = &claims.team_id;
 
     // 1. Delete the webhook token from the jira-tokens lookup table
@@ -1955,6 +1963,7 @@ pub async fn update_jira_config(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let now = chrono::Utc::now().to_rfc3339();
 
     let mut update_expr = vec!["updated_at = :ua".to_string()];
@@ -2001,6 +2010,7 @@ pub async fn update_jira_projects(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let projects = body
         .get("projects")
         .and_then(|v| v.as_array())
@@ -2199,6 +2209,7 @@ pub async fn update_repo(
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let enabled = body["enabled"].as_bool().unwrap_or(true);
@@ -2401,6 +2412,7 @@ pub async fn delete_repo(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
 
@@ -2719,6 +2731,7 @@ pub async fn update_global_instructions(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let content = body["content"].as_str().unwrap_or("");
     update_instructions_inner(&state, &claims.team_id, "INSTRUCTIONS#GLOBAL", content).await
 }
@@ -2742,6 +2755,7 @@ pub async fn update_repo_instructions(
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let content = body["content"].as_str().unwrap_or("");
@@ -2838,6 +2852,7 @@ pub async fn update_global_rules(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let rules = body["rules"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
     update_rules_inner(&state, &claims.team_id, "RULES#GLOBAL", rules).await
 }
@@ -2861,6 +2876,7 @@ pub async fn update_repo_rules(
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let rules = body["rules"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
@@ -2954,6 +2970,7 @@ pub async fn update_global_voice(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let content = body["content"].as_str().unwrap_or("");
     update_instructions_inner(&state, &claims.team_id, "VOICE#GLOBAL", content).await
 }
@@ -2977,6 +2994,7 @@ pub async fn update_repo_voice(
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let content = body["content"].as_str().unwrap_or("");
@@ -3000,6 +3018,7 @@ pub async fn update_global_agents(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let content = body["content"].as_str().unwrap_or("");
     update_instructions_inner(&state, &claims.team_id, "AGENTS#GLOBAL", content).await
 }
@@ -3023,6 +3042,7 @@ pub async fn update_repo_agents(
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let content = body["content"].as_str().unwrap_or("");
@@ -3036,6 +3056,7 @@ pub async fn regenerate_repo(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
 
@@ -3111,6 +3132,7 @@ pub async fn update_budget(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(4)?; // owner only
     let max_tokens = body["max_tokens"].as_u64().unwrap_or(0);
 
     state
@@ -3254,6 +3276,7 @@ pub async fn update_workflow_settings(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
     let commit_openspec = body["commit_openspec"].as_bool().unwrap_or(false);
     let default_destination = body["default_destination"]
         .as_str()
@@ -3305,6 +3328,7 @@ pub async fn get_model_provider(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
     let result = state
         .dynamo
         .get_item()
@@ -3362,6 +3386,7 @@ pub async fn update_model_provider(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(4)?; // owner only
     let provider = "anthropic";
 
     let api_key_from_body = body["api_key"].as_str().map(|s| s.to_string());
@@ -3451,6 +3476,7 @@ pub async fn delete_model_provider(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(4)?; // owner only
     state
         .dynamo
         .delete_item()
@@ -3472,6 +3498,7 @@ pub async fn health(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
     let now = chrono::Utc::now();
     let mut checks: Vec<Value> = Vec::new();
     let mut status = "healthy";

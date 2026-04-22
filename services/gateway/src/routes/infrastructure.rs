@@ -139,6 +139,7 @@ pub async fn refresh_infrastructure(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
     let now = chrono::Utc::now().to_rfc3339();
     let sk = "INFRA#analysis".to_string();
 
@@ -267,6 +268,7 @@ pub async fn refresh_repo_infrastructure(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
     let repo_full = format!("{owner}/{name}");
     let now = chrono::Utc::now().to_rfc3339();
     let sk = format!("INFRA#REPO#{repo_full}");

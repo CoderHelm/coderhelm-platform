@@ -763,6 +763,7 @@ pub async fn test_connection(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plugin_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
     let plugin_def = CATALOG
         .iter()
         .find(|p| p.id == plugin_id)
