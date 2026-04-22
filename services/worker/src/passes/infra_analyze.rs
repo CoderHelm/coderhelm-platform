@@ -618,6 +618,36 @@ async fn collect_infra_code(
                                 tf_found = true;
                                 // Don't break — check other subdirs too
                             }
+
+                            // Go one more level: check sub-subdirectories (e.g. environments/prod/)
+                            if !tf_found || found.len() < 30 {
+                                let sub_subdirs: Vec<_> = sub_entries
+                                    .iter()
+                                    .filter(|e| e.entry_type == "dir")
+                                    .collect();
+                                for sub_subdir in &sub_subdirs {
+                                    if let Ok(deep_entries) = github.list_directory(owner, repo, &sub_subdir.path, "HEAD").await {
+                                        let deep_tf: Vec<_> = deep_entries
+                                            .iter()
+                                            .filter(|e| e.entry_type == "file" && e.name.ends_with(".tf"))
+                                            .collect();
+                                        if !deep_tf.is_empty() {
+                                            for entry in &deep_tf {
+                                                if let Ok(c) = github.get_file_content(owner, repo, &entry.path).await {
+                                                    found.push((format!("{repo_full}/{}", entry.path), c));
+                                                }
+                                                if found.len() >= 30 {
+                                                    break;
+                                                }
+                                            }
+                                            tf_found = true;
+                                        }
+                                    }
+                                    if found.len() >= 30 {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         if found.len() >= 30 {
                             break;
@@ -630,12 +660,26 @@ async fn collect_infra_code(
             } // Ok(entries)
             } // match
         }
-        // Fallback: if no directory listing worked, try known filenames
+        // Fallback: if no directory listing worked, try the full recursive tree
         if !tf_found {
-            for tf_path in &["main.tf", "infra/main.tf", "terraform/main.tf"] {
-                if let Ok(content) = github.get_file_content(owner, repo, tf_path).await {
-                    found.push((format!("{repo_full}/{tf_path}"), content));
-                    break;
+            info!(repo_full, "Terraform directory scan found nothing — trying recursive tree");
+            if let Ok(tree) = github.get_tree(owner, repo, "HEAD").await {
+                let tf_paths: Vec<String> = tree
+                    .iter()
+                    .filter(|e| e.path.ends_with(".tf") && e.entry_type == "blob")
+                    .map(|e| e.path.clone())
+                    .take(30)
+                    .collect();
+                if !tf_paths.is_empty() {
+                    info!(repo_full, count = tf_paths.len(), "Found .tf files via recursive tree");
+                    for tf_path in &tf_paths {
+                        if let Ok(content) = github.get_file_content(owner, repo, tf_path).await {
+                            found.push((format!("{repo_full}/{tf_path}"), content));
+                        }
+                        if found.len() >= 30 {
+                            break;
+                        }
+                    }
                 }
             }
         }
