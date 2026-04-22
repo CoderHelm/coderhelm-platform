@@ -88,13 +88,14 @@ pub async fn run(
                 // Fall through to normal resume logic below
             } else {
                 // Run is still being processed by another invocation.
-                // Re-queue with a delay so we check again shortly.
-                warn!(
+                // Don't re-queue — the safety-net resume (sent after awaiting_ci)
+                // and any new webhook events will pick it up. Re-queuing here
+                // causes an exponential cascade of bouncing messages.
+                info!(
                     run_id = msg.run_id,
                     status,
-                    "Run is currently running — re-queuing with 30s delay"
+                    "Run is currently running — dropping resume (safety-net will cover)"
                 );
-                send_delayed_resume(state, &msg, 30).await;
                 return Ok(());
             }
         } else {
@@ -118,7 +119,26 @@ pub async fn run(
     };
     if events.is_empty() {
         // No events — webhook may have been missed or repo has no CI.
-        // Check GitHub PR check status directly.
+        // Only check GitHub if we've been in awaiting_ci for >90 seconds,
+        // otherwise we'd see stale check results from the previous commit.
+        let updated_at = run_record
+            .get("updated_at")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+        let secs_since_update = updated_at
+            .map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds())
+            .unwrap_or(0);
+
+        if secs_since_update < 90 {
+            info!(
+                run_id = msg.run_id,
+                secs_since_update,
+                "No events but run just entered awaiting_ci — waiting for CI webhooks"
+            );
+            send_delayed_resume(state, &msg, 90).await;
+            return Ok(());
+        }
+
         info!(run_id = msg.run_id, "No unprocessed events — checking GitHub PR status");
 
         let repo_owner = run_record

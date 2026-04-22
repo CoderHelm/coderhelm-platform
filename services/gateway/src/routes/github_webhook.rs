@@ -922,10 +922,19 @@ async fn handle_workflow_run(
     }
 
     let conclusion = wf["conclusion"].as_str().unwrap_or("");
+    let workflow_name = wf["name"].as_str().unwrap_or("unknown");
+
+    // Skip "skipped" workflows — they're not failures, just conditional workflows
+    // that didn't apply (e.g., deploy only runs on main). Writing them as ci_failed
+    // pollutes the events and confuses the CI fix loop.
+    if conclusion == "skipped" || conclusion == "cancelled" || conclusion == "neutral" || conclusion == "stale" {
+        info!(branch, conclusion, workflow_name, "Ignoring non-actionable workflow conclusion");
+        return Ok(StatusCode::OK);
+    }
+
     let repo = &payload["repository"];
     let repo_owner = repo["owner"]["login"].as_str().unwrap_or("");
     let repo_name = repo["name"].as_str().unwrap_or("");
-    let workflow_name = wf["name"].as_str().unwrap_or("unknown");
 
     // Find the run_id for this branch
     let run_id = match find_run_by_branch(state, team_id, repo_owner, repo_name, branch).await {
