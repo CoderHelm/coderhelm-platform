@@ -13,6 +13,13 @@ use crate::WorkerState;
 const MAX_CI_FIX_CYCLES: usize = 10;
 const MAX_LOG_CHARS: usize = 15_000;
 
+/// Wall-clock duration from run created_at, falling back to Lambda start time.
+fn wall_clock_secs(created_at: Option<chrono::DateTime<chrono::Utc>>, start: &std::time::Instant) -> u64 {
+    created_at
+        .map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds().max(0) as u64)
+        .unwrap_or_else(|| start.elapsed().as_secs())
+}
+
 #[derive(Debug)]
 struct RunEvent {
     sk: String,
@@ -108,6 +115,13 @@ pub async fn run(
         }
     }
 
+    // Parse created_at for wall-clock duration (spans multiple Lambda invocations)
+    let created_at = run_record
+        .get("created_at")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+
     // Load all unprocessed events
     info!(run_id = %msg.run_id, events_table = %state.config.events_table_name, "Loading events");
     let events = match load_unprocessed_events(state, &msg.run_id).await {
@@ -188,7 +202,7 @@ pub async fn run(
             // No CI workflows at all — mark PR ready and complete
             info!(run_id = msg.run_id, "No CI checks found — marking PR ready and completing");
             mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
-            set_run_complete(state, &msg.team_id, &msg.run_id).await;
+            set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
             return Ok(());
         }
 
@@ -242,7 +256,7 @@ pub async fn run(
         // All checks passed but webhook was missed — mark ready and complete
         info!(run_id = msg.run_id, "CI passed (missed webhook) — marking PR ready and completing");
         mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
-        set_run_complete(state, &msg.team_id, &msg.run_id).await;
+        set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
         return Ok(());
     }
 
@@ -452,7 +466,7 @@ pub async fn run(
                 pr_number,
                 &branch,
                 &usage,
-                start.elapsed().as_secs(),
+                wall_clock_secs(created_at, &start),
             )
             .await?;
 
@@ -538,7 +552,7 @@ pub async fn run(
                         pr_number,
                         &branch,
                         &usage,
-                        start.elapsed().as_secs(),
+                        wall_clock_secs(created_at, &start),
                     )
                     .await?;
                     mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
@@ -556,7 +570,7 @@ pub async fn run(
                     pr_number,
                     &branch,
                     &usage,
-                    start.elapsed().as_secs(),
+                    wall_clock_secs(created_at, &start),
                 )
                 .await?;
                 mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
@@ -588,7 +602,7 @@ pub async fn run(
             pr_number,
             &branch,
             &usage,
-            start.elapsed().as_secs(),
+            wall_clock_secs(created_at, &start),
         )
         .await?;
 
@@ -675,7 +689,7 @@ pub async fn run(
                 pr_number,
                 &branch,
                 &usage,
-                start.elapsed().as_secs(),
+                wall_clock_secs(created_at, &start),
             )
             .await?;
         } else {
@@ -731,7 +745,7 @@ pub async fn run(
                             pr_number,
                             &branch,
                             &usage,
-                            start.elapsed().as_secs(),
+                            wall_clock_secs(created_at, &start),
                         )
                         .await?;
                         return Ok(());
@@ -750,7 +764,7 @@ pub async fn run(
                         pr_number,
                         &branch,
                         &usage,
-                        start.elapsed().as_secs(),
+                        wall_clock_secs(created_at, &start),
                     )
                     .await?;
                     return Ok(());
@@ -769,7 +783,7 @@ pub async fn run(
                 pr_number,
                 &branch,
                 &usage,
-                start.elapsed().as_secs(),
+                wall_clock_secs(created_at, &start),
             )
             .await?;
 
@@ -1002,20 +1016,39 @@ async fn mark_pr_ready(
     if pr_number == 0 {
         return;
     }
-    match github
-        .get_pull_request(repo_owner, repo_name, pr_number)
-        .await
-    {
-        Ok(pr) => {
-            if let Some(node_id) = pr.get("node_id").and_then(|v| v.as_str()) {
-                match github.mark_pr_ready(node_id).await {
-                    Ok(_) => info!(pr_number, "PR marked ready for review"),
-                    Err(e) => warn!(pr_number, error = %e, "Failed to mark PR ready"),
+    // Retry once on failure — transient GitHub API issues are common
+    for attempt in 1..=2 {
+        match github
+            .get_pull_request(repo_owner, repo_name, pr_number)
+            .await
+        {
+            Ok(pr) => {
+                let is_draft = pr.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !is_draft {
+                    info!(pr_number, "PR already not a draft — skipping mark_pr_ready");
+                    return;
+                }
+                if let Some(node_id) = pr.get("node_id").and_then(|v| v.as_str()) {
+                    match github.mark_pr_ready(node_id).await {
+                        Ok(_) => {
+                            info!(pr_number, "PR marked ready for review");
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(pr_number, attempt, error = %e, "Failed to mark PR ready");
+                        }
+                    }
+                } else {
+                    warn!(pr_number, attempt, "PR response missing node_id");
                 }
             }
+            Err(e) => warn!(pr_number, attempt, error = %e, "Failed to fetch PR for marking ready"),
         }
-        Err(e) => warn!(pr_number, error = %e, "Failed to fetch PR for marking ready"),
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
     }
+    error!(pr_number, "Failed to mark PR ready after 2 attempts");
 }
 
 async fn complete_run_with_status(
@@ -1111,21 +1144,25 @@ async fn send_delayed_resume(state: &WorkerState, msg: &ResumeMessage, delay_sec
 }
 
 /// Mark a run as completed (success) without needing full token usage context.
-async fn set_run_complete(state: &WorkerState, team_id: &str, run_id: &str) {
-    let now = chrono::Utc::now().to_rfc3339();
+async fn set_run_complete(state: &WorkerState, team_id: &str, run_id: &str, created_at: Option<chrono::DateTime<chrono::Utc>>) {
+    let now = chrono::Utc::now();
+    let duration = created_at
+        .map(|t| now.signed_duration_since(t).num_seconds().max(0) as u64)
+        .unwrap_or(0);
     let _ = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
-        .update_expression("SET #s = :s, updated_at = :t, current_pass = :cp, status_run_id = :sri")
+        .update_expression("SET #s = :s, updated_at = :t, current_pass = :cp, status_run_id = :sri, duration_s = :d")
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":s", attr_s("success"))
-        .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":t", attr_s(&now.to_rfc3339()))
         .expression_attribute_values(":cp", attr_s("done"))
         .expression_attribute_values(":sri", attr_s(&format!("success#{run_id}")))
+        .expression_attribute_values(":d", attr_n(duration))
         .send()
         .await;
-    info!(run_id, "Run marked complete (no CI / CI passed)");
+    info!(run_id, duration, "Run marked complete (no CI / CI passed)");
 }
