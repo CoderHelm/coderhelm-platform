@@ -86,6 +86,22 @@ INSIGHTS_QUERIES = [
             "fields @timestamp, @message, @logGroup "
             "| filter @message like /(?i)(ERROR|FATAL|CRITICAL|UnhandledPromiseRejection|Traceback)/ "
             "| filter @message not like /(?i)(healthcheck|ping|OPTIONS)/ "
+            # Filter out common bot/scanner noise before it reaches the LLM
+            "| filter @message not like /(?i)(Not found: \\/\\.env|Not found: \\/\\.git|Not found: \\/wp-|Not found: \\/admin|Not found: \\/phpMyAdmin|Not found: \\/\\.aws|Not found: \\/\\.DS_Store|Not found: \\/robots\\.txt|Not found: \\/favicon\\.ico|Not found: \\/sitemap)/ "
+            "| stats count() as error_count by @logGroup, @message "
+            "| sort error_count desc "
+            "| limit 20"
+        ),
+    },
+    {
+        "name": "http_4xx_5xx",
+        "description": "HTTP error responses from web services",
+        "log_group_pattern": "/ecs/",
+        "query": (
+            "fields @timestamp, @message, @logGroup "
+            "| filter @message like /(?i)(\\\"(GET|POST|PUT|DELETE|PATCH).*\\\" [45]\\d{2}|HTTP [45]\\d{2}|status[=: ]+[45]\\d{2})/ "
+            # Exclude known scanner paths
+            "| filter @message not like /(?i)(\\.env|\\.git|wp-admin|wp-login|phpMyAdmin|\\.aws|xmlrpc|wp-content|wp-includes)/ "
             "| stats count() as error_count by @logGroup, @message "
             "| sort error_count desc "
             "| limit 20"
@@ -449,39 +465,43 @@ def analyze_with_anthropic(query_results, account_id, api_key):
     if len(context) > 50000:
         context = context[:50000] + "\n... (truncated)"
 
-    prompt = f"""You are an AWS infrastructure expert analyzing CloudWatch Logs error summaries for AWS account {account_id}.
+    prompt = f"""You are a senior SRE analyzing CloudWatch Logs error summaries for AWS account {account_id}.
 
-Below are aggregated error patterns from CloudWatch Logs Insights queries, grouped by log group. Each log group section contains the queries that found errors and their results.
+Below are aggregated error patterns from CloudWatch Logs Insights queries, grouped by log group. Each entry shows the error message and how many times it occurred.
 
 <error_summaries>
 {context}
 </error_summaries>
 
-Analyze these errors and create actionable recommendations. For each distinct issue:
+Your job: identify REAL operational issues that need engineering attention. Think step-by-step:
 
-1. Identify the root cause
-2. Group related errors
-3. Suggest a specific fix
+1. For each error pattern, determine:
+   - Is this an INTERNAL application error (code bug, resource exhaustion, misconfiguration)?
+   - Or EXTERNAL noise (bot scanners, user typos, crawlers hitting nonexistent paths)?
+   - What is the actual blast radius — is it affecting users or just generating log noise?
 
-Return a JSON array of recommendations. Each recommendation must have:
+2. Group related errors into a single finding (e.g., multiple 502s from the same service = one finding)
+
+3. Prioritize by impact: service outages > data integrity > performance > cleanup
+
+Return a JSON array of recommendations. Each must have:
 - "title": Short descriptive title (max 80 chars)
 - "severity": "critical" | "warning" | "info"
-- "summary": 2-3 sentence explanation of the issue
-- "suggested_action": Specific steps to fix the issue
+- "summary": 2-3 sentence explanation. Be specific about what's broken and why.
+- "suggested_action": Concrete steps — not generic advice. Reference actual service names, error codes, log groups.
 - "source_log_group": The primary log group where this was detected
 - "error_pattern": A representative error string for deduplication
 
+Severity guide:
+- critical = service down/crashing, data loss risk, active security breach
+- warning = degraded performance, recurring errors impacting users, resource pressure
+- info = cleanup opportunities, optimization suggestions
+
 Rules:
-- Only include actionable issues, not informational noise
-- Recognize common bot/scanner noise and do NOT report it as application bugs:
-  - Requests for /.env, /.git, /wp-admin, /robots.txt, /.aws, /phpMyAdmin etc. are automated scanners probing for vulnerabilities — these are external, not your app trying to access files
-  - 404s on well-known attack paths are expected internet background noise, not config issues
-  - If you must mention scanner activity, label it clearly as "External Scanner Noise" with severity "info" and suggest WAF rules, not application code changes
-- critical = service down, data loss risk, or security issue
-- warning = degraded performance, recurring errors, resource constraints
-- info = non-urgent improvements, cleanup opportunities
-- Maximum 10 recommendations
-- Be specific — include function names, error messages, resource names
+- Do NOT report bot/scanner noise (404s on /.env, /.git, /wp-admin, /robots.txt, /phpMyAdmin etc.) as application issues. These are automated internet scanners, not your application failing.
+- Do NOT give generic advice like "review application logs" — be specific or don't include it.
+- Quality over quantity — 3 high-signal findings beat 10 vague ones.
+- Maximum 8 recommendations.
 
 Return ONLY the JSON array, no surrounding text."""
 
