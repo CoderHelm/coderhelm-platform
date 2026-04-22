@@ -473,6 +473,10 @@ Return a JSON array of recommendations. Each recommendation must have:
 
 Rules:
 - Only include actionable issues, not informational noise
+- Recognize common bot/scanner noise and do NOT report it as application bugs:
+  - Requests for /.env, /.git, /wp-admin, /robots.txt, /.aws, /phpMyAdmin etc. are automated scanners probing for vulnerabilities — these are external, not your app trying to access files
+  - 404s on well-known attack paths are expected internet background noise, not config issues
+  - If you must mention scanner activity, label it clearly as "External Scanner Noise" with severity "info" and suggest WAF rules, not application code changes
 - critical = service down, data loss risk, or security issue
 - warning = degraded performance, recurring errors, resource constraints
 - info = non-urgent improvements, cleanup opportunities
