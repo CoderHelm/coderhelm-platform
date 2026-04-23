@@ -30,6 +30,45 @@ pub async fn run(
         &state.http,
     )?;
 
+    // Resolve merge conflicts before processing feedback (especially on re-review)
+    {
+        let run_record = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()))
+            .key("run_id", aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item);
+        if let Some(ref item) = run_record {
+            let branch = item.get("branch").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default();
+            let base_branch = item.get("base_branch").and_then(|v| v.as_s().ok()).cloned().unwrap_or_else(|| "main".to_string());
+            if !branch.is_empty() {
+                let ticket_msg = crate::models::TicketMessage {
+                    team_id: msg.team_id.clone(),
+                    installation_id: msg.installation_id,
+                    source: TicketSource::Github,
+                    ticket_id: String::new(),
+                    title: String::new(),
+                    body: String::new(),
+                    repo_owner: msg.repo_owner.clone(),
+                    repo_name: msg.repo_name.clone(),
+                    issue_number: 0,
+                    sender: String::new(),
+                    base_branch,
+                    image_attachments: vec![],
+                };
+                match super::pr::resolve_conflicts(state, &ticket_msg, &github, &branch, &provider, &mut usage).await {
+                    Ok(true) => info!(run_id = %msg.run_id, "Resolved merge conflicts before feedback"),
+                    Ok(false) => {}
+                    Err(e) => warn!(run_id = %msg.run_id, error = %e, "Failed to resolve merge conflicts"),
+                }
+            }
+        }
+    }
+
     // If the gateway didn't send inline comments (PR review submitted event),
     // fetch them from the GitHub API using the review_id.
     // When review_id == 0 (re-review), fetch ALL non-bot comments and let
