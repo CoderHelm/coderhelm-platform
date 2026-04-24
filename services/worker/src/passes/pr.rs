@@ -222,85 +222,198 @@ pub async fn resolve_conflicts(
         return Ok(false);
     }
 
-    // Conflicts detected — find which files conflict
     info!(branch, "Merge conflicts detected, resolving with LLM");
 
-    let diff = github
+    // Get SHAs for the merge commit parents
+    let branch_sha = github
+        .get_ref(&msg.repo_owner, &msg.repo_name, branch)
+        .await?;
+    let base_sha = github
+        .get_ref(&msg.repo_owner, &msg.repo_name, &msg.base_branch)
+        .await?;
+
+    // Use the compare API to find the merge base and files changed on each side
+    let compare = github
         .get_diff(&msg.repo_owner, &msg.repo_name, &msg.base_branch, branch)
         .await?;
 
-    let files = diff
+    let merge_base_sha = compare
+        .pointer("/merge_base_commit/sha")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&base_sha);
+
+    // Get files changed on the BASE side (merge_base → base_branch)
+    let base_diff = github
+        .get_diff(
+            &msg.repo_owner,
+            &msg.repo_name,
+            merge_base_sha,
+            &msg.base_branch,
+        )
+        .await?;
+    let base_changed: std::collections::HashSet<String> = base_diff
+        .get("files")
+        .and_then(|v| v.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| f.get("filename").and_then(|v| v.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Get files changed on the BRANCH side (merge_base → branch)
+    let branch_diff = github
+        .get_diff(
+            &msg.repo_owner,
+            &msg.repo_name,
+            merge_base_sha,
+            branch,
+        )
+        .await?;
+    let branch_files = branch_diff
         .get("files")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
 
-    // For each modified file that exists in both branches, read both versions and resolve
+    // Only files changed on BOTH sides are actual conflicts
+    let conflicting: Vec<&serde_json::Value> = branch_files
+        .iter()
+        .filter(|f| {
+            f.get("filename")
+                .and_then(|v| v.as_str())
+                .map(|name| base_changed.contains(name))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    info!(
+        branch,
+        total_branch_files = branch_files.len(),
+        base_changed = base_changed.len(),
+        conflicting = conflicting.len(),
+        "Identified conflicting files (changed on both sides)"
+    );
+
     let mut resolved_files: Vec<FileOp> = Vec::new();
 
-    for file in &files {
+    // For files only changed on base (not touched by branch), take the base version
+    for base_file in &base_changed {
+        let touched_by_branch = branch_files
+            .iter()
+            .any(|f| f.get("filename").and_then(|v| v.as_str()) == Some(base_file));
+        if !touched_by_branch {
+            match github
+                .read_file(&msg.repo_owner, &msg.repo_name, base_file, &msg.base_branch)
+                .await
+            {
+                Ok(content) => {
+                    resolved_files.push(FileOp::Write {
+                        path: base_file.clone(),
+                        content,
+                    });
+                }
+                Err(_) => {
+                    // File was deleted on base
+                    resolved_files.push(FileOp::Delete {
+                        path: base_file.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // For files changed on BOTH sides, do 3-way merge with LLM
+    for file in &conflicting {
         let path = match file.get("filename").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => continue,
         };
-        let status = file
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("modified");
 
-        // Only resolve files that exist on both sides (modified or changed)
-        if status == "added" || status == "removed" {
-            continue;
-        }
-
-        // Read the file from both branches
-        let main_content = match github
+        // Read all three versions: merge base, base branch (main), feature branch
+        let ancestor = github
+            .read_file(&msg.repo_owner, &msg.repo_name, path, merge_base_sha)
+            .await
+            .ok();
+        let main_content = github
             .read_file(&msg.repo_owner, &msg.repo_name, path, &msg.base_branch)
             .await
-        {
-            Ok(c) => c,
-            Err(_) => continue, // file doesn't exist on base branch, skip
-        };
-        let branch_content = match github
+            .ok();
+        let branch_content = github
             .read_file(&msg.repo_owner, &msg.repo_name, path, branch)
             .await
-        {
-            Ok(c) => c,
-            Err(_) => continue,
+            .ok();
+
+        // If either side deleted the file, prefer branch's decision
+        let (main_content, branch_content) = match (main_content, branch_content) {
+            (Some(m), Some(b)) if m == b => continue, // no actual conflict
+            (Some(m), Some(b)) => (m, b),
+            (None, Some(b)) => {
+                // Main deleted, branch still has it — keep branch version
+                resolved_files.push(FileOp::Write {
+                    path: path.to_string(),
+                    content: b,
+                });
+                continue;
+            }
+            (Some(_), None) => {
+                // Branch deleted, main still has it — keep branch's deletion
+                resolved_files.push(FileOp::Delete {
+                    path: path.to_string(),
+                });
+                continue;
+            }
+            (None, None) => continue,
         };
 
-        if main_content == branch_content {
-            continue;
-        }
-
-        // Cap file contents at 16KB to control token usage
-        let cap = |s: &str, label: &str| -> String {
-            if s.len() > 16_000 {
-                let cut = s[..16_000].rfind('\n').unwrap_or(16_000);
-                format!(
-                    "{}... (truncated — {} is {} bytes)",
-                    &s[..cut],
-                    label,
-                    s.len()
-                )
+        let cap = |s: &str, limit: usize| -> String {
+            if s.len() > limit {
+                let cut = s[..limit].rfind('\n').unwrap_or(limit);
+                format!("{}... (truncated, {} bytes total)", &s[..cut], s.len())
             } else {
                 s.to_string()
             }
         };
-        let main_capped = cap(&main_content, &format!("main:{path}"));
-        let branch_capped = cap(&branch_content, &format!("branch:{path}"));
 
-        // Use LLM to resolve the conflict
-        let system = "You are a merge conflict resolver. Given two versions of a file (main and branch), produce the merged file that incorporates both sets of changes. Return ONLY the merged file content, no explanations or markdown fences.".to_string();
+        // Build a 3-way merge prompt
+        let system = "You are a precise merge conflict resolver. You will be given three versions of a file: the common ancestor, the main branch version, and the feature branch version. Produce the correctly merged file that incorporates changes from BOTH sides. When changes conflict directly, prefer the feature branch version. Return ONLY the file content — no explanations, no markdown fences, no commentary.".to_string();
 
-        let prompt = format!(
-            "Merge these two versions of `{path}`.\n\n## main version\n```\n{main_capped}\n```\n\n## branch version (our changes — prefer these)\n```\n{branch_capped}\n```\n\nReturn the merged file content. Prefer the branch version when changes conflict directly.",
-        );
+        let mut prompt = format!("Merge these versions of `{path}`.\n\n");
+
+        if let Some(ref anc) = ancestor {
+            prompt.push_str(&format!(
+                "## Common ancestor\n```\n{}\n```\n\n",
+                cap(anc, 12_000)
+            ));
+        }
+
+        prompt.push_str(&format!(
+            "## main branch version (their changes)\n```\n{}\n```\n\n",
+            cap(&main_content, 16_000)
+        ));
+        prompt.push_str(&format!(
+            "## feature branch version (our changes — prefer when conflicting)\n```\n{}\n```\n\n",
+            cap(&branch_content, 16_000)
+        ));
+
+        if ancestor.is_some() {
+            prompt.push_str(
+                "Use the common ancestor to understand what each side changed. \
+                 Include changes from BOTH sides. Only prefer the feature branch \
+                 when both sides modified the exact same lines.",
+            );
+        } else {
+            prompt.push_str(
+                "Include changes from BOTH sides. Only prefer the feature branch \
+                 when both sides modified the exact same lines.",
+            );
+        }
 
         let mut messages = vec![(
-        "user".to_string(),
-        vec![serde_json::json!({"type": "text", "text": prompt})],
-    )];
+            "user".to_string(),
+            vec![serde_json::json!({"type": "text", "text": prompt})],
+        )];
 
         let model_id = provider.primary_model_id();
         let merged_content = provider::converse(
@@ -318,7 +431,7 @@ pub async fn resolve_conflicts(
                 deadline: None,
             },
             None,
-        None,
+            None,
         )
         .await?;
 
@@ -328,39 +441,38 @@ pub async fn resolve_conflicts(
         });
     }
 
-    if resolved_files.is_empty() {
+    if resolved_files.is_empty() && !conflicting.is_empty() {
         warn!(
             branch,
-            "Conflict detected but no files to resolve — retrying merge"
+            "Conflict detected but no files to resolve — all files matched"
         );
-        return Err("Merge conflict detected but could not identify conflicting files".into());
+        // Try the merge one more time in case it was transient
+        let retry = github
+            .merge_branch(&msg.repo_owner, &msg.repo_name, branch, &msg.base_branch)
+            .await?;
+        return Ok(retry);
     }
 
     info!(
         branch,
-        files = resolved_files.len(),
-        "Resolved conflicts, committing"
+        resolved = resolved_files.len(),
+        llm_resolved = conflicting.len(),
+        auto_resolved = resolved_files.len().saturating_sub(conflicting.len()),
+        "Creating merge commit"
     );
 
-    // Commit the resolved files
+    // Create a proper merge commit with TWO parents — this tells Git the merge is done
     github
-        .batch_write(
+        .create_merge_commit(
             &msg.repo_owner,
             &msg.repo_name,
             branch,
-            "Resolve merge conflicts with main",
+            &branch_sha,
+            &base_sha,
+            &format!("Merge {} into {}", &msg.base_branch, branch),
             &resolved_files,
         )
         .await?;
-
-    // Verify the merge now succeeds
-    let retry = github
-        .merge_branch(&msg.repo_owner, &msg.repo_name, branch, &msg.base_branch)
-        .await?;
-
-    if !retry {
-        warn!(branch, "Conflicts remain after resolution attempt");
-    }
 
     Ok(true)
 }

@@ -559,6 +559,105 @@ impl GitHubClient {
         Ok(commit_sha)
     }
 
+    /// Create a merge commit with two parents (for conflict resolution).
+    /// Builds a tree from the branch tree + overridden files, then creates
+    /// a commit with both branch and base as parents.
+    pub async fn create_merge_commit(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        branch_sha: &str,
+        base_sha: &str,
+        message: &str,
+        resolved_files: &[FileOp],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // Get the branch commit's tree as the base tree
+        let commit_url = format!("{API_BASE}/repos/{owner}/{repo}/git/commits/{branch_sha}");
+        let commit_data = self.get(&commit_url).await?;
+        let base_tree = commit_data
+            .pointer("/tree/sha")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing tree sha in branch commit")?;
+
+        let mut tree_entries = Vec::new();
+        for f in resolved_files {
+            match f {
+                FileOp::Write { path, content } => {
+                    let blob_url = format!("{API_BASE}/repos/{owner}/{repo}/git/blobs");
+                    let blob = self
+                        .post(
+                            &blob_url,
+                            &serde_json::json!({
+                                "content": content,
+                                "encoding": "utf-8",
+                            }),
+                        )
+                        .await?;
+                    let blob_sha = blob
+                        .get("sha")
+                        .and_then(|v| v.as_str())
+                        .ok_or("Missing blob sha")?;
+                    tree_entries.push(serde_json::json!({
+                        "path": path,
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": blob_sha,
+                    }));
+                }
+                FileOp::Delete { path } => {
+                    tree_entries.push(serde_json::json!({
+                        "path": path,
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": null,
+                    }));
+                }
+            }
+        }
+
+        // Create tree with resolved files overlaid on branch tree
+        let tree_url = format!("{API_BASE}/repos/{owner}/{repo}/git/trees");
+        let tree = self
+            .post(
+                &tree_url,
+                &serde_json::json!({
+                    "base_tree": base_tree,
+                    "tree": tree_entries,
+                }),
+            )
+            .await?;
+        let tree_sha = tree
+            .get("sha")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing tree sha")?;
+
+        // Create merge commit with TWO parents
+        let new_commit_url = format!("{API_BASE}/repos/{owner}/{repo}/git/commits");
+        let commit = self
+            .post(
+                &new_commit_url,
+                &serde_json::json!({
+                    "message": message,
+                    "tree": tree_sha,
+                    "parents": [branch_sha, base_sha],
+                }),
+            )
+            .await?;
+        let commit_sha = commit
+            .get("sha")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing commit sha")?
+            .to_string();
+
+        // Update branch ref to point to the merge commit
+        let ref_url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
+        self.patch(&ref_url, &serde_json::json!({"sha": &commit_sha}))
+            .await?;
+
+        Ok(commit_sha)
+    }
+
     // ─── Diff ───────────────────────────────────────────────────
 
     /// Compare two refs.
