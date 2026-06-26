@@ -3386,7 +3386,7 @@ pub async fn update_model_provider(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    claims.require_role(4)?; // owner only
+    claims.require_role(3)?; // admin+
     let provider = "anthropic";
 
     let api_key_from_body = body["api_key"].as_str().map(|s| s.to_string());
