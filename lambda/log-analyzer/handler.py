@@ -27,7 +27,7 @@ logger.setLevel(logging.INFO)
 
 AWS_INSIGHTS_TABLE = os.environ.get("AWS_INSIGHTS_TABLE_NAME", "coderhelm-prod-aws-insights")
 SETTINGS_TABLE = os.environ.get("SETTINGS_TABLE_NAME", "coderhelm-prod-settings")
-MODEL_ID = os.environ.get("MODEL_ID", "claude-sonnet-4-20250514")
+MODEL_ID = os.environ.get("MODEL_ID", "claude-sonnet-4-6")
 CODERHELM_ACCOUNT_ID = os.environ["CODERHELM_ACCOUNT_ID"]
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"

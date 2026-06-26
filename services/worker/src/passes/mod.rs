@@ -93,8 +93,13 @@ fn sanitize_error(msg: &str) -> String {
     }
     // Remove model IDs
     let patterns = [
+        "claude-opus-4-7",
+        "claude-opus-4-6",
         "claude-opus-4-20250514",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
         "claude-sonnet-4-20250514",
+        "claude-haiku-4-5",
     ];
     for p in &patterns {
         s = s.replace(p, "");

@@ -293,7 +293,7 @@ export class ApiStack extends cdk.Stack {
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
-        MODEL_ID: "claude-sonnet-4-20250514",
+        MODEL_ID: "claude-sonnet-4-6",
         COGNITO_USER_POOL_ID: userPool.userPoolId,
         COGNITO_CLIENT_ID: userPoolClient.userPoolClientId,
         COGNITO_DOMAIN: userPoolDomain.domainName,

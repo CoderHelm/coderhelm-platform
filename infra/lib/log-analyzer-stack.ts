@@ -62,7 +62,7 @@ export class LogAnalyzerStack extends cdk.Stack {
       environment: {
         AWS_INSIGHTS_TABLE_NAME: props.awsInsightsTable.tableName,
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
-        MODEL_ID: "claude-sonnet-4-20250514",
+        MODEL_ID: "claude-sonnet-4-6",
         CODERHELM_ACCOUNT_ID: this.account,
         LOOKBACK_HOURS: "6",
       },
