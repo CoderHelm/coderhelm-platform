@@ -242,11 +242,10 @@ async fn handle_issue_event(
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
-        .key_condition_expression("team_id = :tid")
-        .filter_expression("ticket_id = :ticket")
+        .index_name("ticket-index")
+        .key_condition_expression("team_id = :tid AND ticket_id = :ticket")
         .expression_attribute_values(":tid", attr_s(team_id))
         .expression_attribute_values(":ticket", attr_s(&ticket_id_str))
-        .limit(5)
         .send()
         .await;
 

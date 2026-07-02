@@ -171,6 +171,12 @@ Return ONLY the markdown body text."#,
         let nid = pr_data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         info!(pr_number = number, pr_url = %url, "Using existing PR");
         (number, url, nid)
+    } else if let Some(pr_data) = reopen_prior_pr(github, msg, branch).await {
+        let number = pr_data.get("number").and_then(|v| v.as_u64()).ok_or("Missing PR number")?;
+        let url = pr_data.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let nid = pr_data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        info!(pr_number = number, pr_url = %url, "Reopened prior PR for branch");
+        (number, url, nid)
     } else {
         // Create draft PR — CI triggers on PR creation, and we'll mark it ready after tests/review pass
         let pr_data = github
@@ -199,6 +205,34 @@ Return ONLY the markdown body text."#,
         draft: true,
         node_id,
     })
+}
+
+/// Reopen the branch's prior closed-unmerged PR, if any. A ticket-update
+/// re-run force-resets the branch to base, which makes GitHub auto-close the
+/// PR ("all commits removed"); once the fresh implementation has pushed new
+/// commits, reopening keeps the PR number and its review history instead of
+/// creating a new PR every re-run. Failures fall back to PR creation.
+async fn reopen_prior_pr(
+    github: &GitHubClient,
+    msg: &TicketMessage,
+    branch: &str,
+) -> Option<serde_json::Value> {
+    let prior = github
+        .find_reopenable_pr_for_branch(&msg.repo_owner, &msg.repo_name, branch)
+        .await
+        .ok()
+        .flatten()?;
+    let number = prior.get("number").and_then(|v| v.as_u64())?;
+    match github
+        .reopen_pull_request(&msg.repo_owner, &msg.repo_name, number)
+        .await
+    {
+        Ok(()) => Some(prior),
+        Err(e) => {
+            warn!(pr_number = number, error = %e, "Could not reopen prior PR; creating a new one");
+            None
+        }
+    }
 }
 
 /// Attempt to merge main into the feature branch before creating the PR.

@@ -361,6 +361,7 @@ mod tests {
             repo_name: "repo".into(),
             issue_number: 42,
             sender: "user".into(),
+            image_attachments: vec![],
         });
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();
