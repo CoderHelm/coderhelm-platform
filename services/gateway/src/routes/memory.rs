@@ -267,7 +267,7 @@ pub async fn list_memories(
     }
 
     // Sort by created_at descending (newest first)
-    items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    items.sort_by_key(|item| std::cmp::Reverse(item.created_at));
 
     let filtered_total = items.len();
     let page = q.page.max(1);
