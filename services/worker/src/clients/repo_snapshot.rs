@@ -50,9 +50,7 @@ impl RepoSnapshot {
     /// Build a snapshot from raw `.tar.gz` bytes as returned by
     /// `GET /repos/{owner}/{repo}/tarball/{ref}`. The archive's single
     /// top-level directory prefix is stripped.
-    pub fn from_tarball(
-        bytes: &[u8],
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn from_tarball(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let decoder = GzDecoder::new(bytes);
         let mut archive = Archive::new(decoder);
         let mut files = HashMap::new();
@@ -149,10 +147,7 @@ impl RepoSnapshot {
     /// every whitespace-separated term (mirrors GitHub code search AND
     /// semantics that the pass prompts were written against).
     pub async fn search(&self, query: &str) -> Vec<SnapshotMatch> {
-        let terms: Vec<String> = query
-            .split_whitespace()
-            .map(|t| t.to_lowercase())
-            .collect();
+        let terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
         if terms.is_empty() {
             return Vec::new();
         }
@@ -209,7 +204,10 @@ impl RepoSnapshot {
 
     /// Mirror a delete that was committed through the GitHub API.
     pub async fn apply_delete(&self, path: &str) {
-        self.files.write().await.remove(path.trim_start_matches('/'));
+        self.files
+            .write()
+            .await
+            .remove(path.trim_start_matches('/'));
     }
 }
 
@@ -237,14 +235,20 @@ mod tests {
     #[tokio::test]
     async fn search_and_reads() {
         let tarball = make_tarball(&[
-            ("src/filter.ts", "const ageRangeMap = {\n  ZERO_TO_THREE: [0, 3],\n};\n"),
+            (
+                "src/filter.ts",
+                "const ageRangeMap = {\n  ZERO_TO_THREE: [0, 3],\n};\n",
+            ),
             ("src/other.ts", "export const unrelated = 1;\n"),
             ("README.md", "Age filter docs\n"),
         ]);
         let snap = RepoSnapshot::from_tarball(&tarball).unwrap();
 
         // Tree + prefix stripping
-        assert_eq!(snap.tree().await, vec!["README.md", "src/filter.ts", "src/other.ts"]);
+        assert_eq!(
+            snap.tree().await,
+            vec!["README.md", "src/filter.ts", "src/other.ts"]
+        );
 
         // Single-term search with line numbers
         let hits = snap.search("ageRangeMap").await;
@@ -265,7 +269,8 @@ mod tests {
         assert!(snap.list_directory("nope").await.is_none());
 
         // Write coherence
-        snap.apply_write("src/filter.ts", "const renamedMap = {};\n").await;
+        snap.apply_write("src/filter.ts", "const renamedMap = {};\n")
+            .await;
         assert!(snap.search("ageRangeMap").await.is_empty());
         assert_eq!(snap.search("renamedMap").await.len(), 1);
         snap.apply_delete("src/other.ts").await;

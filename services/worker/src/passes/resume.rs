@@ -16,9 +16,17 @@ const MAX_LOG_CHARS: usize = 15_000;
 const MAX_AWAITING_CI_HOURS: i64 = 24;
 
 /// Wall-clock duration from run created_at, falling back to Lambda start time.
-fn wall_clock_secs(created_at: Option<chrono::DateTime<chrono::Utc>>, start: &std::time::Instant) -> u64 {
+fn wall_clock_secs(
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    start: &std::time::Instant,
+) -> u64 {
     created_at
-        .map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds().max(0) as u64)
+        .map(|t| {
+            chrono::Utc::now()
+                .signed_duration_since(t)
+                .num_seconds()
+                .max(0) as u64
+        })
         .unwrap_or_else(|| start.elapsed().as_secs())
 }
 
@@ -102,16 +110,14 @@ pub async fn run(
                 // causes an exponential cascade of bouncing messages.
                 info!(
                     run_id = msg.run_id,
-                    status,
-                    "Run is currently running — dropping resume (safety-net will cover)"
+                    status, "Run is currently running — dropping resume (safety-net will cover)"
                 );
                 return Ok(());
             }
         } else {
             info!(
                 run_id = msg.run_id,
-                status,
-                "Run not in awaiting_ci status, skipping resume"
+                status, "Run not in awaiting_ci status, skipping resume"
             );
             return Ok(());
         }
@@ -197,7 +203,10 @@ pub async fn run(
             return Ok(());
         }
 
-        info!(run_id = msg.run_id, "No unprocessed events — checking GitHub PR status");
+        info!(
+            run_id = msg.run_id,
+            "No unprocessed events — checking GitHub PR status"
+        );
 
         let repo_owner = run_record
             .get("repo")
@@ -223,7 +232,10 @@ pub async fn run(
             .unwrap_or(0);
 
         if repo_owner.is_empty() || repo_name.is_empty() || branch.is_empty() {
-            info!(run_id = msg.run_id, "Missing repo/branch info, can't check CI");
+            info!(
+                run_id = msg.run_id,
+                "Missing repo/branch info, can't check CI"
+            );
             return Ok(());
         }
 
@@ -244,7 +256,10 @@ pub async fn run(
 
         if total == 0 {
             // No CI workflows at all — mark PR ready and complete
-            info!(run_id = msg.run_id, "No CI checks found — marking PR ready and completing");
+            info!(
+                run_id = msg.run_id,
+                "No CI checks found — marking PR ready and completing"
+            );
             mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
             set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
             return Ok(());
@@ -261,7 +276,10 @@ pub async fn run(
 
         if any_in_progress {
             // CI still running — send another delayed resume to check again later
-            info!(run_id = msg.run_id, "CI still in progress — scheduling re-check");
+            info!(
+                run_id = msg.run_id,
+                "CI still in progress — scheduling re-check"
+            );
             send_delayed_resume(state, &msg, 120).await;
             return Ok(());
         }
@@ -277,7 +295,10 @@ pub async fn run(
 
         if any_failed {
             // CI failed but webhook was missed — write a synthetic ci_failed event and re-trigger
-            info!(run_id = msg.run_id, "CI failed (missed webhook) — writing event and re-triggering");
+            info!(
+                run_id = msg.run_id,
+                "CI failed (missed webhook) — writing event and re-triggering"
+            );
             let now = chrono::Utc::now();
             let event_sk = format!("EVENT#{}#ci_failed", now.format("%Y%m%dT%H%M%S%.3fZ"));
             let _ = state
@@ -298,7 +319,10 @@ pub async fn run(
         }
 
         // All checks passed but webhook was missed — mark ready and complete
-        info!(run_id = msg.run_id, "CI passed (missed webhook) — marking PR ready and completing");
+        info!(
+            run_id = msg.run_id,
+            "CI passed (missed webhook) — marking PR ready and completing"
+        );
         mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
         set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
         return Ok(());
@@ -432,8 +456,7 @@ pub async fn run(
 
     // Load rules and repo instructions so CI fix / review fix have full context
     let rules = super::load_rules(state, &ticket_msg).await;
-    let repo_instructions =
-        super::load_repo_instructions(&github, &repo_owner, &repo_name).await;
+    let repo_instructions = super::load_repo_instructions(&github, &repo_owner, &repo_name).await;
 
     // Collect any review feedback (comments on the PR) — useful for both CI fix and review paths
     let review_feedback = collect_review_feedback(&events);
@@ -465,14 +488,20 @@ pub async fn run(
             {
                 Ok(l) => {
                     let trimmed = if l.len() > MAX_LOG_CHARS / failed_run_ids.len().max(1) {
-                        format!("... (truncated)\n{}", &l[l.len() - MAX_LOG_CHARS / failed_run_ids.len().max(1)..])
+                        format!(
+                            "... (truncated)\n{}",
+                            &l[l.len() - MAX_LOG_CHARS / failed_run_ids.len().max(1)..]
+                        )
                     } else {
                         l
                     };
                     all_logs.push(trimmed);
                 }
                 Err(e) => {
-                    warn!(workflow_run_id = wf_run_id, "Failed to download workflow logs: {e}");
+                    warn!(
+                        workflow_run_id = wf_run_id,
+                        "Failed to download workflow logs: {e}"
+                    );
                 }
             }
         }
@@ -487,7 +516,11 @@ pub async fn run(
                 .await
             {
                 Ok(annotations) if !annotations.is_empty() => {
-                    info!(run_id = msg.run_id, len = annotations.len(), "Got check run annotations as fallback");
+                    info!(
+                        run_id = msg.run_id,
+                        len = annotations.len(),
+                        "Got check run annotations as fallback"
+                    );
                     format!("{failure_logs}\n\nCheck run annotations:\n{annotations}")
                 }
                 _ => failure_logs.clone(),
@@ -571,7 +604,11 @@ pub async fn run(
         .await
         {
             Ok(result) => {
-                info!(run_id = msg.run_id, files = result.files_modified.len(), "CI fix implemented");
+                info!(
+                    run_id = msg.run_id,
+                    files = result.files_modified.len(),
+                    "CI fix implemented"
+                );
                 write_pass_trace(
                     state,
                     &msg.team_id,
@@ -585,7 +622,10 @@ pub async fn run(
                 .await;
 
                 if result.files_modified.is_empty() {
-                    warn!(run_id = msg.run_id, "CI fix produced no changes — completing with PR for human review");
+                    warn!(
+                        run_id = msg.run_id,
+                        "CI fix produced no changes — completing with PR for human review"
+                    );
                     // Don't hard-fail — complete the run and mark PR ready for human review
                     complete_run_with_status(
                         state,
@@ -778,7 +818,10 @@ pub async fn run(
                     .await;
 
                     if result.files_modified.is_empty() {
-                        warn!(run_id = msg.run_id, "Review fix produced no changes — completing anyway");
+                        warn!(
+                            run_id = msg.run_id,
+                            "Review fix produced no changes — completing anyway"
+                        );
                         mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
                         complete_run_with_status(
                             state,
@@ -816,8 +859,7 @@ pub async fn run(
             }
 
             // Back to awaiting_ci for the next CI run
-            save_checkpoint(state, &msg.team_id, &msg.run_id, "pr", &branch, 0, &usage)
-                .await;
+            save_checkpoint(state, &msg.team_id, &msg.run_id, "pr", &branch, 0, &usage).await;
             mark_events_processed(state, &msg.run_id, &events).await;
             set_run_awaiting_ci(
                 state,
@@ -1051,12 +1093,7 @@ async fn set_run_awaiting_ci(
     Ok(())
 }
 
-async fn mark_pr_ready(
-    github: &GitHubClient,
-    repo_owner: &str,
-    repo_name: &str,
-    pr_number: u64,
-) {
+async fn mark_pr_ready(github: &GitHubClient, repo_owner: &str, repo_name: &str, pr_number: u64) {
     if pr_number == 0 {
         return;
     }
@@ -1182,13 +1219,21 @@ async fn send_delayed_resume(state: &WorkerState, msg: &ResumeMessage, delay_sec
         .send()
         .await
     {
-        Ok(_) => info!(run_id = msg.run_id, delay_seconds, "Delayed resume scheduled"),
+        Ok(_) => info!(
+            run_id = msg.run_id,
+            delay_seconds, "Delayed resume scheduled"
+        ),
         Err(e) => error!(run_id = msg.run_id, error = %e, "Failed to send delayed resume"),
     }
 }
 
 /// Mark a run as completed (success) without needing full token usage context.
-async fn set_run_complete(state: &WorkerState, team_id: &str, run_id: &str, created_at: Option<chrono::DateTime<chrono::Utc>>) {
+async fn set_run_complete(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
     let now = chrono::Utc::now();
     let duration = created_at
         .map(|t| now.signed_duration_since(t).num_seconds().max(0) as u64)

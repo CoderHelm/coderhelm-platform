@@ -46,7 +46,10 @@ async fn acquire_ticket_lock(state: &AppState, team_id: &str, ticket_id: &str) -
         Ok(_) => true,
         Err(e) => {
             if e.to_string().contains("ConditionalCheckFailed") {
-                info!(team_id, ticket_id, "Ticket lock held — skipping duplicate enqueue");
+                info!(
+                    team_id,
+                    ticket_id, "Ticket lock held — skipping duplicate enqueue"
+                );
                 false
             } else {
                 warn!(team_id, ticket_id, error = %e, "Ticket lock check failed — allowing through");
@@ -387,8 +390,7 @@ async fn process_jira_payload(
     // hash must match what the worker stores on the run record, so it is
     // computed from the same title/body/attachment-keys the TicketMessage
     // will carry.
-    let expected_keys =
-        super::trigger_gate::expected_attachment_keys(team_id, ticket_key, payload);
+    let expected_keys = super::trigger_gate::expected_attachment_keys(team_id, ticket_key, payload);
     let context_hash = common::ticket_context_hash(&title, &body_text, &expected_keys);
     match super::trigger_gate::gate_ticket_trigger(
         state,
@@ -400,13 +402,29 @@ async fn process_jira_payload(
     .await
     {
         super::trigger_gate::TicketGate::SkipInFlight => {
-            log_jira_event(state, team_id, event_type, ticket_key, &title, "duplicate", None)
-                .await;
+            log_jira_event(
+                state,
+                team_id,
+                event_type,
+                ticket_key,
+                &title,
+                "duplicate",
+                None,
+            )
+            .await;
             return Ok(StatusCode::OK);
         }
         super::trigger_gate::TicketGate::SkipUnchanged => {
-            log_jira_event(state, team_id, event_type, ticket_key, &title, "unchanged", None)
-                .await;
+            log_jira_event(
+                state,
+                team_id,
+                event_type,
+                ticket_key,
+                &title,
+                "unchanged",
+                None,
+            )
+            .await;
             return Ok(StatusCode::OK);
         }
         super::trigger_gate::TicketGate::Enqueue => {}
@@ -467,17 +485,20 @@ async fn process_jira_payload(
     }
 
     // Upload image attachments to S3 (sent by Forge as base64)
-    let image_attachments = upload_image_attachments(
-        state,
-        team_id,
-        ticket_key,
-        payload,
-    )
-    .await;
+    let image_attachments = upload_image_attachments(state, team_id, ticket_key, payload).await;
 
     // Acquire ticket lock to prevent duplicate concurrent runs
     if !acquire_ticket_lock(state, team_id, ticket_key).await {
-        log_jira_event(state, team_id, event_type, ticket_key, &title, "lock_held", None).await;
+        log_jira_event(
+            state,
+            team_id,
+            event_type,
+            ticket_key,
+            &title,
+            "lock_held",
+            None,
+        )
+        .await;
         return Ok(StatusCode::OK);
     }
 
@@ -672,8 +693,12 @@ async fn handle_jira_comment(
 
     // Find the most recent run for this ticket.
     // Paginate because DynamoDB limit applies before filter_expression.
-    let mut run_item_found: Option<std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
-    let mut exclusive_start_key: Option<std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+    let mut run_item_found: Option<
+        std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+    > = None;
+    let mut exclusive_start_key: Option<
+        std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+    > = None;
     for _ in 0..10 {
         let mut q = state
             .dynamo
@@ -796,7 +821,16 @@ async fn handle_jira_comment(
             // Acquire ticket lock to prevent duplicate concurrent runs
             if !acquire_ticket_lock(state, team_id, ticket_key).await {
                 let repo_display = format!("{repo_owner}/{repo_name}");
-                log_jira_event(state, team_id, "comment_retry", ticket_key, title, "lock_held", Some(&repo_display)).await;
+                log_jira_event(
+                    state,
+                    team_id,
+                    "comment_retry",
+                    ticket_key,
+                    title,
+                    "lock_held",
+                    Some(&repo_display),
+                )
+                .await;
                 return Ok(StatusCode::OK);
             }
 
@@ -868,7 +902,16 @@ async fn handle_jira_comment(
 
             if !acquire_ticket_lock(state, team_id, ticket_key).await {
                 let repo_display = format!("{repo_owner}/{repo_name}");
-                log_jira_event(state, team_id, "comment_retry", ticket_key, title, "lock_held", Some(&repo_display)).await;
+                log_jira_event(
+                    state,
+                    team_id,
+                    "comment_retry",
+                    ticket_key,
+                    title,
+                    "lock_held",
+                    Some(&repo_display),
+                )
+                .await;
                 return Ok(StatusCode::OK);
             }
 
@@ -878,7 +921,20 @@ async fn handle_jira_comment(
             );
             let result = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
             let repo_display = format!("{repo_owner}/{repo_name}");
-            log_jira_event(state, team_id, "comment_retry", ticket_key, title, if result.is_ok() { "reprocessing" } else { "error" }, Some(&repo_display)).await;
+            log_jira_event(
+                state,
+                team_id,
+                "comment_retry",
+                ticket_key,
+                title,
+                if result.is_ok() {
+                    "reprocessing"
+                } else {
+                    "error"
+                },
+                Some(&repo_display),
+            )
+            .await;
             result
         }
         // Completed run with PR — send feedback
@@ -1088,7 +1144,10 @@ async fn upload_image_attachments(
         let data = match base64_decode(data_b64) {
             Some(d) => d,
             None => {
-                warn!(team_id, ticket_key, filename, "Failed to decode base64 image attachment");
+                warn!(
+                    team_id,
+                    ticket_key, filename, "Failed to decode base64 image attachment"
+                );
                 continue;
             }
         };

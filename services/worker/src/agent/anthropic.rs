@@ -88,10 +88,7 @@ enum ContentBlock {
 #[serde(tag = "type")]
 enum ImageSource {
     #[serde(rename = "base64")]
-    Base64 {
-        media_type: String,
-        data: String,
-    },
+    Base64 { media_type: String, data: String },
 }
 
 #[derive(Clone, Serialize)]
@@ -231,7 +228,10 @@ pub async fn converse_tool_loop(
                 return Ok("(timed out — partial implementation)".to_string());
             } else if remaining < 120 && !deadline_warned {
                 deadline_warned = true;
-                warn!(remaining, "Approaching deadline — injecting wrap-up message");
+                warn!(
+                    remaining,
+                    "Approaching deadline — injecting wrap-up message"
+                );
                 messages.push((
                     "user".to_string(),
                     vec![json!({"type": "text", "text":
@@ -420,19 +420,22 @@ pub async fn converse_tool_loop(
                 }
             }));
             // Log tool results (truncate large outputs to 100KB)
-            let truncated_results: Vec<Value> = tool_results.iter().map(|r| {
-                let mut entry = r.clone();
-                if let Some(content) = entry.get("content").and_then(|c| c.as_str()) {
-                    if content.len() > 102_400 {
-                        entry["content"] = Value::String(format!(
-                            "{}... [truncated, {} bytes total]",
-                            &content[..102_400],
-                            content.len()
-                        ));
+            let truncated_results: Vec<Value> = tool_results
+                .iter()
+                .map(|r| {
+                    let mut entry = r.clone();
+                    if let Some(content) = entry.get("content").and_then(|c| c.as_str()) {
+                        if content.len() > 102_400 {
+                            entry["content"] = Value::String(format!(
+                                "{}... [truncated, {} bytes total]",
+                                &content[..102_400],
+                                content.len()
+                            ));
+                        }
                     }
-                }
-                entry
-            }).collect();
+                    entry
+                })
+                .collect();
             log.push(json!({
                 "turn": turns,
                 "role": "tool_results",
@@ -457,7 +460,11 @@ fn truncate_input_summary(input: &Value) -> String {
         command.chars().take(200).collect()
     } else {
         let s = input.to_string();
-        if s.len() > 200 { format!("{}…", &s[..200]) } else { s }
+        if s.len() > 200 {
+            format!("{}…", &s[..200])
+        } else {
+            s
+        }
     };
     summary
 }
@@ -556,8 +563,11 @@ fn compact_messages(messages: &mut [(String, Vec<Value>)], keep_last: usize) {
                     if c.len() > 150 {
                         // Preserve a brief hint of what was in the result
                         let hint = &c[..c.len().min(60)];
-                        block["content"] =
-                            json!(format!("[Cleared — {len} chars: {hint}…]", len = c.len(), hint = hint));
+                        block["content"] = json!(format!(
+                            "[Cleared — {len} chars: {hint}…]",
+                            len = c.len(),
+                            hint = hint
+                        ));
                     }
                 }
             }

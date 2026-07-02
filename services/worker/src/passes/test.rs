@@ -23,7 +23,12 @@ pub async fn run(
 ) -> Result<TestResult, Box<dyn std::error::Error + Send + Sync>> {
     // Check if repo has CI workflows
     let has_ci = github
-        .read_file(&msg.repo_owner, &msg.repo_name, ".github/workflows", &msg.base_branch)
+        .read_file(
+            &msg.repo_owner,
+            &msg.repo_name,
+            ".github/workflows",
+            &msg.base_branch,
+        )
         .await
         .is_ok();
 

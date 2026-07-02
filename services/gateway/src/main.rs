@@ -357,10 +357,7 @@ async fn main() -> Result<(), Error> {
         .route("/plugins/:id/test", post(routes::plugins::test_connection))
         // Memory browser
         .route("/memories", get(routes::memory::list_memories))
-        .route(
-            "/memories/stats",
-            get(routes::memory::memory_stats),
-        )
+        .route("/memories/stats", get(routes::memory::memory_stats))
         .route(
             "/memories/:memory_id",
             delete(routes::memory::delete_memory),

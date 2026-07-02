@@ -9,8 +9,8 @@ use tracing::{error, info, warn};
 
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
-    FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo,
-    PlanTaskContinueMessage, ResumeMessage, TicketMessage, TicketSource, WorkerMessage,
+    FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo, PlanTaskContinueMessage,
+    ResumeMessage, TicketMessage, TicketSource, WorkerMessage,
 };
 use crate::AppState;
 
@@ -365,8 +365,7 @@ async fn handle_issue_comment(
     // enqueue a duplicate run with no dedup at all.
     let ticket_id_str = format!("GH-{}", issue["number"].as_u64().unwrap_or(0));
     if matches!(
-        super::trigger_gate::gate_ticket_trigger(state, team_id, &ticket_id_str, None, true)
-            .await,
+        super::trigger_gate::gate_ticket_trigger(state, team_id, &ticket_id_str, None, true).await,
         super::trigger_gate::TicketGate::SkipInFlight
     ) {
         info!(ticket_id = %ticket_id_str, "Skipping slash command — run already in flight");
@@ -584,9 +583,7 @@ async fn handle_check_run(
     let check_name = payload["check_run"]["name"].as_str().unwrap_or("unknown");
     info!(
         team_id,
-        branch,
-        check_name,
-        "check_run failed — will be handled by workflow_run completion"
+        branch, check_name, "check_run failed — will be handled by workflow_run completion"
     );
 
     Ok(StatusCode::OK)
@@ -628,7 +625,9 @@ async fn handle_installation(
                         .ok()
                         .and_then(|r| r.items().first().cloned())
                         .and_then(|item| {
-                            item.get("pk").and_then(|v| v.as_s().ok()).map(|s| s.to_string())
+                            item.get("pk")
+                                .and_then(|v| v.as_s().ok())
+                                .map(|s| s.to_string())
                         })
                 } else {
                     None
@@ -652,7 +651,9 @@ async fn handle_installation(
                         .ok()
                         .and_then(|r| r.items().first().cloned())
                         .and_then(|item| {
-                            item.get("pk").and_then(|v| v.as_s().ok()).map(|s| s.to_string())
+                            item.get("pk")
+                                .and_then(|v| v.as_s().ok())
+                                .map(|s| s.to_string())
                         })
                 };
 
@@ -691,9 +692,7 @@ async fn handle_installation(
                         )
                         .expression_attribute_values(
                             ":iid",
-                            aws_sdk_dynamodb::types::AttributeValue::N(
-                                installation_id.to_string(),
-                            ),
+                            aws_sdk_dynamodb::types::AttributeValue::N(installation_id.to_string()),
                         )
                         .expression_attribute_values(":org", attr_s(org))
                         .expression_attribute_values(":now", attr_s(&now))
@@ -756,8 +755,7 @@ async fn handle_installation(
             );
 
             // Find ALL teams linked to this installation and remove the link
-            let team_ids =
-                resolve_all_teams_by_installation(state, installation_id).await;
+            let team_ids = resolve_all_teams_by_installation(state, installation_id).await;
             let now = chrono::Utc::now().to_rfc3339();
             for team_id in &team_ids {
                 // Remove from teams table
@@ -792,7 +790,10 @@ async fn handle_installation(
                 );
             }
             if team_ids.is_empty() {
-                info!(installation_id, "No teams found for uninstalled installation");
+                info!(
+                    installation_id,
+                    "No teams found for uninstalled installation"
+                );
             }
 
             Ok(StatusCode::OK)
@@ -918,7 +919,10 @@ async fn handle_check_suite(
     let conclusion = payload["check_suite"]["conclusion"].as_str().unwrap_or("");
     // All CI result handling is done by the workflow_run event handler.
     // check_suite just logs for observability.
-    info!(branch, conclusion, "check_suite completed — workflow_run handler will process");
+    info!(
+        branch,
+        conclusion, "check_suite completed — workflow_run handler will process"
+    );
     Ok(StatusCode::OK)
 }
 
@@ -946,8 +950,15 @@ async fn handle_workflow_run(
     // Skip "skipped" workflows — they're not failures, just conditional workflows
     // that didn't apply (e.g., deploy only runs on main). Writing them as ci_failed
     // pollutes the events and confuses the CI fix loop.
-    if conclusion == "skipped" || conclusion == "cancelled" || conclusion == "neutral" || conclusion == "stale" {
-        info!(branch, conclusion, workflow_name, "Ignoring non-actionable workflow conclusion");
+    if conclusion == "skipped"
+        || conclusion == "cancelled"
+        || conclusion == "neutral"
+        || conclusion == "stale"
+    {
+        info!(
+            branch,
+            conclusion, workflow_name, "Ignoring non-actionable workflow conclusion"
+        );
         return Ok(StatusCode::OK);
     }
 
@@ -964,8 +975,13 @@ async fn handle_workflow_run(
                 let prs = wf["pull_requests"].as_array().cloned().unwrap_or_default();
                 for pr in &prs {
                     let pr_number = pr["number"].as_u64().unwrap_or(0);
-                    if pr_number == 0 { continue; }
-                    info!(branch, pr_number, "CI passed (no run found) — marking PR ready directly");
+                    if pr_number == 0 {
+                        continue;
+                    }
+                    info!(
+                        branch,
+                        pr_number, "CI passed (no run found) — marking PR ready directly"
+                    );
                     let message = WorkerMessage::MarkReady(MarkReadyMessage {
                         team_id: team_id.to_string(),
                         installation_id,
@@ -981,14 +997,14 @@ async fn handle_workflow_run(
     };
 
     let now = chrono::Utc::now();
-    let event_type = if conclusion == "success" { "ci_passed" } else { "ci_failed" };
+    let event_type = if conclusion == "success" {
+        "ci_passed"
+    } else {
+        "ci_failed"
+    };
 
     // Write event to events table
-    let event_sk = format!(
-        "EVENT#{}#{}",
-        now.format("%Y%m%dT%H%M%S%.3fZ"),
-        event_type,
-    );
+    let event_sk = format!("EVENT#{}#{}", now.format("%Y%m%dT%H%M%S%.3fZ"), event_type,);
 
     let mut logs_url = String::new();
     if let Some(url) = wf.get("logs_url").and_then(|v| v.as_str()) {
@@ -1013,7 +1029,10 @@ async fn handle_workflow_run(
         .item("sk", attr_s(&event_sk))
         .item("event_type", attr_s(event_type))
         .item("payload", attr_s(&event_payload.to_string()))
-        .item("processed", aws_sdk_dynamodb::types::AttributeValue::Bool(false))
+        .item(
+            "processed",
+            aws_sdk_dynamodb::types::AttributeValue::Bool(false),
+        )
         .item("created_at", attr_s(&now.to_rfc3339()))
         .item("expires_at", attr_n(now.timestamp() as u64 + 30 * 86400))
         .send()
@@ -1025,10 +1044,7 @@ async fn handle_workflow_run(
 
     info!(
         run_id,
-        branch,
-        event_type,
-        workflow_name,
-        "CI event recorded — sending Resume"
+        branch, event_type, workflow_name, "CI event recorded — sending Resume"
     );
 
     // Send Resume message with a delay — CI repos often have multiple workflows
@@ -1297,7 +1313,12 @@ async fn send_to_queue(
 }
 
 /// Write a run event to the events table for the resume flow.
-async fn write_run_event(state: &AppState, run_id: &str, event_type: &str, payload: &serde_json::Value) {
+async fn write_run_event(
+    state: &AppState,
+    run_id: &str,
+    event_type: &str,
+    payload: &serde_json::Value,
+) {
     if state.config.events_table_name.is_empty() {
         return;
     }
@@ -1312,7 +1333,10 @@ async fn write_run_event(state: &AppState, run_id: &str, event_type: &str, paylo
         .item("sk", attr_s(&event_sk))
         .item("event_type", attr_s(event_type))
         .item("payload", attr_s(&payload.to_string()))
-        .item("processed", aws_sdk_dynamodb::types::AttributeValue::Bool(false))
+        .item(
+            "processed",
+            aws_sdk_dynamodb::types::AttributeValue::Bool(false),
+        )
         .item("created_at", attr_s(&now.to_rfc3339()))
         .item("expires_at", attr_n(now.timestamp() as u64 + 30 * 86400))
         .send()

@@ -266,7 +266,14 @@ impl GitHubClient {
     }
 
     /// Mirror a committed write into any snapshot held for this ref.
-    async fn mirror_write(&self, owner: &str, repo: &str, git_ref: &str, path: &str, content: &str) {
+    async fn mirror_write(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        path: &str,
+        content: &str,
+    ) {
         if let Some(snap) = self.existing_snapshot(owner, repo, git_ref).await {
             snap.apply_write(path, content).await;
         }
@@ -314,8 +321,14 @@ impl GitHubClient {
     ) -> Result<(Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}");
         let data = self.get(&url).await?;
-        let language = data.get("language").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let description = data.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let language = data
+            .get("language")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let description = data
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         Ok((language, description))
     }
 
@@ -606,7 +619,7 @@ impl GitHubClient {
                 self.invalidate_snapshot(owner, repo, base).await;
                 Ok(true) // merged
             }
-            204 => Ok(true), // already up-to-date
+            204 => Ok(true),  // already up-to-date
             409 => Ok(false), // conflict
             _ => {
                 let status = resp.status();
@@ -1096,9 +1109,8 @@ impl GitHubClient {
         run_id: u64,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         // First, list jobs for this run and find the failed one(s)
-        let jobs_url = format!(
-            "{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/jobs?filter=latest"
-        );
+        let jobs_url =
+            format!("{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/jobs?filter=latest");
         let jobs: serde_json::Value = self.get(&jobs_url).await?;
         let failed_jobs: Vec<u64> = jobs["jobs"]
             .as_array()
@@ -1162,7 +1174,9 @@ impl GitHubClient {
             }
             let check_name = check["name"].as_str().unwrap_or("unknown");
             let check_id = check["id"].as_u64().unwrap_or(0);
-            if check_id == 0 { continue; }
+            if check_id == 0 {
+                continue;
+            }
 
             // Fetch annotations for this check run
             let url = format!(
@@ -1171,16 +1185,16 @@ impl GitHubClient {
             match self.get(&url).await {
                 Ok(annotations) => {
                     let ann_array = annotations.as_array().cloned().unwrap_or_default();
-                    if ann_array.is_empty() { continue; }
+                    if ann_array.is_empty() {
+                        continue;
+                    }
                     all_annotations.push_str(&format!("\n--- {check_name} ---\n"));
                     for ann in &ann_array {
                         let path = ann["path"].as_str().unwrap_or("");
                         let start_line = ann["start_line"].as_u64().unwrap_or(0);
                         let msg = ann["message"].as_str().unwrap_or("");
                         let level = ann["annotation_level"].as_str().unwrap_or("error");
-                        all_annotations.push_str(
-                            &format!("{level}: {path}:{start_line}: {msg}\n")
-                        );
+                        all_annotations.push_str(&format!("{level}: {path}:{start_line}: {msg}\n"));
                     }
                 }
                 Err(_) => continue,
@@ -1190,7 +1204,9 @@ impl GitHubClient {
         // Also grab the output summary/text from failed checks (often has error details)
         for check in checks["check_runs"].as_array().unwrap_or(&vec![]) {
             let conclusion = check["conclusion"].as_str().unwrap_or("");
-            if conclusion != "failure" { continue; }
+            if conclusion != "failure" {
+                continue;
+            }
             let check_name = check["name"].as_str().unwrap_or("unknown");
             if let Some(output) = check.get("output") {
                 let summary = output["summary"].as_str().unwrap_or("");
@@ -1201,7 +1217,11 @@ impl GitHubClient {
                         all_annotations.push_str(&format!("{summary}\n"));
                     }
                     if !text.is_empty() {
-                        let truncated = if text.len() > 3000 { &text[..3000] } else { text };
+                        let truncated = if text.len() > 3000 {
+                            &text[..3000]
+                        } else {
+                            text
+                        };
                         all_annotations.push_str(&format!("{truncated}\n"));
                     }
                 }
@@ -1253,11 +1273,9 @@ impl GitHubClient {
             "{API_BASE}/repos/{owner}/{repo}/pulls?state=closed&head={owner}:{branch}&sort=created&direction=desc&per_page=5"
         );
         let data = self.get(&url).await?;
-        Ok(data.as_array().and_then(|arr| {
-            arr.iter()
-                .find(|pr| pr["merged_at"].is_null())
-                .cloned()
-        }))
+        Ok(data
+            .as_array()
+            .and_then(|arr| arr.iter().find(|pr| pr["merged_at"].is_null()).cloned()))
     }
 
     /// Reopen a closed pull request.

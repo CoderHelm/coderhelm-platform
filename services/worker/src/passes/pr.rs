@@ -34,7 +34,8 @@ pub async fn run(
     let diff_summary = format_diff_summary(&diff);
 
     // Check for PR template in the repo
-    let pr_template = fetch_pr_template(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await;
+    let pr_template =
+        fetch_pr_template(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await;
 
     // Generate PR body via LLM
     let voice_block = if voice.is_empty() {
@@ -166,15 +167,37 @@ Return ONLY the markdown body text."#,
         .await?;
 
     let (pr_number, pr_url, node_id) = if let Some(pr_data) = existing_pr {
-        let number = pr_data.get("number").and_then(|v| v.as_u64()).ok_or("Missing PR number")?;
-        let url = pr_data.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let nid = pr_data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let number = pr_data
+            .get("number")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing PR number")?;
+        let url = pr_data
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let nid = pr_data
+            .get("node_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         info!(pr_number = number, pr_url = %url, "Using existing PR");
         (number, url, nid)
     } else if let Some(pr_data) = reopen_prior_pr(github, msg, branch).await {
-        let number = pr_data.get("number").and_then(|v| v.as_u64()).ok_or("Missing PR number")?;
-        let url = pr_data.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let nid = pr_data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let number = pr_data
+            .get("number")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing PR number")?;
+        let url = pr_data
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let nid = pr_data
+            .get("node_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         info!(pr_number = number, pr_url = %url, "Reopened prior PR for branch");
         (number, url, nid)
     } else {
@@ -191,9 +214,20 @@ Return ONLY the markdown body text."#,
             )
             .await?;
 
-        let number = pr_data.get("number").and_then(|v| v.as_u64()).ok_or("Missing PR number")?;
-        let url = pr_data.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let nid = pr_data.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let number = pr_data
+            .get("number")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing PR number")?;
+        let url = pr_data
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let nid = pr_data
+            .get("node_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         info!(pr_number = number, pr_url = %url, "PR created");
         (number, url, nid)
     };
@@ -298,12 +332,7 @@ pub async fn resolve_conflicts(
 
     // Get files changed on the BRANCH side (merge_base → branch)
     let branch_diff = github
-        .get_diff(
-            &msg.repo_owner,
-            &msg.repo_name,
-            merge_base_sha,
-            branch,
-        )
+        .get_diff(&msg.repo_owner, &msg.repo_name, merge_base_sha, branch)
         .await?;
     let branch_files = branch_diff
         .get("files")

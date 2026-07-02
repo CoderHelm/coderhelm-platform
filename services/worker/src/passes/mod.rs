@@ -104,12 +104,7 @@ fn sanitize_error(msg: &str) -> String {
     for p in &patterns {
         s = s.replace(p, "");
     }
-    s = s
-        .replace(
-            "Anthropic API error",
-            "An error occurred during processing",
-        )
-;
+    s = s.replace("Anthropic API error", "An error occurred during processing");
     // Collapse extra whitespace
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -133,12 +128,12 @@ mod plan;
 pub mod plan_execute;
 mod pr;
 mod resolve;
+pub mod resume;
 mod review;
 mod security;
 #[allow(dead_code)]
 mod test;
 mod triage;
-pub mod resume;
 
 /// Minimal MCP plugin catalog: (server_id, npx_package, env_mapping).
 /// Kept in sync with the full catalog in gateway/routes/plugins.rs.
@@ -315,13 +310,19 @@ pub async fn orchestrate_ticket(
         }
         Err(_elapsed) => {
             let duration = start.elapsed().as_secs();
-            warn!(run_id, duration, "Orchestration timed out — Lambda limit approaching");
+            warn!(
+                run_id,
+                duration, "Orchestration timed out — Lambda limit approaching"
+            );
 
             // Check if there's partial work on a branch we can salvage as a draft PR
             let checkpoint = load_checkpoint(state, &msg.team_id, &run_id).await;
             let salvaged = if let Some((ref last_pass, ref branch, _)) = checkpoint {
                 if !branch.is_empty() && matches!(last_pass.as_str(), "implement" | "security") {
-                    info!(run_id, branch, "Timeout — attempting to salvage partial work as draft PR");
+                    info!(
+                        run_id,
+                        branch, "Timeout — attempting to salvage partial work as draft PR"
+                    );
                     match salvage_timeout_pr(state, &msg, &run_id, branch, &usage, duration).await {
                         Ok(pr_url) => {
                             info!(run_id, pr_url, "Salvaged partial work into draft PR");
@@ -414,7 +415,8 @@ async fn run_passes(
     let file_cache = FileCache::new();
 
     // Deadline for the implement pass — leave 150s buffer for PR creation + cleanup
-    let implement_deadline = Some(*start + std::time::Duration::from_secs(LAMBDA_TIMEOUT_SECS.saturating_sub(150)));
+    let implement_deadline =
+        Some(*start + std::time::Duration::from_secs(LAMBDA_TIMEOUT_SECS.saturating_sub(150)));
 
     // Pre-run budget gate: reject if monthly token limit exceeded
     if let Some(reason) = check_budget_exceeded(state, &msg.team_id).await {
@@ -494,7 +496,11 @@ async fn run_passes(
         }
 
         // If no mapping (or mapped repo not enabled), use LLM to pick the best repo
-        if msg.repo_owner.is_empty() || !repos.iter().any(|r| r == &format!("{}/{}", msg.repo_owner, msg.repo_name)) {
+        if msg.repo_owner.is_empty()
+            || !repos
+                .iter()
+                .any(|r| r == &format!("{}/{}", msg.repo_owner, msg.repo_name))
+        {
             if repos.len() == 1 {
                 // Only one repo — no need for LLM
                 let (owner, name) = repos[0].split_once('/').unwrap_or(("", ""));
@@ -540,13 +546,20 @@ async fn run_passes(
                 .get_item()
                 .table_name(&state.config.repos_table_name)
                 .key("pk", attr_s(&msg.team_id))
-                .key("sk", attr_s(&format!("REPO#{}/{}", msg.repo_owner, msg.repo_name)))
+                .key(
+                    "sk",
+                    attr_s(&format!("REPO#{}/{}", msg.repo_owner, msg.repo_name)),
+                )
                 .projection_expression("default_branch")
                 .send()
                 .await
                 .ok()
                 .and_then(|r| r.item)
-                .and_then(|item| item.get("default_branch").and_then(|v| v.as_s().ok()).cloned())
+                .and_then(|item| {
+                    item.get("default_branch")
+                        .and_then(|v| v.as_s().ok())
+                        .cloned()
+                })
                 .filter(|s| !s.is_empty());
             match cached {
                 Some(branch) => {
@@ -667,7 +680,8 @@ async fn run_passes(
     let context_hash = plan::compute_ticket_context_hash(msg);
 
     // Try to reuse existing plan from S3 (same ticket, no changes)
-    let existing_plan = load_existing_plan(state, &msg.team_id, &msg.ticket_id, &context_hash).await;
+    let existing_plan =
+        load_existing_plan(state, &msg.team_id, &msg.ticket_id, &context_hash).await;
     let mut context_changed = existing_plan.is_none();
     let plan_result = if let Some(plan) = existing_plan {
         // Reuse if plan has content AND has unchecked tasks (not a completed plan from a previous run)
@@ -680,13 +694,25 @@ async fn run_passes(
         } else {
             context_changed = true;
             plan::run(
-                state, msg, &github, &triage_result, &repo_instructions, &provider, usage,
+                state,
+                msg,
+                &github,
+                &triage_result,
+                &repo_instructions,
+                &provider,
+                usage,
             )
             .await?
         }
     } else {
         plan::run(
-            state, msg, &github, &triage_result, &repo_instructions, &provider, usage,
+            state,
+            msg,
+            &github,
+            &triage_result,
+            &repo_instructions,
+            &provider,
+            usage,
         )
         .await?
     };
@@ -931,7 +957,12 @@ async fn run_passes(
         update_pass(state, &msg.team_id, run_id, "implement").await?;
 
         let diff_json = github
-            .get_diff(&msg.repo_owner, &msg.repo_name, &msg.base_branch, &branch_name)
+            .get_diff(
+                &msg.repo_owner,
+                &msg.repo_name,
+                &msg.base_branch,
+                &branch_name,
+            )
             .await?;
         let files_modified: Vec<String> = diff_json["files"]
             .as_array()
@@ -947,7 +978,10 @@ async fn run_passes(
             files = files_modified.len(),
             "Reconstructed files_modified from branch diff"
         );
-        implement::ImplementResult { files_modified, conversation_log: vec![] }
+        implement::ImplementResult {
+            files_modified,
+            conversation_log: vec![],
+        }
     } else {
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "implement").await?;
@@ -975,10 +1009,15 @@ async fn run_passes(
             let pr_url = pr["html_url"].as_str().unwrap_or("").to_string();
             let pr_head_sha = pr["head"]["sha"].as_str().unwrap_or("").to_string();
             let base_sha = pr["base"]["sha"].as_str().unwrap_or("").to_string();
-            let check_ref = if pr_head_sha.is_empty() { branch_name.clone() } else { pr_head_sha.clone() };
+            let check_ref = if pr_head_sha.is_empty() {
+                branch_name.clone()
+            } else {
+                pr_head_sha.clone()
+            };
 
             // Detect if the branch was force-reset to base (no diff from base = previous retry wiped it)
-            let branch_is_reset = !pr_head_sha.is_empty() && !base_sha.is_empty() && pr_head_sha == base_sha;
+            let branch_is_reset =
+                !pr_head_sha.is_empty() && !base_sha.is_empty() && pr_head_sha == base_sha;
 
             // Check CI status on the PR's head commit
             let checks = github
@@ -988,9 +1027,13 @@ async fn run_passes(
             let failed_conclusions = ["failure", "action_required", "timed_out", "startup_failure"];
             let has_ci_failure = checks["check_runs"]
                 .as_array()
-                .map(|runs| runs.iter().any(|r| {
-                    r["conclusion"].as_str().map_or(false, |c| failed_conclusions.contains(&c))
-                }))
+                .map(|runs| {
+                    runs.iter().any(|r| {
+                        r["conclusion"]
+                            .as_str()
+                            .map_or(false, |c| failed_conclusions.contains(&c))
+                    })
+                })
                 .unwrap_or(false);
 
             // Check for pending review comments on the PR
@@ -1033,7 +1076,11 @@ async fn run_passes(
                         .as_array()
                         .and_then(|runs| {
                             runs.iter()
-                                .filter(|r| r["conclusion"].as_str().map_or(false, |c| failed_conclusions.contains(&c)))
+                                .filter(|r| {
+                                    r["conclusion"]
+                                        .as_str()
+                                        .map_or(false, |c| failed_conclusions.contains(&c))
+                                })
                                 .filter_map(|r| {
                                     r["details_url"]
                                         .as_str()
@@ -1054,7 +1101,11 @@ async fn run_passes(
                             Err(_) => {
                                 // Fallback: check run annotations (uses checks:read, not actions:read)
                                 github
-                                    .get_check_run_annotations(&msg.repo_owner, &msg.repo_name, &branch_name)
+                                    .get_check_run_annotations(
+                                        &msg.repo_owner,
+                                        &msg.repo_name,
+                                        &branch_name,
+                                    )
                                     .await
                                     .unwrap_or_else(|_| "(failed to download logs)".to_string())
                             }
@@ -1064,7 +1115,11 @@ async fn run_passes(
                             .as_array()
                             .and_then(|runs| {
                                 runs.iter()
-                                    .find(|r| r["conclusion"].as_str().map_or(false, |c| failed_conclusions.contains(&c)))
+                                    .find(|r| {
+                                        r["conclusion"]
+                                            .as_str()
+                                            .map_or(false, |c| failed_conclusions.contains(&c))
+                                    })
                                     .and_then(|r| r["id"].as_u64())
                             })
                             .unwrap_or(0);
@@ -1101,7 +1156,10 @@ async fn run_passes(
                         state,
                         &msg.team_id,
                         run_id,
-                        &format!("Existing PR #{pr_number} has {} review comment(s) — addressing", pending_reviews.len()),
+                        &format!(
+                            "Existing PR #{pr_number} has {} review comment(s) — addressing",
+                            pending_reviews.len()
+                        ),
                     )
                     .await;
 
@@ -1137,15 +1195,48 @@ async fn run_passes(
                 let usage_before = usage.clone();
 
                 match implement::run(
-                    state, msg, &github, &plan_result, &branch_name, &[], "",
-                    Some(&feedback), "medium", &provider, usage, &file_cache, Some(run_id), None,
+                    state,
+                    msg,
+                    &github,
+                    &plan_result,
+                    &branch_name,
+                    &[],
+                    "",
+                    Some(&feedback),
+                    "medium",
+                    &provider,
+                    usage,
+                    &file_cache,
+                    Some(run_id),
+                    None,
                 )
                 .await
                 {
                     Ok(result) => {
-                        write_pass_trace(state, &msg.team_id, run_id, "ci_fix", pass_start, &usage_before, usage, None).await;
-                        write_conversation_log(state, &msg.team_id, run_id, "ci_fix", &result.conversation_log).await;
-                        info!(run_id, files = result.files_modified.len(), "Fix implemented on re-run");
+                        write_pass_trace(
+                            state,
+                            &msg.team_id,
+                            run_id,
+                            "ci_fix",
+                            pass_start,
+                            &usage_before,
+                            usage,
+                            None,
+                        )
+                        .await;
+                        write_conversation_log(
+                            state,
+                            &msg.team_id,
+                            run_id,
+                            "ci_fix",
+                            &result.conversation_log,
+                        )
+                        .await;
+                        info!(
+                            run_id,
+                            files = result.files_modified.len(),
+                            "Fix implemented on re-run"
+                        );
 
                         // Store PR info on run record and go to awaiting_ci
                         let now = chrono::Utc::now().to_rfc3339();
@@ -1181,7 +1272,8 @@ async fn run_passes(
                             .send()
                             .await;
 
-                        save_checkpoint(state, &msg.team_id, run_id, "pr", &branch_name, 1, usage).await;
+                        save_checkpoint(state, &msg.team_id, run_id, "pr", &branch_name, 1, usage)
+                            .await;
                         return Ok(());
                     }
                     Err(e) => {
@@ -1195,13 +1287,21 @@ async fn run_passes(
         // Track whether to skip branch creation (PR exists, just needs fresh implementation)
         let skip_branch_reset = if context_changed && existing_pr.is_some() {
             // Context changed (new description, images, etc.) — force reset branch for clean implementation
-            let pr_number = existing_pr.as_ref().and_then(|p| p["number"].as_u64()).unwrap_or(0);
-            info!(run_id, pr_number, "Context changed — forcing branch reset for fresh implementation");
+            let pr_number = existing_pr
+                .as_ref()
+                .and_then(|p| p["number"].as_u64())
+                .unwrap_or(0);
+            info!(
+                run_id,
+                pr_number, "Context changed — forcing branch reset for fresh implementation"
+            );
             add_progress_note(
                 state,
                 &msg.team_id,
                 run_id,
-                &format!("Ticket updated — resetting PR #{pr_number} branch for fresh implementation"),
+                &format!(
+                    "Ticket updated — resetting PR #{pr_number} branch for fresh implementation"
+                ),
             )
             .await;
             false
@@ -1215,7 +1315,10 @@ async fn run_passes(
         };
 
         if skip_branch_reset {
-            let pr_number = existing_pr.as_ref().and_then(|p| p["number"].as_u64()).unwrap_or(0);
+            let pr_number = existing_pr
+                .as_ref()
+                .and_then(|p| p["number"].as_u64())
+                .unwrap_or(0);
             info!(run_id, pr_number, branch = %branch_name, "Skipping branch reset — PR exists, branch already at base");
             add_progress_note(
                 state,
@@ -1227,7 +1330,12 @@ async fn run_passes(
         } else {
             // Create working branch (or reset existing one to base)
             github
-                .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, &msg.base_branch)
+                .create_branch(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    &branch_name,
+                    &msg.base_branch,
+                )
                 .await?;
             info!(run_id, branch = %branch_name, "Created working branch");
             add_progress_note(
@@ -1310,11 +1418,18 @@ async fn run_passes(
 
                 // Create (or reset) the working branch in the new repo
                 github
-                    .create_branch(&msg.repo_owner, &msg.repo_name, &branch_name, &msg.base_branch)
+                    .create_branch(
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        &branch_name,
+                        &msg.base_branch,
+                    )
                     .await
                     .map_err(|e| {
-                        format!("Failed to create branch {} in {}/{} after repo switch: {e}",
-                            branch_name, msg.repo_owner, msg.repo_name)
+                        format!(
+                            "Failed to create branch {} in {}/{} after repo switch: {e}",
+                            branch_name, msg.repo_owner, msg.repo_name
+                        )
                     })?;
 
                 // Update run record
@@ -1413,9 +1528,8 @@ async fn run_passes(
                     .unwrap_or_else(|_| "main".to_string());
 
                 // Load repo-specific instructions
-                let repo_instr = load_repo_instructions(
-                    &github, &repo_task.owner, &repo_task.name,
-                ).await;
+                let repo_instr =
+                    load_repo_instructions(&github, &repo_task.owner, &repo_task.name).await;
 
                 match run_repo_pipeline(
                     state,
@@ -1463,16 +1577,28 @@ async fn run_passes(
             }
 
             // Save checkpoint + set awaiting_ci with all PRs
-            save_checkpoint(state, &msg.team_id, run_id, "pr", &pr_results[0].branch, 0, usage).await;
+            save_checkpoint(
+                state,
+                &msg.team_id,
+                run_id,
+                "pr",
+                &pr_results[0].branch,
+                0,
+                usage,
+            )
+            .await;
 
             let duration = start.elapsed().as_secs();
             let now = chrono::Utc::now().to_rfc3339();
             let cost = usage.estimated_cost();
 
             // Build PR list attributes
-            let pr_urls: Vec<AttributeValue> = pr_results.iter().map(|p| attr_s(&p.pr_url)).collect();
-            let pr_numbers: Vec<AttributeValue> = pr_results.iter().map(|p| attr_n(p.pr_number)).collect();
-            let branches: Vec<AttributeValue> = pr_results.iter().map(|p| attr_s(&p.branch)).collect();
+            let pr_urls: Vec<AttributeValue> =
+                pr_results.iter().map(|p| attr_s(&p.pr_url)).collect();
+            let pr_numbers: Vec<AttributeValue> =
+                pr_results.iter().map(|p| attr_n(p.pr_number)).collect();
+            let branches: Vec<AttributeValue> =
+                pr_results.iter().map(|p| attr_s(&p.branch)).collect();
 
             // Store first PR as primary for backward compat, plus full lists
             state
@@ -1560,10 +1686,7 @@ async fn run_passes(
             .key("run_id", attr_s(run_id))
             .update_expression("SET repo = :r, team_repo = :tr")
             .expression_attribute_values(":r", attr_s(&final_repo))
-            .expression_attribute_values(
-                ":tr",
-                attr_s(&format!("{}#{}", msg.team_id, final_repo)),
-            )
+            .expression_attribute_values(":tr", attr_s(&format!("{}#{}", msg.team_id, final_repo)))
             .send()
             .await;
 
@@ -1614,7 +1737,14 @@ async fn run_passes(
         );
 
         // Save conversation log to S3
-        write_conversation_log(state, &msg.team_id, run_id, "implement", &result.conversation_log).await;
+        write_conversation_log(
+            state,
+            &msg.team_id,
+            run_id,
+            "implement",
+            &result.conversation_log,
+        )
+        .await;
 
         add_progress_note(
             state,
@@ -1732,26 +1862,66 @@ async fn run_passes(
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
         let test_issues = adversarial_test(
-            state, msg, &github, &plan_result, &branch_name, &provider, usage, &file_cache,
-            &impl_result.files_modified, run_id,
-        ).await;
-        write_pass_trace(state, &msg.team_id, run_id, "test", pass_start, &usage_before, usage, None).await;
+            state,
+            msg,
+            &github,
+            &plan_result,
+            &branch_name,
+            &provider,
+            usage,
+            &file_cache,
+            &impl_result.files_modified,
+            run_id,
+        )
+        .await;
+        write_pass_trace(
+            state,
+            &msg.team_id,
+            run_id,
+            "test",
+            pass_start,
+            &usage_before,
+            usage,
+            None,
+        )
+        .await;
 
         if !test_issues.is_empty() {
             warn!(run_id, "Adversarial test found issues — running auto-fix");
             add_progress_note(
-                state, &msg.team_id, run_id, "Test found issues — auto-fixing",
-            ).await;
+                state,
+                &msg.team_id,
+                run_id,
+                "Test found issues — auto-fixing",
+            )
+            .await;
 
             let fix_plan = plan::PlanResult {
-                proposal: String::new(), tasks: String::new(),
-                spec: String::new(), design: String::new(), repo_tasks: vec![],
+                proposal: String::new(),
+                tasks: String::new(),
+                spec: String::new(),
+                design: String::new(),
+                repo_tasks: vec![],
             };
             let fix_cache = FileCache::default();
             if let Err(e) = implement::run(
-                state, msg, &github, &fix_plan, &branch_name, &[],
-                "", Some(&test_issues), "low", &provider, usage, &fix_cache, Some(run_id), None,
-            ).await {
+                state,
+                msg,
+                &github,
+                &fix_plan,
+                &branch_name,
+                &[],
+                "",
+                Some(&test_issues),
+                "low",
+                &provider,
+                usage,
+                &fix_cache,
+                Some(run_id),
+                None,
+            )
+            .await
+            {
                 warn!(run_id, error = %e, "Test auto-fix failed, proceeding anyway");
             }
         }
@@ -1861,7 +2031,14 @@ async fn run_passes(
                 None,
             )
             .await?;
-            write_conversation_log(state, &msg.team_id, run_id, "security_fix", &sec_fix_result.conversation_log).await;
+            write_conversation_log(
+                state,
+                &msg.team_id,
+                run_id,
+                "security_fix",
+                &sec_fix_result.conversation_log,
+            )
+            .await;
 
             check_cancelled(state, &msg.team_id, run_id).await?;
             update_pass(state, &msg.team_id, run_id, "security").await?;
@@ -1946,16 +2123,7 @@ async fn run_passes(
 
     // Save checkpoint and set awaiting_ci — Lambda returns here.
     // The webhook-driven resume flow handles CI results and review.
-    save_checkpoint(
-        state,
-        &msg.team_id,
-        run_id,
-        "pr",
-        &branch_name,
-        0,
-        usage,
-    )
-    .await;
+    save_checkpoint(state, &msg.team_id, run_id, "pr", &branch_name, 0, usage).await;
 
     // Update run record with PR info + awaiting_ci status
     let duration = start.elapsed().as_secs();
@@ -2038,10 +2206,8 @@ async fn run_passes(
 
     // Persist agent memory (extract learnings first)
     if let Some(mut mem) = agent_memory {
-        mem.extract_learnings_from_conversation(
-            &impl_result.conversation_log,
-            provider.api_key(),
-        ).await;
+        mem.extract_learnings_from_conversation(&impl_result.conversation_log, provider.api_key())
+            .await;
         if let Err(e) = mem.close_and_upload(state).await {
             warn!(run_id, error = %e, "Failed to persist agent memory");
         }
@@ -2085,7 +2251,10 @@ async fn run_repo_pipeline(
         state,
         &msg.team_id,
         run_id,
-        &format!("Created branch {} on {}/{}", branch_name, repo_owner, repo_name),
+        &format!(
+            "Created branch {} on {}/{}",
+            branch_name, repo_owner, repo_name
+        ),
     )
     .await;
 
@@ -2121,9 +2290,35 @@ async fn run_repo_pipeline(
         implement_deadline,
     )
     .await?;
-    write_pass_trace(state, &msg.team_id, run_id, "implement", pass_start, &usage_before, usage, None).await;
-    write_conversation_log(state, &msg.team_id, run_id, &format!("implement_{repo_owner}_{repo_name}"), &impl_result.conversation_log).await;
-    save_checkpoint(state, &msg.team_id, run_id, "implement", branch_name, 0, usage).await;
+    write_pass_trace(
+        state,
+        &msg.team_id,
+        run_id,
+        "implement",
+        pass_start,
+        &usage_before,
+        usage,
+        None,
+    )
+    .await;
+    write_conversation_log(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!("implement_{repo_owner}_{repo_name}"),
+        &impl_result.conversation_log,
+    )
+    .await;
+    save_checkpoint(
+        state,
+        &msg.team_id,
+        run_id,
+        "implement",
+        branch_name,
+        0,
+        usage,
+    )
+    .await;
 
     info!(
         run_id,
@@ -2135,7 +2330,12 @@ async fn run_repo_pipeline(
         state,
         &msg.team_id,
         run_id,
-        &format!("Implemented {} file(s) in {}/{}", impl_result.files_modified.len(), repo_owner, repo_name),
+        &format!(
+            "Implemented {} file(s) in {}/{}",
+            impl_result.files_modified.len(),
+            repo_owner,
+            repo_name
+        ),
     )
     .await;
 
@@ -2143,7 +2343,8 @@ async fn run_repo_pipeline(
         return Err(format!(
             "No files modified in {}/{}. The issue may need more detail.",
             repo_owner, repo_name
-        ).into());
+        )
+        .into());
     }
 
     // --- Adversarial Test (catches bugs before security/PR) ---
@@ -2153,26 +2354,66 @@ async fn run_repo_pipeline(
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
         let test_issues = adversarial_test(
-            state, msg, github, &repo_plan, branch_name, provider, usage, file_cache,
-            &impl_result.files_modified, run_id,
-        ).await;
-        write_pass_trace(state, &msg.team_id, run_id, "test", pass_start, &usage_before, usage, None).await;
+            state,
+            msg,
+            github,
+            &repo_plan,
+            branch_name,
+            provider,
+            usage,
+            file_cache,
+            &impl_result.files_modified,
+            run_id,
+        )
+        .await;
+        write_pass_trace(
+            state,
+            &msg.team_id,
+            run_id,
+            "test",
+            pass_start,
+            &usage_before,
+            usage,
+            None,
+        )
+        .await;
 
         if !test_issues.is_empty() {
             warn!(run_id, "Adversarial test found issues — running auto-fix");
             add_progress_note(
-                state, &msg.team_id, run_id, "Test found issues — auto-fixing",
-            ).await;
+                state,
+                &msg.team_id,
+                run_id,
+                "Test found issues — auto-fixing",
+            )
+            .await;
 
             let fix_plan = plan::PlanResult {
-                proposal: String::new(), tasks: String::new(),
-                spec: String::new(), design: String::new(), repo_tasks: vec![],
+                proposal: String::new(),
+                tasks: String::new(),
+                spec: String::new(),
+                design: String::new(),
+                repo_tasks: vec![],
             };
             let fix_cache = FileCache::default();
             if let Err(e) = implement::run(
-                state, msg, github, &fix_plan, branch_name, &[],
-                "", Some(&test_issues), "low", provider, usage, &fix_cache, Some(run_id), None,
-            ).await {
+                state,
+                msg,
+                github,
+                &fix_plan,
+                branch_name,
+                &[],
+                "",
+                Some(&test_issues),
+                "low",
+                provider,
+                usage,
+                &fix_cache,
+                Some(run_id),
+                None,
+            )
+            .await
+            {
                 warn!(run_id, error = %e, "Test auto-fix failed, proceeding anyway");
             }
         }
@@ -2184,25 +2425,60 @@ async fn run_repo_pipeline(
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
     let security_result = match security::run(
-        state, msg, github, &repo_plan, branch_name, repo_instructions, provider, usage, file_cache, Some(run_id),
+        state,
+        msg,
+        github,
+        &repo_plan,
+        branch_name,
+        repo_instructions,
+        provider,
+        usage,
+        file_cache,
+        Some(run_id),
     )
     .await
     {
         Ok(r) => r,
         Err(e) => {
             warn!(run_id, error = %e, "Security pass errored, proceeding");
-            security::SecurityResult { passed: true, summary: format!("Security error: {e}") }
+            security::SecurityResult {
+                passed: true,
+                summary: format!("Security error: {e}"),
+            }
         }
     };
-    write_pass_trace(state, &msg.team_id, run_id, "security", pass_start, &usage_before, usage, None).await;
-    save_checkpoint(state, &msg.team_id, run_id, "security", branch_name, 0, usage).await;
+    write_pass_trace(
+        state,
+        &msg.team_id,
+        run_id,
+        "security",
+        pass_start,
+        &usage_before,
+        usage,
+        None,
+    )
+    .await;
+    save_checkpoint(
+        state,
+        &msg.team_id,
+        run_id,
+        "security",
+        branch_name,
+        0,
+        usage,
+    )
+    .await;
 
     info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), passed = security_result.passed, "Security audit complete");
     add_progress_note(
         state,
         &msg.team_id,
         run_id,
-        if security_result.passed { "Security audit passed" } else { "Security issues found, fixing" },
+        if security_result.passed {
+            "Security audit passed"
+        } else {
+            "Security issues found, fixing"
+        },
     )
     .await;
 
@@ -2212,12 +2488,33 @@ async fn run_repo_pipeline(
             info!(run_id, "Running security remediation");
             check_cancelled(state, &msg.team_id, run_id).await?;
             let sec_fix = implement::run(
-                state, msg, github, &repo_plan, branch_name, rules, repo_instructions,
-                Some(&format!("Security audit found vulnerabilities. Fix ALL of the following:\n\n{}", security_result.summary)),
-                complexity, provider, usage, file_cache, Some(run_id), None,
+                state,
+                msg,
+                github,
+                &repo_plan,
+                branch_name,
+                rules,
+                repo_instructions,
+                Some(&format!(
+                    "Security audit found vulnerabilities. Fix ALL of the following:\n\n{}",
+                    security_result.summary
+                )),
+                complexity,
+                provider,
+                usage,
+                file_cache,
+                Some(run_id),
+                None,
             )
             .await?;
-            write_conversation_log(state, &msg.team_id, run_id, &format!("security_fix_{}", branch_name), &sec_fix.conversation_log).await;
+            write_conversation_log(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("security_fix_{}", branch_name),
+                &sec_fix.conversation_log,
+            )
+            .await;
         } else {
             warn!(run_id, "Skipping security remediation — not enough time");
         }
@@ -2238,15 +2535,38 @@ async fn run_repo_pipeline(
 
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let pr_result = pr::run(state, msg, github, branch_name, &repo_plan, voice, provider, usage).await?;
-    write_pass_trace(state, &msg.team_id, run_id, "pr", pass_start, &usage_before, usage, None).await;
+    let pr_result = pr::run(
+        state,
+        msg,
+        github,
+        branch_name,
+        &repo_plan,
+        voice,
+        provider,
+        usage,
+    )
+    .await?;
+    write_pass_trace(
+        state,
+        &msg.team_id,
+        run_id,
+        "pr",
+        pass_start,
+        &usage_before,
+        usage,
+        None,
+    )
+    .await;
 
     info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), pr_url = %pr_result.pr_url, "Draft PR created");
     add_progress_note(
         state,
         &msg.team_id,
         run_id,
-        &format!("Draft PR #{} created for {}/{}", pr_result.pr_number, repo_owner, repo_name),
+        &format!(
+            "Draft PR #{} created for {}/{}",
+            pr_result.pr_number, repo_owner, repo_name
+        ),
     )
     .await;
 
@@ -2289,12 +2609,17 @@ async fn create_run_record(
         .item("issue_number", attr_n(msg.issue_number))
         .item("base_branch", attr_s(&msg.base_branch))
         // Store body for Jira tickets so retry can re-use it (GitHub re-fetches from API)
-        .item("ticket_body", attr_s(if matches!(msg.source, TicketSource::Jira) { &msg.body } else { "" }))
+        .item(
+            "ticket_body",
+            attr_s(if matches!(msg.source, TicketSource::Jira) {
+                &msg.body
+            } else {
+                ""
+            }),
+        )
         .item(
             "image_attachments",
-            AttributeValue::S(
-                serde_json::to_string(&msg.image_attachments).unwrap_or_default(),
-            ),
+            AttributeValue::S(serde_json::to_string(&msg.image_attachments).unwrap_or_default()),
         )
         .item("tokens_in", attr_n(0))
         .item("tokens_out", attr_n(0))
@@ -2358,7 +2683,12 @@ pub(crate) async fn update_pass(
 }
 
 /// Append a timestamped progress note to the run record for live activity display.
-pub(crate) async fn add_progress_note(state: &WorkerState, team_id: &str, run_id: &str, message: &str) {
+pub(crate) async fn add_progress_note(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    message: &str,
+) {
     let now = chrono::Utc::now().to_rfc3339();
     let entry = aws_sdk_dynamodb::types::AttributeValue::M(std::collections::HashMap::from([
         ("message".to_string(), attr_s(message)),
@@ -2406,7 +2736,12 @@ async fn write_conversation_log(
             {
                 warn!(run_id, pass_name, error = %e, "Failed to write conversation log to S3");
             } else {
-                info!(run_id, pass_name, entries = log.len(), "Conversation log saved to S3");
+                info!(
+                    run_id,
+                    pass_name,
+                    entries = log.len(),
+                    "Conversation log saved to S3"
+                );
             }
         }
         Err(e) => {
@@ -3196,7 +3531,10 @@ async fn validate_plan(
         let sample: Vec<&String> = mentioned_files.iter().take(10).collect();
         let mut missing = Vec::new();
         for path in &sample {
-            match github.read_file(repo_owner, repo_name, path, base_branch).await {
+            match github
+                .read_file(repo_owner, repo_name, path, base_branch)
+                .await
+            {
                 Ok(_) => {}
                 Err(_) => missing.push(path.to_string()),
             }
@@ -3215,10 +3553,8 @@ async fn validate_plan(
 
             // Check if these files exist in another enabled repo (triage may have picked wrong)
             let current_repo = format!("{repo_owner}/{repo_name}");
-            let other_repos: Vec<&String> = team_repos
-                .iter()
-                .filter(|r| *r != &current_repo)
-                .collect();
+            let other_repos: Vec<&String> =
+                team_repos.iter().filter(|r| *r != &current_repo).collect();
 
             for candidate in &other_repos {
                 let parts: Vec<&str> = candidate.splitn(2, '/').collect();
@@ -3228,7 +3564,11 @@ async fn validate_plan(
                 let (c_owner, c_name) = (parts[0], parts[1]);
                 let mut found = 0usize;
                 for path in &missing {
-                    if github.read_file(c_owner, c_name, path, "HEAD").await.is_ok() {
+                    if github
+                        .read_file(c_owner, c_name, path, "HEAD")
+                        .await
+                        .is_ok()
+                    {
                         found += 1;
                     }
                 }
@@ -3252,15 +3592,19 @@ async fn validate_plan(
     //    but triage started in the wrong one (common for Jira tickets).
     if switch_repo.is_none() {
         let current_repo = format!("{repo_owner}/{repo_name}");
-        let full_plan = format!("{}\n{}\n{}\n{}", plan.proposal, plan.design, plan.tasks, plan.spec);
+        let full_plan = format!(
+            "{}\n{}\n{}\n{}",
+            plan.proposal, plan.design, plan.tasks, plan.spec
+        );
         let full_plan_lower = full_plan.to_lowercase();
 
         // Count mentions of each team repo using word-boundary regex to avoid
         // substring false positives (e.g. "api" matching inside "gangway-api")
         let mut best_candidate: Option<(String, usize)> = None;
         let current_name_lower = repo_name.to_lowercase();
-        let current_re = regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(&current_name_lower)))
-            .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
+        let current_re =
+            regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(&current_name_lower)))
+                .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
         let current_mentions = current_re.find_iter(&full_plan_lower).count();
 
         for candidate in team_repos {
@@ -3271,13 +3615,17 @@ async fn validate_plan(
                 let cand_lower = cand_name.to_lowercase();
                 // First try full owner/name match, then word-bounded name match
                 let full_match_count = full_plan_lower.matches(&candidate.to_lowercase()).count();
-                let name_re = regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(&cand_lower)))
-                    .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
+                let name_re =
+                    regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(&cand_lower)))
+                        .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
                 let cand_mentions = full_match_count + name_re.find_iter(&full_plan_lower).count();
 
                 // Candidate repo must be mentioned at least 2 times and more than current
                 if cand_mentions >= 2 && cand_mentions > current_mentions {
-                    if best_candidate.as_ref().map_or(true, |(_, best)| cand_mentions > *best) {
+                    if best_candidate
+                        .as_ref()
+                        .map_or(true, |(_, best)| cand_mentions > *best)
+                    {
                         best_candidate = Some((candidate.clone(), cand_mentions));
                     }
                 }
@@ -3305,29 +3653,56 @@ async fn validate_plan(
         // Gather context: AGENTS#GLOBAL + repo info + directory listing
         let global_agents = load_content(state, team_id, "AGENTS#GLOBAL").await;
 
-        let (current_lang, current_desc) = github.get_repo_info(repo_owner, repo_name).await
+        let (current_lang, current_desc) = github
+            .get_repo_info(repo_owner, repo_name)
+            .await
             .unwrap_or((None, None));
-        let current_dirs = match github.list_directory(repo_owner, repo_name, "", base_branch).await {
-            Ok(entries) => entries.iter().take(20).map(|e| e.name.clone()).collect::<Vec<_>>().join(", "),
+        let current_dirs = match github
+            .list_directory(repo_owner, repo_name, "", base_branch)
+            .await
+        {
+            Ok(entries) => entries
+                .iter()
+                .take(20)
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
             Err(_) => String::new(),
         };
 
         // Build candidate repo summaries
         let mut other_repo_info = Vec::new();
         for candidate in team_repos {
-            if *candidate == current_repo { continue; }
+            if *candidate == current_repo {
+                continue;
+            }
             let parts: Vec<&str> = candidate.splitn(2, '/').collect();
-            if parts.len() != 2 { continue; }
-            let (cand_lang, cand_desc) = github.get_repo_info(parts[0], parts[1]).await
+            if parts.len() != 2 {
+                continue;
+            }
+            let (cand_lang, cand_desc) = github
+                .get_repo_info(parts[0], parts[1])
+                .await
                 .unwrap_or((None, None));
             let cand_dirs = match github.list_directory(parts[0], parts[1], "", "HEAD").await {
-                Ok(entries) => entries.iter().take(15).map(|e| e.name.clone()).collect::<Vec<_>>().join(", "),
+                Ok(entries) => entries
+                    .iter()
+                    .take(15)
+                    .map(|e| e.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 Err(_) => String::new(),
             };
             let mut info = format!("  {candidate}");
-            if let Some(l) = cand_lang { info.push_str(&format!(" (lang: {l})")); }
-            if let Some(d) = cand_desc { info.push_str(&format!(" — {d}")); }
-            if !cand_dirs.is_empty() { info.push_str(&format!("\n    files: [{cand_dirs}]")); }
+            if let Some(l) = cand_lang {
+                info.push_str(&format!(" (lang: {l})"));
+            }
+            if let Some(d) = cand_desc {
+                info.push_str(&format!(" — {d}"));
+            }
+            if !cand_dirs.is_empty() {
+                info.push_str(&format!("\n    files: [{cand_dirs}]"));
+            }
             other_repo_info.push(info);
         }
 
@@ -3377,7 +3752,10 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
         let system = "You are a repository routing validator. Be precise — only suggest a switch \
                       if you are confident the plan does NOT belong in the current repo.";
 
-        let mut messages = vec![("user".to_string(), vec![serde_json::json!({"type": "text", "text": prompt})])];
+        let mut messages = vec![(
+            "user".to_string(),
+            vec![serde_json::json!({"type": "text", "text": prompt})],
+        )];
 
         match provider::converse(
             state,
@@ -3388,10 +3766,16 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
             &[],
             &triage::NoOpExecutor,
             usage,
-            llm::ConverseOptions { max_turns: 1, max_tokens: 128, deadline: None },
+            llm::ConverseOptions {
+                max_turns: 1,
+                max_tokens: 128,
+                deadline: None,
+            },
             None,
             None,
-        ).await {
+        )
+        .await
+        {
             Ok(response) => {
                 let trimmed: &str = response.trim();
                 if let Some(rest) = trimmed.strip_prefix("SWITCH") {
@@ -3420,7 +3804,11 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
         }
     }
 
-    PlanValidation { warnings, blocked, switch_repo }
+    PlanValidation {
+        warnings,
+        blocked,
+        switch_repo,
+    }
 }
 
 /// Load a numeric workflow setting from SETTINGS#WORKFLOW.
@@ -3566,7 +3954,11 @@ async fn salvage_timeout_pr(
     let diff = github
         .get_diff(&msg.repo_owner, &msg.repo_name, &msg.base_branch, branch)
         .await?;
-    let files_changed = diff.get("files").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0);
+    let files_changed = diff
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
     if files_changed == 0 {
         return Err("No changes on branch to salvage".into());
     }
@@ -3577,7 +3969,11 @@ async fn salvage_timeout_pr(
         .await?;
     let (pr_number, pr_url) = if let Some(pr_data) = existing {
         let n = pr_data.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
-        let u = pr_data.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let u = pr_data
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         (n, u)
     } else {
         let title = format!("⚠️ Partial: #{}: {}", msg.issue_number, msg.title);
@@ -3601,7 +3997,11 @@ async fn salvage_timeout_pr(
             )
             .await?;
         let n = pr_data.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
-        let u = pr_data.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let u = pr_data
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         (n, u)
     };
 
@@ -4081,7 +4481,11 @@ If everything is clean, respond with "CLEAN" and nothing else."#,
         }
     };
 
-    tracing::info!(run_id, "Adversarial test result: {}", &response[..response.len().min(200)]);
+    tracing::info!(
+        run_id,
+        "Adversarial test result: {}",
+        &response[..response.len().min(200)]
+    );
 
     if response.starts_with("CLEAN") || !response.contains("ISSUES_FOUND:") {
         String::new()

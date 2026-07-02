@@ -530,11 +530,31 @@ pub async fn get_run(
     let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
 
     // Fallback: if run-level tokens are 0/missing, sum from per-pass traces
-    let tokens_in = item.get("tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-    let tokens_out = item.get("tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-    let cache_read = item.get("cache_read_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-    let cache_write = item.get("cache_write_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-    let cost_usd = item.get("cost_usd").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<f64>().ok()).unwrap_or(0.0);
+    let tokens_in = item
+        .get("tokens_in")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let tokens_out = item
+        .get("tokens_out")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let cache_read = item
+        .get("cache_read_tokens")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let cache_write = item
+        .get("cache_write_tokens")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let cost_usd = item
+        .get("cost_usd")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<f64>().ok())
+        .unwrap_or(0.0);
 
     let (tokens_in, tokens_out, cache_read, cache_write, cost_usd) = if tokens_in == 0 {
         // Sum from traces as fallback
@@ -553,18 +573,38 @@ pub async fn get_run(
             let mut cr: u64 = 0;
             let mut cw: u64 = 0;
             for t in traces.items() {
-                ti += t.get("input_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-                to += t.get("output_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-                cr += t.get("cache_read_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-                cw += t.get("cache_write_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+                ti += t
+                    .get("input_tokens")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0);
+                to += t
+                    .get("output_tokens")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0);
+                cr += t
+                    .get("cache_read_tokens")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0);
+                cw += t
+                    .get("cache_write_tokens")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0);
             }
             // Estimate cost from traces (use Opus rates as default)
             let cost = if ti > 0 {
                 let input_rate = 15.0 / 1_000_000.0;
                 let output_rate = 75.0 / 1_000_000.0;
-                (ti as f64 * input_rate) + (to as f64 * output_rate)
-                    + (cr as f64 * input_rate * 0.1) + (cw as f64 * input_rate * 1.25)
-            } else { 0.0 };
+                (ti as f64 * input_rate)
+                    + (to as f64 * output_rate)
+                    + (cr as f64 * input_rate * 0.1)
+                    + (cw as f64 * input_rate * 1.25)
+            } else {
+                0.0
+            };
             (ti, to, cr, cw, if cost > 0.0 { cost } else { cost_usd })
         } else {
             (tokens_in, tokens_out, cache_read, cache_write, cost_usd)
@@ -739,9 +779,17 @@ pub async fn get_agent_log(
             .await
         {
             for item in result.items() {
-                let payload_str = item.get("payload").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default();
+                let payload_str = item
+                    .get("payload")
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+                    .unwrap_or_default();
                 let payload: Value = serde_json::from_str(&payload_str).unwrap_or_default();
-                let timestamp = item.get("timestamp").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default();
+                let timestamp = item
+                    .get("timestamp")
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+                    .unwrap_or_default();
                 live_events.push(json!({
                     "tool": payload.get("tool").and_then(|v| v.as_str()).unwrap_or(""),
                     "input_summary": payload.get("input_summary").and_then(|v| v.as_str()).unwrap_or(""),
@@ -753,7 +801,9 @@ pub async fn get_agent_log(
         }
     }
 
-    Ok(Json(json!({ "passes": passes, "live_events": live_events })))
+    Ok(Json(
+        json!({ "passes": passes, "live_events": live_events }),
+    ))
 }
 
 /// GET /api/runs/:run_id/openspec — fetch the four openspec files from S3.
@@ -818,7 +868,7 @@ pub async fn retry_run(
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(1)?; // member+
-    // Block if token limit exceeded
+                             // Block if token limit exceeded
     if super::github_webhook::check_run_budget(&state, &claims.team_id)
         .await
         .is_some()
@@ -985,7 +1035,7 @@ pub async fn re_review_run(
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(1)?; // member+
-    // Block if token limit exceeded
+                             // Block if token limit exceeded
     if super::github_webhook::check_run_budget(&state, &claims.team_id)
         .await
         .is_some()
@@ -1173,7 +1223,7 @@ pub async fn sync_repos(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(3)?; // admin+
-    // Get installation_id from META record
+                             // Get installation_id from META record
     let meta = state
         .dynamo
         .get_item()
@@ -1596,7 +1646,7 @@ pub async fn delete_jira_secret(
     Extension(claims): Extension<Claims>,
 ) -> Result<StatusCode, StatusCode> {
     claims.require_role(3)?; // admin+
-    // Delete token from jira-tokens table first
+                             // Delete token from jira-tokens table first
     let old = load_jira_secret(&state, &claims.team_id).await;
     if let Some((old_token, _)) = old {
         let _ = state
@@ -2042,12 +2092,10 @@ pub async fn update_jira_projects(
             put = put.item("repo", attr_s(repo));
         }
 
-        put.send()
-            .await
-            .map_err(|e| {
-                error!("Failed to save Jira project {key}: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        put.send().await.map_err(|e| {
+            error!("Failed to save Jira project {key}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     }
 
     info!(team_id = %claims.team_id, count = projects.len(), "Updated Jira projects");
@@ -2259,29 +2307,30 @@ pub async fn update_repo(
         let installation_id = get_team_installation_id(&state, &claims.team_id).await?;
 
         // Fetch actual default branch from GitHub API
-        let default_branch = match crate::auth::github_app::get_installation_token(&state, installation_id).await {
-            Ok(token) => {
-                let url = format!("https://api.github.com/repos/{owner}/{name}");
-                match state
-                    .http
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {token}"))
-                    .header("Accept", "application/vnd.github+json")
-                    .header("User-Agent", "Coderhelm-bot")
-                    .send()
-                    .await
-                {
-                    Ok(resp) => resp
-                        .json::<Value>()
+        let default_branch =
+            match crate::auth::github_app::get_installation_token(&state, installation_id).await {
+                Ok(token) => {
+                    let url = format!("https://api.github.com/repos/{owner}/{name}");
+                    match state
+                        .http
+                        .get(&url)
+                        .header("Authorization", format!("Bearer {token}"))
+                        .header("Accept", "application/vnd.github+json")
+                        .header("User-Agent", "Coderhelm-bot")
+                        .send()
                         .await
-                        .ok()
-                        .and_then(|v| v["default_branch"].as_str().map(String::from))
-                        .unwrap_or_else(|| "main".to_string()),
-                    Err(_) => "main".to_string(),
+                    {
+                        Ok(resp) => resp
+                            .json::<Value>()
+                            .await
+                            .ok()
+                            .and_then(|v| v["default_branch"].as_str().map(String::from))
+                            .unwrap_or_else(|| "main".to_string()),
+                        Err(_) => "main".to_string(),
+                    }
                 }
-            }
-            Err(_) => "main".to_string(),
-        };
+                Err(_) => "main".to_string(),
+            };
 
         let message = WorkerMessage::Onboard(OnboardMessage {
             team_id: claims.team_id.clone(),
@@ -3922,9 +3971,7 @@ pub async fn list_dlq_messages(
             let receive_count = m
                 .attributes()
                 .and_then(|a| {
-                    a.get(
-                        &aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount,
-                    )
+                    a.get(&aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
                 })
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
@@ -3932,9 +3979,7 @@ pub async fn list_dlq_messages(
             let source_queue = m
                 .attributes()
                 .and_then(|a| {
-                    a.get(
-                        &aws_sdk_sqs::types::MessageSystemAttributeName::DeadLetterQueueSourceArn,
-                    )
+                    a.get(&aws_sdk_sqs::types::MessageSystemAttributeName::DeadLetterQueueSourceArn)
                 })
                 .cloned()
                 .unwrap_or_default();
@@ -3976,13 +4021,14 @@ pub async fn redrive_dlq_message(
         serde_json::to_string(message_body).unwrap_or_default()
     };
 
-    let target_queue = if body_str.contains("\"type\":\"ci_fix\"") || body_str.contains("\"type\":\"resume\"") {
-        &state.config.ci_fix_queue_url
-    } else if body_str.contains("\"type\":\"feedback\"") {
-        &state.config.feedback_queue_url
-    } else {
-        &state.config.ticket_queue_url
-    };
+    let target_queue =
+        if body_str.contains("\"type\":\"ci_fix\"") || body_str.contains("\"type\":\"resume\"") {
+            &state.config.ci_fix_queue_url
+        } else if body_str.contains("\"type\":\"feedback\"") {
+            &state.config.feedback_queue_url
+        } else {
+            &state.config.ticket_queue_url
+        };
 
     if target_queue.is_empty() {
         error!("Cannot redrive — target queue URL is empty");

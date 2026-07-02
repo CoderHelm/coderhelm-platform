@@ -106,7 +106,10 @@ pub async fn get_infrastructure(
                 .and_then(|s| serde_json::from_str(s).ok());
 
             let error_msg = item.get("error").and_then(|v| v.as_s().ok()).cloned();
-            let updated_at = item.get("updated_at").and_then(|v| v.as_s().ok()).map(|s| s.as_str());
+            let updated_at = item
+                .get("updated_at")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.as_str());
 
             let suggested_prompt = if has_infra {
                 None
@@ -232,7 +235,10 @@ pub async fn get_repo_infrastructure(
                 .and_then(|v| v.as_bool().ok())
                 .copied()
                 .unwrap_or(false);
-            let updated_at = item.get("updated_at").and_then(|v| v.as_s().ok()).map(|s| s.as_str());
+            let updated_at = item
+                .get("updated_at")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.as_str());
             let mut a = InfraAnalysis {
                 status,
                 has_infra,

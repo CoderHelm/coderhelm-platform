@@ -1148,9 +1148,7 @@ pub async fn github_callback(
             .table_name(&state.config.table_name)
             .key("pk", attr_s(&team_id))
             .key("sk", attr_s("META"))
-            .update_expression(
-                "SET github_install_id = :iid, github_org = :org, updated_at = :now",
-            )
+            .update_expression("SET github_install_id = :iid, github_org = :org, updated_at = :now")
             .expression_attribute_values(
                 ":iid",
                 aws_sdk_dynamodb::types::AttributeValue::N(inst_id.to_string()),

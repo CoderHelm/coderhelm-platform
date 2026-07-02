@@ -149,7 +149,8 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             &state.config.mcp_configs_table_name
         };
         let mcp_plugins =
-            mcp::load_team_plugins(&state.dynamo, mcp_table, &msg.team_id, &super::MCP_CATALOG).await;
+            mcp::load_team_plugins(&state.dynamo, mcp_table, &msg.team_id, &super::MCP_CATALOG)
+                .await;
 
         for plugin in &mcp_plugins {
             let schemas = match mcp::load_tool_cache(
@@ -161,8 +162,12 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             {
                 Some(cache) => cache.tools,
                 None if !state.config.mcp_proxy_function_name.is_empty() => {
-                    match mcp::list_tools(&state.lambda, &state.config.mcp_proxy_function_name, plugin)
-                        .await
+                    match mcp::list_tools(
+                        &state.lambda,
+                        &state.config.mcp_proxy_function_name,
+                        plugin,
+                    )
+                    .await
                     {
                         Ok(schemas) => schemas,
                         Err(e) => {
@@ -249,34 +254,48 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         deadline,
     };
 
-    let on_tool: Option<Box<dyn Fn(&str, u64, &str, bool) + Send + Sync>> = if let Some(rid) = run_id {
+    let on_tool: Option<Box<dyn Fn(&str, u64, &str, bool) + Send + Sync>> = if let Some(rid) =
+        run_id
+    {
         let dynamo = state.dynamo.clone();
         let table = state.config.runs_table_name.clone();
         let events_table = state.config.events_table_name.clone();
         let team = msg.team_id.clone();
         let rid = rid.to_string();
-        Some(Box::new(move |tool_name: &str, duration_ms: u64, input_summary: &str, is_error: bool| {
-            let dynamo = dynamo.clone();
-            let table = table.clone();
-            let events_table = events_table.clone();
-            let team = team.clone();
-            let rid = rid.clone();
-            let tool_name = tool_name.to_string();
-            let input_summary = input_summary.to_string();
-            tokio::spawn(async move {
-                let now = chrono::Utc::now().to_rfc3339();
+        Some(Box::new(
+            move |tool_name: &str, duration_ms: u64, input_summary: &str, is_error: bool| {
+                let dynamo = dynamo.clone();
+                let table = table.clone();
+                let events_table = events_table.clone();
+                let team = team.clone();
+                let rid = rid.clone();
+                let tool_name = tool_name.to_string();
+                let input_summary = input_summary.to_string();
+                tokio::spawn(async move {
+                    let now = chrono::Utc::now().to_rfc3339();
 
-                // Write progress note (existing behavior for timeline)
-                let msg = if input_summary.is_empty() {
-                    format!("Tool: {tool_name}")
-                } else {
-                    format!("Tool: {tool_name} — {}", &input_summary[..input_summary.len().min(100)])
-                };
-                let entry = aws_sdk_dynamodb::types::AttributeValue::M(std::collections::HashMap::from([
-                    ("message".to_string(), aws_sdk_dynamodb::types::AttributeValue::S(msg)),
-                    ("timestamp".to_string(), aws_sdk_dynamodb::types::AttributeValue::S(now.clone())),
-                ]));
-                let _ = dynamo.update_item()
+                    // Write progress note (existing behavior for timeline)
+                    let msg = if input_summary.is_empty() {
+                        format!("Tool: {tool_name}")
+                    } else {
+                        format!(
+                            "Tool: {tool_name} — {}",
+                            &input_summary[..input_summary.len().min(100)]
+                        )
+                    };
+                    let entry = aws_sdk_dynamodb::types::AttributeValue::M(
+                        std::collections::HashMap::from([
+                            (
+                                "message".to_string(),
+                                aws_sdk_dynamodb::types::AttributeValue::S(msg),
+                            ),
+                            (
+                                "timestamp".to_string(),
+                                aws_sdk_dynamodb::types::AttributeValue::S(now.clone()),
+                            ),
+                        ]),
+                    );
+                    let _ = dynamo.update_item()
                     .table_name(&table)
                     .key("team_id", aws_sdk_dynamodb::types::AttributeValue::S(team.clone()))
                     .key("run_id", aws_sdk_dynamodb::types::AttributeValue::S(rid.clone()))
@@ -287,32 +306,50 @@ Go DIRECTLY to the target files listed in the OpenSpec.
                     .send()
                     .await;
 
-                // Write detailed tool event to events table for agent log live view
-                if !events_table.is_empty() {
-                    let ts = chrono::Utc::now().timestamp_millis();
-                    let sk = format!("TOOL#{ts:013}#{tool_name}");
-                    let payload = serde_json::json!({
-                        "tool": tool_name,
-                        "input_summary": input_summary,
-                        "duration_ms": duration_ms,
-                        "is_error": is_error,
-                    });
-                    let _ = dynamo.put_item()
-                        .table_name(&events_table)
-                        .item("pk", aws_sdk_dynamodb::types::AttributeValue::S(format!("RUN#{rid}")))
-                        .item("sk", aws_sdk_dynamodb::types::AttributeValue::S(sk))
-                        .item("event_type", aws_sdk_dynamodb::types::AttributeValue::S("tool_call".to_string()))
-                        .item("payload", aws_sdk_dynamodb::types::AttributeValue::S(payload.to_string()))
-                        .item("processed", aws_sdk_dynamodb::types::AttributeValue::Bool(true))
-                        .item("timestamp", aws_sdk_dynamodb::types::AttributeValue::S(now))
-                        .item("ttl", aws_sdk_dynamodb::types::AttributeValue::N(
-                            (chrono::Utc::now().timestamp() as u64 + 30 * 86400).to_string()
-                        ))
-                        .send()
-                        .await;
-                }
-            });
-        }))
+                    // Write detailed tool event to events table for agent log live view
+                    if !events_table.is_empty() {
+                        let ts = chrono::Utc::now().timestamp_millis();
+                        let sk = format!("TOOL#{ts:013}#{tool_name}");
+                        let payload = serde_json::json!({
+                            "tool": tool_name,
+                            "input_summary": input_summary,
+                            "duration_ms": duration_ms,
+                            "is_error": is_error,
+                        });
+                        let _ = dynamo
+                            .put_item()
+                            .table_name(&events_table)
+                            .item(
+                                "pk",
+                                aws_sdk_dynamodb::types::AttributeValue::S(format!("RUN#{rid}")),
+                            )
+                            .item("sk", aws_sdk_dynamodb::types::AttributeValue::S(sk))
+                            .item(
+                                "event_type",
+                                aws_sdk_dynamodb::types::AttributeValue::S("tool_call".to_string()),
+                            )
+                            .item(
+                                "payload",
+                                aws_sdk_dynamodb::types::AttributeValue::S(payload.to_string()),
+                            )
+                            .item(
+                                "processed",
+                                aws_sdk_dynamodb::types::AttributeValue::Bool(true),
+                            )
+                            .item("timestamp", aws_sdk_dynamodb::types::AttributeValue::S(now))
+                            .item(
+                                "ttl",
+                                aws_sdk_dynamodb::types::AttributeValue::N(
+                                    (chrono::Utc::now().timestamp() as u64 + 30 * 86400)
+                                        .to_string(),
+                                ),
+                            )
+                            .send()
+                            .await;
+                    }
+                });
+            },
+        ))
     } else {
         None
     };
@@ -722,9 +759,16 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     }
                     let count = content.matches(old_text).count();
                     if count == 0 {
-                        errors.push(format!("old_text not found: {}…", &old_text[..old_text.len().min(60)]));
+                        errors.push(format!(
+                            "old_text not found: {}…",
+                            &old_text[..old_text.len().min(60)]
+                        ));
                     } else if count > 1 {
-                        errors.push(format!("old_text matched {} times (must be unique): {}…", count, &old_text[..old_text.len().min(60)]));
+                        errors.push(format!(
+                            "old_text matched {} times (must be unique): {}…",
+                            count,
+                            &old_text[..old_text.len().min(60)]
+                        ));
                     } else {
                         content = content.replacen(old_text, new_text, 1);
                         applied += 1;
@@ -732,7 +776,10 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                 }
 
                 if applied == 0 {
-                    return Ok(json!(format!("No edits applied to {path}: {}", errors.join("; "))));
+                    return Ok(json!(format!(
+                        "No edits applied to {path}: {}",
+                        errors.join("; ")
+                    )));
                 }
 
                 // Guardrail: reject edits that break brace balance or delete too much
@@ -745,7 +792,8 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
 
                 // Write the modified file back
                 // Get sha for update
-                let sha = self.github
+                let sha = self
+                    .github
                     .get_file_sha(&self.owner, &self.repo, path, &self.branch)
                     .await
                     .ok();
@@ -761,9 +809,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     )
                     .await?;
                 self.files_modified.lock().unwrap().insert(path.to_string());
-                self.file_cache
-                    .insert(cache_key, content)
-                    .await;
+                self.file_cache.insert(cache_key, content).await;
                 self.task_tracker.mark_files_done(&[path]).await;
 
                 let mut result = format!("Applied {applied} edit(s) to {path}");
@@ -938,8 +984,8 @@ fn extract_file_paths(tasks: &str) -> Vec<String> {
 fn validate_edit_safety(original: &str, edited: &str, path: &str) -> Option<String> {
     // Only validate code files (JS/TS/JSX/TSX/Java/Kotlin/Rust/Go/C/C++)
     let code_ext = [
-        ".ts", ".tsx", ".js", ".jsx", ".java", ".kt", ".rs", ".go", ".c", ".cpp", ".cs",
-        ".swift", ".dart", ".rb", ".py",
+        ".ts", ".tsx", ".js", ".jsx", ".java", ".kt", ".rs", ".go", ".c", ".cpp", ".cs", ".swift",
+        ".dart", ".rb", ".py",
     ];
     if !code_ext.iter().any(|ext| path.ends_with(ext)) {
         return None;

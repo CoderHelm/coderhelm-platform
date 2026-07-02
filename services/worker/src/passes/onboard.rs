@@ -66,10 +66,19 @@ pub async fn run(
                         .dynamo
                         .update_item()
                         .table_name(&state.config.repos_table_name)
-                        .key("pk", aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()))
-                        .key("sk", aws_sdk_dynamodb::types::AttributeValue::S(format!("REPO#{full_name}")))
+                        .key(
+                            "pk",
+                            aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
+                        )
+                        .key(
+                            "sk",
+                            aws_sdk_dynamodb::types::AttributeValue::S(format!("REPO#{full_name}")),
+                        )
                         .update_expression("SET default_branch = :b")
-                        .expression_attribute_values(":b", aws_sdk_dynamodb::types::AttributeValue::S(repo.default_branch.clone()))
+                        .expression_attribute_values(
+                            ":b",
+                            aws_sdk_dynamodb::types::AttributeValue::S(repo.default_branch.clone()),
+                        )
                         .send()
                         .await;
                 }
@@ -132,7 +141,9 @@ pub async fn run(
 
         // Use Anthropic to generate a proper org-level summary
         let global_content = if !repo_summaries.is_empty() {
-            match generate_global_context(state, &provider, &enabled_repos, &repo_summaries, usage).await {
+            match generate_global_context(state, &provider, &enabled_repos, &repo_summaries, usage)
+                .await
+            {
                 Ok(content) => content,
                 Err(e) => {
                     warn!(error = %e, "Failed to generate global context via Anthropic, using fallback");
@@ -354,14 +365,9 @@ async fn generate_voice_md(
     );
 
     let client = AnthropicClient::new(provider.api_key().to_string());
-    let voice_md = anthropic::converse_simple(
-        &client,
-        provider.primary_model_id(),
-        system,
-        &prompt,
-        usage,
-    )
-    .await?;
+    let voice_md =
+        anthropic::converse_simple(&client, provider.primary_model_id(), system, &prompt, usage)
+            .await?;
 
     // Store VOICE.md in DynamoDB (not committed to repo)
     let voice_sk = format!("VOICE#REPO#{full_name}");
@@ -411,14 +417,7 @@ async fn generate_global_context(
     );
 
     let client = AnthropicClient::new(provider.api_key().to_string());
-    anthropic::converse_simple(
-        &client,
-        provider.primary_model_id(),
-        system,
-        &prompt,
-        usage,
-    )
-    .await
+    anthropic::converse_simple(&client, provider.primary_model_id(), system, &prompt, usage).await
 }
 
 /// Fallback when Anthropic call fails — simple list without AI enrichment.

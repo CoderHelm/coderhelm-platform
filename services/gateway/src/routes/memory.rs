@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use tar::{Archive, Builder};
 use tracing::info;
 
-use crate::AppState;
 use crate::models::Claims;
+use crate::AppState;
 
 const MEMORY_PREFIX: &str = "teams";
 const MEMORY_SUFFIX: &str = "memory.tar.gz";
@@ -193,7 +193,12 @@ async fn upload_and_close(
         tar.append_dir_all(".", dir)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Tar: {e}")))?;
         tar.into_inner()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Tar finish: {e}")))?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Tar finish: {e}"),
+                )
+            })?
             .finish()
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Gz finish: {e}")))?;
     }
@@ -218,8 +223,14 @@ pub async fn list_memories(
     Query(q): Query<ListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let (owner, name) = parse_repo(&q.repo)?;
-    let (mut db, dir) =
-        open_db(&state.s3, &state.config.bucket_name, &claims.team_id, owner, name).await?;
+    let (mut db, dir) = open_db(
+        &state.s3,
+        &state.config.bucket_name,
+        &claims.team_id,
+        owner,
+        name,
+    )
+    .await?;
 
     let ids = db.memory_ids();
 
@@ -291,8 +302,14 @@ pub async fn delete_memory(
         return Err((StatusCode::FORBIDDEN, "Admin+ required".into()));
     }
     let (owner, name) = parse_repo(&q.repo)?;
-    let (mut db, dir) =
-        open_db(&state.s3, &state.config.bucket_name, &claims.team_id, owner, name).await?;
+    let (mut db, dir) = open_db(
+        &state.s3,
+        &state.config.bucket_name,
+        &claims.team_id,
+        owner,
+        name,
+    )
+    .await?;
 
     let id = memory_id
         .parse()
@@ -333,8 +350,14 @@ pub async fn memory_stats(
     Query(q): Query<StatsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let (owner, name) = parse_repo(&q.repo)?;
-    let (mut db, dir) =
-        open_db(&state.s3, &state.config.bucket_name, &claims.team_id, owner, name).await?;
+    let (mut db, dir) = open_db(
+        &state.s3,
+        &state.config.bucket_name,
+        &claims.team_id,
+        owner,
+        name,
+    )
+    .await?;
 
     let ids = db.memory_ids();
     let total = ids.len();
