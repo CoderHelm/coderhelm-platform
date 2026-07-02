@@ -764,6 +764,7 @@ impl GitHubClient {
     /// Create a merge commit with two parents (for conflict resolution).
     /// Builds a tree from the branch tree + overridden files, then creates
     /// a commit with both branch and base as parents.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_merge_commit(
         &self,
         owner: &str,

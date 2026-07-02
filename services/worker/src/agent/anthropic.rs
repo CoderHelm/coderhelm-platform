@@ -183,7 +183,7 @@ pub async fn converse_tool_loop(
     max_turns: usize,
     max_tokens: i32,
     deadline: Option<std::time::Instant>,
-    on_tool_call: Option<&(dyn Fn(&str, u64, &str, bool) + Send + Sync)>,
+    on_tool_call: Option<&super::llm::OnToolCall>,
     mut conversation_log: Option<&mut Vec<Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let api_tools: Vec<ApiTool> = tools

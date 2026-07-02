@@ -271,7 +271,7 @@ pub async fn list_memories(
 
     let filtered_total = items.len();
     let page = q.page.max(1);
-    let page_size = q.page_size.min(100).max(1);
+    let page_size = q.page_size.clamp(1, 100);
     let start = (page - 1) * page_size;
     let paged: Vec<MemoryItem> = items.into_iter().skip(start).take(page_size).collect();
 

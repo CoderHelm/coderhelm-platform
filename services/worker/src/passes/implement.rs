@@ -254,9 +254,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         deadline,
     };
 
-    let on_tool: Option<Box<dyn Fn(&str, u64, &str, bool) + Send + Sync>> = if let Some(rid) =
-        run_id
-    {
+    let on_tool: Option<Box<llm::OnToolCall>> = if let Some(rid) = run_id {
         let dynamo = state.dynamo.clone();
         let table = state.config.runs_table_name.clone();
         let events_table = state.config.events_table_name.clone();

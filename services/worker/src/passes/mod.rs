@@ -509,7 +509,7 @@ async fn run_passes(
                 info!(run_id, repo = %repos[0], "Single repo available");
             } else {
                 // Multiple repos — ask LLM to pick based on ticket content
-                match triage::select_repo(state, &msg, &repos, &github, &provider, usage).await {
+                match triage::select_repo(state, msg, &repos, &github, &provider, usage).await {
                     Ok(selected) => {
                         let (owner, name) = selected.split_once('/').unwrap_or(("", ""));
                         msg.repo_owner = owner.to_string();
@@ -1031,7 +1031,7 @@ async fn run_passes(
                     runs.iter().any(|r| {
                         r["conclusion"]
                             .as_str()
-                            .map_or(false, |c| failed_conclusions.contains(&c))
+                            .is_some_and(|c| failed_conclusions.contains(&c))
                     })
                 })
                 .unwrap_or(false);
@@ -1079,7 +1079,7 @@ async fn run_passes(
                                 .filter(|r| {
                                     r["conclusion"]
                                         .as_str()
-                                        .map_or(false, |c| failed_conclusions.contains(&c))
+                                        .is_some_and(|c| failed_conclusions.contains(&c))
                                 })
                                 .filter_map(|r| {
                                     r["details_url"]
@@ -1088,7 +1088,7 @@ async fn run_passes(
                                         .and_then(|s| s.split('/').next())
                                         .and_then(|s| s.parse::<u64>().ok())
                                 })
-                                .last()
+                                .next_back()
                         })
                         .unwrap_or(0);
 
@@ -1118,7 +1118,7 @@ async fn run_passes(
                                     .find(|r| {
                                         r["conclusion"]
                                             .as_str()
-                                            .map_or(false, |c| failed_conclusions.contains(&c))
+                                            .is_some_and(|c| failed_conclusions.contains(&c))
                                     })
                                     .and_then(|r| r["id"].as_u64())
                             })
@@ -1306,7 +1306,7 @@ async fn run_passes(
             .await;
             false
         } else {
-            existing_pr.as_ref().map_or(false, |pr| {
+            existing_pr.as_ref().is_some_and(|pr| {
                 let pr_head = pr["head"]["sha"].as_str().unwrap_or("");
                 let base = pr["base"]["sha"].as_str().unwrap_or("");
                 // Branch was reset to base by a previous retry — don't reset again
@@ -1546,7 +1546,7 @@ async fn run_passes(
                     &provider,
                     usage,
                     &file_cache,
-                    &start,
+                    start,
                     run_id,
                     &mut agent_memory,
                     implement_deadline,
@@ -1994,10 +1994,10 @@ async fn run_passes(
     .await;
 
     if !security_result.passed {
-        if !has_time_for_remediation(&start) {
+        if !has_time_for_remediation(start) {
             warn!(
                 run_id,
-                remaining_secs = remaining_secs(&start),
+                remaining_secs = remaining_secs(start),
                 "Skipping security remediation — not enough time remaining"
             );
             add_progress_note(
@@ -3130,9 +3130,7 @@ async fn lookup_team_installation_id(
         .and_then(|n| n.parse::<u64>().ok())
         .filter(|&id| id > 0)
         .ok_or_else(|| {
-            format!(
-                "GitHub App is not installed for this team. Please install it at https://github.com/apps/coderhelm/installations/new"
-            )
+            "GitHub App is not installed for this team. Please install it at https://github.com/apps/coderhelm/installations/new".to_string()
             .into()
         })
 }
@@ -3466,6 +3464,7 @@ struct PlanValidation {
 /// Plan validation — catches bad plans before the expensive Implement pass.
 /// Uses deterministic checks (scope, file existence, plan-text mentions) plus
 /// an LLM repo-fit check as a final safety net.
+#[allow(clippy::too_many_arguments)]
 async fn validate_plan(
     plan: &plan::PlanResult,
     github: &GitHubClient,
@@ -3613,21 +3612,23 @@ async fn validate_plan(
             }
             if let Some((_owner, cand_name)) = candidate.split_once('/') {
                 let cand_lower = cand_name.to_lowercase();
-                // First try full owner/name match, then word-bounded name match
+                // First try full owner/name match, then word-bounded name match.
+                // The pattern varies per candidate, so it can't be hoisted.
                 let full_match_count = full_plan_lower.matches(&candidate.to_lowercase()).count();
+                #[allow(clippy::regex_creation_in_loops)]
                 let name_re =
                     regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(&cand_lower)))
                         .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
                 let cand_mentions = full_match_count + name_re.find_iter(&full_plan_lower).count();
 
                 // Candidate repo must be mentioned at least 2 times and more than current
-                if cand_mentions >= 2 && cand_mentions > current_mentions {
-                    if best_candidate
+                if cand_mentions >= 2
+                    && cand_mentions > current_mentions
+                    && best_candidate
                         .as_ref()
-                        .map_or(true, |(_, best)| cand_mentions > *best)
-                    {
-                        best_candidate = Some((candidate.clone(), cand_mentions));
-                    }
+                        .is_none_or(|(_, best)| cand_mentions > *best)
+                {
+                    best_candidate = Some((candidate.clone(), cand_mentions));
                 }
             }
         }

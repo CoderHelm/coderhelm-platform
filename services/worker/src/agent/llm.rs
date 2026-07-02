@@ -21,6 +21,9 @@ impl Default for ConverseOptions {
     }
 }
 
+/// Observer invoked after each tool call: (tool_name, duration_ms, input_summary, is_error).
+pub type OnToolCall = dyn Fn(&str, u64, &str, bool) + Send + Sync;
+
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
