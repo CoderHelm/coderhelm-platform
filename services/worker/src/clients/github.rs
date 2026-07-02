@@ -1239,6 +1239,40 @@ impl GitHubClient {
         Ok(data.as_array().and_then(|arr| arr.first().cloned()))
     }
 
+    /// Find the most recent closed-but-unmerged PR for a head branch.
+    /// A branch force-reset to base auto-closes its PR ("all commits
+    /// removed"); reopening that PR preserves its number, comments, and
+    /// review history instead of churning out a new PR per re-run.
+    pub async fn find_reopenable_pr_for_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/pulls?state=closed&head={owner}:{branch}&sort=created&direction=desc&per_page=5"
+        );
+        let data = self.get(&url).await?;
+        Ok(data.as_array().and_then(|arr| {
+            arr.iter()
+                .find(|pr| pr["merged_at"].is_null())
+                .cloned()
+        }))
+    }
+
+    /// Reopen a closed pull request.
+    pub async fn reopen_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}");
+        self.patch(&url, &serde_json::json!({"state": "open"}))
+            .await?;
+        Ok(())
+    }
+
     /// List recent commits on a branch.
     pub async fn list_commits(
         &self,

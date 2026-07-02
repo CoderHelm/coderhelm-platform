@@ -143,6 +143,15 @@ export class DatabaseStack extends cdk.Stack {
       sortKey: { name: "run_id", type: dynamodb.AttributeType.STRING },
     });
 
+    // Webhook dedup: "does this ticket already have a run?" A key-condition
+    // query here replaces the old team-partition scan whose Limit applied
+    // before the ticket filter and silently checked only the 5 oldest runs.
+    this.runsTable.addGlobalSecondaryIndex({
+      indexName: "ticket-index",
+      partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "ticket_id", type: dynamodb.AttributeType.STRING },
+    });
+
     // ──────────────────────────────────────────────
     // Analytics table: usage analytics per team
     // PK = team_id, SK = period
