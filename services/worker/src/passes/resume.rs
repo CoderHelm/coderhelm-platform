@@ -1048,6 +1048,7 @@ async fn load_cycle_from_checkpoint(state: &WorkerState, team_id: &str, run_id: 
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn set_run_awaiting_ci(
     state: &WorkerState,
     msg: &TicketMessage,
@@ -1132,6 +1133,7 @@ async fn mark_pr_ready(github: &GitHubClient, repo_owner: &str, repo_name: &str,
     error!(pr_number, "Failed to mark PR ready after 2 attempts");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_run_with_status(
     state: &WorkerState,
     msg: &TicketMessage,

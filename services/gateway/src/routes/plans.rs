@@ -2684,8 +2684,8 @@ async fn run_anthropic_stream(
                     ))
                     .await;
                 track_chat_tokens(
-                    &state,
-                    &team_id,
+                    state,
+                    team_id,
                     total_input_tokens,
                     total_output_tokens,
                     cache_read_tokens,
@@ -2703,8 +2703,8 @@ async fn run_anthropic_stream(
                     ))
                     .await;
                 track_chat_tokens(
-                    &state,
-                    &team_id,
+                    state,
+                    team_id,
                     total_input_tokens,
                     total_output_tokens,
                     cache_read_tokens,
@@ -3021,9 +3021,8 @@ pub async fn plan_chat_stream(
         "plan_chat_stream: starting"
     );
 
-    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input).await.map_err(|s| {
+    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input).await.inspect_err(|&s| {
         error!(status = %s, team_id = %claims.team_id, "plan_chat_stream: load_plan_chat_context failed");
-        s
     })?;
     let mut api_messages = ctx.messages;
 
