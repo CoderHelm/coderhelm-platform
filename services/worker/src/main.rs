@@ -76,12 +76,6 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("Ticket run failed: {e}");
                 }
             }
-            models::WorkerMessage::CiFix(msg) => {
-                info!(team_id = %msg.team_id, run_id = %msg.run_id, "Starting CI fix");
-                if let Err(e) = passes::ci_fix::run(&state, msg).await {
-                    error!("CI fix failed: {e}");
-                }
-            }
             models::WorkerMessage::Feedback(msg) => {
                 info!(team_id = %msg.team_id, run_id = %msg.run_id, "Processing feedback");
                 let team_id = msg.team_id.clone();

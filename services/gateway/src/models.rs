@@ -125,8 +125,6 @@ impl Secrets {
 pub enum WorkerMessage {
     #[serde(rename = "ticket")]
     Ticket(TicketMessage),
-    #[serde(rename = "ci_fix")]
-    CiFix(CiFixMessage),
     #[serde(rename = "feedback")]
     Feedback(FeedbackMessage),
     #[serde(rename = "onboard")]
@@ -210,19 +208,6 @@ pub struct TicketMessage {
 pub enum TicketSource {
     Github,
     Jira,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct CiFixMessage {
-    pub team_id: String,
-    pub installation_id: u64,
-    pub run_id: String,
-    pub repo_owner: String,
-    pub repo_name: String,
-    pub branch: String,
-    pub pr_number: u64,
-    pub check_run_id: u64,
-    pub attempt: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

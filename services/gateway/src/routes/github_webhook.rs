@@ -236,22 +236,29 @@ async fn handle_issue_event(
         return Ok(StatusCode::OK);
     }
 
-    // Dedup: skip if this ticket already has a run
+    // Trigger gate: block while a run is in flight; on a completed latest
+    // run, re-trigger only if the issue content changed (re-labeling an
+    // edited issue reworks it; re-labeling an unchanged one is a no-op).
+    // Failed/needs_input runs no longer block — the old any-run-exists check
+    // made GitHub tickets unretriable by re-label.
     let ticket_id_str = format!("GH-{}", issue["number"].as_u64().unwrap_or(0));
-    let existing = state
-        .dynamo
-        .query()
-        .table_name(&state.config.runs_table_name)
-        .index_name("ticket-index")
-        .key_condition_expression("team_id = :tid AND ticket_id = :ticket")
-        .expression_attribute_values(":tid", attr_s(team_id))
-        .expression_attribute_values(":ticket", attr_s(&ticket_id_str))
-        .send()
-        .await;
-
-    if let Ok(result) = existing {
-        if !result.items().is_empty() {
-            info!(ticket_id = %ticket_id_str, "Skipping — ticket already has a run");
+    let context_hash = common::ticket_context_hash(
+        issue["title"].as_str().unwrap_or(""),
+        issue["body"].as_str().unwrap_or(""),
+        &[],
+    );
+    match super::trigger_gate::gate_ticket_trigger(
+        state,
+        team_id,
+        &ticket_id_str,
+        Some(&context_hash),
+        false,
+    )
+    .await
+    {
+        super::trigger_gate::TicketGate::Enqueue => {}
+        _ => {
+            info!(ticket_id = %ticket_id_str, "Skipping — trigger gate blocked");
             return Ok(StatusCode::OK);
         }
     }
@@ -350,6 +357,19 @@ async fn handle_issue_comment(
         let name = repo["name"].as_str().unwrap_or("");
         let number = issue["number"].as_u64().unwrap_or(0);
         post_limit_comment(state, installation_id, owner, name, number, &reason).await;
+        return Ok(StatusCode::OK);
+    }
+
+    // Explicit human command: skip the content-hash check but still block
+    // while a run is in flight — a repeated "/coderhelm" comment used to
+    // enqueue a duplicate run with no dedup at all.
+    let ticket_id_str = format!("GH-{}", issue["number"].as_u64().unwrap_or(0));
+    if matches!(
+        super::trigger_gate::gate_ticket_trigger(state, team_id, &ticket_id_str, None, true)
+            .await,
+        super::trigger_gate::TicketGate::SkipInFlight
+    ) {
+        info!(ticket_id = %ticket_id_str, "Skipping slash command — run already in flight");
         return Ok(StatusCode::OK);
     }
 

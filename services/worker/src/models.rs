@@ -91,8 +91,6 @@ impl Secrets {
 pub enum WorkerMessage {
     #[serde(rename = "ticket")]
     Ticket(TicketMessage),
-    #[serde(rename = "ci_fix")]
-    CiFix(CiFixMessage),
     #[serde(rename = "feedback")]
     Feedback(FeedbackMessage),
     #[serde(rename = "onboard")]
@@ -182,19 +180,6 @@ fn default_branch() -> String {
 pub enum TicketSource {
     Github,
     Jira,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct CiFixMessage {
-    pub team_id: String,
-    pub installation_id: u64,
-    pub run_id: String,
-    pub repo_owner: String,
-    pub repo_name: String,
-    pub branch: String,
-    pub pr_number: u64,
-    pub check_run_id: u64,
-    pub attempt: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -309,24 +294,6 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, WorkerMessage::Ticket(_)));
-    }
-
-    #[test]
-    fn ci_fix_message_roundtrip() {
-        let msg = WorkerMessage::CiFix(CiFixMessage {
-            team_id: "TEAM#1".into(),
-            installation_id: 1,
-            run_id: "run1".into(),
-            repo_owner: "org".into(),
-            repo_name: "repo".into(),
-            branch: "coderhelm/fix".into(),
-            pr_number: 10,
-            check_run_id: 99,
-            attempt: 1,
-        });
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, WorkerMessage::CiFix(_)));
     }
 
     #[test]

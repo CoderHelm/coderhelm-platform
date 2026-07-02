@@ -970,6 +970,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "common"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1513,6 +1520,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "common",
  "flate2",
  "futures",
  "hex",
@@ -4493,6 +4501,7 @@ dependencies = [
  "aws_lambda_events",
  "base64",
  "chrono",
+ "common",
  "flate2",
  "jsonwebtoken",
  "lambda_runtime",

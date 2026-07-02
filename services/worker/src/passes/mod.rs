@@ -124,7 +124,6 @@ fn has_time_for_remediation(start: &Instant) -> bool {
     remaining_secs(start) >= MIN_TIME_FOR_REMEDIATION_SECS
 }
 
-pub mod ci_fix;
 pub mod feedback;
 pub mod formatter;
 mod implement;
@@ -1628,7 +1627,12 @@ async fn run_passes(
         )
         .await;
 
-        // If no files were changed, comment on the issue and bail — don't open an empty PR
+        // If no files were changed, comment on the issue and stop — don't open
+        // an empty PR. This is a needs_input outcome (mirroring the plan-pass
+        // clarification branch): the ticket lacks detail, a reply re-triggers.
+        // It used to `return Err`, which routed through fail_run — marking the
+        // run failed AND posting a second, generic failure comment on top of
+        // the clarification comment.
         if result.files_modified.is_empty() {
             warn!(run_id, "Implement pass produced zero file changes");
             let raw_clarification = "I explored the codebase but couldn't determine what changes to make for this issue.\n\n\
@@ -1652,7 +1656,6 @@ async fn run_passes(
                 {
                     warn!(run_id, error = %e, "Failed to comment on issue about empty implementation");
                 }
-                return Err(raw_clarification.into());
             } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
                 if let Err(e) = post_jira_comment(
                     state,
@@ -1666,9 +1669,37 @@ async fn run_passes(
                 {
                     warn!(run_id, error = %e, "Failed to comment on Jira ticket about empty implementation");
                 }
-                return Err(raw_clarification.into());
             }
-            return Err(raw_clarification.into());
+
+            let duration = start.elapsed().as_secs();
+            let cost = usage.estimated_cost();
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key("team_id", attr_s(&msg.team_id))
+                .key("run_id", attr_s(run_id))
+                .update_expression(
+                    "SET #status = :s, status_run_id = :sri, error_message = :em, \
+                     tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
+                     cost_usd = :c, duration_s = :d, updated_at = :t, current_pass = :cp",
+                )
+                .expression_attribute_names("#status", "status")
+                .expression_attribute_values(":s", attr_s("needs_input"))
+                .expression_attribute_values(":sri", attr_s(&format!("needs_input#{run_id}")))
+                .expression_attribute_values(":em", attr_s(raw_clarification))
+                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+                .expression_attribute_values(":to", attr_n(usage.output_tokens))
+                .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+                .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+                .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+                .expression_attribute_values(":d", attr_n(duration))
+                .expression_attribute_values(":t", attr_s(&now))
+                .expression_attribute_values(":cp", attr_s("done"))
+                .send()
+                .await;
+            return Ok(());
         }
 
         // Mark all tasks as done in S3 openspec so retries/dashboard see progress
@@ -2268,6 +2299,12 @@ async fn create_run_record(
         .item("tokens_in", attr_n(0))
         .item("tokens_out", attr_n(0))
         .item("cost_usd", attr_n(0))
+        // Content hash of title+body+images: the gateway's webhook gate
+        // compares against this to skip re-triggers where nothing changed.
+        .item(
+            "context_hash",
+            attr_s(&plan::compute_ticket_context_hash(msg)),
+        )
         .item("created_at", attr_s(&now))
         .item("updated_at", attr_s(&now))
         .send()
@@ -2321,7 +2358,7 @@ pub(crate) async fn update_pass(
 }
 
 /// Append a timestamped progress note to the run record for live activity display.
-async fn add_progress_note(state: &WorkerState, team_id: &str, run_id: &str, message: &str) {
+pub(crate) async fn add_progress_note(state: &WorkerState, team_id: &str, run_id: &str, message: &str) {
     let now = chrono::Utc::now().to_rfc3339();
     let entry = aws_sdk_dynamodb::types::AttributeValue::M(std::collections::HashMap::from([
         ("message".to_string(), attr_s(message)),
@@ -2821,25 +2858,35 @@ async fn post_jira_comment(
     Ok(())
 }
 
-/// Check if there is already an active (running) run for this ticket.
-/// Prevents duplicate processing from SQS re-deliveries after Lambda timeouts.
+/// Check if there is already an active run for this ticket. "Active" means
+/// running, queued, or awaiting_ci — an awaiting_ci run owns its branch/PR
+/// (the resume loop is mid-flight on it), so a fresh run starting then would
+/// force-reset that branch out from under it.
+///
+/// Uses the ticket-index GSI. The old status-index version applied Limit(1)
+/// before its ticket filter, so any OTHER ticket's running run made this
+/// ticket look idle — the guard silently never worked for busy teams.
 async fn is_ticket_already_running(state: &WorkerState, msg: &TicketMessage) -> bool {
     let result = state
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
-        .index_name("status-index")
-        .key_condition_expression("team_id = :tid AND begins_with(status_run_id, :prefix)")
-        .filter_expression("ticket_id = :ticket")
+        .index_name("ticket-index")
+        .key_condition_expression("team_id = :tid AND ticket_id = :ticket")
         .expression_attribute_values(":tid", attr_s(&msg.team_id))
-        .expression_attribute_values(":prefix", attr_s("running#"))
         .expression_attribute_values(":ticket", attr_s(&msg.ticket_id))
-        .limit(1)
         .send()
         .await;
 
     match result {
-        Ok(out) => !out.items().is_empty(),
+        Ok(out) => out.items().iter().any(|item| {
+            let status = item
+                .get("status")
+                .and_then(|v| v.as_s().ok())
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            matches!(status, "running" | "queued" | "awaiting_ci")
+        }),
         Err(e) => {
             warn!("Dedup check failed, proceeding: {e}");
             false
