@@ -202,7 +202,8 @@ After researching, output the four files using this exact format:
             &state.config.mcp_configs_table_name
         };
         let mcp_plugins =
-            mcp::load_team_plugins(&state.dynamo, mcp_table, &msg.team_id, &super::MCP_CATALOG).await;
+            mcp::load_team_plugins(&state.dynamo, mcp_table, &msg.team_id, &super::MCP_CATALOG)
+                .await;
 
         for plugin in &mcp_plugins {
             // Try S3 cache first, then invoke proxy to list tools
@@ -215,8 +216,12 @@ After researching, output the four files using this exact format:
             {
                 Some(cache) => cache.tools,
                 None if !state.config.mcp_proxy_function_name.is_empty() => {
-                    match mcp::list_tools(&state.lambda, &state.config.mcp_proxy_function_name, plugin)
-                        .await
+                    match mcp::list_tools(
+                        &state.lambda,
+                        &state.config.mcp_proxy_function_name,
+                        plugin,
+                    )
+                    .await
                     {
                         Ok(schemas) => schemas,
                         Err(e) => {
@@ -290,7 +295,9 @@ After researching, output the four files using this exact format:
 
     let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
     for img in &msg.image_attachments {
-        if let Some(b64) = super::download_image_as_base64(&state.s3, &state.config.bucket_name, &img.s3_key).await {
+        if let Some(b64) =
+            super::download_image_as_base64(&state.s3, &state.config.bucket_name, &img.s3_key).await
+        {
             content_blocks.push(serde_json::json!({
                 "type": "image",
                 "source": { "type": "base64", "media_type": img.media_type, "data": b64 }

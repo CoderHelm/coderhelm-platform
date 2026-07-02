@@ -1967,7 +1967,6 @@ async fn load_plan_chat_context(
     team_id: &str,
     messages_input: &[Value],
 ) -> Result<PlanChatContext, StatusCode> {
-
     // Load org context, repo list, log analyzer flag, enabled plugins, templates, and team META in parallel
     let (
         org_context_result,
@@ -2021,7 +2020,8 @@ async fn load_plan_chat_context(
         .and_then(|i| i.get("content").and_then(|v| v.as_s().ok()).cloned())
         .unwrap_or_default();
 
-    let mut repo_branches: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut repo_branches: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let repo_list: Vec<String> = repo_list_result
         .ok()
         .map(|r| {
@@ -2034,10 +2034,12 @@ async fn load_plan_chat_context(
                         .unwrap_or(false)
                 })
                 .filter_map(|item| {
-                    let name = item.get("repo_name")
+                    let name = item
+                        .get("repo_name")
                         .and_then(|v| v.as_s().ok())
                         .map(|s| s.to_string())?;
-                    let branch = item.get("default_branch")
+                    let branch = item
+                        .get("default_branch")
                         .and_then(|v| v.as_s().ok())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "main".to_string());
@@ -2052,7 +2054,11 @@ async fn load_plan_chat_context(
     let installation_id_opt = team_meta_result
         .ok()
         .and_then(|r| r.item().cloned())
-        .and_then(|i| i.get("github_installation_id").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()))
+        .and_then(|i| {
+            i.get("github_installation_id")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<u64>().ok())
+        })
         .filter(|&id| id > 0);
 
     info!(
@@ -2069,12 +2075,18 @@ async fn load_plan_chat_context(
                 Some(token)
             }
             Err(e) => {
-                warn!(team_id = team_id, "Failed to get GitHub installation token for plan chat: {e}");
+                warn!(
+                    team_id = team_id,
+                    "Failed to get GitHub installation token for plan chat: {e}"
+                );
                 None
             }
         }
     } else {
-        warn!(team_id = team_id, "No github_installation_id found for plan chat");
+        warn!(
+            team_id = team_id,
+            "No github_installation_id found for plan chat"
+        );
         None
     };
 
@@ -2190,7 +2202,7 @@ async fn load_plan_chat_context(
              USE THESE TOOLS when the user asks about code, architecture, or when you need to \
              understand the codebase to create a better plan. Don't ask the user to paste code — \
              look it up yourself. When scoping work, search the codebase to understand what exists \
-             before breaking it into tasks."
+             before breaking it into tasks.",
         );
     }
     if let Some(context) = log_analyzer_context.filter(|c| !c.is_empty()) {
@@ -2389,7 +2401,15 @@ pub async fn plan_chat(
                 let s = state.clone();
                 let t = claims.team_id.clone();
                 tokio::spawn(async move {
-                    track_chat_tokens(&s, &t, total_input_tokens, total_output_tokens, cache_read_tokens, cache_write_tokens).await;
+                    track_chat_tokens(
+                        &s,
+                        &t,
+                        total_input_tokens,
+                        total_output_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                    )
+                    .await;
                 });
                 StatusCode::BAD_GATEWAY
             })?;
@@ -2401,7 +2421,15 @@ pub async fn plan_chat(
             let s = state.clone();
             let t = claims.team_id.clone();
             tokio::spawn(async move {
-                track_chat_tokens(&s, &t, total_input_tokens, total_output_tokens, cache_read_tokens, cache_write_tokens).await;
+                track_chat_tokens(
+                    &s,
+                    &t,
+                    total_input_tokens,
+                    total_output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                )
+                .await;
             });
             return Err(StatusCode::BAD_GATEWAY);
         }
@@ -2411,7 +2439,15 @@ pub async fn plan_chat(
             let s = state.clone();
             let t = claims.team_id.clone();
             tokio::spawn(async move {
-                track_chat_tokens(&s, &t, total_input_tokens, total_output_tokens, cache_read_tokens, cache_write_tokens).await;
+                track_chat_tokens(
+                    &s,
+                    &t,
+                    total_input_tokens,
+                    total_output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                )
+                .await;
             });
             StatusCode::BAD_GATEWAY
         })?;
@@ -2647,7 +2683,15 @@ async fn run_anthropic_stream(
                         json!({"message": format!("Anthropic API error: {status}")}),
                     ))
                     .await;
-                track_chat_tokens(&state, &team_id, total_input_tokens, total_output_tokens, cache_read_tokens, cache_write_tokens).await;
+                track_chat_tokens(
+                    &state,
+                    &team_id,
+                    total_input_tokens,
+                    total_output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                )
+                .await;
                 return;
             }
             Err(e) => {
@@ -2658,7 +2702,15 @@ async fn run_anthropic_stream(
                         json!({"message": format!("AI service error: {e}")}),
                     ))
                     .await;
-                track_chat_tokens(&state, &team_id, total_input_tokens, total_output_tokens, cache_read_tokens, cache_write_tokens).await;
+                track_chat_tokens(
+                    &state,
+                    &team_id,
+                    total_input_tokens,
+                    total_output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                )
+                .await;
                 return;
             }
         };
@@ -2704,7 +2756,11 @@ async fn run_anthropic_stream(
                                 active_tool_id = cb["id"].as_str().unwrap_or("").to_string();
                                 active_tool_name = cb["name"].as_str().unwrap_or("").to_string();
                                 active_tool_input.clear();
-                                let server = active_tool_name.split("__").next().unwrap_or("").to_string();
+                                let server = active_tool_name
+                                    .split("__")
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_string();
                                 let _ = tx
                                     .send(sse_event(
                                         "tool_start",
@@ -2720,8 +2776,9 @@ async fn run_anthropic_stream(
                                 Some("text_delta") => {
                                     if let Some(text) = delta["text"].as_str() {
                                         assistant_text.push_str(text);
-                                        let _ =
-                                            tx.send(sse_event("text_delta", json!({"text": text}))).await;
+                                        let _ = tx
+                                            .send(sse_event("text_delta", json!({"text": text})))
+                                            .await;
                                     }
                                 }
                                 Some("input_json_delta") => {
@@ -2833,10 +2890,9 @@ async fn run_anthropic_stream(
 
             let result = if let Some((server_id, tool_name)) = tu_name.split_once("__") {
                 if server_id == "github" {
-                    let output = execute_github_tool(
-                        &http, github_token, repo_branches,
-                        tool_name, &input,
-                    ).await;
+                    let output =
+                        execute_github_tool(&http, github_token, repo_branches, tool_name, &input)
+                            .await;
                     json!(output)
                 } else {
                     match invoke_mcp_tool(state, team_id, server_id, tool_name, &input).await {
@@ -2850,7 +2906,10 @@ async fn run_anthropic_stream(
             } else {
                 json!(format!("Unknown tool: {tu_name}"))
             };
-            let is_error = result.as_str().map(|s| s.starts_with("Error:")).unwrap_or(false);
+            let is_error = result
+                .as_str()
+                .map(|s| s.starts_with("Error:"))
+                .unwrap_or(false);
             let is_empty = is_empty_tool_result(&result);
             let result_str = if is_empty {
                 "No results found.".to_string()
@@ -2938,8 +2997,8 @@ pub async fn plan_chat_stream(
             StatusCode::UNAUTHORIZED
         })?;
 
-    let claims = crate::auth::jwt::validate_token(token, &state.secrets.jwt_secret)
-        .map_err(|e| {
+    let claims =
+        crate::auth::jwt::validate_token(token, &state.secrets.jwt_secret).map_err(|e| {
             warn!("plan_chat_stream: JWT validation failed: {e}");
             StatusCode::UNAUTHORIZED
         })?;
@@ -3554,9 +3613,7 @@ async fn github_read_file(
     path: &str,
     branch: &str,
 ) -> String {
-    let url = format!(
-        "https://api.github.com/repos/{owner}/{name}/contents/{path}?ref={branch}"
-    );
+    let url = format!("https://api.github.com/repos/{owner}/{name}/contents/{path}?ref={branch}");
     let resp = http
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -3566,18 +3623,20 @@ async fn github_read_file(
         .await;
 
     match resp {
-        Ok(r) if r.status().is_success() => {
-            match r.text().await {
-                Ok(content) => {
-                    if content.len() > 32000 {
-                        format!("{}... (truncated, {} bytes total)", &content[..32000], content.len())
-                    } else {
-                        content
-                    }
+        Ok(r) if r.status().is_success() => match r.text().await {
+            Ok(content) => {
+                if content.len() > 32000 {
+                    format!(
+                        "{}... (truncated, {} bytes total)",
+                        &content[..32000],
+                        content.len()
+                    )
+                } else {
+                    content
                 }
-                Err(e) => format!("Error reading response: {e}"),
             }
-        }
+            Err(e) => format!("Error reading response: {e}"),
+        },
         Ok(r) if r.status().as_u16() == 404 => format!("File not found: {path}"),
         Ok(r) => format!("GitHub API error: {}", r.status()),
         Err(e) => format!("Request failed: {e}"),
@@ -3606,26 +3665,24 @@ async fn github_list_directory(
         .await;
 
     match resp {
-        Ok(r) if r.status().is_success() => {
-            match r.json::<Value>().await {
-                Ok(Value::Array(items)) => {
-                    let mut output = String::new();
-                    for item in &items {
-                        let name = item["name"].as_str().unwrap_or("");
-                        let item_type = item["type"].as_str().unwrap_or("file");
-                        let icon = if item_type == "dir" { "📁" } else { "📄" };
-                        output.push_str(&format!("{icon} {name}\n"));
-                    }
-                    if output.is_empty() {
-                        "Empty directory.".to_string()
-                    } else {
-                        output
-                    }
+        Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+            Ok(Value::Array(items)) => {
+                let mut output = String::new();
+                for item in &items {
+                    let name = item["name"].as_str().unwrap_or("");
+                    let item_type = item["type"].as_str().unwrap_or("file");
+                    let icon = if item_type == "dir" { "📁" } else { "📄" };
+                    output.push_str(&format!("{icon} {name}\n"));
                 }
-                Ok(_) => "Path is a file, not a directory. Use read_file instead.".to_string(),
-                Err(e) => format!("Error parsing directory listing: {e}"),
+                if output.is_empty() {
+                    "Empty directory.".to_string()
+                } else {
+                    output
+                }
             }
-        }
+            Ok(_) => "Path is a file, not a directory. Use read_file instead.".to_string(),
+            Err(e) => format!("Error parsing directory listing: {e}"),
+        },
         Ok(r) if r.status().as_u16() == 404 => format!("Directory not found: {path}"),
         Ok(r) => format!("GitHub API error: {}", r.status()),
         Err(e) => format!("Request failed: {e}"),

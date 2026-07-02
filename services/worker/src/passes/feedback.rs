@@ -36,15 +36,29 @@ pub async fn run(
             .dynamo
             .get_item()
             .table_name(&state.config.runs_table_name)
-            .key("team_id", aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()))
-            .key("run_id", aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()))
+            .key(
+                "team_id",
+                aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
+            )
+            .key(
+                "run_id",
+                aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
+            )
             .send()
             .await
             .ok()
             .and_then(|r| r.item);
         if let Some(ref item) = run_record {
-            let branch = item.get("branch").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default();
-            let base_branch = item.get("base_branch").and_then(|v| v.as_s().ok()).cloned().unwrap_or_else(|| "main".to_string());
+            let branch = item
+                .get("branch")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_default();
+            let base_branch = item
+                .get("base_branch")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_else(|| "main".to_string());
             if !branch.is_empty() {
                 let ticket_msg = crate::models::TicketMessage {
                     team_id: msg.team_id.clone(),
@@ -60,10 +74,23 @@ pub async fn run(
                     base_branch,
                     image_attachments: vec![],
                 };
-                match super::pr::resolve_conflicts(state, &ticket_msg, &github, &branch, &provider, &mut usage).await {
-                    Ok(true) => info!(run_id = %msg.run_id, "Resolved merge conflicts before feedback"),
+                match super::pr::resolve_conflicts(
+                    state,
+                    &ticket_msg,
+                    &github,
+                    &branch,
+                    &provider,
+                    &mut usage,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        info!(run_id = %msg.run_id, "Resolved merge conflicts before feedback")
+                    }
                     Ok(false) => {}
-                    Err(e) => warn!(run_id = %msg.run_id, error = %e, "Failed to resolve merge conflicts"),
+                    Err(e) => {
+                        warn!(run_id = %msg.run_id, error = %e, "Failed to resolve merge conflicts")
+                    }
                 }
             }
         }
@@ -352,7 +379,11 @@ Rules:
 
     // If feedback committed code changes, set awaiting_ci so we watch for CI results
     let code_pushed = *executor.files_modified.lock().unwrap();
-    let final_status = if code_pushed { "awaiting_ci" } else { "completed" };
+    let final_status = if code_pushed {
+        "awaiting_ci"
+    } else {
+        "completed"
+    };
 
     // Update run record in runs table (including status_run_id for GSI)
     let now = chrono::Utc::now().to_rfc3339();
@@ -999,21 +1030,13 @@ async fn detect_wrong_repo(
                   to a different repository, or `NO` if it's normal code review feedback. \
                   Only output WRONG_REPO if the reviewer clearly states this work belongs in another repo.";
 
-    let prompt = format!(
-        "Current repo: {current}\nAvailable repos: {repo_list}\n\nReview text:\n{text}"
-    );
+    let prompt =
+        format!("Current repo: {current}\nAvailable repos: {repo_list}\n\nReview text:\n{text}");
 
     let model_id = provider.primary_model_id();
-    let response = provider::converse_simple(
-        state,
-        &provider,
-        model_id,
-        system,
-        &prompt,
-        usage,
-    )
-    .await
-    .ok()?;
+    let response = provider::converse_simple(state, &provider, model_id, system, &prompt, usage)
+        .await
+        .ok()?;
 
     let response_lower = response.to_lowercase();
     if !response_lower.contains("wrong_repo") {
@@ -1162,7 +1185,9 @@ async fn handle_wrong_repo(
             "run_id",
             aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
         )
-        .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t, error_message = :em")
+        .update_expression(
+            "SET #s = :s, status_run_id = :sri, updated_at = :t, error_message = :em",
+        )
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(
             ":s",
@@ -1172,10 +1197,7 @@ async fn handle_wrong_repo(
             ":sri",
             aws_sdk_dynamodb::types::AttributeValue::S(format!("completed#{}", msg.run_id)),
         )
-        .expression_attribute_values(
-            ":t",
-            aws_sdk_dynamodb::types::AttributeValue::S(now),
-        )
+        .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
         .expression_attribute_values(
             ":em",
             aws_sdk_dynamodb::types::AttributeValue::S(format!("Moved to {target_repo}")),
@@ -1255,9 +1277,6 @@ async fn fetch_ci_failures(
     }
 
     // Last resort: just list the failed check names
-    let names: Vec<&str> = failed
-        .iter()
-        .filter_map(|r| r["name"].as_str())
-        .collect();
+    let names: Vec<&str> = failed.iter().filter_map(|r| r["name"].as_str()).collect();
     Some(format!("Failed checks: {}", names.join(", ")))
 }

@@ -563,117 +563,148 @@ async fn collect_infra_code(
                     continue;
                 }
                 Ok(entries) => {
-                let all_names: Vec<_> = entries.iter().map(|e| format!("{}({})", e.name, e.entry_type)).collect();
-                info!(repo_full, dir = probe_dir, count = entries.len(), files = ?all_names, "Terraform scan: listed directory");
-                // Collect .tf files at this level
-                let tf_entries: Vec<_> = entries
-                    .iter()
-                    .filter(|e| e.entry_type == "file" && e.name.ends_with(".tf"))
-                    .collect();
-                // Also collect subdirectories that might contain .tf files
-                let subdirs: Vec<_> = entries
-                    .iter()
-                    .filter(|e| e.entry_type == "dir")
-                    .collect();
+                    let all_names: Vec<_> = entries
+                        .iter()
+                        .map(|e| format!("{}({})", e.name, e.entry_type))
+                        .collect();
+                    info!(repo_full, dir = probe_dir, count = entries.len(), files = ?all_names, "Terraform scan: listed directory");
+                    // Collect .tf files at this level
+                    let tf_entries: Vec<_> = entries
+                        .iter()
+                        .filter(|e| e.entry_type == "file" && e.name.ends_with(".tf"))
+                        .collect();
+                    // Also collect subdirectories that might contain .tf files
+                    let subdirs: Vec<_> =
+                        entries.iter().filter(|e| e.entry_type == "dir").collect();
 
-                if !tf_entries.is_empty() {
-                    for entry in &tf_entries {
-                        if let Ok(c) = github.get_file_content(owner, repo, &entry.path).await {
-                            found.push((format!("{repo_full}/{}", entry.path), c));
-                        }
-                        if found.len() >= 30 {
-                            break;
-                        }
-                    }
-                    // Also check for modules/ subdirectory
-                    let modules_dir = if base.is_empty() {
-                        "modules".to_string()
-                    } else {
-                        format!("{base}/modules")
-                    };
-                    if let Ok(mod_entries) = github.list_directory(owner, repo, &modules_dir, "HEAD").await {
-                        for mod_entry in mod_entries.iter().filter(|e| e.entry_type == "dir") {
-                            if let Ok(mod_files) = github.list_directory(owner, repo, &mod_entry.path, "HEAD").await {
-                                for mf in mod_files.iter().filter(|e| e.entry_type == "file" && e.name.ends_with(".tf")) {
-                                    if let Ok(c) = github.get_file_content(owner, repo, &mf.path).await {
-                                        found.push((format!("{repo_full}/{}", mf.path), c));
-                                    }
-                                    if found.len() >= 30 {
-                                        break;
-                                    }
-                                }
+                    if !tf_entries.is_empty() {
+                        for entry in &tf_entries {
+                            if let Ok(c) = github.get_file_content(owner, repo, &entry.path).await {
+                                found.push((format!("{repo_full}/{}", entry.path), c));
+                            }
+                            if found.len() >= 30 {
+                                break;
                             }
                         }
-                    }
-                    tf_found = true;
-                    break;
-                }
-
-                // No .tf files at this level — check immediate subdirectories
-                if !tf_found {
-                    for subdir in &subdirs {
-                        if let Ok(sub_entries) = github.list_directory(owner, repo, &subdir.path, "HEAD").await {
-                            let sub_tf: Vec<_> = sub_entries
-                                .iter()
-                                .filter(|e| e.entry_type == "file" && e.name.ends_with(".tf"))
-                                .collect();
-                            if !sub_tf.is_empty() {
-                                for entry in &sub_tf {
-                                    if let Ok(c) = github.get_file_content(owner, repo, &entry.path).await {
-                                        found.push((format!("{repo_full}/{}", entry.path), c));
-                                    }
-                                    if found.len() >= 30 {
-                                        break;
-                                    }
-                                }
-                                tf_found = true;
-                                // Don't break — check other subdirs too
-                            }
-
-                            // Go one more level: check sub-subdirectories (e.g. environments/prod/)
-                            if !tf_found || found.len() < 30 {
-                                let sub_subdirs: Vec<_> = sub_entries
-                                    .iter()
-                                    .filter(|e| e.entry_type == "dir")
-                                    .collect();
-                                for sub_subdir in &sub_subdirs {
-                                    if let Ok(deep_entries) = github.list_directory(owner, repo, &sub_subdir.path, "HEAD").await {
-                                        let deep_tf: Vec<_> = deep_entries
-                                            .iter()
-                                            .filter(|e| e.entry_type == "file" && e.name.ends_with(".tf"))
-                                            .collect();
-                                        if !deep_tf.is_empty() {
-                                            for entry in &deep_tf {
-                                                if let Ok(c) = github.get_file_content(owner, repo, &entry.path).await {
-                                                    found.push((format!("{repo_full}/{}", entry.path), c));
-                                                }
-                                                if found.len() >= 30 {
-                                                    break;
-                                                }
-                                            }
-                                            tf_found = true;
+                        // Also check for modules/ subdirectory
+                        let modules_dir = if base.is_empty() {
+                            "modules".to_string()
+                        } else {
+                            format!("{base}/modules")
+                        };
+                        if let Ok(mod_entries) = github
+                            .list_directory(owner, repo, &modules_dir, "HEAD")
+                            .await
+                        {
+                            for mod_entry in mod_entries.iter().filter(|e| e.entry_type == "dir") {
+                                if let Ok(mod_files) = github
+                                    .list_directory(owner, repo, &mod_entry.path, "HEAD")
+                                    .await
+                                {
+                                    for mf in mod_files.iter().filter(|e| {
+                                        e.entry_type == "file" && e.name.ends_with(".tf")
+                                    }) {
+                                        if let Ok(c) =
+                                            github.get_file_content(owner, repo, &mf.path).await
+                                        {
+                                            found.push((format!("{repo_full}/{}", mf.path), c));
+                                        }
+                                        if found.len() >= 30 {
+                                            break;
                                         }
                                     }
-                                    if found.len() >= 30 {
-                                        break;
-                                    }
                                 }
                             }
                         }
-                        if found.len() >= 30 {
+                        tf_found = true;
+                        break;
+                    }
+
+                    // No .tf files at this level — check immediate subdirectories
+                    if !tf_found {
+                        for subdir in &subdirs {
+                            if let Ok(sub_entries) = github
+                                .list_directory(owner, repo, &subdir.path, "HEAD")
+                                .await
+                            {
+                                let sub_tf: Vec<_> = sub_entries
+                                    .iter()
+                                    .filter(|e| e.entry_type == "file" && e.name.ends_with(".tf"))
+                                    .collect();
+                                if !sub_tf.is_empty() {
+                                    for entry in &sub_tf {
+                                        if let Ok(c) =
+                                            github.get_file_content(owner, repo, &entry.path).await
+                                        {
+                                            found.push((format!("{repo_full}/{}", entry.path), c));
+                                        }
+                                        if found.len() >= 30 {
+                                            break;
+                                        }
+                                    }
+                                    tf_found = true;
+                                    // Don't break — check other subdirs too
+                                }
+
+                                // Go one more level: check sub-subdirectories (e.g. environments/prod/)
+                                if !tf_found || found.len() < 30 {
+                                    let sub_subdirs: Vec<_> = sub_entries
+                                        .iter()
+                                        .filter(|e| e.entry_type == "dir")
+                                        .collect();
+                                    for sub_subdir in &sub_subdirs {
+                                        if let Ok(deep_entries) = github
+                                            .list_directory(owner, repo, &sub_subdir.path, "HEAD")
+                                            .await
+                                        {
+                                            let deep_tf: Vec<_> = deep_entries
+                                                .iter()
+                                                .filter(|e| {
+                                                    e.entry_type == "file"
+                                                        && e.name.ends_with(".tf")
+                                                })
+                                                .collect();
+                                            if !deep_tf.is_empty() {
+                                                for entry in &deep_tf {
+                                                    if let Ok(c) = github
+                                                        .get_file_content(owner, repo, &entry.path)
+                                                        .await
+                                                    {
+                                                        found.push((
+                                                            format!("{repo_full}/{}", entry.path),
+                                                            c,
+                                                        ));
+                                                    }
+                                                    if found.len() >= 30 {
+                                                        break;
+                                                    }
+                                                }
+                                                tf_found = true;
+                                            }
+                                        }
+                                        if found.len() >= 30 {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if found.len() >= 30 {
+                                break;
+                            }
+                        }
+                        if tf_found {
                             break;
                         }
                     }
-                    if tf_found {
-                        break;
-                    }
-                }
-            } // Ok(entries)
+                } // Ok(entries)
             } // match
         }
         // Fallback: if no directory listing worked, try the full recursive tree
         if !tf_found {
-            info!(repo_full, "Terraform directory scan found nothing — trying recursive tree");
+            info!(
+                repo_full,
+                "Terraform directory scan found nothing — trying recursive tree"
+            );
             if let Ok(tree) = github.get_tree(owner, repo, "HEAD").await {
                 let tf_paths: Vec<String> = tree
                     .iter()
@@ -682,7 +713,11 @@ async fn collect_infra_code(
                     .take(30)
                     .collect();
                 if !tf_paths.is_empty() {
-                    info!(repo_full, count = tf_paths.len(), "Found .tf files via recursive tree");
+                    info!(
+                        repo_full,
+                        count = tf_paths.len(),
+                        "Found .tf files via recursive tree"
+                    );
                     for tf_path in &tf_paths {
                         if let Ok(content) = github.get_file_content(owner, repo, tf_path).await {
                             found.push((format!("{repo_full}/{tf_path}"), content));
@@ -798,14 +833,7 @@ async fn call_anthropic(
     );
 
     let client = AnthropicClient::new(provider.api_key().to_string());
-    anthropic::converse_simple(
-        &client,
-        provider.primary_model_id(),
-        SYSTEM,
-        &prompt,
-        usage,
-    )
-    .await
+    anthropic::converse_simple(&client, provider.primary_model_id(), SYSTEM, &prompt, usage).await
 }
 
 /// Retry Anthropic with the original diagram and validation errors as feedback.
@@ -826,14 +854,7 @@ async fn call_anthropic_retry(
     );
 
     let client = AnthropicClient::new(provider.api_key().to_string());
-    anthropic::converse_simple(
-        &client,
-        provider.primary_model_id(),
-        SYSTEM,
-        &prompt,
-        usage,
-    )
-    .await
+    anthropic::converse_simple(&client, provider.primary_model_id(), SYSTEM, &prompt, usage).await
 }
 
 fn parse_response(response: &str) -> (Option<String>, Option<String>) {

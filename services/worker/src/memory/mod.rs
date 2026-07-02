@@ -344,7 +344,10 @@ impl AgentMemory {
         }
 
         if stored > 0 {
-            info!(count = stored, "Extracted and stored learnings from conversation");
+            info!(
+                count = stored,
+                "Extracted and stored learnings from conversation"
+            );
         }
     }
 

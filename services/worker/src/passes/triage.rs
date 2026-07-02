@@ -69,7 +69,9 @@ Rules:
 
     let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
     for img in &msg.image_attachments {
-        if let Some(b64) = super::download_image_as_base64(&state.s3, &state.config.bucket_name, &img.s3_key).await {
+        if let Some(b64) =
+            super::download_image_as_base64(&state.s3, &state.config.bucket_name, &img.s3_key).await
+        {
             content_blocks.push(serde_json::json!({
                 "type": "image",
                 "source": { "type": "base64", "media_type": img.media_type, "data": b64 }
@@ -151,7 +153,10 @@ pub async fn select_repo(
     let mut repo_lines = Vec::new();
     for r in repos {
         if let Some((owner, name)) = r.split_once('/') {
-            let (lang, desc) = github.get_repo_info(owner, name).await.unwrap_or((None, None));
+            let (lang, desc) = github
+                .get_repo_info(owner, name)
+                .await
+                .unwrap_or((None, None));
             let top_dirs = match github.list_directory(owner, name, "", "HEAD").await {
                 Ok(entries) => entries
                     .iter()
@@ -162,9 +167,15 @@ pub async fn select_repo(
                 Err(_) => String::new(),
             };
             let mut parts = Vec::new();
-            if let Some(l) = lang { parts.push(format!("lang: {l}")); }
-            if let Some(d) = desc { parts.push(d); }
-            if !top_dirs.is_empty() { parts.push(format!("files: [{top_dirs}]")); }
+            if let Some(l) = lang {
+                parts.push(format!("lang: {l}"));
+            }
+            if let Some(d) = desc {
+                parts.push(d);
+            }
+            if !top_dirs.is_empty() {
+                parts.push(format!("files: [{top_dirs}]"));
+            }
             if parts.is_empty() {
                 repo_lines.push(format!("- {r}"));
             } else {
@@ -210,7 +221,9 @@ Then on the LAST line, return ONLY the repository in `owner/name` format."#,
 
     let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
     for img in &msg.image_attachments {
-        if let Some(b64) = super::download_image_as_base64(&state.s3, &state.config.bucket_name, &img.s3_key).await {
+        if let Some(b64) =
+            super::download_image_as_base64(&state.s3, &state.config.bucket_name, &img.s3_key).await
+        {
             content_blocks.push(serde_json::json!({
                 "type": "image",
                 "source": { "type": "base64", "media_type": img.media_type, "data": b64 }

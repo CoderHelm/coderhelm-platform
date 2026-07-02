@@ -86,8 +86,16 @@ pub async fn gate_ticket_trigger(
 
     // Latest run by run_id (ULIDs sort lexicographically by creation time).
     let latest = items.iter().max_by(|a, b| {
-        let ra = a.get("run_id").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default();
-        let rb = b.get("run_id").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default();
+        let ra = a
+            .get("run_id")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default();
+        let rb = b
+            .get("run_id")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default();
         ra.cmp(&rb)
     });
     let Some(latest) = latest else {
@@ -96,18 +104,27 @@ pub async fn gate_ticket_trigger(
 
     // "success" is a legacy terminal status from an old resume path;
     // "merged" means the PR landed — rework only on real content change.
-    if matches!(status_of(latest).as_str(), "completed" | "success" | "merged") {
+    if matches!(
+        status_of(latest).as_str(),
+        "completed" | "success" | "merged"
+    ) {
         let stored_hash = latest.get("context_hash").and_then(|v| v.as_s().ok());
         match (new_context_hash, stored_hash) {
             (Some(new), Some(stored)) if new != stored => {
-                info!(team_id, ticket_id, "Trigger gate: content changed — allowing rework");
+                info!(
+                    team_id,
+                    ticket_id, "Trigger gate: content changed — allowing rework"
+                );
                 TicketGate::Enqueue
             }
             // Unchanged content, unknown content, or legacy record without a
             // stored hash: a completed ticket stays done. Humans can still
             // force a run via comment, slash command, or the dashboard retry.
             _ => {
-                info!(team_id, ticket_id, "Trigger gate: completed and unchanged — skipping");
+                info!(
+                    team_id,
+                    ticket_id, "Trigger gate: completed and unchanged — skipping"
+                );
                 TicketGate::SkipUnchanged
             }
         }

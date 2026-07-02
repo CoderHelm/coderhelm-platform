@@ -639,18 +639,20 @@ pub async fn create_plan_from_recommendation(
         .map(|v| v.as_str())
         .unwrap_or("info");
 
-    let mut description = format!(
-        "## Log Analysis Finding ({severity})\n\n{summary}\n\n"
-    );
+    let mut description = format!("## Log Analysis Finding ({severity})\n\n{summary}\n\n");
     if !source_log_group.is_empty() {
         description.push_str(&format!("**Affected Service** (from log group `{source_log_group}`):\nLook for the code that deploys to or runs in this log group.\n\n"));
     }
     if !error_pattern.is_empty() {
-        description.push_str(&format!("**Error Pattern:**\n```\n{error_pattern}\n```\n\n"));
+        description.push_str(&format!(
+            "**Error Pattern:**\n```\n{error_pattern}\n```\n\n"
+        ));
     }
     description.push_str(&format!("### Suggested Fix\n\n{suggested_action}\n\n"));
     description.push_str("### Instructions\n\n");
-    description.push_str("1. Search the codebase for the function/service that produces this error pattern.\n");
+    description.push_str(
+        "1. Search the codebase for the function/service that produces this error pattern.\n",
+    );
     description.push_str("2. Implement the suggested fix.\n");
     description.push_str("3. Add error handling or logging improvements to prevent recurrence.\n");
 
