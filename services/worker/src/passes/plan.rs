@@ -1,6 +1,4 @@
 use serde_json::json;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use tracing::info;
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
@@ -683,13 +681,16 @@ impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
     }
 }
 
-/// Compute a hash of ticket content (body + image attachment keys) for change detection.
+/// Compute a hash of ticket content (title + body + image attachment keys)
+/// for change detection. Delegates to the shared crate so the gateway's
+/// webhook gate and the worker's plan cache / run records all agree.
+/// (Existing S3 plan caches keyed by the old DefaultHasher format are
+/// invalidated once by this change — plans simply regenerate.)
 pub fn compute_ticket_context_hash(msg: &TicketMessage) -> String {
-    let mut hasher = DefaultHasher::new();
-    msg.title.hash(&mut hasher);
-    msg.body.hash(&mut hasher);
-    for img in &msg.image_attachments {
-        img.s3_key.hash(&mut hasher);
-    }
-    format!("{:x}", hasher.finish())
+    let image_keys: Vec<String> = msg
+        .image_attachments
+        .iter()
+        .map(|img| img.s3_key.clone())
+        .collect();
+    common::ticket_context_hash(&msg.title, &msg.body, &image_keys)
 }

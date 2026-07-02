@@ -382,42 +382,34 @@ async fn process_jira_payload(
         installation_id, ticket_key, repo_owner, repo_name, "Jira webhook received"
     );
 
-    // Dedup: skip if this ticket already has a run (running or completed)
-    // Allow re-trigger if all existing runs are failed or needs_input
-    let existing_runs = state
-        .dynamo
-        .query()
-        .table_name(&state.config.runs_table_name)
-        .index_name("ticket-index")
-        .key_condition_expression("team_id = :tid AND ticket_id = :ticket")
-        .expression_attribute_values(":tid", attr_s(team_id))
-        .expression_attribute_values(":ticket", attr_s(ticket_key))
-        .send()
-        .await;
-
-    if let Ok(result) = existing_runs {
-        let has_blocking_run = result.items().iter().any(|item| {
-            let status = item
-                .get("status")
-                .and_then(|v| v.as_s().ok())
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            matches!(status, "running" | "completed" | "queued")
-        });
-        if has_blocking_run {
-            info!(ticket_key, "Skipping — ticket already has a run");
-            log_jira_event(
-                state,
-                team_id,
-                event_type,
-                ticket_key,
-                &title,
-                "duplicate",
-                None,
-            )
-            .await;
+    // Trigger gate: block while a run is in flight; on a completed latest
+    // run, only re-trigger when the ticket content actually changed. The
+    // hash must match what the worker stores on the run record, so it is
+    // computed from the same title/body/attachment-keys the TicketMessage
+    // will carry.
+    let expected_keys =
+        super::trigger_gate::expected_attachment_keys(team_id, ticket_key, payload);
+    let context_hash = common::ticket_context_hash(&title, &body_text, &expected_keys);
+    match super::trigger_gate::gate_ticket_trigger(
+        state,
+        team_id,
+        ticket_key,
+        Some(&context_hash),
+        false,
+    )
+    .await
+    {
+        super::trigger_gate::TicketGate::SkipInFlight => {
+            log_jira_event(state, team_id, event_type, ticket_key, &title, "duplicate", None)
+                .await;
             return Ok(StatusCode::OK);
         }
+        super::trigger_gate::TicketGate::SkipUnchanged => {
+            log_jira_event(state, team_id, event_type, ticket_key, &title, "unchanged", None)
+                .await;
+            return Ok(StatusCode::OK);
+        }
+        super::trigger_gate::TicketGate::Enqueue => {}
     }
 
     // Check token budget before processing
@@ -831,7 +823,7 @@ async fn handle_jira_comment(
             result
         }
         // Completed run without PR — treat like needs_input, re-trigger
-        "completed" if pr_number == 0 => {
+        "completed" | "success" if pr_number == 0 => {
             let raw_description = issue
                 .get("fields")
                 .and_then(|f| f.get("description"))
@@ -890,7 +882,7 @@ async fn handle_jira_comment(
             result
         }
         // Completed run with PR — send feedback
-        "completed" if pr_number > 0 => {
+        "completed" | "success" if pr_number > 0 => {
             let message = WorkerMessage::Feedback(crate::models::FeedbackMessage {
                 team_id: team_id.to_string(),
                 installation_id,

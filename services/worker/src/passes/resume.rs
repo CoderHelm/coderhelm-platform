@@ -12,6 +12,8 @@ use crate::WorkerState;
 
 const MAX_CI_FIX_CYCLES: usize = 10;
 const MAX_LOG_CHARS: usize = 15_000;
+/// Cap on how long a run may sit in awaiting_ci before being finalized.
+const MAX_AWAITING_CI_HOURS: i64 = 24;
 
 /// Wall-clock duration from run created_at, falling back to Lambda start time.
 fn wall_clock_secs(created_at: Option<chrono::DateTime<chrono::Utc>>, start: &std::time::Instant) -> u64 {
@@ -121,6 +123,48 @@ pub async fn run(
         .and_then(|v| v.as_s().ok())
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|t| t.with_timezone(&chrono::Utc));
+
+    // Wall-clock backstop: the reschedule loop has no cycle cap of its own
+    // (unlike CI fixes), so a check that never concludes would keep a run in
+    // awaiting_ci forever. Past the cap, hand the PR to a human as-is.
+    let age_hours = created_at
+        .map(|t| chrono::Utc::now().signed_duration_since(t).num_hours())
+        .unwrap_or(0);
+    if age_hours >= MAX_AWAITING_CI_HOURS {
+        warn!(
+            run_id = msg.run_id,
+            age_hours, "Run exceeded awaiting_ci wall-clock cap — finalizing for human review"
+        );
+        let repo_full = run_record
+            .get("repo")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default();
+        let pr_number = run_record
+            .get("pr_number")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        if let (Some((owner, name)), true) = (repo_full.split_once('/'), pr_number > 0) {
+            if let Ok(github) = GitHubClient::new(
+                &state.secrets.github_app_id,
+                &state.secrets.github_private_key,
+                msg.installation_id,
+                &state.http,
+            ) {
+                mark_pr_ready(&github, owner, name, pr_number).await;
+            }
+        }
+        super::add_progress_note(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            "CI did not conclude within 24h — PR handed off for human review",
+        )
+        .await;
+        set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
+        return Ok(());
+    }
 
     // Load all unprocessed events
     info!(run_id = %msg.run_id, events_table = %state.config.events_table_name, "Loading events");
@@ -1157,10 +1201,13 @@ async fn set_run_complete(state: &WorkerState, team_id: &str, run_id: &str, crea
         .key("run_id", attr_s(run_id))
         .update_expression("SET #s = :s, updated_at = :t, current_pass = :cp, status_run_id = :sri, duration_s = :d")
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", attr_s("success"))
+        // "completed" — the single terminal-success status. This path used
+        // to write "success", which every status filter in the gateway and
+        // dashboard missed (dedup, comment routing, retry eligibility).
+        .expression_attribute_values(":s", attr_s("completed"))
         .expression_attribute_values(":t", attr_s(&now.to_rfc3339()))
         .expression_attribute_values(":cp", attr_s("done"))
-        .expression_attribute_values(":sri", attr_s(&format!("success#{run_id}")))
+        .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
         .expression_attribute_values(":d", attr_n(duration))
         .send()
         .await;
