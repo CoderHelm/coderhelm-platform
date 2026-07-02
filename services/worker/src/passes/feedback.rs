@@ -866,7 +866,7 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .ok_or("Missing query")?;
                 let results = self
                     .github
-                    .search_code(self.owner, self.repo, query)
+                    .search_code(self.owner, self.repo, self.branch, query)
                     .await?;
                 let lines: Vec<String> = results
                     .iter()

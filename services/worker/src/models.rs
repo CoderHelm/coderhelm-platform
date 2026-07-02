@@ -303,6 +303,8 @@ mod tests {
             repo_name: "repo".into(),
             issue_number: 42,
             sender: "user".into(),
+            base_branch: "main".into(),
+            image_attachments: vec![],
         });
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();
@@ -342,6 +344,9 @@ mod tests {
                 path: "src/main.rs".into(),
                 line: Some(10),
                 body: "nit".into(),
+                comment_id: None,
+                node_id: None,
+                is_context: false,
             }],
         });
         let json = serde_json::to_string(&msg).unwrap();

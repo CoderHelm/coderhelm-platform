@@ -2,10 +2,18 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::repo_snapshot::RepoSnapshot;
+
 const API_BASE: &str = "https://api.github.com";
+
+/// Tarballs larger than this are not snapshotted (Lambda memory guard);
+/// search falls back to the GitHub Code Search API for such repos.
+const MAX_TARBALL_BYTES: usize = 150 * 1024 * 1024;
 
 /// Cached installation token.
 struct CachedToken {
@@ -20,6 +28,9 @@ pub struct GitHubClient {
     installation_id: u64,
     http: Client,
     token_cache: Mutex<Option<CachedToken>>,
+    /// Repo snapshots keyed by "owner/repo@ref". `None` marks a failed fetch
+    /// so we don't re-download a too-large tarball on every search.
+    snapshots: tokio::sync::RwLock<HashMap<String, Option<Arc<RepoSnapshot>>>>,
 }
 
 #[derive(Serialize)]
@@ -47,6 +58,7 @@ impl GitHubClient {
             installation_id,
             http: http.clone(),
             token_cache: Mutex::new(None),
+            snapshots: tokio::sync::RwLock::new(HashMap::new()),
         })
     }
 
@@ -181,6 +193,101 @@ impl GitHubClient {
         Ok(resp.json().await?)
     }
 
+    // ─── Repo snapshot (tarball-backed local search + reads) ────
+
+    /// Download the repo tarball for a ref. One core-API request; the 302
+    /// redirect to codeload is followed automatically by reqwest.
+    async fn download_tarball(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/tarball/{git_ref}");
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.get(&url);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await?.error_for_status()?;
+        let bytes = resp.bytes().await?;
+        if bytes.len() > MAX_TARBALL_BYTES {
+            return Err(format!(
+                "tarball too large to snapshot ({} MB)",
+                bytes.len() / (1024 * 1024)
+            )
+            .into());
+        }
+        Ok(bytes.to_vec())
+    }
+
+    fn snapshot_key(owner: &str, repo: &str, git_ref: &str) -> String {
+        format!("{owner}/{repo}@{git_ref}")
+    }
+
+    /// Get or lazily build the in-memory snapshot for a repo@ref.
+    /// Returns None when a previous fetch failed (too large / API error) so
+    /// callers fall back to per-request API access.
+    async fn snapshot(&self, owner: &str, repo: &str, git_ref: &str) -> Option<Arc<RepoSnapshot>> {
+        let key = Self::snapshot_key(owner, repo, git_ref);
+        if let Some(entry) = self.snapshots.read().await.get(&key) {
+            return entry.clone();
+        }
+        let built = match self.download_tarball(owner, repo, git_ref).await {
+            Ok(bytes) => match RepoSnapshot::from_tarball(&bytes) {
+                Ok(snap) => Some(Arc::new(snap)),
+                Err(e) => {
+                    tracing::warn!(key, error = %e, "Failed to parse repo tarball; falling back to API");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(key, error = %e, "Failed to download repo tarball; falling back to API");
+                None
+            }
+        };
+        self.snapshots.write().await.insert(key, built.clone());
+        built
+    }
+
+    /// Snapshot for a ref if one was already built (never triggers a download).
+    async fn existing_snapshot(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Option<Arc<RepoSnapshot>> {
+        self.snapshots
+            .read()
+            .await
+            .get(&Self::snapshot_key(owner, repo, git_ref))
+            .cloned()
+            .flatten()
+    }
+
+    /// Mirror a committed write into any snapshot held for this ref.
+    async fn mirror_write(&self, owner: &str, repo: &str, git_ref: &str, path: &str, content: &str) {
+        if let Some(snap) = self.existing_snapshot(owner, repo, git_ref).await {
+            snap.apply_write(path, content).await;
+        }
+    }
+
+    /// Mirror a committed delete into any snapshot held for this ref.
+    async fn mirror_delete(&self, owner: &str, repo: &str, git_ref: &str, path: &str) {
+        if let Some(snap) = self.existing_snapshot(owner, repo, git_ref).await {
+            snap.apply_delete(path).await;
+        }
+    }
+
+    /// Drop a cached snapshot after a server-side mutation we can't mirror
+    /// (merges). The next search re-downloads the tarball at the new head.
+    async fn invalidate_snapshot(&self, owner: &str, repo: &str, git_ref: &str) {
+        self.snapshots
+            .write()
+            .await
+            .remove(&Self::snapshot_key(owner, repo, git_ref));
+    }
+
     // ─── Tree / File reads ──────────────────────────────────────
 
     /// Get the repository's default branch name.
@@ -219,6 +326,18 @@ impl GitHubClient {
         repo: &str,
         git_ref: &str,
     ) -> Result<Vec<TreeEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(snap) = self.existing_snapshot(owner, repo, git_ref).await {
+            return Ok(snap
+                .tree()
+                .await
+                .into_iter()
+                .map(|path| TreeEntry {
+                    path,
+                    entry_type: "blob".to_string(),
+                    sha: String::new(),
+                })
+                .collect());
+        }
         let url = format!("{API_BASE}/repos/{owner}/{repo}/git/trees/{git_ref}?recursive=1");
         let data = self.get(&url).await?;
         let tree: Vec<TreeEntry> =
@@ -226,7 +345,9 @@ impl GitHubClient {
         Ok(tree)
     }
 
-    /// Read a single file (base64 decoded).
+    /// Read a single file (base64 decoded). Served from the repo snapshot
+    /// when one is held for this ref; API otherwise (and for binary or
+    /// oversized files the snapshot doesn't index).
     pub async fn read_file(
         &self,
         owner: &str,
@@ -234,6 +355,11 @@ impl GitHubClient {
         path: &str,
         git_ref: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(snap) = self.existing_snapshot(owner, repo, git_ref).await {
+            if let Some(content) = snap.read_file(path).await {
+                return Ok(content);
+            }
+        }
         let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
         let data = self.get(&url).await?;
         let content = data.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -282,9 +408,35 @@ impl GitHubClient {
         Ok(result)
     }
 
-    /// Search code in a repository using GitHub Code Search API.
-    /// Returns up to 10 results with file path and matching text fragments.
+    /// Search code in a repository. Backed by an in-memory snapshot of the
+    /// repo at `git_ref` (built from one tarball download on first search):
+    /// no code-search rate limit, and results reflect the working branch
+    /// including the agent's own commits — the Code Search API only indexes
+    /// the default branch and lags pushes. Falls back to the API when the
+    /// repo is too large to snapshot.
     pub async fn search_code(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        query: &str,
+    ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(snap) = self.snapshot(owner, repo, git_ref).await {
+            return Ok(snap
+                .search(query)
+                .await
+                .into_iter()
+                .map(|m| SearchResult {
+                    path: m.path,
+                    matches: m.fragments,
+                })
+                .collect());
+        }
+        self.search_code_api(owner, repo, query).await
+    }
+
+    /// Legacy Code Search API path — default-branch only, 10 requests/min.
+    async fn search_code_api(
         &self,
         owner: &str,
         repo: &str,
@@ -338,6 +490,26 @@ impl GitHubClient {
         path: &str,
         git_ref: &str,
     ) -> Result<Vec<DirEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(snap) = self.existing_snapshot(owner, repo, git_ref).await {
+            if let Some(entries) = snap.list_directory(path).await {
+                return Ok(entries
+                    .into_iter()
+                    .filter_map(|line| {
+                        let (entry_type, name) = line.split_once(": ")?;
+                        let full_path = if path.is_empty() || path == "." || path == "/" {
+                            name.to_string()
+                        } else {
+                            format!("{}/{}", path.trim_matches('/'), name)
+                        };
+                        Some(DirEntry {
+                            name: name.to_string(),
+                            entry_type: entry_type.to_string(),
+                            path: full_path,
+                        })
+                    })
+                    .collect());
+            }
+        }
         let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
         let data = self.get(&url).await?;
         let entries: Vec<DirEntry> = serde_json::from_value(data)?;
@@ -430,8 +602,12 @@ impl GitHubClient {
         }
         let resp = req.send().await?;
         match resp.status().as_u16() {
-            201 | 204 => Ok(true), // merged or already up-to-date
-            409 => Ok(false),      // conflict
+            201 => {
+                self.invalidate_snapshot(owner, repo, base).await;
+                Ok(true) // merged
+            }
+            204 => Ok(true), // already up-to-date
+            409 => Ok(false), // conflict
             _ => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
@@ -464,7 +640,9 @@ impl GitHubClient {
         if let Some(s) = sha {
             body["sha"] = serde_json::json!(s);
         }
-        self.put(&url, &body).await
+        let result = self.put(&url, &body).await?;
+        self.mirror_write(owner, repo, branch, path, content).await;
+        Ok(result)
     }
 
     // ─── Batch write (atomic multi-file commit) ─────────────────
@@ -555,6 +733,17 @@ impl GitHubClient {
         let ref_url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
         self.patch(&ref_url, &serde_json::json!({"sha": &commit_sha}))
             .await?;
+
+        for f in files {
+            match f {
+                FileOp::Write { path, content } => {
+                    self.mirror_write(owner, repo, branch, path, content).await;
+                }
+                FileOp::Delete { path } => {
+                    self.mirror_delete(owner, repo, branch, path).await;
+                }
+            }
+        }
 
         Ok(commit_sha)
     }
@@ -654,6 +843,9 @@ impl GitHubClient {
         let ref_url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
         self.patch(&ref_url, &serde_json::json!({"sha": &commit_sha}))
             .await?;
+
+        // Merge commit pulls in base content we can't mirror file-by-file.
+        self.invalidate_snapshot(owner, repo, branch).await;
 
         Ok(commit_sha)
     }

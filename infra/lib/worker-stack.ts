@@ -63,7 +63,9 @@ export class WorkerStack extends cdk.Stack {
       architecture: lambda.Architecture.ARM_64,
       handler: "bootstrap",
       code: lambda.Code.fromAsset(workerAssetPath),
-      memorySize: 1024,
+      // Repo snapshots (tarball-backed search) are held in memory alongside
+      // the tarball during extraction — 2048 gives headroom for large repos.
+      memorySize: 2048,
       timeout: cdk.Duration.minutes(15),
       ephemeralStorageSize: cdk.Size.mebibytes(1024),
       logGroup: workerLogGroup,

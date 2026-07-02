@@ -571,7 +571,10 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
                     .get("query")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing query")?;
-                let results = self.github.search_code(&owner, &repo, query).await?;
+                let results = self
+                    .github
+                    .search_code(&owner, &repo, branch, query)
+                    .await?;
                 let lines: Vec<String> = results
                     .iter()
                     .map(|r| {
