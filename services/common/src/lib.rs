@@ -95,13 +95,22 @@ pub fn parse_verdict(response: &str, pass_token: &str, fail_token: &str) -> Verd
     let fail_upper = fail_token.to_ascii_uppercase();
     let pass_upper = pass_token.to_ascii_uppercase();
 
+    // Token must be word-bounded: "CLEAN up the handler" is prose, not a
+    // CLEAN verdict.
+    let bounded = |norm: &str, token: &str| {
+        norm.starts_with(token)
+            && !norm[token.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
     let mut saw_pass = false;
     for line in response.lines() {
         let norm = normalize(line);
-        if norm.starts_with(&fail_upper) {
+        if bounded(&norm, &fail_upper) {
             return Verdict::Fail;
         }
-        if norm.starts_with(&pass_upper) {
+        if bounded(&norm, &pass_upper) {
             saw_pass = true;
         }
     }

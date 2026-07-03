@@ -325,6 +325,28 @@ pub async fn update_role(
         format!("USER#{user_id}")
     };
 
+    // Only an owner may change an OWNER's role — without this, an admin
+    // could demote the owner to viewer and then remove them (team takeover).
+    let target = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&sk))
+        .send()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .item
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let target_role = target
+        .get("role")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    if target_role == "owner" && claims.role != "owner" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     state
         .dynamo
         .update_item()

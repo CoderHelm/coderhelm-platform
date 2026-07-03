@@ -100,7 +100,7 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
         None,
     )
     .await?;
-    info!("Review result: {}", &response[..response.len().min(200)]);
+    info!("Review result: {}", common::truncate_str(&response, 200));
 
     // Fail-closed verdict: the old `starts_with` check treated ANY response
     // not literally beginning with "ISSUES_FOUND:" as a pass — a preamble

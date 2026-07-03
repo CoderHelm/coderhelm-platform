@@ -90,7 +90,7 @@ export class WorkerStack extends cdk.Stack {
         EVENTS_TABLE_NAME: props.eventsTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
-        MODEL_ID: process.env.MODEL_ID || "claude-opus-4-7",
+        MODEL_ID: process.env.MODEL_ID || "claude-opus-4-8",
         LIGHT_MODEL_ID: process.env.LIGHT_MODEL_ID || "claude-sonnet-4-6",
         SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
