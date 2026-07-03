@@ -689,7 +689,7 @@ pub async fn run(
         // where another resume grabs the run and re-processes stale events
         mark_events_processed(state, &msg.run_id, &events).await;
 
-        set_run_awaiting_ci(
+        let still_active = set_run_awaiting_ci(
             state,
             &ticket_msg,
             &msg.run_id,
@@ -700,6 +700,10 @@ pub async fn run(
             wall_clock_secs(created_at, &start),
         )
         .await?;
+
+        if !still_active {
+            return Ok(()); // run cancelled — do not reschedule
+        }
 
         // Schedule a safety-net resume in case the CI webhook is missed
         send_delayed_resume(state, &msg, 120).await;
@@ -914,7 +918,7 @@ pub async fn run(
             )
             .await;
             mark_events_processed(state, &msg.run_id, &events).await;
-            set_run_awaiting_ci(
+            let still_active = set_run_awaiting_ci(
                 state,
                 &ticket_msg,
                 &msg.run_id,
@@ -927,7 +931,9 @@ pub async fn run(
             .await?;
 
             // Schedule a safety-net resume in case the CI webhook is missed
-            send_delayed_resume(state, &msg, 120).await;
+            if still_active {
+                send_delayed_resume(state, &msg, 120).await;
+            }
         }
     }
 
@@ -941,7 +947,7 @@ pub async fn run(
             run_id = msg.run_id,
             "Resume had no CI events (review/comments only) — restoring awaiting_ci"
         );
-        set_run_awaiting_ci(
+        let still_active = set_run_awaiting_ci(
             state,
             &ticket_msg,
             &msg.run_id,
@@ -952,7 +958,9 @@ pub async fn run(
             wall_clock_secs(created_at, &start),
         )
         .await?;
-        send_delayed_resume(state, &msg, 120).await;
+        if still_active {
+            send_delayed_resume(state, &msg, 120).await;
+        }
     }
 
     // Mark events processed only after all work completes successfully
@@ -1135,11 +1143,15 @@ async fn set_run_awaiting_ci(
     branch: &str,
     usage: &TokenUsage,
     duration: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
     let cost = usage.estimated_cost();
 
-    state
+    // Conditional on the run NOT being cancelled: a user cancel must be
+    // durable — a racing CI-fix/resume invocation used to blindly overwrite
+    // "cancelled" with "awaiting_ci" and resurrect the loop. Returns
+    // Ok(false) when the run was cancelled so the caller stops rescheduling.
+    let res = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
@@ -1152,8 +1164,10 @@ async fn set_run_awaiting_ci(
              status_run_id = :sri \
              REMOVE error_message, #err",
         )
+        .condition_expression("#s <> :cancelled")
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error")
+        .expression_attribute_values(":cancelled", attr_s("cancelled"))
         .expression_attribute_values(":s", attr_s("awaiting_ci"))
         .expression_attribute_values(":pr", attr_s(pr_url))
         .expression_attribute_values(":pn", attr_n(pr_number))
@@ -1168,9 +1182,18 @@ async fn set_run_awaiting_ci(
         .expression_attribute_values(":cp", attr_s("awaiting_ci"))
         .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
         .send()
-        .await?;
-
-    Ok(())
+        .await;
+    match res {
+        Ok(_) => Ok(true),
+        Err(e) if format!("{e}").contains("ConditionalCheckFailed") => {
+            info!(
+                run_id,
+                "Run is cancelled — not restoring awaiting_ci; stopping loop"
+            );
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub(crate) async fn mark_pr_ready(
@@ -1305,6 +1328,30 @@ async fn complete_run_with_status(
 async fn send_delayed_resume(state: &WorkerState, msg: &ResumeMessage, delay_seconds: i32) {
     if state.config.ci_fix_queue_url.is_empty() {
         warn!("CI_FIX_QUEUE_URL not configured — cannot send delayed resume");
+        return;
+    }
+    // Final backstop: never re-arm the resume loop for a cancelled run.
+    let cancelled = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .consistent_read(true)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .projection_expression("#s")
+        .expression_attribute_names("#s", "status")
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .and_then(|i| i.get("status").and_then(|v| v.as_s().ok()).cloned())
+        .map(|st| st == "cancelled")
+        .unwrap_or(false);
+    if cancelled {
+        info!(
+            run_id = msg.run_id,
+            "Run cancelled — not scheduling delayed resume"
+        );
         return;
     }
     let body = serde_json::json!({
