@@ -41,6 +41,12 @@ pub async fn run(
         return Ok(());
     }
 
+    // A user cancel must halt feedback immediately — don't process or push.
+    if run_is_cancelled(state, &msg.team_id, &msg.run_id).await {
+        info!(run_id = %msg.run_id, "Run is cancelled — skipping feedback");
+        return Ok(());
+    }
+
     // Whether the pre-feedback conflict resolution pushed a merge commit —
     // that push triggers CI, so completing without awaiting_ci would leave
     // the CI result with no consumer (and a salvaged draft PR stuck in
@@ -441,8 +447,13 @@ Rules:
              pass_history = list_append(if_not_exists(pass_history, :empty), :entry) \
              REMOVE error_message, #err",
         )
+        .condition_expression("#s <> :cancelled")
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error")
+        .expression_attribute_values(
+            ":cancelled",
+            aws_sdk_dynamodb::types::AttributeValue::S("cancelled".to_string()),
+        )
         .expression_attribute_values(
             ":ti",
             aws_sdk_dynamodb::types::AttributeValue::N(usage.input_tokens.to_string()),
@@ -1402,6 +1413,33 @@ async fn fetch_ci_failures(
 /// reopening as needed, and drop the "⚠️ Partial:" salvage prefix from the
 /// title. Best-effort: failures log and fall through (comments still land on
 /// a closed PR).
+/// Whether the run has been cancelled (consistent read — cancel must win
+/// against a racing pass).
+async fn run_is_cancelled(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .consistent_read(true)
+        .key(
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
+        )
+        .key(
+            "run_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(run_id.to_string()),
+        )
+        .projection_expression("#s")
+        .expression_attribute_names("#s", "status")
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .and_then(|i| i.get("status").and_then(|v| v.as_s().ok()).cloned())
+        .map(|s| s == "cancelled")
+        .unwrap_or(false)
+}
+
 /// Prepare the run's PR for feedback. Returns `false` if the run must NOT
 /// proceed — specifically when a human closed the PR (their decision wins;
 /// resurrecting it and pushing commits, as the churn-era reopen did, is
