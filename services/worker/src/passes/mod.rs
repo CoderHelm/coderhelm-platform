@@ -3457,7 +3457,19 @@ async fn is_ticket_already_running(state: &WorkerState, msg: &TicketMessage) -> 
                 .and_then(|v| v.as_s().ok())
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            matches!(status, "running" | "queued" | "awaiting_ci")
+            // Same staleness bounds as the gateway trigger gate — a zombie
+            // run must not block the ticket forever.
+            let age_hours = item
+                .get("updated_at")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| chrono::Utc::now().signed_duration_since(t).num_hours())
+                .unwrap_or(i64::MAX);
+            match status {
+                "running" | "queued" => age_hours < 2,
+                "awaiting_ci" => age_hours < 26,
+                _ => false,
+            }
         }),
         Err(e) => {
             warn!("Dedup check failed, proceeding: {e}");
