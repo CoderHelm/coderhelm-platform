@@ -141,10 +141,11 @@ impl AgentMemory {
         // Relevance floor: top-k on a small store returns SOMETHING no matter
         // how unrelated — injecting off-topic memories into every ticket
         // steers the agent wrong. Cosine similarity below the floor is noise.
-        // Titan-embed-v2 cosine scores for related text sit lower than
-        // OpenAI-style embeddings — 0.45 filtered genuinely relevant
-        // memories; 0.25 removes only noise.
-        const MIN_RELEVANCE: f32 = 0.25;
+        // mentedb's recall_similar returns RRF-fused rank scores
+        // (max ≈ 0.08 = 1/60·0.7 + salience·0.05 + recency·0.02), NOT cosine
+        // similarity — a cosine-scale floor filtered out every result. This
+        // floor only drops the deep tail of the ranked list.
+        const MIN_RELEVANCE: f32 = 0.02;
         let results: Vec<_> = results
             .into_iter()
             .filter(|(_, score)| *score >= MIN_RELEVANCE)

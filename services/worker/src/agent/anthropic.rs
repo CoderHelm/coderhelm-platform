@@ -20,7 +20,10 @@ pub struct AnthropicClient {
 impl AnthropicClient {
     pub fn new(api_key: String) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             api_key,
         }
     }
@@ -428,7 +431,7 @@ pub async fn converse_tool_loop(
                         if content.len() > 102_400 {
                             entry["content"] = Value::String(format!(
                                 "{}... [truncated, {} bytes total]",
-                                &content[..102_400],
+                                common::truncate_str(content, 102_400),
                                 content.len()
                             ));
                         }
@@ -461,7 +464,7 @@ fn truncate_input_summary(input: &Value) -> String {
     } else {
         let s = input.to_string();
         if s.len() > 200 {
-            format!("{}…", &s[..200])
+            format!("{}…", common::truncate_str(&s, 200))
         } else {
             s
         }
@@ -488,7 +491,7 @@ async fn send_request(
         let body = resp.text().await.unwrap_or_default();
         if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
             return Err(format!(
-                "Anthropic API error ({}): {}",
+                "Anthropic API error {status} ({}): {}",
                 api_err.error.r#type, api_err.error.message
             )
             .into());
@@ -513,7 +516,13 @@ async fn send_with_retry(
                     || err_str.contains("rate_limit")
                     || err_str.contains("529")
                     || err_str.contains("500")
-                    || err_str.contains("503");
+                    || err_str.contains("502")
+                    || err_str.contains("503")
+                    || err_str.contains("504")
+                    || err_str.contains("api_error")
+                    || err_str.contains("timed out")
+                    || err_str.contains("connection")
+                    || err_str.contains("error sending request");
                 if attempt < 2 && transient {
                     let delay_secs = 2u64.pow(attempt + 1);
                     warn!(
@@ -562,7 +571,7 @@ fn compact_messages(messages: &mut [(String, Vec<Value>)], keep_last: usize) {
                 if let Some(c) = block.get("content").and_then(|c| c.as_str()) {
                     if c.len() > 150 {
                         // Preserve a brief hint of what was in the result
-                        let hint = &c[..c.len().min(60)];
+                        let hint = common::truncate_str(c, 60);
                         block["content"] = json!(format!(
                             "[Cleared — {len} chars: {hint}…]",
                             len = c.len(),

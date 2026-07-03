@@ -209,8 +209,11 @@ fn scan_brackets(content: &str, opts: ScanOpts) -> Vec<String> {
     let mut stack: Vec<char> = Vec::new();
     // Template-literal nesting: stack depth at each `${` entry.
     let mut template_stack: Vec<usize> = Vec::new();
-    // Last significant char — drives the JS division-vs-regex heuristic.
+    // Last significant char + trailing identifier — drive the JS
+    // division-vs-regex heuristic (a `/` after `return`/`case`/… is a regex).
     let mut last_sig: Option<char> = None;
+    let mut last_word = String::new();
+    let mut in_word = false;
 
     let chars: Vec<char> = content.chars().collect();
     let mut i = 0usize;
@@ -273,9 +276,15 @@ fn scan_brackets(content: &str, opts: ScanOpts) -> Vec<String> {
         // unbalanced brackets. Regex literals cannot span lines — if no
         // closing `/` is found on the line, treat as division.
         if opts.js_regex && c == '/' {
+            const REGEX_KEYWORDS: [&str; 8] =
+                ["RETURN", "TYPEOF", "CASE", "IN", "OF", "DO", "ELSE", "VOID"];
             let regex_ok = match last_sig {
                 None => true,
-                Some(p) => "([{,;=:!&|?+-*%<>^~".contains(p) || p == '\n',
+                Some(p) => {
+                    "([{,;=:!&|?+-*%<>^~".contains(p)
+                        || p == '\n'
+                        || REGEX_KEYWORDS.contains(&last_word.to_ascii_uppercase().as_str())
+                }
             };
             if regex_ok {
                 let mut j = i + 1;
@@ -492,8 +501,23 @@ fn scan_brackets(content: &str, opts: ScanOpts) -> Vec<String> {
         }
         if c == '\n' {
             last_sig = Some('\n');
+            last_word.clear();
+            in_word = false;
         } else if !c.is_whitespace() {
             last_sig = Some(c);
+            if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+                if !in_word {
+                    last_word.clear();
+                }
+                last_word.push(c);
+                in_word = true;
+            } else {
+                last_word.clear();
+                in_word = false;
+            }
+        } else {
+            // whitespace: end the word but KEEP it (e.g. "return /re/")
+            in_word = false;
         }
         i += 1;
     }
@@ -673,5 +697,18 @@ mod tests {
     fn mismatched_pairs_caught() {
         assert!(!scan("a.ts", "const a = [1, 2);\n").is_empty());
         assert!(!scan("a.ts", "}}}\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod keyword_regex_tests {
+    use super::scan;
+
+    #[test]
+    fn regex_after_keyword() {
+        assert!(scan("a.ts", "function f(s) { return /[(]/.test(s); }\n").is_empty());
+        assert!(scan("a.ts", "const t = x ? /[)]/ : /[(]/;\n").is_empty());
+        // Division after identifier still division
+        assert!(scan("a.ts", "const y = total / count;\n").is_empty());
     }
 }

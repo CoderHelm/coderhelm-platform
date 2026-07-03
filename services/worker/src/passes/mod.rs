@@ -116,6 +116,7 @@ fn sanitize_error(msg: &str) -> String {
     }
     // Remove model IDs
     let patterns = [
+        "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-opus-4-6",
         "claude-opus-4-20250514",
@@ -1574,12 +1575,9 @@ async fn run_passes(
                     to = %better_repo,
                     "Switching repo — plan files found in different repo"
                 );
-                msg.repo_owner = new_owner.to_string();
-                msg.repo_name = new_name.to_string();
-
                 // Keep the openspec cache coherent: copy it to the new
-                // repo's prefix so the task tracker (post-switch msg) and
-                // future reuse reads find it.
+                // repo's prefix BEFORE mutating msg (computing the old prefix
+                // after the mutation made this a self-copy no-op).
                 let old_prefix = openspec_prefix(
                     &msg.team_id,
                     &msg.ticket_id,
@@ -1587,6 +1585,8 @@ async fn run_passes(
                     &msg.repo_name,
                 );
                 let new_prefix = openspec_prefix(&msg.team_id, &msg.ticket_id, new_owner, new_name);
+                msg.repo_owner = new_owner.to_string();
+                msg.repo_name = new_name.to_string();
                 for name in [
                     "proposal.md",
                     "design.md",
@@ -3219,7 +3219,7 @@ async fn fail_run(
         )
         .expression_attribute_names("#status", "status")
         .expression_attribute_values(":s", attr_s("failed"))
-        .expression_attribute_values(":err", attr_s(&error_msg[..error_msg.len().min(500)]))
+        .expression_attribute_values(":err", attr_s(common::truncate_str(error_msg, 500)))
         .expression_attribute_values(":ti", attr_n(usage.input_tokens))
         .expression_attribute_values(":to", attr_n(usage.output_tokens))
         .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
@@ -3272,7 +3272,7 @@ async fn fail_run(
                  If you can, add more detail to the issue description — for example which files to change, \
                  expected behavior, or relevant code snippets — and I'll try again.\n\n\
                  [View run →](https://app.coderhelm.com/runs/detail?id={})",
-                &error_msg[..error_msg.len().min(300)],
+                common::truncate_str(error_msg, 300),
                 run_id,
             );
             if let Err(e) = gh
@@ -3287,7 +3287,7 @@ async fn fail_run(
             "{}\n\n\
              Add more detail — which files to change, expected behavior, or relevant code snippets — and comment to retry.\n\n\
              View run → https://app.coderhelm.com/runs/detail?id={}",
-            &error_msg[..error_msg.len().min(300)],
+            common::truncate_str(error_msg, 300),
             run_id,
         );
         if let Err(e) = post_jira_comment(
@@ -4766,7 +4766,7 @@ If everything is clean, respond with "CLEAN" and nothing else."#,
     tracing::info!(
         run_id,
         "Adversarial test result: {}",
-        &response[..response.len().min(200)]
+        common::truncate_str(&response, 200)
     );
 
     // Fail-closed: unparseable output cannot vouch for the diff.

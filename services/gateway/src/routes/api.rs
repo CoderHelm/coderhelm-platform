@@ -3381,6 +3381,7 @@ pub async fn update_workflow_settings(
 
 /// Allowed model IDs for the Anthropic provider.
 const ALLOWED_MODELS: &[&str] = &[
+    "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-sonnet-4-6",

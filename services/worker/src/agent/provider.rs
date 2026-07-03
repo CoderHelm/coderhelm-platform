@@ -63,7 +63,7 @@ impl ModelProvider {
             .get("heavy_model")
             .and_then(|v| v.as_s().ok())
             .cloned()
-            .unwrap_or_else(|| "claude-opus-4-7".to_string());
+            .unwrap_or_else(|| "claude-opus-4-8".to_string());
 
         info!(team_id, "Loaded Anthropic provider");
         Ok(Self {

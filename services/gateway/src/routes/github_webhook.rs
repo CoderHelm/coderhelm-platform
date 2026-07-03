@@ -320,6 +320,12 @@ async fn handle_issue_comment(
                 review_body: body.to_string(),
                 comments: vec![],
             });
+            // Budget gate — the review-feedback path checks this, but the comment
+            // path didn't, letting over-limit teams keep spending via PR comments.
+            if check_run_budget(state, team_id).await.is_some() {
+                info!(team_id, "PR comment feedback skipped — token limit reached");
+                return Ok(StatusCode::OK);
+            }
             return send_to_queue(state, &state.config.feedback_queue_url, &message).await;
         }
     }
@@ -418,7 +424,9 @@ async fn handle_pull_request(
         .expression_attribute_values(":tr", attr_s(&team_repo))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .scan_index_forward(false)
-        .limit(1)
+        // Limit applies BEFORE the filter — limit(1) only ever examined the
+        // repo's newest run, dropping feedback/merge events for older PRs.
+        .limit(50)
         .send()
         .await
         .map_err(|e| {
@@ -1158,7 +1166,7 @@ async fn handle_repository_event(
                     .update_item()
                     .table_name(&state.config.repos_table_name)
                     .key("pk", attr_s(team_id))
-                    .key("sk", attr_s(&format!("REPO#{}", parts[1])))
+                    .key("sk", attr_s(&format!("REPO#{}", repo_name)))
                     .update_expression("SET #status = :s, updated_at = :t")
                     .expression_attribute_names("#status", "status")
                     .expression_attribute_values(":s", attr_s("inactive"))
@@ -1507,7 +1515,9 @@ async fn lookup_run_by_pr(
         .expression_attribute_values(":tr", attr_s(&team_repo))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .scan_index_forward(false)
-        .limit(1)
+        // Limit applies BEFORE the filter — limit(1) only ever examined the
+        // repo's newest run, dropping feedback/merge events for older PRs.
+        .limit(50)
         .send()
         .await;
 

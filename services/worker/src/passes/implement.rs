@@ -284,7 +284,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
                     } else {
                         format!(
                             "Tool: {tool_name} — {}",
-                            &input_summary[..input_summary.len().min(100)]
+                            common::truncate_str(&input_summary, 100)
                         )
                     };
                     let entry = aws_sdk_dynamodb::types::AttributeValue::M(

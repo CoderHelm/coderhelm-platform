@@ -83,6 +83,9 @@ pub async fn create_plan(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    // plans.rs had NO role gates — any authed viewer could dispatch paid
+    // agent runs or delete the team's plans.
+    claims.require_role(1)?;
     let title = body["title"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
     let description = body["description"].as_str().unwrap_or("");
     let repo = body["repo"].as_str().unwrap_or("");
@@ -276,6 +279,9 @@ pub async fn update_plan(
     axum::extract::Path(plan_id): axum::extract::Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    // plans.rs had NO role gates — any authed viewer could dispatch paid
+    // agent runs or delete the team's plans.
+    claims.require_role(1)?;
     validate_plan_id(&plan_id)?;
     let sk = format!("PLAN#{plan_id}");
     let now = chrono::Utc::now().to_rfc3339();
@@ -372,6 +378,9 @@ pub async fn delete_plan(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
 ) -> Result<StatusCode, StatusCode> {
+    // plans.rs had NO role gates — any authed viewer could dispatch paid
+    // agent runs or delete the team's plans.
+    claims.require_role(3)?;
     validate_plan_id(&plan_id)?;
 
     // Query all items for this plan (plan + tasks)
@@ -632,6 +641,9 @@ pub async fn approve_task(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
+    // plans.rs had NO role gates — any authed viewer could dispatch paid
+    // agent runs or delete the team's plans.
+    claims.require_role(1)?;
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
 
@@ -742,6 +754,9 @@ pub async fn approve_all_and_execute(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    // plans.rs had NO role gates — any authed viewer could dispatch paid
+    // agent runs or delete the team's plans.
+    claims.require_role(1)?;
     validate_plan_id(&plan_id)?;
 
     let result = state
@@ -887,6 +902,9 @@ pub async fn force_run_task(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
+    // plans.rs had NO role gates — any authed viewer could dispatch paid
+    // agent runs or delete the team's plans.
+    claims.require_role(1)?;
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
 
@@ -966,6 +984,15 @@ pub async fn execute_plan(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    // plans.rs had NO role gates — any authed viewer could dispatch paid
+    // agent runs or delete the team's plans.
+    claims.require_role(1)?;
+    if super::github_webhook::check_run_budget(&state, &claims.team_id)
+        .await
+        .is_some()
+    {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     validate_plan_id(&plan_id)?;
 
     // Get plan + all tasks

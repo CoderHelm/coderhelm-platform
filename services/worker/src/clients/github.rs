@@ -353,6 +353,28 @@ impl GitHubClient {
         }
         let url = format!("{API_BASE}/repos/{owner}/{repo}/git/trees/{git_ref}?recursive=1");
         let data = self.get(&url).await?;
+        // GitHub silently truncates trees over 100k entries / 7MB. A partial
+        // tree makes agents conclude files don't exist — build the snapshot
+        // (full tarball) for the complete listing instead.
+        if data.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
+            if let Some(snap) = self.snapshot(owner, repo, git_ref).await {
+                return Ok(snap
+                    .tree()
+                    .await
+                    .into_iter()
+                    .map(|path| TreeEntry {
+                        path,
+                        entry_type: "blob".to_string(),
+                        sha: String::new(),
+                    })
+                    .collect());
+            }
+            tracing::warn!(
+                owner,
+                repo,
+                "git tree truncated and snapshot unavailable — file list incomplete"
+            );
+        }
         let tree: Vec<TreeEntry> =
             serde_json::from_value(data.get("tree").cloned().unwrap_or(serde_json::json!([])))?;
         Ok(tree)
@@ -981,9 +1003,23 @@ impl GitHubClient {
         repo: &str,
         pr_number: u64,
     ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/comments");
-        let data = self.get(&url).await?;
-        let comments: Vec<serde_json::Value> = serde_json::from_value(data)?;
+        // Paginate: GitHub's default page size is 30, and the bot's own
+        // replies count toward it — an active PR blows past one page fast,
+        // making newer reviewer comments invisible and already-answered
+        // ones look unanswered.
+        let mut comments: Vec<serde_json::Value> = Vec::new();
+        for page in 1..=5u32 {
+            let url = format!(
+                "{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/comments?per_page=100&page={page}"
+            );
+            let data = self.get(&url).await?;
+            let batch: Vec<serde_json::Value> = serde_json::from_value(data)?;
+            let done = batch.len() < 100;
+            comments.extend(batch);
+            if done {
+                break;
+            }
+        }
         Ok(comments)
     }
 

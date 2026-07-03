@@ -134,7 +134,7 @@ pub async fn run(
         match fetch_ci_failures(&github, &msg, &branch).await {
             Some(logs) => format!(
                 "\n## CI Failures\nThe following CI checks are failing. Fix these issues as well:\n\n```\n{}\n```\n",
-                if logs.len() > 12000 { format!("... (truncated)\n{}", &logs[logs.len() - 12000..]) } else { logs }
+                if logs.len() > 12000 { format!("... (truncated)\n{}", common::tail_str(&logs, 12000)) } else { logs }
             ),
             None => String::new(),
         }
@@ -280,7 +280,7 @@ Rules:
     info!(
         run_id = %msg.run_id,
         "Feedback complete: {}",
-        &response[..response.len().min(200)]
+        common::truncate_str(&response, 200)
     );
 
     // Reply to each review comment in its own thread.
@@ -304,7 +304,7 @@ Rules:
         // Matched — post each section to its corresponding comment thread
         for (section, comment) in sections.iter().zip(actionable_comments.iter()) {
             let reply = if section.len() > 65000 {
-                format!("{}\n\n*(truncated)*", &section[..65000])
+                format!("{}\n\n*(truncated)*", common::truncate_str(section, 65000))
             } else {
                 section.to_string()
             };
@@ -715,8 +715,13 @@ async fn filter_unanswered(
         Err(_) => return comments, // can't check — process all
     };
 
-    // Collect comment IDs that the bot already replied to
-    let answered_ids: std::collections::HashSet<u64> = all_comments
+    // GitHub review threads are FLAT: every reply's in_reply_to_id points at
+    // the thread ROOT, even replies posted to a follow-up comment. Keying
+    // "answered" on the replied-to id therefore never matched follow-ups and
+    // the bot re-answered them on every re-review. Instead: a comment is
+    // answered when the bot has a LATER comment (higher id) in the SAME
+    // thread (thread key = in_reply_to_id, or own id for roots).
+    let bot_replies: Vec<(u64, u64)> = all_comments
         .iter()
         .filter(|c| {
             c["user"]["login"]
@@ -724,16 +729,29 @@ async fn filter_unanswered(
                 .map(|l| l.contains("coderhelm"))
                 .unwrap_or(false)
         })
-        .filter_map(|c| c["in_reply_to_id"].as_u64())
+        .filter_map(|c| {
+            let id = c["id"].as_u64()?;
+            let thread = c["in_reply_to_id"].as_u64().unwrap_or(id);
+            Some((thread, id))
+        })
+        .collect();
+    let thread_of: std::collections::HashMap<u64, u64> = all_comments
+        .iter()
+        .filter_map(|c| {
+            let id = c["id"].as_u64()?;
+            Some((id, c["in_reply_to_id"].as_u64().unwrap_or(id)))
+        })
         .collect();
 
     let before = comments.len();
     let filtered: Vec<ReviewComment> = comments
         .into_iter()
         .filter(|c| {
-            c.comment_id
-                .map(|id| !answered_ids.contains(&id))
-                .unwrap_or(true)
+            let Some(id) = c.comment_id else { return true };
+            let thread = thread_of.get(&id).copied().unwrap_or(id);
+            !bot_replies
+                .iter()
+                .any(|(t, bot_id)| *t == thread && *bot_id > id)
         })
         .collect();
 

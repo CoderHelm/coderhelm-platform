@@ -357,7 +357,7 @@ async fn process_jira_payload(
     info!(
         team_id,
         body_len = body_text.len(),
-        body_preview = &body_text[..body_text.len().min(200)],
+        body_preview = common::truncate_str(&body_text, 200),
         "Jira ticket body extracted"
     );
 
@@ -648,7 +648,7 @@ pub async fn handle_forge(
         installation_id
     };
 
-    info!(team_id, installation_id, payload = %payload, "Forge Jira webhook received");
+    info!(team_id, installation_id, "Forge Jira webhook received");
 
     process_jira_payload(&state, &team_id, installation_id, &payload).await
 }

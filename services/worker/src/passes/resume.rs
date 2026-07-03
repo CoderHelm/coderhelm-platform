@@ -77,7 +77,13 @@ pub async fn run(
                 .and_then(|v| v.as_s().ok())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
             let stale = updated_at
-                .map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds() > 600)
+                .map(|t| {
+                    // Must exceed the worker Lambda's max lifetime (900s): a
+                    // 600s threshold let a second resume claim a run whose
+                    // 12-minute implement was still alive, double-writing the
+                    // same branch.
+                    chrono::Utc::now().signed_duration_since(t).num_seconds() > 960
+                })
                 .unwrap_or(false);
 
             if stale {
@@ -915,6 +921,30 @@ pub async fn run(
             // Schedule a safety-net resume in case the CI webhook is missed
             send_delayed_resume(state, &msg, 120).await;
         }
+    }
+
+    // Review/comment-only events (no CI signal): the two branches above both
+    // skipped, but the run was already claimed to "running" — without this,
+    // it wedged there and the reviewer's feedback was silently discarded.
+    // Restore awaiting_ci and keep the safety net alive; comment feedback is
+    // handled by the feedback pass once the run completes.
+    if !has_ci_fail && !has_ci_pass {
+        info!(
+            run_id = msg.run_id,
+            "Resume had no CI events (review/comments only) — restoring awaiting_ci"
+        );
+        set_run_awaiting_ci(
+            state,
+            &ticket_msg,
+            &msg.run_id,
+            &pr_url,
+            pr_number,
+            &branch,
+            &usage,
+            wall_clock_secs(created_at, &start),
+        )
+        .await?;
+        send_delayed_resume(state, &msg, 120).await;
     }
 
     // Mark events processed only after all work completes successfully
