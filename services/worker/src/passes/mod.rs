@@ -375,6 +375,7 @@ pub async fn orchestrate_ticket(
                     &msg.team_id,
                     &msg.repo_owner,
                     &msg.repo_name,
+                    None, // tokenless: only clears an EXPIRED lock
                 )
                 .await;
             }

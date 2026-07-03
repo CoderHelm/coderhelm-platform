@@ -43,14 +43,37 @@ pub async fn resolve_team_by_installation(
 
     let items = result.items();
 
-    // If multiple teams have this installation, prefer the one with the most users
-    // (the real team, not orphan auto-created ones)
+    // If multiple teams share this installation, prefer the one with the
+    // most members — orphan auto-created teams have 0-1 users. Returning
+    // whichever DynamoDB listed first routed webhooks to the wrong tenant.
     if items.len() > 1 {
         tracing::warn!(
             installation_id,
             team_count = items.len(),
-            "Multiple teams found for installation — returning first"
+            "Multiple teams found for installation — selecting by member count"
         );
+        let mut best: Option<(String, i32)> = None;
+        for item in items {
+            let Some(team_id) = item.get("team_id").and_then(|v| v.as_s().ok()).cloned() else {
+                continue;
+            };
+            let count = state
+                .dynamo
+                .query()
+                .table_name(&state.config.users_table_name)
+                .key_condition_expression("pk = :pk AND begins_with(sk, :u)")
+                .expression_attribute_values(":pk", attr_s(&team_id))
+                .expression_attribute_values(":u", attr_s("USER#"))
+                .select(aws_sdk_dynamodb::types::Select::Count)
+                .send()
+                .await
+                .map(|r| r.count)
+                .unwrap_or(0);
+            if best.as_ref().is_none_or(|(_, c)| count > *c) {
+                best = Some((team_id, count));
+            }
+        }
+        return best.map(|(t, _)| t);
     }
 
     items

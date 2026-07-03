@@ -20,7 +20,7 @@ pub struct AgentMemory {
     team_id: String,
     repo_owner: String,
     repo_name: String,
-    has_lock: bool,
+    lock_token: Option<String>,
     dirty: bool,
 }
 
@@ -39,8 +39,8 @@ impl AgentMemory {
             return None;
         }
 
-        // Acquire lock
-        let has_lock = match lock::acquire_lock(
+        // Acquire lock (fencing token — see lock.rs)
+        let lock_token = match lock::acquire_lock(
             &state.dynamo,
             &state.config.table_name,
             team_id,
@@ -49,16 +49,14 @@ impl AgentMemory {
         )
         .await
         {
-            Ok(locked) => locked,
+            Ok(token) => token,
             Err(e) => {
                 warn!(error = %e, "Failed to acquire memory lock, running stateless");
-                false
+                None
             }
         };
 
-        if !has_lock {
-            return None;
-        }
+        let lock_token = lock_token?;
 
         // Download snapshot from S3
         let local_dir = match s3_sync::download_memory(
@@ -79,6 +77,7 @@ impl AgentMemory {
                     team_id,
                     repo_owner,
                     repo_name,
+                    Some(&lock_token),
                 )
                 .await;
                 return None;
@@ -100,7 +99,7 @@ impl AgentMemory {
                     team_id: team_id.to_string(),
                     repo_owner: repo_owner.to_string(),
                     repo_name: repo_name.to_string(),
-                    has_lock,
+                    lock_token: Some(lock_token),
                     dirty: false,
                 })
             }
@@ -112,6 +111,7 @@ impl AgentMemory {
                     team_id,
                     repo_owner,
                     repo_name,
+                    Some(&lock_token),
                 )
                 .await;
                 None
@@ -396,14 +396,15 @@ impl AgentMemory {
             info!(memories = memory_count, "Persisted agent memory to S3");
         }
 
-        // Release lock
-        if self.has_lock {
+        // Release lock (fenced by our token)
+        if let Some(ref token) = self.lock_token {
             lock::release_lock(
                 &state.dynamo,
                 &state.config.table_name,
                 &self.team_id,
                 &self.repo_owner,
                 &self.repo_name,
+                Some(token),
             )
             .await;
         }

@@ -62,6 +62,15 @@ pub async fn run(
             continue;
         };
 
+        // Idempotency: SQS is at-least-once and a mid-batch crash redelivers
+        // the whole PlanExecute message — without this, already-completed
+        // tasks were re-run, creating duplicate GitHub issues/Jira tickets
+        // (each duplicate then triggering a full duplicate agent run).
+        if matches!(task.status.as_str(), "running" | "done" | "issue_created") {
+            info!(task_id, status = %task.status, "Task already processed — skipping (redelivery)");
+            continue;
+        }
+
         // If task has a dependency, mark as waiting instead of processing
         if let Some(ref dep) = task.depends_on {
             if !dep.is_empty() {
@@ -305,6 +314,7 @@ async fn get_plan_repo(
 }
 
 struct TaskData {
+    status: String,
     title: String,
     description: String,
     acceptance_criteria: String,
@@ -337,6 +347,7 @@ async fn get_task(
     };
 
     Ok(result.item().map(|item| TaskData {
+        status: str_field(item, "status").unwrap_or_default(),
         title: str_field(item, "title").unwrap_or_default(),
         description: str_field(item, "description").unwrap_or_default(),
         acceptance_criteria: str_field(item, "acceptance_criteria").unwrap_or_default(),

@@ -1,6 +1,6 @@
 use axum::{
     extract::{Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Json,
 };
@@ -9,7 +9,7 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::auth::jwt;
 use crate::middleware::auth::SESSION_TTL_SECS;
@@ -112,13 +112,13 @@ pub struct MfaChallengeRequest {
 #[derive(Deserialize)]
 pub struct CallbackParams {
     code: String,
-    #[allow(dead_code)]
     state: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct GoogleCallbackParams {
     code: String,
+    state: Option<String>,
 }
 
 // ── Signup ───────────────────────────────────────────────────────────
@@ -506,6 +506,21 @@ pub async fn confirm_reset(
 
 // ── Google OAuth ─────────────────────────────────────────────────────
 
+/// CSRF `state` for OAuth: random value carried both in the authorize URL and
+/// an HttpOnly cookie; the callback requires them to match. Without it, an
+/// attacker could complete the dance with their own `code` in a victim's
+/// browser (login-CSRF / session fixation).
+fn oauth_state_cookie(name: &str, value: &str) -> String {
+    format!("{name}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600")
+}
+
+fn validate_oauth_state(req_cookies: &str, cookie_name: &str, query_state: Option<&str>) -> bool {
+    let Some(expected) = extract_cookie(req_cookies, cookie_name) else {
+        return false;
+    };
+    query_state.is_some_and(|s| !s.is_empty() && s == expected)
+}
+
 /// GET /auth/google — Redirect to Cognito hosted UI for Google login.
 pub async fn google_login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let redirect_uri = if state.config.stage == "prod" {
@@ -525,22 +540,39 @@ pub async fn google_login(State(state): State<Arc<AppState>>) -> impl IntoRespon
         format!("https://{domain}.auth.us-east-1.amazoncognito.com")
     };
 
+    let csrf = ulid::Ulid::new().to_string();
     let url = format!(
         "{base}/oauth2/authorize?\
          response_type=code&client_id={client_id}&\
          redirect_uri={redirect_uri}&\
          identity_provider=Google&\
+         state={csrf}&\
          scope=openid+email+profile+aws.cognito.signin.user.admin"
     );
 
-    Redirect::temporary(&url)
+    (
+        [(
+            header::SET_COOKIE,
+            oauth_state_cookie("__Host-oauth_state_g", &csrf),
+        )],
+        Redirect::temporary(&url),
+    )
 }
 
 /// GET /auth/google/callback — Handle Cognito/Google OAuth callback.
 pub async fn google_callback(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<GoogleCallbackParams>,
 ) -> Result<Response, StatusCode> {
+    let cookies = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !validate_oauth_state(cookies, "__Host-oauth_state_g", params.state.as_deref()) {
+        warn!("Google OAuth callback with missing/mismatched CSRF state");
+        return Err(StatusCode::FORBIDDEN);
+    }
     let redirect_uri = if state.config.stage == "prod" {
         "https://api.coderhelm.com/auth/google/callback"
     } else {
@@ -745,10 +777,17 @@ pub async fn github_login(State(state): State<Arc<AppState>>) -> impl IntoRespon
     } else {
         "http://localhost:3000/auth/github/callback"
     };
+    let csrf = ulid::Ulid::new().to_string();
     let url = format!(
-        "https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&scope=read:user,read:org"
+        "https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&scope=read:user,read:org&state={csrf}"
     );
-    Redirect::temporary(&url)
+    (
+        [(
+            header::SET_COOKIE,
+            oauth_state_cookie("__Host-oauth_state_gh", &csrf),
+        )],
+        Redirect::temporary(&url),
+    )
 }
 
 /// GET /auth/github/callback — GitHub OAuth callback.
@@ -760,6 +799,16 @@ pub async fn github_callback(
     Query(params): Query<CallbackParams>,
     req: axum::extract::Request,
 ) -> Result<Response, StatusCode> {
+    let cookies = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !validate_oauth_state(cookies, "__Host-oauth_state_gh", params.state.as_deref()) {
+        warn!("GitHub OAuth callback with missing/mismatched CSRF state");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     // Exchange code for access token
     let client = &state.http;
     let token_resp = client
