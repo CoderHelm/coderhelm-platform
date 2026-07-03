@@ -1453,7 +1453,15 @@ async fn run_passes(
                     state,
                     &msg.team_id,
                     run_id,
-                    &format!("Switched to {} (plan files matched)", resolved_repo),
+                    &format!(
+                        "Switched to {} ({})",
+                        resolved_repo,
+                        if plan_warnings.switch_reason.is_empty() {
+                            "repo routing"
+                        } else {
+                            &plan_warnings.switch_reason
+                        }
+                    ),
                 )
                 .await;
             }
@@ -3459,6 +3467,8 @@ struct PlanValidation {
     blocked: bool,
     /// If triage picked the wrong repo, this suggests the correct one (owner/name).
     switch_repo: Option<String>,
+    /// Human-readable reason for the switch, shown in the run's progress notes.
+    switch_reason: String,
 }
 
 /// Plan validation — catches bad plans before the expensive Implement pass.
@@ -3480,6 +3490,7 @@ async fn validate_plan(
     let mut warnings = Vec::new();
     let mut blocked = false;
     let mut switch_repo: Option<String> = None;
+    let mut switch_reason = String::new();
 
     // Extract file paths from plan text (design + tasks)
     let plan_text = format!("{}\n{}", plan.design, plan.tasks);
@@ -3525,15 +3536,16 @@ async fn validate_plan(
         ));
     }
 
-    // 2. File existence check (sample up to 10 files to avoid API spam)
+    // 2. File existence check (sample up to 10 files to avoid API spam).
+    // Read at HEAD, same as the candidate-repo checks below — reading the
+    // current repo at base_branch while candidates get HEAD meant a repo
+    // whose default branch isn't the message's base_branch had ALL its
+    // files "missing", which then triggered a bogus repo switch.
     if !mentioned_files.is_empty() {
         let sample: Vec<&String> = mentioned_files.iter().take(10).collect();
         let mut missing = Vec::new();
         for path in &sample {
-            match github
-                .read_file(repo_owner, repo_name, path, base_branch)
-                .await
-            {
+            match github.read_file(repo_owner, repo_name, path, "HEAD").await {
                 Ok(_) => {}
                 Err(_) => missing.push(path.to_string()),
             }
@@ -3580,15 +3592,24 @@ async fn validate_plan(
                         "Plan files found in different repo — suggesting switch"
                     );
                     switch_repo = Some(candidate.to_string());
+                    switch_reason = format!(
+                        "{found} of {} plan files exist there but not here",
+                        missing.len()
+                    );
                     break;
                 }
             }
         }
     }
 
-    // 3. Plan-text repo mention check — if the plan explicitly names a different team repo
-    //    more than the current one, the planner probably explored and found the right repo
-    //    but triage started in the wrong one (common for Jira tickets).
+    // 3. Plan-text repo mention check. Only FULL "owner/name" references are
+    //    strong enough to decide a switch — an unambiguous repo path in the
+    //    plan means the planner found the right repo. Bare repo names are
+    //    demoted to a HINT for the LLM check below: repos named after common
+    //    words make bare-name counting actively wrong (a ticket about LCP
+    //    "for mobile" — the device — routed speedboat work into the repo
+    //    named "mobile" because \bmobile\b matched twice).
+    let mut mention_hint: Option<String> = None;
     if switch_repo.is_none() {
         let current_repo = format!("{repo_owner}/{repo_name}");
         let full_plan = format!(
@@ -3597,51 +3618,59 @@ async fn validate_plan(
         );
         let full_plan_lower = full_plan.to_lowercase();
 
-        // Count mentions of each team repo using word-boundary regex to avoid
-        // substring false positives (e.g. "api" matching inside "gangway-api")
-        let mut best_candidate: Option<(String, usize)> = None;
-        let current_name_lower = repo_name.to_lowercase();
-        let current_re =
-            regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(&current_name_lower)))
-                .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
-        let current_mentions = current_re.find_iter(&full_plan_lower).count();
+        let current_full_mentions = full_plan_lower
+            .matches(&current_repo.to_lowercase())
+            .count();
 
+        let mut best_full: Option<(String, usize)> = None;
+        let mut best_bare: Option<(String, usize)> = None;
         for candidate in team_repos {
             if *candidate == current_repo {
                 continue;
             }
             if let Some((_owner, cand_name)) = candidate.split_once('/') {
-                let cand_lower = cand_name.to_lowercase();
-                // First try full owner/name match, then word-bounded name match.
-                // The pattern varies per candidate, so it can't be hoisted.
-                let full_match_count = full_plan_lower.matches(&candidate.to_lowercase()).count();
-                #[allow(clippy::regex_creation_in_loops)]
-                let name_re =
-                    regex::Regex::new(&format!(r"(?i)\b{}\b", regex::escape(&cand_lower)))
-                        .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
-                let cand_mentions = full_match_count + name_re.find_iter(&full_plan_lower).count();
-
-                // Candidate repo must be mentioned at least 2 times and more than current
-                if cand_mentions >= 2
-                    && cand_mentions > current_mentions
-                    && best_candidate
+                let full_count = full_plan_lower.matches(&candidate.to_lowercase()).count();
+                if full_count > 0
+                    && best_full
                         .as_ref()
-                        .is_none_or(|(_, best)| cand_mentions > *best)
+                        .is_none_or(|(_, best)| full_count > *best)
                 {
-                    best_candidate = Some((candidate.clone(), cand_mentions));
+                    best_full = Some((candidate.clone(), full_count));
+                }
+
+                // Word-boundary bare-name count — hint only, never decides.
+                // The pattern varies per candidate, so it can't be hoisted.
+                #[allow(clippy::regex_creation_in_loops)]
+                let name_re = regex::Regex::new(&format!(
+                    r"(?i)\b{}\b",
+                    regex::escape(&cand_name.to_lowercase())
+                ))
+                .unwrap_or_else(|_| regex::Regex::new("^$").unwrap());
+                let bare_count = name_re.find_iter(&full_plan_lower).count();
+                if bare_count >= 2
+                    && best_bare
+                        .as_ref()
+                        .is_none_or(|(_, best)| bare_count > *best)
+                {
+                    best_bare = Some((candidate.clone(), bare_count));
                 }
             }
         }
 
-        if let Some((candidate, mentions)) = best_candidate {
-            info!(
-                current = %current_repo,
-                candidate = %candidate,
-                mentions,
-                current_mentions,
-                "Plan text references different repo more often — suggesting switch"
-            );
-            switch_repo = Some(candidate);
+        if let Some((candidate, mentions)) = best_full {
+            if mentions > current_full_mentions {
+                info!(
+                    current = %current_repo,
+                    candidate = %candidate,
+                    mentions,
+                    "Plan explicitly references different repo path — suggesting switch"
+                );
+                switch_repo = Some(candidate);
+                switch_reason = format!("plan explicitly references it {mentions}x");
+            }
+        }
+        if switch_repo.is_none() {
+            mention_hint = best_bare.map(|(candidate, _)| candidate);
         }
     }
 
@@ -3714,6 +3743,17 @@ async fn validate_plan(
             &plan.tasks[..plan.tasks.len().min(500)],
         );
 
+        let hint_section = match &mention_hint {
+            Some(candidate) => format!(
+                "\n## Weak signal (verify, do not trust blindly):\n\
+                 The plan text mentions the name of `{candidate}` several times. This may \
+                 be a genuine reference to that repository, OR ordinary English usage of \
+                 the same word (e.g. a repo named \"mobile\" vs. a ticket about mobile \
+                 devices). Judge from the repo descriptions and directory structures.\n"
+            ),
+            None => String::new(),
+        };
+
         let prompt = format!(
             r#"You are validating whether an implementation plan belongs in the correct repository.
 
@@ -3724,7 +3764,7 @@ Top-level files: [{dirs}]
 
 ## Other available repositories:
 {others}
-{agents_section}
+{agents_section}{hint_section}
 ## Plan summary:
 {plan_summary}
 
@@ -3735,6 +3775,7 @@ Rules:
 - Consider what each repo is FOR based on its name, description, directory structure, and AGENTS context.
 - Data/ETL/pipeline repos are for data work only, NOT application features.
 - If the plan mentions a specific service or API (e.g. "gangway", "adyen webhook"), match it to the repo that OWNS that code.
+- A repo name appearing as an ordinary word in prose (e.g. "mobile", "web", "data") is NOT evidence the work belongs there.
 - If the plan clearly belongs in the current repo, respond: CORRECT
 - If it belongs in a different repo, respond: SWITCH owner/name
 
@@ -3788,6 +3829,7 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
                             "LLM repo-fit check suggests switching repo"
                         );
                         switch_repo = Some(clean);
+                        switch_reason = "repo-fit check matched the plan to it".to_string();
                     } else {
                         warn!(
                             current = %current_repo,
@@ -3809,6 +3851,7 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
         warnings,
         blocked,
         switch_repo,
+        switch_reason,
     }
 }
 
