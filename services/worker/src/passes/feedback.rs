@@ -11,7 +11,7 @@ use crate::WorkerState;
 
 pub async fn run(
     state: &WorkerState,
-    msg: FeedbackMessage,
+    mut msg: FeedbackMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut usage = TokenUsage::default();
 
@@ -29,6 +29,14 @@ pub async fn run(
         msg.installation_id,
         &state.http,
     )?;
+
+    // Re-review on a run whose PR was closed (branch superseded, manual
+    // close): silently working against a closed PR confused users. Reattach
+    // to the branch's current open PR if one exists (GitHub forbids two open
+    // PRs per branch), otherwise reopen the original. Also strip the
+    // "⚠️ Partial:" salvage marker — someone actively re-reviewing means the
+    // work is being finished.
+    ensure_pr_open(state, &github, &mut msg).await;
 
     // Resolve merge conflicts before processing feedback (especially on re-review)
     {
@@ -1303,4 +1311,112 @@ async fn fetch_ci_failures(
     // Last resort: just list the failed check names
     let names: Vec<&str> = failed.iter().filter_map(|r| r["name"].as_str()).collect();
     Some(format!("Failed checks: {}", names.join(", ")))
+}
+
+/// Make sure the run's PR is open before feedback work starts, reattaching or
+/// reopening as needed, and drop the "⚠️ Partial:" salvage prefix from the
+/// title. Best-effort: failures log and fall through (comments still land on
+/// a closed PR).
+async fn ensure_pr_open(state: &WorkerState, github: &GitHubClient, msg: &mut FeedbackMessage) {
+    let Ok(pr) = github
+        .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    else {
+        return;
+    };
+
+    let closed = pr["state"].as_str() == Some("closed");
+    let merged = !pr["merged_at"].is_null();
+    let branch = pr["head"]["ref"].as_str().unwrap_or("").to_string();
+
+    if closed && !merged && !branch.is_empty() {
+        // Another PR may have taken over the branch (the pre-v0.1.0 churn
+        // closed old PRs and minted new ones on the same branch).
+        let successor = github
+            .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, &branch)
+            .await
+            .ok()
+            .flatten();
+        if let Some(open_pr) = successor {
+            let new_number = open_pr["number"].as_u64().unwrap_or(msg.pr_number);
+            let new_url = open_pr["html_url"].as_str().unwrap_or("").to_string();
+            info!(
+                old_pr = msg.pr_number,
+                new_pr = new_number,
+                "Run's PR is closed — reattaching feedback to the branch's open PR"
+            );
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &format!(
+                    "PR #{} is closed — continuing on open PR #{new_number} for the same branch",
+                    msg.pr_number
+                ),
+            )
+            .await;
+            msg.pr_number = new_number;
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key(
+                    "team_id",
+                    aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
+                )
+                .key(
+                    "run_id",
+                    aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
+                )
+                .update_expression("SET pr_number = :pn, pr_url = :pu")
+                .expression_attribute_values(
+                    ":pn",
+                    aws_sdk_dynamodb::types::AttributeValue::N(new_number.to_string()),
+                )
+                .expression_attribute_values(
+                    ":pu",
+                    aws_sdk_dynamodb::types::AttributeValue::S(new_url),
+                )
+                .send()
+                .await;
+        } else if github
+            .reopen_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+            .await
+            .is_ok()
+        {
+            info!(
+                pr_number = msg.pr_number,
+                "Reopened closed PR for re-review"
+            );
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &format!("Reopened PR #{} for re-review", msg.pr_number),
+            )
+            .await;
+        } else {
+            warn!(
+                pr_number = msg.pr_number,
+                "Could not reopen closed PR — feedback will post to it anyway"
+            );
+        }
+    }
+
+    // Strip the salvage marker from the title now that the PR is being
+    // actively finished.
+    if let Some(title) = pr["title"].as_str() {
+        if let Some(clean) = title.strip_prefix("⚠️ Partial: ") {
+            if github
+                .update_pr_title(&msg.repo_owner, &msg.repo_name, msg.pr_number, clean)
+                .await
+                .is_ok()
+            {
+                info!(
+                    pr_number = msg.pr_number,
+                    "Removed Partial marker from PR title"
+                );
+            }
+        }
+    }
 }

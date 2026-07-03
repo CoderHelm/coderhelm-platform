@@ -1176,6 +1176,15 @@ async fn mark_pr_ready(github: &GitHubClient, repo_owner: &str, repo_name: &str,
             .await
         {
             Ok(pr) => {
+                // A PR reaching ready (CI + review passed) is no longer
+                // "partial" — drop the salvage marker from the title.
+                if let Some(title) = pr.get("title").and_then(|v| v.as_str()) {
+                    if let Some(clean) = title.strip_prefix("⚠️ Partial: ") {
+                        let _ = github
+                            .update_pr_title(repo_owner, repo_name, pr_number, clean)
+                            .await;
+                    }
+                }
                 let is_draft = pr.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
                 if !is_draft {
                     info!(pr_number, "PR already not a draft — skipping mark_pr_ready");
