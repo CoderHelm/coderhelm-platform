@@ -1071,9 +1071,12 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .await
                 {
                     Ok(c) => c,
-                    Err(e) => return Ok(json!(format!(
-                        "Could not read {path} at ref '{from_ref}': {e}. Check the path and ref."
-                    ))),
+                    Err(e) => {
+                        let hint = format!(
+                            "Could not read {path} at ref '{from_ref}': {e}. Check the path and ref."
+                        );
+                        return Ok(json!(hint));
+                    }
                 };
                 let sha = self
                     .github
