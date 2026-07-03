@@ -1165,7 +1165,12 @@ async fn set_run_awaiting_ci(
     Ok(())
 }
 
-async fn mark_pr_ready(github: &GitHubClient, repo_owner: &str, repo_name: &str, pr_number: u64) {
+pub(crate) async fn mark_pr_ready(
+    github: &GitHubClient,
+    repo_owner: &str,
+    repo_name: &str,
+    pr_number: u64,
+) {
     if pr_number == 0 {
         return;
     }

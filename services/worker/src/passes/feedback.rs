@@ -38,6 +38,12 @@ pub async fn run(
     // work is being finished.
     ensure_pr_open(state, &github, &mut msg).await;
 
+    // Whether the pre-feedback conflict resolution pushed a merge commit —
+    // that push triggers CI, so completing without awaiting_ci would leave
+    // the CI result with no consumer (and a salvaged draft PR stuck in
+    // draft forever).
+    let mut conflicts_pushed = false;
+
     // Resolve merge conflicts before processing feedback (especially on re-review)
     {
         let run_record = state
@@ -93,6 +99,7 @@ pub async fn run(
                 .await
                 {
                     Ok(true) => {
+                        conflicts_pushed = true;
                         info!(run_id = %msg.run_id, "Resolved merge conflicts before feedback")
                     }
                     Ok(false) => {}
@@ -154,6 +161,16 @@ pub async fn run(
 
     if comments.is_empty() && msg.review_body.is_empty() && !has_ci_failures {
         info!(run_id = %msg.run_id, "All comments already answered and CI green — skipping feedback");
+
+        // Nothing left to do and CI is green — a salvaged DRAFT PR would
+        // otherwise never be marked ready (only resume paths did that).
+        crate::passes::resume::mark_pr_ready(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+        )
+        .await;
 
         // Reset status back to completed so the run doesn't stay stuck at "running"
         let now = chrono::Utc::now().to_rfc3339();
@@ -389,8 +406,10 @@ Rules:
         }
     }
 
-    // If feedback committed code changes, set awaiting_ci so we watch for CI results
-    let code_pushed = *executor.files_modified.lock().unwrap();
+    // If feedback committed code changes — OR the pre-feedback conflict
+    // resolution pushed a merge commit — set awaiting_ci so the CI result
+    // has a consumer.
+    let code_pushed = *executor.files_modified.lock().unwrap() || conflicts_pushed;
     let final_status = if code_pushed {
         "awaiting_ci"
     } else {
