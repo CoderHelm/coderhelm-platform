@@ -36,7 +36,10 @@ pub async fn run(
     // PRs per branch), otherwise reopen the original. Also strip the
     // "⚠️ Partial:" salvage marker — someone actively re-reviewing means the
     // work is being finished.
-    ensure_pr_open(state, &github, &mut msg).await;
+    if !ensure_pr_open(state, &github, &mut msg).await {
+        // A human closed the PR — respect it and stop.
+        return Ok(());
+    }
 
     // Whether the pre-feedback conflict resolution pushed a merge commit —
     // that push triggers CI, so completing without awaiting_ci would leave
@@ -1399,21 +1402,99 @@ async fn fetch_ci_failures(
 /// reopening as needed, and drop the "⚠️ Partial:" salvage prefix from the
 /// title. Best-effort: failures log and fall through (comments still land on
 /// a closed PR).
-async fn ensure_pr_open(state: &WorkerState, github: &GitHubClient, msg: &mut FeedbackMessage) {
+/// Prepare the run's PR for feedback. Returns `false` if the run must NOT
+/// proceed — specifically when a human closed the PR (their decision wins;
+/// resurrecting it and pushing commits, as the churn-era reopen did, is
+/// exactly what we must not do). Returns `true` to continue.
+async fn ensure_pr_open(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &mut FeedbackMessage,
+) -> bool {
     let Ok(pr) = github
         .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await
     else {
-        return;
+        return true;
     };
 
     let closed = pr["state"].as_str() == Some("closed");
     let merged = !pr["merged_at"].is_null();
     let branch = pr["head"]["ref"].as_str().unwrap_or("").to_string();
 
+    if merged {
+        return true;
+    }
+
+    if closed {
+        // Who closed it? Only reopen/reattach when CODERHELM closed it (the
+        // churn-era force-reset auto-closed its own PRs). If a HUMAN closed
+        // it, they made a deliberate decision — stop the run, don't reopen,
+        // don't push anything.
+        let closer = github
+            .get_pr_closed_by(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+            .await;
+        let closed_by_human = closer
+            .as_deref()
+            .map(|login| !login.to_lowercase().contains("coderhelm"))
+            .unwrap_or(false);
+        if closed_by_human {
+            let who = closer.as_deref().unwrap_or("a user");
+            info!(
+                pr_number = msg.pr_number,
+                closed_by = who,
+                "PR was closed by a human — abandoning the run, not reopening"
+            );
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &format!(
+                    "PR #{} was closed by {who} — stopping (a human closed it).",
+                    msg.pr_number
+                ),
+            )
+            .await;
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key(
+                    "team_id",
+                    aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
+                )
+                .key(
+                    "run_id",
+                    aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
+                )
+                .update_expression(
+                    "SET #s = :s, status_run_id = :sri, current_pass = :cp, updated_at = :t",
+                )
+                .expression_attribute_names("#s", "status")
+                .expression_attribute_values(
+                    ":s",
+                    aws_sdk_dynamodb::types::AttributeValue::S("cancelled".to_string()),
+                )
+                .expression_attribute_values(
+                    ":sri",
+                    aws_sdk_dynamodb::types::AttributeValue::S(format!("cancelled#{}", msg.run_id)),
+                )
+                .expression_attribute_values(
+                    ":cp",
+                    aws_sdk_dynamodb::types::AttributeValue::S("cancelled".to_string()),
+                )
+                .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
+                .send()
+                .await;
+            return false;
+        }
+    }
+
     if closed && !merged && !branch.is_empty() {
-        // Another PR may have taken over the branch (the pre-v0.1.0 churn
-        // closed old PRs and minted new ones on the same branch).
+        // Coderhelm closed it (churn force-reset). Another PR may have taken
+        // over the branch (the pre-v0.1.0 churn closed old PRs and minted new
+        // ones on the same branch).
         let successor = github
             .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, &branch)
             .await
@@ -1501,4 +1582,6 @@ async fn ensure_pr_open(state: &WorkerState, github: &GitHubClient, msg: &mut Fe
             }
         }
     }
+
+    true
 }

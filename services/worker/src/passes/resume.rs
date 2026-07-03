@@ -1189,6 +1189,12 @@ pub(crate) async fn mark_pr_ready(
             .await
         {
             Ok(pr) => {
+                // If the PR was closed (e.g. a human closed it), never
+                // reopen/mark it ready — respect the close.
+                if pr.get("state").and_then(|v| v.as_str()) == Some("closed") {
+                    info!(pr_number, "PR is closed — not marking ready");
+                    return;
+                }
                 // A PR reaching ready (CI + review passed) is no longer
                 // "partial" — drop the salvage marker from the title.
                 if let Some(title) = pr.get("title").and_then(|v| v.as_str()) {

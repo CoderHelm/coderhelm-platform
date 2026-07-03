@@ -939,6 +939,22 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// The login of whoever closed a PR, via the issues endpoint (the PR
+    /// object doesn't carry `closed_by`). None if open, merged, or unknown.
+    pub async fn get_pr_closed_by(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Option<String> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/issues/{pr_number}");
+        let data = self.get(&url).await.ok()?;
+        data.get("closed_by")
+            .and_then(|v| v.get("login"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
     /// Create a pull request.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_pull_request(
