@@ -9,6 +9,7 @@ use crate::agent::provider::ModelProvider;
 use crate::clients::github::{FileOp, GitHubClient};
 use crate::models::{TicketMessage, TokenUsage};
 use crate::passes::plan::PlanResult;
+use crate::passes::syntax_check;
 use crate::passes::FileCache;
 use crate::WorkerState;
 
@@ -37,7 +38,8 @@ pub async fn run(
     let rules_block = super::format_rules_block(rules);
     // Trim repo instructions for simple issues to reduce per-turn token cost
     let trimmed_instructions = if complexity == "simple" && repo_instructions.len() > 2000 {
-        &repo_instructions[..repo_instructions[..2000].rfind('\n').unwrap_or(2000)]
+        let head = common::truncate_str(repo_instructions, 2000);
+        &head[..head.rfind('\n').unwrap_or(head.len())]
     } else {
         repo_instructions
     };
@@ -208,9 +210,13 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     }
 
     let tasks_key = format!(
-        "teams/{}/runs/{}/openspec/tasks.md",
-        msg.team_id,
-        msg.ticket_id.to_lowercase()
+        "{}/tasks.md",
+        crate::passes::openspec_prefix(
+            &msg.team_id,
+            &msg.ticket_id,
+            &msg.repo_owner,
+            &msg.repo_name
+        )
     );
     let task_tracker = TaskTracker::new(
         &state.s3,
@@ -696,6 +702,15 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing message")?;
+                // Full-content writes must be syntactically clean — there is
+                // no prior brokenness to inherit for a rewrite the agent
+                // authored end-to-end.
+                if let Err(problem) = syntax_check::validate_change(path, None, content) {
+                    return Ok(json!(format!(
+                        "Write REJECTED for {path} — content has syntax problems: {problem}. \
+                         Fix the content and retry."
+                    )));
+                }
                 let sha = input.get("sha").and_then(|v| v.as_str());
                 self.github
                     .write_file(
@@ -745,7 +760,10 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                 };
                 let mut content = original_content.clone();
 
-                // Apply edits sequentially
+                // Apply edits sequentially — ALL must succeed or NOTHING is
+                // written. Committing the subset that happened to match left
+                // logically incomplete changes (half a rename) on the branch
+                // with only a "Warnings:" note.
                 let mut applied = 0;
                 let mut errors = Vec::new();
                 for edit in edits {
@@ -759,13 +777,13 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     if count == 0 {
                         errors.push(format!(
                             "old_text not found: {}…",
-                            &old_text[..old_text.len().min(60)]
+                            common::truncate_str(old_text, 60)
                         ));
                     } else if count > 1 {
                         errors.push(format!(
                             "old_text matched {} times (must be unique): {}…",
                             count,
-                            &old_text[..old_text.len().min(60)]
+                            common::truncate_str(old_text, 60)
                         ));
                     } else {
                         content = content.replacen(old_text, new_text, 1);
@@ -773,14 +791,32 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     }
                 }
 
-                if applied == 0 {
+                if !errors.is_empty() {
                     return Ok(json!(format!(
-                        "No edits applied to {path}: {}",
+                        "NO edits applied to {path} — all edits in one call must succeed \
+                         atomically, and {} failed: {}. Re-read the current file content \
+                         and retry with corrected old_text (remember earlier edits in the \
+                         same call change the text later edits must match).",
+                        errors.len(),
                         errors.join("; ")
                     )));
                 }
+                if applied == 0 {
+                    return Ok(json!(format!("No edits provided for {path}")));
+                }
 
-                // Guardrail: reject edits that break brace balance or delete too much
+                // Syntax gate: the edited file must parse-scan clean (or be no
+                // worse than it already was). Catches single dropped braces,
+                // corrupted JSON/YAML, broken template literals.
+                if let Err(problem) =
+                    syntax_check::validate_change(path, Some(&original_content), &content)
+                {
+                    return Ok(json!(format!(
+                        "Edit REJECTED for {path} — it would break the file's syntax: {problem}. \
+                         Read the file again and retry with a corrected edit."
+                    )));
+                }
+                // Deletion guardrail: reject edits that gut the file
                 if let Some(problem) = validate_edit_safety(&original_content, &content, path) {
                     return Ok(json!(format!(
                         "Edit REJECTED for {path}: {problem}. \
@@ -810,11 +846,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                 self.file_cache.insert(cache_key, content).await;
                 self.task_tracker.mark_files_done(&[path]).await;
 
-                let mut result = format!("Applied {applied} edit(s) to {path}");
-                if !errors.is_empty() {
-                    result.push_str(&format!(". Warnings: {}", errors.join("; ")));
-                }
-                Ok(json!(result))
+                Ok(json!(format!("Applied {applied} edit(s) to {path}")))
             }
             "batch_write" => {
                 let message = input
@@ -843,15 +875,19 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                         });
                     } else {
                         let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        // Atomic batch: one syntactically broken file rejects
+                        // the whole commit — same contract as edit_file.
+                        if let Err(problem) = syntax_check::validate_change(path, None, content) {
+                            return Ok(json!(format!(
+                                "Batch write REJECTED — {path} has syntax problems: {problem}. \
+                                 Nothing was committed; fix the content and retry."
+                            )));
+                        }
                         ops.push(FileOp::Write {
                             path: path.to_string(),
                             content: content.to_string(),
                         });
                     }
-                    self.files_modified.lock().unwrap().insert(path.to_string());
-                    self.file_cache
-                        .remove(&format!("{}:{}", self.branch, path))
-                        .await;
                 }
                 if ops.is_empty() {
                     return Ok(json!(format!(
@@ -863,6 +899,18 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     .github
                     .batch_write(&self.owner, &self.repo, &self.branch, message, &ops)
                     .await?;
+                // Bookkeeping only after the commit actually landed — doing it
+                // inside the build loop recorded files as modified even when a
+                // later file rejected the whole batch.
+                for op in &ops {
+                    let path = match op {
+                        FileOp::Write { path, .. } | FileOp::Delete { path } => path,
+                    };
+                    self.files_modified.lock().unwrap().insert(path.clone());
+                    self.file_cache
+                        .remove(&format!("{}:{}", self.branch, path))
+                        .await;
+                }
                 let written_paths: Vec<&str> = ops
                     .iter()
                     .filter_map(|op| match op {
@@ -896,7 +944,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                         lines.push(format!("{filename} ({status}, +{adds}/-{dels})"));
                         if let Some(patch) = f.get("patch").and_then(|v| v.as_str()) {
                             let truncated = if patch.len() > 2000 {
-                                format!("{}... (truncated)", &patch[..2000])
+                                format!("{}... (truncated)", common::truncate_str(patch, 2000))
                             } else {
                                 patch.to_string()
                             };
@@ -977,57 +1025,17 @@ fn extract_file_paths(tasks: &str) -> Vec<String> {
     paths
 }
 
-/// Validates that an edit didn't break brace balance or delete too much code.
-/// Returns `Some(reason)` if the edit should be rejected, `None` if it's safe.
+/// Deletion guardrail: rejects edits that gut the file. Bracket/syntax
+/// validation moved to `syntax_check::validate_change`, which is
+/// string/comment-aware and catches single-delimiter breaks the old raw
+/// character count (threshold ±2) waved through.
 fn validate_edit_safety(original: &str, edited: &str, path: &str) -> Option<String> {
-    // Only validate code files (JS/TS/JSX/TSX/Java/Kotlin/Rust/Go/C/C++)
     let code_ext = [
         ".ts", ".tsx", ".js", ".jsx", ".java", ".kt", ".rs", ".go", ".c", ".cpp", ".cs", ".swift",
         ".dart", ".rb", ".py",
     ];
     if !code_ext.iter().any(|ext| path.ends_with(ext)) {
         return None;
-    }
-
-    fn brace_balance(s: &str) -> (i32, i32, i32) {
-        let mut curly = 0i32;
-        let mut round = 0i32;
-        let mut square = 0i32;
-        for ch in s.chars() {
-            match ch {
-                '{' => curly += 1,
-                '}' => curly -= 1,
-                '(' => round += 1,
-                ')' => round -= 1,
-                '[' => square += 1,
-                ']' => square -= 1,
-                _ => {}
-            }
-        }
-        (curly, round, square)
-    }
-
-    let (oc, or_, os) = brace_balance(original);
-    let (ec, er, es) = brace_balance(edited);
-
-    // If original was balanced (or close) and edit broke it significantly, reject
-    if (ec - oc).abs() >= 2 {
-        return Some(format!(
-            "curly brace balance changed by {} (was {oc}, now {ec}) — likely missing closing braces",
-            ec - oc
-        ));
-    }
-    if (er - or_).abs() >= 3 {
-        return Some(format!(
-            "parenthesis balance changed by {} — likely missing closing parens",
-            er - or_
-        ));
-    }
-    if (es - os).abs() >= 3 {
-        return Some(format!(
-            "bracket balance changed by {} — likely missing closing brackets",
-            es - os
-        ));
     }
 
     // Net deletion guard: if edit removes more than 40% of lines, reject

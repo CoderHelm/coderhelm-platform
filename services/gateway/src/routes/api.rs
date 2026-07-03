@@ -819,7 +819,7 @@ pub async fn get_run_openspec(
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&claims.team_id))
         .key("run_id", attr_s(&run_id))
-        .projection_expression("ticket_id")
+        .projection_expression("ticket_id, repo")
         .send()
         .await
         .map_err(|e| {
@@ -833,26 +833,47 @@ pub async fn get_run_openspec(
         .and_then(|v| v.as_s().ok())
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let prefix = format!(
+    // Worker writes openspec under a repo-scoped prefix; fall back to the
+    // legacy ticket-only prefix for runs that predate the scoping.
+    let repo_scoped = item
+        .get("repo")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|r| r.split_once('/'))
+        .map(|(owner, name)| {
+            format!(
+                "teams/{}/runs/{}/openspec/{owner}__{name}",
+                claims.team_id,
+                ticket_id.to_lowercase()
+            )
+        });
+    let legacy = format!(
         "teams/{}/runs/{}/openspec",
         claims.team_id,
         ticket_id.to_lowercase()
     );
+    let prefixes: Vec<String> = repo_scoped.into_iter().chain([legacy]).collect();
 
     let mut files = serde_json::Map::new();
     for name in &["proposal.md", "design.md", "tasks.md", "spec.md"] {
-        let key = format!("{prefix}/{name}");
-        if let Ok(output) = state
-            .s3
-            .get_object()
-            .bucket(&state.config.bucket_name)
-            .key(&key)
-            .send()
-            .await
-        {
-            if let Ok(bytes) = output.body.collect().await {
-                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                    files.insert(name.replace(".md", ""), Value::String(text));
+        let mut found = false;
+        for prefix in &prefixes {
+            if found {
+                break;
+            }
+            let key = format!("{prefix}/{name}");
+            if let Ok(output) = state
+                .s3
+                .get_object()
+                .bucket(&state.config.bucket_name)
+                .key(&key)
+                .send()
+                .await
+            {
+                if let Ok(bytes) = output.body.collect().await {
+                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                        files.insert(name.replace(".md", ""), Value::String(text));
+                        found = true;
+                    }
                 }
             }
         }

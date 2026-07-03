@@ -131,7 +131,7 @@ pub async fn run(
             if !agents_md.is_empty() {
                 // Take first ~500 chars (overview + tech stack, not full file)
                 let summary = if agents_md.len() > 500 {
-                    format!("{}...", &agents_md[..500])
+                    format!("{}...", common::truncate_str(&agents_md, 500))
                 } else {
                     agents_md
                 };
@@ -223,7 +223,7 @@ async fn onboard_repo(
         {
             // Limit each file to ~4KB to stay within context window
             let truncated = if content.len() > 4096 {
-                format!("{}...(truncated)", &content[..4096])
+                format!("{}...(truncated)", common::truncate_str(&content, 4096))
             } else {
                 content
             };
@@ -321,7 +321,7 @@ async fn generate_voice_md(
         if let Some(body) = pr.get("body").and_then(|b| b.as_str()) {
             if !body.is_empty() {
                 let truncated = if body.len() > 2048 {
-                    &body[..2048]
+                    common::truncate_str(body, 2048)
                 } else {
                     body
                 };

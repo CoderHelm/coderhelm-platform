@@ -138,6 +138,17 @@ impl AgentMemory {
             }
         };
 
+        // Relevance floor: top-k on a small store returns SOMETHING no matter
+        // how unrelated — injecting off-topic memories into every ticket
+        // steers the agent wrong. Cosine similarity below the floor is noise.
+        // Titan-embed-v2 cosine scores for related text sit lower than
+        // OpenAI-style embeddings — 0.45 filtered genuinely relevant
+        // memories; 0.25 removes only noise.
+        const MIN_RELEVANCE: f32 = 0.25;
+        let results: Vec<_> = results
+            .into_iter()
+            .filter(|(_, score)| *score >= MIN_RELEVANCE)
+            .collect();
         if results.is_empty() {
             return String::new();
         }
@@ -211,6 +222,7 @@ impl AgentMemory {
         &mut self,
         conversation_json: &[serde_json::Value],
         api_key: &str,
+        model_id: &str,
     ) {
         if conversation_json.is_empty() || api_key.is_empty() {
             return;
@@ -230,7 +242,7 @@ impl AgentMemory {
                     for block in content {
                         if block["type"].as_str() == Some("text") {
                             if let Some(text) = block["text"].as_str() {
-                                let truncated = if text.len() > 500 { &text[..500] } else { text };
+                                let truncated = common::truncate_str(text, 500);
                                 summary.push_str(&format!("[Assistant]: {truncated}\n"));
                             }
                         }
@@ -272,7 +284,9 @@ impl AgentMemory {
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&serde_json::json!({
-                "model": "claude-haiku-4-5",
+                // Team-configured model — the hardcoded model id silently
+                // broke extraction for teams whose keys lack access to it.
+                "model": model_id,
                 "max_tokens": 1024,
                 "messages": [{"role": "user", "content": extraction_prompt}],
             }))
