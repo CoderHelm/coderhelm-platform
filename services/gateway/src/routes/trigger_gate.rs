@@ -72,10 +72,27 @@ pub async fn gate_ticket_trigger(
             .unwrap_or_default()
     };
 
-    if items
-        .iter()
-        .any(|i| matches!(status_of(i).as_str(), "running" | "queued" | "awaiting_ci"))
-    {
+    // In-flight only counts while plausibly ALIVE: a run stuck in "running"
+    // (worker crashed pre-terminal) or an abandoned awaiting_ci would
+    // otherwise block the ticket forever. Bounds: running/queued can't
+    // outlive a 15-min Lambda by much (2h is generous across retries);
+    // awaiting_ci is finalized by the 24h wall cap (26h adds slack).
+    let now = chrono::Utc::now();
+    let age_hours = |i: &std::collections::HashMap<String, AttributeValue>| {
+        i.get("updated_at")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| now.signed_duration_since(t).num_hours())
+            .unwrap_or(i64::MAX)
+    };
+    if items.iter().any(|i| {
+        let h = age_hours(i);
+        match status_of(i).as_str() {
+            "running" | "queued" => h < 2,
+            "awaiting_ci" => h < 26,
+            _ => false,
+        }
+    }) {
         info!(team_id, ticket_id, "Trigger gate: run in flight — skipping");
         return TicketGate::SkipInFlight;
     }
