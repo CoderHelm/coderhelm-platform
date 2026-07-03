@@ -3970,9 +3970,19 @@ pub async fn list_dlq_messages(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // The DLQ is one queue shared by ALL tenants — without this filter any
+    // team's admin could read every other team's failed messages (ticket
+    // bodies, repo details). Receipt handles for other teams' messages are
+    // never returned, which implicitly scopes redrive/delete too.
     let messages: Vec<Value> = resp
         .messages()
         .iter()
+        .filter(|m| {
+            m.body()
+                .and_then(|b| serde_json::from_str::<Value>(b).ok())
+                .and_then(|v| v.get("team_id").and_then(|t| t.as_str()).map(String::from))
+                .is_some_and(|t| t == claims.team_id)
+        })
         .map(|m| {
             let body: Value = m
                 .body()
@@ -4035,6 +4045,14 @@ pub async fn redrive_dlq_message(
         .as_str()
         .ok_or(StatusCode::BAD_REQUEST)?;
     let message_body = body.get("body").ok_or(StatusCode::BAD_REQUEST)?;
+    // Cross-tenant guard: only redrive messages belonging to the caller's team.
+    if message_body
+        .get("team_id")
+        .and_then(|t| t.as_str())
+        .is_none_or(|t| t != claims.team_id)
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     // Determine which source queue to send to based on message content
     let body_str = if message_body.is_string() {
@@ -4129,17 +4147,50 @@ pub async fn purge_dlq(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    state
-        .sqs
-        .purge_queue()
-        .queue_url(&state.config.dlq_url)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to purge DLQ: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // The DLQ is shared across ALL tenants — a queue-level purge destroyed
+    // every other team's recovery data. Iterate and delete only the caller's
+    // team's messages instead (bounded sweep).
+    let mut deleted = 0u32;
+    for _ in 0..20 {
+        let resp = state
+            .sqs
+            .receive_message()
+            .queue_url(&state.config.dlq_url)
+            .max_number_of_messages(10)
+            .visibility_timeout(30)
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to receive DLQ messages for purge: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let msgs = resp.messages();
+        if msgs.is_empty() {
+            break;
+        }
+        for m in msgs {
+            let mine = m
+                .body()
+                .and_then(|b| serde_json::from_str::<Value>(b).ok())
+                .and_then(|v| v.get("team_id").and_then(|t| t.as_str()).map(String::from))
+                .is_some_and(|t| t == claims.team_id);
+            if mine {
+                if let Some(handle) = m.receipt_handle() {
+                    let _ = state
+                        .sqs
+                        .delete_message()
+                        .queue_url(&state.config.dlq_url)
+                        .receipt_handle(handle)
+                        .send()
+                        .await;
+                    deleted += 1;
+                }
+            }
+            // Other teams' messages return to the queue when their 30s
+            // visibility timeout lapses.
+        }
+    }
 
-    warn!(team_id = %claims.team_id, "DLQ purged");
+    warn!(team_id = %claims.team_id, deleted, "DLQ purged (team-scoped)");
     Ok(StatusCode::OK)
 }
