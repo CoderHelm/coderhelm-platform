@@ -1049,6 +1049,222 @@ pub async fn retry_run(
     Ok(Json(json!({ "status": "retrying" })))
 }
 
+/// Close a PR and delete a branch via the GitHub App token. Best-effort.
+async fn github_reset_branch(
+    state: &AppState,
+    installation_id: u64,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    pr_number: u64,
+) {
+    let token = match crate::auth::github_app::get_installation_token(state, installation_id).await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("reset: could not get installation token: {e}");
+            return;
+        }
+    };
+    // Close the PR (if any) so the fresh run doesn't reuse it.
+    if pr_number > 0 {
+        let url = format!("https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}");
+        let _ = state
+            .http
+            .patch(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "Coderhelm-bot")
+            .json(&serde_json::json!({ "state": "closed" }))
+            .send()
+            .await;
+    }
+    // Delete the working branch so the run starts from a clean base. GitHub
+    // 422s if it's already gone — fine.
+    if !branch.is_empty() {
+        let url = format!("https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch}");
+        let _ = state
+            .http
+            .delete(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "Coderhelm-bot")
+            .send()
+            .await;
+    }
+}
+
+/// POST /api/runs/:run_id/reset — close the PR, delete the branch, and start
+/// a brand-new run from scratch. Unlike retry, works on ANY run status —
+/// the "start over cleanly" control for a run whose branch is corrupted or
+/// whose work should be thrown away.
+pub async fn reset_and_rerun(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+
+    if super::github_webhook::check_run_budget(&state, &claims.team_id)
+        .await
+        .is_some()
+    {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&claims.team_id))
+        .key("run_id", attr_s(&run_id))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch run for reset: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
+
+    let repo = item
+        .get("repo")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let parts: Vec<&str> = repo.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let mut installation_id = item
+        .get("installation_id")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    if installation_id == 0 {
+        installation_id = get_team_installation_id(&state, &claims.team_id).await?;
+    }
+
+    let branch = item
+        .get("branch")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    let pr_number = item
+        .get("pr_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    // Clean the GitHub side: close PR + delete branch.
+    github_reset_branch(
+        &state,
+        installation_id,
+        parts[0],
+        parts[1],
+        &branch,
+        pr_number,
+    )
+    .await;
+
+    let ticket_source = item
+        .get("ticket_source")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("github");
+    let source = match ticket_source {
+        "jira" => TicketSource::Jira,
+        _ => TicketSource::Github,
+    };
+    let ticket_id = item
+        .get("ticket_id")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let issue_number = item
+        .get("issue_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    delete_ticket_lock(&state, &claims.team_id, ticket_id).await;
+
+    let (r_owner, r_name) = if matches!(source, TicketSource::Jira) {
+        (String::new(), String::new())
+    } else {
+        (parts[0].to_string(), parts[1].to_string())
+    };
+    let body = if matches!(source, TicketSource::Jira) {
+        item.get("ticket_body")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let message = WorkerMessage::Ticket(TicketMessage {
+        team_id: claims.team_id.clone(),
+        installation_id,
+        source,
+        ticket_id: ticket_id.to_string(),
+        title: item
+            .get("title")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        body,
+        repo_owner: r_owner,
+        repo_name: r_name,
+        issue_number,
+        sender: claims
+            .github_login
+            .clone()
+            .unwrap_or_else(|| claims.email.clone()),
+        image_attachments: item
+            .get("image_attachments")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default(),
+    });
+    let body = serde_json::to_string(&message).map_err(|e| {
+        error!("Failed to serialize reset message: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to enqueue reset run: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&claims.team_id))
+        .key("run_id", attr_s(&run_id))
+        .update_expression("SET #status = :s, status_run_id = :sri, updated_at = :t")
+        .expression_attribute_names("#status", "status")
+        .expression_attribute_values(":s", attr_s("retried"))
+        .expression_attribute_values(":sri", attr_s(&format!("retried#{run_id}")))
+        .expression_attribute_values(":t", attr_s(&now))
+        .send()
+        .await;
+
+    info!(
+        run_id,
+        "Run reset — branch cleaned and fresh run dispatched"
+    );
+    Ok(Json(json!({ "status": "resetting" })))
+}
+
 /// POST /api/runs/:run_id/re-review — re-enqueue feedback for a completed run.
 pub async fn re_review_run(
     State(state): State<Arc<AppState>>,
