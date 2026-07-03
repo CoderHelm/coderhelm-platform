@@ -336,10 +336,11 @@ After researching, output the four files using this exact format:
     let files = parse_openspec_files(&response);
 
     // Write openspec to S3
-    let prefix = format!(
-        "teams/{}/runs/{}/openspec",
-        msg.team_id,
-        msg.ticket_id.to_lowercase()
+    let prefix = crate::passes::openspec_prefix(
+        &msg.team_id,
+        &msg.ticket_id,
+        &msg.repo_owner,
+        &msg.repo_name,
     );
     for (name, content) in [
         ("proposal.md", &files.proposal),

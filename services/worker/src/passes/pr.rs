@@ -5,6 +5,7 @@ use crate::agent::{llm, provider};
 use crate::clients::github::{FileOp, GitHubClient};
 use crate::models::{TicketMessage, TicketSource, TokenUsage};
 use crate::passes::plan::PlanResult;
+use crate::passes::syntax_check;
 use crate::WorkerState;
 
 #[allow(dead_code)]
@@ -70,16 +71,21 @@ pub async fn run(
          4. **Verification** — Numbered steps to verify the change."
     };
 
+    let diff_patches = format_diff_patches(&diff);
     let prompt = format!(
         r#"Write a concise pull request description for ticket {ticket_ref}: {title}
 
-## Summary
+## Plan (context — what was INTENDED)
 {summary}
 
 ## Files Changed
-{diff_summary}{template_block}
+{diff_summary}
+
+## Actual diff excerpts (the source of truth — describe THIS)
+{diff_patches}{template_block}
 
 ## Instructions
+Describe what the DIFF actually does. Where the diff differs from the plan, the diff wins.
 {instructions}
 
 Rules:
@@ -157,8 +163,9 @@ Return ONLY the markdown body text."#,
         TicketSource::Jira => format!("{}: {}", msg.ticket_id, msg.title),
     };
     if title.len() > 72 {
-        title.truncate(69);
-        title.push_str("...");
+        // char-boundary-safe: String::truncate panics mid-codepoint, and
+        // ticket titles routinely contain em-dashes/emoji.
+        title = format!("{}...", common::truncate_str(&title, 69));
     }
 
     // Check if a PR already exists for this branch (e.g. from a re-run or retry)
@@ -432,8 +439,9 @@ pub async fn resolve_conflicts(
 
         let cap = |s: &str, limit: usize| -> String {
             if s.len() > limit {
-                let cut = s[..limit].rfind('\n').unwrap_or(limit);
-                format!("{}... (truncated, {} bytes total)", &s[..cut], s.len())
+                let head = common::truncate_str(s, limit);
+                let cut = head.rfind('\n').unwrap_or(head.len());
+                format!("{}... (truncated, {} bytes total)", &head[..cut], s.len())
             } else {
                 s.to_string()
             }
@@ -498,6 +506,39 @@ pub async fn resolve_conflicts(
         )
         .await?;
 
+        // Validate the model's merge before it becomes a commit — the output
+        // used to be committed verbatim (dropped hunks, stray fences,
+        // truncation all landed as file corruption). Any invalid file aborts
+        // the whole resolution: an unresolved conflict GitHub can display is
+        // strictly safer than a silently corrupted merge.
+        let merged_content = strip_code_fences(&merged_content);
+        let min_side = branch_content.len().min(main_content.len());
+        if merged_content.trim().is_empty() && min_side > 0 {
+            warn!(
+                path,
+                "LLM merge produced empty output — aborting conflict resolution"
+            );
+            return Ok(false);
+        }
+        if min_side > 200 && merged_content.len() < min_side * 3 / 10 {
+            warn!(
+                path,
+                merged = merged_content.len(),
+                min_side,
+                "LLM merge dropped most of the file — aborting conflict resolution"
+            );
+            return Ok(false);
+        }
+        if let Err(problem) =
+            syntax_check::validate_change(path, Some(&branch_content), &merged_content)
+        {
+            warn!(
+                path,
+                problem, "LLM merge is syntactically broken — aborting conflict resolution"
+            );
+            return Ok(false);
+        }
+
         resolved_files.push(FileOp::Write {
             path: path.to_string(),
             content: merged_content,
@@ -540,6 +581,22 @@ pub async fn resolve_conflicts(
     Ok(true)
 }
 
+/// Strip a wrapping markdown code fence the model may have added despite
+/// instructions ("```lang\n…\n```"). Inner fences are left untouched.
+fn strip_code_fences(s: &str) -> String {
+    let trimmed = s.trim();
+    // Only strip a WRAPPING fence: starts with ``` AND ends with ```.
+    // A file that legitimately begins with a fence (markdown docs) but has
+    // content after its last fence must pass through untouched.
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        if let Some(inner) = rest.strip_suffix("```") {
+            let after_lang = inner.find('\n').map(|i| i + 1).unwrap_or(0);
+            return inner[after_lang..].trim_end().to_string() + "\n";
+        }
+    }
+    s.to_string()
+}
+
 fn format_diff_summary(diff: &serde_json::Value) -> String {
     let files = match diff.get("files").and_then(|v| v.as_array()) {
         Some(f) => f,
@@ -560,6 +617,38 @@ fn format_diff_summary(diff: &serde_json::Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Real patch excerpts for the PR body writer. It previously saw only the
+/// plan and a filename list — when implement deviated from plan, the PR
+/// description confidently described a change that wasn't in the diff.
+/// Caps: per-file and total, char-boundary-safe.
+fn format_diff_patches(diff: &serde_json::Value) -> String {
+    const PER_FILE: usize = 1200;
+    const TOTAL: usize = 12_000;
+    let files = match diff.get("files").and_then(|v| v.as_array()) {
+        Some(f) => f,
+        None => return String::new(),
+    };
+    let mut out = String::new();
+    for f in files {
+        if out.len() >= TOTAL {
+            out.push_str("\n[… more files omitted …]\n");
+            break;
+        }
+        let path = f.get("filename").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(patch) = f.get("patch").and_then(|v| v.as_str()) else {
+            continue; // binary or too-large-for-API files have no patch
+        };
+        let excerpt = common::truncate_str(patch, PER_FILE);
+        let marker = if excerpt.len() < patch.len() {
+            "\n[… truncated …]"
+        } else {
+            ""
+        };
+        out.push_str(&format!("\n### {path}\n```diff\n{excerpt}{marker}\n```\n"));
+    }
+    out
 }
 
 /// Try to fetch a PR template from common locations in the repo.

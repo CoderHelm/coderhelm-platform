@@ -19,12 +19,40 @@ pub struct TriageResult {
 pub async fn run(
     state: &WorkerState,
     msg: &TicketMessage,
-    _github: &GitHubClient,
+    github: &GitHubClient,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<TriageResult, Box<dyn std::error::Error + Send + Sync>> {
     let system = "You are a ticket triage agent for a GitHub issue. \
                   Analyze the issue and classify it. Return only valid JSON.";
+
+    // Give the classifier a glimpse of the actual codebase — complexity is
+    // defined in file counts, which is unknowable from ticket text alone.
+    // Top-level structure is cheap (one tree call) and materially grounds
+    // the simple/medium/complex guess. Best-effort: skipped on any error.
+    let tree_hint = match github
+        .get_tree(&msg.repo_owner, &msg.repo_name, &msg.base_branch)
+        .await
+    {
+        Ok(tree) => {
+            let mut top_dirs: Vec<String> = tree
+                .iter()
+                .filter_map(|e| e.path.split('/').next().map(|s| s.to_string()))
+                .collect();
+            top_dirs.sort();
+            top_dirs.dedup();
+            top_dirs.truncate(40);
+            if top_dirs.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\nRepository top-level structure (for sizing the change):\n{}",
+                    top_dirs.join(", ")
+                )
+            }
+        }
+        Err(_) => String::new(),
+    };
 
     let has_images = !msg.image_attachments.is_empty();
     let image_hint = if has_images {
@@ -45,7 +73,7 @@ Number: #{number}
 Title: {title}
 
 Body:
-{body}{image_hint}
+{body}{image_hint}{tree_hint}
 
 ## Instructions
 Return a JSON object with these fields:
@@ -65,6 +93,7 @@ Rules:
         title = msg.title,
         body = msg.body,
         image_hint = image_hint,
+        tree_hint = tree_hint,
     );
 
     let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
@@ -101,16 +130,34 @@ Rules:
     )
     .await?;
 
-    // Parse JSON from response (strip markdown fences if present)
+    // Parse JSON from response. Tolerant extraction: take the outermost
+    // {...} span, so a prose preamble or trailing commentary (which used to
+    // hard-fail the whole run on serde error) doesn't matter.
     let raw = response.trim();
-    let json_str = if raw.starts_with("```") {
-        let inner = raw.split('\n').skip(1).collect::<Vec<_>>().join("\n");
-        inner.trim_end_matches("```").trim().to_string()
-    } else {
-        raw.to_string()
-    };
-
-    let result: TriageResult = serde_json::from_str(&json_str)?;
+    let end = raw.rfind('}').map(|e| e + 1).unwrap_or(raw.len());
+    // Prose preambles can contain '{' ("Analyzing {ticket}…") — try each
+    // candidate start until one parses.
+    let mut result: Option<TriageResult> = None;
+    let mut search_from = 0usize;
+    for _ in 0..5 {
+        let Some(start) = raw[search_from..].find('{').map(|p| p + search_from) else {
+            break;
+        };
+        if start >= end {
+            break;
+        }
+        if let Ok(parsed) = serde_json::from_str::<TriageResult>(&raw[start..end]) {
+            result = Some(parsed);
+            break;
+        }
+        search_from = start + 1;
+    }
+    let result = result.ok_or_else(|| {
+        format!(
+            "Triage returned unparseable JSON: {}",
+            common::truncate_str(raw, 200)
+        )
+    })?;
     info!(complexity = %result.complexity, clarity = %result.clarity, "Triage complete");
     Ok(result)
 }
@@ -245,7 +292,11 @@ Then on the LAST line, return ONLY the repository in `owner/name` format."#,
         usage,
         llm::ConverseOptions {
             max_turns: 1,
-            max_tokens: 512,
+            // The prompt asks for step-by-step reasoning THEN the answer on
+            // the last line — 512 tokens routinely cut the completion before
+            // the answer line existed, and the mid-sentence fragment fell
+            // through to the repos[0] fallback.
+            max_tokens: 2048,
             deadline: None,
         },
         None,
@@ -253,36 +304,84 @@ Then on the LAST line, return ONLY the repository in `owner/name` format."#,
     )
     .await?;
 
-    // Extract repo from the last non-empty line (reasoning comes before it)
-    let last_line = response
-        .trim()
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim()
-        .trim_matches('`')
-        .trim()
-        .to_string();
+    info!(response = %response.trim(), "Triage repo selection reasoning");
 
-    info!(response = %response.trim(), parsed = %last_line, "Triage repo selection reasoning");
+    if let Some(repo) = extract_repo_choice(&response, repos) {
+        info!(repo = %repo, "Repo selected for Jira ticket");
+        return Ok(repo);
+    }
 
-    let selected = last_line;
+    // Fall back to first repo — should now be rare (truncation fixed and the
+    // parser scans every line); the progress notes make it visible upstream.
+    info!(fallback = %repos[0], "LLM pick not in list, falling back");
+    Ok(repos[0].clone())
+}
 
-    // Validate the selection is in our list
-    if repos.contains(&selected) {
-        info!(repo = %selected, "Repo selected for Jira ticket");
-        Ok(selected)
-    } else {
-        // Fuzzy match — LLM might format slightly differently
+/// Scan the response from the LAST line upward for a line that names one of
+/// the team's repos. Tolerates markdown wrapping, punctuation, and prose
+/// around the `owner/name` token.
+fn extract_repo_choice(response: &str, repos: &[String]) -> Option<String> {
+    for line in response.trim().lines().rev() {
+        let cleaned = line.trim().trim_matches(['`', '*', '_', '"', '\'', '.']);
+        if cleaned.is_empty() {
+            continue;
+        }
+        // Exact / case-insensitive line match first
         for repo in repos {
-            if repo.eq_ignore_ascii_case(&selected) {
-                info!(repo = %repo, "Repo selected (case-insensitive match)");
-                return Ok(repo.clone());
+            if repo.eq_ignore_ascii_case(cleaned) {
+                return Some(repo.clone());
             }
         }
-        // Fall back to first repo
-        info!(selected = %selected, fallback = %repos[0], "LLM pick not in list, falling back");
-        Ok(repos[0].clone())
+        // Then substring: "SWITCH to owner/name" / "Answer: owner/name".
+        // Longest name wins (Org/app must not shadow Org/app-web) and
+        // negated mentions ("not Org/mobile") don't count.
+        let lower = cleaned.to_ascii_lowercase();
+        if lower.contains(" not ") || lower.contains("n't ") {
+            continue;
+        }
+        let mut candidates: Vec<&String> = repos.iter().collect();
+        candidates.sort_by_key(|r| std::cmp::Reverse(r.len()));
+        for repo in candidates {
+            if lower.contains(&repo.to_ascii_lowercase()) {
+                return Some(repo.clone());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_repo_choice;
+
+    #[test]
+    fn repo_choice_parsing() {
+        let repos = vec!["Org/speedboat".to_string(), "Org/mobile".to_string()];
+        // Plain last line
+        assert_eq!(
+            extract_repo_choice("reasoning...\nOrg/speedboat", &repos).as_deref(),
+            Some("Org/speedboat")
+        );
+        // Markdown + prose wrapping
+        assert_eq!(
+            extract_repo_choice("1. thinking\n2. more\nAnswer: **Org/mobile**.", &repos).as_deref(),
+            Some("Org/mobile")
+        );
+        // Truncated mid-reasoning but an earlier line names the repo
+        assert_eq!(
+            extract_repo_choice(
+                "The ticket belongs to Org/speedboat because the pages",
+                &repos
+            )
+            .as_deref(),
+            Some("Org/speedboat")
+        );
+        // Nothing matches
+        assert_eq!(extract_repo_choice("no idea", &repos), None);
+        // Case-insensitive
+        assert_eq!(
+            extract_repo_choice("org/SPEEDBOAT", &repos).as_deref(),
+            Some("Org/speedboat")
+        );
     }
 }

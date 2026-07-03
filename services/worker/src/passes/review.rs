@@ -102,7 +102,10 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
     .await?;
     info!("Review result: {}", &response[..response.len().min(200)]);
 
-    let passed = response.starts_with("LGTM") || !response.starts_with("ISSUES_FOUND:");
+    // Fail-closed verdict: the old `starts_with` check treated ANY response
+    // not literally beginning with "ISSUES_FOUND:" as a pass — a preamble
+    // line or markdown bold around the token silently discarded findings.
+    let passed = common::parse_verdict(&response, "LGTM", "ISSUES_FOUND") == common::Verdict::Pass;
     Ok(ReviewResult {
         passed,
         summary: response,
@@ -198,7 +201,7 @@ impl<'a> ToolExecutor for ReviewToolExecutor<'a> {
                         lines.push(format!("{filename} ({status}, +{adds}/-{dels})"));
                         if let Some(patch) = f.get("patch").and_then(|v| v.as_str()) {
                             let truncated = if patch.len() > 2000 {
-                                format!("{}... (truncated)", &patch[..2000])
+                                format!("{}... (truncated)", common::truncate_str(patch, 2000))
                             } else {
                                 patch.to_string()
                             };

@@ -79,6 +79,29 @@ impl FileCache {
     }
 }
 
+/// S3 prefix for a ticket's cached openspec plan, scoped to the repo the
+/// plan was generated against. The old ticket-only key silently reused a
+/// plan generated for repo A (its file paths and all) when the same ticket
+/// re-ran in repo B.
+pub(crate) fn openspec_prefix(team_id: &str, ticket_id: &str, owner: &str, repo: &str) -> String {
+    format!(
+        "teams/{team_id}/runs/{}/openspec/{owner}__{repo}",
+        ticket_id.to_lowercase()
+    )
+}
+
+/// Persist and unlock agent memory at an early exit. Without this, the
+/// no-changes / clarification / needs_input / blocked-plan returns leaked the
+/// memory lock for its full 15-minute TTL, forcing subsequent runs on the
+/// repo to start stateless.
+async fn close_memory(state: &WorkerState, mem: Option<crate::memory::AgentMemory>) {
+    if let Some(mem) = mem {
+        if let Err(e) = mem.close_and_upload(state).await {
+            warn!(error = %e, "Failed to persist agent memory at early exit");
+        }
+    }
+}
+
 /// Strip internal model IDs and service names from error messages
 /// so they are safe to display to users.
 fn sanitize_error(msg: &str) -> String {
@@ -131,6 +154,7 @@ mod resolve;
 pub mod resume;
 mod review;
 mod security;
+pub mod syntax_check;
 #[allow(dead_code)]
 mod test;
 mod triage;
@@ -304,8 +328,54 @@ pub async fn orchestrate_ticket(
                 }
             } else {
                 error!(run_id, error = %e, "Orchestration failed");
-                let sanitized = sanitize_error(&err_msg);
-                fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
+                // Salvage before failing: an implement that burned its turn
+                // budget mid-task has already pushed real commits to the
+                // branch. The timeout arm salvaged them into a draft PR; the
+                // error arm silently orphaned them.
+                let checkpoint = load_checkpoint(state, &msg.team_id, &run_id).await;
+                // Only mid-implement deaths salvage: for later-pass errors a
+                // salvage would mark the run completed and hide the real
+                // error behind a misleading "partial work" message.
+                let salvaged = if let Some((ref last_pass, ref branch, _)) = checkpoint {
+                    if !branch.is_empty() && last_pass.as_str() == "implement_started" {
+                        info!(
+                            run_id,
+                            branch,
+                            "Error mid-implement — attempting to salvage partial work as draft PR"
+                        );
+                        match salvage_timeout_pr(state, &msg, &run_id, branch, &usage, duration)
+                            .await
+                        {
+                            Ok(pr_url) => {
+                                info!(run_id, pr_url, "Salvaged partial work into draft PR");
+                                true
+                            }
+                            Err(salvage_err) => {
+                                warn!(run_id, error = %salvage_err, "Failed to salvage partial work");
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !salvaged {
+                    let sanitized = sanitize_error(&err_msg);
+                    fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
+                }
+                // `?` failure paths inside run_passes bypass close_memory —
+                // release the repo's memory lock so the next run isn't
+                // stateless for the lock's full 15-minute TTL.
+                crate::memory::lock::release_lock(
+                    &state.dynamo,
+                    &state.config.table_name,
+                    &msg.team_id,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                )
+                .await;
             }
         }
         Err(_elapsed) => {
@@ -318,7 +388,12 @@ pub async fn orchestrate_ticket(
             // Check if there's partial work on a branch we can salvage as a draft PR
             let checkpoint = load_checkpoint(state, &msg.team_id, &run_id).await;
             let salvaged = if let Some((ref last_pass, ref branch, _)) = checkpoint {
-                if !branch.is_empty() && matches!(last_pass.as_str(), "implement" | "security") {
+                if !branch.is_empty()
+                    && matches!(
+                        last_pass.as_str(),
+                        "implement" | "implement_started" | "security"
+                    )
+                {
                     info!(
                         run_id,
                         branch, "Timeout — attempting to salvage partial work as draft PR"
@@ -640,6 +715,8 @@ async fn run_passes(
         &format!("Triaged as {} complexity", triage_result.complexity),
     )
     .await;
+    // May be upgraded by the plan-size valve below — triage classifies blind.
+    let mut effective_complexity = triage_result.complexity.clone();
     info!(run_id, "Triage complete");
     update_progress_comment(
         &github,
@@ -679,15 +756,24 @@ async fn run_passes(
     // Compute context hash to detect ticket changes (body, images)
     let context_hash = plan::compute_ticket_context_hash(msg);
 
-    // Try to reuse existing plan from S3 (same ticket, no changes)
-    let existing_plan =
-        load_existing_plan(state, &msg.team_id, &msg.ticket_id, &context_hash).await;
+    // Try to reuse existing plan from S3 (same ticket, repo, and content)
+    let existing_plan = load_existing_plan(
+        state,
+        &msg.team_id,
+        &msg.ticket_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &context_hash,
+    )
+    .await;
     let mut context_changed = existing_plan.is_none();
-    let plan_result = if let Some(plan) = existing_plan {
+    let mut plan_was_reused = false;
+    let mut plan_result = if let Some(plan) = existing_plan {
         // Reuse if plan has content AND has unchecked tasks (not a completed plan from a previous run)
         let has_unchecked = plan.tasks.contains("- [ ]");
         if !plan.tasks.is_empty() && !plan.design.is_empty() && has_unchecked {
             context_changed = false;
+            plan_was_reused = true;
             info!(run_id, "Reusing existing plan from S3 — ticket unchanged");
             add_progress_note(state, &msg.team_id, run_id, "Reused existing plan").await;
             plan
@@ -739,6 +825,27 @@ async fn run_passes(
         run_id,
     )
     .await;
+
+    // --- Guard: a malformed/truncated plan must not proceed to implement ---
+    // parse_openspec_files returns empty strings for any fence the model
+    // omitted; an empty task list used to flow straight into implement and
+    // produce a guaranteed zero-change run.
+    let plan_is_directive = plan_result.tasks.starts_with("NO_CHANGES_NEEDED:")
+        || plan_result.tasks.starts_with("CLARIFICATION_NEEDED:");
+    if !plan_is_directive
+        && (plan_result.tasks.trim().is_empty() || plan_result.design.trim().is_empty())
+    {
+        warn!(
+            run_id,
+            "Plan generation produced empty tasks/design — failing run"
+        );
+        close_memory(state, agent_memory.take()).await;
+        return Err(
+            "Plan generation produced an empty or malformed plan (missing tasks/design). \
+             This is usually a transient model formatting issue — retry the run."
+                .into(),
+        );
+    }
 
     // --- Check: already done? ---
     if plan_result.tasks.starts_with("NO_CHANGES_NEEDED:") {
@@ -837,6 +944,7 @@ async fn run_passes(
                 .await;
         }
 
+        close_memory(state, agent_memory.take()).await;
         return Ok(());
     }
 
@@ -941,6 +1049,7 @@ async fn run_passes(
                 .await;
         }
 
+        close_memory(state, agent_memory.take()).await;
         return Ok(());
     }
 
@@ -1135,7 +1244,7 @@ async fn run_passes(
 
                     let max_log = 15_000;
                     let trimmed_logs = if logs.len() > max_log {
-                        format!("... (truncated)\n{}", &logs[logs.len() - max_log..])
+                        common::head_tail_str(&logs, max_log)
                     } else {
                         logs
                     };
@@ -1274,6 +1383,7 @@ async fn run_passes(
 
                         save_checkpoint(state, &msg.team_id, run_id, "pr", &branch_name, 1, usage)
                             .await;
+                        close_memory(state, agent_memory.take()).await;
                         return Ok(());
                     }
                     Err(e) => {
@@ -1345,6 +1455,39 @@ async fn run_passes(
                 &format!("Created branch {}", branch_name),
             )
             .await;
+
+            // The reset wiped any commits from a previous partial run, so a
+            // reused plan's `- [x]` checkmarks no longer reflect reality —
+            // implement is told to skip checked tasks, which silently dropped
+            // the wiped work. Reset every task to unchecked.
+            if plan_was_reused && plan_result.tasks.contains("- [x]") {
+                plan_result.tasks = plan_result.tasks.replace("- [x]", "- [ ]");
+                let tasks_key = format!(
+                    "{}/tasks.md",
+                    openspec_prefix(
+                        &msg.team_id,
+                        &msg.ticket_id,
+                        &msg.repo_owner,
+                        &msg.repo_name
+                    )
+                );
+                if let Err(e) = state
+                    .s3
+                    .put_object()
+                    .bucket(&state.config.bucket_name)
+                    .key(&tasks_key)
+                    .body(plan_result.tasks.as_bytes().to_vec().into())
+                    .content_type("text/markdown")
+                    .send()
+                    .await
+                {
+                    warn!(run_id, error = %e, "Failed to reset task checkmarks after branch reset");
+                }
+                info!(
+                    run_id,
+                    "Branch reset — reused plan's task checkmarks cleared"
+                );
+            }
         }
 
         // Commit openspec to the repo branch if enabled (default: on)
@@ -1397,6 +1540,30 @@ async fn run_passes(
         )
         .await;
 
+        // Complexity upgrade valve: triage classifies with zero codebase
+        // knowledge, and a wrong "simple" verdict silently strips the
+        // implement agent's model tier, exploration tools, and design
+        // context. If the plan itself references several files, the ticket
+        // is not simple — upgrade before implement. (Never downgrades.)
+        if triage_result.complexity == "simple" && plan_warnings.mentioned_file_count >= 4 {
+            info!(
+                run_id,
+                files = plan_warnings.mentioned_file_count,
+                "Plan touches multiple files — upgrading complexity simple → medium"
+            );
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Upgraded to medium complexity (plan references {} files)",
+                    plan_warnings.mentioned_file_count
+                ),
+            )
+            .await;
+            effective_complexity = "medium".to_string();
+        }
+
         // If plan files exist in a different repo, switch before implement
         if let Some(ref better_repo) = plan_warnings.switch_repo {
             let (new_owner, new_name) = better_repo.split_once('/').unwrap_or(("", ""));
@@ -1409,6 +1576,36 @@ async fn run_passes(
                 );
                 msg.repo_owner = new_owner.to_string();
                 msg.repo_name = new_name.to_string();
+
+                // Keep the openspec cache coherent: copy it to the new
+                // repo's prefix so the task tracker (post-switch msg) and
+                // future reuse reads find it.
+                let old_prefix = openspec_prefix(
+                    &msg.team_id,
+                    &msg.ticket_id,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                );
+                let new_prefix = openspec_prefix(&msg.team_id, &msg.ticket_id, new_owner, new_name);
+                for name in [
+                    "proposal.md",
+                    "design.md",
+                    "tasks.md",
+                    "spec.md",
+                    "context_hash.txt",
+                ] {
+                    let _ = state
+                        .s3
+                        .copy_object()
+                        .bucket(&state.config.bucket_name)
+                        .copy_source(format!(
+                            "{}/{}/{}",
+                            state.config.bucket_name, old_prefix, name
+                        ))
+                        .key(format!("{new_prefix}/{name}"))
+                        .send()
+                        .await;
+                }
 
                 // Re-resolve default branch for new repo
                 msg.base_branch = github
@@ -1492,6 +1689,7 @@ async fn run_passes(
                 )
                 .await;
             }
+            close_memory(state, agent_memory.take()).await;
             return Err(format!("Plan validation blocked: {warning_text}").into());
         }
         if !plan_warnings.warnings.is_empty() {
@@ -1549,7 +1747,7 @@ async fn run_passes(
                     &repo_msg.base_branch,
                     &rules,
                     &repo_instr,
-                    &triage_result.complexity,
+                    &effective_complexity,
                     &voice,
                     &provider,
                     usage,
@@ -1581,6 +1779,7 @@ async fn run_passes(
             }
 
             if pr_results.is_empty() {
+                close_memory(state, agent_memory.take()).await;
                 return Err("Multi-repo pipeline produced no PRs".into());
             }
 
@@ -1698,6 +1897,21 @@ async fn run_passes(
             .send()
             .await;
 
+        // Record the branch BEFORE implement runs: if implement dies mid-way
+        // (turn exhaustion, API failure), salvage needs the branch name, and
+        // the last successful checkpoint ("plan") doesn't carry one. The
+        // distinct pass name keeps can_skip_implement from treating an
+        // unfinished implement as done on SQS redelivery.
+        save_checkpoint(
+            state,
+            &msg.team_id,
+            run_id,
+            "implement_started",
+            &branch_name,
+            0,
+            usage,
+        )
+        .await;
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
         let result = implement::run(
@@ -1709,7 +1923,7 @@ async fn run_passes(
             &rules,
             &repo_instructions,
             None,
-            &triage_result.complexity,
+            &effective_complexity,
             &provider,
             usage,
             &file_cache,
@@ -1837,14 +2051,19 @@ async fn run_passes(
                 .expression_attribute_values(":cp", attr_s("done"))
                 .send()
                 .await;
+            close_memory(state, agent_memory.take()).await;
             return Ok(());
         }
 
         // Mark all tasks as done in S3 openspec so retries/dashboard see progress
         let tasks_key = format!(
-            "teams/{}/runs/{}/openspec/tasks.md",
-            msg.team_id,
-            msg.ticket_id.to_lowercase()
+            "{}/tasks.md",
+            openspec_prefix(
+                &msg.team_id,
+                &msg.ticket_id,
+                &msg.repo_owner,
+                &msg.repo_name
+            )
         );
         let checked = plan_result.tasks.replace("- [ ]", "- [x]");
         if let Err(e) = state
@@ -1912,16 +2131,19 @@ async fn run_passes(
                 repo_tasks: vec![],
             };
             let fix_cache = FileCache::default();
+            // Fixer gets the same rules/conventions as the original implement
+            // — it used to run with empty rules and instructions, free to
+            // violate every must-rule while "fixing".
             if let Err(e) = implement::run(
                 state,
                 msg,
                 &github,
                 &fix_plan,
                 &branch_name,
-                &[],
-                "",
+                &rules,
+                &repo_instructions,
                 Some(&test_issues),
-                "low",
+                "simple",
                 &provider,
                 usage,
                 &fix_cache,
@@ -2031,7 +2253,7 @@ async fn run_passes(
                     "Security audit found vulnerabilities. Fix ALL of the following:\n\n{}",
                     security_result.summary
                 )),
-                &triage_result.complexity,
+                &effective_complexity,
                 &provider,
                 usage,
                 &file_cache,
@@ -2214,8 +2436,12 @@ async fn run_passes(
 
     // Persist agent memory (extract learnings first)
     if let Some(mut mem) = agent_memory {
-        mem.extract_learnings_from_conversation(&impl_result.conversation_log, provider.api_key())
-            .await;
+        mem.extract_learnings_from_conversation(
+            &impl_result.conversation_log,
+            provider.api_key(),
+            provider.primary_model_id(),
+        )
+        .await;
         if let Err(e) = mem.close_and_upload(state).await {
             warn!(run_id, error = %e, "Failed to persist agent memory");
         }
@@ -2404,16 +2630,18 @@ async fn run_repo_pipeline(
                 repo_tasks: vec![],
             };
             let fix_cache = FileCache::default();
+            // Same rules/conventions as the original implement (see the
+            // single-repo auto-fix above).
             if let Err(e) = implement::run(
                 state,
                 msg,
                 github,
                 &fix_plan,
                 branch_name,
-                &[],
-                "",
+                rules,
+                repo_instructions,
                 Some(&test_issues),
-                "low",
+                "simple",
                 provider,
                 usage,
                 &fix_cache,
@@ -3296,20 +3524,27 @@ pub fn format_rules_block(rules: &[String]) -> String {
 }
 
 /// Format the full OpenSpec as a single context block for downstream passes.
-/// Compact OpenSpec summary for review/security passes.
-/// Only includes proposal and acceptance criteria (skips design/tasks detail).
+/// Compact OpenSpec summary for review/security passes: proposal, design,
+/// and acceptance criteria. Design was previously dropped entirely, so
+/// reviewers judged changes with no knowledge of the intended approach.
 pub fn format_openspec_summary(plan: &plan::PlanResult) -> String {
     let mut block = String::from("\n\n## OpenSpec Summary\n");
-    if !plan.proposal.is_empty() {
-        block.push_str("### Proposal\n");
-        // Cap proposal at 2KB
-        if plan.proposal.len() > 2000 {
-            block.push_str(&plan.proposal[..plan.proposal[..2000].rfind('\n').unwrap_or(2000)]);
+    fn push_capped(block: &mut String, header: &str, text: &str) {
+        block.push_str(header);
+        if text.len() > 2000 {
+            let head = common::truncate_str(text, 2000);
+            block.push_str(&head[..head.rfind('\n').unwrap_or(head.len())]);
             block.push_str("\n... (truncated)\n");
         } else {
-            block.push_str(&plan.proposal);
+            block.push_str(text);
             block.push('\n');
         }
+    }
+    if !plan.proposal.is_empty() {
+        push_capped(&mut block, "### Proposal\n", &plan.proposal);
+    }
+    if !plan.design.is_empty() {
+        push_capped(&mut block, "\n### Design\n", &plan.design);
     }
     if !plan.spec.is_empty() {
         block.push_str("\n### Acceptance Criteria\n");
@@ -3385,10 +3620,11 @@ pub async fn load_repo_instructions(
         match github.read_file(owner, repo, path, "HEAD").await {
             Ok(content) if !content.trim().is_empty() => {
                 let remaining = MAX_TOTAL_BYTES.saturating_sub(combined.len());
-                let truncated = if content.len() > remaining {
-                    &content[..content[..remaining].rfind('\n').unwrap_or(remaining)]
+                let truncated: String = if content.len() > remaining {
+                    let head = common::truncate_str(&content, remaining);
+                    head[..head.rfind('\n').unwrap_or(head.len())].to_string()
                 } else {
-                    &content
+                    content.clone()
                 };
                 if !combined.is_empty() {
                     combined.push_str("\n\n---\n\n");
@@ -3469,6 +3705,9 @@ struct PlanValidation {
     switch_repo: Option<String>,
     /// Human-readable reason for the switch, shown in the run's progress notes.
     switch_reason: String,
+    /// How many distinct files the plan text references — used to upgrade a
+    /// misclassified "simple" ticket before implement.
+    mentioned_file_count: usize,
 }
 
 /// Plan validation — catches bad plans before the expensive Implement pass.
@@ -3738,9 +3977,9 @@ async fn validate_plan(
 
         let plan_summary = format!(
             "Proposal: {}\nDesign: {}\nTasks: {}",
-            &plan.proposal[..plan.proposal.len().min(500)],
-            &plan.design[..plan.design.len().min(500)],
-            &plan.tasks[..plan.tasks.len().min(500)],
+            common::truncate_str(&plan.proposal, 500),
+            common::truncate_str(&plan.design, 500),
+            common::truncate_str(&plan.tasks, 500),
         );
 
         let hint_section = match &mention_hint {
@@ -3852,6 +4091,7 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
         blocked,
         switch_repo,
         switch_reason,
+        mentioned_file_count: mentioned_files.len(),
     }
 }
 
@@ -4033,7 +4273,7 @@ async fn salvage_timeout_pr(
             .create_pull_request(
                 &msg.repo_owner,
                 &msg.repo_name,
-                &title[..title.len().min(72)],
+                common::truncate_str(&title, 72),
                 &body,
                 branch,
                 &msg.base_branch,
@@ -4367,13 +4607,11 @@ async fn load_existing_plan(
     state: &WorkerState,
     team_id: &str,
     ticket_id: &str,
+    repo_owner: &str,
+    repo_name: &str,
     context_hash: &str,
 ) -> Option<plan::PlanResult> {
-    let prefix = format!(
-        "teams/{}/runs/{}/openspec",
-        team_id,
-        ticket_id.to_lowercase()
-    );
+    let prefix = openspec_prefix(team_id, ticket_id, repo_owner, repo_name);
 
     // Check if ticket context has changed (body, images, etc.)
     let hash_key = format!("{prefix}/context_hash.txt");
@@ -4531,7 +4769,8 @@ If everything is clean, respond with "CLEAN" and nothing else."#,
         &response[..response.len().min(200)]
     );
 
-    if response.starts_with("CLEAN") || !response.contains("ISSUES_FOUND:") {
+    // Fail-closed: unparseable output cannot vouch for the diff.
+    if common::parse_verdict(&response, "CLEAN", "ISSUES_FOUND") == common::Verdict::Pass {
         String::new()
     } else {
         format!(

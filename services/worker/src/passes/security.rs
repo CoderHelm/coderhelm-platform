@@ -30,7 +30,10 @@ pub async fn run(
 ) -> Result<SecurityResult, Box<dyn std::error::Error + Send + Sync>> {
     // Trim repo instructions for the security pass (it only needs high-level context)
     let trimmed = if repo_instructions.len() > 2000 {
-        &repo_instructions[..repo_instructions[..2000].rfind('\n').unwrap_or(2000)]
+        {
+            let head = common::truncate_str(repo_instructions, 2000);
+            &head[..head.rfind('\n').unwrap_or(head.len())]
+        }
     } else {
         repo_instructions
     };
@@ -99,7 +102,10 @@ Output format:
     )
     .await?;
 
-    let passed = final_text.contains("SECURITY_PASS");
+    // Fail-closed verdict: `contains("SECURITY_PASS")` passed any report that
+    // merely mentioned the token ("falls short of a SECURITY_PASS").
+    let passed = common::parse_verdict(&final_text, "SECURITY_PASS", "SECURITY_FAIL")
+        == common::Verdict::Pass;
 
     info!(passed, "Security audit complete");
 
@@ -189,7 +195,7 @@ impl ToolExecutor for SecurityToolExecutor<'_> {
                             let truncated = if patch.len() > 4000 {
                                 format!(
                                     "{}... (truncated, use read_file for full content)",
-                                    &patch[..4000]
+                                    common::truncate_str(patch, 4000)
                                 )
                             } else {
                                 patch.to_string()

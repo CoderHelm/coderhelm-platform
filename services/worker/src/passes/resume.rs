@@ -487,15 +487,12 @@ pub async fn run(
                 .await
             {
                 Ok(l) => {
-                    let trimmed = if l.len() > MAX_LOG_CHARS / failed_run_ids.len().max(1) {
-                        format!(
-                            "... (truncated)\n{}",
-                            &l[l.len() - MAX_LOG_CHARS / failed_run_ids.len().max(1)..]
-                        )
-                    } else {
-                        l
-                    };
-                    all_logs.push(trimmed);
+                    // Head+tail: compile cascades put the root-cause error at
+                    // the HEAD of the log; the old tail-only keep discarded it
+                    // and fed the fixer downstream noise. (Also char-safe —
+                    // the raw byte slice panicked on multibyte log content.)
+                    let budget = MAX_LOG_CHARS / failed_run_ids.len().max(1);
+                    all_logs.push(common::head_tail_str(&l, budget));
                 }
                 Err(e) => {
                     warn!(
@@ -777,7 +774,39 @@ pub async fn run(
             )
             .await?;
         } else {
-            // Review found issues — implement fix and go back to awaiting_ci
+            // Review found issues — implement fix and go back to awaiting_ci.
+            // Draws on the SAME bounded budget as CI fixes: this branch used
+            // to run uncapped AND reset the shared counter to zero, so an
+            // oscillating review could loop until the 24h wall clock.
+            let cycle = load_cycle_from_checkpoint(state, &msg.team_id, &msg.run_id).await;
+            if cycle >= MAX_CI_FIX_CYCLES {
+                warn!(
+                    run_id = msg.run_id,
+                    cycle, "Fix budget exhausted — handing PR to human review as-is"
+                );
+                super::add_progress_note(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    "Automated fix budget exhausted — PR handed off for human review",
+                )
+                .await;
+                mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                complete_run_with_status(
+                    state,
+                    &ticket_msg,
+                    &msg.run_id,
+                    "completed",
+                    &pr_url,
+                    pr_number,
+                    &branch,
+                    &usage,
+                    wall_clock_secs(created_at, &start),
+                )
+                .await?;
+                mark_events_processed(state, &msg.run_id, &events).await;
+                return Ok(());
+            }
             info!(
                 run_id = msg.run_id,
                 "Review found issues — implementing fix"
@@ -858,8 +887,18 @@ pub async fn run(
                 }
             }
 
-            // Back to awaiting_ci for the next CI run
-            save_checkpoint(state, &msg.team_id, &msg.run_id, "pr", &branch, 0, &usage).await;
+            // Back to awaiting_ci for the next CI run. Increment the shared
+            // fix counter — writing 0 here reset the CI-fix budget each time.
+            save_checkpoint(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                "pr",
+                &branch,
+                (cycle + 1).min(u8::MAX as usize) as u8,
+                &usage,
+            )
+            .await;
             mark_events_processed(state, &msg.run_id, &events).await;
             set_run_awaiting_ci(
                 state,
