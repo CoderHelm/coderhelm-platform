@@ -161,8 +161,12 @@ pub async fn run(
                 "run_id",
                 aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
             )
-            .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t")
+            .update_expression(
+                "SET #s = :s, status_run_id = :sri, updated_at = :t \
+                 REMOVE error_message, #err",
+            )
             .expression_attribute_names("#s", "status")
+            .expression_attribute_names("#err", "error")
             .expression_attribute_values(
                 ":s",
                 aws_sdk_dynamodb::types::AttributeValue::S("completed".to_string()),
@@ -404,9 +408,11 @@ Rules:
              cache_read_tokens = if_not_exists(cache_read_tokens, :zero) + :crt, \
              cache_write_tokens = if_not_exists(cache_write_tokens, :zero) + :cwt, \
              updated_at = :t, #s = :s, current_pass = :p, status_run_id = :sri, \
-             pass_history = list_append(if_not_exists(pass_history, :empty), :entry)",
+             pass_history = list_append(if_not_exists(pass_history, :empty), :entry) \
+             REMOVE error_message, #err",
         )
         .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#err", "error")
         .expression_attribute_values(
             ":ti",
             aws_sdk_dynamodb::types::AttributeValue::N(usage.input_tokens.to_string()),
