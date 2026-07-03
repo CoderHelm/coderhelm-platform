@@ -1315,6 +1315,20 @@ impl GitHubClient {
             .and_then(|arr| arr.iter().find(|pr| pr["merged_at"].is_null()).cloned()))
     }
 
+    /// Update a pull request's title.
+    pub async fn update_pr_title(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        title: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}");
+        self.patch(&url, &serde_json::json!({"title": title}))
+            .await?;
+        Ok(())
+    }
+
     /// Reopen a closed pull request.
     pub async fn reopen_pull_request(
         &self,
