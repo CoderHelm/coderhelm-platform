@@ -1142,8 +1142,12 @@ pub async fn re_review_run(
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&claims.team_id))
         .key("run_id", attr_s(&run_id))
-        .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t, current_pass = :p")
+        .update_expression(
+            "SET #s = :s, status_run_id = :sri, updated_at = :t, current_pass = :p \
+             REMOVE error_message, #err",
+        )
         .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#err", "error")
         .expression_attribute_values(":s", attr_s("running"))
         .expression_attribute_values(":sri", attr_s(&format!("running#{run_id}")))
         .expression_attribute_values(":t", attr_s(&now))

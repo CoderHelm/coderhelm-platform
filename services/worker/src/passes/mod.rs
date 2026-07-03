@@ -3040,9 +3040,11 @@ async fn complete_run(
              tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri, files_modified = :fm, \
-             repo = :repo, team_repo = :tr, mcp_servers = :mcp",
+             repo = :repo, team_repo = :tr, mcp_servers = :mcp \
+             REMOVE error_message, #err",
         )
         .expression_attribute_names("#status", "status")
+        .expression_attribute_names("#err", "error")
         .expression_attribute_values(":s", attr_s("completed"))
         .expression_attribute_values(":pr", attr_s(&pr.pr_url))
         .expression_attribute_values(":pn", attr_n(pr.pr_number))

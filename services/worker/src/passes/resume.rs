@@ -1141,9 +1141,11 @@ async fn set_run_awaiting_ci(
             "SET #s = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
              tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
              cost_usd = :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
-             status_run_id = :sri",
+             status_run_id = :sri \
+             REMOVE error_message, #err",
         )
         .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#err", "error")
         .expression_attribute_values(":s", attr_s("awaiting_ci"))
         .expression_attribute_values(":pr", attr_s(pr_url))
         .expression_attribute_values(":pn", attr_n(pr_number))
@@ -1227,9 +1229,11 @@ async fn complete_run_with_status(
             "SET #s = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
              tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
              cost_usd = :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
-             status_run_id = :sri",
+             status_run_id = :sri \
+             REMOVE error_message, #err",
         )
         .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#err", "error")
         .expression_attribute_values(":s", attr_s(status))
         .expression_attribute_values(":pr", attr_s(pr_url))
         .expression_attribute_values(":pn", attr_n(pr_number))
@@ -1315,7 +1319,11 @@ async fn set_run_complete(
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
-        .update_expression("SET #s = :s, updated_at = :t, current_pass = :cp, status_run_id = :sri, duration_s = :d")
+        .update_expression(
+            "SET #s = :s, updated_at = :t, current_pass = :cp, status_run_id = :sri, duration_s = :d \
+             REMOVE error_message, #err",
+        )
+        .expression_attribute_names("#err", "error")
         .expression_attribute_names("#s", "status")
         // "completed" — the single terminal-success status. This path used
         // to write "success", which every status filter in the gateway and
