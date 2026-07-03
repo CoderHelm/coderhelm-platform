@@ -511,6 +511,19 @@ fn all_tools() -> Vec<ToolDefinition> {
             description: "Compare the current branch to main.".to_string(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
+        ToolDefinition {
+            name: "restore_file".to_string(),
+            description: "Restore a file to its EXACT content at another git ref (e.g. \"main\", the base branch, or a commit SHA) without loading the content into your context. The worker copies the bytes directly — byte-exact, works for files of ANY size, and cannot alter or truncate the content. Use this to recover a file corrupted or truncated by a bad merge, or to revert a file to its base version, instead of reconstructing it by hand.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to repo root"},
+                    "from_ref": {"type": "string", "description": "Git ref to restore from (branch name like \"main\", or a commit SHA)"},
+                    "message": {"type": "string", "description": "Commit message (optional)"}
+                },
+                "required": ["path", "from_ref"]
+            }),
+        },
     ]
 }
 
@@ -955,6 +968,64 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                 } else {
                     Ok(json!("No changes compared to main."))
                 }
+            }
+            "restore_file" => {
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing path")?;
+                if is_protected_path(path) {
+                    return Ok(json!(format!(
+                        "Cannot modify {path}: CI/CD workflow files are protected."
+                    )));
+                }
+                let from_ref = input
+                    .get("from_ref")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing from_ref")?;
+                let message = input
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| format!("Restore {path} from {from_ref}"));
+
+                // Read the source content directly (worker-side, never enters
+                // the LLM context) and write it to the working branch.
+                let content = match self
+                    .github
+                    .read_file(&self.owner, &self.repo, path, from_ref)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => return Ok(json!(format!(
+                        "Could not read {path} at ref '{from_ref}': {e}. Check the path and ref."
+                    ))),
+                };
+                let sha = self
+                    .github
+                    .get_file_sha(&self.owner, &self.repo, path, &self.branch)
+                    .await
+                    .ok();
+                self.github
+                    .write_file(
+                        &self.owner,
+                        &self.repo,
+                        path,
+                        &content,
+                        &self.branch,
+                        &message,
+                        sha.as_deref(),
+                    )
+                    .await?;
+                self.files_modified.lock().unwrap().insert(path.to_string());
+                self.file_cache
+                    .insert(format!("{}:{}", self.branch, path), content.clone())
+                    .await;
+                self.task_tracker.mark_files_done(&[path]).await;
+                Ok(json!(format!(
+                    "Restored {path} from '{from_ref}' ({} bytes) — exact copy, content not loaded into context",
+                    content.len()
+                )))
             }
             _ => Err(format!("Unknown tool: {name}").into()),
         }

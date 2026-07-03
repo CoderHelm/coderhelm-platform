@@ -880,6 +880,19 @@ fn feedback_tools() -> Vec<ToolDefinition> {
                 "required": ["message", "files"]
             }),
         },
+        ToolDefinition {
+            name: "restore_file".to_string(),
+            description: "Restore a file to its EXACT content at another git ref (e.g. \"main\", the base branch, or a commit SHA) without loading the content into your context. The worker copies the bytes directly — byte-exact, works for files of ANY size, cannot alter or truncate. Use this to recover a file corrupted or truncated by a bad merge, or to revert to its base version, instead of reconstructing it by hand.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to repo root"},
+                    "from_ref": {"type": "string", "description": "Git ref to restore from (e.g. \"main\" or a commit SHA)"},
+                    "message": {"type": "string", "description": "Commit message (optional)"}
+                },
+                "required": ["path", "from_ref"]
+            }),
+        },
     ]
 }
 
@@ -1033,8 +1046,55 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                 *self.files_modified.lock().unwrap() = true;
                 Ok(json!(format!(
                     "Batch commit {} — {} files",
-                    &sha[..8],
+                    &sha[..8.min(sha.len())],
                     ops.len()
+                )))
+            }
+            "restore_file" => {
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing path")?;
+                let from_ref = input
+                    .get("from_ref")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing from_ref")?;
+                let message = input
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| format!("Restore {path} from {from_ref}"));
+                // Worker-side copy: bytes never enter the LLM context.
+                let content = match self
+                    .github
+                    .read_file(self.owner, self.repo, path, from_ref)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => return Ok(json!(format!(
+                        "Could not read {path} at ref '{from_ref}': {e}. Check the path and ref."
+                    ))),
+                };
+                let sha = self
+                    .github
+                    .get_file_sha(self.owner, self.repo, path, self.branch)
+                    .await
+                    .ok();
+                self.github
+                    .write_file(
+                        self.owner,
+                        self.repo,
+                        path,
+                        &content,
+                        self.branch,
+                        &message,
+                        sha.as_deref(),
+                    )
+                    .await?;
+                *self.files_modified.lock().unwrap() = true;
+                Ok(json!(format!(
+                    "Restored {path} from '{from_ref}' ({} bytes) — exact copy, content not loaded into context",
+                    content.len()
                 )))
             }
             _ => Err(format!("Unknown tool: {name}").into()),
