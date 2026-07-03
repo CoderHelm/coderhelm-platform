@@ -139,8 +139,16 @@ pub async fn run(
     // Wall-clock backstop: the reschedule loop has no cycle cap of its own
     // (unlike CI fixes), so a check that never concludes would keep a run in
     // awaiting_ci forever. Past the cap, hand the PR to a human as-is.
-    let age_hours = created_at
+    // Age = time since the last state write (updated_at), NOT run creation:
+    // a re-review on a days-old run re-enters awaiting_ci with an ancient
+    // created_at, and the creation-age version finalized it instantly —
+    // skipping the CI result it had just been handed.
+    let age_hours = run_record
+        .get("updated_at")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|t| chrono::Utc::now().signed_duration_since(t).num_hours())
+        .or_else(|| created_at.map(|t| chrono::Utc::now().signed_duration_since(t).num_hours()))
         .unwrap_or(0);
     if age_hours >= MAX_AWAITING_CI_HOURS {
         warn!(
