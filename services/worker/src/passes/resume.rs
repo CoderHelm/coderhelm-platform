@@ -595,6 +595,8 @@ pub async fn run(
              - If the failure is in a test, fix the code (not the test) unless the test itself is wrong.\n\
              - If tests need updating because the feature changed behavior intentionally, update the tests.\n\
              - For lint/formatting failures (Prettier, ESLint): read the existing file first, match its style exactly (trailing commas, line length, quote style, indentation). Write the COMPLETE file content.\n\
+             - NEVER replace a real file with a stub or placeholder to make an error go away — write the complete, working implementation. If you broke a file, use restore_file to recover it, then fix it properly.\n\
+             - Before you finish, call run_checks to verify your fix builds and type-checks against real output. Do not finish on a red result if run_checks is available.\n\
              - You may create new test files or edit existing ones if needed.\n\n\
              Failure summary:\n{failure_logs}\n\n\
              Full logs:\n{logs}{review_context}"

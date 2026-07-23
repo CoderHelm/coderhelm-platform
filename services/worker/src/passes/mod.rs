@@ -2376,7 +2376,7 @@ async fn run_passes(
     let now = chrono::Utc::now().to_rfc3339();
     let cost = usage.estimated_cost();
 
-    state
+    let awaiting_res = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
@@ -2390,6 +2390,9 @@ async fn run_passes(
              repo = :repo, team_repo = :tr, mcp_servers = :mcp",
         )
         .expression_attribute_names("#status", "status")
+        // Never flip a cancelled run back to awaiting_ci (would resume it).
+        .condition_expression("#status <> :cancel")
+        .expression_attribute_values(":cancel", attr_s("cancelled"))
         .expression_attribute_values(":s", attr_s("awaiting_ci"))
         .expression_attribute_values(":pr", attr_s(&pr_result.pr_url))
         .expression_attribute_values(":pn", attr_n(pr_result.pr_number))
@@ -2424,7 +2427,17 @@ async fn run_passes(
             ),
         )
         .send()
-        .await?;
+        .await;
+    if let Err(e) = awaiting_res {
+        if format!("{e:?}").contains("ConditionalCheckFailed") {
+            info!(
+                run_id,
+                "Run cancelled during orchestration — not setting awaiting_ci"
+            );
+            return Ok(());
+        }
+        return Err(e.into());
+    }
 
     info!(
         run_id,

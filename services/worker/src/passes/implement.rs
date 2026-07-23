@@ -794,6 +794,30 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                          Fix the content and retry."
                     )));
                 }
+                // Anti-stub guard: overwriting an existing substantial file with
+                // a drastically smaller version is the classic "rewrote it as a
+                // placeholder/stub" failure that then needs a restore to undo
+                // (the churn seen on real PRs). Reject it the same way edit_file
+                // does. New files have no prior content, so this only fires on
+                // real overwrites.
+                let write_cache_key = format!("{}:{}", self.branch, path);
+                let existing = match self.file_cache.get(&write_cache_key).await {
+                    Some(c) => Some(c),
+                    None => self
+                        .github
+                        .read_file(&self.owner, &self.repo, path, &self.branch)
+                        .await
+                        .ok(),
+                };
+                if let Some(old) = &existing {
+                    if let Some(problem) = validate_edit_safety(old, content, path) {
+                        return Ok(json!(format!(
+                            "Write REJECTED for {path}: {problem}. If you are rewriting the whole \
+                             file, write the COMPLETE implementation — never a stub or placeholder. \
+                             To change part of it, use edit_file instead."
+                        )));
+                    }
+                }
                 let sha = input.get("sha").and_then(|v| v.as_str());
                 self.github
                     .write_file(
