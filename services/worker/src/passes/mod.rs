@@ -1101,6 +1101,12 @@ async fn run_passes(
         // If an open PR exists, we always try to fix it rather than starting fresh.
         // Previous retries may have force-reset the branch to base, so we also check
         // for prior runs of the same ticket that were awaiting_ci (evidence of CI failures).
+        // Track whether the PR lookup actually SUCCEEDED. A transient API
+        // failure used to collapse to `None` (indistinguishable from "no PR"),
+        // which then flipped skip_branch_reset=false → force-reset the branch
+        // to base, wiping any real work on it. On a failed lookup we must NOT
+        // reset.
+        let mut pr_lookup_failed = false;
         let existing_pr = match github
             .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, &branch_name)
             .await
@@ -1110,7 +1116,8 @@ async fn run_passes(
                 pr
             }
             Err(e) => {
-                warn!(run_id, branch = %branch_name, error = %e, "Re-run detection: failed to check for open PR");
+                warn!(run_id, branch = %branch_name, error = %e, "Re-run detection: failed to check for open PR — will NOT reset branch");
+                pr_lookup_failed = true;
                 None
             }
         };
@@ -1397,7 +1404,15 @@ async fn run_passes(
         }
 
         // Track whether to skip branch creation (PR exists, just needs fresh implementation)
-        let skip_branch_reset = if context_changed && existing_pr.is_some() {
+        let skip_branch_reset = if pr_lookup_failed {
+            // Couldn't confirm PR state — never force-reset (would risk wiping
+            // real work on the branch on a transient API error).
+            info!(
+                run_id,
+                "PR lookup failed — skipping branch reset to protect existing work"
+            );
+            true
+        } else if context_changed && existing_pr.is_some() {
             // Context changed (new description, images, etc.) — force reset branch for clean implementation
             let pr_number = existing_pr
                 .as_ref()
