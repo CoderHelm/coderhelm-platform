@@ -208,6 +208,33 @@ Return ONLY the markdown body text."#,
         info!(pr_number = number, pr_url = %url, "Reopened prior PR for branch");
         (number, url, nid)
     } else {
+        // Squash the run's many per-tool-call commits into one clean commit
+        // before opening the PR. Safe here: the main flow is sequential and
+        // single-writer at this point (webhook-driven CI-fix/feedback writes
+        // only start after the PR exists). Best-effort — a failure just leaves
+        // the noisier history. Skipped for existing/reopened PRs above to avoid
+        // rewriting a PR a human may already be reviewing.
+        let squash_msg = format!(
+            "{}: {}",
+            match msg.source {
+                TicketSource::Github => format!("#{}", msg.issue_number),
+                TicketSource::Jira => msg.ticket_id.clone(),
+            },
+            msg.title
+        );
+        if let Err(e) = github
+            .squash_branch(
+                &msg.repo_owner,
+                &msg.repo_name,
+                branch,
+                &msg.base_branch,
+                &squash_msg,
+            )
+            .await
+        {
+            warn!(branch, error = %e, "Squash before PR failed — proceeding with full history");
+        }
+
         // Create draft PR — CI triggers on PR creation, and we'll mark it ready after tests/review pass
         let pr_data = github
             .create_pull_request(
