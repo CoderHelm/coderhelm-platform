@@ -219,6 +219,21 @@ pub async fn run(
         return Ok(());
     }
 
+    // CI-ONLY churn (no unanswered human comment or review to answer — the
+    // all-empty case already returned above, so reaching here with both empty
+    // means CI failures are the sole driver) is the automated-fix path. Draw it
+    // from the durable budget so a PR that structurally can't go green (e.g.
+    // codegen that can't run in the sandbox) can't churn forever. Human feedback
+    // is ALWAYS honored, never budget-gated. The claim is atomic, so concurrent
+    // feedback webhooks for one run can't overshoot the cap.
+    if comments.is_empty()
+        && msg.review_body.trim().is_empty()
+        && !super::claim_auto_fix_slot(state, &msg.team_id, &msg.run_id).await
+    {
+        hand_off_to_human(state, &github, &msg).await;
+        return Ok(());
+    }
+
     let formatted = format_review_comments(&msg.review_body, &comments);
 
     // Load voice instructions (repo-specific falls back to global)
@@ -1421,6 +1436,92 @@ async fn fetch_ci_failures(
 /// a closed PR).
 /// Whether the run has been cancelled (consistent read — cancel must win
 /// against a racing pass).
+/// Hand a PR to a human after the automated-fix budget is spent.
+///
+/// Ordering matters for crash-safety. The RELIABLE, idempotent signals run
+/// first — mark the PR ready and finalize the run (cancel-guarded, clearing the
+/// stale partial/error marker) — so that even if this invocation dies mid-way,
+/// the human still sees a ready PR and a redelivery just repeats these no-ops.
+/// The explanatory note + PR comment run LAST, gated by an atomic
+/// `handoff_notified` marker so repeated webhooks on the now-finalized run don't
+/// spam the PR. If the comment is lost to a crash, the PR is already marked
+/// ready — the worst case is a missing comment, never a stuck draft.
+async fn hand_off_to_human(state: &WorkerState, github: &GitHubClient, msg: &FeedbackMessage) {
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    // Respect a cancel (best-effort early out; the status write below is also
+    // cancel-guarded for the race window).
+    if run_is_cancelled(state, &msg.team_id, &msg.run_id).await {
+        return;
+    }
+
+    // (1) Reliable signal: un-draft the PR. Idempotent (no-ops if already ready).
+    crate::passes::resume::mark_pr_ready(github, &msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await;
+
+    // (2) Finalize the run — completed, stale error cleared, never clobbering a
+    // cancel. Safe to repeat on redelivery.
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", AttributeValue::S(msg.team_id.clone()))
+        .key("run_id", AttributeValue::S(msg.run_id.clone()))
+        .update_expression(
+            "SET #s = :s, status_run_id = :sri, updated_at = :t REMOVE error_message, #err",
+        )
+        .condition_expression("#s <> :cancelled")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#err", "error")
+        .expression_attribute_values(":s", AttributeValue::S("completed".to_string()))
+        .expression_attribute_values(
+            ":sri",
+            AttributeValue::S(format!("completed#{}", msg.run_id)),
+        )
+        .expression_attribute_values(":t", AttributeValue::S(now))
+        .expression_attribute_values(":cancelled", AttributeValue::S("cancelled".to_string()))
+        .send()
+        .await;
+
+    // (3) Explain ONCE. The marker write wins for exactly one invocation; a
+    // redelivered/concurrent event sees the marker and skips (no PR spam). Done
+    // last so a crash here can't suppress the reliable signals above.
+    let first_notify = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", AttributeValue::S(msg.team_id.clone()))
+        .key("run_id", AttributeValue::S(msg.run_id.clone()))
+        .update_expression("SET handoff_notified = :true")
+        .condition_expression("attribute_not_exists(handoff_notified)")
+        .expression_attribute_values(":true", AttributeValue::Bool(true))
+        .send()
+        .await
+        .is_ok();
+    if first_notify {
+        warn!(run_id = %msg.run_id, "Auto-fix budget spent — handed PR to human");
+        super::add_progress_note(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            "Reached the automated-fix limit without getting CI green — handed off for human review.",
+        )
+        .await;
+        let _ = github
+            .create_issue_comment(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                "🤝 CoderHelm hit its automated-fix limit on this PR without getting CI green, so \
+                 it's handed off for human review. If this needs generated files (e.g. Sanity \
+                 types) regenerated, that step has to be run locally — the sandbox can't run \
+                 codegen that needs project configuration.",
+            )
+            .await;
+    }
+}
+
 async fn run_is_cancelled(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
     state
         .dynamo

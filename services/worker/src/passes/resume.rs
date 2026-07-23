@@ -639,10 +639,15 @@ pub async fn run(
 
         // Load checkpoint for review cycle count
         let cycle = load_cycle_from_checkpoint(state, &msg.team_id, &msg.run_id).await;
-        if cycle >= MAX_CI_FIX_CYCLES {
+        let over_cycle = cycle >= MAX_CI_FIX_CYCLES;
+        // Atomically claim a shared auto-fix slot (skipped when the cycle cap has
+        // already tripped, so we don't consume a slot on the way out).
+        let claimed =
+            !over_cycle && super::claim_auto_fix_slot(state, &msg.team_id, &msg.run_id).await;
+        if over_cycle || !claimed {
             warn!(
                 run_id = msg.run_id,
-                cycle, "Max CI fix cycles reached, completing with failure"
+                cycle, "Fix budget reached — completing for human review"
             );
             complete_run_with_status(
                 state,
@@ -930,7 +935,10 @@ pub async fn run(
             // to run uncapped AND reset the shared counter to zero, so an
             // oscillating review could loop until the 24h wall clock.
             let cycle = load_cycle_from_checkpoint(state, &msg.team_id, &msg.run_id).await;
-            if cycle >= MAX_CI_FIX_CYCLES {
+            let over_cycle = cycle >= MAX_CI_FIX_CYCLES;
+            let claimed =
+                !over_cycle && super::claim_auto_fix_slot(state, &msg.team_id, &msg.run_id).await;
+            if over_cycle || !claimed {
                 warn!(
                     run_id = msg.run_id,
                     cycle, "Fix budget exhausted — handing PR to human review as-is"

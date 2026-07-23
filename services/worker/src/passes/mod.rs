@@ -110,6 +110,54 @@ async fn try_auto_continue(
     }
 }
 
+/// Hard, signature-INDEPENDENT ceiling on how many times the automated post-PR
+/// loops (CI-fix, review-fix, feedback) may push a fix to a PR before it is
+/// handed to a human. This is the backstop for thrash that (a) mutating-error
+/// stall detection can't catch (each cycle emits different errors, so the
+/// signature never repeats) and (b) a dropped resume ("run already running")
+/// lets bypass the per-cycle counter while the uncapped feedback loop keeps
+/// pushing. Durable on the run record so it survives every Lambda invocation and
+/// is shared across all three loops. High enough for a PR that legitimately
+/// iterates across several distinct CI stages (lint → types → tests → a review
+/// round), low enough to stop an hour-long churn fast (the real incident ran 16+
+/// cycles). Human-driven feedback is NOT gated by this (see feedback.rs).
+pub(crate) const MAX_AUTO_FIX_PUSHES: u32 = 8;
+
+/// Atomically claim one automated-fix slot for the run: increment the durable
+/// counter IFF it is still under MAX_AUTO_FIX_PUSHES — the check and the
+/// increment are ONE conditional write, so concurrent invocations (feedback is
+/// unserialized: several webhooks for one run can run at once) can never
+/// overshoot the cap. Returns true if a slot was claimed (proceed with the fix),
+/// false if the budget is spent (hand off to a human). Fails CLOSED: a
+/// non-ConditionalCheckFailed error also returns false, because the feedback
+/// path has NO other cap (no per-cycle counter, no wall-clock) and failing open
+/// there would resurrect the exact unbounded churn this prevents. A transient
+/// DynamoDB blip therefore causes an early, RECOVERABLE hand-off — strictly
+/// safer than thrash.
+pub(crate) async fn claim_auto_fix_slot(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
+    match state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("ADD auto_fix_pushes :one")
+        .condition_expression("attribute_not_exists(auto_fix_pushes) OR auto_fix_pushes < :max")
+        .expression_attribute_values(":one", attr_n(1))
+        .expression_attribute_values(":max", attr_n(u64::from(MAX_AUTO_FIX_PUSHES)))
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            if !format!("{e:?}").contains("ConditionalCheckFailed") {
+                warn!(run_id, error = %e, "auto-fix slot claim errored — failing closed (hand off)");
+            }
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod continuation_tests {
     use super::{
