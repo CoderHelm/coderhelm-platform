@@ -591,6 +591,72 @@ impl GitHubClient {
         }
     }
 
+    /// Collapse all of `branch`'s commits into a SINGLE commit on top of
+    /// `base_branch`, preserving the exact final tree (the diff is identical).
+    /// Turns a run's 10-30 noisy per-tool-call commits into one clean commit.
+    /// MUST only be called when no other writer is touching the branch (the
+    /// sequential main flow before the PR exists) — it force-rewrites history.
+    /// Best-effort: returns Err without mutating on any problem.
+    pub async fn squash_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        base_branch: &str,
+        message: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let base_sha = self.get_ref(owner, repo, base_branch).await?;
+        let branch_sha = self.get_ref(owner, repo, branch).await?;
+        if branch_sha == base_sha {
+            return Ok(()); // nothing to squash
+        }
+        // Tree of the branch's current tip = the full accumulated result.
+        let commit_url = format!("{API_BASE}/repos/{owner}/{repo}/git/commits/{branch_sha}");
+        let tree_sha = self
+            .get(&commit_url)
+            .await?
+            .pointer("/tree/sha")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing tree sha in branch commit")?
+            .to_string();
+        // Don't squash if it would produce an empty diff vs base (guards
+        // against a base that already contains the tree).
+        let base_tree = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/git/commits/{base_sha}"
+            ))
+            .await?
+            .pointer("/tree/sha")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if base_tree.as_deref() == Some(tree_sha.as_str()) {
+            return Ok(()); // no net change
+        }
+        let new_commit = self
+            .post(
+                &format!("{API_BASE}/repos/{owner}/{repo}/git/commits"),
+                &serde_json::json!({
+                    "message": message,
+                    "tree": tree_sha,
+                    "parents": [base_sha],
+                }),
+            )
+            .await?;
+        let new_sha = new_commit
+            .get("sha")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing sha in squash commit")?;
+        // Force-update: intentional history rewrite (single-writer context).
+        let ref_url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
+        self.patch(
+            &ref_url,
+            &serde_json::json!({"sha": new_sha, "force": true}),
+        )
+        .await?;
+        self.invalidate_snapshot(owner, repo, branch).await;
+        Ok(())
+    }
+
     /// Create a new branch from an existing ref.
     pub async fn create_branch(
         &self,
