@@ -7,3 +7,7 @@
 [toolchain]
 channel = "1.97.1"
 components = ["rustfmt", "clippy"]
+# The deploy cross-compiles the Lambdas for this target; it must be installed
+# for the PINNED toolchain (the deploy action adds it to `stable`, which is a
+# separate rustup identity from a pinned version).
+targets = ["aarch64-unknown-linux-musl"]
