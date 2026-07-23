@@ -54,6 +54,37 @@ impl CheckOutcome {
     }
 }
 
+const MARKER_CODEGEN_END: &str = "CODERHELM_CODEGEN_END exit=";
+const MARKER_CODEGEN_UPLOADED: &str = "CODERHELM_CODEGEN_UPLOADED";
+/// Caps on captured codegen output (regenerated files are large but bounded).
+const MAX_CODEGEN_FILES: usize = 40;
+const MAX_CODEGEN_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Result of a sandbox codegen run — the files the repo's codegen CHANGED,
+/// captured for the worker to commit back to the branch (making the sandbox
+/// bidirectional so the agent can regenerate generated files).
+pub struct CodegenOutcome {
+    /// Codegen actually ran (marker present).
+    pub ran: bool,
+    /// Codegen exited 0.
+    pub passed: bool,
+    /// (path, content) for each file codegen created or modified.
+    pub changed: Vec<(String, String)>,
+    /// Tail of the codegen output.
+    pub output: String,
+}
+
+impl CodegenOutcome {
+    fn not_run(reason: impl Into<String>) -> Self {
+        Self {
+            ran: false,
+            passed: false,
+            changed: Vec::new(),
+            output: reason.into(),
+        }
+    }
+}
+
 /// Thin driver over CodeBuild + S3 + CloudWatch Logs. Holds only borrows from
 /// `WorkerState`; construct it per pass.
 pub struct SandboxClient<'a> {
@@ -148,6 +179,202 @@ impl<'a> SandboxClient<'a> {
             .send()
             .await;
         outcome
+    }
+
+    /// Run the repo's codegen in the sandbox and return the files it CHANGED,
+    /// for the caller to commit back to the branch. Never Err for an ordinary
+    /// codegen failure — that's `CodegenOutcome { ran: true, passed: false }`.
+    pub async fn run_codegen(
+        &self,
+        run_id: &str,
+        attempt: usize,
+        tarball: Vec<u8>,
+        codegen_cmd: &str,
+        node_version: Option<&str>,
+        deadline: Option<Instant>,
+    ) -> Result<CodegenOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.is_enabled() {
+            return Ok(CodegenOutcome::not_run("sandbox not configured"));
+        }
+        if !self.has_time(deadline) {
+            return Ok(CodegenOutcome::not_run(
+                "not enough time left before the pass deadline to run codegen",
+            ));
+        }
+        let key = format!("sandbox/{run_id}/codegen-{attempt}.tgz");
+        let out_key = format!("codegen-out/{run_id}/{attempt}.tgz");
+        if let Err(e) = self
+            .s3
+            .put_object()
+            .bucket(self.bucket)
+            .key(&key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(tarball))
+            .content_type("application/gzip")
+            .send()
+            .await
+        {
+            return Err(format!("codegen tarball upload failed: {e}").into());
+        }
+        let outcome = self
+            .codegen_build_and_capture(&key, &out_key, codegen_cmd, node_version, deadline)
+            .await;
+        // Clean up both transient objects.
+        let _ = self
+            .s3
+            .delete_object()
+            .bucket(self.bucket)
+            .key(&key)
+            .send()
+            .await;
+        let _ = self
+            .s3
+            .delete_object()
+            .bucket(self.bucket)
+            .key(&out_key)
+            .send()
+            .await;
+        outcome
+    }
+
+    async fn codegen_build_and_capture(
+        &self,
+        key: &str,
+        out_key: &str,
+        codegen_cmd: &str,
+        node_version: Option<&str>,
+        deadline: Option<Instant>,
+    ) -> Result<CodegenOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let mut env = vec![
+            env_var("SANDBOX_BUCKET", self.bucket)?,
+            env_var("SANDBOX_KEY", key)?,
+            env_var("CODEGEN_CMD", codegen_cmd)?,
+            env_var("CODEGEN_OUT_KEY", out_key)?,
+        ];
+        if let Some(v) = node_version {
+            env.push(env_var("NODE_VERSION", v)?);
+        }
+        let started = self
+            .codebuild
+            .start_build()
+            .project_name(self.project)
+            .set_environment_variables_override(Some(env))
+            .send()
+            .await
+            .map_err(|e| format!("codebuild start_build (codegen) failed: {e}"))?;
+        let build_id = started
+            .build_value()
+            .and_then(|b| b.id())
+            .ok_or("codebuild returned no build id")?
+            .to_string();
+        info!(build_id = %build_id, "sandbox: codegen build started");
+
+        let poll_until = {
+            let by_max = Instant::now() + MAX_WAIT;
+            match deadline {
+                Some(dl) => (dl - DEADLINE_BUFFER).min(by_max),
+                None => by_max,
+            }
+        };
+        loop {
+            let builds = self
+                .codebuild
+                .batch_get_builds()
+                .ids(&build_id)
+                .send()
+                .await
+                .map_err(|e| format!("codebuild batch_get_builds failed: {e}"))?;
+            let build = builds.builds().first().ok_or("no build record")?;
+            if !matches!(build.build_status(), Some(StatusType::InProgress)) {
+                let (group, stream) = build
+                    .logs()
+                    .and_then(|l| Some((l.group_name()?.to_string(), l.stream_name()?.to_string())))
+                    .unzip_or_default();
+                return self.read_codegen_outcome(&group, &stream, out_key).await;
+            }
+            if Instant::now() >= poll_until {
+                warn!(build_id = %build_id, "sandbox: codegen deadline reached, stopping");
+                let _ = self.codebuild.stop_build().id(&build_id).send().await;
+                return Ok(CodegenOutcome::not_run("codegen exceeded the time budget"));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    async fn read_codegen_outcome(
+        &self,
+        group: &str,
+        stream: &str,
+        out_key: &str,
+    ) -> Result<CodegenOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        if group.is_empty() {
+            return Ok(CodegenOutcome::not_run(
+                "codegen produced no logs (infra fault)",
+            ));
+        }
+        let full = self.fetch_log(group, stream).await?;
+        let output = common::tail_str(&full, MAX_OUTPUT_CHARS).to_string();
+        let Some(code) = parse_marker_exit(&full, MARKER_CODEGEN_END) else {
+            return Ok(CodegenOutcome::not_run(
+                "codegen did not complete (no result marker)",
+            ));
+        };
+        if code != 0 || !full.contains(MARKER_CODEGEN_UPLOADED) {
+            // Codegen failed, or changed nothing (nothing uploaded).
+            return Ok(CodegenOutcome {
+                ran: true,
+                passed: code == 0,
+                changed: Vec::new(),
+                output,
+            });
+        }
+        let changed = self.download_changed(out_key).await.unwrap_or_default();
+        Ok(CodegenOutcome {
+            ran: true,
+            passed: true,
+            changed,
+            output,
+        })
+    }
+
+    /// Download the captured tar.gz of changed files and read them into
+    /// (path, content) pairs, bounded in count and per-file size.
+    async fn download_changed(
+        &self,
+        out_key: &str,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let obj = self
+            .s3
+            .get_object()
+            .bucket(self.bucket)
+            .key(out_key)
+            .send()
+            .await
+            .map_err(|e| format!("codegen output download failed: {e}"))?;
+        let bytes = obj.body.collect().await?.into_bytes();
+        let gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut ar = tar::Archive::new(gz);
+        let mut out = Vec::new();
+        for entry in ar.entries()? {
+            let mut entry = entry?;
+            if entry.header().entry_type() != tar::EntryType::Regular {
+                continue;
+            }
+            if entry.size() > MAX_CODEGEN_FILE_BYTES {
+                warn!("codegen: skipping oversized changed file");
+                continue;
+            }
+            let path = entry.path()?.to_string_lossy().replace('\\', "/");
+            let mut content = String::new();
+            use std::io::Read;
+            if entry.read_to_string(&mut content).is_err() {
+                continue; // skip binary/non-utf8
+            }
+            out.push((path, content));
+            if out.len() >= MAX_CODEGEN_FILES {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     async fn build_and_read(
@@ -328,12 +555,17 @@ fn env_var(
         .map_err(|e| format!("bad codebuild env var {name}: {e}").into())
 }
 
-/// Parse the exit code from the buildspec's end marker.
-fn parse_exit(log: &str) -> Option<i32> {
-    let idx = log.find(MARKER_END)?;
-    let rest = &log[idx + MARKER_END.len()..];
+/// Parse the exit code that follows a given end-marker.
+fn parse_marker_exit(log: &str, marker: &str) -> Option<i32> {
+    let idx = log.find(marker)?;
+    let rest = &log[idx + marker.len()..];
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
+}
+
+/// Parse the exit code from the checks end marker.
+fn parse_exit(log: &str) -> Option<i32> {
+    parse_marker_exit(log, MARKER_END)
 }
 
 /// Slice the log to just the check window (between the start/end markers), so

@@ -4041,6 +4041,66 @@ pub(crate) async fn detect_node_version(
     None
 }
 
+/// Detect the repo's codegen command (Sanity typegen, GraphQL codegen, etc.) so
+/// the agent can REGENERATE generated files — the thing it otherwise can't do,
+/// which makes tickets like "add a Sanity block" (whose block key must land in
+/// the generated types union) autonomously completable. Returns None if no
+/// codegen script is found (the run_codegen tool then stays off).
+pub(crate) async fn detect_codegen_command(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> Option<String> {
+    let pkg_raw = github
+        .read_file(owner, repo, "package.json", git_ref)
+        .await
+        .ok()?;
+    let pkg = serde_json::from_str::<serde_json::Value>(&pkg_raw).ok()?;
+    let scripts = pkg.get("scripts").and_then(|s| s.as_object());
+    let has = |name: &str| scripts.map(|s| s.contains_key(name)).unwrap_or(false);
+
+    let (install, run) = if github
+        .read_file(owner, repo, "pnpm-lock.yaml", git_ref)
+        .await
+        .is_ok()
+    {
+        (
+            "corepack enable && pnpm install --frozen-lockfile",
+            "pnpm run",
+        )
+    } else if github
+        .read_file(owner, repo, "yarn.lock", git_ref)
+        .await
+        .is_ok()
+    {
+        ("corepack enable && yarn install --frozen-lockfile", "yarn")
+    } else {
+        ("npm ci --no-audit --no-fund", "npm run")
+    };
+
+    // A root codegen script wins.
+    for name in [
+        "typegen",
+        "codegen",
+        "sanity-typegen",
+        "gen:types",
+        "generate:types",
+    ] {
+        if has(name) {
+            return Some(format!("{install} && {run} {name}"));
+        }
+    }
+    // pnpm monorepo: codegen often lives in a workspace (e.g. apps/studio). Run
+    // it recursively where present (`--if-present` = no-op elsewhere, exit 0).
+    if run == "pnpm run" {
+        return Some(format!(
+            "{install} && pnpm -r --if-present run typegen && pnpm -r --if-present run codegen"
+        ));
+    }
+    None
+}
+
 /// Well-known instruction files that coding agents/IDEs use.
 const INSTRUCTION_FILES: &[&str] = &[
     "AGENTS.md",

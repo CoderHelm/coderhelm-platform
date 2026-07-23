@@ -230,27 +230,49 @@ export class WorkerStack extends cdk.Stack {
       // checks, and emits a parseable verdict marker. The verdict is read from
       // the marker (not the build status), so "checks failed" is cleanly
       // distinguishable from "the sandbox itself broke".
+      // Two modes in one buildspec:
+      //  - CHECKS  (default): run the repo's build/type-check, emit a verdict
+      //    marker read by the worker (not the build status).
+      //  - CODEGEN (when $CODEGEN_CMD is set): run the repo's codegen, capture
+      //    ONLY the files it changed (find -newer), and upload them to S3 so the
+      //    worker can commit them back — making the sandbox bidirectional so the
+      //    agent can regenerate generated files (Sanity types, GraphQL, etc.).
+      // `n` switches Node to the repo's version; the cd is gated so a bad
+      // extract fails the build (no marker) instead of running in the wrong dir.
       buildSpec: codebuild.BuildSpec.fromObject({
         version: "0.2",
         phases: {
           build: {
             commands: [
-              'aws s3 cp "s3://$SANDBOX_BUCKET/$SANDBOX_KEY" /tmp/src.tgz',
-              "mkdir -p /tmp/src && tar xzf /tmp/src.tgz -C /tmp/src",
-              // Switch Node to the repo's version (worker-detected; default 20)
-              // via `n` before checks — otherwise a repo needing >=20 fails
-              // `next build` on the image's default Node 18. Then run checks
-              // inside a cd-gated block so a bad extract yields no marker (infra
-              // fault) rather than checks in the wrong dir.
-              'n "${NODE_VERSION:-20}" >/dev/null 2>&1 || true; hash -r 2>/dev/null || true; cd /tmp/src/$(ls /tmp/src) && { echo "===CODERHELM_CHECKS_START==="; node --version; (eval "$CHECKS_CMD"); CODE=$?; echo "===CODERHELM_CHECKS_END exit=$CODE==="; }',
+              [
+                "set +e",
+                'aws s3 cp "s3://$SANDBOX_BUCKET/$SANDBOX_KEY" /tmp/src.tgz',
+                "mkdir -p /tmp/src && tar xzf /tmp/src.tgz -C /tmp/src",
+                "cd /tmp/src/$(ls /tmp/src) || exit 1",
+                'n "${NODE_VERSION:-20}" >/dev/null 2>&1 || true; hash -r 2>/dev/null || true',
+                'if [ -n "$CODEGEN_CMD" ]; then',
+                '  MARK=/tmp/mark; touch "$MARK"; sleep 1',
+                '  echo "===CODERHELM_CODEGEN_START==="; node --version',
+                '  (eval "$CODEGEN_CMD"); CODE=$?',
+                '  echo "===CODERHELM_CODEGEN_END exit=$CODE==="',
+                "  find . -type f -newer \"$MARK\" -not -path './node_modules/*' -not -path './.git/*' | sed 's|^\\./||' > /tmp/changed.txt",
+                '  echo "CHANGED:"; cat /tmp/changed.txt',
+                '  if [ -s /tmp/changed.txt ] && [ -n "$CODEGEN_OUT_KEY" ]; then tar czf /tmp/out.tgz -T /tmp/changed.txt && aws s3 cp /tmp/out.tgz "s3://$SANDBOX_BUCKET/$CODEGEN_OUT_KEY" && echo "===CODERHELM_CODEGEN_UPLOADED==="; fi',
+                "else",
+                '  echo "===CODERHELM_CHECKS_START==="; node --version',
+                '  (eval "$CHECKS_CMD"); CODE=$?',
+                '  echo "===CODERHELM_CHECKS_END exit=$CODE==="',
+                "fi",
+              ].join("\n"),
             ],
           },
         },
       }),
     });
 
-    // CodeBuild reads ONLY the sandbox bucket (no other creds).
-    sandboxBucket.grantRead(sandboxProject);
+    // CodeBuild reads the source tarball AND writes captured codegen output —
+    // both scoped to this ephemeral bucket only (no other creds).
+    sandboxBucket.grantReadWrite(sandboxProject);
 
     // Worker: upload tarballs, drive builds, read their logs.
     sandboxBucket.grantReadWrite(this.workerFunction);

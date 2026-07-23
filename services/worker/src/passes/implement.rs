@@ -156,6 +156,12 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     } else {
         None
     };
+    let codegen_cmd = if sandbox.is_some() {
+        super::detect_codegen_command(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch)
+            .await
+    } else {
+        None
+    };
 
     let mut tools = if complexity == "simple" {
         // Simple issues: no read_tree or list_directory — plan already says which files to edit
@@ -170,6 +176,10 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     // Offer the sandbox verifier only when it can actually run for this repo.
     if sandbox.is_some() && checks_cmd.is_some() {
         tools.push(run_checks_tool());
+    }
+    // Offer codegen regeneration when the repo has a codegen command.
+    if sandbox.is_some() && codegen_cmd.is_some() {
+        tools.push(run_codegen_tool());
     }
 
     // Only load MCP plugins if the issue body contains URLs or external references
@@ -287,6 +297,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             file_cache,
             sandbox,
             checks_cmd,
+            codegen_cmd,
             run_id: run_id.map(|s| s.to_string()),
             node_version,
             check_budget: std::sync::atomic::AtomicUsize::new(0),
@@ -462,6 +473,25 @@ fn run_checks_tool() -> ToolDefinition {
              the real error output, fix the root cause, and run it again. Aim to finish with a \
              PASSED result. Takes no arguments (the commands come from the repo's own build config)."
             .to_string(),
+        input_schema: json!({"type": "object", "properties": {}}),
+    }
+}
+
+/// Regenerates the repo's generated files (Sanity types, GraphQL types, etc.) by
+/// running its codegen in the sandbox and committing the changed files back —
+/// the capability that lets the agent finish tickets whose fix depends on
+/// regenerated types. Arg-less: the codegen command comes from the repo.
+fn run_codegen_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "run_codegen".to_string(),
+        description:
+            "Regenerate this repository's GENERATED files (e.g. Sanity `sanity.types.ts`, \
+             GraphQL types) by running the repo's own codegen in the sandbox, then commit the \
+             regenerated files. Use this AFTER you add or change a schema/source that feeds \
+             generated types — for example after adding a Sanity block, so its key lands in the \
+             generated types union and type-checks pass. Do NOT hand-edit large generated files; \
+             run this instead. Takes no arguments. After it runs, call run_checks to confirm."
+                .to_string(),
         input_schema: json!({"type": "object", "properties": {}}),
     }
 }
@@ -679,6 +709,8 @@ struct WriteToolExecutor<'a> {
     sandbox: Option<crate::clients::sandbox::SandboxClient<'a>>,
     /// Derived check command (None when the stack wasn't recognized).
     checks_cmd: Option<String>,
+    /// Derived codegen command (None when the repo has no codegen).
+    codegen_cmd: Option<String>,
     /// Node major version to switch the sandbox to (None -> buildspec default).
     node_version: Option<String>,
     run_id: Option<String>,
@@ -1162,6 +1194,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                 )))
             }
             "run_checks" => self.run_checks_impl().await,
+            "run_codegen" => self.run_codegen_impl().await,
             _ => Err(format!("Unknown tool: {name}").into()),
         }
     }
@@ -1241,6 +1274,115 @@ impl<'a> WriteToolExecutor<'a> {
             Err(e) => Ok(json!(format!(
                 "Sandbox error: {e}. Proceed carefully; CI still runs."
             ))),
+        }
+    }
+
+    /// Regenerate the repo's generated files in the sandbox and COMMIT the
+    /// changed files back to the branch. Content is committed worker-side (never
+    /// loaded into the agent's context — like restore_file). Ok(...) even on
+    /// failure; the agent reads the summary and iterates.
+    async fn run_codegen_impl(
+        &self,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        use std::sync::atomic::Ordering;
+        let (Some(sandbox), Some(cmd), Some(run_id)) =
+            (&self.sandbox, &self.codegen_cmd, &self.run_id)
+        else {
+            return Ok(json!("Codegen isn't available for this repo."));
+        };
+        let attempt = self.check_budget.fetch_add(1, Ordering::SeqCst);
+        if attempt >= MAX_CHECKS_PER_RUN {
+            return Ok(json!(format!(
+                "Sandbox budget ({MAX_CHECKS_PER_RUN}) reached for this run."
+            )));
+        }
+        if !sandbox.has_time(self.deadline) {
+            return Ok(json!(
+                "Not enough time remains to run codegen; finalize your changes now."
+            ));
+        }
+        let tarball = match self
+            .github
+            .download_tarball(&self.owner, &self.repo, &self.branch)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(json!(format!(
+                    "Could not snapshot the branch for codegen: {e}."
+                )))
+            }
+        };
+        match sandbox
+            .run_codegen(
+                run_id,
+                attempt,
+                tarball,
+                cmd,
+                self.node_version.as_deref(),
+                self.deadline,
+            )
+            .await
+        {
+            Ok(o) if o.ran && o.passed => {
+                if o.changed.is_empty() {
+                    return Ok(json!(format!(
+                        "Codegen ran cleanly but changed no files (nothing to regenerate). \
+                         Commands: {cmd}"
+                    )));
+                }
+                // Commit the regenerated files directly (worker-side, bypassing
+                // the anti-stub write guard — these are legitimate codegen output
+                // whose content never enters the agent's context).
+                let ops: Vec<FileOp> = o
+                    .changed
+                    .iter()
+                    .map(|(p, c)| FileOp::Write {
+                        path: p.clone(),
+                        content: c.clone(),
+                    })
+                    .collect();
+                let paths: Vec<String> = o.changed.iter().map(|(p, _)| p.clone()).collect();
+                match self
+                    .github
+                    .batch_write(
+                        &self.owner,
+                        &self.repo,
+                        &self.branch,
+                        "chore: regenerate generated files (codegen)",
+                        &ops,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        for p in &paths {
+                            self.files_modified.lock().unwrap().insert(p.clone());
+                            self.file_cache
+                                .remove(&format!("{}:{}", self.branch, p))
+                                .await;
+                        }
+                        Ok(json!(format!(
+                            "Regenerated and committed {} file(s): {}. Now call run_checks to \
+                             confirm the type errors are resolved.",
+                            paths.len(),
+                            paths.join(", ")
+                        )))
+                    }
+                    Err(e) => Ok(json!(format!(
+                        "Codegen produced {} file(s) but committing them failed: {e}",
+                        paths.len()
+                    ))),
+                }
+            }
+            Ok(o) if o.ran => Ok(json!(format!(
+                "Codegen FAILED (non-zero exit). Commands: {cmd}\n\n--- output (tail) ---\n{}",
+                o.output
+            ))),
+            Ok(o) => Ok(json!(format!(
+                "Codegen couldn't run ({}). Proceed carefully.",
+                o.output
+            ))),
+            Err(e) => Ok(json!(format!("Codegen error: {e}."))),
         }
     }
 }
