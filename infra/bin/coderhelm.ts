@@ -74,6 +74,7 @@ const worker = new WorkerStack(app, `${prefix}-worker`, {
   ciFixQueue: api.ciFixQueue,
   feedbackQueue: api.feedbackQueue,
   mcpProxyFunction: api.mcpProxyFunction,
+  encryptionKey: database.encryptionKey,
 });
 
 // --- Email ---

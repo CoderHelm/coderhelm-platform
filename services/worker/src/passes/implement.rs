@@ -932,7 +932,11 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     })
                     .collect();
                 self.task_tracker.mark_files_done(&written_paths).await;
-                let mut result = format!("Batch commit {} — {} files", &sha[..8], ops.len());
+                let mut result = format!(
+                    "Batch commit {} — {} files",
+                    &sha[..8.min(sha.len())],
+                    ops.len()
+                );
                 if !skipped.is_empty() {
                     result.push_str(&format!(
                         ". Skipped protected files: {}",

@@ -432,7 +432,9 @@ impl GitHubClient {
         let full = self.read_file(owner, repo, path, git_ref).await?;
         let lines: Vec<&str> = full.lines().collect();
         let start = start_line.saturating_sub(1).min(lines.len());
-        let end = end_line.min(lines.len());
+        // Guard against a model-supplied inverted range (start > end): clamp
+        // end up to start so the slice can never panic.
+        let end = end_line.min(lines.len()).max(start);
         let mut result = String::new();
         for (i, line) in lines[start..end].iter().enumerate() {
             result.push_str(&format!("{:>4} | {}\n", start + i + 1, line));
@@ -1270,12 +1272,11 @@ impl GitHubClient {
                         all_annotations.push_str(&format!("{summary}\n"));
                     }
                     if !text.is_empty() {
-                        let truncated = if text.len() > 3000 {
-                            &text[..3000]
-                        } else {
-                            text
-                        };
-                        all_annotations.push_str(&format!("{truncated}\n"));
+                        // char-safe: annotation text is arbitrary lint/test
+                        // output; a raw byte slice panics on a multibyte char
+                        // at the cut and (panic=abort) hard-kills the worker.
+                        all_annotations
+                            .push_str(&format!("{}\n", common::truncate_str(text, 3000)));
                     }
                 }
             }
