@@ -238,9 +238,12 @@ pub async fn converse_tool_loop(
                 messages.push((
                     "user".to_string(),
                     vec![json!({"type": "text", "text":
-                        "[SYSTEM NOTE — DEADLINE] You are running out of time. \
-                         STOP reading files. Commit any remaining changes NOW with batch_write, \
-                         then output a summary of what you completed and what's left. \
+                        "[SYSTEM NOTE — DEADLINE] You are almost out of time. Your completed \
+                         edits are ALREADY committed (each edit committed as you made it), so \
+                         do NOT dump remaining work now. Above all, do NOT write a stub, \
+                         placeholder, or half-finished file to 'save progress' — a partial file \
+                         breaks the build and is worse than leaving it unfinished. Stop, and \
+                         output a short summary of what you finished and what still needs doing. \
                          This is your LAST turn."
                     })],
                 ));

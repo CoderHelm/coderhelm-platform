@@ -1004,6 +1004,28 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                                  Nothing was committed; fix the content and retry."
                             )));
                         }
+                        // Anti-stub guard: overwriting an existing substantial file
+                        // with a drastic shrink is the placeholder-then-restore
+                        // churn. batch_write was the one write path missing this
+                        // check (write_file/edit_file already have it).
+                        let bw_key = format!("{}:{}", self.branch, path);
+                        let bw_existing = match self.file_cache.get(&bw_key).await {
+                            Some(c) => Some(c),
+                            None => self
+                                .github
+                                .read_file(&self.owner, &self.repo, path, &self.branch)
+                                .await
+                                .ok(),
+                        };
+                        if let Some(old) = &bw_existing {
+                            if let Some(problem) = validate_edit_safety(old, content, path) {
+                                return Ok(json!(format!(
+                                    "Batch write REJECTED — {path}: {problem}. Never replace a \
+                                     real file with a stub or placeholder; write the COMPLETE \
+                                     file. Nothing was committed."
+                                )));
+                            }
+                        }
                         ops.push(FileOp::Write {
                             path: path.to_string(),
                             content: content.to_string(),
