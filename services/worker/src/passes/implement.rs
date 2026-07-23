@@ -246,6 +246,20 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         }
     }
 
+    // When the execution sandbox is available, tell the agent to actually use
+    // it — otherwise simple/quick changes finish without ever verifying (the
+    // regression canary shipped a file with zero run_checks calls). Cheap
+    // insurance: one real build/type-check before finishing.
+    if tools.iter().any(|t| t.name == "run_checks") {
+        full_system.push_str(
+            "\n\n## Verify before finishing (required)\nA `run_checks` tool is available that \
+             runs this repository's REAL build and type-check against your committed changes. \
+             Before you finish — even for a small, seemingly-obvious change — call `run_checks` \
+             and confirm it passes. Do NOT finish on a failing build: read the real errors it \
+             returns and fix the root cause, then run it again.",
+        );
+    }
+
     let tasks_key = format!(
         "{}/tasks.md",
         crate::passes::openspec_prefix(
