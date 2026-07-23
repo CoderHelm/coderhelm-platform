@@ -179,20 +179,6 @@ impl GitHubClient {
         Ok(resp.json().await?)
     }
 
-    async fn put(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let headers = self.auth_headers().await?;
-        let mut req = self.http.put(url).json(body);
-        for (k, v) in headers {
-            req = req.header(k, v);
-        }
-        let resp = req.send().await?.error_for_status()?;
-        Ok(resp.json().await?)
-    }
-
     // ─── Repo snapshot (tarball-backed local search + reads) ────
 
     /// Download the repo tarball for a ref. One core-API request; the 302
@@ -571,6 +557,40 @@ impl GitHubClient {
         Ok(sha.to_string())
     }
 
+    /// Fast-forward-only ref update (compare-and-swap): points `branch` at
+    /// `sha` with `force:false`, so GitHub REJECTS a non-fast-forward move
+    /// (another writer raced us). Returns Ok(false) on that conflict so the
+    /// caller can rebuild on the new tip; Ok(true) on success. This is what
+    /// turns concurrent branch writes from "silently drop a commit" into
+    /// "serialize by retry."
+    async fn update_ref_ff(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        sha: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
+        let headers = self.auth_headers().await?;
+        let mut req = self
+            .http
+            .patch(&url)
+            .json(&serde_json::json!({"sha": sha, "force": false}));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await?;
+        match resp.status().as_u16() {
+            200 => Ok(true),
+            409 | 422 => Ok(false), // non-fast-forward — someone advanced the ref
+            _ => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("update ref failed: {status} {body}").into())
+            }
+        }
+    }
+
     /// Create a new branch from an existing ref.
     pub async fn create_branch(
         &self,
@@ -669,17 +689,48 @@ impl GitHubClient {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}");
         let encoded = B64.encode(content.as_bytes());
-        let mut body = serde_json::json!({
-            "message": message,
-            "content": encoded,
-            "branch": branch,
-        });
-        if let Some(s) = sha {
-            body["sha"] = serde_json::json!(s);
+        // Retry on 409 (stale blob sha — a concurrent commit changed the file):
+        // re-fetch the current sha and re-PUT, so a raced write serializes
+        // instead of erroring the whole pass.
+        let mut cur_sha = sha.map(|s| s.to_string());
+        let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        for attempt in 0..4u32 {
+            let mut body = serde_json::json!({
+                "message": message,
+                "content": encoded,
+                "branch": branch,
+            });
+            if let Some(ref s) = cur_sha {
+                body["sha"] = serde_json::json!(s);
+            }
+            let headers = self.auth_headers().await?;
+            let mut req = self.http.put(&url).json(&body);
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let resp = req.send().await?;
+            let status = resp.status().as_u16();
+            if (200..300).contains(&status) {
+                let result: serde_json::Value = resp.json().await?;
+                self.mirror_write(owner, repo, branch, path, content).await;
+                return Ok(result);
+            }
+            if status == 409 || status == 422 {
+                tracing::warn!(
+                    path,
+                    attempt,
+                    "write_file conflict — refetching sha and retrying"
+                );
+                cur_sha = self.get_file_sha(owner, repo, path, branch).await.ok();
+                tokio::time::sleep(std::time::Duration::from_millis(250 * (attempt as u64 + 1)))
+                    .await;
+                continue;
+            }
+            let body_txt = resp.text().await.unwrap_or_default();
+            last_err = Some(format!("write_file failed: {status} {body_txt}").into());
+            break;
         }
-        let result = self.put(&url, &body).await?;
-        self.mirror_write(owner, repo, branch, path, content).await;
-        Ok(result)
+        Err(last_err.unwrap_or_else(|| "write_file: exhausted retries under conflict".into()))
     }
 
     // ─── Batch write (atomic multi-file commit) ─────────────────
@@ -693,13 +744,12 @@ impl GitHubClient {
         message: &str,
         files: &[FileOp],
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let branch_sha = self.get_ref(owner, repo, branch).await?;
-
-        let mut tree_entries = Vec::new();
+        // Blobs are content-addressed and immutable — create them once, reuse
+        // across retries.
+        let mut blob_entries = Vec::new();
         for f in files {
             match f {
                 FileOp::Write { path, content } => {
-                    // Create blob
                     let blob_url = format!("{API_BASE}/repos/{owner}/{repo}/git/blobs");
                     let blob = self
                         .post(
@@ -713,8 +763,9 @@ impl GitHubClient {
                     let blob_sha = blob
                         .get("sha")
                         .and_then(|v| v.as_str())
-                        .ok_or("Missing blob sha")?;
-                    tree_entries.push(serde_json::json!({
+                        .ok_or("Missing blob sha")?
+                        .to_string();
+                    blob_entries.push(serde_json::json!({
                         "path": path,
                         "mode": "100644",
                         "type": "blob",
@@ -722,7 +773,7 @@ impl GitHubClient {
                     }));
                 }
                 FileOp::Delete { path } => {
-                    tree_entries.push(serde_json::json!({
+                    blob_entries.push(serde_json::json!({
                         "path": path,
                         "mode": "100644",
                         "type": "blob",
@@ -732,44 +783,56 @@ impl GitHubClient {
             }
         }
 
-        // Create tree
+        // Build tree + commit ON THE CURRENT TIP and update the ref with a
+        // fast-forward-only CAS. If another writer raced us, rebuild on their
+        // new tip (base_tree = new ref preserves their commit) and retry.
         let tree_url = format!("{API_BASE}/repos/{owner}/{repo}/git/trees");
-        let tree = self
-            .post(
-                &tree_url,
-                &serde_json::json!({
-                    "base_tree": branch_sha,
-                    "tree": tree_entries,
-                }),
-            )
-            .await?;
-        let tree_sha = tree
-            .get("sha")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing tree sha")?;
-
-        // Create commit
         let commit_url = format!("{API_BASE}/repos/{owner}/{repo}/git/commits");
-        let commit = self
-            .post(
-                &commit_url,
-                &serde_json::json!({
-                    "message": message,
-                    "tree": tree_sha,
-                    "parents": [branch_sha],
-                }),
-            )
-            .await?;
-        let commit_sha = commit
-            .get("sha")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing commit sha")?
-            .to_string();
-
-        // Update branch ref
-        let ref_url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
-        self.patch(&ref_url, &serde_json::json!({"sha": &commit_sha}))
-            .await?;
+        let mut commit_sha = String::new();
+        let mut committed = false;
+        for attempt in 0..6u32 {
+            let branch_sha = self.get_ref(owner, repo, branch).await?;
+            let tree = self
+                .post(
+                    &tree_url,
+                    &serde_json::json!({ "base_tree": branch_sha, "tree": blob_entries }),
+                )
+                .await?;
+            let tree_sha = tree
+                .get("sha")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing tree sha")?;
+            let commit = self
+                .post(
+                    &commit_url,
+                    &serde_json::json!({
+                        "message": message,
+                        "tree": tree_sha,
+                        "parents": [branch_sha],
+                    }),
+                )
+                .await?;
+            commit_sha = commit
+                .get("sha")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing commit sha")?
+                .to_string();
+            if self.update_ref_ff(owner, repo, branch, &commit_sha).await? {
+                committed = true;
+                break;
+            }
+            tracing::warn!(
+                branch,
+                attempt,
+                "batch_write ref conflict — another writer advanced the branch; rebuilding on new tip"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(300 * (attempt as u64 + 1))).await;
+        }
+        if !committed {
+            return Err(
+                "batch_write: branch kept advancing under concurrent writes (6 retries)".into(),
+            );
+        }
 
         for f in files {
             match f {
@@ -877,10 +940,15 @@ impl GitHubClient {
             .ok_or("Missing commit sha")?
             .to_string();
 
-        // Update branch ref to point to the merge commit
-        let ref_url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
-        self.patch(&ref_url, &serde_json::json!({"sha": &commit_sha}))
-            .await?;
+        // Update branch ref with fast-forward-only CAS. If the branch advanced
+        // during the (slow, LLM-driven) merge, the resolved content is stale —
+        // fail cleanly so resolve_conflicts re-runs against the new tip rather
+        // than clobbering the concurrent commit with a stale merge.
+        if !self.update_ref_ff(owner, repo, branch, &commit_sha).await? {
+            return Err(
+                "create_merge_commit: branch advanced during conflict resolution; retry".into(),
+            );
+        }
 
         // Merge commit pulls in base content we can't mirror file-by-file.
         self.invalidate_snapshot(owner, repo, branch).await;
