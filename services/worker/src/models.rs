@@ -25,6 +25,11 @@ pub struct Config {
     pub mcp_proxy_function_name: String,
     pub ci_fix_queue_url: String,
     pub ticket_queue_url: String,
+    /// Execution sandbox: S3 bucket for transient source tarballs and the
+    /// CodeBuild project that runs the repo's real build/lint/tests. Both empty
+    /// => sandbox disabled (the agent falls back to blind CI, never worse).
+    pub sandbox_bucket_name: String,
+    pub sandbox_project_name: String,
 }
 
 impl Config {
@@ -61,6 +66,8 @@ impl Config {
             mcp_proxy_function_name: std::env::var("MCP_PROXY_FUNCTION_NAME").unwrap_or_default(),
             ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").unwrap_or_default(),
             ticket_queue_url: std::env::var("TICKET_QUEUE_URL").unwrap_or_default(),
+            sandbox_bucket_name: std::env::var("SANDBOX_BUCKET_NAME").unwrap_or_default(),
+            sandbox_project_name: std::env::var("SANDBOX_PROJECT_NAME").unwrap_or_default(),
         }
     }
 }

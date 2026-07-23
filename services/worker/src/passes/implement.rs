@@ -13,6 +13,10 @@ use crate::passes::syntax_check;
 use crate::passes::FileCache;
 use crate::WorkerState;
 
+/// Cap on sandbox check runs per implement pass — bounds cost/time and forces
+/// the agent to converge within a handful of real verifications.
+const MAX_CHECKS_PER_RUN: usize = 6;
+
 pub struct ImplementResult {
     pub files_modified: Vec<String>,
     pub conversation_log: Vec<serde_json::Value>,
@@ -125,6 +129,29 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         )
     };
 
+    // Execution sandbox: construct the driver (if configured) and derive the
+    // repo's real check command ONCE, up front, so the agent can verify against
+    // ground truth via the run_checks tool.
+    let sandbox = if !state.config.sandbox_bucket_name.is_empty()
+        && !state.config.sandbox_project_name.is_empty()
+    {
+        Some(crate::clients::sandbox::SandboxClient::new(
+            &state.codebuild,
+            &state.s3,
+            &state.logs,
+            &state.config.sandbox_bucket_name,
+            &state.config.sandbox_project_name,
+        ))
+    } else {
+        None
+    };
+    let checks_cmd = if sandbox.is_some() {
+        super::detect_check_commands(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch)
+            .await
+    } else {
+        None
+    };
+
     let mut tools = if complexity == "simple" {
         // Simple issues: no read_tree or list_directory — plan already says which files to edit
         all_tools()
@@ -134,6 +161,11 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     } else {
         all_tools()
     };
+
+    // Offer the sandbox verifier only when it can actually run for this repo.
+    if sandbox.is_some() && checks_cmd.is_some() {
+        tools.push(run_checks_tool());
+    }
 
     // Only load MCP plugins if the issue body contains URLs or external references
     let has_external_refs = msg.body.contains("http://")
@@ -234,6 +266,11 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             files_modified: std::sync::Mutex::new(HashSet::new()),
             task_tracker: &task_tracker,
             file_cache,
+            sandbox,
+            checks_cmd,
+            run_id: run_id.map(|s| s.to_string()),
+            check_budget: std::sync::atomic::AtomicUsize::new(0),
+            deadline,
         },
         mcp_plugins: &loaded_mcp_plugins,
         lambda: &state.lambda,
@@ -391,6 +428,23 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 }
 
 // ─── Full tool set for implement pass ───────────────────────
+
+/// The execution-sandbox verifier. Offered only when a sandbox is configured
+/// AND a check command was derived for the repo. Arg-less on purpose: the agent
+/// cannot inject commands (the derived CI command is all that ever runs).
+fn run_checks_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "run_checks".to_string(),
+        description: "Run the repository's REAL build, type-check, and lint (and tests) in an \
+             isolated sandbox against your current committed changes, and get back the actual \
+             compiler/test output. This is ground truth — use it to VERIFY your work instead of \
+             guessing. Call it after making a coherent set of edits. If it reports FAILED, read \
+             the real error output, fix the root cause, and run it again. Aim to finish with a \
+             PASSED result. Takes no arguments (the commands come from the repo's own build config)."
+            .to_string(),
+        input_schema: json!({"type": "object", "properties": {}}),
+    }
+}
 
 fn all_tools() -> Vec<ToolDefinition> {
     vec![
@@ -601,6 +655,14 @@ struct WriteToolExecutor<'a> {
     files_modified: std::sync::Mutex<HashSet<String>>,
     task_tracker: &'a TaskTracker,
     file_cache: &'a FileCache,
+    /// Execution sandbox (None when unconfigured). Runs the repo's real checks.
+    sandbox: Option<crate::clients::sandbox::SandboxClient<'a>>,
+    /// Derived check command (None when the stack wasn't recognized).
+    checks_cmd: Option<String>,
+    run_id: Option<String>,
+    /// Bounds sandbox runs per pass; also the S3 key nonce per attempt.
+    check_budget: std::sync::atomic::AtomicUsize,
+    deadline: Option<std::time::Instant>,
 }
 
 #[async_trait::async_trait]
@@ -1031,7 +1093,79 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     content.len()
                 )))
             }
+            "run_checks" => self.run_checks_impl().await,
             _ => Err(format!("Unknown tool: {name}").into()),
+        }
+    }
+}
+
+impl<'a> WriteToolExecutor<'a> {
+    /// Run the repo's real checks in the sandbox and return the actual output
+    /// for the agent to iterate on. Returns Ok(...) even on a failing build — a
+    /// red result is normal feedback, not a tool error.
+    async fn run_checks_impl(
+        &self,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        use std::sync::atomic::Ordering;
+        let (Some(sandbox), Some(cmd), Some(run_id)) =
+            (&self.sandbox, &self.checks_cmd, &self.run_id)
+        else {
+            return Ok(json!(
+                "Sandbox verification isn't available for this run; rely on careful reasoning \
+                 and the existing tests."
+            ));
+        };
+
+        // Budget doubles as the per-attempt S3 key nonce (unique, deterministic).
+        let attempt = self.check_budget.fetch_add(1, Ordering::SeqCst);
+        if attempt >= MAX_CHECKS_PER_RUN {
+            return Ok(json!(format!(
+                "run_checks budget ({MAX_CHECKS_PER_RUN}) reached for this run. Finalize using \
+                 the output you already have."
+            )));
+        }
+        if !sandbox.has_time(self.deadline) {
+            return Ok(json!(
+                "Not enough time remains to run a sandbox build safely; finalize your changes now."
+            ));
+        }
+
+        let tarball = match self
+            .github
+            .download_tarball(&self.owner, &self.repo, &self.branch)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(json!(format!(
+                "Could not snapshot the branch for checks: {e}. Proceed carefully; CI still runs."
+            )))
+            }
+        };
+
+        match sandbox
+            .run_checks(run_id, attempt, tarball, cmd, self.deadline)
+            .await
+        {
+            Ok(o) if o.ran => {
+                let verdict = if o.passed {
+                    "PASSED ✅ — your changes build and lint clean"
+                } else {
+                    "FAILED ❌ — fix the errors below, then run_checks again"
+                };
+                Ok(json!(format!(
+                    "Sandbox checks {verdict} (exit {:?}).\nCommands: {cmd}\n\n\
+                     --- real output (tail) ---\n{}",
+                    o.exit_code, o.output
+                )))
+            }
+            Ok(o) => Ok(json!(format!(
+                "Sandbox couldn't verify this time ({}). Proceed carefully; CI still runs.",
+                o.output
+            ))),
+            Err(e) => Ok(json!(format!(
+                "Sandbox error: {e}. Proceed carefully; CI still runs."
+            ))),
         }
     }
 }

@@ -3620,6 +3620,104 @@ pub fn format_instructions_block(instructions: &str) -> String {
     )
 }
 
+/// Derive the shell command the execution sandbox runs to verify the repo —
+/// its real build / type-check / lint (and tests, last, so a broken build
+/// short-circuits before the slow suite). Mirrors what the repo's own CI runs,
+/// so "green in the sandbox" tracks "green in CI" — the durable generalization
+/// of pinning a toolchain. Returns None when the stack isn't recognized, in
+/// which case the sandbox stays off for the run (graceful, never worse).
+pub(crate) async fn detect_check_commands(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> Option<String> {
+    // ---- Node / TypeScript (the common case) ----
+    if let Ok(pkg_raw) = github.read_file(owner, repo, "package.json", git_ref).await {
+        if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&pkg_raw) {
+            let scripts = pkg.get("scripts").and_then(|s| s.as_object());
+            let has = |name: &str| scripts.map(|s| s.contains_key(name)).unwrap_or(false);
+
+            // Package manager from whichever lockfile the repo commits.
+            let (install, run) = if github
+                .read_file(owner, repo, "pnpm-lock.yaml", git_ref)
+                .await
+                .is_ok()
+            {
+                (
+                    "corepack enable && pnpm install --frozen-lockfile",
+                    "pnpm run",
+                )
+            } else if github
+                .read_file(owner, repo, "yarn.lock", git_ref)
+                .await
+                .is_ok()
+            {
+                ("corepack enable && yarn install --frozen-lockfile", "yarn")
+            } else {
+                ("npm ci --no-audit --no-fund", "npm run")
+            };
+
+            let mut steps = vec![install.to_string()];
+            // Most-fundamental failures first — `&&` short-circuits, so a broken
+            // build never reaches the (slow) test suite.
+            for script in ["typecheck", "type-check", "lint", "build", "test"] {
+                if has(script) {
+                    steps.push(format!("{run} {script}"));
+                }
+            }
+            // No build/typecheck script but TS is configured — check types anyway.
+            let has_compile_step = steps.iter().any(|s| {
+                s.contains("build") || s.contains("typecheck") || s.contains("type-check")
+            });
+            if !has_compile_step
+                && github
+                    .read_file(owner, repo, "tsconfig.json", git_ref)
+                    .await
+                    .is_ok()
+            {
+                steps.push("npx --no-install tsc --noEmit".to_string());
+            }
+            // Only the install step => still verifies deps resolve (low signal
+            // but valid); more steps => the real checks.
+            return Some(steps.join(" && "));
+        }
+    }
+
+    // ---- Rust ----
+    if github
+        .read_file(owner, repo, "Cargo.toml", git_ref)
+        .await
+        .is_ok()
+    {
+        return Some("cargo build --locked && cargo test --locked".to_string());
+    }
+    // ---- Go ----
+    if github
+        .read_file(owner, repo, "go.mod", git_ref)
+        .await
+        .is_ok()
+    {
+        return Some("go build ./... && go vet ./... && go test ./...".to_string());
+    }
+    // ---- Python ----
+    if github
+        .read_file(owner, repo, "requirements.txt", git_ref)
+        .await
+        .is_ok()
+    {
+        return Some("pip install -r requirements.txt && python -m compileall -q .".to_string());
+    }
+    if github
+        .read_file(owner, repo, "pyproject.toml", git_ref)
+        .await
+        .is_ok()
+    {
+        return Some("pip install -e . && python -m compileall -q .".to_string());
+    }
+    None
+}
+
 /// Well-known instruction files that coding agents/IDEs use.
 const INSTRUCTION_FILES: &[&str] = &[
     "AGENTS.md",

@@ -17,6 +17,8 @@ pub struct WorkerState {
     pub bedrock: aws_sdk_bedrockruntime::Client, // Used for Titan embeddings only (not LLM)
     pub lambda: aws_sdk_lambda::Client,
     pub sqs: aws_sdk_sqs::Client,
+    pub codebuild: aws_sdk_codebuild::Client,
+    pub logs: aws_sdk_cloudwatchlogs::Client,
     pub http: reqwest::Client,
     pub config: models::Config,
     pub secrets: models::Secrets,
@@ -36,6 +38,8 @@ async fn main() -> Result<(), Error> {
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
     let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
     let sqs = aws_sdk_sqs::Client::new(&aws_config);
+    let codebuild = aws_sdk_codebuild::Client::new(&aws_config);
+    let logs = aws_sdk_cloudwatchlogs::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
 
     let config = models::Config::from_env();
@@ -48,6 +52,8 @@ async fn main() -> Result<(), Error> {
         bedrock,
         lambda: lambda_client,
         sqs,
+        codebuild,
+        logs,
         http: reqwest::Client::builder()
             .user_agent("coderhelm-worker/0.1")
             .build()?,

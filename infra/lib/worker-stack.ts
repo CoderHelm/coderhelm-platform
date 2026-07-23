@@ -10,6 +10,7 @@ import * as logs from "aws-cdk-lib/aws-logs";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as eventsources from "aws-cdk-lib/aws-lambda-event-sources";
+import * as codebuild from "aws-cdk-lib/aws-codebuild";
 import { Construct } from "constructs";
 import * as path from "path";
 
@@ -183,6 +184,83 @@ export class WorkerStack extends cdk.Stack {
     this.workerFunction.addEnvironment(
       "MCP_PROXY_FUNCTION_NAME",
       props.mcpProxyFunction.functionName
+    );
+
+    // --- Execution sandbox (CodeBuild) ---
+    // Runs each repo's REAL build/lint/tests in an isolated container so the
+    // agent iterates against ground truth instead of guessing at CI. The
+    // sandbox runs untrusted customer build scripts, so its role is minimal by
+    // design: read ONE ephemeral S3 bucket + write its own logs. No GitHub
+    // token, no DynamoDB, no KMS. SSE-S3 (not the account CMK) on the bucket is
+    // what keeps the CodeBuild role KMS-free.
+    const sandboxLogGroup = new logs.LogGroup(this, "SandboxLogGroup", {
+      logGroupName: `/aws/codebuild/${prefix}-sandbox`,
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const sandboxBucket = new s3.Bucket(this, "SandboxBucket", {
+      bucketName: `${prefix}-sandbox`,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+      // Source tarballs are transient — expire fast as a backstop to the
+      // worker's per-build cleanup.
+      lifecycleRules: [{ expiration: cdk.Duration.days(1) }],
+    });
+
+    const sandboxProject = new codebuild.Project(this, "SandboxProject", {
+      projectName: `${prefix}-sandbox`,
+      timeout: cdk.Duration.minutes(15),
+      environment: {
+        buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
+        computeType: codebuild.ComputeType.SMALL,
+      },
+      logging: { cloudWatch: { logGroup: sandboxLogGroup } },
+      // NO_SOURCE: the worker passes the tarball location + the derived check
+      // command as env overrides. The buildspec fetches, extracts, runs the
+      // checks, and emits a parseable verdict marker. The verdict is read from
+      // the marker (not the build status), so "checks failed" is cleanly
+      // distinguishable from "the sandbox itself broke".
+      buildSpec: codebuild.BuildSpec.fromObject({
+        version: "0.2",
+        phases: {
+          build: {
+            commands: [
+              'aws s3 cp "s3://$SANDBOX_BUCKET/$SANDBOX_KEY" /tmp/src.tgz',
+              "mkdir -p /tmp/src && tar xzf /tmp/src.tgz -C /tmp/src",
+              'cd /tmp/src/$(ls /tmp/src) && echo "===CODERHELM_CHECKS_START===" && (eval "$CHECKS_CMD"); CODE=$?; echo "===CODERHELM_CHECKS_END exit=$CODE==="',
+            ],
+          },
+        },
+      }),
+    });
+
+    // CodeBuild reads ONLY the sandbox bucket (no other creds).
+    sandboxBucket.grantRead(sandboxProject);
+
+    // Worker: upload tarballs, drive builds, read their logs.
+    sandboxBucket.grantReadWrite(this.workerFunction);
+    this.workerFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "codebuild:StartBuild",
+          "codebuild:BatchGetBuilds",
+          "codebuild:StopBuild",
+        ],
+        resources: [sandboxProject.projectArn],
+      })
+    );
+    sandboxLogGroup.grantRead(this.workerFunction);
+    this.workerFunction.addEnvironment(
+      "SANDBOX_BUCKET_NAME",
+      sandboxBucket.bucketName
+    );
+    this.workerFunction.addEnvironment(
+      "SANDBOX_PROJECT_NAME",
+      sandboxProject.projectName
     );
 
     // --- Stuck Run Cleanup Lambda (Python) ---

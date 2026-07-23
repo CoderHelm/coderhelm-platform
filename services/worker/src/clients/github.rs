@@ -183,7 +183,7 @@ impl GitHubClient {
 
     /// Download the repo tarball for a ref. One core-API request; the 302
     /// redirect to codeload is followed automatically by reqwest.
-    async fn download_tarball(
+    pub async fn download_tarball(
         &self,
         owner: &str,
         repo: &str,
