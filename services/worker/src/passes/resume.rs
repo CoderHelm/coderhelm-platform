@@ -454,6 +454,9 @@ pub async fn run(
         sender: String::new(),
         base_branch,
         image_attachments: vec![],
+        continuation: 0,
+        continuation_run_id: None,
+        first_attempt_ms: 0,
     };
 
     let provider = ModelProvider::load_for_team(

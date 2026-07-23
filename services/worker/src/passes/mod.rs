@@ -9,6 +9,67 @@ const LAMBDA_TIMEOUT_SECS: u64 = 900;
 /// Minimum seconds remaining before we'll start a new implement cycle.
 const MIN_TIME_FOR_REMEDIATION_SECS: u64 = 240; // 4 minutes
 
+/// Auto-continuation: a big ticket that times out mid-implement is re-enqueued
+/// to continue from its partial (already-committed) branch state, rather than
+/// stopping at a partial PR. Hard-bounded two ways so it can NEVER loop:
+const MAX_CONTINUATIONS: u32 = 3;
+/// ...and a wall-clock backstop across all continuations (survives a bad count).
+const MAX_CONTINUATION_WALL_SECS: u64 = 45 * 60;
+
+/// May a timed-out run be auto-continued? Pure + total so it's unit-tested.
+/// False the moment EITHER bound is hit — defense in depth against a runaway.
+fn should_auto_continue(continuation: u32, first_attempt_ms: u64, now_ms: u64) -> bool {
+    if continuation >= MAX_CONTINUATIONS {
+        return false;
+    }
+    if first_attempt_ms > 0 {
+        let elapsed_secs = now_ms.saturating_sub(first_attempt_ms) / 1000;
+        if elapsed_secs >= MAX_CONTINUATION_WALL_SECS {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::{should_auto_continue, MAX_CONTINUATIONS, MAX_CONTINUATION_WALL_SECS};
+
+    #[test]
+    fn stops_at_max_count() {
+        assert!(should_auto_continue(0, 0, 0));
+        assert!(should_auto_continue(MAX_CONTINUATIONS - 1, 0, 0));
+        assert!(!should_auto_continue(MAX_CONTINUATIONS, 0, 0)); // cap hit
+        assert!(!should_auto_continue(MAX_CONTINUATIONS + 5, 0, 0));
+    }
+
+    #[test]
+    fn stops_past_wall_clock() {
+        let start = 1_000_000_000u64;
+        // within budget → allowed
+        assert!(should_auto_continue(1, start, start + 10 * 60 * 1000));
+        // past the wall-clock budget → stopped even though count is fine
+        let past = start + (MAX_CONTINUATION_WALL_SECS + 60) * 1000;
+        assert!(!should_auto_continue(1, start, past));
+    }
+
+    #[test]
+    fn count_cap_beats_fresh_clock() {
+        // Even with a fresh clock, the count cap still stops it.
+        assert!(!should_auto_continue(
+            MAX_CONTINUATIONS,
+            1_000_000_000,
+            1_000_000_000
+        ));
+    }
+
+    #[test]
+    fn zero_first_attempt_ignores_wall_clock() {
+        // first_attempt_ms == 0 means "unset" — only the count bounds apply.
+        assert!(should_auto_continue(0, 0, u64::MAX));
+    }
+}
+
 use crate::agent::mcp;
 use crate::agent::{llm, provider};
 use crate::clients::email;
@@ -258,14 +319,27 @@ pub async fn orchestrate_ticket(
     state: &WorkerState,
     mut msg: TicketMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let run_id = ulid::Ulid::new().to_string();
+    // A continuation reuses its original run_id (so it's ONE run, not a
+    // duplicate); a fresh ticket mints a new one.
+    let is_continuation = msg.continuation > 0
+        && msg
+            .continuation_run_id
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+    let run_id = msg
+        .continuation_run_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ulid::Ulid::new().to_string());
     let mut usage = TokenUsage::default();
     let start = std::time::Instant::now();
 
-    info!(run_id, ticket_id = %msg.ticket_id, "Orchestration started");
+    info!(run_id, ticket_id = %msg.ticket_id, continuation = msg.continuation, "Orchestration started");
 
-    // Dedup: skip if another run for this ticket is already in progress
-    if is_ticket_already_running(state, &msg).await {
+    // Dedup only FRESH runs — a continuation legitimately reuses its own run_id
+    // and would otherwise see itself as "already running" and drop.
+    if !is_continuation && is_ticket_already_running(state, &msg).await {
         warn!(
             run_id,
             ticket_id = %msg.ticket_id,
@@ -274,8 +348,20 @@ pub async fn orchestrate_ticket(
         return Ok(());
     }
 
-    // Create run record
-    create_run_record(state, &msg, &run_id).await?;
+    if is_continuation {
+        // Reuse the existing run record — but ONLY if it isn't cancelled. This
+        // is the hard guard that prevents auto-continuation from ever
+        // resurrecting a run the user cancelled.
+        if !resume_run_to_running(state, &msg.team_id, &run_id).await {
+            info!(
+                run_id,
+                "Continuation aborted — run is cancelled or no longer exists"
+            );
+            return Ok(());
+        }
+    } else {
+        create_run_record(state, &msg, &run_id).await?;
+    }
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(LAMBDA_TIMEOUT_SECS - 30), // 30s buffer for cleanup
@@ -387,46 +473,103 @@ pub async fn orchestrate_ticket(
                 duration, "Orchestration timed out — Lambda limit approaching"
             );
 
-            // Check if there's partial work on a branch we can salvage as a draft PR
             let checkpoint = load_checkpoint(state, &msg.team_id, &run_id).await;
-            let salvaged = if let Some((ref last_pass, ref branch, _)) = checkpoint {
-                if !branch.is_empty()
-                    && matches!(
-                        last_pass.as_str(),
-                        "implement" | "implement_started" | "security"
-                    )
-                {
-                    info!(
-                        run_id,
-                        branch, "Timeout — attempting to salvage partial work as draft PR"
-                    );
-                    match salvage_timeout_pr(state, &msg, &run_id, branch, &usage, duration).await {
-                        Ok(pr_url) => {
-                            info!(run_id, pr_url, "Salvaged partial work into draft PR");
+            let has_partial = matches!(&checkpoint, Some((lp, br, _))
+                if !br.is_empty() && matches!(lp.as_str(), "implement" | "implement_started" | "security"));
+
+            // Prefer AUTO-CONTINUATION over a partial PR: re-enqueue to resume
+            // from the already-committed partial work. Hard-bounded by count AND
+            // wall-clock so it can never loop; only when a ticket queue exists.
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let first_ms = if msg.first_attempt_ms > 0 {
+                msg.first_attempt_ms
+            } else {
+                now_ms
+            };
+            let continued = if has_partial
+                && !state.config.ticket_queue_url.is_empty()
+                && should_auto_continue(msg.continuation, first_ms, now_ms)
+            {
+                let mut cont = msg.clone();
+                cont.continuation = msg.continuation + 1;
+                cont.continuation_run_id = Some(run_id.clone());
+                cont.first_attempt_ms = first_ms;
+                match serde_json::to_string(&crate::models::WorkerMessage::Ticket(cont)) {
+                    Ok(body) => match state
+                        .sqs
+                        .send_message()
+                        .queue_url(&state.config.ticket_queue_url)
+                        .message_body(body)
+                        .delay_seconds(5)
+                        .send()
+                        .await
+                    {
+                        Ok(_) => {
+                            info!(
+                                run_id,
+                                next_continuation = msg.continuation + 1,
+                                "Timed out with partial work — auto-continuing (bounded)"
+                            );
                             true
                         }
                         Err(e) => {
-                            warn!(run_id, error = %e, "Failed to salvage partial work");
+                            warn!(run_id, error = %e, "Continuation enqueue failed — salvaging instead");
                             false
                         }
+                    },
+                    Err(e) => {
+                        warn!(run_id, error = %e, "Continuation serialize failed — salvaging instead");
+                        false
                     }
-                } else {
-                    false
                 }
             } else {
                 false
             };
 
-            if !salvaged {
-                fail_run(
-                    state,
-                    &msg,
-                    &run_id,
-                    "Run timed out (exceeded execution time limit). The issue may need a narrower scope.",
-                    &usage,
-                    duration,
-                )
-                .await;
+            // Fallback (bounds hit, no queue, or enqueue failed): salvage the
+            // partial work as a draft PR, else fail.
+            if !continued {
+                let salvaged = if let Some((ref last_pass, ref branch, _)) = checkpoint {
+                    if !branch.is_empty()
+                        && matches!(
+                            last_pass.as_str(),
+                            "implement" | "implement_started" | "security"
+                        )
+                    {
+                        info!(
+                            run_id,
+                            branch, "Timeout — attempting to salvage partial work as draft PR"
+                        );
+                        match salvage_timeout_pr(state, &msg, &run_id, branch, &usage, duration)
+                            .await
+                        {
+                            Ok(pr_url) => {
+                                info!(run_id, pr_url, "Salvaged partial work into draft PR");
+                                true
+                            }
+                            Err(e) => {
+                                warn!(run_id, error = %e, "Failed to salvage partial work");
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !salvaged {
+                    fail_run(
+                        state,
+                        &msg,
+                        &run_id,
+                        "Run timed out (exceeded execution time limit). The issue may need a narrower scope.",
+                        &usage,
+                        duration,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -2840,6 +2983,30 @@ async fn run_repo_pipeline(
         pr_number: pr_result.pr_number,
         pr_url: pr_result.pr_url,
     })
+}
+
+/// Flip a continuation's existing run back to "running" — but ONLY if it still
+/// exists and is NOT cancelled. Returns false (→ abort the continuation)
+/// otherwise. This is the guard that stops auto-continuation from ever
+/// resurrecting a run the user cancelled.
+async fn resume_run_to_running(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
+    let now = chrono::Utc::now().to_rfc3339();
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET #s = :r, status_run_id = :sri, updated_at = :t")
+        .condition_expression("attribute_exists(run_id) AND #s <> :cancelled")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":r", attr_s("running"))
+        .expression_attribute_values(":sri", attr_s(&format!("running#{run_id}")))
+        .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":cancelled", attr_s("cancelled"))
+        .send()
+        .await
+        .is_ok()
 }
 
 async fn create_run_record(

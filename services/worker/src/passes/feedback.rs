@@ -96,6 +96,9 @@ pub async fn run(
                     sender: String::new(),
                     base_branch,
                     image_attachments: vec![],
+                    continuation: 0,
+                    continuation_run_id: None,
+                    first_attempt_ms: 0,
                 };
                 match super::pr::resolve_conflicts(
                     state,
@@ -1283,6 +1286,9 @@ async fn handle_wrong_repo(
         sender: String::new(),
         base_branch: "main".to_string(),
         image_attachments,
+        continuation: 0,
+        continuation_run_id: None,
+        first_attempt_ms: 0,
     });
 
     if state.config.ticket_queue_url.is_empty() {

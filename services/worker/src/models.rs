@@ -176,6 +176,16 @@ pub struct TicketMessage {
     pub base_branch: String,
     #[serde(default)]
     pub image_attachments: Vec<ImageAttachment>,
+    // --- Auto-continuation (bounded resume of a timed-out run) ---
+    /// How many times this ticket has already been auto-continued. Hard cap.
+    #[serde(default)]
+    pub continuation: u32,
+    /// Reuse this run_id across continuations so it's ONE run, not duplicates.
+    #[serde(default)]
+    pub continuation_run_id: Option<String>,
+    /// Epoch ms of the first attempt — the wall-clock runaway backstop.
+    #[serde(default)]
+    pub first_attempt_ms: u64,
 }
 
 fn default_branch() -> String {
@@ -297,6 +307,9 @@ mod tests {
             sender: "user".into(),
             base_branch: "main".into(),
             image_attachments: vec![],
+            continuation: 0,
+            continuation_run_id: None,
+            first_attempt_ms: 0,
         });
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();
