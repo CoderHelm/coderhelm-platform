@@ -3508,11 +3508,26 @@ async fn is_ticket_already_running(state: &WorkerState, msg: &TicketMessage) -> 
 
 /// Load must-rules (global + repo-specific) from DynamoDB and merge them.
 pub(crate) async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<String> {
-    // Hardcoded safety rules that always apply
+    // Built-in rules that ship for EVERY team (no per-team config needed).
+    // First two are safety; the rest are the core code-quality guarantees that
+    // apply universally. Teams can add their own on top via RULES#GLOBAL /
+    // RULES#REPO below.
     let mut rules = vec![
         "Never push directly to the default/main branch. Always create a feature branch."
             .to_string(),
         "Never commit secrets, credentials, API keys, tokens, or sensitive information. Use environment variables or secret managers instead."
+            .to_string(),
+        "Reuse existing code before inventing: search the repo for an existing component, utility, or pattern and use it with its ACTUAL API. Never create a parallel version or guess a component's props, a function's signature, or a type's fields — read the definition (or the generated types) first."
+            .to_string(),
+        "When a run_checks tool is available, call it before finishing and make sure the repo's real build and type-check pass. Never finish with failing type errors."
+            .to_string(),
+        "Never leave stubs, placeholders, or TODOs — write complete, working code. If you break a file, restore it and fix it properly rather than shipping a partial version."
+            .to_string(),
+        "Never suppress or fake a check to make it pass: do not use `as any`/`as never`, `@ts-ignore`, `@ts-expect-error`, `eslint-disable`, or a non-null `!` to dodge a real error, and never loosen a type or delete/skip a test just to turn a check green. Fix the actual cause — a green check must mean the code is correct."
+            .to_string(),
+        "Ground every reference in the repo — don't guess. Before referencing any import path, exported symbol, type field, environment variable, or package script, confirm it exists by reading the file or the generated types. The installed versions in THIS repo are the source of truth, not how a library usually works."
+            .to_string(),
+        "If you add something a codegen step consumes (a Sanity block/schema, GraphQL type, etc.), update or regenerate the generated types so they include it — otherwise type-checks will fail."
             .to_string(),
     ];
 
