@@ -31,9 +31,105 @@ fn should_auto_continue(continuation: u32, first_attempt_ms: u64, now_ms: u64) -
     true
 }
 
+/// The agent-loop error emitted when the step budget is exhausted
+/// (anthropic.rs: "Reached the maximum number of steps (N) without finishing").
+/// This means "needs more turns", NOT a real failure — treated like the
+/// wall-clock timeout and auto-continued rather than salvaged into a
+/// half-finished PR. Substring match is the same error-classification idiom as
+/// the `cancelled by user` check. Coupled to the message in
+/// `agent::anthropic::converse_tool_loop`.
+fn is_budget_exhausted(err_msg: &str) -> bool {
+    err_msg.contains("maximum number of steps")
+}
+
+/// Auto-continue a run that ran out of budget (wall-clock OR step limit) with
+/// real partial work already committed to its branch: re-enqueue the ticket to
+/// resume from that branch (reusing run_id). Hard-bounded by count AND
+/// wall-clock via `should_auto_continue` so it can NEVER loop, and only when a
+/// partial checkpoint + ticket queue exist. Returns true iff a continuation was
+/// enqueued. Shared by both orchestration death paths (timeout + error arms) so
+/// they can't drift.
+async fn try_auto_continue(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    checkpoint: &Option<(String, String, u8)>,
+    continuable_passes: &[&str],
+) -> bool {
+    // Gate on the checkpoint's pass IDENTITY, not just on there being a branch.
+    // The wall-clock-timeout arm passes the broad set (any late pass with work
+    // committed is worth resuming); the step-budget arm passes only
+    // ["implement_started"] so a step-limit raised by some OTHER pass sharing the
+    // agent loop (security/test) can never resume from a stale implement
+    // checkpoint. Callers own this invariant; don't widen it here.
+    let has_partial = matches!(checkpoint, Some((lp, br, _))
+        if !br.is_empty() && continuable_passes.contains(&lp.as_str()));
+    if !has_partial || state.config.ticket_queue_url.is_empty() {
+        return false;
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let first_ms = if msg.first_attempt_ms > 0 {
+        msg.first_attempt_ms
+    } else {
+        now_ms
+    };
+    if !should_auto_continue(msg.continuation, first_ms, now_ms) {
+        return false;
+    }
+    let mut cont = msg.clone();
+    cont.continuation = msg.continuation + 1;
+    cont.continuation_run_id = Some(run_id.to_string());
+    cont.first_attempt_ms = first_ms;
+    match serde_json::to_string(&crate::models::WorkerMessage::Ticket(cont)) {
+        Ok(body) => match state
+            .sqs
+            .send_message()
+            .queue_url(&state.config.ticket_queue_url)
+            .message_body(body)
+            .delay_seconds(5)
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    run_id,
+                    next_continuation = msg.continuation + 1,
+                    "Ran out of budget with partial work — auto-continuing (bounded)"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(run_id, error = %e, "Continuation enqueue failed — falling back to salvage");
+                false
+            }
+        },
+        Err(e) => {
+            warn!(run_id, error = %e, "Continuation serialize failed — falling back to salvage");
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod continuation_tests {
-    use super::{should_auto_continue, MAX_CONTINUATIONS, MAX_CONTINUATION_WALL_SECS};
+    use super::{
+        is_budget_exhausted, should_auto_continue, MAX_CONTINUATIONS, MAX_CONTINUATION_WALL_SECS,
+    };
+
+    #[test]
+    fn budget_exhausted_classifies_step_limit() {
+        // The exact message agent::anthropic emits when the step budget is hit.
+        assert!(is_budget_exhausted(
+            "Reached the maximum number of steps (60) without finishing. \
+             The issue may need more detail or a narrower scope."
+        ));
+        // Genuine failures must NOT be treated as continuable.
+        assert!(!is_budget_exhausted(
+            "not_found_error: model does not exist"
+        ));
+        assert!(!is_budget_exhausted("cancelled by user"));
+        assert!(!is_budget_exhausted("GitHub API 404: issue not found"));
+    }
 
     #[test]
     fn stops_at_max_count() {
@@ -415,15 +511,28 @@ pub async fn orchestrate_ticket(
                 }
             } else {
                 error!(run_id, error = %e, "Orchestration failed");
-                // Salvage before failing: an implement that burned its turn
-                // budget mid-task has already pushed real commits to the
-                // branch. The timeout arm salvaged them into a draft PR; the
-                // error arm silently orphaned them.
                 let checkpoint = load_checkpoint(state, &msg.team_id, &run_id).await;
+                // Budget exhausted (hit the step limit) with committed partial
+                // work is "needs more turns", not a real failure — auto-continue
+                // (bounded) from the branch instead of salvaging a half-finished
+                // PR the user sees as an error. Identical treatment to the
+                // wall-clock timeout arm; only THIS error class continues, other
+                // failures still salvage/fail below.
+                // Only a genuine mid-implement step-budget death continues (the
+                // salvage arm below uses the same "implement_started" signal). This
+                // stays correct even if a future non-implement pass propagates the
+                // same step-limit message — it won't match this checkpoint.
+                let continued = is_budget_exhausted(&err_msg)
+                    && try_auto_continue(state, &msg, &run_id, &checkpoint, &["implement_started"])
+                        .await;
+                // Salvage before failing: an implement that burned its turn
+                // budget mid-task has already pushed real commits to the branch.
                 // Only mid-implement deaths salvage: for later-pass errors a
-                // salvage would mark the run completed and hide the real
-                // error behind a misleading "partial work" message.
-                let salvaged = if let Some((ref last_pass, ref branch, _)) = checkpoint {
+                // salvage would mark the run completed and hide the real error
+                // behind a misleading "partial work" message.
+                let salvaged = if continued {
+                    false
+                } else if let Some((ref last_pass, ref branch, _)) = checkpoint {
                     if !branch.is_empty() && last_pass.as_str() == "implement_started" {
                         info!(
                             run_id,
@@ -448,7 +557,7 @@ pub async fn orchestrate_ticket(
                 } else {
                     false
                 };
-                if !salvaged {
+                if !continued && !salvaged {
                     let sanitized = sanitize_error(&err_msg);
                     fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
                 }
@@ -474,57 +583,19 @@ pub async fn orchestrate_ticket(
             );
 
             let checkpoint = load_checkpoint(state, &msg.team_id, &run_id).await;
-            let has_partial = matches!(&checkpoint, Some((lp, br, _))
-                if !br.is_empty() && matches!(lp.as_str(), "implement" | "implement_started" | "security"));
 
             // Prefer AUTO-CONTINUATION over a partial PR: re-enqueue to resume
-            // from the already-committed partial work. Hard-bounded by count AND
-            // wall-clock so it can never loop; only when a ticket queue exists.
-            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-            let first_ms = if msg.first_attempt_ms > 0 {
-                msg.first_attempt_ms
-            } else {
-                now_ms
-            };
-            let continued = if has_partial
-                && !state.config.ticket_queue_url.is_empty()
-                && should_auto_continue(msg.continuation, first_ms, now_ms)
-            {
-                let mut cont = msg.clone();
-                cont.continuation = msg.continuation + 1;
-                cont.continuation_run_id = Some(run_id.clone());
-                cont.first_attempt_ms = first_ms;
-                match serde_json::to_string(&crate::models::WorkerMessage::Ticket(cont)) {
-                    Ok(body) => match state
-                        .sqs
-                        .send_message()
-                        .queue_url(&state.config.ticket_queue_url)
-                        .message_body(body)
-                        .delay_seconds(5)
-                        .send()
-                        .await
-                    {
-                        Ok(_) => {
-                            info!(
-                                run_id,
-                                next_continuation = msg.continuation + 1,
-                                "Timed out with partial work — auto-continuing (bounded)"
-                            );
-                            true
-                        }
-                        Err(e) => {
-                            warn!(run_id, error = %e, "Continuation enqueue failed — salvaging instead");
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        warn!(run_id, error = %e, "Continuation serialize failed — salvaging instead");
-                        false
-                    }
-                }
-            } else {
-                false
-            };
+            // from the already-committed partial work (bounded — see helper). A
+            // wall-clock timeout can strand real work in any late pass, so the
+            // full continuable set applies here.
+            let continued = try_auto_continue(
+                state,
+                &msg,
+                &run_id,
+                &checkpoint,
+                &["implement", "implement_started", "security"],
+            )
+            .await;
 
             // Fallback (bounds hit, no queue, or enqueue failed): salvage the
             // partial work as a draft PR, else fail.

@@ -86,10 +86,21 @@ pub async fn run(
         super::format_openspec_block(plan)
     };
 
+    // A continuation resumes a run whose prior attempt already committed partial
+    // work to this branch. Tell the agent so it finishes rather than restarting
+    // (the snapshot reflects the branch, so the partial code is already visible).
+    let continuation_note = if msg.continuation > 0 {
+        "\n## CONTINUATION — a PRIOR attempt already committed partial work to THIS branch. \
+         Do NOT start over. Read the files you intend to touch to see what is already done, then \
+         complete ONLY the remaining work. Reuse existing correct code; never rewrite or restore it. \
+         Move quickly to finish and verify.\n"
+    } else {
+        ""
+    };
     let prompt = if complexity == "simple" {
         format!(
             r#"Implement for issue #{number}: {title}
-{openspec}{files_hint}{feedback}
+{continuation}{openspec}{files_hint}{feedback}
 
 ## Instructions — SIMPLE CHANGE
 Go DIRECTLY to the target files listed in the OpenSpec.
@@ -101,6 +112,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - After implementing, output a one-line summary."#,
             number = msg.issue_number,
             title = msg.title,
+            continuation = continuation_note,
             openspec = openspec_block,
             files_hint = files_hint,
             feedback = feedback_section,
@@ -108,7 +120,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     } else {
         format!(
             r#"Implement the following tasks for issue #{number}: {title}
-{openspec}{feedback}
+{continuation}{openspec}{feedback}
 
 ## Instructions
 - Use `search_code` to find exact files and lines before reading. Prefer `read_file_lines` over `read_file`.
@@ -124,6 +136,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - Only implement the listed tasks. Do not add extras."#,
             number = msg.issue_number,
             title = msg.title,
+            continuation = continuation_note,
             openspec = openspec_block,
             feedback = feedback_section,
         )
@@ -301,6 +314,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             run_id: run_id.map(|s| s.to_string()),
             node_version,
             check_budget: std::sync::atomic::AtomicUsize::new(0),
+            gen_edit_rejects: std::sync::Mutex::new(std::collections::HashMap::new()),
             deadline,
         },
         mcp_plugins: &loaded_mcp_plugins,
@@ -716,8 +730,19 @@ struct WriteToolExecutor<'a> {
     run_id: Option<String>,
     /// Bounds sandbox runs per pass; also the S3 key nonce per attempt.
     check_budget: std::sync::atomic::AtomicUsize,
+    /// Per-path count of generated-file edit rejections. After MAX_GEN_REJECTS
+    /// on the same path the guard opens (escape hatch) so a banner-carrying file
+    /// that run_codegen cannot regenerate — or a false-positive banner match —
+    /// can never deadlock the agent.
+    gen_edit_rejects: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     deadline: Option<std::time::Instant>,
 }
+
+/// How many times the generated-file guard rejects edits to the SAME path
+/// before it gives up steering and lets the hand-edit through. Two firm nudges
+/// toward run_codegen, then never block again — bounds any thrash to 2 turns
+/// per file instead of the whole budget.
+const MAX_GEN_REJECTS: u32 = 2;
 
 #[async_trait::async_trait]
 impl<'a> ToolExecutor for WriteToolExecutor<'a> {
@@ -856,6 +881,12 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                         .ok(),
                 };
                 if let Some(old) = &existing {
+                    // Don't let the agent hand-edit generated files — steer it to
+                    // run_codegen. Bounded (see should_block_generated) so it can
+                    // never deadlock on a file codegen can't regenerate.
+                    if self.should_block_generated(path, old) {
+                        return Ok(json!(generated_file_reject(path)));
+                    }
                     if let Some(problem) = validate_edit_safety(old, content, path) {
                         return Ok(json!(format!(
                             "Write REJECTED for {path}: {problem}. If you are rewriting the whole \
@@ -958,6 +989,11 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     return Ok(json!(format!("No edits provided for {path}")));
                 }
 
+                // Generated files must be regenerated, not hand-edited — steer
+                // to run_codegen. Bounded escape hatch prevents any deadlock.
+                if self.should_block_generated(path, &original_content) {
+                    return Ok(json!(generated_file_reject(path)));
+                }
                 // Syntax gate: the edited file must parse-scan clean (or be no
                 // worse than it already was). Catches single dropped braces,
                 // corrupted JSON/YAML, broken template literals.
@@ -1050,6 +1086,13 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                                 .ok(),
                         };
                         if let Some(old) = &bw_existing {
+                            if self.should_block_generated(path, old) {
+                                return Ok(json!(format!(
+                                    "Batch write REJECTED — {path} is a GENERATED file (do-not-edit \
+                                     banner). Change the source and call `run_codegen` to regenerate \
+                                     it; never hand-edit it. Nothing was committed."
+                                )));
+                            }
                             if let Some(problem) = validate_edit_safety(old, content, path) {
                                 return Ok(json!(format!(
                                     "Batch write REJECTED — {path}: {problem}. Never replace a \
@@ -1201,6 +1244,24 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
 }
 
 impl<'a> WriteToolExecutor<'a> {
+    /// Should a hand-edit to `path` (whose current content is `existing`) be
+    /// rejected and steered to run_codegen? True only when the repo HAS a codegen
+    /// command, the file looks generated, AND this path hasn't already been
+    /// rejected MAX_GEN_REJECTS times. The counter is the escape hatch: after two
+    /// nudges the guard opens permanently for that path, so a file run_codegen
+    /// can't regenerate (multi-generator repo) or a false-positive banner match
+    /// can never deadlock the agent. Only increments when it actually blocks.
+    fn should_block_generated(&self, path: &str, existing: &str) -> bool {
+        let mut counts = self.gen_edit_rejects.lock().unwrap();
+        let n = counts.entry(path.to_string()).or_insert(0);
+        if gen_block_decision(self.codegen_cmd.is_some(), existing, *n) {
+            *n += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Run the repo's real checks in the sandbox and return the actual output
     /// for the agent to iterate on. Returns Ok(...) even on a failing build — a
     /// red result is normal feedback, not a tool error.
@@ -1451,6 +1512,50 @@ fn extract_file_paths(tasks: &str) -> Vec<String> {
     paths
 }
 
+/// True if `content` is machine-generated output carrying a do-not-edit banner.
+/// Hand-editing these is wasted work — the next codegen run overwrites it — and
+/// was the #1 cause of an agent thrashing its ENTIRE turn budget restoring and
+/// re-editing generated types (e.g. Sanity `sanity.types.ts`) instead of calling
+/// run_codegen. High-precision: keyed on banners real codegen tools emit that
+/// ordinary source never carries. Only the head is scanned (banner is always at
+/// the top) and via `chars().take` so it's UTF-8-boundary-safe.
+fn is_generated_file(content: &str) -> bool {
+    let head: String = content
+        .chars()
+        .take(400)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    head.contains("do not edit")
+        || head.contains("do-not-edit")
+        || head.contains("@generated")
+        || head.contains("code generated by") // Go convention
+        || head.contains("automatically generated")
+        || head.contains("auto-generated")
+        || head.contains("generated by sanity") // Sanity TypeGen banner
+}
+
+/// Pure block decision for the generated-file guard (see `should_block_generated`).
+/// Block only when the repo has codegen, the file looks generated, AND this path
+/// hasn't already been rejected the max number of times. The last clause is the
+/// deadlock-proofing: past the cap it returns false forever for that path.
+fn gen_block_decision(has_codegen: bool, existing: &str, prior_rejects: u32) -> bool {
+    has_codegen && prior_rejects < MAX_GEN_REJECTS && is_generated_file(existing)
+}
+
+/// The reject message steering the agent from a hand-edit of a generated file
+/// to the run_codegen tool. Only surfaced when a codegen command exists for the
+/// repo (else the agent has no other way to fix it and the edit is allowed).
+fn generated_file_reject(path: &str) -> String {
+    format!(
+        "REJECTED editing {path}: this is a GENERATED file (it carries a \
+         do-not-edit / @generated banner). Never hand-edit generated files — the \
+         change gets overwritten and it burns your turn budget. Instead: edit the \
+         SOURCE it is generated from (the schema/query/config), then call \
+         `run_codegen` to regenerate it. If you already changed the source, just \
+         call `run_codegen` now."
+    )
+}
+
 /// Deletion guardrail: rejects edits that gut the file. Bracket/syntax
 /// validation moved to `syntax_check::validate_change`, which is
 /// string/comment-aware and catches single-delimiter breaks the old raw
@@ -1476,4 +1581,72 @@ fn validate_edit_safety(original: &str, edited: &str, path: &str) -> Option<Stri
     }
 
     None
+}
+
+#[cfg(test)]
+mod generated_guard_tests {
+    use super::{gen_block_decision, is_generated_file, MAX_GEN_REJECTS};
+
+    #[test]
+    fn escape_hatch_opens_after_cap() {
+        let gen = "// @generated do not edit\nexport type X = 1;\n";
+        // Blocks up to the cap...
+        for prior in 0..MAX_GEN_REJECTS {
+            assert!(
+                gen_block_decision(true, gen, prior),
+                "should block at prior={prior}"
+            );
+        }
+        // ...then opens PERMANENTLY (deadlock-proof), no matter how high.
+        assert!(!gen_block_decision(true, gen, MAX_GEN_REJECTS));
+        assert!(!gen_block_decision(true, gen, MAX_GEN_REJECTS + 50));
+    }
+
+    #[test]
+    fn never_blocks_without_codegen_or_on_plain_source() {
+        // No codegen command in the repo → never block (agent has no alternative).
+        assert!(!gen_block_decision(false, "// @generated\n", 0));
+        // Plain source → never block regardless of codegen availability.
+        assert!(!gen_block_decision(true, "export const x = 1;\n", 0));
+    }
+
+    #[test]
+    fn detects_sanity_typegen_banner() {
+        let sanity = "/**\n * This file has been generated by Sanity TypeGen.\n \
+                      * Command: `sanity typegen generate`\n * ⚠️ DO NOT EDIT THIS FILE\n */\n\
+                      export type Foo = { _type: 'foo' };\n";
+        assert!(is_generated_file(sanity));
+    }
+
+    #[test]
+    fn detects_common_banners() {
+        assert!(is_generated_file("// @generated by protoc\npackage x;"));
+        assert!(is_generated_file(
+            "// Code generated by mockgen. DO NOT EDIT.\n"
+        ));
+        assert!(is_generated_file(
+            "/* eslint-disable */\n/* This file is automatically generated. */\n"
+        ));
+        assert!(is_generated_file("# Auto-generated. Do not edit.\n"));
+    }
+
+    #[test]
+    fn allows_normal_source() {
+        // Ordinary source that merely talks about generation must NOT trip it.
+        let src = "import { generate } from './gen';\n\
+                   // helper that will generate the report\n\
+                   export function generateReport() { return 42; }\n";
+        assert!(!is_generated_file(src));
+        assert!(!is_generated_file(
+            "export const config = { editable: true };\n"
+        ));
+        assert!(!is_generated_file(""));
+    }
+
+    #[test]
+    fn utf8_boundary_safe() {
+        // Multibyte chars around the scan window must not panic.
+        let s = format!("// {}\nexport const x = 1;\n", "🎨".repeat(300));
+        let _ = is_generated_file(&s); // just must not panic
+    }
 }
