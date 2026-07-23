@@ -1087,14 +1087,21 @@ async fn handle_workflow_run(
         installation_id,
     });
     let body = serde_json::to_string(&message).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let _ = state
+    // The self-healing CI loop hinges on THIS one message — a discarded send
+    // strands the run in awaiting_ci with no re-drive. Surface the failure so
+    // GitHub retries the webhook (and the awaiting_ci reaper is the backstop).
+    if let Err(e) = state
         .sqs
         .send_message()
         .queue_url(&state.config.ticket_queue_url)
         .message_body(&body)
         .delay_seconds(60)
         .send()
-        .await;
+        .await
+    {
+        error!(run_id, error = %e, "Failed to enqueue CI resume — returning 500 so GitHub retries");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     Ok(StatusCode::OK)
 }

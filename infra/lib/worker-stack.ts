@@ -4,6 +4,7 @@ import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
+import * as kms from "aws-cdk-lib/aws-kms";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as events from "aws-cdk-lib/aws-events";
@@ -31,6 +32,7 @@ interface WorkerStackProps extends cdk.StackProps {
   ciFixQueue: sqs.Queue;
   feedbackQueue: sqs.Queue;
   mcpProxyFunction: lambda.Function;
+  encryptionKey: kms.Key;
 }
 
 export class WorkerStack extends cdk.Stack {
@@ -207,6 +209,10 @@ export class WorkerStack extends cdk.Stack {
     });
 
     runsTable.grantReadWriteData(cleanupFunction);
+    // The runs table is CMK-encrypted; grantReadWriteData on a fromTableName
+    // ref does NOT include KMS, so every scan failed with AccessDenied and the
+    // reaper silently never cleaned a single stuck run. Grant decrypt/encrypt.
+    props.encryptionKey.grantEncryptDecrypt(cleanupFunction);
 
     new events.Rule(this, "StuckRunCleanupSchedule", {
       ruleName: `${prefix}-stuck-run-cleanup`,

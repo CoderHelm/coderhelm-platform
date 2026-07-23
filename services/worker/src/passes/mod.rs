@@ -3665,10 +3665,11 @@ pub fn truncate_content(content: &str, path: &str) -> String {
     if content.len() <= MAX_BYTES {
         return content.to_string();
     }
-    let cut = content[..MAX_BYTES].rfind('\n').unwrap_or(MAX_BYTES);
+    let head = common::truncate_str(content, MAX_BYTES);
+    let cut = head.rfind('\n').unwrap_or(head.len());
     format!(
         "{}\n\n... (truncated — {path} is {} bytes, showing first {cut} bytes)",
-        &content[..cut],
+        &head[..cut],
         content.len(),
     )
 }
