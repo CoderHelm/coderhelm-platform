@@ -443,6 +443,20 @@ Rules:
         "completed"
     };
 
+    // A terminal completion must leave the PR ready for review. Every other
+    // completion path marks it ready (resume review-pass, the CI-green early
+    // return above, the budget hand-off); the normal feedback completion skipped
+    // it, stranding the PR as a draft even though the run was done. Idempotent.
+    if final_status == "completed" {
+        crate::passes::resume::mark_pr_ready(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+        )
+        .await;
+    }
+
     // Update run record in runs table (including status_run_id for GSI)
     let now = chrono::Utc::now().to_rfc3339();
     state
