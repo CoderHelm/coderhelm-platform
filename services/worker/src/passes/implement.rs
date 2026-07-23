@@ -175,6 +175,13 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     } else {
         None
     };
+    // Public per-repo codegen env (e.g. Sanity projectId/dataset) so codegen that
+    // needs project config the tarball lacks can run in the sandbox.
+    let codegen_env = if sandbox.is_some() && codegen_cmd.is_some() {
+        super::load_codegen_env(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await
+    } else {
+        Vec::new()
+    };
 
     let mut tools = if complexity == "simple" {
         // Simple issues: no read_tree or list_directory — plan already says which files to edit
@@ -311,6 +318,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             sandbox,
             checks_cmd,
             codegen_cmd,
+            codegen_env,
             run_id: run_id.map(|s| s.to_string()),
             node_version,
             check_budget: std::sync::atomic::AtomicUsize::new(0),
@@ -725,6 +733,9 @@ struct WriteToolExecutor<'a> {
     checks_cmd: Option<String>,
     /// Derived codegen command (None when the repo has no codegen).
     codegen_cmd: Option<String>,
+    /// Public per-repo codegen env (e.g. Sanity projectId/dataset) passed to the
+    /// sandbox codegen build. Never a secret — see `load_codegen_env`.
+    codegen_env: Vec<(String, String)>,
     /// Node major version to switch the sandbox to (None -> buildspec default).
     node_version: Option<String>,
     run_id: Option<String>,
@@ -1381,6 +1392,7 @@ impl<'a> WriteToolExecutor<'a> {
                 tarball,
                 cmd,
                 self.node_version.as_deref(),
+                &self.codegen_env,
                 self.deadline,
             )
             .await

@@ -184,6 +184,7 @@ impl<'a> SandboxClient<'a> {
     /// Run the repo's codegen in the sandbox and return the files it CHANGED,
     /// for the caller to commit back to the branch. Never Err for an ordinary
     /// codegen failure — that's `CodegenOutcome { ran: true, passed: false }`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_codegen(
         &self,
         run_id: &str,
@@ -191,6 +192,7 @@ impl<'a> SandboxClient<'a> {
         tarball: Vec<u8>,
         codegen_cmd: &str,
         node_version: Option<&str>,
+        extra_env: &[(String, String)],
         deadline: Option<Instant>,
     ) -> Result<CodegenOutcome, Box<dyn std::error::Error + Send + Sync>> {
         if !self.is_enabled() {
@@ -216,7 +218,14 @@ impl<'a> SandboxClient<'a> {
             return Err(format!("codegen tarball upload failed: {e}").into());
         }
         let outcome = self
-            .codegen_build_and_capture(&key, &out_key, codegen_cmd, node_version, deadline)
+            .codegen_build_and_capture(
+                &key,
+                &out_key,
+                codegen_cmd,
+                node_version,
+                extra_env,
+                deadline,
+            )
             .await;
         // Clean up both transient objects.
         let _ = self
@@ -236,12 +245,14 @@ impl<'a> SandboxClient<'a> {
         outcome
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn codegen_build_and_capture(
         &self,
         key: &str,
         out_key: &str,
         codegen_cmd: &str,
         node_version: Option<&str>,
+        extra_env: &[(String, String)],
         deadline: Option<Instant>,
     ) -> Result<CodegenOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let mut env = vec![
@@ -252,6 +263,22 @@ impl<'a> SandboxClient<'a> {
         ];
         if let Some(v) = node_version {
             env.push(env_var("NODE_VERSION", v)?);
+        }
+        // Repo's public codegen env (e.g. Sanity projectId/dataset). Reserved
+        // build vars are protected — an env entry can't hijack the tarball or
+        // output location.
+        const RESERVED: [&str; 5] = [
+            "SANDBOX_BUCKET",
+            "SANDBOX_KEY",
+            "CODEGEN_CMD",
+            "CODEGEN_OUT_KEY",
+            "NODE_VERSION",
+        ];
+        for (k, v) in extra_env {
+            if RESERVED.contains(&k.as_str()) {
+                continue;
+            }
+            env.push(env_var(k, v)?);
         }
         let started = self
             .codebuild

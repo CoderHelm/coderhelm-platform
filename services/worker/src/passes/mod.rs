@@ -4220,6 +4220,44 @@ pub(crate) async fn detect_codegen_command(
     None
 }
 
+/// Load a repo's PUBLIC codegen environment (e.g. Sanity's project-id and
+/// dataset vars) from team settings, so the sandbox can run codegen that needs
+/// project config the secret-free tarball lacks (Sanity's `schema extract` does
+/// a CORS check against the real project id — a dummy id fails, the real public
+/// one succeeds without a token). Stored per-repo at
+/// `SETTINGS#CODEGEN_ENV#<owner>/<repo>` as a String map under attribute `env`.
+/// PUBLIC config ONLY — these values ship in the client bundle; a token/secret
+/// must never be put here (it would cross the sandbox's secret-free boundary).
+pub(crate) async fn load_codegen_env(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+) -> Vec<(String, String)> {
+    let sk = format!("SETTINGS#CODEGEN_ENV#{owner}/{repo}");
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sk))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item);
+    let Some(item) = item else {
+        return Vec::new();
+    };
+    item.get("env")
+        .and_then(|v| v.as_m().ok())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_s().ok().map(|s| (k.clone(), s.clone())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Well-known instruction files that coding agents/IDEs use.
 const INSTRUCTION_FILES: &[&str] = &[
     "AGENTS.md",
