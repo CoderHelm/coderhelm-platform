@@ -1,0 +1,9 @@
+# Pin the toolchain so local and CI use the exact same rustc/clippy/rustfmt.
+# CI's `dtolnay/rust-toolchain@stable` kept drifting ahead of local, so newer
+# clippy/rustfmt lints failed CI on code that passed locally (repeatedly).
+# rustup reads this file for every cargo command in services/ and
+# auto-installs the pinned version, so both sides now match exactly.
+# Bump deliberately (and re-run clippy locally) when adopting a newer Rust.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
