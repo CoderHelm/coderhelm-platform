@@ -3718,6 +3718,47 @@ pub(crate) async fn detect_check_commands(
     None
 }
 
+/// Detect the Node.js major version the repo expects (package.json `engines.node`
+/// or `.nvmrc`) so the sandbox runs the repo's real toolchain. Returns None when
+/// it's not a Node repo or the version is unspecified — the buildspec then
+/// defaults to a modern Node. Only the major is used (e.g. ">=20.9.0" -> "20").
+/// Without this a repo requiring Node >=20 fails `next build` on the image's
+/// default Node 18 — a false RED.
+pub(crate) async fn detect_node_version(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> Option<String> {
+    fn first_major(s: &str) -> Option<String> {
+        let major: String = s
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        (!major.is_empty()).then_some(major)
+    }
+    if let Ok(pkg_raw) = github.read_file(owner, repo, "package.json", git_ref).await {
+        if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&pkg_raw) {
+            if let Some(node) = pkg
+                .get("engines")
+                .and_then(|e| e.get("node"))
+                .and_then(|v| v.as_str())
+            {
+                if let Some(m) = first_major(node) {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    if let Ok(nvmrc) = github.read_file(owner, repo, ".nvmrc", git_ref).await {
+        if let Some(m) = first_major(nvmrc.trim()) {
+            return Some(m);
+        }
+    }
+    None
+}
+
 /// Well-known instruction files that coding agents/IDEs use.
 const INSTRUCTION_FILES: &[&str] = &[
     "AGENTS.md",

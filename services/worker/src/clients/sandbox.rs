@@ -106,6 +106,7 @@ impl<'a> SandboxClient<'a> {
         attempt: usize,
         tarball: Vec<u8>,
         checks_cmd: &str,
+        node_version: Option<&str>,
         deadline: Option<Instant>,
     ) -> Result<CheckOutcome, Box<dyn std::error::Error + Send + Sync>> {
         if !self.is_enabled() {
@@ -136,7 +137,9 @@ impl<'a> SandboxClient<'a> {
 
         // Drive the build, then ALWAYS clean up the tarball (it is transient;
         // the bucket also has a 1-day lifecycle backstop).
-        let outcome = self.build_and_read(&key, checks_cmd, deadline).await;
+        let outcome = self
+            .build_and_read(&key, checks_cmd, node_version, deadline)
+            .await;
         let _ = self
             .s3
             .delete_object()
@@ -151,13 +154,21 @@ impl<'a> SandboxClient<'a> {
         &self,
         key: &str,
         checks_cmd: &str,
+        node_version: Option<&str>,
         deadline: Option<Instant>,
     ) -> Result<CheckOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        let env = vec![
+        let mut env = vec![
             env_var("SANDBOX_BUCKET", self.bucket)?,
             env_var("SANDBOX_KEY", key)?,
             env_var("CHECKS_CMD", checks_cmd)?,
         ];
+        // The buildspec switches Node to this via `n` before running checks, so
+        // "green in the sandbox" tracks the repo's real toolchain (it defaults
+        // to 20 when unset). Prevents false REDs like a Next.js repo needing
+        // >=20.9 failing on the image's default Node 18.
+        if let Some(v) = node_version {
+            env.push(env_var("NODE_VERSION", v)?);
+        }
         let started = self
             .codebuild
             .start_build()

@@ -216,7 +216,13 @@ export class WorkerStack extends cdk.Stack {
       timeout: cdk.Duration.minutes(15),
       environment: {
         buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
-        computeType: codebuild.ComputeType.SMALL,
+        // MEDIUM (7 GB) not SMALL (3 GB): a real `next build` can OOM at 3 GB,
+        // and an OOM-kill would masquerade as a code failure. Pair with a
+        // generous Node heap so the sandbox reports real errors, not memory.
+        computeType: codebuild.ComputeType.MEDIUM,
+        environmentVariables: {
+          NODE_OPTIONS: { value: "--max-old-space-size=6144" },
+        },
       },
       logging: { cloudWatch: { logGroup: sandboxLogGroup } },
       // NO_SOURCE: the worker passes the tarball location + the derived check
@@ -231,7 +237,12 @@ export class WorkerStack extends cdk.Stack {
             commands: [
               'aws s3 cp "s3://$SANDBOX_BUCKET/$SANDBOX_KEY" /tmp/src.tgz',
               "mkdir -p /tmp/src && tar xzf /tmp/src.tgz -C /tmp/src",
-              'cd /tmp/src/$(ls /tmp/src) && echo "===CODERHELM_CHECKS_START===" && (eval "$CHECKS_CMD"); CODE=$?; echo "===CODERHELM_CHECKS_END exit=$CODE==="',
+              // Switch Node to the repo's version (worker-detected; default 20)
+              // via `n` before checks — otherwise a repo needing >=20 fails
+              // `next build` on the image's default Node 18. Then run checks
+              // inside a cd-gated block so a bad extract yields no marker (infra
+              // fault) rather than checks in the wrong dir.
+              'n "${NODE_VERSION:-20}" >/dev/null 2>&1 || true; hash -r 2>/dev/null || true; cd /tmp/src/$(ls /tmp/src) && { echo "===CODERHELM_CHECKS_START==="; node --version; (eval "$CHECKS_CMD"); CODE=$?; echo "===CODERHELM_CHECKS_END exit=$CODE==="; }',
             ],
           },
         },

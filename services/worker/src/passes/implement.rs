@@ -151,6 +151,11 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     } else {
         None
     };
+    let node_version = if sandbox.is_some() {
+        super::detect_node_version(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await
+    } else {
+        None
+    };
 
     let mut tools = if complexity == "simple" {
         // Simple issues: no read_tree or list_directory — plan already says which files to edit
@@ -269,6 +274,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             sandbox,
             checks_cmd,
             run_id: run_id.map(|s| s.to_string()),
+            node_version,
             check_budget: std::sync::atomic::AtomicUsize::new(0),
             deadline,
         },
@@ -659,6 +665,8 @@ struct WriteToolExecutor<'a> {
     sandbox: Option<crate::clients::sandbox::SandboxClient<'a>>,
     /// Derived check command (None when the stack wasn't recognized).
     checks_cmd: Option<String>,
+    /// Node major version to switch the sandbox to (None -> buildspec default).
+    node_version: Option<String>,
     run_id: Option<String>,
     /// Bounds sandbox runs per pass; also the S3 key nonce per attempt.
     check_budget: std::sync::atomic::AtomicUsize,
@@ -1144,7 +1152,14 @@ impl<'a> WriteToolExecutor<'a> {
         };
 
         match sandbox
-            .run_checks(run_id, attempt, tarball, cmd, self.deadline)
+            .run_checks(
+                run_id,
+                attempt,
+                tarball,
+                cmd,
+                self.node_version.as_deref(),
+                self.deadline,
+            )
             .await
         {
             Ok(o) if o.ran => {
