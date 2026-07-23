@@ -14,6 +14,98 @@ const MAX_CI_FIX_CYCLES: usize = 10;
 const MAX_LOG_CHARS: usize = 15_000;
 /// Cap on how long a run may sit in awaiting_ci before being finalized.
 const MAX_AWAITING_CI_HOURS: i64 = 24;
+/// Halt the fix loop once the SAME failure has recurred this many times in a
+/// row. This is the real "stop thrashing" signal: if the errors don't change,
+/// the fixes are making no progress (noop commits, placeholder stubs, wrong
+/// fixes), so churning further just mangles the PR — hand it to a human. Sits
+/// UNDER the coarse MAX_CI_FIX_CYCLES ceiling and fires much sooner.
+const MAX_STALL_CYCLES: u32 = 2;
+
+/// Deterministic FNV-1a hash — stable across processes/deploys (unlike a
+/// randomized hasher), so a stored signature compares correctly next invocation.
+fn stable_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// A stable signature of WHAT is failing, so "same failure again" (no progress)
+/// is distinguishable from "different failure" (the fix changed something).
+/// Extracts error lines, normalizes whitespace, sorts + dedupes, then hashes the
+/// set — so log timestamps and ordering don't perturb it.
+fn ci_failure_signature(logs: &str) -> String {
+    let mut errs: Vec<String> = logs
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| {
+            let low = l.to_ascii_lowercase();
+            low.contains("error ts")
+                || low.contains(": error")
+                || low.starts_with("error:")
+                || low.contains("failed with exit")
+        })
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    errs.sort_unstable();
+    errs.dedup();
+    if errs.is_empty() {
+        // No recognizable error lines — fall back to a hash of the tail.
+        return format!("{:016x}", stable_hash(common::tail_str(logs, 2000)));
+    }
+    format!("{:016x}", stable_hash(&errs.join("\n")))
+}
+
+/// Pure decision: given the previous failure signature + stall count and the
+/// current signature, return the new count and whether to HALT. Halts when the
+/// exact same failure set has recurred MAX_STALL_CYCLES times — i.e. the fixes
+/// are making no progress.
+fn stall_decision(prev_sig: &str, prev_stall: u32, current_sig: &str) -> (u32, bool) {
+    if !prev_sig.is_empty() && prev_sig == current_sig {
+        let n = prev_stall + 1;
+        (n, n >= MAX_STALL_CYCLES)
+    } else {
+        (0, false)
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::{ci_failure_signature, stall_decision, MAX_STALL_CYCLES};
+
+    #[test]
+    fn signature_is_order_and_noise_independent() {
+        let a = "src/x.tsx(13,50): error TS2344: bad\n2026 12:03:04 noise\nsrc/y.tsx(1,1): error TS2339: nope";
+        let b = "99:99 other-timestamp\nsrc/y.tsx(1,1): error TS2339: nope\nsrc/x.tsx(13,50): error TS2344: bad";
+        assert_eq!(ci_failure_signature(a), ci_failure_signature(b));
+    }
+
+    #[test]
+    fn different_errors_produce_different_signatures() {
+        let a = "src/x.tsx(1,1): error TS2344: bad";
+        let b = "src/x.tsx(1,1): error TS2339: other";
+        assert_ne!(ci_failure_signature(a), ci_failure_signature(b));
+    }
+
+    #[test]
+    fn halts_after_the_same_failure_repeats() {
+        let (s1, h1) = stall_decision("", 0, "SIG"); // first sight
+        assert_eq!((s1, h1), (0, false));
+        let (s2, _) = stall_decision("SIG", 0, "SIG"); // 1st repeat
+        assert_eq!(s2, 1);
+        let (s3, h3) = stall_decision("SIG", 1, "SIG"); // 2nd repeat → cap
+        assert_eq!(s3, MAX_STALL_CYCLES);
+        assert!(h3);
+    }
+
+    #[test]
+    fn progress_resets_the_counter() {
+        // errors changed → not stalled, count resets even if it was high.
+        assert_eq!(stall_decision("SIG_A", 5, "SIG_B"), (0, false));
+    }
+}
 
 /// Wall-clock duration from run created_at, falling back to Lambda start time.
 fn wall_clock_secs(
@@ -570,6 +662,38 @@ pub async fn run(
             return Ok(());
         }
 
+        // Halt-on-no-progress: if the SAME failure keeps recurring, the fixes
+        // aren't working (noop commits, placeholder stubs, wrong fixes). Stop
+        // churning the PR and hand it to a human — this fires long before the
+        // coarse cycle cap above.
+        if check_and_record_stall(state, &msg.team_id, &msg.run_id, &logs).await {
+            warn!(
+                run_id = msg.run_id,
+                "CI fixes stalled on the same failure — handing PR to human review"
+            );
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                "Automated fixes stalled on the same failure (no progress) — handed off for human review.",
+            )
+            .await;
+            mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+            complete_run_with_status(
+                state,
+                &ticket_msg,
+                &msg.run_id,
+                "completed",
+                &pr_url,
+                pr_number,
+                &branch,
+                &usage,
+                wall_clock_secs(created_at, &start),
+            )
+            .await?;
+            return Ok(());
+        }
+
         // Implement fix
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
@@ -1118,6 +1242,54 @@ async fn load_usage_from_checkpoint(
         }
         Err(_) => TokenUsage::default(),
     }
+}
+
+/// Compare the current failure against the stored one, persist the update, and
+/// return true if the run has STALLED (same failure repeating → halt). The pure
+/// decision (`stall_decision` / `ci_failure_signature`) is unit-tested.
+async fn check_and_record_stall(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    failure_text: &str,
+) -> bool {
+    let current_sig = ci_failure_signature(failure_text);
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("last_error_sig, stall_count")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item);
+    let prev_sig = item
+        .as_ref()
+        .and_then(|i| i.get("last_error_sig"))
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    let prev_stall = item
+        .as_ref()
+        .and_then(|i| i.get("stall_count"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0u32);
+    let (new_stall, halt) = stall_decision(&prev_sig, prev_stall, &current_sig);
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET last_error_sig = :s, stall_count = :c")
+        .expression_attribute_values(":s", attr_s(&current_sig))
+        .expression_attribute_values(":c", attr_n(new_stall as u64))
+        .send()
+        .await;
+    halt
 }
 
 async fn load_cycle_from_checkpoint(state: &WorkerState, team_id: &str, run_id: &str) -> usize {
