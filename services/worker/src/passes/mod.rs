@@ -3671,6 +3671,16 @@ pub(crate) async fn detect_check_commands(
                 ("npm ci --no-audit --no-fund", "npm run")
             };
 
+            // Faithful CI replica: prefer the exact type-check command the repo's
+            // OWN workflow runs (e.g. `pnpm --filter web check-types`). Guessing
+            // from root package.json scripts misses per-workspace commands that
+            // are the real gate on monorepos, and running the full `build`
+            // instead can OOM. A workspace `tsc --noEmit` is light and catches
+            // the type errors CI catches.
+            if let Some(ci_typecheck) = detect_ci_typecheck(github, owner, repo, git_ref).await {
+                return Some(format!("{install} && {ci_typecheck}"));
+            }
+
             let mut steps = vec![install.to_string()];
             // Gate ONLY on typecheck + build — the reliable, self-contained
             // correctness signals. Deliberately NOT lint or test:
@@ -3739,6 +3749,73 @@ pub(crate) async fn detect_check_commands(
         return Some("pip install -e . && python -m compileall -q .".to_string());
     }
     None
+}
+
+/// Extract the type-check command the repo's CI actually runs (e.g.
+/// `pnpm --filter web check-types`) by scanning `.github/workflows/*.yml`. This
+/// is the faithful-CI-replica path: run exactly what CI gates on — it catches
+/// per-workspace type errors the root scripts miss, and `tsc --noEmit` is light
+/// so it won't OOM like a full monorepo build. Returns None if no workflow
+/// type-check step is found.
+async fn detect_ci_typecheck(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> Option<String> {
+    let entries = github
+        .list_directory(owner, repo, ".github/workflows", git_ref)
+        .await
+        .ok()?;
+    // Collect EVERY distinct type-check command CI runs (a monorepo may check
+    // several workspaces), not just the first — otherwise we could run a
+    // workspace the change didn't touch and miss the one it did.
+    let mut cmds: Vec<String> = Vec::new();
+    for entry in entries {
+        if !(entry.name.ends_with(".yml") || entry.name.ends_with(".yaml")) {
+            continue;
+        }
+        let Ok(yaml) = github.read_file(owner, repo, &entry.path, git_ref).await else {
+            continue;
+        };
+        // Workflows are line-oriented; a step's `run:` command (inline or under
+        // `run: |`) sits on its own line. Scan each line, strip the common YAML
+        // prefixes, and keep the ones that are type-check invocations.
+        for raw in yaml.lines() {
+            let line = raw.trim().trim_start_matches("- ").trim();
+            let line = line.strip_prefix("run:").unwrap_or(line).trim();
+            let line = line.trim_matches(|c| c == '"' || c == '\'').trim();
+            if is_typecheck_cmd(line) && !cmds.iter().any(|c| c == line) {
+                cmds.push(line.to_string());
+            }
+        }
+    }
+    if cmds.is_empty() {
+        None
+    } else {
+        Some(cmds.join(" && "))
+    }
+}
+
+/// A single shell line that runs a TypeScript type-check (not install/lint/build).
+fn is_typecheck_cmd(line: &str) -> bool {
+    let low = line.to_lowercase();
+    if low.starts_with('#') {
+        return false;
+    }
+    let looks_typecheck = low.contains("check-types")
+        || low.contains("typecheck")
+        || low.contains("type-check")
+        || (low.contains("tsc") && low.contains("noemit"))
+        || (low.contains("tsc") && low.contains("-p "));
+    // Must be an actual package-manager/tsc invocation, not prose or a job name.
+    let is_cmd = low.contains("pnpm")
+        || low.contains("npm ")
+        || low.contains("yarn")
+        || low.contains("npx")
+        || low.contains("turbo")
+        || low.starts_with("tsc");
+    looks_typecheck && is_cmd
 }
 
 /// Detect the Node.js major version the repo expects (package.json `engines.node`

@@ -247,6 +247,17 @@ impl<'a> SandboxClient<'a> {
         let output = common::tail_str(&window, MAX_OUTPUT_CHARS).to_string();
 
         match exit {
+            // A kill signal is a SANDBOX RESOURCE problem, not the agent's code:
+            // 137 = SIGKILL (OOM), 143 = SIGTERM, 124 = coreutils `timeout`.
+            // Reporting these as a code RED sent the agent chasing a "failure"
+            // that was really the container running out of memory. Treat as
+            // unverified -> blind fallback.
+            Some(code) if code == 137 || code == 143 || code == 124 => {
+                Ok(CheckOutcome::not_run(format!(
+                    "sandbox checks were killed (exit {code} — out of memory or timeout), \
+                     which is a sandbox resource limit, not a code failure; unverified"
+                )))
+            }
             Some(code) => Ok(CheckOutcome {
                 ran: true,
                 passed: code == 0,
