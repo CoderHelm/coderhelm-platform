@@ -3659,9 +3659,16 @@ pub(crate) async fn detect_check_commands(
             };
 
             let mut steps = vec![install.to_string()];
-            // Most-fundamental failures first — `&&` short-circuits, so a broken
-            // build never reaches the (slow) test suite.
-            for script in ["typecheck", "type-check", "lint", "build", "test"] {
+            // Gate ONLY on typecheck + build — the reliable, self-contained
+            // correctness signals. Deliberately NOT lint or test:
+            //   - lint is style, and in monorepos `pnpm run lint` -> `turbo lint`
+            //     can hard-fail on a task-config quirk ("Could not find task
+            //     lint") that has nothing to do with the change — a false RED
+            //     that, with `&&`, would also mask the build result.
+            //   - a full app test suite needs services/env the sandbox lacks, so
+            //     it false-REDs; that verification stays CI's job.
+            // typecheck first (fast) so a type error fails before the slower build.
+            for script in ["typecheck", "type-check", "build"] {
                 if has(script) {
                     steps.push(format!("{run} {script}"));
                 }
@@ -3690,7 +3697,10 @@ pub(crate) async fn detect_check_commands(
         .await
         .is_ok()
     {
-        return Some("cargo build --locked && cargo test --locked".to_string());
+        // Compile + compile-check tests (`--no-run`) but don't EXECUTE them —
+        // running tests can need services/env the sandbox lacks (false RED),
+        // same principle as dropping `test` for Node.
+        return Some("cargo build --locked && cargo test --no-run --locked".to_string());
     }
     // ---- Go ----
     if github
@@ -3698,7 +3708,7 @@ pub(crate) async fn detect_check_commands(
         .await
         .is_ok()
     {
-        return Some("go build ./... && go vet ./... && go test ./...".to_string());
+        return Some("go build ./... && go vet ./...".to_string());
     }
     // ---- Python ----
     if github

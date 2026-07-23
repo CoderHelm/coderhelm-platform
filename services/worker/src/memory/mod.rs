@@ -368,7 +368,7 @@ impl AgentMemory {
 
     /// Flush, close, upload to S3, and release the lock.
     pub async fn close_and_upload(
-        mut self,
+        self,
         state: &WorkerState,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let memory_count = self.db.memory_count();

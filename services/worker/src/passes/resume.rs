@@ -98,6 +98,7 @@ pub async fn run(
                     .key("team_id", attr_s(&msg.team_id))
                     .key("run_id", attr_s(&msg.run_id))
                     .update_expression("SET #s = :s, current_pass = :cp, status_run_id = :sri")
+                    .condition_expression("#s <> :cancelled")
                     .expression_attribute_names("#s", "status")
                     .expression_attribute_values(":s", attr_s("awaiting_ci"))
                     .expression_attribute_values(":cp", attr_s("awaiting_ci"))
@@ -105,6 +106,9 @@ pub async fn run(
                         ":sri",
                         attr_s(&format!("awaiting_ci#{}", msg.run_id)),
                     )
+                    // Never resurrect a cancelled run — the condition makes this
+                    // force-reset a no-op once the run is cancelled.
+                    .expression_attribute_values(":cancelled", attr_s("cancelled"))
                     .send()
                     .await
                     .ok();
@@ -1232,6 +1236,33 @@ pub(crate) async fn mark_pr_ready(
                     info!(pr_number, "PR already not a draft — skipping mark_pr_ready");
                     return;
                 }
+                // Final squash: collapse the run's whole history — the initial
+                // implementation AND every CI-fix cycle (including any
+                // restore/refix churn) — into ONE clean commit before the PR
+                // goes up for review. Runs once, here at completion: the loop is
+                // done (single writer), and only while still a draft, so a human
+                // who has taken the PR over isn't clobbered. Best-effort — a
+                // failure just leaves the noisier history.
+                if let (Some(head), Some(base)) = (
+                    pr.get("head")
+                        .and_then(|h| h.get("ref"))
+                        .and_then(|v| v.as_str()),
+                    pr.get("base")
+                        .and_then(|b| b.get("ref"))
+                        .and_then(|v| v.as_str()),
+                ) {
+                    let title = pr
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Apply changes");
+                    let squash_msg = title.strip_prefix("⚠️ Partial: ").unwrap_or(title);
+                    if let Err(e) = github
+                        .squash_branch(repo_owner, repo_name, head, base, squash_msg)
+                        .await
+                    {
+                        warn!(pr_number, error = %e, "Final squash before mark-ready failed — proceeding with full history");
+                    }
+                }
                 if let Some(node_id) = pr.get("node_id").and_then(|v| v.as_str()) {
                     match github.mark_pr_ready(node_id).await {
                         Ok(_) => {
@@ -1270,7 +1301,7 @@ async fn complete_run_with_status(
     let now = chrono::Utc::now().to_rfc3339();
     let cost = usage.estimated_cost();
 
-    state
+    let res = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
@@ -1298,8 +1329,19 @@ async fn complete_run_with_status(
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
         .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
+        // Cancel is terminal: never overwrite a cancelled run with a completion.
+        .condition_expression("#s <> :cancel")
+        .expression_attribute_values(":cancel", attr_s("cancelled"))
         .send()
-        .await?;
+        .await;
+    match res {
+        Ok(_) => {}
+        Err(e) if format!("{e:?}").contains("ConditionalCheckFailed") => {
+            info!(run_id, "Run is cancelled — not overwriting with completion");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    }
 
     // Update analytics
     let month = chrono::Utc::now().format("%Y-%m").to_string();
