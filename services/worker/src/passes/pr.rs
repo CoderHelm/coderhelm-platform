@@ -573,7 +573,7 @@ pub async fn resolve_conflicts(
             branch,
             &branch_sha,
             &base_sha,
-            &format!("Merge {} into {}", &msg.base_branch, branch),
+            &format!("Merge {} into {}", msg.base_branch, branch),
             &resolved_files,
         )
         .await?;
