@@ -15,6 +15,54 @@ use crate::auth::jwt;
 use crate::middleware::auth::SESSION_TTL_SECS;
 use crate::AppState;
 
+use aws_sdk_dynamodb::types::AttributeValue;
+use std::collections::HashMap;
+
+/// Pick which team a login session should land on, given the user's membership
+/// records (users-table GSI2 by email) and their Cognito sub.
+///
+/// Every user gets an auto-created PERSONAL team (`TEAM#{cognito_sub}`) on first
+/// login. If they are ALSO an active member of a real team they were invited
+/// into, they should land THERE — where the model key and repos live — not on
+/// their empty personal team. The old logic just took the first non-`invited`
+/// record, and the always-active personal team usually won, so an invited user
+/// (e.g. a Chelsea Piers teammate) got prompted for their own Anthropic key.
+///
+/// Preference order (all restricted to active, non-`invited` `USER#` records):
+///   1. a team the user was ADDED to — `role != "owner"` (member/admin). This
+///      is the strongest signal and works regardless of team-id format (the
+///      personal team's id is `TEAM#{cognito_sub}` for email users but
+///      `TEAM#{ulid}` for Google users, so an id check alone isn't portable).
+///   2. else a team that is NOT the Cognito personal team (covers a rare
+///      co-owner invited into a real team, for email/Cognito users).
+///   3. else any active membership (their personal team).
+///
+/// Returns `None` when the user has no team yet (first login → create personal).
+fn select_session_team<'a>(
+    items: &'a [HashMap<String, AttributeValue>],
+    cognito_sub: &str,
+) -> Option<&'a HashMap<String, AttributeValue>> {
+    let personal = format!("TEAM#{cognito_sub}");
+    let sval = |it: &HashMap<String, AttributeValue>, k: &str| {
+        it.get(k).and_then(|v| v.as_s().ok()).cloned()
+    };
+    let usable = |it: &HashMap<String, AttributeValue>| {
+        sval(it, "sk")
+            .map(|s| s.starts_with("USER#"))
+            .unwrap_or(false)
+            && sval(it, "status").map(|s| s != "invited").unwrap_or(true)
+    };
+    items
+        .iter()
+        .find(|it| usable(it) && sval(it, "role").as_deref() != Some("owner"))
+        .or_else(|| {
+            items
+                .iter()
+                .find(|it| usable(it) && sval(it, "pk").as_deref() != Some(personal.as_str()))
+        })
+        .or_else(|| items.iter().find(|it| usable(it)))
+}
+
 /// Compute Cognito SECRET_HASH = Base64(HMAC-SHA256(client_secret, username + client_id))
 pub fn cognito_secret_hash(client_secret: &str, username: &str, client_id: &str) -> String {
     let mut mac =
@@ -659,7 +707,6 @@ pub async fn google_callback(
         .index_name("gsi2")
         .key_condition_expression("gsi2pk = :pk")
         .expression_attribute_values(":pk", attr_s(&format!("EMAIL#{}", normalize_email(&email))))
-        .limit(1)
         .send()
         .await
         .ok()
@@ -677,7 +724,10 @@ pub async fn google_callback(
         return Ok(Redirect::temporary(&redirect).into_response());
     }
 
-    let (team_id, user_id, role) = if let Some(item) = existing.first() {
+    // Prefer a real team the user joined over their personal team (dropped the
+    // .limit(1) above so all memberships are visible to the picker).
+    let selected = select_session_team(&existing, cognito_sub);
+    let (team_id, user_id, role) = if let Some(item) = selected {
         let tid = item
             .get("pk")
             .and_then(|v| v.as_s().ok())
@@ -1049,25 +1099,14 @@ pub async fn github_callback(
             .index_name("gsi2")
             .key_condition_expression("gsi2pk = :email")
             .expression_attribute_values(":email", attr_s(&format!("EMAIL#{normalized_email}")))
-            .limit(5)
             .send()
             .await
             .ok()
             .and_then(|r| {
-                r.items()
-                    .iter()
-                    .find(|item| {
-                        item.get("sk")
-                            .and_then(|v| v.as_s().ok())
-                            .map(|s| s.starts_with("USER#"))
-                            .unwrap_or(false)
-                            && item
-                                .get("status")
-                                .and_then(|v| v.as_s().ok())
-                                .map(|s| s != "invited")
-                                .unwrap_or(true)
-                    })
-                    .cloned()
+                // Prefer a real team the user joined over their personal team
+                // (github_id serves as the own-id for the personal-team check).
+                let items = r.items().to_vec();
+                select_session_team(&items, &github_id.to_string()).cloned()
             })
     } else {
         None
@@ -1323,13 +1362,10 @@ async fn issue_session_from_cognito(
 
     let items = existing.items().to_vec();
 
-    // Find non-invite record (the user's own team) to use for session
-    let active_item = items.iter().find(|item| {
-        item.get("status")
-            .and_then(|v| v.as_s().ok())
-            .map(|s| s != "invited")
-            .unwrap_or(true)
-    });
+    // Prefer a real team the user was added to over their auto-created personal
+    // team (see select_session_team) — else an invited teammate lands on their
+    // empty personal team and gets prompted for an Anthropic key.
+    let active_item = select_session_team(&items, cognito_sub);
 
     let (team_id, user_id, role, github_login) = if let Some(item) = active_item {
         let tid = item
@@ -1632,5 +1668,91 @@ async fn send_welcome_email(state: &AppState, email: &str) {
         error!("Failed to send welcome email to {email}: {e}");
     } else {
         info!(email, "Welcome email sent");
+    }
+}
+
+#[cfg(test)]
+mod team_select_tests {
+    use super::{select_session_team, AttributeValue, HashMap};
+
+    /// Build a membership record: (team_id pk, USER# sk, role, optional status).
+    fn rec(
+        pk: &str,
+        sk: &str,
+        role: &str,
+        status: Option<&str>,
+    ) -> HashMap<String, AttributeValue> {
+        let mut m = HashMap::new();
+        m.insert("pk".into(), AttributeValue::S(pk.into()));
+        m.insert("sk".into(), AttributeValue::S(sk.into()));
+        m.insert("role".into(), AttributeValue::S(role.into()));
+        if let Some(s) = status {
+            m.insert("status".into(), AttributeValue::S(s.into()));
+        }
+        m
+    }
+    fn pk_of(it: &HashMap<String, AttributeValue>) -> &str {
+        it.get("pk").and_then(|v| v.as_s().ok()).unwrap()
+    }
+
+    #[test]
+    fn prefers_joined_team_over_personal() {
+        // cgaba: owner of his personal team, member of chelseapiers (both active).
+        let sub = "7498f458";
+        let items = vec![
+            rec("TEAM#7498f458", "USER#7498f458", "owner", None),
+            rec("TEAM#Google_115", "USER#7498f458", "member", None),
+        ];
+        assert_eq!(
+            pk_of(select_session_team(&items, sub).unwrap()),
+            "TEAM#Google_115"
+        );
+        // Order must not matter.
+        let items_rev: Vec<_> = items.into_iter().rev().collect();
+        assert_eq!(
+            pk_of(select_session_team(&items_rev, sub).unwrap()),
+            "TEAM#Google_115"
+        );
+    }
+
+    #[test]
+    fn solo_user_lands_on_personal() {
+        let items = vec![rec("TEAM#abc", "USER#abc", "owner", None)];
+        assert_eq!(
+            pk_of(select_session_team(&items, "abc").unwrap()),
+            "TEAM#abc"
+        );
+    }
+
+    #[test]
+    fn pending_invite_is_skipped() {
+        // Real-team membership still "invited" → not chosen; land on personal.
+        let items = vec![
+            rec("TEAM#abc", "USER#abc", "owner", None),
+            rec("TEAM#Real", "USER#abc", "member", Some("invited")),
+        ];
+        assert_eq!(
+            pk_of(select_session_team(&items, "abc").unwrap()),
+            "TEAM#abc"
+        );
+    }
+
+    #[test]
+    fn google_user_ulid_personal_still_resolves_by_role() {
+        // Google personal team is a ulid (id check can't help) — role does.
+        let sub = "Google_999";
+        let items = vec![
+            rec("TEAM#01julid", "USER#Google_999", "owner", None),
+            rec("TEAM#Real", "USER#Google_999", "member", None),
+        ];
+        assert_eq!(
+            pk_of(select_session_team(&items, sub).unwrap()),
+            "TEAM#Real"
+        );
+    }
+
+    #[test]
+    fn no_team_yet_returns_none() {
+        assert!(select_session_team(&[], "abc").is_none());
     }
 }
