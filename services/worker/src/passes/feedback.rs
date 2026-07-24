@@ -1,5 +1,5 @@
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::agent::provider;
@@ -51,7 +51,8 @@ pub async fn run(
     // could interleave branch writes with an in-flight resume (or another
     // feedback) and the two would clobber each other. Take the run's writer
     // slot before touching the branch; if a resume holds it, wait briefly and
-    // then let SQS redeliver this message — never write concurrently.
+    // then defer via delayed re-enqueue (send_delayed_feedback) — never write
+    // concurrently, and never fail the run just because a write is in progress.
     let writer_holder = format!(
         "feedback#{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -69,10 +70,40 @@ pub async fn run(
     let _writer_guard = match writer_guard {
         Some(g) => g,
         None => {
-            return Err(
-                "run writer slot busy (another pass is writing this branch) — deferring via SQS redelivery"
-                    .into(),
-            )
+            // An in-flight resume (or another feedback) holds the per-run writer
+            // slot. This is TRANSIENT, not a failure: re-enqueue this feedback with
+            // a delay so it applies once the holder releases the slot. Returning Err
+            // here would mark the whole run failed (main.rs writes status=failed on
+            // any feedback Err) and silently drop the review — the SQS handler acks
+            // the message regardless, so it is never redelivered on its own.
+            //
+            // The slot's TTL frees it within ~17 min (> Lambda's 15-min max hold),
+            // so normal contention clears in a few hops. MAX_FEEDBACK_DEFERS is the
+            // backstop for a genuinely wedged slot: past it, fail loudly so the
+            // anomaly surfaces instead of churning the queue for its 14-day retention.
+            const MAX_FEEDBACK_DEFERS: u32 = 15; // ~30 min at 120s, past the slot TTL
+            if msg.defer_count >= MAX_FEEDBACK_DEFERS {
+                error!(
+                    run_id = %msg.run_id,
+                    defer_count = msg.defer_count,
+                    "writer slot still busy after max feedback defers — wedged; failing so it surfaces"
+                );
+                return Err(
+                    "writer slot did not free within ~30 min (wedged) — cannot apply feedback"
+                        .into(),
+                );
+            }
+            info!(
+                run_id = %msg.run_id,
+                defer_count = msg.defer_count,
+                "run writer slot busy — deferring feedback via delayed re-enqueue"
+            );
+            if !send_delayed_feedback(state, &msg, 120).await {
+                // Could not re-enqueue (queue misconfigured / SQS error). Surface it
+                // instead of silently dropping the review.
+                return Err("could not defer feedback (feedback queue unavailable)".into());
+            }
+            return Ok(());
         }
     };
 
@@ -654,6 +685,66 @@ Rules:
     }
 
     Ok(())
+}
+
+/// Re-enqueue a feedback message to the feedback queue with an SQS delay, so a
+/// feedback that lost the per-run writer-slot race retries once the holder
+/// releases the slot — instead of failing the run or dropping the review.
+/// Fire-and-forget: logs on failure, never propagates (the caller returns Ok).
+/// Returns `true` if the feedback was re-enqueued (or intentionally skipped for a
+/// cancelled run); `false` if it could not be deferred (misconfig / SQS error) so
+/// the caller can surface the loss instead of silently succeeding.
+async fn send_delayed_feedback(
+    state: &WorkerState,
+    msg: &FeedbackMessage,
+    delay_seconds: i32,
+) -> bool {
+    if state.config.feedback_queue_url.is_empty() {
+        error!("FEEDBACK_QUEUE_URL not configured — cannot defer feedback (review would be lost)");
+        return false;
+    }
+    // Never re-arm feedback for a cancelled run — nothing to apply, no loss.
+    if run_is_cancelled(state, &msg.team_id, &msg.run_id).await {
+        info!(run_id = %msg.run_id, "Run cancelled — not deferring feedback");
+        return true;
+    }
+    // Serialize back to the tagged wire form ({"type":"feedback", ...}) the worker
+    // consumes. to_value on &FeedbackMessage avoids needing the struct to be Clone.
+    let mut body = match serde_json::to_value(msg) {
+        Ok(v) => v,
+        Err(e) => {
+            error!(run_id = %msg.run_id, error = %e, "Failed to serialize feedback for defer");
+            return false;
+        }
+    };
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("type".to_string(), json!("feedback"));
+        // Bump the defer counter so the caller's cap can bound a wedged slot.
+        obj.insert("defer_count".to_string(), json!(msg.defer_count + 1));
+    }
+    match state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.feedback_queue_url)
+        .message_body(body.to_string())
+        .delay_seconds(delay_seconds)
+        .send()
+        .await
+    {
+        Ok(_) => {
+            info!(
+                run_id = %msg.run_id,
+                delay_seconds,
+                next_defer = msg.defer_count + 1,
+                "Feedback deferred via delayed re-enqueue"
+            );
+            true
+        }
+        Err(e) => {
+            error!(run_id = %msg.run_id, error = %e, "Failed to defer feedback");
+            false
+        }
+    }
 }
 
 /// Look up the branch name from the run record in DynamoDB.
