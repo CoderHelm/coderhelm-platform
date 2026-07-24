@@ -158,6 +158,106 @@ pub(crate) async fn claim_auto_fix_slot(state: &WorkerState, team_id: &str, run_
     }
 }
 
+/// TTL for the per-run WRITER slot, in seconds. Slightly past the 960s
+/// stale-run reset so a crashed holder never blocks a post-reset retry for
+/// more than ~1 minute after the reset fires.
+pub(crate) const RUN_WRITER_TTL_SECS: i64 = 1020;
+
+/// Acquire the run's exclusive WRITER slot. Feedback and resume both write the
+/// same PR branch; resume serializes against other resumes via the status
+/// claim, but feedback historically took NO claim at all — so a feedback pass
+/// and a resume pass could interleave writes on one branch and clobber each
+/// other (and force-squash under a broken single-writer assumption). This slot
+/// makes "I am the only platform writer on this run's branch" explicit: one
+/// conditional write, re-entrant for the same holder, self-expiring via TTL so
+/// a crashed holder can't wedge the run. Returns true when the slot is held.
+pub(crate) async fn acquire_run_writer_slot(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    holder: &str,
+) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    let until = now + RUN_WRITER_TTL_SECS;
+    match state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET writer_until = :until, writer_holder = :h")
+        .condition_expression(
+            "attribute_not_exists(writer_until) OR writer_until < :now OR writer_holder = :h",
+        )
+        .expression_attribute_values(":until", attr_n(until as u64))
+        .expression_attribute_values(":now", attr_n(now as u64))
+        .expression_attribute_values(":h", attr_s(holder))
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            if !format!("{e:?}").contains("ConditionalCheckFailed") {
+                warn!(run_id, error = %e, "writer-slot acquire errored — treating as busy");
+            }
+            false
+        }
+    }
+}
+
+/// RAII handle for the writer slot: releases on drop (any exit path,
+/// including `?` errors), with the TTL as the backstop for hard crashes.
+pub(crate) struct RunWriterGuard {
+    dynamo: aws_sdk_dynamodb::Client,
+    table: String,
+    team_id: String,
+    run_id: String,
+    holder: String,
+}
+
+impl Drop for RunWriterGuard {
+    fn drop(&mut self) {
+        let dynamo = self.dynamo.clone();
+        let table = self.table.clone();
+        let team_id = self.team_id.clone();
+        let run_id = self.run_id.clone();
+        let holder = self.holder.clone();
+        tokio::spawn(async move {
+            let _ = dynamo
+                .update_item()
+                .table_name(&table)
+                .key("team_id", attr_s(&team_id))
+                .key("run_id", attr_s(&run_id))
+                .update_expression("SET writer_until = :zero")
+                .condition_expression("writer_holder = :h")
+                .expression_attribute_values(":zero", attr_n(0))
+                .expression_attribute_values(":h", attr_s(&holder))
+                .send()
+                .await;
+        });
+    }
+}
+
+/// Acquire the writer slot and wrap it in a self-releasing guard.
+pub(crate) async fn acquire_run_writer_guard(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    holder: &str,
+) -> Option<RunWriterGuard> {
+    if acquire_run_writer_slot(state, team_id, run_id, holder).await {
+        Some(RunWriterGuard {
+            dynamo: state.dynamo.clone(),
+            table: state.config.runs_table_name.clone(),
+            team_id: team_id.to_string(),
+            run_id: run_id.to_string(),
+            holder: holder.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod continuation_tests {
     use super::{
