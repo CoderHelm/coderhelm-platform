@@ -364,6 +364,7 @@ pub mod syntax_check;
 #[allow(dead_code)]
 mod test;
 mod triage;
+pub mod write_guard;
 
 /// Minimal MCP plugin catalog: (server_id, npx_package, env_mapping).
 /// Kept in sync with the full catalog in gateway/routes/plugins.rs.
@@ -1589,6 +1590,9 @@ async fn run_passes(
                     &file_cache,
                     Some(run_id),
                     None,
+                    // Scoped only when purely CI-driven; human review comments
+                    // in the feedback mean the human's ask wins (unscoped).
+                    !has_review_feedback,
                 )
                 .await
                 {
@@ -2207,6 +2211,7 @@ async fn run_passes(
             &file_cache,
             Some(run_id),
             implement_deadline,
+            false, // initial implement — unscoped
         )
         .await?;
         write_pass_trace(
@@ -2427,6 +2432,7 @@ async fn run_passes(
                 &fix_cache,
                 Some(run_id),
                 None,
+                true, // bot-driven test-fix — scoped to the PR
             )
             .await
             {
@@ -2537,6 +2543,7 @@ async fn run_passes(
                 &file_cache,
                 Some(run_id),
                 None,
+                true, // bot-driven security fix — scoped to the PR
             )
             .await?;
             write_conversation_log(
@@ -2813,6 +2820,7 @@ async fn run_repo_pipeline(
         file_cache,
         Some(run_id),
         implement_deadline,
+        false, // initial implement — unscoped
     )
     .await?;
     write_pass_trace(
@@ -2938,6 +2946,7 @@ async fn run_repo_pipeline(
                 &fix_cache,
                 Some(run_id),
                 None,
+                true, // bot-driven test-fix — scoped to the PR
             )
             .await
             {
@@ -3032,6 +3041,7 @@ async fn run_repo_pipeline(
                 file_cache,
                 Some(run_id),
                 None,
+                true, // bot-driven security fix — scoped to the PR
             )
             .await?;
             write_conversation_log(
@@ -3814,6 +3824,10 @@ pub(crate) async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<
         "Ground every reference in the repo — don't guess. Before referencing any import path, exported symbol, type field, environment variable, or package script, confirm it exists by reading the file or the generated types. The installed versions in THIS repo are the source of truth, not how a library usually works."
             .to_string(),
         "If you add something a codegen step consumes (a Sanity block/schema, GraphQL type, etc.), update or regenerate the generated types so they include it — otherwise type-checks will fail."
+            .to_string(),
+        "Stay in ticket scope: change only what the ticket requires. Never fix pre-existing lint warnings, unused imports, style issues, or hook-deps in files your change doesn't touch — even when CI logs mention them. They pre-date this PR and belong in a separate cleanup; note them in your summary instead of fixing them."
+            .to_string(),
+        "UI work must look right on mobile AND desktop. When a design shows different structures per breakpoint (element order, a separate mobile header/trigger, stacked vs inline), build distinct per-breakpoint structures (e.g. `md:hidden` + `hidden md:flex`) — never one structure with only responsive class tweaks — and match per-breakpoint sizing (full-width buttons, taller tap targets on mobile)."
             .to_string(),
     ];
 

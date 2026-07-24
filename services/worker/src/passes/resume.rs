@@ -532,6 +532,15 @@ pub async fn run(
         return Ok(());
     }
 
+    // Rehydrate the ticket's design mockups from the run record so the review
+    // pass (and review-fix implement) can check the code AGAINST the design —
+    // the empty vec here meant post-CI passes never saw the mockups.
+    let image_attachments: Vec<crate::models::ImageAttachment> = run_record
+        .get("image_attachments")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
     // Build a minimal TicketMessage for the implement/review passes
     let ticket_msg = TicketMessage {
         team_id: msg.team_id.clone(),
@@ -545,7 +554,7 @@ pub async fn run(
         issue_number,
         sender: String::new(),
         base_branch,
-        image_attachments: vec![],
+        image_attachments,
         continuation: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
@@ -724,6 +733,10 @@ pub async fn run(
             "CI workflow failed on PR #{pr_number} (branch: {branch}). Fix the failures.\n\n\
              Rules:\n\
              - Only fix what CI is complaining about. Don't refactor or add features.\n\
+             - Fix ONLY failures caused by this PR's own changes. NEVER fix pre-existing \
+               lint warnings/unused imports/style issues in files this PR does not touch, \
+               even when CI logs mention them — they pre-date this PR; note them in your \
+               summary instead.\n\
              - If the failure is in a test, fix the code (not the test) unless the test itself is wrong.\n\
              - If tests need updating because the feature changed behavior intentionally, update the tests.\n\
              - For lint/formatting failures (Prettier, ESLint): read the existing file first, match its style exactly (trailing commas, line length, quote style, indentation). Write the COMPLETE file content.\n\
@@ -749,6 +762,9 @@ pub async fn run(
             &file_cache,
             Some(&msg.run_id),
             None,
+            // Scope to the PR only when this cycle is purely CI-driven; if
+            // human review comments ride along, the human's ask wins.
+            review_feedback.is_empty(),
         )
         .await
         {
@@ -989,6 +1005,9 @@ pub async fn run(
                 &file_cache,
                 Some(&msg.run_id),
                 None,
+                // Bot self-review fix — scoped, unless human comments were
+                // folded into the review context.
+                review_feedback.is_empty(),
             )
             .await
             {

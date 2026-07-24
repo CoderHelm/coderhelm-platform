@@ -38,6 +38,12 @@ pub async fn run(
     file_cache: &FileCache,
     run_id: Option<&str>,
     deadline: Option<std::time::Instant>,
+    // Restrict edits to the PR's already-changed files. Callers pass true ONLY
+    // for purely bot/CI-driven fix cycles; any cycle carrying HUMAN feedback
+    // must pass false — a human asking for an out-of-diff change is
+    // authorization, not overreach. Never inferred from review_feedback (that
+    // parameter also carries human review comments).
+    scope_to_pr: bool,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
     let rules_block = super::format_rules_block(rules);
     // Trim repo instructions for simple issues to reduce per-turn token cost
@@ -97,10 +103,25 @@ pub async fn run(
     } else {
         ""
     };
+    // Design mockups attached to the ticket are passed to the agent as IMAGES
+    // (below) — the plan's text tasks lose visual nuance (e.g. "mobile uses a
+    // different structure"), which produced desktop-only layouts that a human
+    // then had to rebuild for mobile.
+    let design_note = if msg.image_attachments.is_empty() {
+        ""
+    } else {
+        "\n## DESIGN MOCKUPS ATTACHED\nThe attached image(s) are the design source of truth — \
+         match them exactly, at BOTH breakpoints. Audit your implementation against the design \
+         at mobile (~375px) AND desktop. If the design shows DIFFERENT structures for mobile vs \
+         desktop (different element order, a separate mobile header/trigger, stacked vs inline \
+         layouts), build DISTINCT per-breakpoint structures (e.g. `md:hidden` + `hidden md:flex`) \
+         — never one structure with only responsive class tweaks. Match per-breakpoint sizing \
+         from the design (e.g. full-width, taller tap targets on mobile where shown).\n"
+    };
     let prompt = if complexity == "simple" {
         format!(
             r#"Implement for issue #{number}: {title}
-{continuation}{openspec}{files_hint}{feedback}
+{design}{continuation}{openspec}{files_hint}{feedback}
 
 ## Instructions — SIMPLE CHANGE
 Go DIRECTLY to the target files listed in the OpenSpec.
@@ -112,6 +133,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - After implementing, output a one-line summary."#,
             number = msg.issue_number,
             title = msg.title,
+            design = design_note,
             continuation = continuation_note,
             openspec = openspec_block,
             files_hint = files_hint,
@@ -120,7 +142,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     } else {
         format!(
             r#"Implement the following tasks for issue #{number}: {title}
-{continuation}{openspec}{feedback}
+{design}{continuation}{openspec}{feedback}
 
 ## Instructions
 - Use `search_code` to find exact files and lines before reading. Prefer `read_file_lines` over `read_file`.
@@ -136,6 +158,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - Only implement the listed tasks. Do not add extras."#,
             number = msg.issue_number,
             title = msg.title,
+            design = design_note,
             continuation = continuation_note,
             openspec = openspec_block,
             feedback = feedback_section,
@@ -181,6 +204,27 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         super::load_codegen_env(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await
     } else {
         Vec::new()
+    };
+
+    // Purely bot/CI-driven fix cycles are scoped to the files the PR already
+    // changed: a lint/type warning in an untouched file pre-exists on the base
+    // branch and is out of ticket scope — fixing it is the unrelated-file churn
+    // this guard kills. Initial implement and human-directed cycles run
+    // unscoped. Listing failure → unscoped (fail open; never brick a fix cycle
+    // on an API hiccup).
+    let scope_guard = if scope_to_pr {
+        match github
+            .compare_changed_files(&msg.repo_owner, &msg.repo_name, &msg.base_branch, branch)
+            .await
+        {
+            Ok(files) => super::write_guard::ScopeGuard::scoped(files),
+            Err(e) => {
+                warn!(error = %e, "Could not list PR files — fix cycle runs unscoped");
+                super::write_guard::ScopeGuard::unscoped()
+            }
+        }
+    } else {
+        super::write_guard::ScopeGuard::unscoped()
     };
 
     let mut tools = if complexity == "simple" {
@@ -319,6 +363,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             checks_cmd,
             codegen_cmd,
             codegen_env,
+            scope_guard,
             run_id: run_id.map(|s| s.to_string()),
             node_version,
             check_budget: std::sync::atomic::AtomicUsize::new(0),
@@ -330,10 +375,20 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         mcp_proxy_function_name: &state.config.mcp_proxy_function_name,
     };
 
-    let mut messages = vec![(
-        "user".to_string(),
-        vec![serde_json::json!({"type": "text", "text": prompt})],
-    )];
+    // Attach the ticket's design mockups as images — the implementer must SEE
+    // the design, not just the plan's text rendering of it (mirrors plan.rs).
+    let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
+    for img in &msg.image_attachments {
+        if let Some(b64) =
+            super::download_image_as_base64(&state.s3, &state.config.bucket_name, &img.s3_key).await
+        {
+            content_blocks.push(serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": img.media_type, "data": b64 }
+            }));
+        }
+    }
+    let mut messages = vec![("user".to_string(), content_blocks)];
 
     // Route simple issues to primary (Sonnet), medium/complex to heavy (Opus)
     let model_id = match complexity {
@@ -713,7 +768,7 @@ impl TaskTracker {
 }
 
 /// Paths the bot must never write to (require elevated GitHub App permissions).
-fn is_protected_path(path: &str) -> bool {
+pub(crate) fn is_protected_path(path: &str) -> bool {
     let normalized = path.trim_start_matches('/');
     normalized.starts_with(".github/workflows/") || normalized.starts_with(".github/actions/")
 }
@@ -736,6 +791,9 @@ struct WriteToolExecutor<'a> {
     /// Public per-repo codegen env (e.g. Sanity projectId/dataset) passed to the
     /// sandbox codegen build. Never a secret — see `load_codegen_env`.
     codegen_env: Vec<(String, String)>,
+    /// Ticket-scope guard: in FIX cycles, writes are restricted to files the PR
+    /// already changed (bounded escape). Unscoped on initial implement.
+    scope_guard: super::write_guard::ScopeGuard,
     /// Node major version to switch the sandbox to (None -> buildspec default).
     node_version: Option<String>,
     run_id: Option<String>,
@@ -898,6 +956,11 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     if self.should_block_generated(path, old) {
                         return Ok(json!(generated_file_reject(path)));
                     }
+                    // Ticket-scope guard: EDITS of existing out-of-PR files only —
+                    // creating a genuinely-needed new file is never blocked.
+                    if self.scope_guard.should_block(path) {
+                        return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
+                    }
                     if let Some(problem) = validate_edit_safety(old, content, path) {
                         return Ok(json!(format!(
                             "Write REJECTED for {path}: {problem}. If you are rewriting the whole \
@@ -934,6 +997,9 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
+                }
+                if self.scope_guard.should_block(path) {
+                    return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                 }
                 let edits = input
                     .get("edits")
@@ -1104,6 +1170,14 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                                      it; never hand-edit it. Nothing was committed."
                                 )));
                             }
+                            // Ticket-scope guard: EDITS of existing out-of-PR files
+                            // only — new-file creation is never blocked.
+                            if self.scope_guard.should_block(path) {
+                                return Ok(json!(format!(
+                                    "Batch write REJECTED — {}. Nothing was committed.",
+                                    super::write_guard::ScopeGuard::reject_msg(path)
+                                )));
+                            }
                             if let Some(problem) = validate_edit_safety(old, content, path) {
                                 return Ok(json!(format!(
                                     "Batch write REJECTED — {path}: {problem}. Never replace a \
@@ -1195,6 +1269,11 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
+                }
+                // An out-of-scope file is identical to base in this PR — a
+                // "restore" of it is either a no-op commit or out-of-scope churn.
+                if self.scope_guard.should_block(path) {
+                    return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                 }
                 let from_ref = input
                     .get("from_ref")
@@ -1433,6 +1512,9 @@ impl<'a> WriteToolExecutor<'a> {
                             self.file_cache
                                 .remove(&format!("{}:{}", self.branch, p))
                                 .await;
+                            // Regenerated files are now part of the PR — let the
+                            // agent touch them without scope rejections.
+                            self.scope_guard.allow(p);
                         }
                         Ok(json!(format!(
                             "Regenerated and committed {} file(s): {}. Now call run_checks to \
@@ -1572,7 +1654,7 @@ fn generated_file_reject(path: &str) -> String {
 /// validation moved to `syntax_check::validate_change`, which is
 /// string/comment-aware and catches single-delimiter breaks the old raw
 /// character count (threshold ±2) waved through.
-fn validate_edit_safety(original: &str, edited: &str, path: &str) -> Option<String> {
+pub(crate) fn validate_edit_safety(original: &str, edited: &str, path: &str) -> Option<String> {
     let code_ext = [
         ".ts", ".tsx", ".js", ".jsx", ".java", ".kt", ".rs", ".go", ".c", ".cpp", ".cs", ".swift",
         ".dart", ".rb", ".py",

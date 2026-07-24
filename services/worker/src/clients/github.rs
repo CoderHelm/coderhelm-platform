@@ -1447,6 +1447,28 @@ impl GitHubClient {
         Ok(data.as_array().and_then(|arr| arr.first().cloned()))
     }
 
+    /// List the files changed between base and head (compare API). The
+    /// endpoint returns at most 300 files in one response; callers treat a
+    /// near-cap result as "too large to trust" and fall back to unscoped.
+    pub async fn compare_changed_files(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/compare/{base}...{head}");
+        let data = self.get(&url).await?;
+        Ok(data["files"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|f| f["filename"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Find the most recent closed-but-unmerged PR for a head branch.
     /// A branch force-reset to base auto-closes its PR ("all commits
     /// removed"); reopening that PR preserves its number, comments, and

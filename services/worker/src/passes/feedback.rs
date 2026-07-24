@@ -299,6 +299,28 @@ Rules:
     // Try to extract branch from repo metadata. For now, use a convention.
     let branch = get_pr_branch(state, &msg).await?;
 
+    // Ticket-scope guard: CI-ONLY cycles (no unanswered human comment/review —
+    // same signal as the budget gate) may only write files the PR already
+    // changed; a lint/type warning in an untouched file pre-exists on base and
+    // is out of scope. HUMAN-directed feedback runs unscoped — a reviewer
+    // asking for an out-of-diff change is authorization, not overreach.
+    let ci_only = comments.is_empty() && msg.review_body.trim().is_empty();
+    let scope_guard = if ci_only {
+        let base = get_run_base_branch(state, &msg).await;
+        match github
+            .compare_changed_files(&msg.repo_owner, &msg.repo_name, &base, &branch)
+            .await
+        {
+            Ok(files) => super::write_guard::ScopeGuard::scoped(files),
+            Err(e) => {
+                warn!(run_id = %msg.run_id, error = %e, "Could not list PR files — feedback cycle runs unscoped");
+                super::write_guard::ScopeGuard::unscoped()
+            }
+        }
+    } else {
+        super::write_guard::ScopeGuard::unscoped()
+    };
+
     let tools = feedback_tools();
     let executor = FeedbackToolExecutor {
         github: &github,
@@ -306,6 +328,7 @@ Rules:
         repo: &msg.repo_name,
         branch: &branch,
         files_modified: std::sync::Mutex::new(false),
+        scope_guard,
     };
 
     let mut messages = vec![(
@@ -605,6 +628,29 @@ Rules:
 }
 
 /// Look up the branch name from the run record in DynamoDB.
+/// The run's base branch (for scoping fix cycles to the PR's changed files).
+/// Falls back to "main" — an unscoped-by-error guard is safer than a wrong base.
+async fn get_run_base_branch(state: &WorkerState, msg: &FeedbackMessage) -> String {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key(
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
+        )
+        .key(
+            "run_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
+        )
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .and_then(|i| i.get("base_branch").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_else(|| "main".to_string())
+}
+
 async fn get_pr_branch(
     state: &WorkerState,
     msg: &FeedbackMessage,
@@ -948,6 +994,9 @@ struct FeedbackToolExecutor<'a> {
     repo: &'a str,
     branch: &'a str,
     files_modified: std::sync::Mutex<bool>,
+    /// Ticket-scope guard: CI-only cycles may only write files the PR already
+    /// changed (bounded escape). Human-directed feedback is unscoped.
+    scope_guard: super::write_guard::ScopeGuard,
 }
 
 #[async_trait::async_trait]
@@ -1026,6 +1075,16 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
+                // Guard parity with the implement executor — this path had NONE
+                // of the write protections, which is where post-PR churn ran.
+                if super::implement::is_protected_path(path) {
+                    return Ok(json!(format!(
+                        "Cannot modify {path}: CI/CD workflow files are protected."
+                    )));
+                }
+                if self.scope_guard.should_block(path) {
+                    return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
+                }
                 let content = input
                     .get("content")
                     .and_then(|v| v.as_str())
@@ -1034,6 +1093,28 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing message")?;
+                if let Err(problem) = super::syntax_check::validate_change(path, None, content) {
+                    return Ok(json!(format!(
+                        "Write REJECTED for {path} — content has syntax problems: {problem}. \
+                         Fix the content and retry."
+                    )));
+                }
+                // Anti-stub: overwriting a substantial existing file with a
+                // drastic shrink is placeholder churn, not a fix.
+                if let Ok(old) = self
+                    .github
+                    .read_file(self.owner, self.repo, path, self.branch)
+                    .await
+                {
+                    if let Some(problem) =
+                        super::implement::validate_edit_safety(&old, content, path)
+                    {
+                        return Ok(json!(format!(
+                            "Write REJECTED for {path}: {problem}. Write the COMPLETE file — \
+                             never a stub or placeholder."
+                        )));
+                    }
+                }
                 // Auto-fetch SHA if not provided — Contents API requires it for updates
                 let sha = match input.get("sha").and_then(|v| v.as_str()) {
                     Some(s) => Some(s.to_string()),
@@ -1072,6 +1153,20 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                         .get("path")
                         .and_then(|v| v.as_str())
                         .ok_or("Missing file path")?;
+                    // Guard parity with the implement executor (atomic: one bad
+                    // file rejects the whole batch; nothing committed).
+                    if super::implement::is_protected_path(path) {
+                        return Ok(json!(format!(
+                            "Batch write REJECTED — {path} is a protected CI/CD workflow file. \
+                             Nothing was committed."
+                        )));
+                    }
+                    if self.scope_guard.should_block(path) {
+                        return Ok(json!(format!(
+                            "Batch write REJECTED — {}. Nothing was committed.",
+                            super::write_guard::ScopeGuard::reject_msg(path)
+                        )));
+                    }
                     let action = f.get("action").and_then(|v| v.as_str()).unwrap_or("write");
                     if action == "delete" {
                         ops.push(crate::clients::github::FileOp::Delete {
@@ -1079,6 +1174,29 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                         });
                     } else {
                         let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Err(problem) =
+                            super::syntax_check::validate_change(path, None, content)
+                        {
+                            return Ok(json!(format!(
+                                "Batch write REJECTED — {path} has syntax problems: {problem}. \
+                                 Nothing was committed."
+                            )));
+                        }
+                        if let Ok(old) = self
+                            .github
+                            .read_file(self.owner, self.repo, path, self.branch)
+                            .await
+                        {
+                            if let Some(problem) =
+                                super::implement::validate_edit_safety(&old, content, path)
+                            {
+                                return Ok(json!(format!(
+                                    "Batch write REJECTED — {path}: {problem}. Never replace a \
+                                     real file with a stub; write the COMPLETE file. Nothing was \
+                                     committed."
+                                )));
+                            }
+                        }
                         ops.push(crate::clients::github::FileOp::Write {
                             path: path.to_string(),
                             content: content.to_string(),
@@ -1101,6 +1219,14 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
+                if super::implement::is_protected_path(path) {
+                    return Ok(json!(format!(
+                        "Cannot modify {path}: CI/CD workflow files are protected."
+                    )));
+                }
+                if self.scope_guard.should_block(path) {
+                    return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
+                }
                 let from_ref = input
                     .get("from_ref")
                     .and_then(|v| v.as_str())

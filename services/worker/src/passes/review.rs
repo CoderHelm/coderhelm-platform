@@ -54,7 +54,7 @@ Use the `get_diff` tool to see all changes compared to main. Then review for:
 7. **Must-rules** — If must-rules are listed in the system prompt, verify every rule is respected.
 8. **No placeholders** — Flag any TODO, FIXME, REPLACE_ME, stub implementations, or incomplete code left behind.
 9. **No destructive deletions** — If large blocks of existing code were REMOVED without being replaced by equivalent functionality, flag it. The agent should modify code, not gut it.
-10. **Syntax integrity** — For every modified file, verify that braces/brackets are balanced and the code would parse. If a file has orphaned catch blocks, dangling braces, or unreachable code after return/throw, it MUST be flagged.
+10. **Syntax integrity** — For every modified file, verify that braces/brackets are balanced and the code would parse. If a file has orphaned catch blocks, dangling braces, or unreachable code after return/throw, it MUST be flagged.{design_check}
 
 After using `get_diff`, also use `read_file` on any file that had significant changes (>20 lines modified) to verify the full file is syntactically correct. Do NOT skip this step.
 
@@ -63,6 +63,20 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
         number = msg.issue_number,
         title = msg.title,
         openspec = openspec_block,
+        design_check = if msg.image_attachments.is_empty() {
+            ""
+        } else {
+            // Ticket carries design mockups (attached below as images): the
+            // reviewer must check per-breakpoint fidelity — text tasks lose
+            // visual nuance like "mobile uses a different structure".
+            "\n11. **Design fidelity (mockups attached)** — Compare the implementation against \
+             the attached design image(s) at BOTH mobile (~375px) and desktop breakpoints. If \
+             the design shows different mobile vs desktop structures (element order, a separate \
+             mobile header/trigger, stacked vs inline), verify the code builds DISTINCT \
+             per-breakpoint structures — one shared structure with only responsive class tweaks \
+             is a finding. Check per-breakpoint sizing (full-width buttons / taller tap targets \
+             on mobile) matches the design."
+        },
     );
 
     // Read-only tool set — no write_file or batch_write
@@ -76,10 +90,20 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
         file_cache,
     };
 
-    let mut messages = vec![(
-        "user".to_string(),
-        vec![serde_json::json!({"type": "text", "text": prompt})],
-    )];
+    // Attach the design mockups so the reviewer can SEE the design it's
+    // checking against (mirrors plan.rs / implement.rs).
+    let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
+    for img in &msg.image_attachments {
+        if let Some(b64) =
+            super::download_image_as_base64(&state.s3, &state.config.bucket_name, &img.s3_key).await
+        {
+            content_blocks.push(serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": img.media_type, "data": b64 }
+            }));
+        }
+    }
+    let mut messages = vec![("user".to_string(), content_blocks)];
 
     let model_id = provider.primary_model_id();
     let response = provider::converse(
