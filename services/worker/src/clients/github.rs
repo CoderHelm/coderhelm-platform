@@ -21,6 +21,18 @@ struct CachedToken {
     expires_at: u64,
 }
 
+/// A repo snapshot plus the commit SHA it reflects. `base_sha` starts as the
+/// branch tip the tarball was downloaded at and advances as the platform's own
+/// commits are mirrored in — so at any moment it names exactly the last commit
+/// this pass has "seen". Write paths compare the live tip against it to detect
+/// foreign commits (e.g. a user's local push) that the snapshot never saw:
+/// writing snapshot-era file bodies over those would silently revert them.
+#[derive(Clone)]
+struct CachedSnapshot {
+    snap: Arc<RepoSnapshot>,
+    base_sha: String,
+}
+
 /// GitHub REST API client using installation token auth.
 pub struct GitHubClient {
     app_id: String,
@@ -30,7 +42,7 @@ pub struct GitHubClient {
     token_cache: Mutex<Option<CachedToken>>,
     /// Repo snapshots keyed by "owner/repo@ref". `None` marks a failed fetch
     /// so we don't re-download a too-large tarball on every search.
-    snapshots: tokio::sync::RwLock<HashMap<String, Option<Arc<RepoSnapshot>>>>,
+    snapshots: tokio::sync::RwLock<HashMap<String, Option<CachedSnapshot>>>,
 }
 
 #[derive(Serialize)]
@@ -117,6 +129,29 @@ impl GitHubClient {
         });
 
         Ok(resp.token)
+    }
+
+    /// The GitHub login of this app's bot user ("{slug}[bot]") — the identity
+    /// stamped as committer on every commit the platform creates via the API.
+    /// Used to distinguish our own commits from foreign (user) commits.
+    async fn app_bot_login(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let jwt = self.generate_jwt()?;
+        let resp: serde_json::Value = self
+            .http
+            .get(format!("{API_BASE}/app"))
+            .header("Authorization", format!("Bearer {jwt}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "coderhelm-worker")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let slug = resp
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing slug in GET /app response")?;
+        Ok(format!("{slug}[bot]"))
     }
 
     async fn auth_headers(
@@ -214,26 +249,39 @@ impl GitHubClient {
     /// Get or lazily build the in-memory snapshot for a repo@ref.
     /// Returns None when a previous fetch failed (too large / API error) so
     /// callers fall back to per-request API access.
+    ///
+    /// The branch ref is resolved to a commit SHA FIRST and the tarball is
+    /// downloaded by that SHA (immutable), so the snapshot is stamped with
+    /// exactly the commit it contains — no resolve/download race.
     async fn snapshot(&self, owner: &str, repo: &str, git_ref: &str) -> Option<Arc<RepoSnapshot>> {
         let key = Self::snapshot_key(owner, repo, git_ref);
         if let Some(entry) = self.snapshots.read().await.get(&key) {
-            return entry.clone();
+            return entry.clone().map(|c| c.snap);
         }
-        let built = match self.download_tarball(owner, repo, git_ref).await {
-            Ok(bytes) => match RepoSnapshot::from_tarball(&bytes) {
-                Ok(snap) => Some(Arc::new(snap)),
+        let built = match self.get_ref(owner, repo, git_ref).await {
+            Ok(base_sha) => match self.download_tarball(owner, repo, &base_sha).await {
+                Ok(bytes) => match RepoSnapshot::from_tarball(&bytes) {
+                    Ok(snap) => Some(CachedSnapshot {
+                        snap: Arc::new(snap),
+                        base_sha,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(key, error = %e, "Failed to parse repo tarball; falling back to API");
+                        None
+                    }
+                },
                 Err(e) => {
-                    tracing::warn!(key, error = %e, "Failed to parse repo tarball; falling back to API");
+                    tracing::warn!(key, error = %e, "Failed to download repo tarball; falling back to API");
                     None
                 }
             },
             Err(e) => {
-                tracing::warn!(key, error = %e, "Failed to download repo tarball; falling back to API");
+                tracing::warn!(key, error = %e, "Failed to resolve ref for snapshot; falling back to API");
                 None
             }
         };
         self.snapshots.write().await.insert(key, built.clone());
-        built
+        built.map(|c| c.snap)
     }
 
     /// Snapshot for a ref if one was already built (never triggers a download).
@@ -249,6 +297,66 @@ impl GitHubClient {
             .get(&Self::snapshot_key(owner, repo, git_ref))
             .cloned()
             .flatten()
+            .map(|c| c.snap)
+    }
+
+    /// The commit SHA the cached snapshot for this ref reflects (its
+    /// freshness stamp), if a snapshot exists. Write paths use this as the
+    /// expected base: a live tip that differs means commits landed that this
+    /// pass has never read.
+    async fn snapshot_base_sha(&self, owner: &str, repo: &str, git_ref: &str) -> Option<String> {
+        self.snapshots
+            .read()
+            .await
+            .get(&Self::snapshot_key(owner, repo, git_ref))
+            .cloned()
+            .flatten()
+            .map(|c| c.base_sha)
+    }
+
+    /// Advance the snapshot's freshness stamp to a commit the platform itself
+    /// just created (whose content is mirrored via mirror_write/mirror_delete).
+    async fn advance_snapshot_base(&self, owner: &str, repo: &str, git_ref: &str, new_sha: &str) {
+        if let Some(Some(entry)) = self
+            .snapshots
+            .write()
+            .await
+            .get_mut(&Self::snapshot_key(owner, repo, git_ref))
+        {
+            entry.base_sha = new_sha.to_string();
+        }
+    }
+
+    /// Files changed between two commits (compare API), for write-time
+    /// conflict detection against foreign commits.
+    async fn changed_files_between(
+        &self,
+        owner: &str,
+        repo: &str,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}");
+        let data = self.get(&url).await?;
+        let files = data.get("files").and_then(|f| f.as_array());
+        // Pagination fail-safe: the compare API returns at most 300 files in one
+        // page. At the cap the list may be truncated, so a changed path beyond
+        // it would be missed and its file silently reverted. Signal the caller
+        // (which treats an error as "all paths conflict") rather than under-report.
+        if files.map(|a| a.len()).unwrap_or(0) >= 300 {
+            return Err(
+                "compare file list truncated (>=300 files) — cannot verify write freshness".into(),
+            );
+        }
+        Ok(files
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|f| f.get("filename").and_then(|v| v.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Mirror a committed write into any snapshot held for this ref.
@@ -381,6 +489,24 @@ impl GitHubClient {
                 return Ok(content);
             }
         }
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        let data = self.get(&url).await?;
+        let content = data.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let clean = content.replace('\n', "");
+        let bytes = B64.decode(&clean)?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    /// Read a file straight from the LIVE API, bypassing the snapshot cache.
+    /// Used where staleness is dangerous — the 409 reconcile must compare
+    /// against what is ACTUALLY on the branch, not our (possibly stale) mirror.
+    async fn read_file_live(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
         let data = self.get(&url).await?;
         let content = data.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -610,6 +736,67 @@ impl GitHubClient {
         if branch_sha == base_sha {
             return Ok(()); // nothing to squash
         }
+        // FOREIGN-COMMIT GUARD: the force-rewrite below is only safe when
+        // every commit being collapsed is our own. If anyone else (a user's
+        // local push) has committed to this branch, squashing from our view
+        // of the tree would erase their work — so we skip the cosmetic squash
+        // and keep full history instead. Fails safe: any doubt → no squash.
+        match self.app_bot_login().await {
+            Ok(bot_login) => {
+                let compare_url =
+                    format!("{API_BASE}/repos/{owner}/{repo}/compare/{base_sha}...{branch_sha}");
+                let cmp = self.get(&compare_url).await?;
+                // Pagination fail-safe: the compare API returns at most 250
+                // commits in one page. If the branch has more, a user commit
+                // beyond the page would go undetected and the force-squash would
+                // erase it — so any truncation means skip the squash.
+                let total_commits = cmp
+                    .get("total_commits")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let returned_commits = cmp
+                    .get("commits")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if total_commits as usize > returned_commits || returned_commits >= 250 {
+                    tracing::warn!(
+                        branch,
+                        total_commits,
+                        returned_commits,
+                        "skipping squash: too many commits to verify authorship (compare pagination) — preserving history"
+                    );
+                    return Ok(());
+                }
+                let foreign: Vec<String> = cmp
+                    .get("commits")
+                    .and_then(|c| c.as_array())
+                    .map(|commits| {
+                        commits
+                            .iter()
+                            .filter(|c| {
+                                c.pointer("/committer/login").and_then(|v| v.as_str())
+                                    != Some(bot_login.as_str())
+                            })
+                            .filter_map(|c| c.get("sha").and_then(|v| v.as_str()))
+                            .map(|s| s[..7.min(s.len())].to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !foreign.is_empty() {
+                    tracing::warn!(
+                        branch,
+                        foreign_commits = %foreign.join(", "),
+                        "skipping squash: branch contains commits not authored by the app — preserving history"
+                    );
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                tracing::warn!(branch, error = %e, "could not resolve app bot login — skipping squash (fail-safe)");
+                return Ok(());
+            }
+        }
         // Tree of the branch's current tip = the full accumulated result.
         let commit_url = format!("{API_BASE}/repos/{owner}/{repo}/git/commits/{branch_sha}");
         let tree_sha = self
@@ -755,12 +942,37 @@ impl GitHubClient {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}");
         let encoded = B64.encode(content.as_bytes());
-        // Retry on 409 (stale blob sha — a concurrent commit changed the file):
-        // re-fetch the current sha and re-PUT, so a raced write serializes
-        // instead of erroring the whole pass.
+        // FRESHNESS CONTRACT (same as batch_write): if the branch tip moved
+        // past what this pass's snapshot reflects AND this file is among the
+        // foreign changes, refuse — writing our (snapshot-era) body would
+        // silently revert the newer commit. The caller must re-read and
+        // reapply on top of current content.
+        if let Some(expected) = self.snapshot_base_sha(owner, repo, branch).await {
+            let live = self.get_ref(owner, repo, branch).await?;
+            if live != expected {
+                let foreign = self
+                    .changed_files_between(owner, repo, &expected, &live)
+                    .await
+                    .unwrap_or_else(|_| vec![path.to_string()]);
+                if foreign.iter().any(|p| p == path) {
+                    return Err(format!(
+                        "branch advanced upstream: '{path}' was changed by a commit this pass has not read. \
+                         Re-read the file and reapply the change on top of its current content."
+                    )
+                    .into());
+                }
+                self.invalidate_snapshot(owner, repo, branch).await;
+            }
+        }
+        // A 409/422 mid-flight means the file changed under us DURING the
+        // write — the old behavior (refetch sha, re-PUT the same body) would
+        // steamroll that concurrent change. One retry is allowed only for the
+        // stale-sha bookkeeping case where the file's CURRENT content already
+        // equals what we are writing (idempotent replay); anything else is a
+        // real conflict and errors out for the caller to re-read.
         let mut cur_sha = sha.map(|s| s.to_string());
-        let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
-        for attempt in 0..4u32 {
+        let mut retried = false;
+        loop {
             let mut body = serde_json::json!({
                 "message": message,
                 "content": encoded,
@@ -779,24 +991,43 @@ impl GitHubClient {
             if (200..300).contains(&status) {
                 let result: serde_json::Value = resp.json().await?;
                 self.mirror_write(owner, repo, branch, path, content).await;
+                if let Some(new_sha) = result.pointer("/commit/sha").and_then(|v| v.as_str()) {
+                    self.advance_snapshot_base(owner, repo, branch, new_sha)
+                        .await;
+                }
                 return Ok(result);
             }
-            if status == 409 || status == 422 {
-                tracing::warn!(
-                    path,
-                    attempt,
-                    "write_file conflict — refetching sha and retrying"
-                );
-                cur_sha = self.get_file_sha(owner, repo, path, branch).await.ok();
-                tokio::time::sleep(std::time::Duration::from_millis(250 * (attempt as u64 + 1)))
-                    .await;
-                continue;
+            if (status == 409 || status == 422) && !retried {
+                retried = true;
+                // Compare against LIVE content, not the snapshot — a snapshot
+                // read here returns our own mirrored body and would falsely
+                // "reconcile" (re-PUT) over a user's concurrent push, reverting
+                // it. Only truly-idempotent replays (live == intended) proceed.
+                let current_content = self.read_file_live(owner, repo, path, branch).await;
+                let current_sha = self.get_file_sha(owner, repo, path, branch).await;
+                match (current_content, current_sha) {
+                    (Ok(cc), Ok(cs)) if cc == content => {
+                        // Someone already wrote exactly this content — or our
+                        // sha was stale bookkeeping. Safe to reconcile.
+                        tracing::info!(
+                            path,
+                            "write_file conflict resolved: current content already matches"
+                        );
+                        cur_sha = Some(cs);
+                        continue;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "write_file conflict: '{path}' changed concurrently on '{branch}'. \
+                             Re-read the file and reapply the change on top of its current content."
+                        )
+                        .into());
+                    }
+                }
             }
             let body_txt = resp.text().await.unwrap_or_default();
-            last_err = Some(format!("write_file failed: {status} {body_txt}").into());
-            break;
+            return Err(format!("write_file failed: {status} {body_txt}").into());
         }
-        Err(last_err.unwrap_or_else(|| "write_file: exhausted retries under conflict".into()))
     }
 
     // ─── Batch write (atomic multi-file commit) ─────────────────
@@ -852,12 +1083,64 @@ impl GitHubClient {
         // Build tree + commit ON THE CURRENT TIP and update the ref with a
         // fast-forward-only CAS. If another writer raced us, rebuild on their
         // new tip (base_tree = new ref preserves their commit) and retry.
+        //
+        // FRESHNESS CONTRACT: the CAS protects the ref transition, not file
+        // content — these blob bodies came from this pass's snapshot. If the
+        // live tip holds commits the snapshot never saw (a user's local push,
+        // another writer), overlaying snapshot-era bodies would silently
+        // revert them. So when the tip != the snapshot's stamp, we diff the
+        // foreign range: disjoint from our write-set → safe, proceed on the
+        // new tip (and drop the now-stale snapshot); overlapping → REFUSE the
+        // write with the conflicting paths so the caller re-reads fresh state
+        // instead of reverting someone's work.
+        let write_paths: Vec<&str> = files
+            .iter()
+            .map(|f| match f {
+                FileOp::Write { path, .. } => path.as_str(),
+                FileOp::Delete { path } => path.as_str(),
+            })
+            .collect();
         let tree_url = format!("{API_BASE}/repos/{owner}/{repo}/git/trees");
         let commit_url = format!("{API_BASE}/repos/{owner}/{repo}/git/commits");
         let mut commit_sha = String::new();
         let mut committed = false;
         for attempt in 0..6u32 {
             let branch_sha = self.get_ref(owner, repo, branch).await?;
+            if let Some(expected) = self.snapshot_base_sha(owner, repo, branch).await {
+                if branch_sha != expected {
+                    let foreign = self
+                        .changed_files_between(owner, repo, &expected, &branch_sha)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(branch, error = %e, "compare failed during freshness check — treating all write paths as conflicting");
+                            write_paths.iter().map(|p| p.to_string()).collect()
+                        });
+                    let conflicts: Vec<&String> = foreign
+                        .iter()
+                        .filter(|p| write_paths.contains(&p.as_str()))
+                        .collect();
+                    if !conflicts.is_empty() {
+                        return Err(format!(
+                            "branch advanced upstream: {} commit(s) landed after this pass read the repo, touching file(s) this write would overwrite: {}. \
+                             Re-read the current content of these files and reapply the change on top of it.",
+                            &branch_sha[..7.min(branch_sha.len())],
+                            conflicts
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                        .into());
+                    }
+                    tracing::warn!(
+                        branch,
+                        expected_base = %expected,
+                        live_tip = %branch_sha,
+                        "branch advanced upstream in files disjoint from this write — proceeding on the new tip and dropping the stale snapshot"
+                    );
+                    self.invalidate_snapshot(owner, repo, branch).await;
+                }
+            }
             let tree = self
                 .post(
                     &tree_url,
@@ -910,6 +1193,9 @@ impl GitHubClient {
                 }
             }
         }
+        // The snapshot now reflects this commit — advance its freshness stamp.
+        self.advance_snapshot_base(owner, repo, branch, &commit_sha)
+            .await;
 
         Ok(commit_sha)
     }

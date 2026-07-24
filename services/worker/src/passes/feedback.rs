@@ -47,6 +47,35 @@ pub async fn run(
         return Ok(());
     }
 
+    // ONE PLATFORM WRITER PER RUN: feedback historically took no claim, so it
+    // could interleave branch writes with an in-flight resume (or another
+    // feedback) and the two would clobber each other. Take the run's writer
+    // slot before touching the branch; if a resume holds it, wait briefly and
+    // then let SQS redeliver this message — never write concurrently.
+    let writer_holder = format!(
+        "feedback#{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let mut writer_guard = None;
+    for attempt in 0..4u32 {
+        writer_guard =
+            super::acquire_run_writer_guard(state, &msg.team_id, &msg.run_id, &writer_holder).await;
+        if writer_guard.is_some() {
+            break;
+        }
+        info!(run_id = %msg.run_id, attempt, "run writer slot busy — waiting");
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+    }
+    let _writer_guard = match writer_guard {
+        Some(g) => g,
+        None => {
+            return Err(
+                "run writer slot busy (another pass is writing this branch) — deferring via SQS redelivery"
+                    .into(),
+            )
+        }
+    };
+
     // Whether the pre-feedback conflict resolution pushed a merge commit —
     // that push triggers CI, so completing without awaiting_ci would leave
     // the CI result with no consumer (and a salvaged draft PR stuck in
