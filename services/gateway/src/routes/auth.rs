@@ -36,7 +36,8 @@ use std::collections::HashMap;
 ///   2. else a team that is NOT the Cognito personal team (covers a rare
 ///      co-owner invited into a real team, for email/Cognito users).
 ///   3. else any active membership (their personal team).
-/// `None` when the user has no team yet (first login → create personal).
+///
+/// Returns `None` when the user has no team yet (first login → create personal).
 fn select_session_team<'a>(
     items: &'a [HashMap<String, AttributeValue>],
     cognito_sub: &str,
