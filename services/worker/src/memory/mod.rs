@@ -84,7 +84,21 @@ impl AgentMemory {
             }
         };
 
-        // Open MenteDB with Bedrock embedder
+        // NOTE on dedup: the engine default memory_dedup_threshold (0.97 cosine)
+        // is unreachable on Titan-v2-1024 (measured 7/24: paraphrase pairs
+        // 0.75-0.93, near-verbatim 0.94), so store-time dedup never fires and
+        // reworded re-extracted learnings accumulate. Left OFF deliberately: on
+        // this embedder the two-gate (cosine AND token-jaccard) design can't be
+        // made both safe and useful. The jaccard gate is length-dependent — a
+        // single-token VALUE UPDATE ("port 8000"->"8001") in a real 1-2 sentence
+        // learning scores jaccard >=0.89 and cosine ~0.94, so any threshold low
+        // enough to catch near-verbatim dupes also SWALLOWS corrections (the new
+        // value lost, supersession never fires). Reworded paraphrases score
+        // jaccard 0.33-0.41 and are never caught at any safe setting. Losing a
+        // correction is far worse than keeping a duplicate, so we don't dedup at
+        // store time. The real fix is the engine 0.26.0 self-calibrating
+        // thresholds + retroactive dedup sweep (a separate upgrade); until then
+        // the 0.02 recall floor + top-k bound the cost of accumulation.
         let bedrock_embedder = embedder::BedrockEmbedder::new(state.bedrock.clone());
         match MenteDb::open_with_embedder(&local_dir, Box::new(bedrock_embedder)) {
             Ok(db) => {
@@ -130,13 +144,25 @@ impl AgentMemory {
             }
         };
 
-        let results = match self.db.recall_similar(&embedding, k) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "Failed to recall memories");
-                return String::new();
-            }
-        };
+        // Hybrid (vector + BM25 via RRF): tickets name exact code identifiers
+        // (function names, crate names, file paths) that pure vector recall
+        // ranks poorly — the keyword arm catches them. Same fused-score scale
+        // as recall_similar, so the floor below still applies.
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        let results =
+            match self
+                .db
+                .recall_hybrid_at(&embedding, Some(query), k, now_micros, None, None, None)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "Failed to recall memories");
+                    return String::new();
+                }
+            };
 
         // Relevance floor: top-k on a small store returns SOMETHING no matter
         // how unrelated — injecting off-topic memories into every ticket
@@ -373,30 +399,39 @@ impl AgentMemory {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let memory_count = self.db.memory_count();
 
-        if self.dirty {
+        // Flush/close/upload can each fail — capture the outcome instead of
+        // early-returning, so the fenced lock release and /tmp cleanup below
+        // run UNCONDITIONALLY. An early `?` here used to leave the lock to its
+        // 15-minute TTL (repo stateless for following runs) and the local dir
+        // behind on every flush or S3 hiccup.
+        let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+            if self.dirty {
+                self.db
+                    .flush()
+                    .map_err(|e| format!("MenteDB flush error: {e}"))?;
+            }
             self.db
-                .flush()
-                .map_err(|e| format!("MenteDB flush error: {e}"))?;
-        }
-        self.db
-            .close()
-            .map_err(|e| format!("MenteDB close error: {e}"))?;
+                .close()
+                .map_err(|e| format!("MenteDB close error: {e}"))?;
 
-        // Only upload if we have stored something
-        if self.dirty {
-            s3_sync::upload_memory(
-                &state.s3,
-                &state.config.bucket_name,
-                &self.team_id,
-                &self.repo_owner,
-                &self.repo_name,
-                &self.local_dir,
-            )
-            .await?;
-            info!(memories = memory_count, "Persisted agent memory to S3");
+            // Only upload if we have stored something
+            if self.dirty {
+                s3_sync::upload_memory(
+                    &state.s3,
+                    &state.config.bucket_name,
+                    &self.team_id,
+                    &self.repo_owner,
+                    &self.repo_name,
+                    &self.local_dir,
+                )
+                .await?;
+                info!(memories = memory_count, "Persisted agent memory to S3");
+            }
+            Ok(())
         }
+        .await;
 
-        // Release lock (fenced by our token)
+        // Release lock (fenced by our token) — always, success or not.
         if let Some(ref token) = self.lock_token {
             lock::release_lock(
                 &state.dynamo,
@@ -409,9 +444,9 @@ impl AgentMemory {
             .await;
         }
 
-        // Clean up local files
+        // Clean up local files — always.
         s3_sync::cleanup_local(&self.local_dir);
 
-        Ok(())
+        result
     }
 }

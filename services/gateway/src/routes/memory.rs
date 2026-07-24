@@ -172,7 +172,7 @@ fn cleanup(dir: &PathBuf) {
 
 /// Upload modified DB back to S3 (used after delete).
 async fn upload_and_close(
-    mut db: MenteDb,
+    db: MenteDb,
     dir: &PathBuf,
     s3: &aws_sdk_s3::Client,
     bucket: &str,
@@ -223,7 +223,7 @@ pub async fn list_memories(
     Query(q): Query<ListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let (owner, name) = parse_repo(&q.repo)?;
-    let (mut db, dir) = open_db(
+    let (db, dir) = open_db(
         &state.s3,
         &state.config.bucket_name,
         &claims.team_id,
@@ -302,33 +302,91 @@ pub async fn delete_memory(
         return Err((StatusCode::FORBIDDEN, "Admin+ required".into()));
     }
     let (owner, name) = parse_repo(&q.repo)?;
-    let (mut db, dir) = open_db(
-        &state.s3,
-        &state.config.bucket_name,
+
+    // Take the same fencing lock worker runs hold. An unlocked delete raced a
+    // concurrent run's close_and_upload: the run's snapshot (still containing
+    // the memory) overwrote the delete, silently resurrecting it.
+    let lock_token = match common::memlock::acquire_lock(
+        &state.dynamo,
+        &state.config.table_name,
         &claims.team_id,
         owner,
         name,
     )
-    .await?;
+    .await
+    {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "A run is currently using this repo's memory — try again in a few minutes".into(),
+            ))
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Memory lock error: {e}"),
+            ))
+        }
+    };
 
-    let id = memory_id
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid memory ID".into()))?;
+    // From here on, release the lock AND clean /tmp on EVERY path.
+    let result: Result<_, (StatusCode, String)> = async {
+        let (db, dir) = open_db(
+            &state.s3,
+            &state.config.bucket_name,
+            &claims.team_id,
+            owner,
+            name,
+        )
+        .await?;
 
-    let _ = db.forget(id);
-    info!(memory_id = %memory_id, "Deleted memory via dashboard");
+        let id = memory_id
+            .parse()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid memory ID".to_string()))?;
 
-    upload_and_close(
-        db,
-        &dir,
-        &state.s3,
-        &state.config.bucket_name,
+        // Propagate a real forget error instead of reporting a false "deleted"
+        // — otherwise the memory survives, the snapshot re-uploads unchanged,
+        // and the worker keeps injecting a memory the admin believes gone (the
+        // silent-resurrection this whole lock change exists to prevent).
+        db.forget(id).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Delete failed: {e}"),
+            )
+        })?;
+        info!(memory_id = %memory_id, "Deleted memory via dashboard");
+
+        upload_and_close(
+            db,
+            &dir,
+            &state.s3,
+            &state.config.bucket_name,
+            &claims.team_id,
+            owner,
+            name,
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+
+    common::memlock::release_lock(
+        &state.dynamo,
+        &state.config.table_name,
         &claims.team_id,
         owner,
         name,
+        Some(&lock_token),
     )
-    .await?;
+    .await;
 
+    // Belt-and-suspenders /tmp cleanup: upload_and_close cleans on success;
+    // this covers the error paths (bad ID, flush/upload failure) so unpacked
+    // snapshots can't accumulate and exhaust a warm container's 512MB /tmp.
+    cleanup(&local_dir(&claims.team_id, owner, name));
+
+    result?;
     Ok(Json(serde_json::json!({"deleted": memory_id})))
 }
 
@@ -350,7 +408,7 @@ pub async fn memory_stats(
     Query(q): Query<StatsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let (owner, name) = parse_repo(&q.repo)?;
-    let (mut db, dir) = open_db(
+    let (db, dir) = open_db(
         &state.s3,
         &state.config.bucket_name,
         &claims.team_id,

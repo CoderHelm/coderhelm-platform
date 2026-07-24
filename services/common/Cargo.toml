@@ -5,3 +5,8 @@ edition = "2021"
 
 [dependencies]
 sha2 = "0.10"
+# memlock: the shared memory fencing lock (worker runs + gateway deletes)
+aws-sdk-dynamodb = "1"
+chrono = "0.4"
+ulid = "1"
+tracing = "0.1"

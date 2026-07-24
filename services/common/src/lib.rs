@@ -1,5 +1,11 @@
 //! Logic shared between the gateway and worker services.
 
+/// Distributed fencing lock for a team+repo memory snapshot. Lives in common
+/// because BOTH writers must honor it: the worker's run-scoped memory open and
+/// the gateway's dashboard memory-delete (an unlocked delete raced a concurrent
+/// run's upload, silently resurrecting deleted memories).
+pub mod memlock;
+
 use sha2::{Digest, Sha256};
 
 /// Stable content hash for a ticket's context: title + body + image keys.

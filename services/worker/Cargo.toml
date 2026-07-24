@@ -41,10 +41,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Agent memory
-mentedb = { git = "https://github.com/nambok/mentedb.git", branch = "main" }
-mentedb-core = { git = "https://github.com/nambok/mentedb.git", branch = "main" }
-mentedb-embedding = { git = "https://github.com/nambok/mentedb.git", branch = "main" }
-mentedb-extraction = { git = "https://github.com/nambok/mentedb.git", branch = "main" }
+mentedb = { git = "https://github.com/nambok/mentedb.git", rev = "b4db4447d62384cf3b30153787295a70dae4a6a5" }
+mentedb-core = { git = "https://github.com/nambok/mentedb.git", rev = "b4db4447d62384cf3b30153787295a70dae4a6a5" }
+mentedb-embedding = { git = "https://github.com/nambok/mentedb.git", rev = "b4db4447d62384cf3b30153787295a70dae4a6a5" }
+mentedb-extraction = { git = "https://github.com/nambok/mentedb.git", rev = "b4db4447d62384cf3b30153787295a70dae4a6a5" }
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
 tar = "0.4"
