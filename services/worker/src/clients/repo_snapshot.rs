@@ -41,9 +41,29 @@ enum FileEntry {
     Unindexed,
 }
 
+/// Extensions worth flagging when oversized: a search miss on one of these is
+/// probably "the file wasn't indexed", not "the symbol doesn't exist". The
+/// motivating case is a 4MB generated `sanity.types.ts` (> MAX_FILE_BYTES) that
+/// search silently skips, so the agent searches a generated type in vain.
+const SEARCHABLE_EXTS: &[&str] = &[
+    "ts", "tsx", "js", "jsx", "mjs", "cjs", "json", "rs", "go", "py", "java", "kt", "rb", "php",
+    "cs", "swift", "css", "scss", "less", "html", "vue", "svelte", "graphql", "gql", "sql", "yaml",
+    "yml", "toml", "md",
+];
+
+fn is_searchable_ext(path: &str) -> bool {
+    path.rsplit_once('.')
+        .map(|(_, ext)| SEARCHABLE_EXTS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// Immutable-ish snapshot of a repo at a ref, with write mirroring.
 pub struct RepoSnapshot {
     files: RwLock<HashMap<String, FileEntry>>,
+    /// Paths of code/data files too large to index (content-searching skipped).
+    /// Surfaced by `search` so the agent reads them directly instead of
+    /// concluding the symbol is absent.
+    oversized: RwLock<Vec<String>>,
 }
 
 impl RepoSnapshot {
@@ -54,6 +74,7 @@ impl RepoSnapshot {
         let decoder = GzDecoder::new(bytes);
         let mut archive = Archive::new(decoder);
         let mut files = HashMap::new();
+        let mut oversized = Vec::new();
         let mut total_bytes = 0usize;
 
         for entry in archive.entries()? {
@@ -73,6 +94,11 @@ impl RepoSnapshot {
             }
             let size = entry.header().size()? as usize;
             if size > MAX_FILE_BYTES || total_bytes + size > MAX_TOTAL_BYTES {
+                // A large code/data file (e.g. generated types) isn't searched —
+                // remember it so `search` can point the agent at read_file.
+                if size > MAX_FILE_BYTES && is_searchable_ext(&rel) {
+                    oversized.push(rel.clone());
+                }
                 files.insert(rel, FileEntry::Unindexed);
                 continue;
             }
@@ -89,8 +115,10 @@ impl RepoSnapshot {
             }
         }
 
+        oversized.sort();
         Ok(Self {
             files: RwLock::new(files),
+            oversized: RwLock::new(oversized),
         })
     }
 
@@ -191,23 +219,47 @@ impl RepoSnapshot {
                 }
             }
         }
+
+        // Surface large code/data files that weren't content-searched, so a miss
+        // reads as "not indexed" (read_file it) rather than "symbol absent".
+        let oversized = self.oversized.read().await;
+        if !oversized.is_empty() {
+            let listed: Vec<String> = oversized.iter().take(10).cloned().collect();
+            let more = oversized.len().saturating_sub(listed.len());
+            let mut note = format!(
+                "NOTE: {} large file(s) were NOT content-searched (too big to index). If you \
+                 expected a match in one, use read_file / read_file_lines to read it directly: {}",
+                oversized.len(),
+                listed.join(", ")
+            );
+            if more > 0 {
+                note.push_str(&format!(" (+{more} more)"));
+            }
+            results.push(SnapshotMatch {
+                path: "(unsearched large files)".to_string(),
+                fragments: vec![note],
+            });
+        }
         results
     }
 
     /// Mirror a write that was committed through the GitHub API.
     pub async fn apply_write(&self, path: &str, content: &str) {
-        self.files.write().await.insert(
-            path.trim_start_matches('/').to_string(),
-            FileEntry::Text(content.to_string()),
-        );
+        let key = path.trim_start_matches('/').to_string();
+        // A file rewritten through the API is now held as text and searchable,
+        // so drop any stale "oversized/unsearched" flag for it.
+        self.oversized.write().await.retain(|p| p != &key);
+        self.files
+            .write()
+            .await
+            .insert(key, FileEntry::Text(content.to_string()));
     }
 
     /// Mirror a delete that was committed through the GitHub API.
     pub async fn apply_delete(&self, path: &str) {
-        self.files
-            .write()
-            .await
-            .remove(path.trim_start_matches('/'));
+        let key = path.trim_start_matches('/').to_string();
+        self.oversized.write().await.retain(|p| p != &key);
+        self.files.write().await.remove(&key);
     }
 }
 
@@ -276,5 +328,37 @@ mod tests {
         snap.apply_delete("src/other.ts").await;
         assert!(snap.read_file("src/other.ts").await.is_none());
         assert_eq!(snap.tree().await, vec!["README.md", "src/filter.ts"]);
+    }
+
+    #[tokio::test]
+    async fn oversized_text_file_is_surfaced_in_search() {
+        // A >512KB .ts file (like a generated sanity.types.ts) is not indexed;
+        // search must still tell the agent it exists so it reads it directly.
+        let big = format!("export type Generated = {};\n", "x".repeat(600 * 1024));
+        let tarball = make_tarball(&[
+            ("src/app.ts", "import { thing } from './x';\n"),
+            ("src/lib/sanity.types.ts", &big),
+            ("assets/logo.bin", &"0".repeat(600 * 1024)), // oversized but not searchable ext
+        ]);
+        let snap = RepoSnapshot::from_tarball(&tarball).unwrap();
+
+        // Searching a generated type returns the "unsearched large files" note
+        // (which names the .ts, not the .bin).
+        let hits = snap.search("Generated").await;
+        let note = hits.iter().find(|m| m.path == "(unsearched large files)");
+        assert!(note.is_some(), "expected an unsearched-large-files note");
+        let text = &note.unwrap().fragments[0];
+        assert!(text.contains("src/lib/sanity.types.ts"));
+        assert!(!text.contains("logo.bin")); // non-code ext not flagged
+
+        // After the file is rewritten via the API it's indexed — no stale note.
+        snap.apply_write(
+            "src/lib/sanity.types.ts",
+            "export type Generated = number;\n",
+        )
+        .await;
+        let hits = snap.search("Generated").await;
+        assert!(hits.iter().all(|m| m.path != "(unsearched large files)"));
+        assert!(hits.iter().any(|m| m.path == "src/lib/sanity.types.ts"));
     }
 }

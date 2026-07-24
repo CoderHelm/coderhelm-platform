@@ -606,7 +606,7 @@ fn all_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "search_code".to_string(),
-            description: "Search for code in the repository by keyword or symbol name. Returns matching file paths and text fragments. Use this to find where functions, types, or patterns are defined instead of reading many files.".to_string(),
+            description: "Search for code in the repository by keyword or symbol name. Returns matching file paths and text fragments. Use this to find where functions, types, or patterns are defined instead of reading many files. Very large files (e.g. generated types like sanity.types.ts) are NOT content-indexed — search results end with a note listing them; read those directly with read_file rather than assuming the symbol is absent.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -642,7 +642,7 @@ fn all_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "edit_file".to_string(),
-            description: "Make targeted edits to an existing file using search/replace. Sends only the changed parts — use this instead of write_file for modifications. Each edit replaces one occurrence of old_text with new_text.".to_string(),
+            description: "Make targeted edits to an existing file using search/replace. Sends only the changed parts — use this instead of write_file for modifications. Each edit replaces one occurrence of old_text with new_text. old_text must match the file EXACTLY (whitespace, quotes, commas) — a sloppy match can drop a line. For files with JSON, template literals, or heavy special characters, or when an edit call keeps failing, prefer write_file to rewrite the whole file instead.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1057,7 +1057,11 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                         "NO edits applied to {path} — all edits in one call must succeed \
                          atomically, and {} failed: {}. Re-read the current file content \
                          and retry with corrected old_text (remember earlier edits in the \
-                         same call change the text later edits must match).",
+                         same call change the text later edits must match). If edits keep \
+                         failing here — common with JSON, template literals, or other \
+                         special-character content, or when batching several edits — STOP \
+                         retrying edit_file and use write_file to rewrite the whole file with \
+                         the complete corrected content instead.",
                         errors.len(),
                         errors.join("; ")
                     )));

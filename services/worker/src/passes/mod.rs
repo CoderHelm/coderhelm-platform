@@ -3829,6 +3829,8 @@ pub(crate) async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<
             .to_string(),
         "UI work must look right on mobile AND desktop. When a design shows different structures per breakpoint (element order, a separate mobile header/trigger, stacked vs inline), build distinct per-breakpoint structures (e.g. `md:hidden` + `hidden md:flex`) — never one structure with only responsive class tweaks — and match per-breakpoint sizing (full-width buttons, taller tap targets on mobile)."
             .to_string(),
+        "Use the right editing tool. edit_file needs old_text to match EXACTLY; a sloppy match silently drops lines (e.g. an array element). For JSON, template literals, or heavy special characters, or when an edit_file call fails more than once on a file, switch to write_file and rewrite the whole file with complete content. Very large generated files (e.g. sanity.types.ts) are not indexed by search_code — read them directly with read_file instead of concluding a type is missing."
+            .to_string(),
     ];
 
     // Load global rules
