@@ -338,9 +338,17 @@ impl GitHubClient {
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}");
         let data = self.get(&url).await?;
-        Ok(data
-            .get("files")
-            .and_then(|f| f.as_array())
+        let files = data.get("files").and_then(|f| f.as_array());
+        // Pagination fail-safe: the compare API returns at most 300 files in one
+        // page. At the cap the list may be truncated, so a changed path beyond
+        // it would be missed and its file silently reverted. Signal the caller
+        // (which treats an error as "all paths conflict") rather than under-report.
+        if files.map(|a| a.len()).unwrap_or(0) >= 300 {
+            return Err(
+                "compare file list truncated (>=300 files) — cannot verify write freshness".into(),
+            );
+        }
+        Ok(files
             .map(|files| {
                 files
                     .iter()
@@ -481,6 +489,24 @@ impl GitHubClient {
                 return Ok(content);
             }
         }
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        let data = self.get(&url).await?;
+        let content = data.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let clean = content.replace('\n', "");
+        let bytes = B64.decode(&clean)?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    /// Read a file straight from the LIVE API, bypassing the snapshot cache.
+    /// Used where staleness is dangerous — the 409 reconcile must compare
+    /// against what is ACTUALLY on the branch, not our (possibly stale) mirror.
+    async fn read_file_live(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
         let data = self.get(&url).await?;
         let content = data.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -720,6 +746,28 @@ impl GitHubClient {
                 let compare_url =
                     format!("{API_BASE}/repos/{owner}/{repo}/compare/{base_sha}...{branch_sha}");
                 let cmp = self.get(&compare_url).await?;
+                // Pagination fail-safe: the compare API returns at most 250
+                // commits in one page. If the branch has more, a user commit
+                // beyond the page would go undetected and the force-squash would
+                // erase it — so any truncation means skip the squash.
+                let total_commits = cmp
+                    .get("total_commits")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let returned_commits = cmp
+                    .get("commits")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if total_commits as usize > returned_commits || returned_commits >= 250 {
+                    tracing::warn!(
+                        branch,
+                        total_commits,
+                        returned_commits,
+                        "skipping squash: too many commits to verify authorship (compare pagination) — preserving history"
+                    );
+                    return Ok(());
+                }
                 let foreign: Vec<String> = cmp
                     .get("commits")
                     .and_then(|c| c.as_array())
@@ -951,7 +999,11 @@ impl GitHubClient {
             }
             if (status == 409 || status == 422) && !retried {
                 retried = true;
-                let current_content = self.read_file(owner, repo, path, branch).await;
+                // Compare against LIVE content, not the snapshot — a snapshot
+                // read here returns our own mirrored body and would falsely
+                // "reconcile" (re-PUT) over a user's concurrent push, reverting
+                // it. Only truly-idempotent replays (live == intended) proceed.
+                let current_content = self.read_file_live(owner, repo, path, branch).await;
                 let current_sha = self.get_file_sha(owner, repo, path, branch).await;
                 match (current_content, current_sha) {
                     (Ok(cc), Ok(cs)) if cc == content => {

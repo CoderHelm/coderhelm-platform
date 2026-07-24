@@ -225,6 +225,45 @@ pub async fn run(
         }
     }
 
+    // ONE PLATFORM WRITER PER RUN: take the writer slot NOW — before ANY branch
+    // write, including the squash / mark-ready fast-paths below (wall-clock cap,
+    // missed-webhook CI pass) which call squash_branch, a force-push. Acquiring
+    // it here (not just before the status claim) means a slot held by an
+    // in-flight feedback pass defers this resume via SQS redelivery instead of
+    // squashing away its concurrent commit. Held to the end of the invocation;
+    // the guard releases on every exit path (Drop), TTL as the crash backstop.
+    let writer_holder = format!(
+        "resume#{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let mut writer_guard = None;
+    for attempt in 0..5u32 {
+        writer_guard = crate::passes::acquire_run_writer_guard(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            &writer_holder,
+        )
+        .await;
+        if writer_guard.is_some() {
+            break;
+        }
+        info!(
+            run_id = msg.run_id,
+            attempt, "run writer slot busy — waiting"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+    }
+    let _writer_guard = match writer_guard {
+        Some(g) => g,
+        None => {
+            return Err(
+                "run writer slot busy (another pass is writing this branch) — deferring via SQS redelivery"
+                    .into(),
+            )
+        }
+    };
+
     // Parse created_at for wall-clock duration (spans multiple Lambda invocations)
     let created_at = run_record
         .get("created_at")
@@ -503,41 +542,8 @@ pub async fn run(
         .cloned()
         .unwrap_or_else(|| "main".to_string());
 
-    // ONE PLATFORM WRITER PER RUN: take the writer slot BEFORE the status
-    // claim so a slot held by an in-flight feedback pass defers this resume
-    // via SQS redelivery without wedging the run's status. The guard releases
-    // on every exit path (Drop), with the slot TTL as the crash backstop.
-    let writer_holder = format!(
-        "resume#{}",
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let mut writer_guard = None;
-    for attempt in 0..5u32 {
-        writer_guard = crate::passes::acquire_run_writer_guard(
-            state,
-            &msg.team_id,
-            &msg.run_id,
-            &writer_holder,
-        )
-        .await;
-        if writer_guard.is_some() {
-            break;
-        }
-        info!(
-            run_id = msg.run_id,
-            attempt, "run writer slot busy — waiting"
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-    }
-    let _writer_guard = match writer_guard {
-        Some(g) => g,
-        None => {
-            return Err(
-                "run writer slot busy (another pass is writing this branch) — deferring via SQS redelivery"
-                    .into(),
-            )
-        }
-    };
+    // (writer slot already held — acquired right after the awaiting_ci gate so
+    // it also covers the squash fast-paths above.)
 
     // Atomically claim this run: transition awaiting_ci → running.
     // If another Resume Lambda already claimed it, this fails and we exit.

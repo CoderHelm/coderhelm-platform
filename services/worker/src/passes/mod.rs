@@ -222,7 +222,9 @@ impl Drop for RunWriterGuard {
         let team_id = self.team_id.clone();
         let run_id = self.run_id.clone();
         let holder = self.holder.clone();
-        tokio::spawn(async move {
+        // Release only OUR slot (holder-guarded) so a late release can never
+        // steal a successor's slot.
+        let release = async move {
             let _ = dynamo
                 .update_item()
                 .table_name(&table)
@@ -234,7 +236,22 @@ impl Drop for RunWriterGuard {
                 .expression_attribute_values(":h", attr_s(&holder))
                 .send()
                 .await;
-        });
+        };
+        // Drive the release to completion SYNCHRONOUSLY. A bare tokio::spawn
+        // here is unreliable on Lambda: the execution environment freezes the
+        // instant the handler future resolves, so a detached release task
+        // typically never runs and the slot then sits until its TTL (~17 min),
+        // stalling the next writer on the run. `#[tokio::main]` gives a
+        // multi-thread runtime, so block_in_place lets us block this worker on
+        // the release (without wedging the scheduler) so it lands before we
+        // return. Falls back to spawn only if dropped outside a runtime
+        // (best-effort; TTL still backstops).
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(move || handle.block_on(release)),
+            Err(_) => {
+                tokio::spawn(release);
+            }
+        }
     }
 }
 
