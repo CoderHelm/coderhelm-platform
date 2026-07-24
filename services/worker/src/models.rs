@@ -25,6 +25,7 @@ pub struct Config {
     pub mcp_proxy_function_name: String,
     pub ci_fix_queue_url: String,
     pub ticket_queue_url: String,
+    pub feedback_queue_url: String,
     /// Execution sandbox: S3 bucket for transient source tarballs and the
     /// CodeBuild project that runs the repo's real build/lint/tests. Both empty
     /// => sandbox disabled (the agent falls back to blind CI, never worse).
@@ -66,6 +67,7 @@ impl Config {
             mcp_proxy_function_name: std::env::var("MCP_PROXY_FUNCTION_NAME").unwrap_or_default(),
             ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").unwrap_or_default(),
             ticket_queue_url: std::env::var("TICKET_QUEUE_URL").unwrap_or_default(),
+            feedback_queue_url: std::env::var("FEEDBACK_QUEUE_URL").unwrap_or_default(),
             sandbox_bucket_name: std::env::var("SANDBOX_BUCKET_NAME").unwrap_or_default(),
             sandbox_project_name: std::env::var("SANDBOX_PROJECT_NAME").unwrap_or_default(),
         }
@@ -210,6 +212,11 @@ pub struct FeedbackMessage {
     pub review_id: u64,
     pub review_body: String,
     pub comments: Vec<ReviewComment>,
+    /// How many times this feedback has been re-enqueued because the per-run
+    /// writer slot was busy. Absent on messages from the gateway (defaults to 0);
+    /// bounds the defer loop so a wedged slot can't churn indefinitely.
+    #[serde(default)]
+    pub defer_count: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -335,10 +342,27 @@ mod tests {
                 node_id: None,
                 is_context: false,
             }],
+            defer_count: 2,
         });
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, WorkerMessage::Feedback(_)));
+        match parsed {
+            WorkerMessage::Feedback(f) => assert_eq!(f.defer_count, 2),
+            _ => panic!("expected feedback"),
+        }
+    }
+
+    #[test]
+    fn feedback_message_defaults_defer_count_when_absent() {
+        // Messages from the gateway carry no defer_count — it must default to 0.
+        let json = r#"{"type":"feedback","team_id":"TEAM#1","installation_id":1,
+            "run_id":"r","repo_owner":"o","repo_name":"n","pr_number":1,
+            "review_id":1,"review_body":"","comments":[]}"#;
+        let parsed: WorkerMessage = serde_json::from_str(json).unwrap();
+        match parsed {
+            WorkerMessage::Feedback(f) => assert_eq!(f.defer_count, 0),
+            _ => panic!("expected feedback"),
+        }
     }
 
     #[test]

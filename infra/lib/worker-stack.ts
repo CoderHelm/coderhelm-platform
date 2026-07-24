@@ -99,6 +99,7 @@ export class WorkerStack extends cdk.Stack {
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
         CI_FIX_QUEUE_URL: props.ciFixQueue.queueUrl,
         TICKET_QUEUE_URL: props.ticketQueue.queueUrl,
+        FEEDBACK_QUEUE_URL: props.feedbackQueue.queueUrl,
         RUST_LOG: "info",
       },
     });
@@ -171,6 +172,10 @@ export class WorkerStack extends cdk.Stack {
 
     // Worker needs to re-trigger tickets (e.g. wrong-repo re-routing)
     props.ticketQueue.grantSendMessages(this.workerFunction);
+
+    // Worker needs to defer feedback back onto the feedback queue when it loses
+    // the per-run writer-slot race (delayed re-enqueue instead of failing the run)
+    props.feedbackQueue.grantSendMessages(this.workerFunction);
 
     this.workerFunction.addEventSource(
       new eventsources.SqsEventSource(props.feedbackQueue, {

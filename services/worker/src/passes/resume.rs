@@ -229,7 +229,7 @@ pub async fn run(
     // write, including the squash / mark-ready fast-paths below (wall-clock cap,
     // missed-webhook CI pass) which call squash_branch, a force-push. Acquiring
     // it here (not just before the status claim) means a slot held by an
-    // in-flight feedback pass defers this resume via SQS redelivery instead of
+    // in-flight feedback pass defers this resume (delayed re-enqueue) instead of
     // squashing away its concurrent commit. Held to the end of the invocation;
     // the guard releases on every exit path (Drop), TTL as the crash backstop.
     let writer_holder = format!(
@@ -257,10 +257,18 @@ pub async fn run(
     let _writer_guard = match writer_guard {
         Some(g) => g,
         None => {
-            return Err(
-                "run writer slot busy (another pass is writing this branch) — deferring via SQS redelivery"
-                    .into(),
-            )
+            // Another pass (an in-flight feedback or a concurrent resume) holds the
+            // per-run writer slot. This is a TRANSIENT condition under the per-run
+            // lock, NOT a failure — re-enqueue this resume with a short delay so it
+            // retries once the holder releases the slot (or its TTL frees it).
+            // Returning Err here would mark the run failed (the SQS handler acks the
+            // message either way, so it is never actually redelivered on its own).
+            info!(
+                run_id = msg.run_id,
+                "run writer slot busy — deferring resume via delayed re-enqueue"
+            );
+            send_delayed_resume(state, &msg, 120).await;
+            return Ok(());
         }
     };
 
