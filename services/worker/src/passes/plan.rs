@@ -650,6 +650,49 @@ pub async fn fetch_team_repos(state: &WorkerState, team_id: &str) -> Vec<String>
     }
 }
 
+/// Fetch human-assigned repo roles (repo_name → role) for a team. Only repos
+/// that have a role set are returned. Used by Jira repo selection to resolve
+/// ambiguous tickets to the team's designated repo for that domain.
+pub async fn fetch_team_repo_roles(
+    state: &WorkerState,
+    team_id: &str,
+) -> std::collections::HashMap<String, String> {
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.repos_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(
+            ":pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
+        )
+        .expression_attribute_values(
+            ":prefix",
+            aws_sdk_dynamodb::types::AttributeValue::S("REPO#".to_string()),
+        )
+        .send()
+        .await;
+
+    match result {
+        Ok(output) => output
+            .items()
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("repo_name").and_then(|v| v.as_s().ok())?;
+                let role = item
+                    .get("role")
+                    .and_then(|v| v.as_s().ok())
+                    .filter(|s| !s.is_empty())?;
+                Some((name.clone(), role.clone()))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to fetch repo roles");
+            std::collections::HashMap::new()
+        }
+    }
+}
+
 // ─── Combined tool executor (read-only + MCP) ──────────────
 
 struct CombinedToolExecutor<'a> {

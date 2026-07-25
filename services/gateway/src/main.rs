@@ -124,6 +124,7 @@ async fn main() -> Result<(), Error> {
             "/repos/:owner/:name/regenerate",
             post(routes::api::regenerate_repo),
         )
+        .route("/repos/:owner/:name/role", post(routes::api::set_repo_role))
         .route(
             "/integrations/jira/check",
             get(routes::api::get_jira_integration_check)

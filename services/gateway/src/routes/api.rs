@@ -1450,6 +1450,7 @@ pub async fn list_repos(
                 "ticket_source": item.get("ticket_source").and_then(|v| v.as_s().ok()),
                 "onboard_status": item.get("onboard_status").and_then(|v| v.as_s().ok()),
                 "onboard_error": item.get("onboard_error").and_then(|v| v.as_s().ok()),
+                "role": item.get("role").and_then(|v| v.as_s().ok()),
             }))
         })
         .collect();
@@ -2489,6 +2490,54 @@ pub async fn validate_jira_integration_payload(
             "Fix missing fields above and run this check again."
         }
     })))
+}
+
+/// Valid repo role designations. A repo's role tells the Jira repo-selector which
+/// repo owns a domain, so an ambiguous ticket (e.g. a Tailwind change matching two
+/// frontends) resolves to the team's designated repo instead of an LLM guess.
+pub const VALID_REPO_ROLES: &[&str] = &["web", "backend", "mobile", "cms", "infra", "data"];
+
+/// POST /api/repos/:owner/:name/role — set (or clear, with "") a repo's role.
+pub async fn set_repo_role(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
+    let repo = format!("{owner}/{name}");
+    validate_repo_name(&repo)?;
+    let role = body["role"].as_str().unwrap_or("").trim().to_lowercase();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let base = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.repos_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&format!("REPO#{repo}")))
+        // Only designate a repo that exists (was synced) — never mint a stub.
+        .condition_expression("attribute_exists(sk)")
+        .expression_attribute_names("#role", "role")
+        .expression_attribute_values(":ua", attr_s(&now));
+
+    let update = if role.is_empty() {
+        base.update_expression("SET updated_at = :ua REMOVE #role")
+    } else {
+        if !VALID_REPO_ROLES.contains(&role.as_str()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        base.update_expression("SET #role = :role, updated_at = :ua")
+            .expression_attribute_values(":role", attr_s(&role))
+    };
+
+    update.send().await.map_err(|e| {
+        error!("Failed to set repo role for {repo}: {e}");
+        // ConditionalCheckFailed (unknown repo) is a client error.
+        StatusCode::BAD_REQUEST
+    })?;
+
+    Ok(StatusCode::OK)
 }
 
 /// POST /api/repos/:owner/:name — update repo config.
