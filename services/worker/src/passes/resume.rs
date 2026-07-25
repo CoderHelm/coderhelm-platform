@@ -37,15 +37,33 @@ fn stable_hash(s: &str) -> u64 {
 /// Extracts error lines, normalizes whitespace, sorts + dedupes, then hashes the
 /// set — so log timestamps and ordering don't perturb it.
 fn ci_failure_signature(logs: &str) -> String {
+    // GitHub Actions prefixes EVERY log line with an ISO-8601 timestamp
+    // ("2026-07-24T22:01:03.202Z  <content>"). Strip it per line so (a) the
+    // anchored ESLint matcher below sees the real content and (b) the captured
+    // lines don't drift by timestamp every cycle — that drift is exactly what
+    // defeated stall detection and let the fix loop churn to the wall clock.
+    let ts = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s*").ok();
+    // ESLint "stylish" output: a line like `12:5  error  '_' is unused`. Repos
+    // that run `--max-warnings 0` fail CI on `warning` lines too. Without this,
+    // lint failures matched none of the substring patterns below and fell
+    // through to the drifting tail hash.
+    let eslint = regex::Regex::new(r"^\d+:\d+\s+(error|warning)\b").ok();
     let mut errs: Vec<String> = logs
         .lines()
-        .map(|l| l.trim())
+        .map(|l| {
+            let l = l.trim();
+            match &ts {
+                Some(re) => re.replace(l, "").into_owned(),
+                None => l.to_string(),
+            }
+        })
         .filter(|l| {
             let low = l.to_ascii_lowercase();
             low.contains("error ts")
                 || low.contains(": error")
                 || low.starts_with("error:")
                 || low.contains("failed with exit")
+                || eslint.as_ref().is_some_and(|re| re.is_match(&low))
         })
         .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect();
@@ -104,6 +122,36 @@ mod stall_tests {
     fn progress_resets_the_counter() {
         // errors changed → not stalled, count resets even if it was high.
         assert_eq!(stall_decision("SIG_A", 5, "SIG_B"), (0, false));
+    }
+
+    #[test]
+    fn eslint_failures_are_recognized_and_stable() {
+        // The 01KYAZ failure mode: speedboat CI fails on pre-existing ESLint
+        // warnings-as-errors. Real GitHub Actions logs prefix EVERY line with an
+        // ISO timestamp (which differs every cycle) — the signature must strip it
+        // so the same two lint findings hash identically across cycles and stall
+        // detection fires instead of churning to the wall-clock timeout.
+        let a = "2026-07-24T22:01:03.202Z ./src/services/schoolBreakCampService.ts\n\
+                 2026-07-24T22:01:03.210Z   12:5  error  '_' is defined but never used  @typescript-eslint/no-unused-vars\n\
+                 2026-07-24T22:01:03.400Z ::group::lint\n\
+                 2026-07-24T22:01:03.999Z   8:10  warning  Unexpected ternary  no-ternary";
+        let b = "2026-07-24T23:59:59.111Z ./src/services/schoolBreakCampService.ts\n\
+                 2026-07-24T23:59:59.222Z   8:10  warning  Unexpected ternary  no-ternary\n\
+                 2026-07-24T23:59:59.333Z   12:5  error  '_' is defined but never used  @typescript-eslint/no-unused-vars";
+        let sig_a = ci_failure_signature(a);
+        assert_eq!(
+            sig_a,
+            ci_failure_signature(b),
+            "same lint failures (differing timestamps) must hash identically"
+        );
+        // And it must not collapse to the drifting tail-hash fallback: a log with
+        // no recognized error/warning lines hashes differently.
+        assert_ne!(
+            sig_a,
+            ci_failure_signature(
+                "2026-07-24T22:01:03.202Z just some\n2026-07-24T22:01:03.500Z random output"
+            )
+        );
     }
 }
 
@@ -742,6 +790,11 @@ pub async fn run(
                 "Automated fixes stalled on the same failure (no progress) — handed off for human review.",
             )
             .await;
+            // mark_pr_ready squashes the branch (while the PR is still a draft)
+            // before un-drafting, so the placeholder→revert→refix churn collapses
+            // into one clean commit here — no separate squash needed. The churn
+            // only ever leaked before because a stall-blind run timed out and
+            // never reached this handoff.
             mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
             complete_run_with_status(
                 state,
