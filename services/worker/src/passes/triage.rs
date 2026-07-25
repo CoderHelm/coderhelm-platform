@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::agent::provider::ModelProvider;
 use crate::agent::{llm, provider};
@@ -176,8 +176,70 @@ impl llm::ToolExecutor for NoOpExecutor {
     }
 }
 
-/// Select the best repo for a Jira ticket when no explicit repo mapping is provided.
-/// Uses LLM to match ticket content to the right repo based on descriptions and context.
+/// Extract distinctive, code-like identifiers from a ticket that are likely to
+/// appear verbatim in the target repo's source: filenames, kebab-case tokens
+/// (`tracking-tighter`), camelCase (`letterSpacing`), PascalCase (`ClassRow`),
+/// and snake_case. These ground repo selection in WHERE the relevant code
+/// actually lives — repo descriptions alone mis-route generic tickets (a
+/// "Tailwind tracking-tighter" change has no repo hint in its prose).
+///
+/// Most-distinctive patterns first; capped so the caller bounds its searches.
+pub(crate) fn extract_ticket_search_terms(title: &str, body: &str) -> Vec<String> {
+    use regex::Regex;
+    let text = format!("{title}\n{body}");
+    let patterns = [
+        // filenames with a code-ish extension
+        r"[A-Za-z0-9_.-]+\.(?:tsx?|jsx?|mjs|cjs|css|scss|less|json|rs|py|go|rb|java|kt|ya?ml|toml|graphql|prisma|sql)\b",
+        // kebab-case (tracking-tighter, letter-spacing)
+        r"\b[a-z][a-z0-9]*(?:-[a-z0-9]+)+\b",
+        // camelCase (letterSpacing, mapClassRow)
+        r"\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]+)+\b",
+        // PascalCase (ClassRow, GroupCard)
+        r"\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b",
+        // snake_case (school_break_camp)
+        r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b",
+    ];
+    // Hyphenated English that is not a code identifier — harmless to search but
+    // wastes a slot, so drop the obvious ones.
+    const STOP: &[&str] = &[
+        "step-by-step",
+        "out-of-scope",
+        "opt-in",
+        "opt-out",
+        "day-to-day",
+        "up-to-date",
+        "e-g",
+        "what-why",
+    ];
+    let mut seen = std::collections::HashSet::new();
+    let mut terms = Vec::new();
+    for pat in patterns {
+        let Ok(re) = Regex::new(pat) else { continue };
+        for m in re.find_iter(&text) {
+            let t = m
+                .as_str()
+                .trim_matches(|c: char| c == '.' || c == '-' || c == '_');
+            if t.len() < 4 {
+                continue;
+            }
+            let key = t.to_lowercase();
+            if STOP.contains(&key.as_str()) {
+                continue;
+            }
+            if seen.insert(key) {
+                terms.push(t.to_string());
+            }
+        }
+    }
+    terms.truncate(6);
+    terms
+}
+
+/// Select the best repo for a Jira ticket when no explicit project→repo mapping
+/// exists. Grounds the choice in CODE EVIDENCE — searches each candidate repo for
+/// the ticket's identifiers (`extract_ticket_search_terms`) and short-circuits to
+/// a uniquely-matching repo; otherwise asks the LLM with that evidence in hand,
+/// falling back to repo descriptions only when nothing matched.
 pub async fn select_repo(
     state: &WorkerState,
     msg: &TicketMessage,
@@ -234,6 +296,106 @@ pub async fn select_repo(
     }
     let repo_list = repo_lines.join("\n");
 
+    // Ground the choice in CODE EVIDENCE: search each candidate repo for the
+    // ticket's distinctive identifiers and see where they actually live. This is
+    // what makes selection "smart" — descriptions mislead on generic tickets, but
+    // the repo that literally contains `tracking-tighter` / `ClassRow` is almost
+    // always the right one. `search_code` uses an in-memory snapshot (no rate
+    // limit; large repos fall back to the Code Search API), so this is bounded.
+    let search_terms = extract_ticket_search_terms(&msg.title, &msg.body);
+    let probe_terms: Vec<String> = search_terms.iter().take(4).cloned().collect();
+    let mut evidence_lines: Vec<String> = Vec::new();
+    // (repo, distinct terms matched, total files matched)
+    let mut repo_scores: Vec<(String, usize, usize)> = Vec::new();
+    let mut searches_attempted = 0usize;
+    let mut searches_failed = 0usize;
+    // Bound the fan-out: only probe when we have terms and a sane repo count.
+    if !probe_terms.is_empty() && repos.len() <= 10 {
+        for r in repos {
+            let Some((owner, name)) = r.split_once('/') else {
+                continue;
+            };
+            // Search the repo's DEFAULT branch. search_code snapshots by git ref,
+            // and "HEAD" does NOT resolve for the snapshot's ref lookup (it 404s
+            // and silently falls back to the rate-limited Code Search API), so
+            // resolve the real branch first to stay on the fast, un-rate-limited
+            // snapshot path.
+            let branch = github
+                .get_default_branch(owner, name)
+                .await
+                .unwrap_or_else(|_| "main".to_string());
+            let mut matched: Vec<String> = Vec::new();
+            let mut total_files = 0usize;
+            for term in &probe_terms {
+                searches_attempted += 1;
+                match github.search_code(owner, name, &branch, term).await {
+                    Ok(hits) => {
+                        if !hits.is_empty() {
+                            matched.push(format!("{term} ({})", hits.len()));
+                            total_files += hits.len();
+                        }
+                    }
+                    Err(e) => {
+                        searches_failed += 1;
+                        warn!(repo = %r, term = %term, error = %e, "code-evidence search failed");
+                    }
+                }
+            }
+            evidence_lines.push(if matched.is_empty() {
+                format!("- {r} — no matches")
+            } else {
+                format!("- {r} — matched: {}", matched.join(", "))
+            });
+            repo_scores.push((r.clone(), matched.len(), total_files));
+        }
+
+        // If searches failed systemically (rate-limit / network), the "no
+        // matches" lines are unreliable — drop the evidence rather than mislead
+        // the picker or short-circuit on corrupted data.
+        if searches_attempted > 0 && searches_failed * 2 >= searches_attempted {
+            warn!(
+                searches_attempted,
+                searches_failed, "code-evidence unreliable — using descriptions only"
+            );
+            evidence_lines.clear();
+            repo_scores.clear();
+        }
+
+        // Deterministic short-circuit ONLY on strong evidence: one repo uniquely
+        // matched at least TWO distinct identifiers. A single generic token
+        // matching one repo is too weak to bypass the LLM (it could be the very
+        // mis-route we're preventing) — that case falls through to the LLM with
+        // the evidence in hand.
+        let max_terms = repo_scores.iter().map(|(_, m, _)| *m).max().unwrap_or(0);
+        if max_terms >= 2 {
+            let leaders: Vec<&(String, usize, usize)> = repo_scores
+                .iter()
+                .filter(|(_, m, _)| *m == max_terms)
+                .collect();
+            if leaders.len() == 1 {
+                let repo = leaders[0].0.clone();
+                info!(
+                    repo = %repo,
+                    terms = ?probe_terms,
+                    matched = max_terms,
+                    files = leaders[0].2,
+                    "Repo selected by code evidence (unique strong match)"
+                );
+                return Ok(repo);
+            }
+        }
+    }
+    let evidence_section = if evidence_lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## Code evidence — where the ticket's identifiers actually appear\n{}\n\
+             STRONGLY prefer the repo with concrete code matches above; fall back to \
+             descriptions only when no repo matched.\n",
+            evidence_lines.join("\n")
+        )
+    };
+
     let global_agents = super::load_content(state, &msg.team_id, "AGENTS#GLOBAL").await;
 
     let context_section = if global_agents.is_empty() {
@@ -254,10 +416,10 @@ Description:
 {context_section}
 ## Available repositories
 {repo_list}
-
+{evidence_section}
 Think step by step:
 1. What is this ticket about? (one sentence)
-2. Which repo owns that feature area based on the descriptions above?
+2. Which repo owns that feature area? Weigh the CODE EVIDENCE above (which repo actually contains the ticket's identifiers) ABOVE the repo descriptions.
 3. Why is it NOT any of the other repos?
 
 Then on the LAST line, return ONLY the repository in `owner/name` format."#,
@@ -352,7 +514,38 @@ fn extract_repo_choice(response: &str, repos: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_repo_choice;
+    use super::{extract_repo_choice, extract_ticket_search_terms};
+
+    #[test]
+    fn extracts_distinctive_identifiers() {
+        // CPM-7881: the Tailwind token ticket that mis-routed. The kebab tokens
+        // are the signal that would find the repo containing them.
+        let terms = extract_ticket_search_terms(
+            "Override Tailwind \"tighter\" letter-spacing token",
+            "Override the token so tracking-tighter renders at -.0333em everywhere, \
+             not the default -0.05em. Other letter-spacing tokens unchanged.",
+        );
+        assert!(
+            terms.iter().any(|t| t == "tracking-tighter"),
+            "got {terms:?}"
+        );
+        assert!(terms.iter().any(|t| t == "letter-spacing"), "got {terms:?}");
+
+        // CPM-7838: PascalCase component names are the signal.
+        let terms = extract_ticket_search_terms(
+            "render ClassRow tags as styled badges to match GroupCard",
+            "Style the tags in ClassRow to match the badges in GroupCard.",
+        );
+        assert!(terms.iter().any(|t| t == "ClassRow"), "got {terms:?}");
+        assert!(terms.iter().any(|t| t == "GroupCard"), "got {terms:?}");
+
+        // A prose-only ticket yields no code identifiers (falls back to the LLM).
+        let terms = extract_ticket_search_terms(
+            "Improve the checkout experience",
+            "Users are confused by the flow. Make it clearer and faster.",
+        );
+        assert!(terms.is_empty(), "expected no code terms, got {terms:?}");
+    }
 
     #[test]
     fn repo_choice_parsing() {
