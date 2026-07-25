@@ -396,6 +396,33 @@ pub async fn select_repo(
         )
     };
 
+    // Human-assigned repo roles are the AUTHORITATIVE tiebreak for ambiguous
+    // tickets (e.g. two frontends that both use Tailwind): the team designates
+    // which repo owns each domain, so selection follows that instead of guessing
+    // from auto-generated descriptions.
+    let roles = crate::passes::plan::fetch_team_repo_roles(state, &msg.team_id).await;
+    let roles_section = {
+        let mut lines: Vec<String> = repos
+            .iter()
+            .filter_map(|r| roles.get(r).map(|role| format!("- {r} → {role}")))
+            .collect();
+        lines.sort();
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n## Repo roles (human-assigned — AUTHORITATIVE)\n{}\n\
+                 Meanings: web=primary web frontend, backend=primary API/backend, \
+                 mobile=mobile app, cms=content/CMS, infra=infrastructure, data=data/ETL.\n\
+                 These roles OVERRIDE repo descriptions and incidental code matches — a human set \
+                 them to resolve exactly the cases where several repos could match. Classify the \
+                 ticket's domain and pick the repo whose role matches it, unless the ticket \
+                 explicitly names a different repo.\n",
+                lines.join("\n")
+            )
+        }
+    };
+
     let global_agents = super::load_content(state, &msg.team_id, "AGENTS#GLOBAL").await;
 
     let context_section = if global_agents.is_empty() {
@@ -416,10 +443,10 @@ Description:
 {context_section}
 ## Available repositories
 {repo_list}
-{evidence_section}
+{evidence_section}{roles_section}
 Think step by step:
-1. What is this ticket about? (one sentence)
-2. Which repo owns that feature area? Weigh the CODE EVIDENCE above (which repo actually contains the ticket's identifiers) ABOVE the repo descriptions.
+1. What is this ticket about, and what DOMAIN is it — web/frontend, backend/API, mobile, cms, infra, or data? (one sentence)
+2. If a repo has a ROLE matching that domain (see Repo roles), pick it — roles are authoritative and override descriptions. Otherwise weigh the CODE EVIDENCE (which repo actually contains the ticket's identifiers) ABOVE the repo descriptions.
 3. Why is it NOT any of the other repos?
 
 Then on the LAST line, return ONLY the repository in `owner/name` format."#,
