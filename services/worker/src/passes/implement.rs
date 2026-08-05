@@ -187,6 +187,15 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     } else {
         None
     };
+    // The repo's own unit-test command (faithful CI replica). run_checks scopes
+    // it to the changed test files each call. Root cause of shipped red PRs
+    // (CPM-7805): run_checks ran only typecheck+build, so a broken test the agent
+    // wrote sailed through the sandbox gate and only failed once CI ran vitest.
+    let test_cmd = if sandbox.is_some() {
+        super::detect_ci_test(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await
+    } else {
+        None
+    };
     let node_version = if sandbox.is_some() {
         super::detect_node_version(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await
     } else {
@@ -327,10 +336,12 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     if tools.iter().any(|t| t.name == "run_checks") {
         full_system.push_str(
             "\n\n## Verify before finishing (required)\nA `run_checks` tool is available that \
-             runs this repository's REAL build and type-check against your committed changes. \
-             Before you finish — even for a small, seemingly-obvious change — call `run_checks` \
-             and confirm it passes. Do NOT finish on a failing build: read the real errors it \
-             returns and fix the root cause, then run it again.",
+             runs this repository's REAL build, type-check, and the unit tests affected by your \
+             changes against your committed code. Before you finish — even for a small, \
+             seemingly-obvious change — call `run_checks` and confirm it passes. Do NOT finish on \
+             a failure: read the real errors it returns and fix the root cause (a failing test you \
+             wrote or changed counts — fix the test or the code it exercises, never delete or skip \
+             it), then run it again.",
         );
     }
 
@@ -361,6 +372,8 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             file_cache,
             sandbox,
             checks_cmd,
+            test_cmd,
+            last_checks_passed: std::sync::atomic::AtomicBool::new(true),
             codegen_cmd,
             codegen_env,
             scope_guard,
@@ -519,6 +532,64 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         Some(&mut conv_log),
     )
     .await?;
+
+    // Gate: never finish an implement pass that left the affected tests RED.
+    // run_checks now runs them, but the agent can still stop on red — force one
+    // bounded remediation pass with the real failure before returning. (The
+    // whole reason CPM-7805 shipped a red PR: the broken test was never surfaced
+    // in-sandbox, so the agent believed it was done.)
+    if !executor
+        .write_executor
+        .last_checks_passed
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let touched_tests = executor
+            .write_executor
+            .files_modified
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| super::is_test_file(f));
+        if touched_tests {
+            warn!(
+                run_id = run_id.unwrap_or("?"),
+                "Implement finished with RED sandbox checks — forcing one remediation pass"
+            );
+            messages.push((
+                "user".to_string(),
+                vec![serde_json::json!({
+                    "type": "text",
+                    "text": "Your last run_checks FAILED — the build, types, or an affected test is \
+                             still red. Do NOT finish on a red result. Call run_checks, read the real \
+                             error, fix the ROOT CAUSE (if a test you changed is failing, fix the test \
+                             or the code it exercises — do not delete or skip the test), and repeat \
+                             until run_checks PASSES."
+                })],
+            ));
+            let remediation_opts = llm::ConverseOptions {
+                max_turns: 20,
+                max_tokens: 16384,
+                deadline,
+            };
+            if let Err(e) = provider::converse(
+                state,
+                provider,
+                model_id,
+                &full_system,
+                &mut messages,
+                &tools,
+                &executor,
+                usage,
+                remediation_opts,
+                on_tool.as_ref().map(|b| b.as_ref()),
+                Some(&mut conv_log),
+            )
+            .await
+            {
+                warn!(error = %e, "Test-remediation pass errored — proceeding with current state");
+            }
+        }
+    }
 
     let files = executor
         .write_executor
@@ -786,6 +857,13 @@ struct WriteToolExecutor<'a> {
     sandbox: Option<crate::clients::sandbox::SandboxClient<'a>>,
     /// Derived check command (None when the stack wasn't recognized).
     checks_cmd: Option<String>,
+    /// The repo's unit-test command (faithful CI replica); run_checks scopes it
+    /// to the changed test files. None when not testable / no sandbox.
+    test_cmd: Option<String>,
+    /// Verdict of the most recent run_checks (incl. tests). Starts true (nothing
+    /// run yet ⇒ no red seen); set on every run_checks so the finish path can
+    /// warn when the agent stops on a red result.
+    last_checks_passed: std::sync::atomic::AtomicBool,
     /// Derived codegen command (None when the repo has no codegen).
     codegen_cmd: Option<String>,
     /// Public per-repo codegen env (e.g. Sanity projectId/dataset) passed to the
@@ -1386,6 +1464,27 @@ impl<'a> WriteToolExecutor<'a> {
             ));
         }
 
+        // Extend the check command with the repo's unit tests, scoped to the
+        // test files THIS change touched. run_checks used to run only
+        // typecheck+build, so a broken test the agent wrote passed the sandbox
+        // gate and shipped a red PR (CPM-7805). Scoped + --passWithNoTests keeps
+        // it fast and avoids false-REDs from unrelated/service-dependent suites.
+        let changed: Vec<String> = self
+            .files_modified
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        let effective_cmd = match self
+            .test_cmd
+            .as_deref()
+            .and_then(|tc| super::build_scoped_test_cmd(tc, &changed))
+        {
+            Some(test_step) => format!("{cmd} && {test_step}"),
+            None => cmd.clone(),
+        };
+
         let tarball = match self
             .github
             .download_tarball(&self.owner, &self.repo, &self.branch)
@@ -1404,20 +1503,23 @@ impl<'a> WriteToolExecutor<'a> {
                 run_id,
                 attempt,
                 tarball,
-                cmd,
+                &effective_cmd,
                 self.node_version.as_deref(),
                 self.deadline,
             )
             .await
         {
             Ok(o) if o.ran => {
+                // Record the verdict so the finish path can catch a stop-on-red.
+                self.last_checks_passed
+                    .store(o.passed, std::sync::atomic::Ordering::SeqCst);
                 let verdict = if o.passed {
-                    "PASSED ✅ — your changes build and lint clean"
+                    "PASSED ✅ — your changes build, type-check, and the affected tests pass"
                 } else {
-                    "FAILED ❌ — fix the errors below, then run_checks again"
+                    "FAILED ❌ — fix the errors below (build, types, OR a failing test), then run_checks again"
                 };
                 Ok(json!(format!(
-                    "Sandbox checks {verdict} (exit {:?}).\nCommands: {cmd}\n\n\
+                    "Sandbox checks {verdict} (exit {:?}).\nCommands: {effective_cmd}\n\n\
                      --- real output (tail) ---\n{}",
                     o.exit_code, o.output
                 )))
