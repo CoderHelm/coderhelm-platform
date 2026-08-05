@@ -3948,6 +3948,8 @@ pub(crate) async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<
             .to_string(),
         "Use the right editing tool. edit_file needs old_text to match EXACTLY; a sloppy match silently drops lines (e.g. an array element). For JSON, template literals, or heavy special characters, or when an edit_file call fails more than once on a file, switch to write_file and rewrite the whole file with complete content. Very large generated files (e.g. sanity.types.ts) are not indexed by search_code — read them directly with read_file instead of concluding a type is missing."
             .to_string(),
+        "In jsdom / Testing-Library component tests, never select elements with querySelector/querySelectorAll using Tailwind arbitrary-value classes (e.g. `.text-[32px]`, `.w-[50%]`, `.top-[-1px]`) — the square brackets are invalid CSS selector syntax and throw `SyntaxError: '…' is not a valid selector` in jsdom. Query by role, accessible name, text, label, or test id (getByRole/getByText/getByLabelText/getByTestId), or escape the class with CSS.escape. When FIXING such a failing test, change the QUERY approach — do NOT merely swap the tag name (e.g. h3 → h2) while keeping the bracketed class."
+            .to_string(),
     ];
 
     // Load global rules
