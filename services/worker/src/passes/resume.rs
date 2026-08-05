@@ -155,6 +155,170 @@ mod stall_tests {
     }
 }
 
+/// Authoritative CI verdict for a branch head, derived from GitHub's aggregate
+/// check-run list. CI *events* are only wake-ups: a repo with N workflows fires
+/// N independent `workflow_run` completions, so "a ci_passed arrived" says
+/// nothing about the other workflows. A pass on one workflow (e.g. `Lint`) must
+/// never be read as "CI is green" while another (e.g. `Test Suite`) is still
+/// running or has failed — that exact masking shipped a red PR (run 01KZ5AJW:
+/// Lint passed, Test Suite failed, the old `has_ci_fail && !has_ci_pass` guard
+/// skipped the fix path). This aggregate is the single source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CiVerdict {
+    /// The repo runs no CI on this ref.
+    NoChecks,
+    /// At least one check is still queued/in_progress — or the check-runs API
+    /// call itself failed, which is treated as pending so a transient error is
+    /// never read as "green" (fail-closed; the 24h awaiting_ci cap is the
+    /// ultimate backstop).
+    Pending,
+    /// At least one check concluded failure/timed_out.
+    Failed,
+    /// Every check concluded and none failed.
+    Green,
+}
+
+/// Pure verdict from a GitHub `check-runs-for-ref` JSON body. Split from the API
+/// call so it is unit-testable against crafted payloads. A failure anywhere wins
+/// over any number of passes; anything still running keeps the verdict Pending.
+fn ci_verdict_from_checks(checks: &Value) -> CiVerdict {
+    if checks["total_count"].as_u64().unwrap_or(0) == 0 {
+        return CiVerdict::NoChecks;
+    }
+    let runs = checks["check_runs"].as_array();
+    let any_pending = runs
+        .map(|rs| {
+            rs.iter().any(|r| {
+                let s = r["status"].as_str().unwrap_or("");
+                s == "in_progress" || s == "queued"
+            })
+        })
+        .unwrap_or(false);
+    if any_pending {
+        return CiVerdict::Pending;
+    }
+    let any_failed = runs
+        .map(|rs| {
+            rs.iter().any(|r| {
+                let c = r["conclusion"].as_str().unwrap_or("");
+                c == "failure" || c == "timed_out"
+            })
+        })
+        .unwrap_or(false);
+    if any_failed {
+        CiVerdict::Failed
+    } else {
+        CiVerdict::Green
+    }
+}
+
+/// Query GitHub for the aggregate check state on `branch`'s head. A failed API
+/// call is treated as `Pending` (fail-closed: wait and re-check rather than
+/// falsely concluding "no checks → complete").
+async fn evaluate_ci_verdict(
+    github: &GitHubClient,
+    owner: &str,
+    name: &str,
+    branch: &str,
+) -> CiVerdict {
+    match github.list_check_runs_for_ref(owner, name, branch).await {
+        Ok(checks) => ci_verdict_from_checks(&checks),
+        Err(e) => {
+            warn!(owner, name, branch, error = %e, "check-runs query failed — treating CI as pending");
+            CiVerdict::Pending
+        }
+    }
+}
+
+/// Record a synthetic `ci_failed` event so a follow-up resume routes the run into
+/// the fix path. Used when GitHub's aggregate says a check failed but no
+/// `ci_failed` webhook event is present yet — a missed webhook, or a straggler
+/// that failed after a `ci_passed` already landed. The empty payload carries no
+/// `workflow_run_id`, so the fix path falls back to check-run annotations for the
+/// failure detail (see the log-collection block in the fix path).
+async fn record_synthetic_ci_failed(state: &WorkerState, run_id: &str) {
+    let now = chrono::Utc::now();
+    let event_sk = format!("EVENT#{}#ci_failed", now.format("%Y%m%dT%H%M%S%.3fZ"));
+    if let Err(e) = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.events_table_name)
+        .item("pk", attr_s(&format!("RUN#{run_id}")))
+        .item("sk", attr_s(&event_sk))
+        .item("event_type", attr_s("ci_failed"))
+        .item("payload", attr_s("{}"))
+        .item("processed", AttributeValue::Bool(false))
+        .item("created_at", attr_s(&now.to_rfc3339()))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Failed to write synthetic ci_failed event");
+    }
+}
+
+#[cfg(test)]
+mod ci_verdict_tests {
+    use super::{ci_verdict_from_checks, CiVerdict};
+    use serde_json::json;
+
+    #[test]
+    fn no_checks_when_total_zero() {
+        assert_eq!(
+            ci_verdict_from_checks(&json!({"total_count": 0, "check_runs": []})),
+            CiVerdict::NoChecks
+        );
+    }
+
+    #[test]
+    fn green_when_all_completed_and_none_failed() {
+        let checks = json!({"total_count": 2, "check_runs": [
+            {"status": "completed", "conclusion": "success"},
+            {"status": "completed", "conclusion": "success"},
+        ]});
+        assert_eq!(ci_verdict_from_checks(&checks), CiVerdict::Green);
+    }
+
+    #[test]
+    fn pending_when_any_still_running() {
+        // A "Lint passed, Test Suite still running" snapshot must NOT read green.
+        let checks = json!({"total_count": 2, "check_runs": [
+            {"status": "completed", "conclusion": "success", "name": "Lint"},
+            {"status": "in_progress", "conclusion": null, "name": "Test Suite"},
+        ]});
+        assert_eq!(ci_verdict_from_checks(&checks), CiVerdict::Pending);
+    }
+
+    #[test]
+    fn failed_masks_any_number_of_passes() {
+        // The 01KZ5AJW shape: one workflow green, the failing one red. Verdict
+        // must be Failed regardless of the pass.
+        let checks = json!({"total_count": 2, "check_runs": [
+            {"status": "completed", "conclusion": "success", "name": "Lint"},
+            {"status": "completed", "conclusion": "failure", "name": "Test Suite"},
+        ]});
+        assert_eq!(ci_verdict_from_checks(&checks), CiVerdict::Failed);
+    }
+
+    #[test]
+    fn pending_wins_over_a_failure_that_already_landed() {
+        // If something failed but another check is still running, stay Pending so
+        // the fix path waits for the full failure set before acting.
+        let checks = json!({"total_count": 2, "check_runs": [
+            {"status": "completed", "conclusion": "failure"},
+            {"status": "queued", "conclusion": null},
+        ]});
+        assert_eq!(ci_verdict_from_checks(&checks), CiVerdict::Pending);
+    }
+
+    #[test]
+    fn timed_out_counts_as_failed() {
+        let checks = json!({"total_count": 1, "check_runs": [
+            {"status": "completed", "conclusion": "timed_out"},
+        ]});
+        assert_eq!(ci_verdict_from_checks(&checks), CiVerdict::Failed);
+    }
+}
+
 /// Wall-clock duration from run created_at, falling back to Lambda start time.
 fn wall_clock_secs(
     created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -451,86 +615,50 @@ pub async fn run(
             &state.http,
         )?;
 
-        let checks = github
-            .list_check_runs_for_ref(&repo_owner, &repo_name, &branch)
-            .await
-            .unwrap_or(serde_json::json!({"total_count": 0, "check_runs": []}));
-
-        let check_runs: Option<&Vec<Value>> = checks["check_runs"].as_array();
-        let total = checks["total_count"].as_u64().unwrap_or(0);
-
-        if total == 0 {
-            // No CI workflows at all — mark PR ready and complete
-            info!(
-                run_id = msg.run_id,
-                "No CI checks found — marking PR ready and completing"
-            );
-            mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
-            set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
-            return Ok(());
+        // Aggregate check state is the source of truth (see CiVerdict). A failed
+        // API call yields Pending here — never a false "no checks → complete".
+        match evaluate_ci_verdict(&github, &repo_owner, &repo_name, &branch).await {
+            CiVerdict::NoChecks => {
+                // No CI workflows at all — mark PR ready and complete
+                info!(
+                    run_id = msg.run_id,
+                    "No CI checks found — marking PR ready and completing"
+                );
+                mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
+                return Ok(());
+            }
+            CiVerdict::Pending => {
+                // CI still running — send another delayed resume to check again later
+                info!(
+                    run_id = msg.run_id,
+                    "CI still in progress — scheduling re-check"
+                );
+                send_delayed_resume(state, &msg, 120).await;
+                return Ok(());
+            }
+            CiVerdict::Failed => {
+                // CI failed but the webhook was missed — record a synthetic event
+                // and re-trigger so the next resume routes into the fix path.
+                info!(
+                    run_id = msg.run_id,
+                    "CI failed (missed webhook) — writing event and re-triggering"
+                );
+                record_synthetic_ci_failed(state, &msg.run_id).await;
+                send_delayed_resume(state, &msg, 0).await;
+                return Ok(());
+            }
+            CiVerdict::Green => {
+                // All checks passed but webhook was missed — mark ready and complete
+                info!(
+                    run_id = msg.run_id,
+                    "CI passed (missed webhook) — marking PR ready and completing"
+                );
+                mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
+                return Ok(());
+            }
         }
-
-        let any_in_progress = check_runs
-            .map(|runs: &Vec<Value>| {
-                runs.iter().any(|r| {
-                    let status = r["status"].as_str().unwrap_or("");
-                    status == "in_progress" || status == "queued"
-                })
-            })
-            .unwrap_or(false);
-
-        if any_in_progress {
-            // CI still running — send another delayed resume to check again later
-            info!(
-                run_id = msg.run_id,
-                "CI still in progress — scheduling re-check"
-            );
-            send_delayed_resume(state, &msg, 120).await;
-            return Ok(());
-        }
-
-        let any_failed = check_runs
-            .map(|runs: &Vec<Value>| {
-                runs.iter().any(|r| {
-                    let conclusion = r["conclusion"].as_str().unwrap_or("");
-                    conclusion == "failure" || conclusion == "timed_out"
-                })
-            })
-            .unwrap_or(false);
-
-        if any_failed {
-            // CI failed but webhook was missed — write a synthetic ci_failed event and re-trigger
-            info!(
-                run_id = msg.run_id,
-                "CI failed (missed webhook) — writing event and re-triggering"
-            );
-            let now = chrono::Utc::now();
-            let event_sk = format!("EVENT#{}#ci_failed", now.format("%Y%m%dT%H%M%S%.3fZ"));
-            let _ = state
-                .dynamo
-                .put_item()
-                .table_name(&state.config.events_table_name)
-                .item("pk", attr_s(&format!("RUN#{}", msg.run_id)))
-                .item("sk", attr_s(&event_sk))
-                .item("event_type", attr_s("ci_failed"))
-                .item("payload", attr_s("{}"))
-                .item("processed", AttributeValue::Bool(false))
-                .item("created_at", attr_s(&now.to_rfc3339()))
-                .send()
-                .await;
-            // Re-send resume immediately to process the new event
-            send_delayed_resume(state, &msg, 0).await;
-            return Ok(());
-        }
-
-        // All checks passed but webhook was missed — mark ready and complete
-        info!(
-            run_id = msg.run_id,
-            "CI passed (missed webhook) — marking PR ready and completing"
-        );
-        mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
-        set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
-        return Ok(());
     }
 
     // Determine what happened
@@ -681,8 +809,12 @@ pub async fn run(
     // Collect any review feedback (comments on the PR) — useful for both CI fix and review paths
     let review_feedback = collect_review_feedback(&events);
 
-    if has_ci_fail && !has_ci_pass {
-        // CI failed — try to fix
+    if has_ci_fail {
+        // A workflow failed — try to fix. A failure takes precedence over any
+        // pass: on a multi-workflow repo (e.g. speedboat's Lint + Test Suite),
+        // Lint passing must NOT mask Test Suite failing. The old guard
+        // (`has_ci_fail && !has_ci_pass`) skipped this path whenever any workflow
+        // passed, shipping red PRs as "completed" (run 01KZ5AJW).
         info!(run_id = msg.run_id, "CI failed — attempting fix");
 
         // Collect failure logs from events
@@ -970,6 +1102,67 @@ pub async fn run(
             "Fix pushed, back to awaiting_ci for next CI run"
         );
     } else if has_ci_pass {
+        // A ci_passed event arrived and no ci_failed did — but that reflects only
+        // the workflows reported SO FAR. Confirm against GitHub that the whole
+        // check set is complete and green before running review + completing: a
+        // fast workflow (Lint) finishing ahead of a slow one (Test Suite) must
+        // not conclude the run while tests are still running — or after a straggler
+        // has already failed. Events are wake-ups; the aggregate is the source of
+        // truth (see CiVerdict).
+        match evaluate_ci_verdict(&github, &repo_owner, &repo_name, &branch).await {
+            CiVerdict::Pending => {
+                info!(
+                    run_id = msg.run_id,
+                    "A workflow passed but others are still running — waiting for full CI"
+                );
+                // Leave events unprocessed so the next resume re-evaluates with the
+                // full set (and still sees any review feedback that rode along).
+                let still_active = set_run_awaiting_ci(
+                    state,
+                    &ticket_msg,
+                    &msg.run_id,
+                    &pr_url,
+                    pr_number,
+                    &branch,
+                    &usage,
+                    wall_clock_secs(created_at, &start),
+                )
+                .await?;
+                if still_active {
+                    send_delayed_resume(state, &msg, 120).await;
+                }
+                return Ok(());
+            }
+            CiVerdict::Failed => {
+                // A check failed even though a ci_passed landed first. Record a
+                // synthetic ci_failed and re-drive so the next resume routes into
+                // the fix path (the real ci_failed webhook, when it arrives, carries
+                // the workflow_run_id for full logs).
+                info!(
+                    run_id = msg.run_id,
+                    "A workflow passed but another check failed — routing to the fix path"
+                );
+                record_synthetic_ci_failed(state, &msg.run_id).await;
+                let still_active = set_run_awaiting_ci(
+                    state,
+                    &ticket_msg,
+                    &msg.run_id,
+                    &pr_url,
+                    pr_number,
+                    &branch,
+                    &usage,
+                    wall_clock_secs(created_at, &start),
+                )
+                .await?;
+                if still_active {
+                    send_delayed_resume(state, &msg, 0).await;
+                }
+                return Ok(());
+            }
+            // Green (or NoChecks — a pass with no checks now visible) → review.
+            CiVerdict::Green | CiVerdict::NoChecks => {}
+        }
+
         // CI passed — run review (include any PR review/comment feedback)
         let review_repo_instructions = if review_feedback.is_empty() {
             repo_instructions.clone()
