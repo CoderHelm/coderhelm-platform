@@ -4252,6 +4252,199 @@ fn is_typecheck_cmd(line: &str) -> bool {
     looks_typecheck && is_cmd
 }
 
+/// Detect the repo's OWN unit-test command from its CI workflows — the faithful
+/// replica, same approach as `detect_ci_typecheck`. The CI line already encodes
+/// the correct workspace scoping/config (e.g. `pnpm --filter web test`), which
+/// is why we mirror it rather than guess a runner. Returns the FIRST unit-test
+/// invocation; e2e/integration/browser suites are excluded (they need real
+/// services and would false-RED in the sandbox — the exact reason tests were
+/// originally left out of the gate entirely). Callers scope it to the changed
+/// test files via [`build_scoped_test_cmd`] so we never run a full suite.
+async fn detect_ci_test(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> Option<String> {
+    let entries = github
+        .list_directory(owner, repo, ".github/workflows", git_ref)
+        .await
+        .ok()?;
+    for entry in entries {
+        if !(entry.name.ends_with(".yml") || entry.name.ends_with(".yaml")) {
+            continue;
+        }
+        let Ok(yaml) = github.read_file(owner, repo, &entry.path, git_ref).await else {
+            continue;
+        };
+        for raw in yaml.lines() {
+            let line = raw.trim().trim_start_matches("- ").trim();
+            let line = line.strip_prefix("run:").unwrap_or(line).trim();
+            let line = line.trim_matches(|c| c == '"' || c == '\'').trim();
+            if is_test_cmd(line) {
+                return Some(line.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A single shell line that runs a UNIT test suite (vitest/jest or a `test`
+/// script) — deliberately NOT e2e/integration/browser suites, which need real
+/// services and would false-RED in the sandbox.
+fn is_test_cmd(line: &str) -> bool {
+    let low = line.to_lowercase();
+    if low.starts_with('#') {
+        return false;
+    }
+    // Suites that need a browser/DB/services — skip; these are CI-only by nature.
+    if low.contains("e2e")
+        || low.contains("playwright")
+        || low.contains("cypress")
+        || low.contains("integration")
+        || low.contains("storybook")
+    {
+        return false;
+    }
+    let is_cmd = low.contains("pnpm")
+        || low.contains("npm ")
+        || low.contains("yarn")
+        || low.contains("npx")
+        || low.contains("turbo")
+        || low.starts_with("vitest")
+        || low.starts_with("jest");
+    // A direct vitest/jest binary, or a package "test"/"test:unit" script.
+    let looks_test = low.contains("vitest")
+        || low.contains("jest")
+        || line.split_whitespace().any(|t| {
+            let t = t.trim_matches(|c| c == '"' || c == '\'');
+            t == "test" || t == "test:unit" || t == "unit" || t.ends_with(":unit")
+        });
+    looks_test && is_cmd
+}
+
+/// True when `path` is a unit/component test file (by convention). Used to scope
+/// the sandbox test run to the tests a change actually touched.
+pub(crate) fn is_test_file(path: &str) -> bool {
+    let p = path.to_lowercase();
+    let base = p.rsplit('/').next().unwrap_or(&p);
+    base.contains(".test.") || base.contains(".spec.") || p.contains("__tests__/")
+}
+
+/// Scope a repo's unit-test command to specific changed test files by appending
+/// their basenames as filename filters (vitest/jest match test paths by
+/// substring). `--passWithNoTests` is the safety valve: if the filter matches
+/// nothing in the chosen workspace (e.g. a monorepo where the change lives in a
+/// different package than the first detected test command), the run passes
+/// instead of false-REDing. Returns None when there are no changed test files.
+pub(crate) fn build_scoped_test_cmd(base_cmd: &str, changed_files: &[String]) -> Option<String> {
+    let mut names: Vec<String> = changed_files
+        .iter()
+        .filter(|f| is_test_file(f))
+        .filter_map(|f| f.rsplit('/').next())
+        // Drop anything odd so we never inject shell metacharacters.
+        .filter(|n| {
+            !n.is_empty()
+                && n.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        })
+        .map(|n| n.to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return None;
+    }
+    let args = names.join(" ");
+    let low = base_cmd.to_lowercase();
+    // A direct vitest/jest binary takes filename filters positionally; a package
+    // `test` script needs `--` to forward the args to the underlying runner.
+    let direct = low.contains("vitest") || low.contains("jest");
+    Some(if direct {
+        format!("{base_cmd} --passWithNoTests {args}")
+    } else {
+        format!("{base_cmd} -- --passWithNoTests {args}")
+    })
+}
+
+#[cfg(test)]
+mod test_gate_tests {
+    use super::{build_scoped_test_cmd, is_test_cmd, is_test_file};
+
+    #[test]
+    fn recognizes_unit_test_commands() {
+        assert!(is_test_cmd("pnpm --filter web test"));
+        assert!(is_test_cmd("pnpm exec vitest run"));
+        assert!(is_test_cmd("npx jest"));
+        assert!(is_test_cmd("yarn test:unit"));
+    }
+
+    #[test]
+    fn skips_service_dependent_suites() {
+        assert!(!is_test_cmd("pnpm test:e2e"));
+        assert!(!is_test_cmd("pnpm exec playwright test"));
+        assert!(!is_test_cmd("npx cypress run"));
+        assert!(!is_test_cmd("pnpm test:integration"));
+        // not a command at all
+        assert!(!is_test_cmd("# run the tests"));
+        assert!(!is_test_cmd("Run the latest build"));
+    }
+
+    #[test]
+    fn identifies_test_files() {
+        assert!(is_test_file(
+            "apps/web/src/test/components/split-feature.test.tsx"
+        ));
+        assert!(is_test_file("src/foo.spec.ts"));
+        assert!(is_test_file("src/__tests__/bar.ts"));
+        assert!(!is_test_file("apps/web/src/components/split-feature.tsx"));
+        assert!(!is_test_file("src/lib/util.ts"));
+    }
+
+    #[test]
+    fn scopes_vitest_by_basename_positionally() {
+        let cmd = build_scoped_test_cmd(
+            "pnpm exec vitest run",
+            &[
+                "apps/web/src/components/split-feature.tsx".to_string(),
+                "apps/web/src/test/components/split-feature.test.tsx".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            "pnpm exec vitest run --passWithNoTests split-feature.test.tsx"
+        );
+    }
+
+    #[test]
+    fn scopes_test_script_through_double_dash() {
+        let cmd = build_scoped_test_cmd("pnpm --filter web test", &["src/a.test.ts".to_string()])
+            .unwrap();
+        assert_eq!(cmd, "pnpm --filter web test -- --passWithNoTests a.test.ts");
+    }
+
+    #[test]
+    fn none_when_no_test_files_changed() {
+        assert!(build_scoped_test_cmd("pnpm test", &["src/only-source.ts".to_string()]).is_none());
+        assert!(build_scoped_test_cmd("pnpm test", &[]).is_none());
+    }
+
+    #[test]
+    fn rejects_files_with_shell_metacharacters() {
+        // A pathological name never reaches the shell.
+        let cmd = build_scoped_test_cmd(
+            "vitest run",
+            &[
+                "src/a.test.ts".to_string(),
+                "src/$(rm -rf).test.ts".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(cmd, "vitest run --passWithNoTests a.test.ts");
+    }
+}
+
 /// Detect the Node.js major version the repo expects (package.json `engines.node`
 /// or `.nvmrc`) so the sandbox runs the repo's real toolchain. Returns None when
 /// it's not a Node repo or the version is unspecified — the buildspec then
