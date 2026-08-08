@@ -320,8 +320,10 @@ pub async fn run(
         "You are a feedback agent for the {owner}/{repo} repository. \
          You respond to reviewer comments on pull requests by reading and writing files \
          directly to the PR branch. \
-         If a comment requests a code change, use write_file or batch_write to commit it, \
-         then confirm briefly. If a comment asks a question, read the code and answer clearly. \
+         If a comment requests a code change, commit it — use edit_file for targeted edits \
+         (the default, and the ONLY safe option for a few lines in a large file), and write_file \
+         or batch_write only for new files or whole-file rewrites — then confirm briefly. \
+         If a comment asks a question, read the code and answer clearly. \
          Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
@@ -336,7 +338,7 @@ pub async fn run(
 ## Instructions
 For each comment:
 - **Question** — read the relevant code, answer concisely
-- **Change request** — fix the code with write_file/batch_write, then confirm (e.g. "Done — added error handling.")
+- **Change request** — fix the code (prefer edit_file for targeted changes, especially in large files; write_file only for whole-file rewrites), then confirm (e.g. "Done — added error handling.")
 
 If there are CI failures listed above, also fix those — read the failing files, diagnose the issue, and commit a fix.
 
@@ -1056,6 +1058,30 @@ fn feedback_tools() -> Vec<ToolDefinition> {
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDefinition {
+            name: "edit_file".to_string(),
+            description: "Make targeted edits to an existing file using search/replace — the right tool for changing a few lines, ESPECIALLY in a large file where rewriting the whole thing is impractical or unsafe. Each edit replaces one occurrence of old_text with new_text; old_text must match the file EXACTLY (whitespace, quotes, commas) and uniquely. Prefer this over write_file for review-comment fixes. If an edit keeps failing on special-character content, fall back to write_file with the COMPLETE file.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to repo root"},
+                    "edits": {
+                        "type": "array",
+                        "description": "Array of search/replace edits to apply in order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {"type": "string", "description": "Exact text to find (must match uniquely)"},
+                                "new_text": {"type": "string", "description": "Replacement text"}
+                            },
+                            "required": ["old_text", "new_text"]
+                        }
+                    },
+                    "message": {"type": "string", "description": "Commit message"}
+                },
+                "required": ["path", "edits", "message"]
+            }),
+        },
+        ToolDefinition {
             name: "write_file".to_string(),
             description: "Create or update a single file.".to_string(),
             input_schema: json!({
@@ -1189,6 +1215,79 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     })
                     .collect();
                 Ok(json!(lines.join("\n---\n")))
+            }
+            "edit_file" => {
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing path")?;
+                if super::implement::is_protected_path(path) {
+                    return Ok(json!(format!(
+                        "Cannot modify {path}: CI/CD workflow files are protected."
+                    )));
+                }
+                if self.scope_guard.should_block(path) {
+                    return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
+                }
+                let edits = input
+                    .get("edits")
+                    .and_then(|v| v.as_array())
+                    .ok_or("Missing edits array")?;
+                let message = input
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing message")?;
+                let original = self
+                    .github
+                    .read_file(self.owner, self.repo, path, self.branch)
+                    .await?;
+                let content = match super::implement::apply_text_edits(&original, edits) {
+                    Ok(c) => c,
+                    Err(errors) => {
+                        return Ok(json!(format!(
+                            "NO edits applied to {path} — all edits in one call must succeed \
+                             atomically, and {} failed: {}. Re-read the file (read_file_lines) \
+                             and retry with corrected, UNIQUE old_text; only fall back to \
+                             write_file with the complete file if edits keep failing.",
+                            errors.len(),
+                            errors.join("; ")
+                        )));
+                    }
+                };
+                // Same syntax + anti-gut guards the implement pass applies.
+                if let Err(problem) =
+                    super::syntax_check::validate_change(path, Some(&original), &content)
+                {
+                    return Ok(json!(format!(
+                        "Edit REJECTED for {path} — it would break the file's syntax: {problem}. \
+                         Read the file again and retry with a corrected edit."
+                    )));
+                }
+                if let Some(problem) =
+                    super::implement::validate_edit_safety(&original, &content, path)
+                {
+                    return Ok(json!(format!(
+                        "Edit REJECTED for {path}: {problem}. Retry with a smaller, more precise edit."
+                    )));
+                }
+                let sha = self
+                    .github
+                    .get_file_sha(self.owner, self.repo, path, self.branch)
+                    .await
+                    .ok();
+                self.github
+                    .write_file(
+                        self.owner,
+                        self.repo,
+                        path,
+                        &content,
+                        self.branch,
+                        message,
+                        sha.as_deref(),
+                    )
+                    .await?;
+                *self.files_modified.lock().unwrap() = true;
+                Ok(json!(format!("Applied {} edit(s) to {path}", edits.len())))
             }
             "write_file" => {
                 let path = input
