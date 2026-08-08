@@ -1097,56 +1097,27 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                         .read_file(&self.owner, &self.repo, path, &self.branch)
                         .await?
                 };
-                let mut content = original_content.clone();
-
-                // Apply edits sequentially — ALL must succeed or NOTHING is
-                // written. Committing the subset that happened to match left
-                // logically incomplete changes (half a rename) on the branch
-                // with only a "Warnings:" note.
-                let mut applied = 0;
-                let mut errors = Vec::new();
-                for edit in edits {
-                    let old_text = edit.get("old_text").and_then(|v| v.as_str()).unwrap_or("");
-                    let new_text = edit.get("new_text").and_then(|v| v.as_str()).unwrap_or("");
-                    if old_text.is_empty() {
-                        errors.push("Empty old_text in edit".to_string());
-                        continue;
+                // Apply edits atomically via the shared search/replace applier —
+                // ALL must match uniquely or NOTHING is written (committing the
+                // subset that happened to match left half-done changes on the
+                // branch). Same helper the feedback pass now uses.
+                let content = match apply_text_edits(&original_content, edits) {
+                    Ok(c) => c,
+                    Err(errors) => {
+                        return Ok(json!(format!(
+                            "NO edits applied to {path} — all edits in one call must succeed \
+                             atomically, and {} failed: {}. Re-read the current file content \
+                             and retry with corrected old_text (remember earlier edits in the \
+                             same call change the text later edits must match). If edits keep \
+                             failing here — common with JSON, template literals, or other \
+                             special-character content, or when batching several edits — STOP \
+                             retrying edit_file and use write_file to rewrite the whole file with \
+                             the complete corrected content instead.",
+                            errors.len(),
+                            errors.join("; ")
+                        )));
                     }
-                    let count = content.matches(old_text).count();
-                    if count == 0 {
-                        errors.push(format!(
-                            "old_text not found: {}…",
-                            common::truncate_str(old_text, 60)
-                        ));
-                    } else if count > 1 {
-                        errors.push(format!(
-                            "old_text matched {} times (must be unique): {}…",
-                            count,
-                            common::truncate_str(old_text, 60)
-                        ));
-                    } else {
-                        content = content.replacen(old_text, new_text, 1);
-                        applied += 1;
-                    }
-                }
-
-                if !errors.is_empty() {
-                    return Ok(json!(format!(
-                        "NO edits applied to {path} — all edits in one call must succeed \
-                         atomically, and {} failed: {}. Re-read the current file content \
-                         and retry with corrected old_text (remember earlier edits in the \
-                         same call change the text later edits must match). If edits keep \
-                         failing here — common with JSON, template literals, or other \
-                         special-character content, or when batching several edits — STOP \
-                         retrying edit_file and use write_file to rewrite the whole file with \
-                         the complete corrected content instead.",
-                        errors.len(),
-                        errors.join("; ")
-                    )));
-                }
-                if applied == 0 {
-                    return Ok(json!(format!("No edits provided for {path}")));
-                }
+                };
 
                 // Generated files must be regenerated, not hand-edited — steer
                 // to run_codegen. Bounded escape hatch prevents any deadlock.
@@ -1194,7 +1165,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                 self.file_cache.insert(cache_key, content).await;
                 self.task_tracker.mark_files_done(&[path]).await;
 
-                Ok(json!(format!("Applied {applied} edit(s) to {path}")))
+                Ok(json!(format!("Applied {} edit(s) to {path}", edits.len())))
             }
             "batch_write" => {
                 let message = input
@@ -1754,6 +1725,107 @@ fn generated_file_reject(path: &str) -> String {
          `run_codegen` to regenerate it. If you already changed the source, just \
          call `run_codegen` now."
     )
+}
+
+/// Apply a sequence of `old_text` → `new_text` search/replace edits to
+/// `content`, atomically. Each `old_text` must match EXACTLY once (unique
+/// anchor); if ANY edit fails to match uniquely, nothing is applied and the
+/// collected errors are returned so the caller can surface them. Shared by the
+/// implement and feedback passes so review-response edits get the same proven
+/// surgical-edit path (its absence in the feedback pass is what left large-file
+/// review fixes unfixable — CPM-7956 / PR #1093). Pure + unit-tested.
+pub(crate) fn apply_text_edits(
+    content: &str,
+    edits: &[serde_json::Value],
+) -> Result<String, Vec<String>> {
+    let mut out = content.to_string();
+    let mut applied = 0usize;
+    let mut errors = Vec::new();
+    for edit in edits {
+        let old_text = edit.get("old_text").and_then(|v| v.as_str()).unwrap_or("");
+        let new_text = edit.get("new_text").and_then(|v| v.as_str()).unwrap_or("");
+        if old_text.is_empty() {
+            errors.push("Empty old_text in edit".to_string());
+            continue;
+        }
+        // Earlier edits in the same call change the text later edits must match,
+        // so match against the running `out`, not the original.
+        let count = out.matches(old_text).count();
+        if count == 0 {
+            errors.push(format!(
+                "old_text not found: {}…",
+                common::truncate_str(old_text, 60)
+            ));
+        } else if count > 1 {
+            errors.push(format!(
+                "old_text matched {count} times (must be unique): {}…",
+                common::truncate_str(old_text, 60)
+            ));
+        } else {
+            out = out.replacen(old_text, new_text, 1);
+            applied += 1;
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    if applied == 0 {
+        return Err(vec!["No edits provided".to_string()]);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod apply_text_edits_tests {
+    use super::apply_text_edits;
+    use serde_json::json;
+
+    fn e(o: &str, n: &str) -> serde_json::Value {
+        json!({"old_text": o, "new_text": n})
+    }
+
+    #[test]
+    fn applies_unique_edit() {
+        let out = apply_text_edits("a\nB\nc", &[e("B", "X")]).unwrap();
+        assert_eq!(out, "a\nX\nc");
+    }
+
+    #[test]
+    fn sequential_edits_are_atomic_and_ordered() {
+        // second edit matches text produced by the first
+        let out = apply_text_edits("one two", &[e("one", "1"), e("1 two", "done")]).unwrap();
+        assert_eq!(out, "done");
+    }
+
+    #[test]
+    fn rejects_all_when_one_anchor_is_ambiguous() {
+        // "x" appears twice -> whole call fails, nothing applied
+        let err = apply_text_edits("x y x", &[e("y", "Y"), e("x", "Z")]).unwrap_err();
+        assert!(err.iter().any(|m| m.contains("matched 2 times")));
+    }
+
+    #[test]
+    fn rejects_when_anchor_missing() {
+        let err = apply_text_edits("abc", &[e("zzz", "q")]).unwrap_err();
+        assert!(err.iter().any(|m| m.contains("not found")));
+    }
+
+    #[test]
+    fn empty_edits_is_an_error_not_a_silent_noop() {
+        assert!(apply_text_edits("abc", &[]).is_err());
+    }
+
+    #[test]
+    fn surgical_edit_on_a_large_file_body() {
+        // the CPM-7956 shape: one unique line changed inside a big file
+        let big = (0..2000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let target = big.replace("line 924", "line 924 // marker");
+        let out = apply_text_edits(&target, &[e("line 924 // marker", "FIXED")]).unwrap();
+        assert!(out.contains("\nFIXED\n") && !out.contains("marker"));
+    }
 }
 
 /// Deletion guardrail: rejects edits that gut the file. Bracket/syntax
