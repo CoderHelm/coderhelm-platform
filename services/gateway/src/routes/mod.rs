@@ -9,5 +9,6 @@ pub mod log_analyzer;
 pub mod memory;
 pub mod plans;
 pub mod plugins;
+pub mod reviewer;
 pub mod trigger_gate;
 pub mod users;

@@ -1415,6 +1415,87 @@ impl GitHubClient {
             .await
     }
 
+    /// Post a review verdict on a PR. `event` is "APPROVE", "REQUEST_CHANGES",
+    /// or "COMMENT". Note: GitHub rejects APPROVE/REQUEST_CHANGES from the same
+    /// identity that authored the PR — the reviewer pass falls back to "COMMENT"
+    /// in that case so the verdict is still recorded.
+    pub async fn create_pr_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        event: &str,
+        body: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews");
+        self.post(&url, &serde_json::json!({ "event": event, "body": body }))
+            .await
+    }
+
+    /// Merge a PR, but ONLY if its head still equals `sha` (a blast-radius guard:
+    /// a commit pushed after the review moves the head, GitHub returns 409, and
+    /// we return Ok(false) rather than merging unreviewed code). Ok(false) also
+    /// covers "not mergeable" (405, e.g. failing required checks). Any other
+    /// status is a hard error so the caller never treats a failure as a merge.
+    /// `merge_method` is "squash" | "merge" | "rebase".
+    pub async fn merge_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        sha: &str,
+        merge_method: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/merge");
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.put(&url).json(&serde_json::json!({
+            "sha": sha,
+            "merge_method": merge_method,
+        }));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await?;
+        match resp.status().as_u16() {
+            200 => Ok(true),
+            405 | 409 => Ok(false),
+            status => {
+                let text = resp.text().await.unwrap_or_default();
+                Err(format!("merge failed ({status}): {text}").into())
+            }
+        }
+    }
+
+    /// List submitted reviews on a PR (used by the two-key auto-merge gate to
+    /// confirm a human approval exists alongside the bot's).
+    pub async fn list_pr_reviews(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews?per_page=100");
+        self.get(&url).await
+    }
+
+    /// Create a lightweight tag ref pointing at `sha` (e.g. a release tag after
+    /// an approved merge). Idempotency is the caller's job — GitHub 422s on a
+    /// ref that already exists.
+    pub async fn create_tag_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        tag: &str,
+        sha: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs");
+        self.post(
+            &url,
+            &serde_json::json!({ "ref": format!("refs/tags/{tag}"), "sha": sha }),
+        )
+        .await
+    }
+
     /// Mark a draft PR as ready for review using the GraphQL API.
     /// The REST `PATCH {"draft": false}` does NOT work — GitHub requires the
     /// `markPullRequestAsReady` GraphQL mutation.
