@@ -470,10 +470,16 @@ async fn handle_pull_request(
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
 
-    // Reviewer agent: a PR gaining the repo's configured review label — or a new
-    // commit pushed to an already-labeled PR — triggers a code review. Opt-in
-    // and off by default per repo (see load_review_config).
-    if action == "labeled" || action == "synchronize" {
+    // Reviewer agent triggers (opt-in, off by default per repo):
+    //  - human PRs: the review label added, or a new commit on a labeled PR.
+    //  - CoderHelm's own PRs: auto-reviewed on open/reopen/push with no label
+    //    needed (it can't self-approve, so review_pr posts a COMMENT review).
+    if action == "labeled"
+        || action == "synchronize"
+        || action == "opened"
+        || action == "reopened"
+        || action == "ready_for_review"
+    {
         return handle_review_trigger(state, payload, installation_id, team_id, action).await;
     }
 
@@ -1475,9 +1481,17 @@ async fn handle_review_trigger(
         return Ok(StatusCode::OK);
     }
 
-    // Only trigger when the review label is actually involved: on `labeled`, the
-    // added label must BE the review label; on `synchronize` (new commit), the
-    // PR must already carry it.
+    // CoderHelm's own PRs are auto-reviewed (no label needed) — it can't
+    // self-approve, so review_pr posts a COMMENT review. Human PRs are gated on
+    // the review label: on `labeled` the added label must BE the review label;
+    // on `synchronize` (new commit) the PR must already carry it.
+    let is_bot_pr = pr["user"]["login"]
+        .as_str()
+        .unwrap_or("")
+        .contains("coderhelm");
+    // Don't auto-review a draft bot PR — wait for it to be marked ready. An
+    // explicitly-labeled PR is reviewed even as a draft (the label is a request).
+    let is_draft = pr["draft"].as_bool().unwrap_or(false);
     let carries_label = pr["labels"]
         .as_array()
         .map(|ls| {
@@ -1487,7 +1501,8 @@ async fn handle_review_trigger(
         .unwrap_or(false);
     let triggered = match action {
         "labeled" => payload["label"]["name"].as_str() == Some(cfg.label.as_str()),
-        "synchronize" => carries_label,
+        "synchronize" => carries_label || (is_bot_pr && !is_draft),
+        "opened" | "reopened" | "ready_for_review" => is_bot_pr && !is_draft,
         _ => false,
     };
     if !triggered {
@@ -1504,7 +1519,7 @@ async fn handle_review_trigger(
 
     info!(
         owner,
-        name, pr_number, "Reviewer: label matched — enqueuing review job"
+        name, pr_number, is_bot_pr, action, "Reviewer: trigger matched — enqueuing review job"
     );
     let message = WorkerMessage::Review(ReviewMessage {
         team_id: team_id.to_string(),
