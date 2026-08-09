@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
     FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo, PlanTaskContinueMessage,
-    ResumeMessage, TicketMessage, TicketSource, WorkerMessage,
+    ResumeMessage, ReviewMessage, TicketMessage, TicketSource, WorkerMessage,
 };
 use crate::AppState;
 
@@ -351,6 +351,63 @@ async fn handle_issue_comment(
             }
             return send_to_queue(state, &state.config.feedback_queue_url, &message).await;
         }
+
+        // Reviewer reply-handling: on a PR the reviewer covers, a human addressing
+        // the bot ("@coderhelm re-review" or "@coderhelm <question>") re-runs the
+        // review or answers the question — instead of opening a brand-new ticket.
+        // Requires an explicit mention/command so unrelated PR chatter never fires.
+        if !commenter.contains("coderhelm")
+            && (body.contains("@coderhelm") || body.trim_start().starts_with("/coderhelm"))
+        {
+            let repo = &payload["repository"];
+            let owner = repo["owner"]["login"].as_str().unwrap_or("");
+            let name = repo["name"].as_str().unwrap_or("");
+            let pr_number = payload["issue"]["number"].as_u64().unwrap_or(0);
+            let cfg = load_review_config(state, team_id, owner, name).await;
+            if cfg.enabled && !cfg.killed && pr_number != 0 {
+                if let Some(reason) = check_run_budget(state, team_id).await {
+                    post_limit_comment(state, installation_id, owner, name, pr_number, &reason)
+                        .await;
+                    return Ok(StatusCode::OK);
+                }
+                // Strip the address token to recover the human's actual message.
+                let cleaned = body
+                    .replace("@coderhelm", " ")
+                    .trim()
+                    .trim_start_matches("/coderhelm")
+                    .trim()
+                    .to_string();
+                let lower = cleaned.to_lowercase();
+                let is_rereview = lower.contains("re-review")
+                    || lower.contains("rereview")
+                    || lower.contains("review again")
+                    || lower == "review";
+                // Re-review → fresh verdict; anything else → a question the reviewer
+                // answers. Empty head_sha makes the worker resolve the PR's current
+                // head, so a reply always targets the latest code.
+                let question = if is_rereview || cleaned.is_empty() {
+                    None
+                } else {
+                    Some(cleaned)
+                };
+                info!(
+                    owner,
+                    name, pr_number, is_rereview, "Reviewer: reply → review job"
+                );
+                let message = WorkerMessage::Review(ReviewMessage {
+                    team_id: team_id.to_string(),
+                    installation_id,
+                    repo_owner: owner.to_string(),
+                    repo_name: name.to_string(),
+                    pr_number,
+                    head_sha: String::new(),
+                    label: cfg.label,
+                    question,
+                    trigger: "reply".to_string(),
+                });
+                return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+            }
+        }
     }
 
     // Trigger on `/coderhelm` slash command or @coderhelm mention (issues or non-bot PRs)
@@ -408,12 +465,19 @@ async fn handle_issue_comment(
 async fn handle_pull_request(
     state: &AppState,
     payload: &Value,
-    _installation_id: u64,
+    installation_id: u64,
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
-    let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
 
+    // Reviewer agent: a PR gaining the repo's configured review label — or a new
+    // commit pushed to an already-labeled PR — triggers a code review. Opt-in
+    // and off by default per repo (see load_review_config).
+    if action == "labeled" || action == "synchronize" {
+        return handle_review_trigger(state, payload, installation_id, team_id, action).await;
+    }
+
+    let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
     if action != "closed" || !merged {
         return Ok(StatusCode::OK);
     }
@@ -1322,6 +1386,138 @@ fn extract_repos_from_installation(payload: &Value) -> Vec<OnboardRepo> {
             })
         })
         .collect()
+}
+
+/// Per-repo reviewer-agent config. OFF by default — the bulletproof default so
+/// the reviewer never touches a repo until a human explicitly opts it in.
+struct ReviewConfig {
+    enabled: bool,
+    /// PR label that triggers a review.
+    label: String,
+    /// Hard kill switch — blocks ALL reviewer action regardless of `enabled`.
+    killed: bool,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            label: "ch-review".to_string(),
+            killed: false,
+        }
+    }
+}
+
+async fn load_review_config(
+    state: &AppState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> ReviewConfig {
+    let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sk))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned());
+    let Some(item) = item else {
+        return ReviewConfig::default();
+    };
+    let d = ReviewConfig::default();
+    ReviewConfig {
+        enabled: item
+            .get("enabled")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(d.enabled),
+        label: item
+            .get("label")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(d.label),
+        killed: item
+            .get("killed")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(d.killed),
+    }
+}
+
+/// Reviewer trigger: enqueue a code-review job when the repo's review label is
+/// added to an open PR, or a new commit lands on an already-labeled PR.
+/// Idempotency (one review per head SHA) is enforced worker-side by the review
+/// run claim, so a re-label or duplicate webhook is harmless.
+async fn handle_review_trigger(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+    action: &str,
+) -> Result<StatusCode, StatusCode> {
+    let pr = &payload["pull_request"];
+    let pr_number = pr["number"].as_u64().unwrap_or(0);
+    let head_sha = pr["head"]["sha"].as_str().unwrap_or("").to_string();
+    if pr_number == 0 || head_sha.is_empty() || pr["state"].as_str() != Some("open") {
+        return Ok(StatusCode::OK);
+    }
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+
+    let cfg = load_review_config(state, team_id, owner, name).await;
+    if !cfg.enabled || cfg.killed {
+        return Ok(StatusCode::OK);
+    }
+
+    // Only trigger when the review label is actually involved: on `labeled`, the
+    // added label must BE the review label; on `synchronize` (new commit), the
+    // PR must already carry it.
+    let carries_label = pr["labels"]
+        .as_array()
+        .map(|ls| {
+            ls.iter()
+                .any(|l| l["name"].as_str() == Some(cfg.label.as_str()))
+        })
+        .unwrap_or(false);
+    let triggered = match action {
+        "labeled" => payload["label"]["name"].as_str() == Some(cfg.label.as_str()),
+        "synchronize" => carries_label,
+        _ => false,
+    };
+    if !triggered {
+        return Ok(StatusCode::OK);
+    }
+
+    // Budget gate — same as every other enqueue path, so an over-limit team
+    // can't keep spending tokens via label-triggered reviews.
+    if let Some(reason) = check_run_budget(state, team_id).await {
+        info!(team_id, pr_number, "Reviewer skipped — token limit reached");
+        post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
+        return Ok(StatusCode::OK);
+    }
+
+    info!(
+        owner,
+        name, pr_number, "Reviewer: label matched — enqueuing review job"
+    );
+    let message = WorkerMessage::Review(ReviewMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
+        head_sha,
+        label: cfg.label,
+        question: None,
+        trigger: action.to_string(),
+    });
+    send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
 
 async fn send_to_queue(

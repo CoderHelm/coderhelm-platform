@@ -153,6 +153,14 @@ async fn main() -> Result<(), Error> {
         )
         .route("/stats", get(routes::api::get_stats))
         .route("/stats/history", get(routes::api::get_stats_history))
+        // Reviewer agent — per-repo config, reviews list/detail, ratings
+        .route(
+            "/reviewer/config/:owner/:name",
+            get(routes::reviewer::get_config).put(routes::reviewer::update_config),
+        )
+        .route("/reviewer/reviews", get(routes::reviewer::list_reviews))
+        .route("/reviewer/review", get(routes::reviewer::get_review))
+        .route("/reviewer/review/rate", post(routes::reviewer::rate_review))
         // GitHub App installation
         .route(
             "/github/link-installation",

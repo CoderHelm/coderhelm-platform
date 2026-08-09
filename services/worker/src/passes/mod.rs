@@ -476,6 +476,8 @@ mod pr;
 mod resolve;
 pub mod resume;
 mod review;
+pub mod review_actions;
+pub mod review_pr;
 mod security;
 pub mod syntax_check;
 #[allow(dead_code)]

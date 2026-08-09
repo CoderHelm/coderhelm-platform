@@ -1,0 +1,418 @@
+//! Post-approval actions for the reviewer agent: merge → tag → health-guard.
+//!
+//! Everything here is OFF by default and gated behind explicit per-repo config.
+//! The safety model is deliberately conservative:
+//!   - `auto_merge` only runs on a bot APPROVE verdict.
+//!   - `require_human_approval` (default TRUE) is a two-key rule: even with
+//!     auto-merge on, a human must also have approved the PR. This is what keeps
+//!     an LLM verdict from being sufficient to merge to a live branch on its own.
+//!   - the merge is SHA-guarded — GitHub 409s (→ no-op) if a commit landed after
+//!     the review, so unreviewed code can never be merged.
+//!   - after a merge, the health guard watches CI on the base branch (and, when
+//!     configured, scans CloudWatch log groups for an error spike) and posts a
+//!     loud alert if the deploy looks broken. It reports; it never auto-reverts a
+//!     shared branch (that is itself dangerous — a human decides the rollback).
+
+use crate::clients::github::GitHubClient;
+use crate::WorkerState;
+use tracing::{info, warn};
+
+/// Per-repo post-approval config, read from the same REVIEW_CONFIG item the
+/// reviewer core uses. Every field defaults to the SAFE value (no action).
+#[derive(Debug, Clone)]
+pub struct OnApproveConfig {
+    pub auto_merge: bool,
+    /// "squash" | "merge" | "rebase".
+    pub merge_method: String,
+    /// Even with auto_merge, require a human APPROVED review too (two-key).
+    pub require_human_approval: bool,
+    pub auto_tag: bool,
+    pub tag_prefix: String,
+    /// Watch CI on the base branch after merge.
+    pub health_check: bool,
+    /// How long to watch, capped at 300s.
+    pub health_wait_secs: u64,
+    /// CloudWatch log groups to scan for an error spike after merge (optional;
+    /// only meaningful for repos that deploy into this AWS account).
+    pub health_log_groups: Vec<String>,
+}
+
+impl Default for OnApproveConfig {
+    fn default() -> Self {
+        Self {
+            auto_merge: false,
+            merge_method: "squash".to_string(),
+            require_human_approval: true,
+            auto_tag: false,
+            tag_prefix: "v".to_string(),
+            health_check: false,
+            health_wait_secs: 90,
+            health_log_groups: vec![],
+        }
+    }
+}
+
+impl OnApproveConfig {
+    pub async fn load(state: &WorkerState, team_id: &str, owner: &str, name: &str) -> Self {
+        let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
+        let item = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", super::attr_s(team_id))
+            .key("sk", super::attr_s(&sk))
+            .send()
+            .await
+            .ok()
+            .and_then(|o| o.item().cloned());
+        let Some(item) = item else {
+            return Self::default();
+        };
+        let d = Self::default();
+        let get_bool = |k: &str, dv: bool| {
+            item.get(k)
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(dv)
+        };
+        let merge_method = item
+            .get("merge_method")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.to_string())
+            .filter(|s| matches!(s.as_str(), "squash" | "merge" | "rebase"))
+            .unwrap_or(d.merge_method);
+        let tag_prefix = item
+            .get("tag_prefix")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or(d.tag_prefix);
+        let health_wait_secs = item
+            .get("health_wait_secs")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(d.health_wait_secs)
+            .min(300);
+        let health_log_groups = item
+            .get("health_log_groups")
+            .and_then(|v| v.as_l().ok())
+            .map(|l| {
+                l.iter()
+                    .filter_map(|v| v.as_s().ok().cloned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Self {
+            auto_merge: get_bool("auto_merge", d.auto_merge),
+            merge_method,
+            require_human_approval: get_bool("require_human_approval", d.require_human_approval),
+            auto_tag: get_bool("auto_tag", d.auto_tag),
+            tag_prefix,
+            health_check: get_bool("health_check", d.health_check),
+            health_wait_secs,
+            health_log_groups,
+        }
+    }
+}
+
+/// Pure gate: may we auto-merge? Kept separate so the decision is unit-testable
+/// without any network. Fail-safe: anything other than an explicit yes is a no.
+pub fn should_merge(cfg: &OnApproveConfig, verdict_approved: bool, human_approved: bool) -> bool {
+    if !cfg.auto_merge || !verdict_approved {
+        return false;
+    }
+    if cfg.require_human_approval && !human_approved {
+        return false;
+    }
+    true
+}
+
+/// Outcome of the post-approval sequence, surfaced into the review record and a
+/// PR comment.
+#[derive(Debug, Default)]
+pub struct ActionReport {
+    pub merged: bool,
+    pub tag: Option<String>,
+    pub health: Option<String>,
+    /// Human-readable markdown summary for the PR comment; empty ⇒ nothing done.
+    pub summary: String,
+}
+
+/// Is there at least one human APPROVED review on the PR (not the bot's)?
+async fn human_approval_present(github: &GitHubClient, owner: &str, repo: &str, pr: u64) -> bool {
+    match github.list_pr_reviews(owner, repo, pr).await {
+        Ok(v) => v
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .any(|r| {
+                r["state"].as_str() == Some("APPROVED")
+                    && !r["user"]["login"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("coderhelm")
+            }),
+        Err(e) => {
+            warn!(pr, error = %e, "Could not list PR reviews — treating as no human approval");
+            false
+        }
+    }
+}
+
+/// Run the merge → tag → health-guard sequence. Returns a report even when
+/// nothing is enabled (summary empty). Never panics; each step degrades to a
+/// note in the summary on error.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_on_approve(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    head_sha: &str,
+    base_branch: &str,
+) -> ActionReport {
+    let cfg = OnApproveConfig::load(state, team_id, owner, repo).await;
+    let mut report = ActionReport::default();
+
+    if !cfg.auto_merge {
+        return report; // nothing configured
+    }
+
+    let human_ok = if cfg.require_human_approval {
+        human_approval_present(github, owner, repo, pr_number).await
+    } else {
+        true
+    };
+
+    if !should_merge(&cfg, true, human_ok) {
+        report.summary = format!(
+            "⏸️ Auto-merge is on but held: {}.",
+            if cfg.require_human_approval && !human_ok {
+                "waiting on a human approval (two-key)"
+            } else {
+                "gate not satisfied"
+            }
+        );
+        return report;
+    }
+
+    // ── Merge (SHA-guarded) ──
+    match github
+        .merge_pull_request(owner, repo, pr_number, head_sha, &cfg.merge_method)
+        .await
+    {
+        Ok(true) => {
+            report.merged = true;
+            info!(pr_number, "Reviewer auto-merged PR");
+        }
+        Ok(false) => {
+            report.summary =
+                "⏸️ Auto-merge skipped: the PR isn't mergeable or a new commit landed after the \
+                 review (head moved). Re-run the review on the latest commit."
+                    .to_string();
+            return report;
+        }
+        Err(e) => {
+            warn!(pr_number, error = %e, "Auto-merge failed");
+            report.summary = format!("⚠️ Auto-merge failed: {e}");
+            return report;
+        }
+    }
+
+    let mut lines = vec![format!(
+        "✅ Merged `{}` into `{base_branch}` via {}.",
+        &head_sha[..head_sha.len().min(7)],
+        cfg.merge_method
+    )];
+
+    // ── Tag ──
+    if cfg.auto_tag {
+        let tag = format!(
+            "{}{}",
+            cfg.tag_prefix,
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        );
+        match github.create_tag_ref(owner, repo, &tag, head_sha).await {
+            Ok(_) => {
+                report.tag = Some(tag.clone());
+                lines.push(format!("🏷️ Tagged `{tag}`."));
+            }
+            Err(e) => {
+                warn!(pr_number, error = %e, "Auto-tag failed");
+                lines.push(format!("⚠️ Tag failed: {e}"));
+            }
+        }
+    }
+
+    // ── Health guard ──
+    if cfg.health_check {
+        let health = run_health_guard(state, github, owner, repo, base_branch, &cfg).await;
+        lines.push(health.line.clone());
+        report.health = Some(health.status.clone());
+    }
+
+    report.summary = format!("### 🚀 Post-approval actions\n\n{}", lines.join("\n"));
+    report
+}
+
+struct HealthResult {
+    status: String,
+    line: String,
+}
+
+/// Watch CI check runs on the base branch (and optional CloudWatch groups) for a
+/// bounded window after the merge, then classify. Reports only — never reverts.
+async fn run_health_guard(
+    state: &WorkerState,
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    base_branch: &str,
+    cfg: &OnApproveConfig,
+) -> HealthResult {
+    let started = chrono::Utc::now().timestamp_millis();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(cfg.health_wait_secs);
+
+    // Poll base-branch CI: bail early on a failure, otherwise wait for completion.
+    let mut ci_status =
+        "inconclusive (checks still running when the watch window ended)".to_string();
+    loop {
+        match github
+            .list_check_runs_for_ref(owner, repo, base_branch)
+            .await
+        {
+            Ok(v) => {
+                let runs = v["check_runs"].as_array().cloned().unwrap_or_default();
+                let mut any_running = false;
+                let mut failed: Vec<String> = vec![];
+                for r in &runs {
+                    let name = r["name"].as_str().unwrap_or("check").to_string();
+                    let completed = r["status"].as_str() == Some("completed");
+                    if !completed {
+                        any_running = true;
+                        continue;
+                    }
+                    match r["conclusion"].as_str().unwrap_or("") {
+                        "failure" | "timed_out" | "cancelled" | "startup_failure" => {
+                            failed.push(name)
+                        }
+                        _ => {}
+                    }
+                }
+                if !failed.is_empty() {
+                    ci_status = format!("FAILING: {}", failed.join(", "));
+                    break;
+                }
+                if !any_running && !runs.is_empty() {
+                    ci_status = "green".to_string();
+                    break;
+                }
+            }
+            Err(e) => warn!(error = %e, "Health guard: check-runs poll failed"),
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    }
+
+    // Optional CloudWatch error scan since the merge instant.
+    let mut log_note = String::new();
+    if !cfg.health_log_groups.is_empty() {
+        let mut total = 0u64;
+        for group in &cfg.health_log_groups {
+            match state
+                .logs
+                .filter_log_events()
+                .log_group_name(group)
+                .start_time(started)
+                .filter_pattern("?ERROR ?Error ?Exception ?panic")
+                .limit(50)
+                .send()
+                .await
+            {
+                Ok(out) => total += out.events().len() as u64,
+                Err(e) => warn!(group, error = %e, "Health guard: log scan failed"),
+            }
+        }
+        log_note = format!(
+            " · {total} error-like log line(s) in {} group(s) post-merge",
+            cfg.health_log_groups.len()
+        );
+    }
+
+    let healthy = ci_status == "green"
+        && (cfg.health_log_groups.is_empty() || !log_note.contains("error-like log line(s)"));
+    // A non-zero error count makes it non-green even if CI is green.
+    let has_errors = log_note.contains("error-like") && !log_note.contains(" 0 error-like");
+    if ci_status.starts_with("FAILING") || has_errors {
+        HealthResult {
+            status: "unhealthy".to_string(),
+            line: format!(
+                "🔴 **Health check FAILED after merge** — CI: {ci_status}{log_note}. \
+                 A human should review whether to roll back."
+            ),
+        }
+    } else if healthy {
+        HealthResult {
+            status: "healthy".to_string(),
+            line: format!("💚 Health check passed — CI green{log_note}."),
+        }
+    } else {
+        HealthResult {
+            status: "inconclusive".to_string(),
+            line: format!("🟡 Health check inconclusive — CI {ci_status}{log_note}."),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(auto_merge: bool, require_human: bool) -> OnApproveConfig {
+        OnApproveConfig {
+            auto_merge,
+            require_human_approval: require_human,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_merge_when_disabled() {
+        assert!(!should_merge(&cfg(false, false), true, true));
+    }
+
+    #[test]
+    fn no_merge_when_verdict_not_approve() {
+        assert!(!should_merge(&cfg(true, false), false, true));
+    }
+
+    #[test]
+    fn two_key_blocks_without_human() {
+        // auto_merge on, but require_human_approval and no human ⇒ no merge.
+        assert!(!should_merge(&cfg(true, true), true, false));
+    }
+
+    #[test]
+    fn two_key_allows_with_human() {
+        assert!(should_merge(&cfg(true, true), true, true));
+    }
+
+    #[test]
+    fn merges_when_human_gate_disabled() {
+        assert!(should_merge(&cfg(true, false), true, false));
+    }
+
+    #[test]
+    fn defaults_are_all_safe() {
+        let d = OnApproveConfig::default();
+        assert!(!d.auto_merge);
+        assert!(!d.auto_tag);
+        assert!(!d.health_check);
+        assert!(d.require_human_approval);
+        assert!(!should_merge(&d, true, true));
+    }
+}

@@ -114,6 +114,28 @@ pub enum WorkerMessage {
     InfraAnalyze(InfraAnalyzeMessage),
     #[serde(rename = "resume")]
     Resume(ResumeMessage),
+    #[serde(rename = "review")]
+    Review(ReviewMessage),
+}
+
+/// A label-triggered code-review job for an existing PR. Keyed by (pr_number,
+/// head_sha) so re-labels and new commits are idempotent per commit.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ReviewMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub head_sha: String,
+    pub label: String,
+    /// Present when a human replied asking a question — the pass answers instead
+    /// of posting a verdict. Empty/None → normal verdict review.
+    #[serde(default)]
+    pub question: Option<String>,
+    /// What triggered the review: "label" | "synchronize" | "reply". Audit only.
+    #[serde(default)]
+    pub trigger: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

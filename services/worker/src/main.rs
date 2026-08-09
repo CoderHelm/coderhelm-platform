@@ -196,6 +196,12 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("Resume failed: {e:?}");
                 }
             }
+            models::WorkerMessage::Review(msg) => {
+                info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), pr = msg.pr_number, "Reviewing PR from label");
+                if let Err(e) = passes::review_pr::run(&state, msg).await {
+                    error!("Review failed: {e:?}");
+                }
+            }
         }
     }
 
