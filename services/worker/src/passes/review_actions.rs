@@ -27,6 +27,10 @@ pub struct OnApproveConfig {
     /// Even with auto_merge, require a human APPROVED review too (two-key).
     pub require_human_approval: bool,
     pub auto_tag: bool,
+    /// "semver" → cut the next patch release (e.g. v1.2.3 → v1.2.4); "date" →
+    /// a timestamp marker tag. Default semver, so `tag_prefix` "v" produces a
+    /// real release version, not a datestamp wearing a version's prefix.
+    pub tag_mode: String,
     pub tag_prefix: String,
     /// Watch CI on the base branch after merge.
     pub health_check: bool,
@@ -44,6 +48,7 @@ impl Default for OnApproveConfig {
             merge_method: "squash".to_string(),
             require_human_approval: true,
             auto_tag: false,
+            tag_mode: "semver".to_string(),
             tag_prefix: "v".to_string(),
             health_check: false,
             health_wait_secs: 90,
@@ -81,6 +86,12 @@ impl OnApproveConfig {
             .map(|s| s.to_string())
             .filter(|s| matches!(s.as_str(), "squash" | "merge" | "rebase"))
             .unwrap_or(d.merge_method);
+        let tag_mode = item
+            .get("tag_mode")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.to_string())
+            .filter(|s| matches!(s.as_str(), "semver" | "date"))
+            .unwrap_or(d.tag_mode);
         let tag_prefix = item
             .get("tag_prefix")
             .and_then(|v| v.as_s().ok())
@@ -106,6 +117,7 @@ impl OnApproveConfig {
             merge_method,
             require_human_approval: get_bool("require_human_approval", d.require_human_approval),
             auto_tag: get_bool("auto_tag", d.auto_tag),
+            tag_mode,
             tag_prefix,
             health_check: get_bool("health_check", d.health_check),
             health_wait_secs,
@@ -124,6 +136,36 @@ pub fn should_merge(cfg: &OnApproveConfig, verdict_approved: bool, human_approve
         return false;
     }
     true
+}
+
+/// Compute the next patch release tag from existing tags. Parses tags shaped
+/// `[prefix]MAJOR.MINOR.PATCH[-...]` (a bare `v` prefix is also tolerated),
+/// finds the highest version, and bumps PATCH. With no existing semver tag it
+/// seeds `{prefix}0.1.0`. Pure — unit-tested without any network.
+pub fn next_semver_tag(existing: &[String], prefix: &str) -> String {
+    fn parse(tag: &str, prefix: &str) -> Option<(u64, u64, u64)> {
+        let core = tag
+            .strip_prefix(prefix)
+            .or_else(|| tag.strip_prefix('v'))
+            .unwrap_or(tag);
+        // Drop any pre-release/build suffix (e.g. -rc1, +build).
+        let core = core.split(['-', '+']).next().unwrap_or(core);
+        let mut it = core.split('.');
+        let maj = it.next()?.parse::<u64>().ok()?;
+        let min = it.next()?.parse::<u64>().ok()?;
+        let patch = it.next()?.parse::<u64>().ok()?;
+        // Reject trailing junk like "1.2.3.4".
+        if it.next().is_some() {
+            return None;
+        }
+        Some((maj, min, patch))
+    }
+
+    let highest = existing.iter().filter_map(|t| parse(t, prefix)).max();
+    match highest {
+        Some((maj, min, patch)) => format!("{prefix}{maj}.{min}.{}", patch + 1),
+        None => format!("{prefix}0.1.0"),
+    }
 }
 
 /// Outcome of the post-approval sequence, surfaced into the review record and a
@@ -229,11 +271,28 @@ pub async fn run_on_approve(
 
     // ── Tag ──
     if cfg.auto_tag {
-        let tag = format!(
-            "{}{}",
-            cfg.tag_prefix,
-            chrono::Utc::now().format("%Y%m%d-%H%M%S")
-        );
+        let tag = if cfg.tag_mode == "date" {
+            // Explicit datestamp marker — NOT a version; caller sets the prefix.
+            format!(
+                "{}{}",
+                cfg.tag_prefix,
+                chrono::Utc::now().format("%Y%m%d-%H%M%S")
+            )
+        } else {
+            // semver: cut the next patch release from the repo's existing tags.
+            let existing: Vec<String> = github
+                .list_tags(owner, repo)
+                .await
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            next_semver_tag(&existing, &cfg.tag_prefix)
+        };
         match github.create_tag_ref(owner, repo, &tag, head_sha).await {
             Ok(_) => {
                 report.tag = Some(tag.clone());
@@ -413,6 +472,48 @@ mod tests {
         assert!(!d.auto_tag);
         assert!(!d.health_check);
         assert!(d.require_human_approval);
+        assert_eq!(d.tag_mode, "semver");
         assert!(!should_merge(&d, true, true));
+    }
+
+    #[test]
+    fn semver_bumps_the_highest_patch() {
+        let tags = vec!["v1.2.3".into(), "v1.2.9".into(), "v1.2.4".into()];
+        assert_eq!(next_semver_tag(&tags, "v"), "v1.2.10");
+    }
+
+    #[test]
+    fn semver_picks_highest_across_minor_and_major() {
+        let tags = vec!["v1.9.9".into(), "v2.0.1".into(), "v1.10.0".into()];
+        assert_eq!(next_semver_tag(&tags, "v"), "v2.0.2");
+    }
+
+    #[test]
+    fn semver_seeds_when_no_tags() {
+        assert_eq!(next_semver_tag(&[], "v"), "v0.1.0");
+    }
+
+    #[test]
+    fn semver_ignores_non_version_and_prerelease_tags() {
+        let tags = vec![
+            "nightly".into(),
+            "release-candidate".into(),
+            "v1.0.0-rc1".into(),
+            "1.0.0".into(), // bare, no prefix — still parsed
+        ];
+        // Highest parseable is 1.0.0 (rc1 stripped to 1.0.0 too) → bump patch.
+        assert_eq!(next_semver_tag(&tags, "v"), "v1.0.1");
+    }
+
+    #[test]
+    fn semver_rejects_four_part_versions() {
+        let tags = vec!["v1.2.3.4".into(), "v0.5.0".into()];
+        assert_eq!(next_semver_tag(&tags, "v"), "v0.5.1");
+    }
+
+    #[test]
+    fn semver_honors_custom_prefix() {
+        let tags = vec!["rel-2.3.4".into()];
+        assert_eq!(next_semver_tag(&tags, "rel-"), "rel-2.3.5");
     }
 }

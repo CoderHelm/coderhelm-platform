@@ -99,6 +99,7 @@ pub async fn get_config(
         "merge_method": item_str(&item, "merge_method", "squash"),
         "require_human_approval": item_bool(&item, "require_human_approval", true),
         "auto_tag": item_bool(&item, "auto_tag", false),
+        "tag_mode": item_str(&item, "tag_mode", "semver"),
         "tag_prefix": item_str(&item, "tag_prefix", "v"),
         "health_check": item_bool(&item, "health_check", false),
         "health_wait_secs": item_num(&item, "health_wait_secs", 90),
@@ -134,6 +135,10 @@ pub async fn update_config(
     let merge_method = match body["merge_method"].as_str().unwrap_or("squash") {
         m @ ("squash" | "merge" | "rebase") => m,
         _ => "squash",
+    };
+    let tag_mode = match body["tag_mode"].as_str().unwrap_or("semver") {
+        m @ ("semver" | "date") => m,
+        _ => "semver",
     };
     let tag_prefix = {
         let t = body["tag_prefix"].as_str().unwrap_or("v");
@@ -184,6 +189,7 @@ pub async fn update_config(
             "auto_tag",
             attr_bool(body["auto_tag"].as_bool().unwrap_or(false)),
         )
+        .item("tag_mode", attr_s(tag_mode))
         .item("tag_prefix", attr_s(tag_prefix))
         .item(
             "health_check",

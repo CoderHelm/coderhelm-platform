@@ -1478,6 +1478,16 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// List tags on a repo (used to compute the next semver release tag).
+    pub async fn list_tags(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/tags?per_page=100");
+        self.get(&url).await
+    }
+
     /// Create a lightweight tag ref pointing at `sha` (e.g. a release tag after
     /// an approved merge). Idempotency is the caller's job — GitHub 422s on a
     /// ref that already exists.
