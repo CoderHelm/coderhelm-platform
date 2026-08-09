@@ -1466,6 +1466,18 @@ impl GitHubClient {
         }
     }
 
+    /// List open PRs for a repo (newest first), used by the review-reminder sweep.
+    pub async fn list_open_pulls(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/pulls?state=open&sort=created&direction=desc&per_page=100"
+        );
+        self.get(&url).await
+    }
+
     /// List submitted reviews on a PR (used by the two-key auto-merge gate to
     /// confirm a human approval exists alongside the bot's).
     pub async fn list_pr_reviews(

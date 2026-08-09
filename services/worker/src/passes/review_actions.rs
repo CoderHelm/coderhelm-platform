@@ -127,12 +127,19 @@ impl OnApproveConfig {
 }
 
 /// Pure gate: may we auto-merge? Kept separate so the decision is unit-testable
-/// without any network. Fail-safe: anything other than an explicit yes is a no.
-pub fn should_merge(cfg: &OnApproveConfig, verdict_approved: bool, human_approved: bool) -> bool {
-    if !cfg.auto_merge || !verdict_approved {
+/// without any network. `require_human` is passed explicitly (not read from cfg)
+/// because a self-authored PR forces it on regardless of config. Fail-safe:
+/// anything other than an explicit yes is a no.
+pub fn should_merge(
+    auto_merge: bool,
+    require_human: bool,
+    verdict_approved: bool,
+    human_approved: bool,
+) -> bool {
+    if !auto_merge || !verdict_approved {
         return false;
     }
-    if cfg.require_human_approval && !human_approved {
+    if require_human && !human_approved {
         return false;
     }
     true
@@ -214,6 +221,7 @@ pub async fn run_on_approve(
     pr_number: u64,
     head_sha: &str,
     base_branch: &str,
+    self_authored: bool,
 ) -> ActionReport {
     let cfg = OnApproveConfig::load(state, team_id, owner, repo).await;
     let mut report = ActionReport::default();
@@ -222,16 +230,19 @@ pub async fn run_on_approve(
         return report; // nothing configured
     }
 
-    let human_ok = if cfg.require_human_approval {
+    // A self-authored (CoderHelm's own) PR ALWAYS requires a human approval —
+    // the bot's own approval can't be the second key — regardless of config.
+    let require_human = cfg.require_human_approval || self_authored;
+    let human_ok = if require_human {
         human_approval_present(github, owner, repo, pr_number).await
     } else {
         true
     };
 
-    if !should_merge(&cfg, true, human_ok) {
+    if !should_merge(cfg.auto_merge, require_human, true, human_ok) {
         report.summary = format!(
             "⏸️ Auto-merge is on but held: {}.",
-            if cfg.require_human_approval && !human_ok {
+            if require_human && !human_ok {
                 "waiting on a human approval (two-key)"
             } else {
                 "gate not satisfied"
@@ -431,38 +442,39 @@ async fn run_health_guard(
 mod tests {
     use super::*;
 
-    fn cfg(auto_merge: bool, require_human: bool) -> OnApproveConfig {
-        OnApproveConfig {
-            auto_merge,
-            require_human_approval: require_human,
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn no_merge_when_disabled() {
-        assert!(!should_merge(&cfg(false, false), true, true));
+        assert!(!should_merge(false, false, true, true));
     }
 
     #[test]
     fn no_merge_when_verdict_not_approve() {
-        assert!(!should_merge(&cfg(true, false), false, true));
+        assert!(!should_merge(true, false, false, true));
     }
 
     #[test]
     fn two_key_blocks_without_human() {
-        // auto_merge on, but require_human_approval and no human ⇒ no merge.
-        assert!(!should_merge(&cfg(true, true), true, false));
+        // auto_merge on, but require_human and no human ⇒ no merge.
+        assert!(!should_merge(true, true, true, false));
     }
 
     #[test]
     fn two_key_allows_with_human() {
-        assert!(should_merge(&cfg(true, true), true, true));
+        assert!(should_merge(true, true, true, true));
     }
 
     #[test]
     fn merges_when_human_gate_disabled() {
-        assert!(should_merge(&cfg(true, false), true, false));
+        assert!(should_merge(true, false, true, false));
+    }
+
+    #[test]
+    fn bot_pr_forces_human_even_when_config_off() {
+        // review_pr computes require_human = cfg.require_human_approval || self_authored.
+        // So a bot PR (self_authored) forces require_human=true even if config is off:
+        let require_human = false || true; // config off, but self-authored
+        assert!(!should_merge(true, require_human, true, false)); // no human → blocked
+        assert!(should_merge(true, require_human, true, true)); // human approved → ok
     }
 
     #[test]
@@ -473,7 +485,12 @@ mod tests {
         assert!(!d.health_check);
         assert!(d.require_human_approval);
         assert_eq!(d.tag_mode, "semver");
-        assert!(!should_merge(&d, true, true));
+        assert!(!should_merge(
+            d.auto_merge,
+            d.require_human_approval,
+            true,
+            true
+        ));
     }
 
     #[test]

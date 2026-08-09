@@ -116,6 +116,10 @@ pub enum WorkerMessage {
     Resume(ResumeMessage),
     #[serde(rename = "review")]
     Review(ReviewMessage),
+    /// Periodic sweep (EventBridge → SQS) that nudges Teams about PRs awaiting
+    /// review. Carries no fields — the sweep scans per-repo reviewer config.
+    #[serde(rename = "review_reminder")]
+    ReviewReminder,
 }
 
 /// A label-triggered code-review job for an existing PR. Keyed by (pr_number,

@@ -327,7 +327,10 @@ pub async fn run(
     );
 
     // ── Post-approval actions (opt-in, off by default) ──
-    if meta.verdict == "APPROVE" && !self_authored {
+    if meta.verdict == "APPROVE" {
+        // Self-authored (CoderHelm's own) PRs CAN auto-merge, but run_on_approve
+        // forces the two-key human-approval gate on for them — the bot approving
+        // its own code is never the second key. Human PRs use the repo's config.
         let report = super::review_actions::run_on_approve(
             state,
             &github,
@@ -337,6 +340,7 @@ pub async fn run(
             msg.pr_number,
             &head_sha,
             base_branch,
+            self_authored,
         )
         .await;
         if !report.summary.is_empty() {
@@ -360,9 +364,97 @@ pub async fn run(
             )
             .await;
         }
+    } else if self_authored {
+        // CoderHelm reviewed its OWN PR and wants changes → hand the findings to
+        // the run's feedback loop so it applies the fixes (coderhelm reviews
+        // coderhelm → picks up the changes). A new commit re-triggers the review.
+        feed_review_back_to_run(state, &msg, &meta.body).await;
     }
 
     Ok(())
+}
+
+/// Route a self-review's requested changes into the originating run's feedback
+/// loop so CoderHelm fixes them. Best-effort: no run found (PR opened outside a
+/// tracked run) or no queue configured → a logged no-op, never an error.
+async fn feed_review_back_to_run(state: &WorkerState, msg: &ReviewMessage, review_body: &str) {
+    let Some(run_id) = lookup_run_by_pr(
+        state,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+    )
+    .await
+    else {
+        info!(
+            pr = msg.pr_number,
+            "Self-review requested changes but no run found — skipping feedback"
+        );
+        return;
+    };
+    if state.config.feedback_queue_url.is_empty() {
+        warn!("FEEDBACK_QUEUE_URL not set — cannot route self-review feedback");
+        return;
+    }
+    let body = serde_json::json!({
+        "type": "feedback",
+        "team_id": msg.team_id,
+        "installation_id": msg.installation_id,
+        "run_id": run_id,
+        "repo_owner": msg.repo_owner,
+        "repo_name": msg.repo_name,
+        "pr_number": msg.pr_number,
+        "review_id": 0,
+        "review_body": format!("Automated reviewer requested changes:\n\n{review_body}"),
+        "comments": [],
+    });
+    match state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.feedback_queue_url)
+        .message_body(body.to_string())
+        .send()
+        .await
+    {
+        Ok(_) => info!(
+            pr = msg.pr_number,
+            run_id = %run_id,
+            "Reviewer requested changes on own PR → fed back to run"
+        ),
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "Failed to enqueue self-review feedback")
+        }
+    }
+}
+
+/// Newest run for a PR, via the runs-table repo-index GSI. None if untracked.
+async fn lookup_run_by_pr(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+) -> Option<String> {
+    let team_repo = format!("{team_id}#{owner}/{name}");
+    let result = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .index_name("repo-index")
+        .key_condition_expression("team_repo = :tr")
+        .filter_expression("pr_number = :pn")
+        .expression_attribute_values(":tr", attr_s(&team_repo))
+        .expression_attribute_values(":pn", attr_n(pr_number))
+        .scan_index_forward(false)
+        .limit(50)
+        .send()
+        .await
+        .ok()?;
+    result
+        .items()
+        .iter()
+        .find_map(|it| it.get("run_id").and_then(|v| v.as_s().ok()).cloned())
 }
 
 /// Persist a review record to the settings table so the dashboard can list it and

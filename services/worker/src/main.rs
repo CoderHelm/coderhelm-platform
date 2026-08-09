@@ -202,6 +202,12 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("Review failed: {e:?}");
                 }
             }
+            models::WorkerMessage::ReviewReminder => {
+                info!("Running review-reminder sweep");
+                if let Err(e) = passes::review_reminder::run(&state).await {
+                    error!("Review reminder sweep failed: {e:?}");
+                }
+            }
         }
     }
 

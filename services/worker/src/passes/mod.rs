@@ -478,6 +478,7 @@ pub mod resume;
 mod review;
 pub mod review_actions;
 pub mod review_pr;
+pub mod review_reminder;
 mod security;
 pub mod syntax_check;
 #[allow(dead_code)]

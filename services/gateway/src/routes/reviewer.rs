@@ -104,6 +104,9 @@ pub async fn get_config(
         "health_check": item_bool(&item, "health_check", false),
         "health_wait_secs": item_num(&item, "health_wait_secs", 90),
         "health_log_groups": log_groups,
+        "reminders_enabled": item_bool(&item, "reminders_enabled", false),
+        "teams_webhook_url": item_str(&item, "teams_webhook_url", ""),
+        "reminder_cooldown_hours": item_num(&item, "reminder_cooldown_hours", 4),
     })))
 }
 
@@ -149,6 +152,22 @@ pub async fn update_config(
         }
     };
     let health_wait_secs = body["health_wait_secs"].as_u64().unwrap_or(90).min(300);
+    // Teams webhook: must be an https URL (or empty to disable). Guards against a
+    // config that would make the worker POST to an arbitrary/internal endpoint.
+    let teams_webhook_url = {
+        let u = body["teams_webhook_url"].as_str().unwrap_or("").trim();
+        if u.is_empty() {
+            ""
+        } else if u.starts_with("https://") && u.len() <= 500 {
+            u
+        } else {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    let reminder_cooldown_hours = body["reminder_cooldown_hours"]
+        .as_u64()
+        .unwrap_or(4)
+        .clamp(1, 168);
     let log_groups: Vec<AttributeValue> = body["health_log_groups"]
         .as_array()
         .map(|a| {
@@ -196,6 +215,12 @@ pub async fn update_config(
             attr_bool(body["health_check"].as_bool().unwrap_or(false)),
         )
         .item("health_wait_secs", attr_n(health_wait_secs))
+        .item(
+            "reminders_enabled",
+            attr_bool(body["reminders_enabled"].as_bool().unwrap_or(false)),
+        )
+        .item("teams_webhook_url", attr_s(teams_webhook_url))
+        .item("reminder_cooldown_hours", attr_n(reminder_cooldown_hours))
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()));
     put = put.item("health_log_groups", AttributeValue::L(log_groups));
 
