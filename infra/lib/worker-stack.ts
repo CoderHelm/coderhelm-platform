@@ -346,22 +346,8 @@ export class WorkerStack extends cdk.Stack {
       schedule: events.Schedule.rate(cdk.Duration.minutes(10)),
       targets: [new targets.LambdaFunction(cleanupFunction)],
     });
-
-    // Review-reminder sweep: every 20 min, drop a constant message on the ticket
-    // queue; the worker's ReviewReminder handler scans repos with reminders
-    // configured and nudges their Teams webhook about PRs still awaiting review.
-    // (Reuses the worker Lambda — no new function/IAM.) SqsQueue target grants
-    // the rule send permission automatically.
-    new events.Rule(this, "ReviewReminderSchedule", {
-      ruleName: `${prefix}-review-reminder`,
-      schedule: events.Schedule.rate(cdk.Duration.minutes(20)),
-      targets: [
-        new targets.SqsQueue(props.ticketQueue, {
-          message: events.RuleTargetInput.fromObject({
-            type: "review_reminder",
-          }),
-        }),
-      ],
-    });
+    // NOTE: the review-reminder EventBridge → SQS schedule lives in the API stack
+    // (where the ticket queue is defined). Putting it here created a worker→api
+    // dependency cycle (api already depends on worker).
   }
 }
