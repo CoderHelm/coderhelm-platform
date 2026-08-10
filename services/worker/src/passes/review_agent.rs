@@ -44,8 +44,6 @@ pub struct ReviewOutput {
     #[serde(default)]
     pub verdict: String,
     #[serde(default)]
-    pub risk: String,
-    #[serde(default)]
     pub summary: String,
     #[serde(default)]
     pub findings: Vec<Finding>,
@@ -346,13 +344,11 @@ pub async fn generate_review(
     match reply {
         Ok(text) => extract_json(&text).unwrap_or(ReviewOutput {
             verdict: "REQUEST_CHANGES".to_string(),
-            risk: "MEDIUM".to_string(),
             summary: common::head_tail_str(&text, 4000),
             findings: vec![],
         }),
         Err(e) => ReviewOutput {
             verdict: "REQUEST_CHANGES".to_string(),
-            risk: "HIGH".to_string(),
             summary: format!("Automated review could not complete ({e}). Requesting a human look."),
             findings: vec![],
         },
@@ -556,10 +552,10 @@ mod tests {
 
     #[test]
     fn extract_json_from_fenced_block() {
-        let reply = "here is my review\n```json\n{\"verdict\":\"APPROVE\",\"risk\":\"LOW\",\"summary\":\"ok\",\"findings\":[]}\n```";
+        let reply = "here is my review\n```json\n{\"verdict\":\"APPROVE\",\"summary\":\"ok\",\"findings\":[]}\n```";
         let out = extract_json(reply).unwrap();
         assert_eq!(out.verdict, "APPROVE");
-        assert_eq!(out.risk, "LOW");
+        assert_eq!(out.summary, "ok");
     }
 
     #[test]

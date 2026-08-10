@@ -12,7 +12,7 @@
 use crate::agent::provider::{self, ModelProvider};
 use crate::clients::github::GitHubClient;
 use crate::models::{ReviewMessage, TokenUsage};
-use crate::passes::{attr_n, attr_s, review_agent};
+use crate::passes::{attr_n, attr_s, review_agent, review_risk};
 use crate::WorkerState;
 use tracing::{info, warn};
 
@@ -208,14 +208,17 @@ pub async fn run(
     } else {
         "REQUEST_CHANGES"
     };
-    let risk = if matches!(
-        output.risk.to_ascii_uppercase().as_str(),
-        "LOW" | "MEDIUM" | "HIGH"
-    ) {
-        output.risk.to_ascii_uppercase()
-    } else {
-        "MEDIUM".to_string()
-    };
+    // Computed, explainable risk (blast-radius-weighted) — overrides the model's
+    // guess and drives the displayed level.
+    let risk_report = review_risk::assess(
+        &github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &head_sha,
+        &compare,
+    )
+    .await;
+    let risk = risk_report.level.to_string();
 
     // GitHub forbids APPROVE / REQUEST_CHANGES on your OWN PR → downgrade to COMMENT.
     let self_authored = pr_author.contains("coderhelm");
@@ -230,7 +233,7 @@ pub async fn run(
     } else {
         output.summary.clone()
     };
-    let mut full_body = format!("{verdict_line} · risk: **{risk}**\n\n{summary}");
+    let mut full_body = format!("{verdict_line}\n\n{summary}\n\n{}", risk_report.markdown());
     if !postable.unanchored_md.is_empty() {
         full_body.push_str(&format!(
             "\n\n#### Additional findings\n{}",
