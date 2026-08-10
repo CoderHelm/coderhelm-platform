@@ -1,7 +1,10 @@
 //! Armed auto-merge gate. Merges a PR only once BOTH keys are present — the
 //! bot's OWN latest verdict for this head is APPROVE (verified here, not assumed,
 //! since the gateway also arms on any human approval) + a human approval — AND
-//! every CI check is green. It waits (self-scheduling, bounded) for pending checks —
+//! every CI check is green. Once approvals are in, if the repo configures an
+//! (operator-set, never hardcoded) deploy label, the gate ADDS it so the repo's
+//! own CI deploys to staging/preview, then waits for that deploy's CI before
+//! merging. It waits (self-scheduling, bounded) for pending checks —
 //! e.g. a Terraform staging-apply — and NEVER merges on failing or still-running
 //! CI. Bound to the reviewed head: a later commit aborts (the fresh review
 //! re-arms). Reuses the two-key + post-merge (tag/health) logic from review_actions.
@@ -185,10 +188,75 @@ pub async fn run(
         &msg.head_sha,
     )
     .await;
-    let gate_ok = should_merge(cfg.auto_merge, require_human, bot_approved, human_present);
-    let ci = ci_state(&github, owner, repo, &msg.head_sha).await;
+    // Gate 1 — approvals. Until BOTH keys are in (bot APPROVE + human approval),
+    // just keep waiting: never touch CI or add a deploy label on an unapproved PR.
+    if !should_merge(cfg.auto_merge, require_human, bot_approved, human_present) {
+        wait_more(state, &msg).await;
+        return Ok(());
+    }
 
-    match ci {
+    // Gate 2 — optional deploy label. Now that the PR is cleared to merge, add the
+    // operator-configured label (if any) so the repo's OWN CI deploys to
+    // staging/preview, then wait a tick for that CI to register before we judge
+    // it. Idempotent — if the label is already present we fall through to the CI
+    // check. Never merges as a side effect here.
+    if !cfg.deploy_label.is_empty() {
+        let has_label = pr["labels"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .any(|l| l["name"].as_str() == Some(cfg.deploy_label.as_str()))
+            })
+            .unwrap_or(false);
+        if !has_label {
+            match github
+                .add_labels(
+                    owner,
+                    repo,
+                    msg.pr_number,
+                    std::slice::from_ref(&cfg.deploy_label),
+                )
+                .await
+            {
+                Ok(_) => {
+                    let _ = github
+                        .create_issue_comment(
+                            owner,
+                            repo,
+                            msg.pr_number,
+                            &format!(
+                                "🏷️ Cleared to merge — added the `{}` label to kick off the deploy. \
+                                 I'll merge once that deploy's CI passes.",
+                                cfg.deploy_label
+                            ),
+                        )
+                        .await;
+                    info!(pr = msg.pr_number, label = %cfg.deploy_label, "await-merge: added deploy label");
+                }
+                Err(e) => {
+                    warn!(pr = msg.pr_number, error = %e, "await-merge: failed to add deploy label");
+                    let _ = github
+                        .create_issue_comment(
+                            owner,
+                            repo,
+                            msg.pr_number,
+                            &format!(
+                                "⚠️ Couldn't add the deploy label `{}`: {e}",
+                                cfg.deploy_label
+                            ),
+                        )
+                        .await;
+                }
+            }
+            // Give the label-triggered deploy CI time to register before judging
+            // CI, so we don't see the pre-deploy checks as green and merge early.
+            wait_more(state, &msg).await;
+            return Ok(());
+        }
+    }
+
+    // Gate 3 — all CI green (now includes the deploy CI the label triggered).
+    match ci_state(&github, owner, repo, &msg.head_sha).await {
         Ci::Failing(names) => {
             let _ = github
                 .create_issue_comment(
@@ -203,7 +271,7 @@ pub async fn run(
                 .await;
             info!(pr = msg.pr_number, "await-merge: CI failing, aborted");
         }
-        Ci::Green if gate_ok => {
+        Ci::Green => {
             match github
                 .merge_pull_request(owner, repo, msg.pr_number, &msg.head_sha, &cfg.merge_method)
                 .await
@@ -256,19 +324,24 @@ pub async fn run(
                 }
             }
         }
-        // Pending CI or missing human approval → keep waiting (bounded).
-        _ => {
-            if msg.attempts < MAX_ATTEMPTS {
-                send(state, &msg, msg.attempts + 1, RETRY_DELAY_SECS).await;
-            } else {
-                info!(
-                    pr = msg.pr_number,
-                    "await-merge: gave up after cap (still waiting on CI/approval)"
-                );
-            }
+        // CI still running → keep waiting (bounded).
+        Ci::Pending => {
+            wait_more(state, &msg).await;
         }
     }
     Ok(())
+}
+
+/// Re-enqueue the gate for another tick, or give up once the attempt bound is hit.
+async fn wait_more(state: &WorkerState, msg: &AwaitMergeMessage) {
+    if msg.attempts < MAX_ATTEMPTS {
+        send(state, msg, msg.attempts + 1, RETRY_DELAY_SECS).await;
+    } else {
+        info!(
+            pr = msg.pr_number,
+            "await-merge: gave up after cap (still waiting on approval/deploy/CI)"
+        );
+    }
 }
 
 /// Arm the gate for a PR (called at review time and on a human approval). Returns

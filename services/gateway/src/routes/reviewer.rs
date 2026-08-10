@@ -103,6 +103,7 @@ pub async fn get_config(
         "tag_prefix": item_str(&item, "tag_prefix", "v"),
         "health_check": item_bool(&item, "health_check", false),
         "verify_tests": item_bool(&item, "verify_tests", false),
+        "deploy_label": item_str(&item, "deploy_label", ""),
         "health_log_groups": log_groups,
         "reminders_enabled": item_bool(&item, "reminders_enabled", false),
         "teams_webhook_url": item_str(&item, "teams_webhook_url", ""),
@@ -151,6 +152,16 @@ pub async fn update_config(
             t
         }
     };
+    // Optional deploy label the reviewer adds once a PR is cleared to merge (to
+    // trigger the repo's own deploy CI). Operator-set free text; trimmed and
+    // capped to GitHub's 50-char label limit. Empty = no label step.
+    let deploy_label: String = body["deploy_label"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(50)
+        .collect();
     // Teams webhook: must be an https URL (or empty to disable). Guards against a
     // config that would make the worker POST to an arbitrary/internal endpoint.
     let teams_webhook_url = {
@@ -217,6 +228,7 @@ pub async fn update_config(
             "verify_tests",
             attr_bool(body["verify_tests"].as_bool().unwrap_or(false)),
         )
+        .item("deploy_label", attr_s(&deploy_label))
         .item(
             "reminders_enabled",
             attr_bool(body["reminders_enabled"].as_bool().unwrap_or(false)),
