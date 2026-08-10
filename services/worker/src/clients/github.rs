@@ -1361,6 +1361,21 @@ impl GitHubClient {
         self.patch(&url, &serde_json::json!({"body": body})).await
     }
 
+    /// Add one or more labels to an issue/PR. Additive (GitHub keeps existing
+    /// labels) and creates any label that doesn't exist yet. Used to hand a PR
+    /// off to the repo's own label-triggered CI (e.g. a deploy workflow).
+    pub async fn add_labels(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        labels: &[String],
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/labels");
+        self.post(&url, &serde_json::json!({ "labels": labels }))
+            .await
+    }
+
     // ─── Pull requests ─────────────────────────────────────────
 
     /// Get a single pull request.

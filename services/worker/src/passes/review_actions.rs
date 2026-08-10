@@ -34,6 +34,12 @@ pub struct OnApproveConfig {
     pub tag_prefix: String,
     /// Schedule the async, baseline-aware post-merge health check.
     pub health_check: bool,
+    /// Optional label to ADD to the PR once it's cleared to merge (all approvals
+    /// in), before merging. The repo's own CI is expected to react to it (e.g. a
+    /// deploy-to-staging / deploy-preview workflow); the merge gate then waits for
+    /// that CI to go green before merging. Empty = no label step. The value is
+    /// operator-configured per repo — never hardcoded here.
+    pub deploy_label: String,
 }
 
 impl Default for OnApproveConfig {
@@ -46,6 +52,7 @@ impl Default for OnApproveConfig {
             tag_mode: "semver".to_string(),
             tag_prefix: "v".to_string(),
             health_check: false,
+            deploy_label: String::new(),
         }
     }
 }
@@ -90,6 +97,11 @@ impl OnApproveConfig {
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or(d.tag_prefix);
+        let deploy_label = item
+            .get("deploy_label")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or(d.deploy_label);
         Self {
             auto_merge: get_bool("auto_merge", d.auto_merge),
             merge_method,
@@ -98,6 +110,7 @@ impl OnApproveConfig {
             tag_mode,
             tag_prefix,
             health_check: get_bool("health_check", d.health_check),
+            deploy_label,
         }
     }
 }
