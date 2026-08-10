@@ -214,6 +214,12 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("Health check failed: {e:?}");
                 }
             }
+            models::WorkerMessage::AwaitMerge(msg) => {
+                info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Armed auto-merge check");
+                if let Err(e) = passes::await_merge::run(&state, msg).await {
+                    error!("Await-merge failed: {e:?}");
+                }
+            }
         }
     }
 

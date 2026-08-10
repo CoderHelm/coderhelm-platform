@@ -15,7 +15,7 @@
 
 use crate::clients::github::GitHubClient;
 use crate::WorkerState;
-use tracing::{info, warn};
+use tracing::warn;
 
 /// Per-repo post-approval config, read from the same REVIEW_CONFIG item the
 /// reviewer core uses. Every field defaults to the SAFE value (no action).
@@ -155,15 +155,17 @@ pub fn next_semver_tag(existing: &[String], prefix: &str) -> String {
 /// PR comment.
 #[derive(Debug, Default)]
 pub struct ActionReport {
-    pub merged: bool,
-    pub tag: Option<String>,
-    pub health: Option<String>,
     /// Human-readable markdown summary for the PR comment; empty ⇒ nothing done.
     pub summary: String,
 }
 
 /// Is there at least one human APPROVED review on the PR (not the bot's)?
-async fn human_approval_present(github: &GitHubClient, owner: &str, repo: &str, pr: u64) -> bool {
+pub(crate) async fn human_approval_present(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+) -> bool {
     match github.list_pr_reviews(owner, repo, pr).await {
         Ok(v) => v
             .as_array()
@@ -184,9 +186,10 @@ async fn human_approval_present(github: &GitHubClient, owner: &str, repo: &str, 
     }
 }
 
-/// Run the merge → tag → health-guard sequence. Returns a report even when
-/// nothing is enabled (summary empty). Never panics; each step degrades to a
-/// note in the summary on error.
+/// On an APPROVE verdict, ARM the async auto-merge gate (if the repo enabled it).
+/// The actual merge happens in `await_merge` only once BOTH keys are present
+/// (bot APPROVE + human approval) AND every CI check is green — it waits for
+/// pending checks (e.g. a staging deploy) and never merges on failing CI.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_on_approve(
     state: &WorkerState,
@@ -202,72 +205,61 @@ pub async fn run_on_approve(
 ) -> ActionReport {
     let cfg = OnApproveConfig::load(state, team_id, owner, repo).await;
     let mut report = ActionReport::default();
-
     if !cfg.auto_merge {
         return report; // nothing configured
     }
-
-    // A self-authored (CoderHelm's own) PR ALWAYS requires a human approval —
-    // the bot's own approval can't be the second key — regardless of config.
-    let require_human = cfg.require_human_approval || self_authored;
-    let human_ok = if require_human {
-        human_approval_present(github, owner, repo, pr_number).await
-    } else {
-        true
-    };
-
-    if !should_merge(cfg.auto_merge, require_human, true, human_ok) {
-        report.summary = format!(
-            "⏸️ Auto-merge is on but held: {}.",
-            if require_human && !human_ok {
-                "waiting on a human approval (two-key)"
-            } else {
-                "gate not satisfied"
-            }
-        );
-        return report;
-    }
-
-    // ── Merge (SHA-guarded) ──
-    match github
-        .merge_pull_request(owner, repo, pr_number, head_sha, &cfg.merge_method)
-        .await
+    let _ = github; // arming reads config only; the gate re-fetches state each tick
+    if super::await_merge::arm(
+        state,
+        team_id,
+        installation_id,
+        owner,
+        repo,
+        pr_number,
+        head_sha,
+        base_branch,
+        self_authored,
+    )
+    .await
     {
-        Ok(true) => {
-            report.merged = true;
-            info!(pr_number, "Reviewer auto-merged PR");
-        }
-        Ok(false) => {
-            report.summary =
-                "⏸️ Auto-merge skipped: the PR isn't mergeable or a new commit landed after the \
-                 review (head moved). Re-run the review on the latest commit."
-                    .to_string();
-            return report;
-        }
-        Err(e) => {
-            warn!(pr_number, error = %e, "Auto-merge failed");
-            report.summary = format!("⚠️ Auto-merge failed: {e}");
-            return report;
-        }
+        report.summary =
+            "### 🚀 Auto-merge armed\n\n🤝 I'll merge this automatically once a human \
+             approves **and** every CI check passes — I wait for pending checks (like the staging \
+             deploy) and never merge on failing or still-running CI."
+                .to_string();
     }
+    report
+}
 
+/// Tag + schedule the post-merge health check after a successful merge. Returns
+/// markdown lines for the merge comment. Shared by the auto-merge gate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn post_merge_actions(
+    state: &WorkerState,
+    github: &GitHubClient,
+    cfg: &OnApproveConfig,
+    team_id: &str,
+    installation_id: u64,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    head_sha: &str,
+    base_branch: &str,
+) -> Vec<String> {
     let mut lines = vec![format!(
         "✅ Merged `{}` into `{base_branch}` via {}.",
         &head_sha[..head_sha.len().min(7)],
         cfg.merge_method
     )];
 
-    // ── Tag ──
     if cfg.auto_tag {
         let tag = if cfg.tag_mode == "date" {
-            // Explicit datestamp marker — NOT a version; caller sets the prefix.
             format!(
                 "{}{}",
                 cfg.tag_prefix,
                 chrono::Utc::now().format("%Y%m%d-%H%M%S")
             )
         } else {
-            // semver: cut the next patch release from the repo's existing tags.
             let existing: Vec<String> = github
                 .list_tags(owner, repo)
                 .await
@@ -282,10 +274,7 @@ pub async fn run_on_approve(
             next_semver_tag(&existing, &cfg.tag_prefix)
         };
         match github.create_tag_ref(owner, repo, &tag, head_sha).await {
-            Ok(_) => {
-                report.tag = Some(tag.clone());
-                lines.push(format!("🏷️ Tagged `{tag}`."));
-            }
+            Ok(_) => lines.push(format!("🏷️ Tagged `{tag}`.")),
             Err(e) => {
                 warn!(pr_number, error = %e, "Auto-tag failed");
                 lines.push(format!("⚠️ Tag failed: {e}"));
@@ -293,11 +282,7 @@ pub async fn run_on_approve(
         }
     }
 
-    // ── Health guard (async, baseline-aware) ──
     if cfg.health_check {
-        // Baseline = checks already failing at merge, so pre-existing failures are
-        // ignored ("not a previous error"). The check self-schedules until the
-        // deploy completes (no user-set timer) and reports only NEW failures.
         let baseline = super::health_check::failing_checks(github, owner, repo, base_branch).await;
         if super::health_check::schedule(
             state,
@@ -312,15 +297,12 @@ pub async fn run_on_approve(
         )
         .await
         {
-            report.health = Some("scheduled".to_string());
             lines.push(
                 "🩺 Post-merge health check scheduled — I'll watch the deploy checks and flag any NEW failures.".to_string(),
             );
         }
     }
-
-    report.summary = format!("### 🚀 Post-approval actions\n\n{}", lines.join("\n"));
-    report
+    lines
 }
 
 #[cfg(test)]

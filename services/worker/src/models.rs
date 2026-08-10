@@ -125,6 +125,29 @@ pub enum WorkerMessage {
     /// that are NEW vs. the pre-merge baseline.
     #[serde(rename = "health_check")]
     HealthCheck(HealthCheckMessage),
+    /// Armed auto-merge (self-scheduled). Merges the PR only once BOTH keys are
+    /// present (bot APPROVE + human approval) AND every CI check is green — waits
+    /// for pending checks (e.g. a staging deploy); never merges on failing CI.
+    #[serde(rename = "await_merge")]
+    AwaitMerge(AwaitMergeMessage),
+}
+
+/// An armed auto-merge job. Bound to the reviewed head; a later commit aborts it
+/// (the fresh review re-arms).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AwaitMergeMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub head_sha: String,
+    pub base_branch: String,
+    /// The PR is CoderHelm's own — forces the human-approval key on.
+    #[serde(default)]
+    pub self_authored: bool,
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 /// Post-merge health check job. Baseline = checks already failing at merge time,

@@ -1793,6 +1793,19 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// Combined legacy commit-status (external CI that posts statuses rather than
+    /// check-runs — e.g. a Terraform staging-apply status). Returns the roll-up
+    /// `state` ("success" | "pending" | "failure" | "error") + the per-context list.
+    pub async fn get_commit_status(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/commits/{git_ref}/status");
+        self.get(&url).await
+    }
+
     /// Fetch annotations from failed check runs on a branch — useful as fallback
     /// when workflow logs are inaccessible (403). Annotations contain lint errors,
     /// test failures, etc. with file paths and line numbers.
