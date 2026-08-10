@@ -467,6 +467,7 @@ fn has_time_for_remediation(start: &Instant) -> bool {
 
 pub mod feedback;
 pub mod formatter;
+pub mod health_check;
 mod implement;
 pub mod infra_analyze;
 pub mod onboard;
@@ -477,8 +478,10 @@ mod resolve;
 pub mod resume;
 mod review;
 pub mod review_actions;
+pub mod review_agent;
 pub mod review_pr;
 pub mod review_reminder;
+pub mod review_risk;
 mod security;
 pub mod syntax_check;
 #[allow(dead_code)]
@@ -4602,12 +4605,23 @@ const INSTRUCTION_FILES: &[&str] = &[
     ".github/instructions.md",
 ];
 
-/// Load repo-level instruction files (AGENTS.md, CLAUDE.md, copilot-instructions, etc.)
-/// from the GitHub repo. Returns combined content, capped at 16KB total.
+/// Load repo-level instruction files from the repo's default branch (HEAD).
 pub async fn load_repo_instructions(
     github: &crate::clients::github::GitHubClient,
     owner: &str,
     repo: &str,
+) -> String {
+    load_repo_instructions_at_ref(github, owner, repo, "HEAD").await
+}
+
+/// Load repo-level instruction files (AGENTS.md, CLAUDE.md, copilot-instructions, etc.)
+/// at a specific git ref. The reviewer reads them at the PR head so a PR that
+/// edits AGENTS.md is reviewed against its own new rules. Capped at 16KB total.
+pub async fn load_repo_instructions_at_ref(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
 ) -> String {
     const MAX_TOTAL_BYTES: usize = 16_000;
     let mut combined = String::new();
@@ -4616,7 +4630,7 @@ pub async fn load_repo_instructions(
         if combined.len() >= MAX_TOTAL_BYTES {
             break;
         }
-        match github.read_file(owner, repo, path, "HEAD").await {
+        match github.read_file(owner, repo, path, git_ref).await {
             Ok(content) if !content.trim().is_empty() => {
                 let remaining = MAX_TOTAL_BYTES.saturating_sub(combined.len());
                 let truncated: String = if content.len() > remaining {

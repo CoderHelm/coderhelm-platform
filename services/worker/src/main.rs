@@ -208,6 +208,12 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("Review reminder sweep failed: {e:?}");
                 }
             }
+            models::WorkerMessage::HealthCheck(msg) => {
+                info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Post-merge health check");
+                if let Err(e) = passes::health_check::run(&state, msg).await {
+                    error!("Health check failed: {e:?}");
+                }
+            }
         }
     }
 

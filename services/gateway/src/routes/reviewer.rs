@@ -102,7 +102,7 @@ pub async fn get_config(
         "tag_mode": item_str(&item, "tag_mode", "semver"),
         "tag_prefix": item_str(&item, "tag_prefix", "v"),
         "health_check": item_bool(&item, "health_check", false),
-        "health_wait_secs": item_num(&item, "health_wait_secs", 90),
+        "verify_tests": item_bool(&item, "verify_tests", false),
         "health_log_groups": log_groups,
         "reminders_enabled": item_bool(&item, "reminders_enabled", false),
         "teams_webhook_url": item_str(&item, "teams_webhook_url", ""),
@@ -151,7 +151,6 @@ pub async fn update_config(
             t
         }
     };
-    let health_wait_secs = body["health_wait_secs"].as_u64().unwrap_or(90).min(300);
     // Teams webhook: must be an https URL (or empty to disable). Guards against a
     // config that would make the worker POST to an arbitrary/internal endpoint.
     let teams_webhook_url = {
@@ -214,7 +213,10 @@ pub async fn update_config(
             "health_check",
             attr_bool(body["health_check"].as_bool().unwrap_or(false)),
         )
-        .item("health_wait_secs", attr_n(health_wait_secs))
+        .item(
+            "verify_tests",
+            attr_bool(body["verify_tests"].as_bool().unwrap_or(false)),
+        )
         .item(
             "reminders_enabled",
             attr_bool(body["reminders_enabled"].as_bool().unwrap_or(false)),

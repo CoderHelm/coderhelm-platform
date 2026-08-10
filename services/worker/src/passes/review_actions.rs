@@ -32,13 +32,8 @@ pub struct OnApproveConfig {
     /// real release version, not a datestamp wearing a version's prefix.
     pub tag_mode: String,
     pub tag_prefix: String,
-    /// Watch CI on the base branch after merge.
+    /// Schedule the async, baseline-aware post-merge health check.
     pub health_check: bool,
-    /// How long to watch, capped at 300s.
-    pub health_wait_secs: u64,
-    /// CloudWatch log groups to scan for an error spike after merge (optional;
-    /// only meaningful for repos that deploy into this AWS account).
-    pub health_log_groups: Vec<String>,
 }
 
 impl Default for OnApproveConfig {
@@ -51,8 +46,6 @@ impl Default for OnApproveConfig {
             tag_mode: "semver".to_string(),
             tag_prefix: "v".to_string(),
             health_check: false,
-            health_wait_secs: 90,
-            health_log_groups: vec![],
         }
     }
 }
@@ -97,21 +90,6 @@ impl OnApproveConfig {
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or(d.tag_prefix);
-        let health_wait_secs = item
-            .get("health_wait_secs")
-            .and_then(|v| v.as_n().ok())
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or(d.health_wait_secs)
-            .min(300);
-        let health_log_groups = item
-            .get("health_log_groups")
-            .and_then(|v| v.as_l().ok())
-            .map(|l| {
-                l.iter()
-                    .filter_map(|v| v.as_s().ok().cloned())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         Self {
             auto_merge: get_bool("auto_merge", d.auto_merge),
             merge_method,
@@ -120,8 +98,6 @@ impl OnApproveConfig {
             tag_mode,
             tag_prefix,
             health_check: get_bool("health_check", d.health_check),
-            health_wait_secs,
-            health_log_groups,
         }
     }
 }
@@ -216,6 +192,7 @@ pub async fn run_on_approve(
     state: &WorkerState,
     github: &GitHubClient,
     team_id: &str,
+    installation_id: u64,
     owner: &str,
     repo: &str,
     pr_number: u64,
@@ -316,126 +293,34 @@ pub async fn run_on_approve(
         }
     }
 
-    // ── Health guard ──
+    // ── Health guard (async, baseline-aware) ──
     if cfg.health_check {
-        let health = run_health_guard(state, github, owner, repo, base_branch, &cfg).await;
-        lines.push(health.line.clone());
-        report.health = Some(health.status.clone());
+        // Baseline = checks already failing at merge, so pre-existing failures are
+        // ignored ("not a previous error"). The check self-schedules until the
+        // deploy completes (no user-set timer) and reports only NEW failures.
+        let baseline = super::health_check::failing_checks(github, owner, repo, base_branch).await;
+        if super::health_check::schedule(
+            state,
+            team_id,
+            installation_id,
+            owner,
+            repo,
+            pr_number,
+            base_branch,
+            head_sha,
+            baseline,
+        )
+        .await
+        {
+            report.health = Some("scheduled".to_string());
+            lines.push(
+                "🩺 Post-merge health check scheduled — I'll watch the deploy checks and flag any NEW failures.".to_string(),
+            );
+        }
     }
 
     report.summary = format!("### 🚀 Post-approval actions\n\n{}", lines.join("\n"));
     report
-}
-
-struct HealthResult {
-    status: String,
-    line: String,
-}
-
-/// Watch CI check runs on the base branch (and optional CloudWatch groups) for a
-/// bounded window after the merge, then classify. Reports only — never reverts.
-async fn run_health_guard(
-    state: &WorkerState,
-    github: &GitHubClient,
-    owner: &str,
-    repo: &str,
-    base_branch: &str,
-    cfg: &OnApproveConfig,
-) -> HealthResult {
-    let started = chrono::Utc::now().timestamp_millis();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(cfg.health_wait_secs);
-
-    // Poll base-branch CI: bail early on a failure, otherwise wait for completion.
-    let mut ci_status =
-        "inconclusive (checks still running when the watch window ended)".to_string();
-    loop {
-        match github
-            .list_check_runs_for_ref(owner, repo, base_branch)
-            .await
-        {
-            Ok(v) => {
-                let runs = v["check_runs"].as_array().cloned().unwrap_or_default();
-                let mut any_running = false;
-                let mut failed: Vec<String> = vec![];
-                for r in &runs {
-                    let name = r["name"].as_str().unwrap_or("check").to_string();
-                    let completed = r["status"].as_str() == Some("completed");
-                    if !completed {
-                        any_running = true;
-                        continue;
-                    }
-                    match r["conclusion"].as_str().unwrap_or("") {
-                        "failure" | "timed_out" | "cancelled" | "startup_failure" => {
-                            failed.push(name)
-                        }
-                        _ => {}
-                    }
-                }
-                if !failed.is_empty() {
-                    ci_status = format!("FAILING: {}", failed.join(", "));
-                    break;
-                }
-                if !any_running && !runs.is_empty() {
-                    ci_status = "green".to_string();
-                    break;
-                }
-            }
-            Err(e) => warn!(error = %e, "Health guard: check-runs poll failed"),
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-    }
-
-    // Optional CloudWatch error scan since the merge instant.
-    let mut log_note = String::new();
-    if !cfg.health_log_groups.is_empty() {
-        let mut total = 0u64;
-        for group in &cfg.health_log_groups {
-            match state
-                .logs
-                .filter_log_events()
-                .log_group_name(group)
-                .start_time(started)
-                .filter_pattern("?ERROR ?Error ?Exception ?panic")
-                .limit(50)
-                .send()
-                .await
-            {
-                Ok(out) => total += out.events().len() as u64,
-                Err(e) => warn!(group, error = %e, "Health guard: log scan failed"),
-            }
-        }
-        log_note = format!(
-            " · {total} error-like log line(s) in {} group(s) post-merge",
-            cfg.health_log_groups.len()
-        );
-    }
-
-    let healthy = ci_status == "green"
-        && (cfg.health_log_groups.is_empty() || !log_note.contains("error-like log line(s)"));
-    // A non-zero error count makes it non-green even if CI is green.
-    let has_errors = log_note.contains("error-like") && !log_note.contains(" 0 error-like");
-    if ci_status.starts_with("FAILING") || has_errors {
-        HealthResult {
-            status: "unhealthy".to_string(),
-            line: format!(
-                "🔴 **Health check FAILED after merge** — CI: {ci_status}{log_note}. \
-                 A human should review whether to roll back."
-            ),
-        }
-    } else if healthy {
-        HealthResult {
-            status: "healthy".to_string(),
-            line: format!("💚 Health check passed — CI green{log_note}."),
-        }
-    } else {
-        HealthResult {
-            status: "inconclusive".to_string(),
-            line: format!("🟡 Health check inconclusive — CI {ci_status}{log_note}."),
-        }
-    }
 }
 
 #[cfg(test)]

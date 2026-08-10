@@ -222,7 +222,8 @@ async fn sweep_repo(
         let title = pr["title"].as_str().unwrap_or("(untitled)");
         let author = pr["user"]["login"].as_str().unwrap_or("");
         let url = pr["html_url"].as_str().unwrap_or("");
-        let card = build_card(&cfg.repo, pr_number, title, author, url, &reviewers);
+        let age = human_age(pr["created_at"].as_str().unwrap_or(""), now_ts);
+        let card = build_card(&cfg.repo, pr_number, title, author, url, &age, &reviewers);
         match post_teams(&state.http, &cfg.webhook_url, &card).await {
             Ok(()) => {
                 save_reminder_state(state, &cfg.team_id, &cfg.repo, pr_number, head, now_ts).await;
@@ -287,35 +288,82 @@ async fn save_reminder_state(
         .await;
 }
 
-/// Adaptive Card wrapped for a Teams (Power Automate Workflows) incoming webhook.
+/// Human-readable PR age (e.g. "3 days", "5 hours", "just now") from an RFC3339
+/// created_at and the current epoch seconds.
+fn human_age(created_at: &str, now_ts: i64) -> String {
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return "unknown".to_string();
+    };
+    let secs = (now_ts - dt.timestamp()).max(0);
+    if secs < 3600 {
+        "just now".to_string()
+    } else if secs < 86_400 {
+        let h = secs / 3600;
+        format!("{h} hour{}", if h == 1 { "" } else { "s" })
+    } else {
+        let d = secs / 86_400;
+        format!("{d} day{}", if d == 1 { "" } else { "s" })
+    }
+}
+
+/// Polished Adaptive Card (v1.5) wrapped for a Teams Workflows incoming webhook:
+/// a colored, bled header + FactSet metadata + an Open-PR button. Kept to the
+/// v1.5 primitives Teams renders reliably (Container style tint, FactSet, emoji).
 fn build_card(
     repo: &str,
     pr: u64,
     title: &str,
     author: &str,
     url: &str,
+    age: &str,
     reviewers: &[String],
 ) -> serde_json::Value {
-    let who = reviewers
-        .iter()
-        .map(|r| format!("@{r}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let who = if reviewers.is_empty() {
+        "the team".to_string()
+    } else {
+        reviewers
+            .iter()
+            .map(|r| format!("@{r}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     serde_json::json!({
         "type": "message",
         "attachments": [{
             "contentType": "application/vnd.microsoft.card.adaptive",
+            "contentUrl": null,
             "content": {
                 "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                 "type": "AdaptiveCard",
-                "version": "1.4",
+                "version": "1.5",
+                "msteams": { "width": "Full" },
                 "body": [
-                    { "type": "TextBlock", "weight": "Bolder", "size": "Medium", "wrap": true,
-                      "text": format!("🔍 Review needed: {title}") },
-                    { "type": "TextBlock", "isSubtle": true, "wrap": true,
-                      "text": format!("{repo} #{pr} · opened by {author}") },
-                    { "type": "TextBlock", "wrap": true,
-                      "text": format!("Waiting on: {who}") }
+                    {
+                        "type": "Container",
+                        "bleed": true,
+                        "style": "warning",
+                        "items": [
+                            { "type": "TextBlock", "text": "⏳ Review needed", "weight": "Bolder",
+                              "size": "Large", "color": "Warning", "wrap": true }
+                        ]
+                    },
+                    {
+                        "type": "Container",
+                        "spacing": "Medium",
+                        "items": [
+                            { "type": "TextBlock", "text": title, "weight": "Bolder", "size": "Large", "wrap": true },
+                            { "type": "TextBlock", "text": format!("{repo} · #{pr}"), "isSubtle": true, "spacing": "None", "wrap": true }
+                        ]
+                    },
+                    {
+                        "type": "FactSet",
+                        "spacing": "Medium",
+                        "facts": [
+                            { "title": "Author", "value": author },
+                            { "title": "Open for", "value": age },
+                            { "title": "Waiting on", "value": who }
+                        ]
+                    }
                 ],
                 "actions": [
                     { "type": "Action.OpenUrl", "title": "Open PR", "url": url }
@@ -389,5 +437,21 @@ mod tests {
     #[test]
     fn missing_timestamp_notifies() {
         assert!(should_notify(Some("abc"), None, "abc", 1000, COOLDOWN));
+    }
+
+    #[test]
+    fn human_age_buckets() {
+        // created_at = epoch 0; now = 3 days later.
+        let three_days = 3 * 86_400;
+        assert_eq!(
+            super::human_age("1970-01-01T00:00:00Z", three_days),
+            "3 days"
+        );
+        assert_eq!(
+            super::human_age("1970-01-01T00:00:00Z", 2 * 3600),
+            "2 hours"
+        );
+        assert_eq!(super::human_age("1970-01-01T00:00:00Z", 600), "just now");
+        assert_eq!(super::human_age("garbage", 600), "unknown");
     }
 }

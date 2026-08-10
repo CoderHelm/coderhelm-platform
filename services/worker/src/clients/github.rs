@@ -33,6 +33,19 @@ struct CachedSnapshot {
     base_sha: String,
 }
 
+/// A single inline PR review comment. `line` is the (1-indexed) line in the PR
+/// diff the comment anchors to; for a multi-line range, set `start_line` (&lt; line).
+/// `side` is "RIGHT" (added/context) or "LEFT" (deleted). The anchored line(s)
+/// must be part of the diff.
+#[derive(Debug, Clone)]
+pub struct InlineComment {
+    pub path: String,
+    pub line: u64,
+    pub start_line: Option<u64>,
+    pub side: String,
+    pub body: String,
+}
+
 /// GitHub REST API client using installation token auth.
 pub struct GitHubClient {
     app_id: String,
@@ -1430,6 +1443,53 @@ impl GitHubClient {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews");
         self.post(&url, &serde_json::json!({ "event": event, "body": body }))
             .await
+    }
+
+    /// Post a review with INLINE line-level comments in a single call. `commit_id`
+    /// pins the review to the reviewed head so comments land on the right lines;
+    /// each comment anchors to a line (or start_line..line range) that MUST be part
+    /// of the diff or GitHub 422s the whole review. Callers should pre-filter to
+    /// changed lines and fall back to `create_pr_review` (body-only) on error so a
+    /// single bad anchor never drops the verdict.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_pr_review_inline(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        commit_id: &str,
+        event: &str,
+        body: &str,
+        comments: &[InlineComment],
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews");
+        let comments_json: Vec<serde_json::Value> = comments
+            .iter()
+            .map(|c| {
+                let mut o = serde_json::json!({
+                    "path": c.path,
+                    "line": c.line,
+                    "side": c.side,
+                    "body": c.body,
+                });
+                if let Some(sl) = c.start_line {
+                    if sl < c.line {
+                        o["start_line"] = serde_json::json!(sl);
+                        o["start_side"] = serde_json::json!(c.side);
+                    }
+                }
+                o
+            })
+            .collect();
+        let mut payload = serde_json::json!({
+            "event": event,
+            "body": body,
+            "comments": comments_json,
+        });
+        if !commit_id.is_empty() {
+            payload["commit_id"] = serde_json::json!(commit_id);
+        }
+        self.post(&url, &payload).await
     }
 
     /// Merge a PR, but ONLY if its head still equals `sha` (a blast-radius guard:

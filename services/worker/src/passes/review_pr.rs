@@ -12,7 +12,7 @@
 use crate::agent::provider::{self, ModelProvider};
 use crate::clients::github::GitHubClient;
 use crate::models::{ReviewMessage, TokenUsage};
-use crate::passes::{attr_n, attr_s};
+use crate::passes::{attr_n, attr_s, review_agent, review_risk};
 use crate::WorkerState;
 use tracing::{info, warn};
 
@@ -23,6 +23,8 @@ struct ReviewConfig {
     enabled: bool,
     killed: bool,
     instructions: String,
+    /// Run the affected tests/build in the sandbox and attach pass/fail receipts.
+    verify_tests: bool,
 }
 
 async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str) -> ReviewConfig {
@@ -42,6 +44,7 @@ async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str
             enabled: false,
             killed: false,
             instructions: String::new(),
+            verify_tests: false,
         };
     };
     ReviewConfig {
@@ -60,65 +63,11 @@ async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or_default(),
-    }
-}
-
-/// Parsed verdict marker + risk + body.
-pub(crate) struct ReviewMeta {
-    pub verdict: &'static str,
-    pub risk: &'static str,
-    pub body: String,
-}
-
-/// Parse the model's markers. The prompt requires:
-///   line 1: `VERDICT: APPROVE` | `VERDICT: REQUEST_CHANGES`
-///   line 2 (optional): `RISK: LOW|MEDIUM|HIGH`
-/// A missing/garbled verdict → REQUEST_CHANGES (fail-closed: never auto-approve
-/// on an ambiguous verdict). A missing risk → MEDIUM (never silently LOW).
-pub(crate) fn parse_review(reply: &str) -> ReviewMeta {
-    let mut lines = reply.lines();
-    let first = lines.next().unwrap_or("").trim();
-    let upper = first.to_ascii_uppercase();
-    let verdict = if upper.starts_with("VERDICT: APPROVE") || upper == "VERDICT:APPROVE" {
-        "APPROVE"
-    } else {
-        "REQUEST_CHANGES"
-    };
-
-    // Look at the remaining lines; an optional RISK marker may lead.
-    let rest: Vec<&str> = lines.collect();
-    let mut body_start = 0;
-    let mut risk = "MEDIUM";
-    for (i, l) in rest.iter().enumerate() {
-        let t = l.trim();
-        if t.is_empty() {
-            continue;
-        }
-        let u = t.to_ascii_uppercase();
-        if let Some(v) = u.strip_prefix("RISK:") {
-            let v = v.trim();
-            risk = if v.starts_with("LOW") {
-                "LOW"
-            } else if v.starts_with("HIGH") {
-                "HIGH"
-            } else {
-                "MEDIUM"
-            };
-            body_start = i + 1;
-        }
-        break;
-    }
-
-    let body = rest[body_start..].join("\n").trim().to_string();
-    let body = if body.is_empty() {
-        reply.trim().to_string()
-    } else {
-        body
-    };
-    ReviewMeta {
-        verdict,
-        risk,
-        body,
+        verify_tests: item
+            .get("verify_tests")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false),
     }
 }
 
@@ -163,23 +112,17 @@ pub async fn run(
         msg.head_sha.clone()
     };
 
-    // Build the diff (base...head compare gives per-file patches).
+    // Build the diff (base...head compare gives per-file patches), bounded.
     let compare = github
         .get_diff(&msg.repo_owner, &msg.repo_name, base, &head_sha)
         .await?;
-    let mut diff = String::new();
-    if let Some(files) = compare["files"].as_array() {
-        for f in files {
-            let path = f["filename"].as_str().unwrap_or("");
-            let patch = f["patch"].as_str().unwrap_or("(no textual diff)");
-            diff.push_str(&format!("\n### {path}\n{patch}\n"));
-        }
-    }
-    // Keep the prompt bounded; the tail of a huge diff is less useful than the head.
-    let diff = common::head_tail_str(&diff, 40_000);
+    let diff = review_agent::format_diff(&compare, 40_000);
 
+    // Read AGENTS.md/etc. at the PR head so a PR that edits them is reviewed
+    // against its own new rules.
     let repo_instructions =
-        super::load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
+        super::load_repo_instructions_at_ref(&github, &msg.repo_owner, &msg.repo_name, &head_sha)
+            .await;
     let extra = if cfg.instructions.is_empty() {
         String::new()
     } else {
@@ -234,100 +177,175 @@ pub async fn run(
         return Ok(());
     }
 
-    // ── Verdict mode ──
-    let system = format!(
-        "You are a senior code reviewer for {owner}/{repo}. Review the PR diff for correctness \
-         bugs, security issues, and violations of the repo's rules — findings only, no style \
-         nitpicks unless they cause bugs. Be specific: cite file and line.\n\n\
-         Respond in EXACTLY this shape:\n\
-         - Line 1: `VERDICT: APPROVE` (no blocking issues) or `VERDICT: REQUEST_CHANGES` \
-           (one or more real bugs/risks).\n\
-         - Line 2: `RISK: LOW` | `RISK: MEDIUM` | `RISK: HIGH` — the blast radius if this merges \
-           (data loss / auth / prod breakage = HIGH; isolated/tested change = LOW).\n\
-         - Then a concise markdown review body: the findings (file:line + why), or a short \
-           confirmation if approving. If unsure, REQUEST_CHANGES.{instructions}{extra}",
-        owner = msg.repo_owner,
-        repo = msg.repo_name,
-        instructions = super::format_instructions_block(&repo_instructions),
+    // ── Verdict mode (agentic: walk the repo, structured findings, self-critique) ──
+    // Fold this team's past 👎 feedback into the prompt so the reviewer learns and
+    // stops repeating rejected comment styles ("leave comments to learn").
+    let learning =
+        load_learning_context(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    let instructions_block = format!(
+        "{}{extra}{learning}",
+        super::format_instructions_block(&repo_instructions)
     );
-    let prompt = format!(
-        "PR #{pr}: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}",
-        pr = msg.pr_number,
-    );
+    let changed = review_agent::changed_right_lines(&compare);
 
-    // Fail-closed: if the model call fails, request changes rather than silently
-    // approving or leaving the PR unreviewed.
-    let meta = match provider::converse_simple(
+    // 1) High-recall generation with repo-walking tools.
+    let output = review_agent::generate_review(
         state,
         &provider,
-        provider.heavy_model_id(),
-        &system,
-        &prompt,
+        &github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &head_sha,
+        title,
+        pr_body,
+        &diff,
+        &instructions_block,
         &mut usage,
     )
-    .await
-    {
-        Ok(reply) => parse_review(&reply),
-        Err(e) => {
-            warn!(pr = msg.pr_number, error = %e, "Review model call failed — requesting changes (fail-closed)");
-            ReviewMeta {
-                verdict: "REQUEST_CHANGES",
-                risk: "HIGH",
-                body: format!(
-                    "Automated review could not complete ({e}). Requesting changes so a human takes a look."
-                ),
-            }
-        }
-    };
+    .await;
 
-    // GitHub forbids APPROVE / REQUEST_CHANGES on your OWN PR. When the PR was
-    // authored by the bot, downgrade to a COMMENT so the verdict is still posted.
-    let self_authored = pr_author.contains("coderhelm");
-    let effective_event = if self_authored {
-        "COMMENT"
+    // 2) Critic pass drops weak/false findings.
+    let findings =
+        review_agent::critique_findings(state, &provider, &diff, output.findings, &mut usage).await;
+
+    // 3) Map to inline comments (only diff-anchored lines) + summary bullets.
+    let postable = review_agent::to_postable(&findings, &changed);
+
+    // 4) Optional sandbox verification ("receipts"): actually run the affected
+    // tests/build. A hard failure forces REQUEST_CHANGES.
+    let mut verify_md = String::new();
+    let mut verify_failed = false;
+    if cfg.verify_tests {
+        let changed_files: Vec<String> = compare["files"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|f| f["filename"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some((passed, md)) = review_agent::verify_in_sandbox(
+            state,
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &head_sha,
+            &changed_files,
+        )
+        .await
+        {
+            verify_md = md;
+            verify_failed = !passed;
+        }
+    }
+
+    // Verdict: a surviving blocking finding OR a failed verification forces
+    // REQUEST_CHANGES; otherwise the model's verdict, fail-closed to
+    // REQUEST_CHANGES on anything non-APPROVE.
+    let verdict: &'static str = if postable.blocking_count > 0 || verify_failed {
+        "REQUEST_CHANGES"
+    } else if output.verdict.eq_ignore_ascii_case("APPROVE") {
+        "APPROVE"
     } else {
-        meta.verdict
+        "REQUEST_CHANGES"
     };
-    let verdict_line = if meta.verdict == "APPROVE" {
+    // Computed, explainable risk (blast-radius-weighted) — overrides the model's
+    // guess and drives the displayed level.
+    let risk_report = review_risk::assess(
+        &github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &head_sha,
+        &compare,
+    )
+    .await;
+    let risk = risk_report.level.to_string();
+
+    // GitHub forbids APPROVE / REQUEST_CHANGES on your OWN PR → downgrade to COMMENT.
+    let self_authored = pr_author.contains("coderhelm");
+    let effective_event = if self_authored { "COMMENT" } else { verdict };
+    let verdict_line = if verdict == "APPROVE" {
         "✅ **Approved**"
     } else {
         "🔴 **Changes requested**"
     };
-    let full_body = format!(
-        "{verdict_line} · risk: **{}**\n\n{}{RATING_FOOTER}",
-        meta.risk, meta.body
-    );
+    let summary = if output.summary.trim().is_empty() {
+        "Automated review complete.".to_string()
+    } else {
+        output.summary.clone()
+    };
+    let mut full_body = format!("{verdict_line}\n\n{summary}\n\n{}", risk_report.markdown());
+    if !verify_md.is_empty() {
+        full_body.push_str(&format!("\n\n{verify_md}"));
+    }
+    if !postable.unanchored_md.is_empty() {
+        full_body.push_str(&format!(
+            "\n\n#### Additional findings\n{}",
+            postable.unanchored_md
+        ));
+    }
+    full_body.push_str(RATING_FOOTER);
 
-    github
-        .create_pr_review(
+    // Post ONE batched review with inline comments; fall back to body-only if
+    // GitHub rejects an anchor (a bad line must never drop the whole verdict).
+    let posted = github
+        .create_pr_review_inline(
             &msg.repo_owner,
             &msg.repo_name,
             msg.pr_number,
+            &head_sha,
             effective_event,
             &full_body,
+            &postable.inline,
         )
-        .await?;
+        .await;
+    if let Err(e) = posted {
+        warn!(pr = msg.pr_number, error = %e, "Inline review post failed — retrying body-only");
+        github
+            .create_pr_review(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                effective_event,
+                &full_body,
+            )
+            .await?;
+    }
+
+    // Persist: store the summary + a compact findings digest for the dashboard.
+    let record_body = {
+        let mut b = summary.clone();
+        for f in &findings {
+            b.push_str(&format!(
+                "\n\n- [{}] {}:{} — {}\n  {}",
+                f.severity, f.file, f.line, f.title, f.body
+            ));
+        }
+        b
+    };
     store_review_record(
         state,
         &msg,
         &head_sha,
-        meta.verdict,
-        meta.risk,
-        &meta.body,
+        verdict,
+        &risk,
+        &record_body,
         effective_event,
         "",
     )
     .await;
     info!(
         pr = msg.pr_number,
-        verdict = meta.verdict,
-        risk = meta.risk,
+        verdict = verdict,
+        risk = %risk,
+        findings = findings.len(),
+        inline = postable.inline.len(),
         posted_as = effective_event,
         "Reviewer posted verdict"
     );
 
     // ── Post-approval actions (opt-in, off by default) ──
-    if meta.verdict == "APPROVE" {
+    if verdict == "APPROVE" {
         // Self-authored (CoderHelm's own) PRs CAN auto-merge, but run_on_approve
         // forces the two-key human-approval gate on for them — the bot approving
         // its own code is never the second key. Human PRs use the repo's config.
@@ -335,6 +353,7 @@ pub async fn run(
             state,
             &github,
             &msg.team_id,
+            msg.installation_id,
             &msg.repo_owner,
             &msg.repo_name,
             msg.pr_number,
@@ -356,9 +375,9 @@ pub async fn run(
                 state,
                 &msg,
                 &head_sha,
-                meta.verdict,
-                meta.risk,
-                &meta.body,
+                verdict,
+                &risk,
+                &record_body,
                 effective_event,
                 &report.summary,
             )
@@ -368,7 +387,7 @@ pub async fn run(
         // CoderHelm reviewed its OWN PR and wants changes → hand the findings to
         // the run's feedback loop so it applies the fixes (coderhelm reviews
         // coderhelm → picks up the changes). A new commit re-triggers the review.
-        feed_review_back_to_run(state, &msg, &meta.body).await;
+        feed_review_back_to_run(state, &msg, &record_body).await;
     }
 
     Ok(())
@@ -426,6 +445,68 @@ async fn feed_review_back_to_run(state: &WorkerState, msg: &ReviewMessage, revie
             warn!(pr = msg.pr_number, error = %e, "Failed to enqueue self-review feedback")
         }
     }
+}
+
+/// Build a "past feedback to learn from" block from this repo's recent review
+/// records — the 👎 ratings and human notes the team left. Reused so the reviewer
+/// stops repeating comment styles the team rejected. Best-effort, capped, empty
+/// on any error.
+async fn load_learning_context(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> String {
+    let prefix = format!("REVIEW#{owner}/{name}#");
+    let Ok(res) = state
+        .dynamo
+        .query()
+        .table_name(&state.config.settings_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :pfx)")
+        .expression_attribute_values(":pk", attr_s(team_id))
+        .expression_attribute_values(":pfx", attr_s(&prefix))
+        .scan_index_forward(false)
+        .limit(60)
+        .send()
+        .await
+    else {
+        return String::new();
+    };
+
+    let mut notes: Vec<String> = vec![];
+    for item in res.items() {
+        if notes.len() >= 15 {
+            break;
+        }
+        let comments = item
+            .get("rating_comments")
+            .and_then(|v| v.as_l().ok())
+            .cloned()
+            .unwrap_or_default();
+        for c in comments {
+            let Ok(s) = c.as_s() else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+                continue;
+            };
+            let text = v["text"].as_str().unwrap_or("").trim();
+            if text.is_empty() {
+                continue;
+            }
+            let rating = v["rating"].as_str().unwrap_or("");
+            let tag = if rating == "down" { "👎" } else { "📝" };
+            notes.push(format!("- {tag} {}", common::truncate_str(text, 240)));
+            if notes.len() >= 15 {
+                break;
+            }
+        }
+    }
+    if notes.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## Past reviewer feedback from this team (learn from it — don't repeat rejected styles)\n{}",
+        notes.join("\n")
+    )
 }
 
 /// Newest run for a PR, via the runs-table repo-index GSI. None if untracked.
@@ -503,58 +584,5 @@ async fn store_review_record(
     }
     if let Err(e) = put.send().await {
         warn!(pr = msg.pr_number, error = %e, "Failed to persist review record (non-fatal)");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_review;
-
-    #[test]
-    fn approve_marker_parsed() {
-        let m = parse_review("VERDICT: APPROVE\nRISK: LOW\nLooks good, no issues.");
-        assert_eq!(m.verdict, "APPROVE");
-        assert_eq!(m.risk, "LOW");
-        assert_eq!(m.body, "Looks good, no issues.");
-    }
-
-    #[test]
-    fn request_changes_marker_parsed() {
-        let m = parse_review("VERDICT: REQUEST_CHANGES\nRISK: HIGH\nsrc/a.ts:10 null deref.");
-        assert_eq!(m.verdict, "REQUEST_CHANGES");
-        assert_eq!(m.risk, "HIGH");
-        assert!(m.body.contains("null deref"));
-    }
-
-    #[test]
-    fn missing_or_garbled_marker_fails_closed_to_request_changes() {
-        // No verdict line at all → must NOT auto-approve.
-        assert_eq!(
-            parse_review("I think this is probably fine?").verdict,
-            "REQUEST_CHANGES"
-        );
-        assert_eq!(parse_review("").verdict, "REQUEST_CHANGES");
-    }
-
-    #[test]
-    fn approve_is_never_inferred_from_body_text() {
-        // "approve" only counts on the verdict line, not loose in the body.
-        let m = parse_review("VERDICT: REQUEST_CHANGES\nI would approve if you fix X.");
-        assert_eq!(m.verdict, "REQUEST_CHANGES");
-    }
-
-    #[test]
-    fn missing_risk_defaults_to_medium_not_low() {
-        let m = parse_review("VERDICT: APPROVE\nNo risk line here, just prose.");
-        assert_eq!(m.verdict, "APPROVE");
-        assert_eq!(m.risk, "MEDIUM");
-        assert!(m.body.contains("No risk line"));
-    }
-
-    #[test]
-    fn risk_marker_consumed_from_body() {
-        let m = parse_review("VERDICT: APPROVE\nRISK: MEDIUM\nThe actual finding.");
-        assert_eq!(m.risk, "MEDIUM");
-        assert_eq!(m.body, "The actual finding.");
     }
 }
