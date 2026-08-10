@@ -1,6 +1,7 @@
-//! Armed auto-merge gate. Merges a PR only once BOTH keys are present (bot
-//! APPROVE already established when this was armed + a human approval) AND every
-//! CI check is green. It waits (self-scheduling, bounded) for pending checks —
+//! Armed auto-merge gate. Merges a PR only once BOTH keys are present — the
+//! bot's OWN latest verdict for this head is APPROVE (verified here, not assumed,
+//! since the gateway also arms on any human approval) + a human approval — AND
+//! every CI check is green. It waits (self-scheduling, bounded) for pending checks —
 //! e.g. a Terraform staging-apply — and NEVER merges on failing or still-running
 //! CI. Bound to the reviewed head: a later commit aborts (the fresh review
 //! re-arms). Reuses the two-key + post-merge (tag/health) logic from review_actions.
@@ -68,6 +69,63 @@ async fn ci_state(github: &GitHubClient, owner: &str, repo: &str, sha: &str) -> 
     }
 }
 
+/// Was CoderHelm's OWN latest verdict for this head an APPROVE? This is the bot
+/// key of the two-key rule, read from the persisted review record — uniform
+/// across human PRs (where the bot posts a real APPROVE review) and bot-authored
+/// PRs (where GitHub forbids self-approve, so the verdict lives only in the
+/// record). Records are keyed `REVIEW#{owner}/{repo}#{pr:06}#{rfc3339}`, so a
+/// descending scan yields newest-first; we take the newest real verdict for this
+/// exact head. Missing/unreadable/other-head ⇒ false (fail-closed: the gate then
+/// waits rather than merges).
+async fn bot_approved_at_head(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+    head_sha: &str,
+) -> bool {
+    let prefix = format!("REVIEW#{owner}/{repo}#{pr:0>6}#");
+    let out = state
+        .dynamo
+        .query()
+        .table_name(&state.config.settings_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :sk)")
+        .expression_attribute_values(":pk", super::attr_s(team_id))
+        .expression_attribute_values(":sk", super::attr_s(&prefix))
+        .scan_index_forward(false) // newest review first
+        .limit(15)
+        .send()
+        .await;
+    let resp = match out {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(pr, error = %e, "await-merge: could not read review records — bot key treated as absent");
+            return false;
+        }
+    };
+    for it in resp.items() {
+        let verdict = it
+            .get("verdict")
+            .and_then(|a| a.as_s().ok())
+            .map(String::as_str)
+            .unwrap_or("");
+        // Only real verdicts count; skip QUESTION (reply-answer) records.
+        if verdict != "APPROVE" && verdict != "REQUEST_CHANGES" {
+            continue;
+        }
+        let rec_head = it
+            .get("head_sha")
+            .and_then(|a| a.as_s().ok())
+            .map(String::as_str)
+            .unwrap_or("");
+        if rec_head == head_sha {
+            return verdict == "APPROVE";
+        }
+    }
+    false
+}
+
 pub async fn run(
     state: &WorkerState,
     msg: AwaitMergeMessage,
@@ -112,9 +170,22 @@ pub async fn run(
     } else {
         false // ignored by should_merge when require_human is false
     };
-    // The gate is only ever armed after a bot APPROVE verdict, so verdict is
-    // approved by construction; should_merge folds in the two-key rule.
-    let gate_ok = should_merge(cfg.auto_merge, require_human, true, human_present);
+    // The bot key of the two-key rule: CoderHelm's OWN latest verdict for this
+    // head must be APPROVE. The run_on_approve arming path only fires on a bot
+    // APPROVE, but the gateway also arms on ANY human approval — so a human
+    // approving a PR the bot flagged (REQUEST_CHANGES) would otherwise merge.
+    // Verify it explicitly instead of assuming; fail-closed (no/other verdict →
+    // not approved → the gate waits, never merges).
+    let bot_approved = bot_approved_at_head(
+        state,
+        &msg.team_id,
+        owner,
+        repo,
+        msg.pr_number,
+        &msg.head_sha,
+    )
+    .await;
+    let gate_ok = should_merge(cfg.auto_merge, require_human, bot_approved, human_present);
     let ci = ci_state(&github, owner, repo, &msg.head_sha).await;
 
     match ci {
