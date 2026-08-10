@@ -9,8 +9,13 @@
 //!
 //! Dedup (the "don't overpost, but don't post only once" requirement): per-PR
 //! state records the last head SHA and last-notified time. A PR is re-posted
-//! only when it's never been posted, a new commit landed (head changed), or the
-//! cooldown has elapsed while it's still waiting — never on every 20-min tick.
+//! only when it's never been posted, a new commit landed (head changed) AND the
+//! head-change floor has elapsed, or the cooldown has elapsed while it's still
+//! waiting — never on every 20-min tick. The floor exists because an active PR
+//! (a bot PR in a CI-fix loop, a human pushing review fixes) changes head every
+//! few minutes; without it every sweep tick sees "new commits" and the channel
+//! gets a card per tick. A sweep also posts at most MAX_CARDS_PER_SWEEP cards
+//! per repo so first-enable on a backlog of waiting PRs can't flood the channel.
 
 use crate::clients::github::GitHubClient;
 use crate::passes::{attr_n, attr_s};
@@ -21,6 +26,11 @@ use tracing::{info, warn};
 
 const CONFIG_PREFIX: &str = "REVIEW_CONFIG#REPO#";
 const DEFAULT_COOLDOWN_HOURS: i64 = 4;
+/// Minimum quiet time before a head change may re-nudge. Head churn on an
+/// active PR must not beat this; only the full cooldown re-nudges otherwise.
+const HEAD_CHANGE_FLOOR_SECS: i64 = 3600;
+/// Upper bound on cards posted to one repo's channel in a single sweep.
+const MAX_CARDS_PER_SWEEP: usize = 5;
 
 struct RepoReminder {
     team_id: String,
@@ -30,7 +40,8 @@ struct RepoReminder {
 }
 
 /// Pure dedup decision — unit-tested without any clock or network.
-/// Notify when: never notified, the head changed (new commits), or the cooldown
+/// Notify when: never notified; the head changed (new commits) and at least
+/// the head-change floor has passed since the last card; or the cooldown
 /// elapsed while the PR is still waiting.
 pub fn should_notify(
     last_head: Option<&str>,
@@ -41,7 +52,10 @@ pub fn should_notify(
 ) -> bool {
     match (last_head, last_notified_ts) {
         (None, _) | (_, None) => true,
-        (Some(prev), Some(ts)) => prev != current_head || now_ts - ts >= cooldown_secs,
+        (Some(prev), Some(ts)) => {
+            let elapsed = now_ts - ts;
+            (prev != current_head && elapsed >= HEAD_CHANGE_FLOOR_SECS) || elapsed >= cooldown_secs
+        }
     }
 }
 
@@ -184,8 +198,13 @@ async fn sweep_repo(
         return Ok(());
     };
     let now_ts = chrono::Utc::now().timestamp();
+    let mut posted = 0usize;
 
     for pr in arr {
+        if posted >= MAX_CARDS_PER_SWEEP {
+            info!(repo = %cfg.repo, cap = MAX_CARDS_PER_SWEEP, "Reminder card cap reached this sweep — remaining PRs wait for the next tick");
+            break;
+        }
         if pr["draft"].as_bool().unwrap_or(false) {
             continue;
         }
@@ -227,6 +246,7 @@ async fn sweep_repo(
         match post_teams(&state.http, &cfg.webhook_url, &card).await {
             Ok(()) => {
                 save_reminder_state(state, &cfg.team_id, &cfg.repo, pr_number, head, now_ts).await;
+                posted += 1;
                 info!(repo = %cfg.repo, pr = pr_number, reviewers = reviewers.len(), "Posted Teams review reminder");
             }
             Err(e) => warn!(repo = %cfg.repo, pr = pr_number, error = %e, "Teams post failed"),
@@ -274,7 +294,9 @@ async fn save_reminder_state(
     head: &str,
     now_ts: i64,
 ) {
-    let _ = state
+    // A failed save means this PR re-posts next tick — that must be visible,
+    // not swallowed, or the channel spams silently until someone reads Dynamo.
+    if let Err(e) = state
         .dynamo
         .update_item()
         .table_name(&state.config.settings_table_name)
@@ -285,7 +307,10 @@ async fn save_reminder_state(
         .expression_attribute_values(":t", attr_n(now_ts))
         .expression_attribute_values(":one", attr_n(1))
         .send()
-        .await;
+        .await
+    {
+        warn!(repo, pr, error = %e, "Reminder dedup-state save FAILED — this PR will re-post next tick");
+    }
 }
 
 /// Human-readable PR age (e.g. "3 days", "5 hours", "just now") from an RFC3339
@@ -423,12 +448,38 @@ mod tests {
     }
 
     #[test]
-    fn renotifies_immediately_on_new_head() {
-        // New commit within the cooldown still re-notifies.
+    fn new_head_within_floor_stays_quiet() {
+        // Active PR pushing commits every few minutes: a head change 60s after
+        // the last card must NOT re-notify — this was the every-tick channel
+        // spam. Only after the floor does a new head count.
+        assert!(!should_notify(
+            Some("abc"),
+            Some(1000),
+            "def",
+            1000 + 60,
+            COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn new_head_after_floor_renotifies() {
+        // Head changed and the 1h floor has passed (still inside the 4h
+        // cooldown) → the new-commit re-nudge fires.
         assert!(should_notify(
             Some("abc"),
             Some(1000),
             "def",
+            1000 + super::HEAD_CHANGE_FLOOR_SECS,
+            COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn same_head_within_floor_stays_quiet() {
+        assert!(!should_notify(
+            Some("abc"),
+            Some(1000),
+            "abc",
             1000 + 60,
             COOLDOWN
         ));
