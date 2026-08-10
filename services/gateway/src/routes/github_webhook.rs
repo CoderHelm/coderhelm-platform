@@ -9,8 +9,9 @@ use tracing::{error, info, warn};
 
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
-    FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo, PlanTaskContinueMessage,
-    ResumeMessage, ReviewMessage, TicketMessage, TicketSource, WorkerMessage,
+    AwaitMergeMessage, FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo,
+    PlanTaskContinueMessage, ResumeMessage, ReviewMessage, TicketMessage, TicketSource,
+    WorkerMessage,
 };
 use crate::AppState;
 
@@ -585,22 +586,10 @@ async fn handle_pr_review(
         return Ok(StatusCode::OK);
     }
 
-    // Act on "changes_requested" or "commented" reviews (covers both formal
-    // change-request reviews and standalone single-line comments / thread replies)
     let review_state = payload["review"]["state"].as_str().unwrap_or("");
-    if review_state != "changes_requested" && review_state != "commented" {
-        return Ok(StatusCode::OK);
-    }
 
-    // Only process reviews on our PRs
-    let pr_user = payload["pull_request"]["user"]["login"]
-        .as_str()
-        .unwrap_or("");
-    if !pr_user.contains("coderhelm") {
-        return Ok(StatusCode::OK);
-    }
-
-    // Ignore reviews submitted by the bot itself
+    // Ignore reviews submitted by the bot itself — its APPROVE verdict already
+    // armed the gate at review time (review_pr → run_on_approve).
     let reviewer = payload["review"]["user"]["login"].as_str().unwrap_or("");
     if reviewer.contains("coderhelm") {
         return Ok(StatusCode::OK);
@@ -609,7 +598,56 @@ async fn handle_pr_review(
     let repo = &payload["repository"];
     let owner = repo["owner"]["login"].as_str().unwrap_or("");
     let name = repo["name"].as_str().unwrap_or("");
-    let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
+    let pr = &payload["pull_request"];
+    let pr_number = pr["number"].as_u64().unwrap_or(0);
+
+    // A human APPROVED review is the second key for armed auto-merge. Re-arm the
+    // gate so an approval that arrives AFTER the bot review still triggers the
+    // merge — the review-time arming only had the bot's own key. This applies to
+    // human PRs too, not just bot PRs. The worker's await_merge gate remains the
+    // sole authority on whether auto_merge is on, both keys are present, and every
+    // CI check is green before it merges (it waits for pending checks like a
+    // staging deploy and never merges on failing CI). Here we only gate on the
+    // repo having review enabled, so approvals on non-review repos are ignored.
+    if review_state == "approved" {
+        let cfg = load_review_config(state, team_id, owner, name).await;
+        let head_sha = pr["head"]["sha"].as_str().unwrap_or("").to_string();
+        let base_branch = pr["base"]["ref"].as_str().unwrap_or("").to_string();
+        if cfg.enabled && !cfg.killed && pr_number != 0 && !head_sha.is_empty() {
+            let self_authored = pr["user"]["login"]
+                .as_str()
+                .unwrap_or("")
+                .contains("coderhelm");
+            info!(
+                owner,
+                name, pr_number, "Human approval — arming auto-merge gate"
+            );
+            let message = WorkerMessage::AwaitMerge(AwaitMergeMessage {
+                team_id: team_id.to_string(),
+                installation_id,
+                repo_owner: owner.to_string(),
+                repo_name: name.to_string(),
+                pr_number,
+                head_sha,
+                base_branch,
+                self_authored,
+                attempts: 0,
+            });
+            let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+        }
+        return Ok(StatusCode::OK);
+    }
+
+    // Feedback loop: act on "changes_requested" or "commented" reviews (covers
+    // formal change-request reviews and standalone single-line comments / thread
+    // replies). This path is bot-PR only.
+    if review_state != "changes_requested" && review_state != "commented" {
+        return Ok(StatusCode::OK);
+    }
+    let pr_user = pr["user"]["login"].as_str().unwrap_or("");
+    if !pr_user.contains("coderhelm") {
+        return Ok(StatusCode::OK);
+    }
 
     if let Some(reason) = check_run_budget(state, team_id).await {
         info!(team_id, "PR review skipped — token limit reached");

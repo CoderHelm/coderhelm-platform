@@ -140,6 +140,28 @@ pub enum WorkerMessage {
     Resume(ResumeMessage),
     #[serde(rename = "review")]
     Review(ReviewMessage),
+    #[serde(rename = "await_merge")]
+    AwaitMerge(AwaitMergeMessage),
+}
+
+/// Armed auto-merge job (gateway → worker). Enqueued when a human approval lands
+/// on a review-enabled PR; the worker's await_merge gate is the sole authority on
+/// whether auto-merge is actually on, whether both keys are present, and whether
+/// every CI check is green before it merges. Bound to the reviewed head SHA.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AwaitMergeMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub head_sha: String,
+    pub base_branch: String,
+    /// The PR is CoderHelm's own — forces the human-approval key on.
+    #[serde(default)]
+    pub self_authored: bool,
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 /// A label-triggered code-review job for an existing PR. Keyed by (pr_number,
