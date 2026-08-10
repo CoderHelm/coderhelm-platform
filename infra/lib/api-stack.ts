@@ -13,6 +13,8 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as ses from "aws-cdk-lib/aws-ses";
+import * as events from "aws-cdk-lib/aws-events";
+import * as targets from "aws-cdk-lib/aws-events-targets";
 import { Construct } from "constructs";
 
 interface ApiStackProps extends cdk.StackProps {
@@ -238,6 +240,23 @@ export class ApiStack extends cdk.Stack {
       visibilityTimeout: cdk.Duration.minutes(16),
       encryption: sqs.QueueEncryption.SQS_MANAGED,
       deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
+    });
+
+    // Review-reminder sweep: every 20 min, drop a constant message on the ticket
+    // queue; the worker's ReviewReminder handler scans repos with reminders
+    // configured and nudges their Teams webhook about PRs still awaiting review.
+    // Defined here (same stack as the queue) to avoid a worker↔api dependency
+    // cycle; the SqsQueue target auto-grants send permission.
+    new events.Rule(this, "ReviewReminderSchedule", {
+      ruleName: `${prefix}-review-reminder`,
+      schedule: events.Schedule.rate(cdk.Duration.minutes(20)),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "review_reminder",
+          }),
+        }),
+      ],
     });
 
     // --- Secrets ---
