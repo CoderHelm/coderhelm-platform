@@ -120,6 +120,31 @@ pub enum WorkerMessage {
     /// review. Carries no fields — the sweep scans per-repo reviewer config.
     #[serde(rename = "review_reminder")]
     ReviewReminder,
+    /// Async post-merge health check (self-scheduled with SQS delay). Waits for
+    /// the base-branch deploy checks to complete, then alerts only on failures
+    /// that are NEW vs. the pre-merge baseline.
+    #[serde(rename = "health_check")]
+    HealthCheck(HealthCheckMessage),
+}
+
+/// Post-merge health check job. Baseline = checks already failing at merge time,
+/// so pre-existing failures are ignored ("not a previous error").
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HealthCheckMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub base_branch: String,
+    pub merge_sha: String,
+    /// Check-run names already failing at merge — excluded from new-failure alerts.
+    #[serde(default)]
+    pub baseline_failed: Vec<String>,
+    /// How many times this check has re-enqueued while checks were still running
+    /// (bounds the adaptive wait — no user-set timer).
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 /// A label-triggered code-review job for an existing PR. Keyed by (pr_number,

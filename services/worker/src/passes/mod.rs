@@ -467,6 +467,7 @@ fn has_time_for_remediation(start: &Instant) -> bool {
 
 pub mod feedback;
 pub mod formatter;
+pub mod health_check;
 mod implement;
 pub mod infra_analyze;
 pub mod onboard;
