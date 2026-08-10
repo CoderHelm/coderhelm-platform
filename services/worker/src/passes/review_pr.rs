@@ -170,8 +170,12 @@ pub async fn run(
     }
 
     // ── Verdict mode (agentic: walk the repo, structured findings, self-critique) ──
+    // Fold this team's past 👎 feedback into the prompt so the reviewer learns and
+    // stops repeating rejected comment styles ("leave comments to learn").
+    let learning =
+        load_learning_context(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
     let instructions_block = format!(
-        "{}{extra}",
+        "{}{extra}{learning}",
         super::format_instructions_block(&repo_instructions)
     );
     let changed = review_agent::changed_right_lines(&compare);
@@ -400,6 +404,68 @@ async fn feed_review_back_to_run(state: &WorkerState, msg: &ReviewMessage, revie
             warn!(pr = msg.pr_number, error = %e, "Failed to enqueue self-review feedback")
         }
     }
+}
+
+/// Build a "past feedback to learn from" block from this repo's recent review
+/// records — the 👎 ratings and human notes the team left. Reused so the reviewer
+/// stops repeating comment styles the team rejected. Best-effort, capped, empty
+/// on any error.
+async fn load_learning_context(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> String {
+    let prefix = format!("REVIEW#{owner}/{name}#");
+    let Ok(res) = state
+        .dynamo
+        .query()
+        .table_name(&state.config.settings_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :pfx)")
+        .expression_attribute_values(":pk", attr_s(team_id))
+        .expression_attribute_values(":pfx", attr_s(&prefix))
+        .scan_index_forward(false)
+        .limit(60)
+        .send()
+        .await
+    else {
+        return String::new();
+    };
+
+    let mut notes: Vec<String> = vec![];
+    for item in res.items() {
+        if notes.len() >= 15 {
+            break;
+        }
+        let comments = item
+            .get("rating_comments")
+            .and_then(|v| v.as_l().ok())
+            .cloned()
+            .unwrap_or_default();
+        for c in comments {
+            let Ok(s) = c.as_s() else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+                continue;
+            };
+            let text = v["text"].as_str().unwrap_or("").trim();
+            if text.is_empty() {
+                continue;
+            }
+            let rating = v["rating"].as_str().unwrap_or("");
+            let tag = if rating == "down" { "👎" } else { "📝" };
+            notes.push(format!("- {tag} {}", common::truncate_str(text, 240)));
+            if notes.len() >= 15 {
+                break;
+            }
+        }
+    }
+    if notes.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## Past reviewer feedback from this team (learn from it — don't repeat rejected styles)\n{}",
+        notes.join("\n")
+    )
 }
 
 /// Newest run for a PR, via the runs-table repo-index GSI. None if untracked.
