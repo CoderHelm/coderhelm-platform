@@ -23,6 +23,8 @@ struct ReviewConfig {
     enabled: bool,
     killed: bool,
     instructions: String,
+    /// Run the affected tests/build in the sandbox and attach pass/fail receipts.
+    verify_tests: bool,
 }
 
 async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str) -> ReviewConfig {
@@ -42,6 +44,7 @@ async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str
             enabled: false,
             killed: false,
             instructions: String::new(),
+            verify_tests: false,
         };
     };
     ReviewConfig {
@@ -60,6 +63,11 @@ async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or_default(),
+        verify_tests: item
+            .get("verify_tests")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false),
     }
 }
 
@@ -203,9 +211,38 @@ pub async fn run(
     // 3) Map to inline comments (only diff-anchored lines) + summary bullets.
     let postable = review_agent::to_postable(&findings, &changed);
 
-    // Verdict: a surviving blocking finding forces REQUEST_CHANGES; otherwise the
-    // model's verdict, fail-closed to REQUEST_CHANGES on anything non-APPROVE.
-    let verdict: &'static str = if postable.blocking_count > 0 {
+    // 4) Optional sandbox verification ("receipts"): actually run the affected
+    // tests/build. A hard failure forces REQUEST_CHANGES.
+    let mut verify_md = String::new();
+    let mut verify_failed = false;
+    if cfg.verify_tests {
+        let changed_files: Vec<String> = compare["files"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|f| f["filename"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some((passed, md)) = review_agent::verify_in_sandbox(
+            state,
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &head_sha,
+            &changed_files,
+        )
+        .await
+        {
+            verify_md = md;
+            verify_failed = !passed;
+        }
+    }
+
+    // Verdict: a surviving blocking finding OR a failed verification forces
+    // REQUEST_CHANGES; otherwise the model's verdict, fail-closed to
+    // REQUEST_CHANGES on anything non-APPROVE.
+    let verdict: &'static str = if postable.blocking_count > 0 || verify_failed {
         "REQUEST_CHANGES"
     } else if output.verdict.eq_ignore_ascii_case("APPROVE") {
         "APPROVE"
@@ -238,6 +275,9 @@ pub async fn run(
         output.summary.clone()
     };
     let mut full_body = format!("{verdict_line}\n\n{summary}\n\n{}", risk_report.markdown());
+    if !verify_md.is_empty() {
+        full_body.push_str(&format!("\n\n{verify_md}"));
+    }
     if !postable.unanchored_md.is_empty() {
         full_body.push_str(&format!(
             "\n\n#### Additional findings\n{}",

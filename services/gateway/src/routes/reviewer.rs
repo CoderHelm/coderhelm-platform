@@ -102,6 +102,7 @@ pub async fn get_config(
         "tag_mode": item_str(&item, "tag_mode", "semver"),
         "tag_prefix": item_str(&item, "tag_prefix", "v"),
         "health_check": item_bool(&item, "health_check", false),
+        "verify_tests": item_bool(&item, "verify_tests", false),
         "health_log_groups": log_groups,
         "reminders_enabled": item_bool(&item, "reminders_enabled", false),
         "teams_webhook_url": item_str(&item, "teams_webhook_url", ""),
@@ -211,6 +212,10 @@ pub async fn update_config(
         .item(
             "health_check",
             attr_bool(body["health_check"].as_bool().unwrap_or(false)),
+        )
+        .item(
+            "verify_tests",
+            attr_bool(body["verify_tests"].as_bool().unwrap_or(false)),
         )
         .item(
             "reminders_enabled",

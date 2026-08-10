@@ -531,6 +531,70 @@ pub fn to_postable(
     }
 }
 
+/// Verify the PR in the CodeBuild sandbox ("receipts"): run the repo's typecheck/
+/// build + the affected unit tests against the PR head, and return (passed, a
+/// markdown block for the review). None when the sandbox isn't configured, no
+/// command could be derived, or the build couldn't run — i.e. no signal, never a
+/// false failure.
+pub async fn verify_in_sandbox(
+    state: &WorkerState,
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    head_sha: &str,
+    changed_files: &[String],
+) -> Option<(bool, String)> {
+    if state.config.sandbox_bucket_name.is_empty() || state.config.sandbox_project_name.is_empty() {
+        return None;
+    }
+    // Derive commands at the PR head so we test the PR's own code.
+    let checks = super::detect_check_commands(github, owner, repo, head_sha).await;
+    let test = super::detect_ci_test(github, owner, repo, head_sha)
+        .await
+        .and_then(|t| super::build_scoped_test_cmd(&t, changed_files));
+    let cmd = match (checks, test) {
+        (Some(c), Some(t)) => format!("{c} && {t}"),
+        (Some(c), None) => c,
+        (None, Some(t)) => t,
+        (None, None) => return None,
+    };
+    let node = super::detect_node_version(github, owner, repo, head_sha).await;
+    let tarball = github.download_tarball(owner, repo, head_sha).await.ok()?;
+
+    let sandbox = crate::clients::sandbox::SandboxClient::new(
+        &state.codebuild,
+        &state.s3,
+        &state.logs,
+        &state.config.sandbox_bucket_name,
+        &state.config.sandbox_project_name,
+    );
+    let run_id = format!(
+        "review-{owner}-{repo}-{}",
+        &head_sha[..head_sha.len().min(8)]
+    )
+    .replace('/', "-");
+
+    match sandbox
+        .run_checks(&run_id, 0, tarball, &cmd, node.as_deref(), None)
+        .await
+    {
+        Ok(o) if o.ran => {
+            let cmd_short = common::truncate_str(&cmd, 200);
+            let md = if o.passed {
+                format!("#### 🧪 Verification\n✅ Ran `{cmd_short}` in the sandbox — passed.")
+            } else {
+                format!(
+                    "#### 🧪 Verification\n🔴 Ran `{cmd_short}` — **FAILED** (exit {}).\n\n```\n{}\n```",
+                    o.exit_code.unwrap_or(-1),
+                    common::head_tail_str(&o.output, 3000)
+                )
+            };
+            Some((o.passed, md))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
