@@ -118,10 +118,32 @@ pub async fn run(
          — never one structure with only responsive class tweaks. Match per-breakpoint sizing \
          from the design (e.g. full-width, taller tap targets on mobile where shown).\n"
     };
+    // The plan is a STRATEGY summary — what to change and where — and cannot
+    // losslessly carry inline DATA the ticket supplies (id→value mappings,
+    // config values, copy blocks, JSON, long lists). The planner routinely
+    // writes tasks like "merge the mappings provided in the issue", but the
+    // implement agent never saw msg.body, so it concluded the data "wasn't
+    // provided" and gave up with zero changes (CPM-7958). Give implement the
+    // ORIGINAL ticket text as the authoritative data source so it transcribes
+    // real values instead of refusing to fabricate them. Bounded via head_tail
+    // so a pathological body can't blow the context (the head+tail keep the
+    // instruction framing and the bulk of a data table).
+    let issue_source_block = if msg.body.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n## Original issue — source of truth for any data/values\n\
+             The tasks above may reference data \"from the issue\"; the authoritative text is \
+             below. Transcribe these EXACT values (ids, URLs, config, copy) — never treat \
+             referenced data as missing, and never invent substitutes.\n\n{}",
+            common::head_tail_str(&msg.body, 32_000)
+        )
+    };
+
     let prompt = if complexity == "simple" {
         format!(
             r#"Implement for issue #{number}: {title}
-{design}{continuation}{openspec}{files_hint}{feedback}
+{design}{continuation}{openspec}{files_hint}{feedback}{issue}
 
 ## Instructions — SIMPLE CHANGE
 Go DIRECTLY to the target files listed in the OpenSpec.
@@ -138,11 +160,12 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             openspec = openspec_block,
             files_hint = files_hint,
             feedback = feedback_section,
+            issue = issue_source_block,
         )
     } else {
         format!(
             r#"Implement the following tasks for issue #{number}: {title}
-{design}{continuation}{openspec}{feedback}
+{design}{continuation}{openspec}{feedback}{issue}
 
 ## Instructions
 - Use `search_code` to find exact files and lines before reading. Prefer `read_file_lines` over `read_file`.
@@ -162,6 +185,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             continuation = continuation_note,
             openspec = openspec_block,
             feedback = feedback_section,
+            issue = issue_source_block,
         )
     };
 
