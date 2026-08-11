@@ -373,30 +373,41 @@ pub async fn run(
     }
     full_body.push_str(RATING_FOOTER);
 
+    // De-spam: only comment when there's news. If CoderHelm's last recorded verdict
+    // for this PR equals this one (e.g. still APPROVE while the self-fix loop keeps
+    // pushing commits, or a duplicate same-head event), record the new verdict but
+    // stay SILENT — no repeated "Approved"/"armed" comments, which is the main
+    // source of reviewer spam. An explicit reply / re-review (msg.question) always
+    // speaks, and a flip to/from REQUEST_CHANGES always speaks (verdict changed).
+    let prev_verdict = last_review_verdict(state, &msg).await;
+    let should_comment = msg.question.is_some() || prev_verdict.as_deref() != Some(verdict);
+
     // Post ONE batched review with inline comments; fall back to body-only if
     // GitHub rejects an anchor (a bad line must never drop the whole verdict).
-    let posted = github
-        .create_pr_review_inline(
-            &msg.repo_owner,
-            &msg.repo_name,
-            msg.pr_number,
-            &head_sha,
-            effective_event,
-            &full_body,
-            &postable.inline,
-        )
-        .await;
-    if let Err(e) = posted {
-        warn!(pr = msg.pr_number, error = %e, "Inline review post failed — retrying body-only");
-        github
-            .create_pr_review(
+    if should_comment {
+        let posted = github
+            .create_pr_review_inline(
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.pr_number,
+                &head_sha,
                 effective_event,
                 &full_body,
+                &postable.inline,
             )
-            .await?;
+            .await;
+        if let Err(e) = posted {
+            warn!(pr = msg.pr_number, error = %e, "Inline review post failed — retrying body-only");
+            github
+                .create_pr_review(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.pr_number,
+                    effective_event,
+                    &full_body,
+                )
+                .await?;
+        }
     }
 
     // Persist: store the summary + a compact findings digest for the dashboard.
@@ -449,7 +460,10 @@ pub async fn run(
             self_authored,
         )
         .await;
-        if !report.summary.is_empty() {
+        // Arm regardless (the gate is head-bound, so a new commit must re-arm),
+        // but only COMMENT the "armed" note when there's news — otherwise every
+        // re-approved commit re-posts it.
+        if should_comment && !report.summary.is_empty() {
             let _ = github
                 .create_issue_comment(
                     &msg.repo_owner,
@@ -626,6 +640,30 @@ async fn lookup_run_by_pr(
 }
 
 /// Persist a review record to the settings table so the dashboard can list it and
+/// The most recent verdict CoderHelm recorded for this PR (any head), or None if
+/// it has never reviewed it. Records are keyed sk=REVIEW#{repo}#{pr:06}#{rfc3339},
+/// so a descending scan yields newest-first. Used to stay silent on an unchanged
+/// verdict so the reviewer doesn't re-comment every commit.
+async fn last_review_verdict(state: &WorkerState, msg: &ReviewMessage) -> Option<String> {
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let prefix = format!("REVIEW#{repo}#{:0>6}#", msg.pr_number);
+    let resp = state
+        .dynamo
+        .query()
+        .table_name(&state.config.settings_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :sk)")
+        .expression_attribute_values(":pk", attr_s(&msg.team_id))
+        .expression_attribute_values(":sk", attr_s(&prefix))
+        .scan_index_forward(false)
+        .limit(1)
+        .send()
+        .await
+        .ok()?;
+    resp.items()
+        .first()
+        .and_then(|i| i.get("verdict").and_then(|v| v.as_s().ok()).cloned())
+}
+
 /// ratings/actions can attach. Keyed pk=team_id, sk=REVIEW#{repo}#{pr:06}#{ts}.
 /// Best-effort: a storage failure must never break the actual GitHub review.
 #[allow(clippy::too_many_arguments)]
