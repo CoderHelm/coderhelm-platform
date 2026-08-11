@@ -1524,7 +1524,11 @@ async fn handle_review_trigger(
     // present. `labeled`: the just-added label must BE the trigger label.
     // `opened`/`reopened`/`ready_for_review`/`synchronize`: the PR must already
     // carry the label (covers a PR opened with it, and re-review on a new commit).
-    // A labeled draft is still reviewed — the label is an explicit request.
+    // Draft PRs are NEVER reviewed here (see the draft gate below): CoderHelm opens
+    // its own PRs as draft and self-labels them at once, and a human may label a
+    // draft to queue it. Either way the review waits for the PR to actually be
+    // ready — GitHub re-fires this path as `ready_for_review` (draft=false) once the
+    // author clicks "Ready for review" or the pipeline marks it ready.
     let is_bot_pr = pr["user"]["login"]
         .as_str()
         .unwrap_or("")
@@ -1542,6 +1546,45 @@ async fn handle_review_trigger(
         _ => false,
     };
     if !triggered {
+        return Ok(StatusCode::OK);
+    }
+
+    // Draft gate — never review a PR that is still a draft. This is the difference
+    // between "reviewed the instant CoderHelm self-labeled its own half-built draft"
+    // and "reviewed once the PR is genuinely ready". A draft carrying the label is a
+    // queued request, not a live one: when it flips to ready GitHub fires
+    // `ready_for_review` (draft=false) and we land back here with the label present.
+    // An explicit `@coderhelm review` comment still works on a draft — that path is
+    // separate (handle_issue_comment) — for a human who deliberately wants an early
+    // look.
+    if pr["draft"].as_bool().unwrap_or(false) {
+        info!(
+            owner,
+            name,
+            pr_number,
+            action,
+            "Reviewer skipped — PR is a draft; will review on ready_for_review"
+        );
+        return Ok(StatusCode::OK);
+    }
+
+    // Same-head dedup — collapse a burst of events for ONE commit into ONE review.
+    // GitHub fires several `pull_request` events (opened, labeled, synchronize,
+    // ready_for_review) for the same head within a second — CoderHelm's own
+    // self-label on PR creation is a frequent trigger. Each event used to enqueue
+    // its own review, so one commit was reviewed N times (observed: 4 identical
+    // reviews of the same head in 1.3s). The claim is per (repo, pr, head): only the
+    // first event through wins. A genuinely NEW commit has a different head → a
+    // different key → reviews normally; an explicit `@coderhelm review` comment
+    // bypasses this path entirely (handle_issue_comment).
+    if !claim_review_slot(state, team_id, owner, name, pr_number, &head_sha).await {
+        info!(
+            owner,
+            name,
+            pr_number,
+            action,
+            "Reviewer skipped — this head was already claimed by a sibling event (dedup)"
+        );
         return Ok(StatusCode::OK);
     }
 
@@ -1569,6 +1612,67 @@ async fn handle_review_trigger(
         trigger: action.to_string(),
     });
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
+}
+
+/// How long a review claim blocks re-review of the SAME head. Sized to comfortably
+/// outlast the burst of webhook events GitHub fires for one commit (seconds), while
+/// still self-expiring so a stuck/failed review can be re-driven later (push a new
+/// commit, or `@coderhelm review`). The claim is keyed by head_sha, so a new commit
+/// is never blocked regardless of this window.
+const REVIEW_DEDUP_TTL_SECS: u64 = 3600;
+
+/// Atomically claim the review slot for (team, repo, pr, head). Returns `true` if
+/// THIS caller won the claim (should proceed to enqueue), `false` if a sibling
+/// event already claimed this exact head (skip — it is already being reviewed).
+/// Uses a conditional write so concurrent webhook deliveries race safely: exactly
+/// one wins. Fails OPEN on any non-conditional error so a transient DynamoDB blip
+/// never silently drops a legitimate review.
+async fn claim_review_slot(
+    state: &AppState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+    head_sha: &str,
+) -> bool {
+    let now = chrono::Utc::now();
+    let sk = format!("REVIEWCLAIM#{owner}/{name}#{pr_number:06}#{head_sha}");
+    match state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(team_id))
+        .item("sk", attr_s(&sk))
+        .item(
+            "ttl",
+            attr_n(now.timestamp() as u64 + REVIEW_DEDUP_TTL_SECS),
+        )
+        .item("created_at", attr_s(&now.to_rfc3339()))
+        .condition_expression("attribute_not_exists(pk)")
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            // ConditionalCheckFailed => a sibling event already claimed this head.
+            // Any other error (network/throttle/etc.) fails OPEN so a transient blip
+            // never silently drops a real review. `as_service_error` (not
+            // `into_service_error`) so a non-service error can't panic here.
+            let already_claimed = e
+                .as_service_error()
+                .map(|se| se.is_conditional_check_failed_exception())
+                .unwrap_or(false);
+            if already_claimed {
+                false
+            } else {
+                warn!(
+                    owner,
+                    name, pr_number, "Review dedup claim errored — allowing review (fail-open)"
+                );
+                true
+            }
+        }
+    }
 }
 
 async fn send_to_queue(
