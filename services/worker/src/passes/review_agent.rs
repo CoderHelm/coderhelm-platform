@@ -339,12 +339,17 @@ pub async fn generate_review(
          Judge correctness, cross-file breakage (a changed signature with un-updated callers, \
          missing migration, race, broken contract), security, and violations of the repo's rules. \
          Prefer FEW high-confidence findings over many shallow ones; do not nitpick style unless \
-         it causes a bug.{instructions_block}\n\n\
+         it causes a bug. \
+         Also check SCOPE: if the PR changes files clearly unrelated to its stated purpose/title \
+         (e.g. a one-line URL fix that also edits README, package.json, unrelated components or \
+         tests, or `.claude/skills`), flag it as a `scope` finding — these are usually accidental \
+         (a bad rebase or a revert against the wrong base) and should be removed from the PR.\
+         {instructions_block}\n\n\
          When done exploring, output ONLY a fenced ```json block, no prose after it, matching:\n\
          {{\n  \"verdict\": \"APPROVE\" | \"REQUEST_CHANGES\",\n  \"risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n  \
          \"summary\": \"2-4 sentence overview\",\n  \"findings\": [{{\n    \"file\": \"path\", \"line\": <int, a line present on the RIGHT side of the diff>,\n    \
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
-         \"category\": \"bug|security|correctness|perf|convention\", \"title\": \"short\",\n    \
+         \"category\": \"bug|security|correctness|perf|convention|scope\", \"title\": \"short\",\n    \
          \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}]\n}}\n\
          Use \"blocking\" ONLY for real bugs/risks that should stop the merge. If unsure, REQUEST_CHANGES."
     );
