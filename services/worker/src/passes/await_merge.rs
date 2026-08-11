@@ -195,27 +195,41 @@ pub async fn run(
         return Ok(());
     }
 
-    // Gate 2 — optional deploy label. Now that the PR is cleared to merge, add the
-    // operator-configured label (if any) so the repo's OWN CI deploys to
-    // staging/preview, then wait a tick for that CI to register before we judge
-    // it. Idempotent — if the label is already present we fall through to the CI
+    // Gate 2 — optional deploy label(s). Now that the PR is cleared to merge, add
+    // the operator-configured label(s) so the repo's OWN CI runs (deploy /
+    // staging / preview / E2E suites), then wait a tick for that CI to register
+    // before we judge it. `deploy_label` is a comma-separated list, so a repo can
+    // fan out to several suites (e.g. `E2E:IOS,E2E:ANDROID`). Idempotent — only
+    // the MISSING labels are added; once all are present we fall through to the CI
     // check. Never merges as a side effect here.
-    if !cfg.deploy_label.is_empty() {
-        let has_label = pr["labels"]
+    let want_labels: Vec<String> = cfg
+        .deploy_label
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !want_labels.is_empty() {
+        let present: std::collections::HashSet<String> = pr["labels"]
             .as_array()
             .map(|a| {
                 a.iter()
-                    .any(|l| l["name"].as_str() == Some(cfg.deploy_label.as_str()))
+                    .filter_map(|l| l["name"].as_str().map(|s| s.to_string()))
+                    .collect()
             })
-            .unwrap_or(false);
-        if !has_label {
+            .unwrap_or_default();
+        let missing: Vec<String> = want_labels
+            .iter()
+            .filter(|l| !present.contains(*l))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let joined = missing
+                .iter()
+                .map(|l| format!("`{l}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
             match github
-                .add_labels(
-                    owner,
-                    repo,
-                    msg.pr_number,
-                    std::slice::from_ref(&cfg.deploy_label),
-                )
+                .add_labels(owner, repo, msg.pr_number, &missing)
                 .await
             {
                 Ok(_) => {
@@ -225,31 +239,27 @@ pub async fn run(
                             repo,
                             msg.pr_number,
                             &format!(
-                                "🏷️ Cleared to merge — added the `{}` label to kick off the deploy. \
-                                 I'll merge once that deploy's CI passes.",
-                                cfg.deploy_label
+                                "🏷️ Cleared to merge — added {joined} to kick off CI. I'll merge \
+                                 once all of it passes."
                             ),
                         )
                         .await;
-                    info!(pr = msg.pr_number, label = %cfg.deploy_label, "await-merge: added deploy label");
+                    info!(pr = msg.pr_number, labels = %joined, "await-merge: added deploy label(s)");
                 }
                 Err(e) => {
-                    warn!(pr = msg.pr_number, error = %e, "await-merge: failed to add deploy label");
+                    warn!(pr = msg.pr_number, error = %e, "await-merge: failed to add deploy label(s)");
                     let _ = github
                         .create_issue_comment(
                             owner,
                             repo,
                             msg.pr_number,
-                            &format!(
-                                "⚠️ Couldn't add the deploy label `{}`: {e}",
-                                cfg.deploy_label
-                            ),
+                            &format!("⚠️ Couldn't add the deploy label(s) {joined}: {e}"),
                         )
                         .await;
                 }
             }
-            // Give the label-triggered deploy CI time to register before judging
-            // CI, so we don't see the pre-deploy checks as green and merge early.
+            // Give the label-triggered CI time to register before judging CI, so
+            // we don't see the pre-CI checks as green and merge early.
             wait_more(state, &msg).await;
             return Ok(());
         }
