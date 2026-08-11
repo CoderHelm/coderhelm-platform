@@ -311,12 +311,16 @@ impl<'a> SandboxClient<'a> {
                 .await
                 .map_err(|e| format!("codebuild batch_get_builds failed: {e}"))?;
             let build = builds.builds().first().ok_or("no build record")?;
-            if !matches!(build.build_status(), Some(StatusType::InProgress)) {
+            let status = build.build_status();
+            if !matches!(status, Some(StatusType::InProgress)) {
                 let (group, stream) = build
                     .logs()
                     .and_then(|l| Some((l.group_name()?.to_string(), l.stream_name()?.to_string())))
                     .unzip_or_default();
-                return self.read_codegen_outcome(&group, &stream, out_key).await;
+                let build_succeeded = matches!(status, Some(StatusType::Succeeded));
+                return self
+                    .read_codegen_outcome(&group, &stream, out_key, build_succeeded)
+                    .await;
             }
             if Instant::now() >= poll_until {
                 warn!(build_id = %build_id, "sandbox: codegen deadline reached, stopping");
@@ -332,33 +336,78 @@ impl<'a> SandboxClient<'a> {
         group: &str,
         stream: &str,
         out_key: &str,
+        build_succeeded: bool,
     ) -> Result<CodegenOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        // Source of truth for "codegen produced changes" is the S3 artifact the
+        // build uploads on success — NOT the CloudWatch log marker. The build
+        // uploads out.tgz mid-run (before it finishes) and S3 is read-after-write
+        // consistent, so the artifact is reliably there the moment the build is
+        // done. The log marker, by contrast, lags CloudWatch delivery by several
+        // seconds; reading it too early made the worker report "no result marker"
+        // for builds that had ALREADY succeeded and uploaded the regenerated
+        // files, so the agent re-ran the (expensive, always-succeeding) codegen
+        // build over and over until the pass timed out. Check S3 first.
+        let changed = self.download_changed(out_key).await.unwrap_or_default();
+        if !changed.is_empty() {
+            let output = self
+                .fetch_log(group, stream)
+                .await
+                .map(|l| common::tail_str(&l, MAX_OUTPUT_CHARS).to_string())
+                .unwrap_or_default();
+            return Ok(CodegenOutcome {
+                ran: true,
+                passed: true,
+                changed,
+                output,
+            });
+        }
+
+        // No artifact => codegen either passed with nothing to regenerate, or
+        // failed. Read the log for the end marker, briefly retrying to let
+        // CloudWatch flush; fall back to the CodeBuild build status if the marker
+        // never lands (so a delivery lag is never mistaken for a codegen failure).
         if group.is_empty() {
             return Ok(CodegenOutcome::not_run(
                 "codegen produced no logs (infra fault)",
             ));
         }
-        let full = self.fetch_log(group, stream).await?;
-        let output = common::tail_str(&full, MAX_OUTPUT_CHARS).to_string();
-        let Some(code) = parse_marker_exit(&full, MARKER_CODEGEN_END) else {
-            return Ok(CodegenOutcome::not_run(
-                "codegen did not complete (no result marker)",
-            ));
-        };
-        if code != 0 || !full.contains(MARKER_CODEGEN_UPLOADED) {
-            // Codegen failed, or changed nothing (nothing uploaded).
-            return Ok(CodegenOutcome {
-                ran: true,
-                passed: code == 0,
-                changed: Vec::new(),
-                output,
-            });
+        let mut full = String::new();
+        let mut code = None;
+        for attempt in 0..4 {
+            full = self.fetch_log(group, stream).await.unwrap_or_default();
+            code = parse_marker_exit(&full, MARKER_CODEGEN_END);
+            if code.is_some() {
+                break;
+            }
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
         }
-        let changed = self.download_changed(out_key).await.unwrap_or_default();
+        let output = common::tail_str(&full, MAX_OUTPUT_CHARS).to_string();
+        // If the build logged an upload but the first artifact read came back empty
+        // (a transient S3 read), try once more — those changes are real and must
+        // not be dropped as "nothing to regenerate".
+        if full.contains(MARKER_CODEGEN_UPLOADED) {
+            let retry = self.download_changed(out_key).await.unwrap_or_default();
+            if !retry.is_empty() {
+                return Ok(CodegenOutcome {
+                    ran: true,
+                    passed: true,
+                    changed: retry,
+                    output,
+                });
+            }
+        }
+        // Marker exit code is authoritative for pass/fail when present; otherwise
+        // trust the build status. Either way `changed` is empty here.
+        let passed = match code {
+            Some(c) => c == 0,
+            None => build_succeeded,
+        };
         Ok(CodegenOutcome {
             ran: true,
-            passed: true,
-            changed,
+            passed,
+            changed: Vec::new(),
             output,
         })
     }
