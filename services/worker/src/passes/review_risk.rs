@@ -269,8 +269,41 @@ pub async fn assess(
         }
     }
     top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-    let blast_score = (dependents_total * 4).min(100) as u8;
-    let blast_detail = if top.is_empty() {
+
+    // Cross-repo blast: is a changed symbol consumed by OTHER repos in the org? A
+    // shared/exported surface used elsewhere is far higher blast than an in-repo
+    // change. Bounded to the top 3 symbols (code search is ~10/min), skips
+    // short/noisy tokens, and any failure is treated as no signal (never fatal).
+    let self_full = format!("{owner}/{repo}");
+    let mut cross_repo_total = 0usize;
+    let mut cross_repo_top: Vec<(String, usize)> = vec![];
+    for path in source_paths.iter().take(3) {
+        let Some(token) = derive_symbol(path) else {
+            continue;
+        };
+        if token.len() < 4 {
+            continue; // too noisy to search org-wide
+        }
+        if let Ok(hits) = github.search_org_code(owner, &token).await {
+            let repos: std::collections::HashSet<String> = hits
+                .into_iter()
+                .map(|(r, _)| r)
+                .filter(|r| !r.eq_ignore_ascii_case(&self_full))
+                .collect();
+            if !repos.is_empty() {
+                cross_repo_total += repos.len();
+                cross_repo_top.push((
+                    path.rsplit('/').next().unwrap_or(path).to_string(),
+                    repos.len(),
+                ));
+            }
+        }
+    }
+
+    // In-repo dependents + a heavy weight per OTHER repo that consumes a changed
+    // symbol (cross-repo breakage is the costly kind).
+    let blast_score = (dependents_total * 4 + cross_repo_total * 20).min(100) as u8;
+    let mut blast_detail = if top.is_empty() {
         "no downstream references found".to_string()
     } else {
         let names: Vec<String> = top
@@ -283,6 +316,14 @@ pub async fn assess(
             names.join(", ")
         )
     };
+    if cross_repo_total > 0 {
+        let cr: Vec<String> = cross_repo_top
+            .iter()
+            .take(3)
+            .map(|(p, n)| format!("{p} → {n} repo(s)"))
+            .collect();
+        blast_detail = format!("{blast_detail} · cross-repo consumers: {}", cr.join(", "));
+    }
 
     // Test coverage heuristic (patch-level coverage needs the sandbox; this is the
     // cheap gate): source changed with no test files touched → high gap.

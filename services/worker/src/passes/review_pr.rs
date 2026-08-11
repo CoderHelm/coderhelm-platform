@@ -114,6 +114,24 @@ pub(crate) async fn enabled_trigger_label(
     )
 }
 
+/// Team-wide (org-level) review instructions applied to EVERY repo's review, on
+/// top of the per-repo config + AGENTS.md. Stored at sk `REVIEW_CONFIG#GLOBAL`.
+/// Empty when unset.
+async fn load_org_instructions(state: &WorkerState, team_id: &str) -> String {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s("REVIEW_CONFIG#GLOBAL"))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned())
+        .and_then(|it| it.get("instructions").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default()
+}
+
 const RATING_FOOTER: &str =
     "\n\n---\n_Was this review helpful? Rate it 👍 / 👎 and add notes in the \
 CoderHelm dashboard so the reviewer learns. Reply **@coderhelm re-review** to re-run against the \
@@ -174,6 +192,13 @@ pub async fn run(
             cfg.instructions
         )
     };
+    // Org-wide standards apply to every repo, layered under the per-repo focus.
+    let org_instructions = load_org_instructions(state, &msg.team_id).await;
+    let org_block = if org_instructions.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n## Org-wide review standards (apply to every repo)\n{org_instructions}")
+    };
 
     let provider = ModelProvider::load_for_team(
         &state.dynamo,
@@ -188,10 +213,11 @@ pub async fn run(
         let system = format!(
             "You are a senior engineer answering a question about an open PR in {}/{}. Use the diff \
              and PR description as ground truth; be concrete and cite file:line. If the answer \
-             isn't determinable from the diff, say so.{}{}",
+             isn't determinable from the diff, say so.{}{}{}",
             msg.repo_owner,
             msg.repo_name,
             super::format_instructions_block(&repo_instructions),
+            org_block,
             extra,
         );
         let prompt = format!(
@@ -226,7 +252,7 @@ pub async fn run(
     let learning =
         load_learning_context(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
     let instructions_block = format!(
-        "{}{extra}{learning}",
+        "{}{org_block}{extra}{learning}",
         super::format_instructions_block(&repo_instructions)
     );
     let changed = review_agent::changed_right_lines(&compare);
