@@ -71,6 +71,49 @@ async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str
     }
 }
 
+/// The repo's review trigger label IF the reviewer is enabled (and not killed),
+/// else None. Lets CoderHelm self-label the PRs it opens: the reviewer gates
+/// EVERY PR on the label, so a bot PR must carry it to be reviewed + self-fixed.
+/// Defaults to `ch-review` when the field is unset.
+pub(crate) async fn enabled_trigger_label(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> Option<String> {
+    let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sk))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned())?;
+    let enabled = item
+        .get("enabled")
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false);
+    let killed = item
+        .get("killed")
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false);
+    if !enabled || killed {
+        return None;
+    }
+    Some(
+        item.get("label")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "ch-review".to_string()),
+    )
+}
+
 const RATING_FOOTER: &str =
     "\n\n---\n_Was this review helpful? Rate it 👍 / 👎 and add notes in the \
 CoderHelm dashboard so the reviewer learns. Reply **@coderhelm re-review** to re-run against the \

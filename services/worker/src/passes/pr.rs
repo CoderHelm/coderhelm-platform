@@ -266,6 +266,33 @@ Return ONLY the markdown body text."#,
         (number, url, nid)
     };
 
+    // Self-label CoderHelm's own PR with the repo's review trigger label so the
+    // reviewer picks it up. Post-#60 every PR is gated on the label, so a bot PR
+    // must carry it to be reviewed + run the self-review/fix loop. Only when the
+    // reviewer is enabled for the repo; best-effort (a failure just means no
+    // auto-review, never blocks PR creation). Idempotent — re-adding is a no-op.
+    if let Some(label) = super::review_pr::enabled_trigger_label(
+        state,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+    )
+    .await
+    {
+        match github
+            .add_labels(
+                &msg.repo_owner,
+                &msg.repo_name,
+                pr_number,
+                std::slice::from_ref(&label),
+            )
+            .await
+        {
+            Ok(_) => info!(pr_number, label = %label, "Self-labeled own PR for review"),
+            Err(e) => warn!(pr_number, error = %e, "Could not self-label own PR (non-fatal)"),
+        }
+    }
+
     Ok(PrResult {
         pr_number,
         pr_url,
