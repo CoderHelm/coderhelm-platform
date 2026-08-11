@@ -2394,12 +2394,13 @@ async fn run_passes(
         // the clarification comment.
         if result.files_modified.is_empty() {
             warn!(run_id, "Implement pass produced zero file changes");
-            let raw_clarification = "I explored the codebase but couldn't determine what changes to make for this issue.\n\n\
-                 This usually means the issue needs more detail — for example:\n\
-                 - Which file(s) or component(s) should be modified?\n\
-                 - What is the expected behavior vs. current behavior?\n\
-                 - Any relevant code snippets or error messages?\n\n\
-                 Please add more context and I'll try again.";
+            let raw_clarification = "I ran but produced no file changes for this issue.\n\n\
+                 If the issue already spells out the change (the exact file(s) and the values/content \
+                 to write), this is usually a transient miss on my side — **re-run it** and it \
+                 typically goes through.\n\n\
+                 If details are actually missing, add them and re-trigger — for example:\n\
+                 - Which file(s) or component(s) should change?\n\
+                 - The expected vs. current behavior, or the exact values/content to use?";
             let clarification =
                 formatter::format_with_voice(state, &voice, raw_clarification, &provider, usage)
                     .await;

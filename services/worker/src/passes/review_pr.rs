@@ -162,6 +162,24 @@ pub async fn run(
     let pr = github
         .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await?;
+
+    // Coalesce rapid commits: if a newer commit has landed since this verdict
+    // review was enqueued, skip it — the newer commit's own review covers the
+    // latest code. Without this, a burst (e.g. an auto-fix loop pushing several
+    // commits in a minute) makes the reviewer post a review per intermediate
+    // commit ("asking too fast"). Reply/question reviews resolve the head fresh
+    // (msg.head_sha empty) and are never skipped here.
+    let current_head = pr["head"]["sha"].as_str().unwrap_or("");
+    if msg.question.is_none() && !msg.head_sha.is_empty() && current_head != msg.head_sha {
+        info!(
+            pr = msg.pr_number,
+            enqueued = %msg.head_sha,
+            current = current_head,
+            "Skipping superseded review — a newer commit exists"
+        );
+        return Ok(());
+    }
+
     let title = pr["title"].as_str().unwrap_or("");
     let pr_body = pr["body"].as_str().unwrap_or("");
     let base = pr["base"]["sha"].as_str().unwrap_or("");
