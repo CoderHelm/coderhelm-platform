@@ -1784,6 +1784,13 @@ async fn run_passes(
                                  cost_usd = :cost, duration_s = :d, updated_at = :t"
                             )
                             .expression_attribute_names("#s", "status")
+                            // Never resurrect a cancelled run: if the user cancelled
+                            // mid-cycle, this terminal write must be a no-op rather
+                            // than flip the run back to awaiting_ci and re-trigger the
+                            // loop. (This was the resurrection hole — a re-run fix
+                            // cycle finished after a cancel and clobbered it.)
+                            .condition_expression("#s <> :cancelled")
+                            .expression_attribute_values(":cancelled", attr_s("cancelled"))
                             .expression_attribute_values(":s", attr_s("awaiting_ci"))
                             .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
                             .expression_attribute_values(":cp", attr_s("awaiting_ci"))
@@ -2236,7 +2243,7 @@ async fn run_passes(
                 pr_results.iter().map(|p| attr_s(&p.branch)).collect();
 
             // Store first PR as primary for backward compat, plus full lists
-            state
+            let multi_res = state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
@@ -2251,6 +2258,9 @@ async fn run_passes(
                      status_run_id = :sri, mcp_servers = :mcp",
                 )
                 .expression_attribute_names("#status", "status")
+                // Never resurrect a cancelled run (mirrors the single-repo guard).
+                .condition_expression("#status <> :cancel")
+                .expression_attribute_values(":cancel", attr_s("cancelled"))
                 .expression_attribute_values(":s", attr_s("awaiting_ci"))
                 .expression_attribute_values(":pr", attr_s(&pr_results[0].pr_url))
                 .expression_attribute_values(":pn", attr_n(pr_results[0].pr_number))
@@ -2274,7 +2284,17 @@ async fn run_passes(
                     AttributeValue::L(used_mcp_ids.iter().map(|id| attr_s(id)).collect()),
                 )
                 .send()
-                .await?;
+                .await;
+            if let Err(e) = multi_res {
+                if format!("{e:?}").contains("ConditionalCheckFailed") {
+                    info!(
+                        run_id,
+                        "Multi-repo run cancelled during orchestration — not setting awaiting_ci"
+                    );
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
 
             info!(
                 run_id,
