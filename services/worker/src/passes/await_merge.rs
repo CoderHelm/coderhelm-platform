@@ -111,21 +111,23 @@ async fn ci_state(github: &GitHubClient, owner: &str, repo: &str, sha: &str) -> 
     }
 }
 
-/// Claim the right to post the "auto-merge aborted" notice for this exact head,
-/// so it is posted at most once. The gate re-arms on many CI events; without this
-/// a failing head would collect a fresh abort comment on every re-check. First
-/// caller for a (repo, pr, head) wins; later ones skip. Fails OPEN — only a
-/// definitive "already posted" (ConditionalCheckFailed) suppresses; a transient
-/// DynamoDB error still posts, so a real first notice is never lost.
-async fn claim_abort_notice(
+/// Claim the right to post a given auto-merge status notice (aborted / declined /
+/// failed) for this exact head + kind, so each is posted at most once. The gate
+/// re-arms on many CI events; without this a head would collect a fresh status
+/// comment on every re-check. First caller for a (repo, pr, head, kind) wins;
+/// later ones skip. Fails OPEN — only a definitive "already posted"
+/// (ConditionalCheckFailed) suppresses; a transient DynamoDB error still posts, so
+/// a real first notice is never lost.
+async fn claim_notice(
     state: &WorkerState,
     team_id: &str,
     owner: &str,
     repo: &str,
     pr: u64,
     head: &str,
+    kind: &str,
 ) -> bool {
-    let sk = format!("AWAITABORT#{owner}/{repo}#{pr:06}#{head}");
+    let sk = format!("AWAITNOTICE#{owner}/{repo}#{pr:06}#{head}#{kind}");
     let ttl = chrono::Utc::now().timestamp() as u64 + 7 * 86_400;
     match state
         .dynamo
@@ -347,13 +349,14 @@ pub async fn run(
             // Post the abort notice at most once per head (the gate re-arms on many
             // events). CI is only reported failing once every check is terminal, so
             // this fires on a genuine, settled failure — not mid-run.
-            if claim_abort_notice(
+            if claim_notice(
                 state,
                 &msg.team_id,
                 owner,
                 repo,
                 msg.pr_number,
                 &msg.head_sha,
+                "aborted",
             )
             .await
             {
@@ -401,26 +404,50 @@ pub async fn run(
                     info!(pr = msg.pr_number, "Armed auto-merge: merged");
                 }
                 Ok(false) => {
-                    let _ = github
-                        .create_issue_comment(
-                            owner,
-                            repo,
-                            msg.pr_number,
-                            "⏸️ Auto-merge: GitHub declined the merge (branch protection unmet or a \
-                             conflict). Merge manually once resolved.",
-                        )
-                        .await;
+                    if claim_notice(
+                        state,
+                        &msg.team_id,
+                        owner,
+                        repo,
+                        msg.pr_number,
+                        &msg.head_sha,
+                        "declined",
+                    )
+                    .await
+                    {
+                        let _ = github
+                            .create_issue_comment(
+                                owner,
+                                repo,
+                                msg.pr_number,
+                                "⏸️ Auto-merge: GitHub declined the merge (branch protection unmet \
+                                 or a conflict). Merge manually once resolved.",
+                            )
+                            .await;
+                    }
                 }
                 Err(e) => {
                     warn!(pr = msg.pr_number, error = %e, "Auto-merge failed");
-                    let _ = github
-                        .create_issue_comment(
-                            owner,
-                            repo,
-                            msg.pr_number,
-                            &format!("⚠️ Auto-merge failed: {e}"),
-                        )
-                        .await;
+                    if claim_notice(
+                        state,
+                        &msg.team_id,
+                        owner,
+                        repo,
+                        msg.pr_number,
+                        &msg.head_sha,
+                        "failed",
+                    )
+                    .await
+                    {
+                        let _ = github
+                            .create_issue_comment(
+                                owner,
+                                repo,
+                                msg.pr_number,
+                                &format!("⚠️ Auto-merge failed: {e}"),
+                            )
+                            .await;
+                    }
                 }
             }
         }
