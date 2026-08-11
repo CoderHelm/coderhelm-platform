@@ -155,6 +155,10 @@ async fn main() -> Result<(), Error> {
         .route("/stats/history", get(routes::api::get_stats_history))
         // Reviewer agent — per-repo config, reviews list/detail, ratings
         .route(
+            "/reviewer/org-config",
+            get(routes::reviewer::get_org_config).put(routes::reviewer::update_org_config),
+        )
+        .route(
             "/reviewer/config/:owner/:name",
             get(routes::reviewer::get_config).put(routes::reviewer::update_config),
         )

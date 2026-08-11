@@ -59,6 +59,58 @@ fn item_num(item: &HashMap<String, AttributeValue>, k: &str, d: u64) -> u64 {
         .unwrap_or(d)
 }
 
+/// GET /api/reviewer/org-config — team-wide review instructions applied to
+/// EVERY repo's review (sk REVIEW_CONFIG#GLOBAL), on top of per-repo config.
+pub async fn get_org_config(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s("REVIEW_CONFIG#GLOBAL"))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned())
+        .unwrap_or_default();
+    Ok(Json(
+        json!({ "instructions": item_str(&item, "instructions", "") }),
+    ))
+}
+
+/// PUT /api/reviewer/org-config — set team-wide review instructions (admin).
+pub async fn update_org_config(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    claims.require_role(3)?; // admin+
+    let instructions: String = body["instructions"]
+        .as_str()
+        .unwrap_or("")
+        .chars()
+        .take(16_000)
+        .collect();
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(&claims.team_id))
+        .item("sk", attr_s("REVIEW_CONFIG#GLOBAL"))
+        .item("instructions", attr_s(&instructions))
+        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("put org review config: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::OK)
+}
+
 /// GET /api/reviewer/config/:owner/:name — current reviewer config (defaults
 /// applied so the UI always renders a full, safe form).
 pub async fn get_config(

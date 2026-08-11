@@ -102,6 +102,23 @@ pub fn review_tools() -> Vec<ToolDefinition> {
                 "required": ["query"]
             }),
         },
+        ToolDefinition {
+            name: "search_org".to_string(),
+            description:
+                "Search the WHOLE ORG's OTHER repos for a symbol/string to find cross-repo \
+                 consumers (blast radius beyond this repo). Use ONLY when the PR changes a \
+                 SHARED/exported surface — an exported function/type, a public API route or \
+                 handler, a shared schema/contract, or a package's public export — to see who \
+                 else depends on it. Skip it for purely internal changes. Rate-limited: call it \
+                 a few times at most, with precise symbol names. Returns repo+path hits in \
+                 sibling repos."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "exact symbol/string to find across the org"}},
+                "required": ["query"]
+            }),
+        },
     ]
 }
 
@@ -169,6 +186,30 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
                     }
                 }
                 Ok(json!(common::head_tail_str(&out, 12_000)))
+            }
+            "search_org" => {
+                let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let self_full = format!("{}/{}", self.owner, self.repo);
+                let out = match self.github.search_org_code(self.owner, query).await {
+                    Ok(hits) => {
+                        let lines: Vec<String> = hits
+                            .into_iter()
+                            .filter(|(r, _)| !r.eq_ignore_ascii_case(&self_full))
+                            .take(40)
+                            .map(|(r, p)| format!("{r}: {p}"))
+                            .collect();
+                        if lines.is_empty() {
+                            "No other org repos reference that.".to_string()
+                        } else {
+                            format!(
+                                "Cross-repo consumers (sibling repos):\n{}",
+                                lines.join("\n")
+                            )
+                        }
+                    }
+                    Err(e) => format!("(org search unavailable: {e})"),
+                };
+                Ok(json!(common::head_tail_str(&out, 8_000)))
             }
             other => Ok(json!(format!("Unknown tool: {other}"))),
         }

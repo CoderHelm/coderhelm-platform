@@ -597,6 +597,46 @@ impl GitHubClient {
         self.search_code_api(owner, repo, query).await
     }
 
+    /// Cross-repo code search across a whole ORG (code search API + `org:`
+    /// qualifier). One call surfaces consumers of a symbol in sibling repos
+    /// without downloading them — the basis for cross-repo blast radius.
+    /// Default-branch only and rate-limited (~10/min); callers must use it
+    /// sparingly and treat any error as "no signal", never fatal. Returns
+    /// (repo_full_name, path) hits.
+    pub async fn search_org_code(
+        &self,
+        org: &str,
+        query: &str,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let raw_query = format!("{query} org:{org}");
+        let encoded_query = urlencoding::encode(&raw_query);
+        let url = format!("{API_BASE}/search/code?q={encoded_query}&per_page=30");
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.get(&url);
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await?.error_for_status()?;
+        let data: serde_json::Value = resp.json().await?;
+        let items = data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let repo = item
+                    .get("repository")?
+                    .get("full_name")?
+                    .as_str()?
+                    .to_string();
+                let path = item.get("path")?.as_str()?.to_string();
+                Some((repo, path))
+            })
+            .collect())
+    }
+
     /// Legacy Code Search API path — default-branch only, 10 requests/min.
     async fn search_code_api(
         &self,
