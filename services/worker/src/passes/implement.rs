@@ -784,20 +784,20 @@ fn all_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "get_diff".to_string(),
-            description: "Compare the current branch to main.".to_string(),
+            description: "Compare the current branch to the PR's BASE branch (the branch this PR merges into — NOT necessarily `main`).".to_string(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDefinition {
             name: "restore_file".to_string(),
-            description: "Restore a file to its EXACT content at another git ref (e.g. \"main\", the base branch, or a commit SHA) without loading the content into your context. The worker copies the bytes directly — byte-exact, works for files of ANY size, and cannot alter or truncate the content. Use this to recover a file corrupted or truncated by a bad merge, or to revert a file to its base version, instead of reconstructing it by hand.".to_string(),
+            description: "Restore a file to its EXACT content at a git ref without loading the content into your context (byte-exact, any size). Use it to recover a file a bad merge corrupted, or to REMOVE an out-of-scope change by restoring the file to the PR's base. IMPORTANT: to remove out-of-scope changes, OMIT from_ref — it defaults to this PR's base branch. Do NOT pass \"main\": this PR's base may be a different branch (e.g. `develop`), and restoring to `main` leaves the out-of-scope change in the diff. Only pass from_ref for an unusual source (a specific commit SHA).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path relative to repo root"},
-                    "from_ref": {"type": "string", "description": "Git ref to restore from (branch name like \"main\", or a commit SHA)"},
+                    "from_ref": {"type": "string", "description": "Optional git ref to restore from (a commit SHA). Omit to restore from this PR's base branch — that is what removes an out-of-scope change."},
                     "message": {"type": "string", "description": "Commit message (optional)"}
                 },
-                "required": ["path", "from_ref"]
+                "required": ["path"]
             }),
         },
     ]
@@ -1334,7 +1334,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                     }
                     Ok(json!(lines.join("\n")))
                 } else {
-                    Ok(json!("No changes compared to main."))
+                    Ok(json!("No changes compared to the PR's base branch."))
                 }
             }
             "restore_file" => {
@@ -1352,10 +1352,15 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                 if self.scope_guard.should_block(path) {
                     return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                 }
+                // Default to the PR's base branch — restoring an out-of-scope file
+                // to base is exactly how you remove the out-of-scope change.
+                // Hardcoding/guessing "main" was the bug: on a repo whose base is
+                // e.g. `develop`, restoring to main leaves the change in the diff.
                 let from_ref = input
                     .get("from_ref")
                     .and_then(|v| v.as_str())
-                    .ok_or("Missing from_ref")?;
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&self.base_branch);
                 let message = input
                     .get("message")
                     .and_then(|v| v.as_str())

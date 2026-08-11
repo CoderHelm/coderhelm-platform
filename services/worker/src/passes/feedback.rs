@@ -366,9 +366,11 @@ Rules:
     // changed; a lint/type warning in an untouched file pre-exists on base and
     // is out of scope. HUMAN-directed feedback runs unscoped — a reviewer
     // asking for an out-of-diff change is authorization, not overreach.
+    // The PR's base branch — used both for scope detection and as restore_file's
+    // default target so out-of-scope reverts hit the real base, not `main`.
+    let base = get_run_base_branch(state, &msg).await;
     let ci_only = comments.is_empty() && msg.review_body.trim().is_empty();
     let scope_guard = if ci_only {
-        let base = get_run_base_branch(state, &msg).await;
         match github
             .compare_changed_files(&msg.repo_owner, &msg.repo_name, &base, &branch)
             .await
@@ -389,6 +391,7 @@ Rules:
         owner: &msg.repo_owner,
         repo: &msg.repo_name,
         branch: &branch,
+        base_branch: &base,
         files_modified: std::sync::Mutex::new(false),
         scope_guard,
     };
@@ -1120,15 +1123,15 @@ fn feedback_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "restore_file".to_string(),
-            description: "Restore a file to its EXACT content at another git ref (e.g. \"main\", the base branch, or a commit SHA) without loading the content into your context. The worker copies the bytes directly — byte-exact, works for files of ANY size, cannot alter or truncate. Use this to recover a file corrupted or truncated by a bad merge, or to revert to its base version, instead of reconstructing it by hand.".to_string(),
+            description: "Restore a file to its EXACT content at a git ref without loading the content into your context (byte-exact, any size). Use it to recover a file a bad merge corrupted, or to REMOVE an out-of-scope change by restoring the file to the PR's base. IMPORTANT: to remove out-of-scope changes, OMIT from_ref — it defaults to this PR's base branch. Do NOT pass \"main\": this PR's base may be a different branch (e.g. `develop`), and restoring to `main` leaves the out-of-scope change in the diff. Only pass from_ref for an unusual source (a specific commit SHA).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path relative to repo root"},
-                    "from_ref": {"type": "string", "description": "Git ref to restore from (e.g. \"main\" or a commit SHA)"},
+                    "from_ref": {"type": "string", "description": "Optional git ref to restore from (a commit SHA). Omit to restore from this PR's base branch — that is what removes an out-of-scope change."},
                     "message": {"type": "string", "description": "Commit message (optional)"}
                 },
-                "required": ["path", "from_ref"]
+                "required": ["path"]
             }),
         },
     ]
@@ -1139,6 +1142,9 @@ struct FeedbackToolExecutor<'a> {
     owner: &'a str,
     repo: &'a str,
     branch: &'a str,
+    /// The PR's base branch — restore_file defaults to it so out-of-scope
+    /// reverts target the real base (not a hardcoded `main`).
+    base_branch: &'a str,
     files_modified: std::sync::Mutex<bool>,
     /// Ticket-scope guard: CI-only cycles may only write files the PR already
     /// changed (bounded escape). Human-directed feedback is unscoped.
@@ -1446,10 +1452,14 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                 if self.scope_guard.should_block(path) {
                     return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                 }
+                // Default to the PR's base branch: restoring an out-of-scope file
+                // to base is how you remove the change. Guessing "main" was the bug
+                // on repos whose base is e.g. `develop`.
                 let from_ref = input
                     .get("from_ref")
                     .and_then(|v| v.as_str())
-                    .ok_or("Missing from_ref")?;
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(self.base_branch);
                 let message = input
                     .get("message")
                     .and_then(|v| v.as_str())
