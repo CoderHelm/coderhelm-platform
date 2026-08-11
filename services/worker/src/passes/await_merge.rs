@@ -404,6 +404,11 @@ pub async fn run(
                     info!(pr = msg.pr_number, "Armed auto-merge: merged");
                 }
                 Ok(false) => {
+                    // GitHub refused the merge — almost always a branch-protection
+                    // requirement not yet met (most often a required approving review
+                    // still pending), occasionally a conflict. Do NOT tell the user to
+                    // merge by hand: keep waiting (bounded) and re-attempt, so it
+                    // merges on its own once the requirement clears. Note once per head.
                     if claim_notice(
                         state,
                         &msg.team_id,
@@ -420,11 +425,13 @@ pub async fn run(
                                 owner,
                                 repo,
                                 msg.pr_number,
-                                "⏸️ Auto-merge: GitHub declined the merge (branch protection unmet \
-                                 or a conflict). Merge manually once resolved.",
+                                "⏸️ Auto-merge is waiting — GitHub won't allow the merge yet (a \
+                                 required approval or branch-protection check isn't satisfied, or \
+                                 there's a conflict). I'll merge automatically once that clears.",
                             )
                             .await;
                     }
+                    wait_more(state, &msg).await;
                 }
                 Err(e) => {
                     warn!(pr = msg.pr_number, error = %e, "Auto-merge failed");
