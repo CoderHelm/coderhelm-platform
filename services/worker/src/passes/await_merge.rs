@@ -1,10 +1,11 @@
 //! Armed auto-merge gate. Merges a PR only once BOTH keys are present — the
 //! bot's OWN latest verdict for this head is APPROVE (verified here, not assumed,
 //! since the gateway also arms on any human approval) + a human approval — AND
-//! every CI check is green. Once approvals are in, if the repo configures an
-//! (operator-set, never hardcoded) deploy label, the gate ADDS it so the repo's
-//! own CI deploys to staging/preview, then waits for that deploy's CI before
-//! merging. It waits (self-scheduling, bounded) for pending checks —
+//! every CI check is green. If the repo configures an (operator-set, never
+//! hardcoded) deploy label, CoderHelm's own PRs carry it from PR creation (the PR
+//! maker adds it) so the repo's deploy/preview CI runs from the start; human PRs
+//! get it added here once approved. Either way the gate waits for that deploy's CI
+//! before merging. It waits (self-scheduling, bounded) for pending checks —
 //! e.g. a Terraform staging-apply — and NEVER merges on failing or still-running
 //! CI. Bound to the reviewed head: a later commit aborts (the fresh review
 //! re-arms). Reuses the two-key + post-merge (tag/health) logic from review_actions.
@@ -268,13 +269,15 @@ pub async fn run(
         return Ok(());
     }
 
-    // Gate 2 — optional deploy label(s). Now that the PR is cleared to merge, add
-    // the operator-configured label(s) so the repo's OWN CI runs (deploy /
-    // staging / preview / E2E suites), then wait a tick for that CI to register
-    // before we judge it. `deploy_label` is a comma-separated list, so a repo can
-    // fan out to several suites (e.g. `E2E:IOS,E2E:ANDROID`). Idempotent — only
-    // the MISSING labels are added; once all are present we fall through to the CI
-    // check. Never merges as a side effect here.
+    // Gate 2 — optional deploy label(s). CoderHelm's OWN PRs already carry these
+    // from PR creation (the PR maker adds them alongside the review label), so this
+    // is a no-op for them and we fall straight through to the CI check. It still
+    // matters for HUMAN-authored PRs: add the operator-configured label(s) now that
+    // the PR is cleared to merge so the repo's OWN CI runs (deploy / staging /
+    // preview / E2E suites), then wait a tick for that CI to register before we
+    // judge it. `deploy_label` is a comma-separated list (e.g. `E2E:IOS,E2E:ANDROID`).
+    // Idempotent — only the MISSING labels are added; once all are present we fall
+    // through to the CI check. Never merges as a side effect here.
     let want_labels: Vec<String> = cfg
         .deploy_label
         .split(',')

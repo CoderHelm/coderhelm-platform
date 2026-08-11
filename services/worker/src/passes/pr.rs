@@ -266,11 +266,17 @@ Return ONLY the markdown body text."#,
         (number, url, nid)
     };
 
-    // Self-label CoderHelm's own PR with the repo's review trigger label so the
-    // reviewer picks it up. Post-#60 every PR is gated on the label, so a bot PR
-    // must carry it to be reviewed + run the self-review/fix loop. Only when the
-    // reviewer is enabled for the repo; best-effort (a failure just means no
-    // auto-review, never blocks PR creation). Idempotent — re-adding is a no-op.
+    // Label CoderHelm's own PR at creation — this is the PR MAKER, so it owns the
+    // PR's labels. Two things get added here, only when the reviewer is enabled for
+    // the repo; best-effort (a failure just means no auto-review, never blocks PR
+    // creation). Idempotent — re-adding any label is a no-op.
+    //   1. The review TRIGGER label (e.g. `ch-review`). Post-#60 every PR is gated
+    //      on it, so a bot PR must carry it to be reviewed + run the self-fix loop.
+    //   2. The configured DEPLOY label(s) (e.g. `CI:DEPLOY_PREVIEW`), so the repo's
+    //      own deploy / preview / E2E CI runs from the START — not gated behind
+    //      approval by the merge gate. `deploy_label` is a comma-separated list.
+    //      The auto-merge gate later only adds a label that's still MISSING, so for
+    //      these bot PRs it's a no-op there and simply waits for that CI to go green.
     if let Some(label) = super::review_pr::enabled_trigger_label(
         state,
         &msg.team_id,
@@ -279,17 +285,28 @@ Return ONLY the markdown body text."#,
     )
     .await
     {
+        let mut to_add: Vec<String> = vec![label];
+        let cfg = super::review_actions::OnApproveConfig::load(
+            state,
+            &msg.team_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+        )
+        .await;
+        to_add.extend(
+            cfg.deploy_label
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        );
         match github
-            .add_labels(
-                &msg.repo_owner,
-                &msg.repo_name,
-                pr_number,
-                std::slice::from_ref(&label),
-            )
+            .add_labels(&msg.repo_owner, &msg.repo_name, pr_number, &to_add)
             .await
         {
-            Ok(_) => info!(pr_number, label = %label, "Self-labeled own PR for review"),
-            Err(e) => warn!(pr_number, error = %e, "Could not self-label own PR (non-fatal)"),
+            Ok(_) => {
+                info!(pr_number, labels = ?to_add, "Labeled own PR (review + deploy) at creation")
+            }
+            Err(e) => warn!(pr_number, error = %e, "Could not label own PR (non-fatal)"),
         }
     }
 
