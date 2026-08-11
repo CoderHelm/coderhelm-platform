@@ -137,11 +137,12 @@ pub async fn run(
                 .and_then(|v| v.as_s().ok())
                 .cloned()
                 .unwrap_or_default();
-            let base_branch = item
-                .get("base_branch")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-                .unwrap_or_else(|| "main".to_string());
+            // Base for the pre-fix conflict merge — resolved from the LIVE PR, not
+            // the run record's possibly-stale `base_branch`. Merging the PR's real
+            // base (e.g. `develop`) keeps the branch in sync WITHOUT pulling in
+            // `main`-only files that would masquerade as out-of-scope changes and
+            // trigger an endless revert/re-merge loop.
+            let base_branch = resolve_pr_base(&github, &msg).await;
             if !branch.is_empty() {
                 let ticket_msg = crate::models::TicketMessage {
                     team_id: msg.team_id.clone(),
@@ -368,7 +369,10 @@ Rules:
     // asking for an out-of-diff change is authorization, not overreach.
     // The PR's base branch — used both for scope detection and as restore_file's
     // default target so out-of-scope reverts hit the real base, not `main`.
-    let base = get_run_base_branch(state, &msg).await;
+    // Resolved from the LIVE PR (ground truth), never the run record's stored value.
+    let base = resolve_pr_base(&github, &msg).await;
+    // Correct a stale stored base so the rest of the system stays consistent.
+    heal_run_base_branch(state, &msg, &base).await;
     let ci_only = comments.is_empty() && msg.review_body.trim().is_empty();
     let scope_guard = if ci_only {
         match github
@@ -752,13 +756,51 @@ async fn send_delayed_feedback(
     }
 }
 
-/// Look up the branch name from the run record in DynamoDB.
-/// The run's base branch (for scoping fix cycles to the PR's changed files).
-/// Falls back to "main" — an unscoped-by-error guard is safer than a wrong base.
-async fn get_run_base_branch(state: &WorkerState, msg: &FeedbackMessage) -> String {
-    state
+/// The base branch to scope, restore, and merge against — read from the LIVE PR,
+/// which is ground truth for what GitHub will actually merge into. A persisted
+/// run-record `base_branch` can go stale and poison the whole fix loop: a run was
+/// once stamped `main` while its PR was correctly opened against `develop`, and the
+/// loop trusted the record — every cycle merged `main` (re-adding `main`-only files
+/// that looked like out-of-scope changes) and reverted to `main` (a no-op relative
+/// to the real base `develop`, so the files never actually left the diff). Reading
+/// the PR's `base.ref` each cycle makes that divergence impossible. Order:
+/// PR base → repo default branch → `main` (last resort, warned). Deliberately does
+/// NOT read the run record's `base_branch`, which is exactly the value we distrust.
+async fn resolve_pr_base(github: &GitHubClient, msg: &FeedbackMessage) -> String {
+    if msg.pr_number > 0 {
+        if let Ok(pr) = github
+            .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+            .await
+        {
+            if let Some(b) = pr["base"]["ref"].as_str().filter(|s| !s.is_empty()) {
+                return b.to_string();
+            }
+        }
+    }
+    match github
+        .get_default_branch(&msg.repo_owner, &msg.repo_name)
+        .await
+    {
+        Ok(b) if !b.is_empty() => b,
+        _ => {
+            warn!(
+                repo = %format!("{}/{}", msg.repo_owner, msg.repo_name),
+                pr_number = msg.pr_number,
+                "Could not resolve PR base or default branch — falling back to main"
+            );
+            "main".to_string()
+        }
+    }
+}
+
+/// Best-effort: overwrite the run record's stored `base_branch` with the
+/// authoritative value resolved from the PR, so every OTHER reader (resume loop,
+/// dashboard) is consistent and a stale `main` can't linger. Failures are ignored —
+/// the fix loop already resolves from the PR directly and does not depend on this.
+async fn heal_run_base_branch(state: &WorkerState, msg: &FeedbackMessage, base: &str) {
+    let _ = state
         .dynamo
-        .get_item()
+        .update_item()
         .table_name(&state.config.runs_table_name)
         .key(
             "team_id",
@@ -768,12 +810,13 @@ async fn get_run_base_branch(state: &WorkerState, msg: &FeedbackMessage) -> Stri
             "run_id",
             aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
         )
+        .update_expression("SET base_branch = :b")
+        .expression_attribute_values(
+            ":b",
+            aws_sdk_dynamodb::types::AttributeValue::S(base.to_string()),
+        )
         .send()
-        .await
-        .ok()
-        .and_then(|r| r.item)
-        .and_then(|i| i.get("base_branch").and_then(|v| v.as_s().ok()).cloned())
-        .unwrap_or_else(|| "main".to_string())
+        .await;
 }
 
 async fn get_pr_branch(

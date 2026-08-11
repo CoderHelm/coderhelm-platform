@@ -1041,6 +1041,28 @@ async fn run_passes(
     };
     msg.base_branch = default_branch;
 
+    // create_run_record() ran BEFORE run_passes and persisted the UNRESOLVED
+    // incoming base_branch, which defaults to `main`. Now that the repo's real
+    // default is resolved (e.g. `develop`), write it back so the stored record
+    // matches the branch the PR will actually target. A stale `main` on the record
+    // is precisely what let a `develop`-based PR's fix loop merge `main` and churn
+    // out-of-scope files endlessly. Best-effort — the fix loop also resolves the
+    // base from the live PR directly, so this is defence in depth, not the only
+    // guard.
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET base_branch = :b")
+        .expression_attribute_values(":b", attr_s(&msg.base_branch))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Failed to persist resolved base_branch to run record");
+    }
+
     // Load enabled MCP plugins once for this run
     let mcp_table = if state.config.mcp_configs_table_name.is_empty() {
         &state.config.settings_table_name
