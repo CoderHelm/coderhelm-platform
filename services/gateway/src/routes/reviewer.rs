@@ -207,12 +207,15 @@ pub async fn update_config(
     // Optional deploy label the reviewer adds once a PR is cleared to merge (to
     // trigger the repo's own deploy CI). Operator-set free text; trimmed and
     // capped to GitHub's 50-char label limit. Empty = no label step.
+    // Comma-separated list of labels to add once a PR is cleared to merge (each
+    // triggers the repo's own CI — deploy/staging/preview/E2E). Capped generously
+    // to fit several labels; trimming of individual entries happens worker-side.
     let deploy_label: String = body["deploy_label"]
         .as_str()
         .unwrap_or("")
         .trim()
         .chars()
-        .take(50)
+        .take(200)
         .collect();
     // Teams webhook: must be an https URL (or empty to disable). Guards against a
     // config that would make the worker POST to an arbitrary/internal endpoint.
