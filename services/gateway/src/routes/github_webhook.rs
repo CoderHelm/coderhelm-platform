@@ -1519,17 +1519,16 @@ async fn handle_review_trigger(
         return Ok(StatusCode::OK);
     }
 
-    // CoderHelm's own PRs are auto-reviewed (no label needed) — it can't
-    // self-approve, so review_pr posts a COMMENT review. Human PRs are gated on
-    // the review label: on `labeled` the added label must BE the review label;
-    // on `synchronize` (new commit) the PR must already carry it.
+    // Review is gated on the repo's trigger label for EVERY PR, including
+    // CoderHelm's own (bot-authored) PRs — nothing is reviewed until the label is
+    // present. `labeled`: the just-added label must BE the trigger label.
+    // `opened`/`reopened`/`ready_for_review`/`synchronize`: the PR must already
+    // carry the label (covers a PR opened with it, and re-review on a new commit).
+    // A labeled draft is still reviewed — the label is an explicit request.
     let is_bot_pr = pr["user"]["login"]
         .as_str()
         .unwrap_or("")
         .contains("coderhelm");
-    // Don't auto-review a draft bot PR — wait for it to be marked ready. An
-    // explicitly-labeled PR is reviewed even as a draft (the label is a request).
-    let is_draft = pr["draft"].as_bool().unwrap_or(false);
     let carries_label = pr["labels"]
         .as_array()
         .map(|ls| {
@@ -1539,8 +1538,7 @@ async fn handle_review_trigger(
         .unwrap_or(false);
     let triggered = match action {
         "labeled" => payload["label"]["name"].as_str() == Some(cfg.label.as_str()),
-        "synchronize" => carries_label || (is_bot_pr && !is_draft),
-        "opened" | "reopened" | "ready_for_review" => is_bot_pr && !is_draft,
+        "synchronize" | "opened" | "reopened" | "ready_for_review" => carries_label,
         _ => false,
     };
     if !triggered {
