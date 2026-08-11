@@ -29,6 +29,48 @@ enum Ci {
     Failing(String),
 }
 
+/// Pure classification of a ref's GitHub check-runs → (any_pending, failing_names).
+/// GitHub returns EVERY check-run for a ref, including superseded ones: a re-run or
+/// a concurrency-cancel leaves the stale earlier run behind, so one check name can
+/// appear several times (e.g. a `cancelled` plus a later `success`). We keep only
+/// the LATEST run per name so a stale duplicate can't veto the current result, and
+/// `cancelled` is treated as NEUTRAL — GitHub cancels superseded / concurrency-
+/// grouped runs and fail-fast matrix siblings as a matter of course, and a genuine
+/// failure always surfaces as `failure`/`timed_out` on its own check. Counting
+/// `cancelled` as failing was producing false "CI is failing" aborts on PRs whose
+/// checks had actually passed.
+fn classify_check_runs(runs: &[serde_json::Value]) -> (bool, Vec<String>) {
+    use std::collections::HashMap;
+    let mut latest: HashMap<&str, &serde_json::Value> = HashMap::new();
+    for r in runs {
+        let name = r["name"].as_str().unwrap_or("check");
+        let ts = r["started_at"].as_str().unwrap_or("");
+        let newer = latest
+            .get(name)
+            .and_then(|e| e["started_at"].as_str())
+            .map(|prev| prev <= ts)
+            .unwrap_or(true);
+        if newer {
+            latest.insert(name, r);
+        }
+    }
+    let mut pending = false;
+    let mut failing: Vec<String> = vec![];
+    for r in latest.values() {
+        if r["status"].as_str() != Some("completed") {
+            pending = true;
+            continue;
+        }
+        match r["conclusion"].as_str().unwrap_or("") {
+            "failure" | "timed_out" | "startup_failure" | "action_required" => {
+                failing.push(r["name"].as_str().unwrap_or("check").to_string())
+            }
+            _ => {}
+        }
+    }
+    (pending, failing)
+}
+
 /// Combine GitHub Actions check-runs + legacy commit statuses into one verdict.
 /// No checks at all ⇒ Green (nothing to gate on).
 async fn ci_state(github: &GitHubClient, owner: &str, repo: &str, sha: &str) -> Ci {
@@ -36,18 +78,10 @@ async fn ci_state(github: &GitHubClient, owner: &str, repo: &str, sha: &str) -> 
     let mut failing: Vec<String> = vec![];
 
     if let Ok(v) = github.list_check_runs_for_ref(owner, repo, sha).await {
-        for r in v["check_runs"].as_array().cloned().unwrap_or_default() {
-            if r["status"].as_str() != Some("completed") {
-                pending = true;
-                continue;
-            }
-            match r["conclusion"].as_str().unwrap_or("") {
-                "failure" | "timed_out" | "cancelled" | "startup_failure" | "action_required" => {
-                    failing.push(r["name"].as_str().unwrap_or("check").to_string())
-                }
-                _ => {}
-            }
-        }
+        let runs = v["check_runs"].as_array().cloned().unwrap_or_default();
+        let (p, f) = classify_check_runs(&runs);
+        pending |= p;
+        failing.extend(f);
     }
     // Legacy commit statuses (external CI that posts a status, e.g. staging apply).
     // Only meaningful when there's at least one status — an empty set reports
@@ -63,12 +97,51 @@ async fn ci_state(github: &GitHubClient, owner: &str, repo: &str, sha: &str) -> 
         }
     }
 
-    if !failing.is_empty() {
-        Ci::Failing(failing.join(", "))
-    } else if pending {
+    // Wait for CI to FULLY settle before ever declaring a failure: while anything
+    // is still running the verdict isn't final, so keep waiting rather than
+    // shouting "CI is failing" mid-run (and re-posting it on every re-check). Only
+    // once every check is terminal do we decide fail vs green.
+    if pending {
         Ci::Pending
+    } else if !failing.is_empty() {
+        Ci::Failing(failing.join(", "))
     } else {
         Ci::Green
+    }
+}
+
+/// Claim the right to post the "auto-merge aborted" notice for this exact head,
+/// so it is posted at most once. The gate re-arms on many CI events; without this
+/// a failing head would collect a fresh abort comment on every re-check. First
+/// caller for a (repo, pr, head) wins; later ones skip. Fails OPEN — only a
+/// definitive "already posted" (ConditionalCheckFailed) suppresses; a transient
+/// DynamoDB error still posts, so a real first notice is never lost.
+async fn claim_abort_notice(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+    head: &str,
+) -> bool {
+    let sk = format!("AWAITABORT#{owner}/{repo}#{pr:06}#{head}");
+    let ttl = chrono::Utc::now().timestamp() as u64 + 7 * 86_400;
+    match state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", super::attr_s(team_id))
+        .item("sk", super::attr_s(&sk))
+        .item("ttl", super::attr_n(ttl))
+        .condition_expression("attribute_not_exists(pk)")
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => !e
+            .as_service_error()
+            .map(|se| se.is_conditional_check_failed_exception())
+            .unwrap_or(false),
     }
 }
 
@@ -268,17 +341,31 @@ pub async fn run(
     // Gate 3 — all CI green (now includes the deploy CI the label triggered).
     match ci_state(&github, owner, repo, &msg.head_sha).await {
         Ci::Failing(names) => {
-            let _ = github
-                .create_issue_comment(
-                    owner,
-                    repo,
-                    msg.pr_number,
-                    &format!(
-                        "🔴 **Auto-merge aborted** — CI is failing ({names}). Not merging; push a \
-                         fix and it will re-arm."
-                    ),
-                )
-                .await;
+            // Post the abort notice at most once per head (the gate re-arms on many
+            // events). CI is only reported failing once every check is terminal, so
+            // this fires on a genuine, settled failure — not mid-run.
+            if claim_abort_notice(
+                state,
+                &msg.team_id,
+                owner,
+                repo,
+                msg.pr_number,
+                &msg.head_sha,
+            )
+            .await
+            {
+                let _ = github
+                    .create_issue_comment(
+                        owner,
+                        repo,
+                        msg.pr_number,
+                        &format!(
+                            "🔴 **Auto-merge aborted** — CI is failing ({names}). Not merging; \
+                             push a fix and it will re-arm."
+                        ),
+                    )
+                    .await;
+            }
             info!(pr = msg.pr_number, "await-merge: CI failing, aborted");
         }
         Ci::Green => {
@@ -415,5 +502,85 @@ async fn send(state: &WorkerState, msg: &AwaitMergeMessage, attempts: u32, delay
             warn!(error = %e, "await-merge: enqueue failed");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod ci_tests {
+    use super::classify_check_runs;
+    use serde_json::json;
+
+    fn cr(name: &str, status: &str, conclusion: &str, started_at: &str) -> serde_json::Value {
+        json!({"name": name, "status": status, "conclusion": conclusion, "started_at": started_at})
+    }
+
+    #[test]
+    fn cancelled_duplicate_does_not_fail() {
+        // The incident: a superseded `cancelled` run alongside a later `success`
+        // for the same check must NOT be reported as failing.
+        let runs = vec![
+            cr(
+                "Web App Lint",
+                "completed",
+                "success",
+                "2026-08-11T10:00:00Z",
+            ),
+            cr(
+                "Web App Lint",
+                "completed",
+                "cancelled",
+                "2026-08-11T09:00:00Z",
+            ),
+        ];
+        let (pending, failing) = classify_check_runs(&runs);
+        assert!(!pending);
+        assert!(
+            failing.is_empty(),
+            "cancelled dup must not fail: {failing:?}"
+        );
+    }
+
+    #[test]
+    fn cancelled_only_is_neutral() {
+        let runs = vec![cr(
+            "Deploy",
+            "completed",
+            "cancelled",
+            "2026-08-11T10:00:00Z",
+        )];
+        let (pending, failing) = classify_check_runs(&runs);
+        assert!(!pending);
+        assert!(failing.is_empty());
+    }
+
+    #[test]
+    fn real_failure_is_reported() {
+        let runs = vec![cr("Lint", "completed", "failure", "2026-08-11T10:00:00Z")];
+        let (_, failing) = classify_check_runs(&runs);
+        assert_eq!(failing, vec!["Lint".to_string()]);
+    }
+
+    #[test]
+    fn in_progress_is_pending() {
+        let runs = vec![cr(
+            "Deploy Preview",
+            "in_progress",
+            "",
+            "2026-08-11T10:00:00Z",
+        )];
+        let (pending, failing) = classify_check_runs(&runs);
+        assert!(pending);
+        assert!(failing.is_empty());
+    }
+
+    #[test]
+    fn latest_run_per_name_wins() {
+        // Older success then newer failure for one name => failing (latest wins).
+        let runs = vec![
+            cr("Lint", "completed", "success", "2026-08-11T09:00:00Z"),
+            cr("Lint", "completed", "failure", "2026-08-11T10:00:00Z"),
+        ];
+        let (_, failing) = classify_check_runs(&runs);
+        assert_eq!(failing, vec!["Lint".to_string()]);
     }
 }
