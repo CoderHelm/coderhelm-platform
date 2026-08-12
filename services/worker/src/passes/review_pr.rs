@@ -485,13 +485,124 @@ pub async fn run(
             .await;
         }
     } else if self_authored {
-        // CoderHelm reviewed its OWN PR and wants changes → hand the findings to
-        // the run's feedback loop so it applies the fixes (coderhelm reviews
-        // coderhelm → picks up the changes). A new commit re-triggers the review.
-        feed_review_back_to_run(state, &msg, &record_body).await;
+        // CoderHelm reviewed its OWN PR and wants changes → hand the findings to the
+        // run's feedback loop so it applies the fixes. Two guards keep this review↔fix
+        // loop from running away (it once flip-flopped a verdict into 67 commits / 44
+        // reviews):
+        //   (1) Hysteresis — if the PREVIOUS verdict was APPROVE, do NOT auto-fix this
+        //       REQUEST_CHANGES. An approve→request flip on the bot's own code is
+        //       almost always reviewer non-determinism, not a real regression; the
+        //       findings stay visible for a human to judge.
+        //   (2) Convergence cap — bound the self-review→fix rounds per PR. Past the
+        //       cap, stop auto-fixing and hand off to a human (announced once).
+        if prev_verdict.as_deref() == Some("APPROVE") {
+            info!(
+                pr = msg.pr_number,
+                "Self-review flipped APPROVE→REQUEST_CHANGES — holding for a human, not re-fixing (hysteresis)"
+            );
+        } else if claim_self_review_round(
+            state,
+            &msg.team_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+        )
+        .await
+        {
+            // Under the cap — apply the fixes. A new commit re-triggers the review.
+            feed_review_back_to_run(state, &msg, &record_body).await;
+        } else if claim_once(
+            state,
+            &msg.team_id,
+            &format!(
+                "SELFREVIEWHANDOFF#{}/{}#{:0>6}",
+                msg.repo_owner, msg.repo_name, msg.pr_number
+            ),
+        )
+        .await
+        {
+            // Cap reached — stop the auto-fix loop and hand to a human, once.
+            let _ = github
+                .create_issue_comment(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.pr_number,
+                    &format!(
+                        "🛑 I've self-fixed this PR {MAX_SELF_REVIEW_FIX_ROUNDS} times without the \
+                         review converging, so I'm stopping the automatic fix loop and handing it \
+                         to a human. My latest findings are above."
+                    ),
+                )
+                .await;
+            info!(
+                pr = msg.pr_number,
+                "Self-review→fix cap reached — handed off to a human"
+            );
+        }
     }
 
     Ok(())
+}
+
+/// How many self-review → self-fix rounds CoderHelm runs on its OWN PR before it
+/// gives up and hands to a human. Bounds the review↔fix loop so a flip-flopping
+/// verdict can't churn commits/reviews forever (one PR hit 67 commits / 44 reviews
+/// oscillating APPROVE↔REQUEST_CHANGES).
+const MAX_SELF_REVIEW_FIX_ROUNDS: u32 = 3;
+
+/// Claim one self-review→fix round for this PR (atomic conditional increment).
+/// True while under MAX_SELF_REVIEW_FIX_ROUNDS (proceed with the fix); false once
+/// the cap is reached — or on ANY error (fail CLOSED, like claim_auto_fix_slot:
+/// never keep looping when the bound can't be confirmed). Self-expires via TTL so
+/// a genuinely fresh re-run of the ticket later starts over.
+async fn claim_self_review_round(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+) -> bool {
+    let sk = format!("SELFREVIEWROUNDS#{owner}/{repo}#{pr:0>6}");
+    let ttl = chrono::Utc::now().timestamp() as u64 + 3 * 86_400;
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sk))
+        .update_expression("SET #ttl = :ttl ADD rounds :one")
+        .condition_expression("attribute_not_exists(rounds) OR rounds < :max")
+        .expression_attribute_names("#ttl", "ttl")
+        .expression_attribute_values(":one", attr_n(1))
+        .expression_attribute_values(":max", attr_n(u64::from(MAX_SELF_REVIEW_FIX_ROUNDS)))
+        .expression_attribute_values(":ttl", attr_n(ttl))
+        .send()
+        .await
+        .is_ok()
+}
+
+/// Perform a one-time action for a key (e.g. post the handoff notice once).
+/// Conditional put: true only for the first caller. Fails OPEN (acts) on a
+/// transient error so a real one-time notice is never lost. TTL-expiring.
+async fn claim_once(state: &WorkerState, team_id: &str, sk: &str) -> bool {
+    let ttl = chrono::Utc::now().timestamp() as u64 + 7 * 86_400;
+    match state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(team_id))
+        .item("sk", attr_s(sk))
+        .item("ttl", attr_n(ttl))
+        .condition_expression("attribute_not_exists(pk)")
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => !e
+            .as_service_error()
+            .map(|se| se.is_conditional_check_failed_exception())
+            .unwrap_or(false),
+    }
 }
 
 /// Route a self-review's requested changes into the originating run's feedback
