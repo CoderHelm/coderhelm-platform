@@ -15,7 +15,11 @@
 
 use crate::clients::github::GitHubClient;
 use crate::WorkerState;
-use tracing::warn;
+use tracing::{info, warn};
+
+/// SQS `DelaySeconds` hard cap (15 min). Batch windows longer than this chain
+/// across multiple delayed messages.
+const SQS_MAX_DELAY_SECS: u64 = 900;
 
 /// Per-repo post-approval config, read from the same REVIEW_CONFIG item the
 /// reviewer core uses. Every field defaults to the SAFE value (no action).
@@ -32,6 +36,11 @@ pub struct OnApproveConfig {
     /// real release version, not a datestamp wearing a version's prefix.
     pub tag_mode: String,
     pub tag_prefix: String,
+    /// Batch window, in minutes, for release tags: merges that land within the
+    /// window fold into ONE release tag cut at the latest HEAD (fewer redundant
+    /// prod deploys). `0` = tag immediately on every merge (no batching).
+    /// Default 15.
+    pub tag_batch_minutes: u32,
     /// Schedule the async, baseline-aware post-merge health check.
     pub health_check: bool,
     /// Optional label to ADD to the PR once it's cleared to merge (all approvals
@@ -51,6 +60,7 @@ impl Default for OnApproveConfig {
             auto_tag: false,
             tag_mode: "semver".to_string(),
             tag_prefix: "v".to_string(),
+            tag_batch_minutes: 15,
             health_check: false,
             deploy_label: String::new(),
         }
@@ -102,6 +112,14 @@ impl OnApproveConfig {
             .and_then(|v| v.as_s().ok())
             .map(|s| s.trim().to_string())
             .unwrap_or(d.deploy_label);
+        // Stored as a DynamoDB number. Cap at 6h so a fat-fingered value can't
+        // strand a merge undeployed for days; 0 stays "immediate".
+        let tag_batch_minutes = item
+            .get("tag_batch_minutes")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|m| m.min(360))
+            .unwrap_or(d.tag_batch_minutes);
         Self {
             auto_merge: get_bool("auto_merge", d.auto_merge),
             merge_method,
@@ -109,6 +127,7 @@ impl OnApproveConfig {
             auto_tag: get_bool("auto_tag", d.auto_tag),
             tag_mode,
             tag_prefix,
+            tag_batch_minutes,
             health_check: get_bool("health_check", d.health_check),
             deploy_label,
         }
@@ -265,37 +284,46 @@ pub(crate) async fn post_merge_actions(
         cfg.merge_method
     )];
 
+    // Release tag. In batch mode we do NOT tag here — we arm a single coalesced
+    // sweep for the repo, so several merges in the window share one release tag
+    // (and one prod deploy). In immediate mode (window = 0) we tag now, but
+    // idempotently (skip if this commit is already tagged).
+    let batched_tag = cfg.auto_tag && cfg.tag_batch_minutes > 0;
     if cfg.auto_tag {
-        let tag = if cfg.tag_mode == "date" {
-            format!(
-                "{}{}",
-                cfg.tag_prefix,
-                chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        if batched_tag {
+            schedule_tag_sweep(
+                state,
+                cfg,
+                team_id,
+                installation_id,
+                owner,
+                repo,
+                pr_number,
+                base_branch,
             )
+            .await;
+            lines.push(format!(
+                "🏷️ Release tag batched — I'll cut one tag at the latest commit in ~{} min so merges in this window share a single release. Set the batch window to 0 to tag every merge immediately.",
+                cfg.tag_batch_minutes
+            ));
         } else {
-            let existing: Vec<String> = github
-                .list_tags(owner, repo)
-                .await
-                .ok()
-                .and_then(|v| v.as_array().cloned())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            next_semver_tag(&existing, &cfg.tag_prefix)
-        };
-        match github.create_tag_ref(owner, repo, &tag, head_sha).await {
-            Ok(_) => lines.push(format!("🏷️ Tagged `{tag}`.")),
-            Err(e) => {
-                warn!(pr_number, error = %e, "Auto-tag failed");
-                lines.push(format!("⚠️ Tag failed: {e}"));
+            match cut_tag_if_new(github, cfg, owner, repo, head_sha).await {
+                Ok(Some(tag)) => lines.push(format!("🏷️ Tagged `{tag}`.")),
+                Ok(None) => {
+                    lines.push("🏷️ This commit is already tagged — no new release cut.".to_string())
+                }
+                Err(e) => {
+                    warn!(pr_number, error = %e, "Auto-tag failed");
+                    lines.push(format!("⚠️ Tag failed: {e}"));
+                }
             }
         }
     }
 
-    if cfg.health_check {
+    // Health guard runs at merge time — EXCEPT for a batched tag, where the prod
+    // deploy fires later off the sweep's tag, so the sweep owns the health check
+    // (scheduling it here would watch the wrong, pre-deploy checks).
+    if cfg.health_check && !batched_tag {
         let baseline = super::health_check::failing_checks(github, owner, repo, base_branch).await;
         if super::health_check::schedule(
             state,
@@ -316,6 +344,232 @@ pub(crate) async fn post_merge_actions(
         }
     }
     lines
+}
+
+/// Cut the next release tag at `sha`, unless that commit is already tagged.
+/// Returns `Ok(Some(tag))` when a new tag was created, `Ok(None)` when `sha`
+/// already carries a tag (idempotent no-op). That "already tagged" check is what
+/// makes the batched sweep safe to run more than once for the same HEAD — a
+/// duplicate sweep (from a race or a fail-open claim) becomes a clean no-op
+/// instead of a redundant release.
+pub(crate) async fn cut_tag_if_new(
+    github: &GitHubClient,
+    cfg: &OnApproveConfig,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let tags = github
+        .list_tags(owner, repo)
+        .await
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    // A freshly created tag at HEAD is always among the newest tags returned, so
+    // scanning page 1 reliably catches the "already released this commit" case.
+    if tags
+        .iter()
+        .any(|t| t["commit"]["sha"].as_str() == Some(sha))
+    {
+        return Ok(None);
+    }
+    let tag = if cfg.tag_mode == "date" {
+        format!(
+            "{}{}",
+            cfg.tag_prefix,
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        )
+    } else {
+        let names: Vec<String> = tags
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
+            .collect();
+        next_semver_tag(&names, &cfg.tag_prefix)
+    };
+    github.create_tag_ref(owner, repo, &tag, sha).await?;
+    Ok(Some(tag))
+}
+
+/// Ensure exactly ONE tag sweep is armed for this repo's current batch window.
+/// The first merge in the window claims a per-repo marker and enqueues the
+/// delayed sweep; later merges see the marker and fold in (no second sweep).
+/// Returns true if THIS call armed a new sweep. Fails OPEN on a transient claim
+/// error (arms anyway) — a redundant sweep is harmless (see `cut_tag_if_new`),
+/// a lost release is not.
+#[allow(clippy::too_many_arguments)]
+async fn schedule_tag_sweep(
+    state: &WorkerState,
+    cfg: &OnApproveConfig,
+    team_id: &str,
+    installation_id: u64,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    base_branch: &str,
+) -> bool {
+    let marker = format!("TAGSWEEP#{owner}/{repo}");
+    // TTL past the window so a crashed sweep can't wedge the marker for long.
+    let ttl = chrono::Utc::now().timestamp() as u64 + (cfg.tag_batch_minutes as u64 * 60) + 3_600;
+    let claimed = match state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", super::attr_s(team_id))
+        .item("sk", super::attr_s(&marker))
+        .item("ttl", super::attr_n(ttl))
+        .condition_expression("attribute_not_exists(pk)")
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            let conflict = e
+                .as_service_error()
+                .map(|se| se.is_conditional_check_failed_exception())
+                .unwrap_or(false);
+            if conflict {
+                return false; // a sweep is already armed — fold in silently
+            }
+            warn!(error = %e, "Tag sweep claim errored — arming anyway (fail-open)");
+            true
+        }
+    };
+    if claimed {
+        let msg = crate::models::TagSweepMessage {
+            team_id: team_id.to_string(),
+            installation_id,
+            repo_owner: owner.to_string(),
+            repo_name: repo.to_string(),
+            base_branch: base_branch.to_string(),
+            pr_number,
+            delay_remaining_secs: cfg.tag_batch_minutes as u64 * 60,
+        };
+        enqueue_tag_sweep(state, &msg).await;
+    }
+    claimed
+}
+
+/// Send (or re-send) the sweep with an SQS delay. Windows longer than the 900s
+/// SQS cap chain: each hop waits up to 900s and decrements `delay_remaining_secs`
+/// until it reaches 0, when the sweep actually runs.
+async fn enqueue_tag_sweep(state: &WorkerState, msg: &crate::models::TagSweepMessage) -> bool {
+    if state.config.ticket_queue_url.is_empty() {
+        return false;
+    }
+    let delay = msg.delay_remaining_secs.min(SQS_MAX_DELAY_SECS);
+    let body = match serde_json::to_value(msg) {
+        Ok(mut v) => {
+            if let Some(o) = v.as_object_mut() {
+                o.insert("type".to_string(), serde_json::json!("tag_sweep"));
+            }
+            v.to_string()
+        }
+        Err(e) => {
+            warn!(error = %e, "Tag sweep: serialize failed");
+            return false;
+        }
+    };
+    match state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(body)
+        .delay_seconds(delay as i32)
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(error = %e, "Tag sweep: enqueue failed");
+            false
+        }
+    }
+}
+
+/// Fire (or chain) a coalesced release-tag sweep. Cuts ONE tag at the base
+/// branch's current HEAD — folding in every merge that landed during the window
+/// — and, when enabled, schedules the post-deploy health guard against that tag.
+pub async fn run_tag_sweep(
+    state: &WorkerState,
+    msg: crate::models::TagSweepMessage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Still inside the window — wait another hop (a single SQS delay is capped).
+    if msg.delay_remaining_secs > SQS_MAX_DELAY_SECS {
+        let mut next = msg.clone();
+        next.delay_remaining_secs -= SQS_MAX_DELAY_SECS;
+        enqueue_tag_sweep(state, &next).await;
+        return Ok(());
+    }
+
+    let owner = &msg.repo_owner;
+    let repo = &msg.repo_name;
+    let marker = format!("TAGSWEEP#{owner}/{repo}");
+
+    // Open the NEXT window BEFORE reading HEAD/tagging: any merge that lands from
+    // here on must arm a fresh sweep rather than be silently folded into this one
+    // (which is about to finish). The worst case is a second sweep at the same
+    // HEAD, which `cut_tag_if_new` no-ops.
+    let _ = state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", super::attr_s(&msg.team_id))
+        .key("sk", super::attr_s(&marker))
+        .send()
+        .await;
+
+    let cfg = OnApproveConfig::load(state, &msg.team_id, owner, repo).await;
+    if !cfg.auto_tag {
+        info!(repo = %format!("{owner}/{repo}"), "Tag sweep: auto_tag disabled mid-window — nothing to cut");
+        return Ok(());
+    }
+
+    let github = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    )?;
+
+    // Tag the branch's CURRENT head — every merge in the window is included.
+    let head = match github.get_ref(owner, repo, &msg.base_branch).await {
+        Ok(sha) => sha,
+        Err(e) => {
+            warn!(error = %e, base = %msg.base_branch, "Tag sweep: could not resolve base-branch head");
+            return Ok(());
+        }
+    };
+
+    match cut_tag_if_new(&github, &cfg, owner, repo, &head).await {
+        Ok(Some(tag)) => {
+            info!(%tag, repo = %format!("{owner}/{repo}"), "Batched release tag cut");
+            // Prod deploy fires off the tag → schedule the health guard now.
+            if cfg.health_check {
+                let baseline =
+                    super::health_check::failing_checks(&github, owner, repo, &msg.base_branch)
+                        .await;
+                super::health_check::schedule(
+                    state,
+                    &msg.team_id,
+                    msg.installation_id,
+                    owner,
+                    repo,
+                    msg.pr_number,
+                    &msg.base_branch,
+                    &head,
+                    baseline,
+                )
+                .await;
+            }
+        }
+        Ok(None) => {
+            info!(repo = %format!("{owner}/{repo}"), "Tag sweep: HEAD already tagged — skipped")
+        }
+        Err(e) => {
+            warn!(error = %e, repo = %format!("{owner}/{repo}"), "Tag sweep: create tag failed")
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
