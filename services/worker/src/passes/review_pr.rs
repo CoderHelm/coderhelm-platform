@@ -380,7 +380,12 @@ pub async fn run(
     // source of reviewer spam. An explicit reply / re-review (msg.question) always
     // speaks, and a flip to/from REQUEST_CHANGES always speaks (verdict changed).
     let prev_verdict = last_review_verdict(state, &msg).await;
-    let should_comment = msg.question.is_some() || prev_verdict.as_deref() != Some(verdict);
+    // An explicit human ask (a reply/question or the native "Re-request review"
+    // button) always speaks, even if the verdict is unchanged — the person asked to
+    // see it. Only webhook-driven re-reviews (a self-fix commit, a re-label) get
+    // silenced when the verdict didn't change.
+    let explicit = msg.question.is_some() || msg.trigger == "reply" || msg.trigger == "rerequest";
+    let should_comment = explicit || prev_verdict.as_deref() != Some(verdict);
 
     // Post ONE batched review with inline comments; fall back to body-only if
     // GitHub rejects an anchor (a bad line must never drop the whole verdict).
