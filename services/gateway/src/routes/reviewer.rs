@@ -153,6 +153,7 @@ pub async fn get_config(
         "auto_tag": item_bool(&item, "auto_tag", false),
         "tag_mode": item_str(&item, "tag_mode", "semver"),
         "tag_prefix": item_str(&item, "tag_prefix", "v"),
+        "tag_batch_minutes": item_num(&item, "tag_batch_minutes", 15),
         "health_check": item_bool(&item, "health_check", false),
         "verify_tests": item_bool(&item, "verify_tests", false),
         "deploy_label": item_str(&item, "deploy_label", ""),
@@ -233,6 +234,10 @@ pub async fn update_config(
         .as_u64()
         .unwrap_or(4)
         .clamp(1, 168);
+    // Release-tag batch window in minutes: 0 = tag every merge immediately,
+    // otherwise merges within the window share one release tag. Capped at 6h so
+    // a bad value can't strand a merge undeployed for days.
+    let tag_batch_minutes = body["tag_batch_minutes"].as_u64().unwrap_or(15).min(360);
     let log_groups: Vec<AttributeValue> = body["health_log_groups"]
         .as_array()
         .map(|a| {
@@ -275,6 +280,7 @@ pub async fn update_config(
         )
         .item("tag_mode", attr_s(tag_mode))
         .item("tag_prefix", attr_s(tag_prefix))
+        .item("tag_batch_minutes", attr_n(tag_batch_minutes))
         .item(
             "health_check",
             attr_bool(body["health_check"].as_bool().unwrap_or(false)),

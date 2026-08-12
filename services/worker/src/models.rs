@@ -130,6 +130,31 @@ pub enum WorkerMessage {
     /// for pending checks (e.g. a staging deploy); never merges on failing CI.
     #[serde(rename = "await_merge")]
     AwaitMerge(AwaitMergeMessage),
+    /// Coalesced release-tag sweep (self-scheduled with SQS delay). One is armed
+    /// per repo by the first merge in a batch window; later merges in the window
+    /// fold into it. When it fires it cuts ONE release tag at the default
+    /// branch's current HEAD — skipping if that commit is already tagged.
+    #[serde(rename = "tag_sweep")]
+    TagSweep(TagSweepMessage),
+}
+
+/// A coalesced release-tag sweep. Carries only routing + the batch clock; the
+/// per-repo tag config is re-read at fire time so late config edits win.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TagSweepMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    /// Default/base branch whose HEAD receives the release tag.
+    pub base_branch: String,
+    /// PR that opened this batch window — where any health alert lands.
+    pub pr_number: u64,
+    /// Seconds still to wait before the sweep fires. A single SQS message delay
+    /// caps at 900s (15 min), so longer windows chain, decrementing this each
+    /// hop; the sweep runs when it reaches 0.
+    #[serde(default)]
+    pub delay_remaining_secs: u64,
 }
 
 /// An armed auto-merge job. Bound to the reviewed head; a later commit aborts it
