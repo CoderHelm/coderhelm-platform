@@ -475,6 +475,48 @@ async fn handle_pull_request(
     //  - human PRs: the review label added, or a new commit on a labeled PR.
     //  - CoderHelm's own PRs: auto-reviewed on open/reopen/push with no label
     //    needed (it can't self-approve, so review_pr posts a COMMENT review).
+    // Native "Re-request review" button. GitHub fires `pull_request/review_requested`
+    // with the reviewer being re-requested. Treat it like an explicit "@coderhelm
+    // re-review": if CoderHelm is the requested reviewer and the repo is enabled,
+    // enqueue a fresh review of the CURRENT head (empty head_sha → the worker
+    // resolves it), bypassing the label/draft/dedup gates since it's a deliberate ask.
+    if action == "review_requested" {
+        let reviewer = payload["requested_reviewer"]["login"]
+            .as_str()
+            .unwrap_or("");
+        if !reviewer.contains("coderhelm") {
+            return Ok(StatusCode::OK);
+        }
+        let repo = &payload["repository"];
+        let owner = repo["owner"]["login"].as_str().unwrap_or("");
+        let name = repo["name"].as_str().unwrap_or("");
+        let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
+        let cfg = load_review_config(state, team_id, owner, name).await;
+        if !cfg.enabled || cfg.killed || pr_number == 0 {
+            return Ok(StatusCode::OK);
+        }
+        if let Some(reason) = check_run_budget(state, team_id).await {
+            post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
+            return Ok(StatusCode::OK);
+        }
+        info!(
+            owner,
+            name, pr_number, "Reviewer: native re-request review → review job"
+        );
+        let message = WorkerMessage::Review(ReviewMessage {
+            team_id: team_id.to_string(),
+            installation_id,
+            repo_owner: owner.to_string(),
+            repo_name: name.to_string(),
+            pr_number,
+            head_sha: String::new(),
+            label: cfg.label,
+            question: None,
+            trigger: "rerequest".to_string(),
+        });
+        return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+    }
+
     if action == "labeled"
         || action == "synchronize"
         || action == "opened"
