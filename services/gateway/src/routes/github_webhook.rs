@@ -395,6 +395,11 @@ async fn handle_issue_comment(
                     owner,
                     name, pr_number, is_rereview, "Reviewer: reply → review job"
                 );
+                // Idempotency key = this comment's id. A webhook GitHub delivers
+                // more than once (at-least-once) carries the SAME comment id, so
+                // the worker runs the review exactly once; a genuinely new
+                // `@coderhelm re-review` comment has a new id and re-runs.
+                let comment_id = payload["comment"]["id"].as_u64().unwrap_or(0);
                 let message = WorkerMessage::Review(ReviewMessage {
                     team_id: team_id.to_string(),
                     installation_id,
@@ -405,6 +410,7 @@ async fn handle_issue_comment(
                     label: cfg.label,
                     question,
                     trigger: "reply".to_string(),
+                    dedup_key: format!("reply#{comment_id}"),
                 });
                 return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
             }
@@ -503,6 +509,13 @@ async fn handle_pull_request(
             owner,
             name, pr_number, "Reviewer: native re-request review → review job"
         );
+        // Dedup a redelivered `review_requested` by the head it targets (the
+        // payload carries it even though the worker resolves head fresh).
+        let req_head = payload["pull_request"]["head"]["sha"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("pr{pr_number}"));
         let message = WorkerMessage::Review(ReviewMessage {
             team_id: team_id.to_string(),
             installation_id,
@@ -513,6 +526,7 @@ async fn handle_pull_request(
             label: cfg.label,
             question: None,
             trigger: "rerequest".to_string(),
+            dedup_key: format!("rerequest#{req_head}"),
         });
         return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
     }
@@ -1642,6 +1656,7 @@ async fn handle_review_trigger(
         owner,
         name, pr_number, is_bot_pr, action, "Reviewer: trigger matched — enqueuing review job"
     );
+    let dedup_key = format!("head#{head_sha}");
     let message = WorkerMessage::Review(ReviewMessage {
         team_id: team_id.to_string(),
         installation_id,
@@ -1652,6 +1667,7 @@ async fn handle_review_trigger(
         label: cfg.label,
         question: None,
         trigger: action.to_string(),
+        dedup_key,
     });
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }

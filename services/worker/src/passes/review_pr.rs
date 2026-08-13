@@ -137,6 +137,13 @@ const RATING_FOOTER: &str =
 CoderHelm dashboard so the reviewer learns. Reply **@coderhelm re-review** to re-run against the \
 latest commit, or **@coderhelm <question>** to ask._";
 
+/// How long a processed review trigger stays claimed (consume-once dedup). Long
+/// enough to outlast any duplicate webhook / SQS redelivery of the SAME trigger
+/// (seconds–minutes apart), short enough that a review which errored out can be
+/// re-driven for the same head once it expires. Keys that are unique per action
+/// (a comment id) are unaffected by the length; head-based keys get this window.
+const REVIEW_JOB_DEDUP_TTL_SECS: u64 = 6 * 3600;
+
 pub async fn run(
     state: &WorkerState,
     msg: ReviewMessage,
@@ -148,6 +155,31 @@ pub async fn run(
             "Reviewer disabled/killed for repo — skipping"
         );
         return Ok(());
+    }
+
+    // Consume-once idempotency. GitHub webhooks AND SQS are both at-least-once, so
+    // the same trigger (a `@coderhelm re-review` comment, a native re-request, a
+    // label event) can be delivered more than once — each delivery would post
+    // another full review + auto-merge-arm (observed: one re-review comment
+    // produced two approvals + two arms). The gateway stamps a `dedup_key` that is
+    // stable per user action (comment id / head sha); the first delivery claims it
+    // and any duplicate is dropped here, before any GitHub/model work. Empty key
+    // (old in-flight messages) or a transient DynamoDB error falls through to
+    // processing — `claim_once_ttl` fails OPEN, so a real review is never lost. The
+    // short TTL lets a failed review be re-driven later.
+    if !msg.dedup_key.is_empty() {
+        let sk = format!(
+            "REVIEWJOB#{}/{}#{:06}#{}",
+            msg.repo_owner, msg.repo_name, msg.pr_number, msg.dedup_key
+        );
+        if !claim_once_ttl(state, &msg.team_id, &sk, REVIEW_JOB_DEDUP_TTL_SECS).await {
+            info!(
+                pr = msg.pr_number,
+                dedup_key = %msg.dedup_key,
+                "Skipping duplicate review job — this trigger was already processed"
+            );
+            return Ok(());
+        }
     }
 
     let github = GitHubClient::new(
@@ -590,7 +622,14 @@ async fn claim_self_review_round(
 /// Conditional put: true only for the first caller. Fails OPEN (acts) on a
 /// transient error so a real one-time notice is never lost. TTL-expiring.
 async fn claim_once(state: &WorkerState, team_id: &str, sk: &str) -> bool {
-    let ttl = chrono::Utc::now().timestamp() as u64 + 7 * 86_400;
+    claim_once_ttl(state, team_id, sk, 7 * 86_400).await
+}
+
+/// `claim_once` with a caller-chosen TTL. Short TTLs suit dedup markers that
+/// should self-heal (a failed review can be re-driven once the marker expires);
+/// long TTLs suit one-shot handoffs. Fails OPEN on a transient error.
+async fn claim_once_ttl(state: &WorkerState, team_id: &str, sk: &str, ttl_secs: u64) -> bool {
+    let ttl = chrono::Utc::now().timestamp() as u64 + ttl_secs;
     match state
         .dynamo
         .put_item()
