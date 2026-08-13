@@ -213,6 +213,12 @@ pub struct ReviewMessage {
     /// What triggered the review: "label" | "synchronize" | "reply". Audit only.
     #[serde(default)]
     pub trigger: String,
+    /// Stable idempotency key for the TRIGGER (comment id for a reply, head sha
+    /// for a label event, etc.). Claimed once at review entry so a duplicate
+    /// webhook / SQS delivery of the same trigger produces exactly one review.
+    /// Empty ⇒ no dedup (old in-flight messages / paths that don't set it).
+    #[serde(default)]
+    pub dedup_key: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

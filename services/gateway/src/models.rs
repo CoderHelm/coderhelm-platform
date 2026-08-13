@@ -185,6 +185,13 @@ pub struct ReviewMessage {
     /// What triggered the review: "label" | "synchronize" | "reply". Audit only.
     #[serde(default)]
     pub trigger: String,
+    /// Stable idempotency key for the TRIGGER (e.g. the comment id for a reply,
+    /// the head sha for a label event). GitHub webhooks and SQS are both
+    /// at-least-once, so the same trigger can arrive twice; the worker claims
+    /// this key once and drops any duplicate — one user action ⇒ one review.
+    /// Empty ⇒ no dedup (old in-flight messages / paths that don't set it).
+    #[serde(default)]
+    pub dedup_key: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
