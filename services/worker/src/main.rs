@@ -226,6 +226,12 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("Tag sweep failed: {e:?}");
                 }
             }
+            models::WorkerMessage::GraphIndex(msg) => {
+                info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), incremental = msg.changed_files.is_some(), "Code-graph index pass");
+                if let Err(e) = passes::code_graph::run(&state, msg).await {
+                    error!("Code-graph index failed: {e:?}");
+                }
+            }
         }
     }
 

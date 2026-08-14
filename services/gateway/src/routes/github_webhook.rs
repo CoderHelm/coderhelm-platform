@@ -9,9 +9,9 @@ use tracing::{error, info, warn};
 
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
-    AwaitMergeMessage, FeedbackMessage, MarkReadyMessage, OnboardMessage, OnboardRepo,
-    PlanTaskContinueMessage, ResumeMessage, ReviewMessage, TicketMessage, TicketSource,
-    WorkerMessage,
+    AwaitMergeMessage, FeedbackMessage, GraphIndexMessage, MarkReadyMessage, OnboardMessage,
+    OnboardRepo, PlanTaskContinueMessage, ResumeMessage, ReviewMessage, TicketMessage,
+    TicketSource, WorkerMessage,
 };
 use crate::AppState;
 
@@ -179,6 +179,7 @@ pub async fn handle(
             );
             Ok(StatusCode::OK)
         }
+        "push" => handle_push(&state, &payload, installation_id, &team_id).await,
         "check_run" => handle_check_run(&state, &payload, installation_id, &team_id).await,
         "check_suite" => handle_check_suite(&state, &payload, installation_id, &team_id).await,
         "repository" => handle_repository_event(&state, &payload, installation_id, &team_id).await,
@@ -1547,6 +1548,92 @@ async fn load_review_config(
             .copied()
             .unwrap_or(d.killed),
     }
+}
+
+/// Push to a branch: if the repo's code graph is enabled and the push is to the
+/// DEFAULT branch, enqueue an INCREMENTAL graph index for exactly the files the
+/// push touched (added/modified/removed across its commits). This is what keeps
+/// the graph permanently fresh without scheduled rebuilds.
+async fn handle_push(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+) -> Result<StatusCode, StatusCode> {
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"]
+        .as_str()
+        .or_else(|| repo["owner"]["name"].as_str())
+        .unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let default_branch = repo["default_branch"].as_str().unwrap_or("main");
+    let git_ref = payload["ref"].as_str().unwrap_or("");
+    if owner.is_empty() || name.is_empty() {
+        return Ok(StatusCode::OK);
+    }
+    // Only the branch the graph tracks.
+    if git_ref != format!("refs/heads/{default_branch}") {
+        return Ok(StatusCode::OK);
+    }
+    // Graph must be explicitly enabled for the repo.
+    let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
+    let graph_enabled = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sk))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned())
+        .and_then(|it| {
+            it.get("graph_enabled")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+        })
+        .unwrap_or(false);
+    if !graph_enabled {
+        return Ok(StatusCode::OK);
+    }
+    // Every file any commit in this push touched (deduped, bounded — a huge
+    // push falls back to a FULL index rather than a 1000-file incremental).
+    let mut files: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for c in payload["commits"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+    {
+        for key in ["added", "modified", "removed"] {
+            for f in c[key].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                if let Some(p) = f.as_str() {
+                    if seen.insert(p.to_string()) {
+                        files.push(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if files.is_empty() {
+        return Ok(StatusCode::OK);
+    }
+    let changed_files = if files.len() > 300 { None } else { Some(files) };
+    info!(
+        owner,
+        name,
+        full = changed_files.is_none(),
+        "Push on default branch → code-graph index"
+    );
+    let message = WorkerMessage::GraphIndex(GraphIndexMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        branch: default_branch.to_string(),
+        changed_files,
+    });
+    send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
 
 /// Reviewer trigger: enqueue a code-review job when the repo's review label is

@@ -156,6 +156,7 @@ pub async fn get_config(
         "tag_batch_minutes": item_num(&item, "tag_batch_minutes", 15),
         "health_check": item_bool(&item, "health_check", false),
         "verify_tests": item_bool(&item, "verify_tests", false),
+        "graph_enabled": item_bool(&item, "graph_enabled", false),
         "deploy_label": item_str(&item, "deploy_label", ""),
         "health_log_groups": log_groups,
         "reminders_enabled": item_bool(&item, "reminders_enabled", false),
@@ -297,12 +298,79 @@ pub async fn update_config(
         .item("teams_webhook_url", attr_s(teams_webhook_url))
         .item("reminder_cooldown_hours", attr_n(reminder_cooldown_hours))
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()));
+    let graph_enabled = body["graph_enabled"].as_bool().unwrap_or(false);
+    put = put.item("graph_enabled", attr_bool(graph_enabled));
     put = put.item("health_log_groups", AttributeValue::L(log_groups));
+
+    // Detect the OFF→ON transition BEFORE overwriting, so enabling the code
+    // graph kicks off its initial FULL index (pushes keep it fresh after that).
+    let was_enabled = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&sk))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned())
+        .and_then(|it| {
+            it.get("graph_enabled")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+        })
+        .unwrap_or(false);
 
     put.send().await.map_err(|e| {
         error!("Failed to update reviewer config: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    if graph_enabled && !was_enabled {
+        // Resolve the team's GitHub installation and enqueue the full index.
+        // Best-effort: a failed enqueue leaves the flag on; the next push to the
+        // default branch falls back to a full index (>300 files) or the operator
+        // re-toggles. Never fails the config write.
+        let installation_id = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.teams_table_name)
+            .key("team_id", attr_s(&claims.team_id))
+            .key("sk", attr_s("META"))
+            .send()
+            .await
+            .ok()
+            .and_then(|o| o.item().cloned())
+            .and_then(|it| {
+                it.get("github_installation_id")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<u64>().ok())
+            });
+        if let Some(installation_id) = installation_id {
+            let msg = crate::models::WorkerMessage::GraphIndex(crate::models::GraphIndexMessage {
+                team_id: claims.team_id.clone(),
+                installation_id,
+                repo_owner: owner.clone(),
+                repo_name: name.clone(),
+                branch: String::new(), // worker resolves the default branch
+                changed_files: None,   // full index
+            });
+            if let Ok(body) = serde_json::to_string(&msg) {
+                if let Err(e) = state
+                    .sqs
+                    .send_message()
+                    .queue_url(&state.config.ticket_queue_url)
+                    .message_body(body)
+                    .send()
+                    .await
+                {
+                    error!("Code graph: initial index enqueue failed: {e}");
+                }
+            }
+        } else {
+            error!("Code graph enabled but no GitHub installation found for team");
+        }
+    }
     Ok(StatusCode::OK)
 }
 
