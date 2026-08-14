@@ -119,7 +119,100 @@ pub fn review_tools() -> Vec<ToolDefinition> {
                 "required": ["query"]
             }),
         },
+        ToolDefinition {
+            name: "check_package".to_string(),
+            description: "Query the LIVE package registry (npm / crates.io / PyPI) for a package: \
+                          does this exact version exist, and what are the current latest/dist-tags? \
+                          ALWAYS use this before making any claim about published versions or \
+                          registry state — your training knowledge has a cutoff; registries don't."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "registry": {"type": "string", "enum": ["npm", "crates", "pypi"]},
+                    "name": {"type": "string", "description": "package name, e.g. typescript or @scope/pkg"},
+                    "version": {"type": "string", "description": "optional exact version to check for existence"}
+                },
+                "required": ["registry", "name"]
+            }),
+        },
     ]
+}
+
+/// Live registry lookup backing the `check_package` tool. Fail-open: any
+/// network/parse error returns a "(could not verify …)" string — the agent must
+/// then phrase its concern as a question, never a confident claim.
+async fn check_package_registry(
+    http: &reqwest::Client,
+    registry: &str,
+    name: &str,
+    version: Option<&str>,
+) -> String {
+    let enc = name.replace('/', "%2F");
+    let (exists_url, latest_url) = match registry {
+        "npm" => (
+            version.map(|v| format!("https://registry.npmjs.org/{enc}/{v}")),
+            format!("https://registry.npmjs.org/-/package/{enc}/dist-tags"),
+        ),
+        "crates" => (
+            version.map(|v| format!("https://crates.io/api/v1/crates/{name}/{v}")),
+            format!("https://crates.io/api/v1/crates/{name}"),
+        ),
+        "pypi" => (
+            version.map(|v| format!("https://pypi.org/pypi/{name}/{v}/json")),
+            format!("https://pypi.org/pypi/{name}/json"),
+        ),
+        other => return format!("(unknown registry `{other}` — use npm, crates, or pypi)"),
+    };
+    let get = |url: String| async move {
+        http.get(&url)
+            .header("User-Agent", "coderhelm-reviewer")
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await
+    };
+    let mut out = String::new();
+    if let (Some(url), Some(v)) = (exists_url, version) {
+        match get(url).await {
+            Ok(resp) if resp.status().is_success() => {
+                out.push_str(&format!("{name}@{v}: EXISTS on {registry}.\n"));
+            }
+            Ok(resp) if resp.status().as_u16() == 404 => {
+                out.push_str(&format!("{name}@{v}: NOT FOUND on {registry}.\n"));
+            }
+            Ok(resp) => {
+                out.push_str(&format!(
+                    "(could not verify {name}@{v}: HTTP {})\n",
+                    resp.status()
+                ));
+            }
+            Err(e) => out.push_str(&format!("(could not verify {name}@{v}: {e})\n")),
+        }
+    }
+    match get(latest_url).await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let summary = match registry {
+                "npm" => format!("dist-tags: {body}"),
+                "crates" => format!(
+                    "max_version: {}, max_stable_version: {}",
+                    body["crate"]["max_version"].as_str().unwrap_or("?"),
+                    body["crate"]["max_stable_version"].as_str().unwrap_or("?")
+                ),
+                _ => format!(
+                    "latest: {}",
+                    body["info"]["version"].as_str().unwrap_or("?")
+                ),
+            };
+            out.push_str(&format!("Current registry state for {name}: {summary}"));
+        }
+        Ok(resp) if resp.status().as_u16() == 404 => {
+            out.push_str(&format!("Package {name}: NOT FOUND on {registry}."));
+        }
+        Ok(resp) => out.push_str(&format!("(could not fetch {name}: HTTP {})", resp.status())),
+        Err(e) => out.push_str(&format!("(could not fetch {name}: {e})")),
+    }
+    out
 }
 
 pub struct PrReviewToolExecutor<'a> {
@@ -263,6 +356,16 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
                 };
                 Ok(json!(common::head_tail_str(&out, 8_000)))
             }
+            "check_package" => {
+                let registry = input.get("registry").and_then(|v| v.as_str()).unwrap_or("");
+                let pkg = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let version = input.get("version").and_then(|v| v.as_str());
+                if pkg.is_empty() || pkg.len() > 200 {
+                    return Ok(json!("(check_package: missing/invalid package name)"));
+                }
+                let out = check_package_registry(&self.state.http, registry, pkg, version).await;
+                Ok(json!(common::head_tail_str(&out, 4_000)))
+            }
             other => Ok(json!(format!("Unknown tool: {other}"))),
         }
     }
@@ -404,7 +507,14 @@ pub async fn generate_review(
          Also check SCOPE: if the PR changes files clearly unrelated to its stated purpose/title \
          (e.g. a one-line URL fix that also edits README, package.json, unrelated components or \
          tests, or `.claude/skills`), flag it as a `scope` finding — these are usually accidental \
-         (a bad rebase or a revert against the wrong base) and should be removed from the PR.\
+         (a bad rebase or a revert against the wrong base) and should be removed from the PR. \
+         EXTERNAL FACTS: never assert claims about package registries, published versions, or \
+         tool releases from memory — your training has a cutoff and registries don't. Verify with \
+         check_package first, or phrase it as a QUESTION in a non-blocking finding; a blocking \
+         finding must never rest on an unverified external fact. \
+         CI EVIDENCE: this PR's current CI results are provided below. Never claim an install, \
+         build, or typecheck \"will fail\" when a GREEN check on this same head already ran it — \
+         cite the check instead. A RED check is evidence for a finding; name it.\
          {instructions_block}\n\n\
          When done exploring, output ONLY a fenced ```json block, no prose after it, matching:\n\
          {{\n  \"verdict\": \"APPROVE\" | \"REQUEST_CHANGES\",\n  \"risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n  \

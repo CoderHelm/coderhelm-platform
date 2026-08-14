@@ -341,6 +341,46 @@ pub async fn run(
         String::new()
     };
 
+    // CI evidence: the PR's ACTUAL check results for this head, injected into
+    // the prompt. A reviewer claim like "this cannot install" is refutable by a
+    // green install job on the same head — that signal must be in front of the
+    // model, not discoverable-in-theory. Best-effort: absent on API failure.
+    let ci_context = match github
+        .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, &head_sha)
+        .await
+    {
+        Ok(v) => {
+            let runs = v["check_runs"].as_array().cloned().unwrap_or_default();
+            if runs.is_empty() {
+                String::new()
+            } else {
+                let lines: Vec<String> = runs
+                    .iter()
+                    .take(30)
+                    .map(|r| {
+                        format!(
+                            "- {}: {}",
+                            r["name"].as_str().unwrap_or("?"),
+                            r["conclusion"]
+                                .as_str()
+                                .unwrap_or_else(|| r["status"].as_str().unwrap_or("?"))
+                        )
+                    })
+                    .collect();
+                format!(
+                    "\n## CI results on this PR's head ({})\n{}\n",
+                    &head_sha[..head_sha.len().min(7)],
+                    lines.join("\n")
+                )
+            }
+        }
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "Could not fetch check runs for review context");
+            String::new()
+        }
+    };
+    let extra_context = format!("{graph_context}{ci_context}");
+
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(
         state,
@@ -354,7 +394,7 @@ pub async fn run(
         &diff,
         &instructions_block,
         graph.as_ref(),
-        &graph_context,
+        &extra_context,
         &mut usage,
     )
     .await;
