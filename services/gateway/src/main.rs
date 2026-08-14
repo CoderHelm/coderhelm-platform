@@ -165,6 +165,15 @@ async fn main() -> Result<(), Error> {
         .route("/reviewer/reviews", get(routes::reviewer::list_reviews))
         .route("/reviewer/review", get(routes::reviewer::get_review))
         .route("/reviewer/review/rate", post(routes::reviewer::rate_review))
+        // Code graph — its own feature (serves the reviewer AND the PR maker)
+        .route("/graph/repos", get(routes::graph::list_repos))
+        .route("/graph/status", get(routes::graph::status))
+        .route("/graph/symbol", get(routes::graph::symbol))
+        .route("/graph/neighborhood", get(routes::graph::neighborhood))
+        .route(
+            "/graph/config/:owner/:name",
+            put(routes::graph::update_config),
+        )
         // GitHub App installation
         .route(
             "/github/link-installation",
