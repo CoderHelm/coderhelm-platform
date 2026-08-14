@@ -184,6 +184,11 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        // Graph lookups share one implementation with the PR-maker agent.
+        if let Some(out) = super::code_graph::handle_tool(self.state, self.graph, name, input).await
+        {
+            return Ok(json!(common::head_tail_str(&out, 8_000)));
+        }
         match name {
             "read_file" => {
                 let content = self
@@ -255,76 +260,6 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
                         }
                     }
                     Err(e) => format!("(org search unavailable: {e})"),
-                };
-                Ok(json!(common::head_tail_str(&out, 8_000)))
-            }
-            "graph_definition" => {
-                let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let Some(graph) = self.graph else {
-                    return Ok(json!("(code graph not available for this repo)"));
-                };
-                let defs = graph.definitions(self.state, name).await;
-                let out = if defs.is_empty() {
-                    format!("No definition of `{name}` in the graph (unindexed language, or defined dynamically — fall back to search_code).")
-                } else {
-                    defs.iter()
-                        .take(10)
-                        .map(|(p, k, l, r)| format!("{p}:{l} ({k}, rank {r:.4})"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                Ok(json!(out))
-            }
-            "graph_callers" => {
-                let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let Some(graph) = self.graph else {
-                    return Ok(json!("(code graph not available for this repo)"));
-                };
-                let mut callers = graph.callers(self.state, name).await;
-                callers.sort();
-                let out = if callers.is_empty() {
-                    format!("No files reference `{name}` (or it's in an unindexed language — confirm with search_code).")
-                } else {
-                    format!(
-                        "{} file(s) reference `{name}`:\n{}",
-                        callers.len(),
-                        callers
-                            .iter()
-                            .take(40)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    )
-                };
-                Ok(json!(common::head_tail_str(&out, 8_000)))
-            }
-            "graph_impact" => {
-                let paths: Vec<String> = input
-                    .get("paths")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let Some(graph) = self.graph else {
-                    return Ok(json!("(code graph not available for this repo)"));
-                };
-                let impacted = graph.impacted_by(self.state, &paths).await;
-                let out = if impacted.is_empty() {
-                    "No other files import or reference symbols from those files.".to_string()
-                } else {
-                    format!(
-                        "{} impacted file(s):\n{}",
-                        impacted.len(),
-                        impacted
-                            .iter()
-                            .take(60)
-                            .map(|(f, why)| format!("{f} — {why}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    )
                 };
                 Ok(json!(common::head_tail_str(&out, 8_000)))
             }

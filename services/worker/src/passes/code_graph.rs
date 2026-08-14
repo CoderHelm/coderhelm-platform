@@ -861,6 +861,83 @@ impl Graph {
     }
 }
 
+/// Shared handler for the three graph lookup tools — ONE implementation used by
+/// both the reviewer and the PR-maker agents so their semantics can't drift.
+/// Returns None for a tool name it doesn't own (caller falls through).
+pub async fn handle_tool(
+    state: &WorkerState,
+    graph: Option<&Graph>,
+    name: &str,
+    input: &serde_json::Value,
+) -> Option<String> {
+    if !matches!(name, "graph_definition" | "graph_callers" | "graph_impact") {
+        return None;
+    }
+    let Some(graph) = graph else {
+        return Some("(code graph not available for this repo)".to_string());
+    };
+    match name {
+        "graph_definition" => {
+            let sym = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let defs = graph.definitions(state, sym).await;
+            Some(if defs.is_empty() {
+                format!("No definition of `{sym}` in the graph (unindexed language, or defined dynamically — fall back to search_code).")
+            } else {
+                defs.iter()
+                    .take(10)
+                    .map(|(p, k, l, r)| format!("{p}:{l} ({k}, rank {r:.4})"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        }
+        "graph_callers" => {
+            let sym = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let mut callers = graph.callers(state, sym).await;
+            callers.sort();
+            Some(if callers.is_empty() {
+                format!("No files reference `{sym}` (or it's in an unindexed language — confirm with search_code).")
+            } else {
+                format!(
+                    "{} file(s) reference `{sym}`:\n{}",
+                    callers.len(),
+                    callers
+                        .iter()
+                        .take(40)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })
+        }
+        _ => {
+            let paths: Vec<String> = input
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let impacted = graph.impacted_by(state, &paths).await;
+            Some(if impacted.is_empty() {
+                "No other files import or reference symbols from those files.".to_string()
+            } else {
+                format!(
+                    "{} impacted file(s):\n{}",
+                    impacted.len(),
+                    impacted
+                        .iter()
+                        .take(60)
+                        .map(|(f, why)| format!("{f} — {why}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
