@@ -270,6 +270,14 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         all_tools()
     };
 
+    // Persistent code graph (when the repo is indexed): exact structural lookups
+    // so the implementer KNOWS who calls what it's changing instead of guessing.
+    let graph =
+        super::code_graph::Graph::open(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    if graph.is_some() {
+        tools.extend(super::review_agent::graph_tools());
+    }
+
     // Offer the sandbox verifier only when it can actually run for this repo.
     if sandbox.is_some() && checks_cmd.is_some() {
         tools.push(run_checks_tool());
@@ -394,6 +402,8 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             files_modified: std::sync::Mutex::new(HashSet::new()),
             task_tracker: &task_tracker,
             file_cache,
+            state,
+            graph,
             sandbox,
             checks_cmd,
             test_cmd,
@@ -877,6 +887,12 @@ struct WriteToolExecutor<'a> {
     files_modified: std::sync::Mutex<HashSet<String>>,
     task_tracker: &'a TaskTracker,
     file_cache: &'a FileCache,
+    /// Worker state + the repo's persistent code graph (None when not indexed).
+    /// Powers graph_definition/graph_callers/graph_impact — exact structural
+    /// lookups (who calls X, what a change reaches) while editing. The graph
+    /// reflects the DEFAULT branch, not this run's in-flight edits.
+    state: &'a WorkerState,
+    graph: Option<super::code_graph::Graph>,
     /// Execution sandbox (None when unconfigured). Runs the repo's real checks.
     sandbox: Option<crate::clients::sandbox::SandboxClient<'a>>,
     /// Derived check command (None when the stack wasn't recognized).
@@ -922,6 +938,12 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        // Graph lookups share one implementation with the reviewer agent.
+        if let Some(out) =
+            super::code_graph::handle_tool(self.state, self.graph.as_ref(), name, input).await
+        {
+            return Ok(json!(common::head_tail_str(&out, 8_000)));
+        }
         match name {
             "read_tree" => {
                 let tree = self
