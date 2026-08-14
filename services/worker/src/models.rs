@@ -136,6 +136,24 @@ pub enum WorkerMessage {
     /// branch's current HEAD — skipping if that commit is already tagged.
     #[serde(rename = "tag_sweep")]
     TagSweep(TagSweepMessage),
+    /// Code-graph index pass: full (on enable / repair) or incremental (a push
+    /// to the default branch re-indexes only the changed files).
+    #[serde(rename = "graph_index")]
+    GraphIndex(GraphIndexMessage),
+}
+
+/// A code-graph index job. `changed_files: None` ⇒ full index of the branch
+/// head; `Some(paths)` ⇒ incremental (delete + re-extract just those files).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GraphIndexMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    /// Branch the graph tracks (the repo's default branch).
+    pub branch: String,
+    #[serde(default)]
+    pub changed_files: Option<Vec<String>>,
 }
 
 /// A coalesced release-tag sweep. Carries only routing + the batch clock; the

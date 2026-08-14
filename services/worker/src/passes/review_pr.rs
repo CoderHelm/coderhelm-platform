@@ -307,6 +307,40 @@ pub async fn run(
     );
     let changed = review_agent::changed_right_lines(&compare);
 
+    // Code graph: if this repo is indexed, compute the EXACT impacted-file set
+    // for the PR's changed files and inject it into the prompt (agents under-use
+    // structural tools unless the result is put in front of them), and hand the
+    // agent the graph lookup tools for deeper digging.
+    let graph =
+        super::code_graph::Graph::open(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    let graph_context = if let Some(g) = &graph {
+        let changed_paths: Vec<String> = compare["files"]
+            .as_array()
+            .map(|fs| {
+                fs.iter()
+                    .filter_map(|f| f["filename"].as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let impacted = g.impacted_by(state, &changed_paths).await;
+        if impacted.is_empty() {
+            String::new()
+        } else {
+            let lines: Vec<String> = impacted
+                .iter()
+                .take(40)
+                .map(|(f, why)| format!("- {f} — {why}"))
+                .collect();
+            format!(
+                "\n## Impacted files (from the code graph — files that import or reference \
+                 symbols defined in the changed files; check these for breakage)\n{}\n",
+                lines.join("\n")
+            )
+        }
+    } else {
+        String::new()
+    };
+
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(
         state,
@@ -319,6 +353,8 @@ pub async fn run(
         pr_body,
         &diff,
         &instructions_block,
+        graph.as_ref(),
+        &graph_context,
         &mut usage,
     )
     .await;

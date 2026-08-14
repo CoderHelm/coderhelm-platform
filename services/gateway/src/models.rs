@@ -142,6 +142,23 @@ pub enum WorkerMessage {
     Review(ReviewMessage),
     #[serde(rename = "await_merge")]
     AwaitMerge(AwaitMergeMessage),
+    /// Code-graph index pass (gateway → worker): full on enable, incremental on
+    /// a push to the graph's branch.
+    #[serde(rename = "graph_index")]
+    GraphIndex(GraphIndexMessage),
+}
+
+/// A code-graph index job. `changed_files: None` ⇒ full index; `Some(paths)` ⇒
+/// incremental. Empty `branch` ⇒ the worker resolves the repo's default branch.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GraphIndexMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub branch: String,
+    #[serde(default)]
+    pub changed_files: Option<Vec<String>>,
 }
 
 /// Armed auto-merge job (gateway → worker). Enqueued when a human approval lands

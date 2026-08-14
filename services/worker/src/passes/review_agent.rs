@@ -127,6 +127,53 @@ pub struct PrReviewToolExecutor<'a> {
     pub owner: &'a str,
     pub repo: &'a str,
     pub head_sha: &'a str,
+    /// The repo's persistent code graph, when indexed — powers the exact
+    /// definition/caller/impact tools. None ⇒ those tools aren't offered.
+    pub state: &'a WorkerState,
+    pub graph: Option<&'a super::code_graph::Graph>,
+}
+
+/// Structural lookup tools backed by the persistent code graph. Offered only
+/// when the repo has an indexed graph.
+pub fn graph_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "graph_definition".to_string(),
+            description: "EXACT lookup: where is this symbol DEFINED? Returns path, kind, line \
+                          and an importance rank from the repo's code graph. Faster and more \
+                          precise than search_code for known symbol names."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "symbol name, e.g. processOrder"}},
+                "required": ["name"]
+            }),
+        },
+        ToolDefinition {
+            name: "graph_callers".to_string(),
+            description: "EXACT lookup: which files REFERENCE this symbol (its caller set)? Use \
+                          for blast radius of a changed function/type. Name-based — confirm \
+                          surprising hits by reading the file."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]
+            }),
+        },
+        ToolDefinition {
+            name: "graph_impact".to_string(),
+            description: "EXACT lookup: every file that imports OR references symbols defined in \
+                          the given files — the impacted set of changing them. Use on the PR's \
+                          changed files to know where to look for breakage."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"paths": {"type": "array", "items": {"type": "string"}}},
+                "required": ["paths"]
+            }),
+        },
+    ]
 }
 
 #[async_trait::async_trait]
@@ -208,6 +255,76 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
                         }
                     }
                     Err(e) => format!("(org search unavailable: {e})"),
+                };
+                Ok(json!(common::head_tail_str(&out, 8_000)))
+            }
+            "graph_definition" => {
+                let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(graph) = self.graph else {
+                    return Ok(json!("(code graph not available for this repo)"));
+                };
+                let defs = graph.definitions(self.state, name).await;
+                let out = if defs.is_empty() {
+                    format!("No definition of `{name}` in the graph (unindexed language, or defined dynamically — fall back to search_code).")
+                } else {
+                    defs.iter()
+                        .take(10)
+                        .map(|(p, k, l, r)| format!("{p}:{l} ({k}, rank {r:.4})"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                Ok(json!(out))
+            }
+            "graph_callers" => {
+                let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(graph) = self.graph else {
+                    return Ok(json!("(code graph not available for this repo)"));
+                };
+                let mut callers = graph.callers(self.state, name).await;
+                callers.sort();
+                let out = if callers.is_empty() {
+                    format!("No files reference `{name}` (or it's in an unindexed language — confirm with search_code).")
+                } else {
+                    format!(
+                        "{} file(s) reference `{name}`:\n{}",
+                        callers.len(),
+                        callers
+                            .iter()
+                            .take(40)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                };
+                Ok(json!(common::head_tail_str(&out, 8_000)))
+            }
+            "graph_impact" => {
+                let paths: Vec<String> = input
+                    .get("paths")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let Some(graph) = self.graph else {
+                    return Ok(json!("(code graph not available for this repo)"));
+                };
+                let impacted = graph.impacted_by(self.state, &paths).await;
+                let out = if impacted.is_empty() {
+                    "No other files import or reference symbols from those files.".to_string()
+                } else {
+                    format!(
+                        "{} impacted file(s):\n{}",
+                        impacted.len(),
+                        impacted
+                            .iter()
+                            .take(60)
+                            .map(|(f, why)| format!("{f} — {why}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
                 };
                 Ok(json!(common::head_tail_str(&out, 8_000)))
             }
@@ -330,8 +447,17 @@ pub async fn generate_review(
     pr_body: &str,
     diff: &str,
     instructions_block: &str,
+    graph: Option<&super::code_graph::Graph>,
+    graph_context: &str,
     usage: &mut TokenUsage,
 ) -> ReviewOutput {
+    let graph_note = if graph.is_some() {
+        "\nThis repo has a CODE GRAPH: prefer graph_definition/graph_callers/graph_impact for \
+         exact structural lookups (where is X defined, who calls X, what a change reaches); use \
+         search_code for text and unindexed languages."
+    } else {
+        ""
+    };
     let system = format!(
         "You are a senior code reviewer for {owner}/{repo}. You have READ-ONLY tools to walk the \
          repository at the PR head — use them: from the diff, search for CALLERS of changed \
@@ -351,10 +477,10 @@ pub async fn generate_review(
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
          \"category\": \"bug|security|correctness|perf|convention|scope\", \"title\": \"short\",\n    \
          \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}]\n}}\n\
-         Use \"blocking\" ONLY for real bugs/risks that should stop the merge. If unsure, REQUEST_CHANGES."
+         Use \"blocking\" ONLY for real bugs/risks that should stop the merge. If unsure, REQUEST_CHANGES.{graph_note}"
     );
     let prompt = format!(
-        "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n\n\
+        "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{graph_context}\n\
          Explore with the tools as needed, then emit the JSON review."
     );
     let mut messages = vec![(
@@ -366,8 +492,13 @@ pub async fn generate_review(
         owner,
         repo,
         head_sha,
+        state,
+        graph,
     };
-    let tools = review_tools();
+    let mut tools = review_tools();
+    if graph.is_some() {
+        tools.extend(graph_tools());
+    }
     let reply = provider::converse(
         state,
         provider,

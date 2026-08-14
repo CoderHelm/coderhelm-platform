@@ -466,6 +466,7 @@ fn has_time_for_remediation(start: &Instant) -> bool {
 }
 
 pub mod await_merge;
+pub mod code_graph;
 pub mod feedback;
 pub mod formatter;
 pub mod health_check;
