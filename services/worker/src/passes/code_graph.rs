@@ -596,7 +596,7 @@ pub async fn run(
 
     // Rank over the WHOLE graph: current partition state + this pass's files.
     // Edges: file →(imports)→ file, and file →(references name)→ defining file.
-    let (ranks, def_counts, ref_counts) = {
+    let (ranks, def_counts, ref_counts, file_defs) = {
         let mut def_site: HashMap<String, Vec<String>> = HashMap::new(); // name → def files
         let mut file_refs: HashMap<String, Vec<String>> = HashMap::new(); // file → names
         let mut file_imports: HashMap<String, Vec<String>> = HashMap::new();
@@ -696,7 +696,14 @@ pub async fn run(
                 *ref_counts.entry(n.clone()).or_default() += 1;
             }
         }
-        (ranks, def_site.len(), ref_counts.len())
+        // Per-file definition counts — feeds the precomputed browse summary.
+        let mut file_defs: HashMap<String, usize> = HashMap::new();
+        for files in def_site.values() {
+            for f in files {
+                *file_defs.entry(f.clone()).or_default() += 1;
+            }
+        }
+        (ranks, def_site.len(), ref_counts.len(), file_defs)
     };
 
     // Write the extracted files' items with their fresh ranks.
@@ -722,6 +729,39 @@ pub async fn run(
         .item("symbols", attr_n(def_counts as u64))
         .item("names_referenced", attr_n(ref_counts as u64))
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await;
+
+    // Precomputed browse summary for the dashboard's Code Graph page: the top
+    // load-bearing files by rank, with their definition counts. One item read
+    // instead of a partition scan.
+    let mut top: Vec<(&String, f64)> = ranks
+        .iter()
+        .filter(|(p, _)| language_for(p).is_some())
+        .map(|(p, r)| (p, *r))
+        .collect();
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let summary: Vec<serde_json::Value> = top
+        .iter()
+        .take(60)
+        .map(|(p, r)| {
+            serde_json::json!({
+                "path": p,
+                "rank": (r * 1_000_000.0).round() / 1_000_000.0,
+                "defs": file_defs.get(p.as_str()).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    let _ = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(&pk))
+        .item("sk", attr_s("SUMMARY"))
+        .item(
+            "top_files",
+            attr_s(&serde_json::to_string(&summary).unwrap_or_default()),
+        )
         .send()
         .await;
 

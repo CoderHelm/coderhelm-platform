@@ -3,6 +3,7 @@ pub mod auth;
 pub mod banners;
 pub mod github;
 pub mod github_webhook;
+pub mod graph;
 pub mod infrastructure;
 pub mod jira_webhook;
 pub mod log_analyzer;
