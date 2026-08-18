@@ -199,18 +199,35 @@ pub(crate) async fn human_approval_present(
     pr: u64,
 ) -> bool {
     match github.list_pr_reviews(owner, repo, pr).await {
-        Ok(v) => v
-            .as_array()
-            .map(|a| a.as_slice())
-            .unwrap_or(&[])
-            .iter()
-            .any(|r| {
-                r["state"].as_str() == Some("APPROVED")
-                    && !r["user"]["login"]
-                        .as_str()
-                        .unwrap_or("")
-                        .contains("coderhelm")
-            }),
+        Ok(v) => {
+            // LATEST-review-per-reviewer semantics (what GitHub itself uses for
+            // merge eligibility). A human who approved and LATER requested
+            // changes keeps the old review's state "APPROVED" in history — a
+            // simple any(APPROVED) would count that stale approval as the human
+            // key against the reviewer's CURRENT objection. COMMENTED reviews
+            // don't supersede a verdict; DISMISSED clears one. And any
+            // reviewer whose current verdict is CHANGES_REQUESTED blocks — a
+            // standing objection can't be outvoted by someone else's approval.
+            let mut latest: std::collections::HashMap<String, &str> =
+                std::collections::HashMap::new();
+            for r in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                let login = r["user"]["login"].as_str().unwrap_or("");
+                if login.is_empty() || login.contains("coderhelm") {
+                    continue;
+                }
+                // list_pr_reviews returns chronological order — the last
+                // meaningful state per reviewer wins. COMMENTED/PENDING never
+                // supersede a verdict.
+                if let s @ ("APPROVED" | "CHANGES_REQUESTED" | "DISMISSED") =
+                    r["state"].as_str().unwrap_or("")
+                {
+                    latest.insert(login.to_string(), s);
+                }
+            }
+            let any_approved = latest.values().any(|s| *s == "APPROVED");
+            let any_blocking = latest.values().any(|s| *s == "CHANGES_REQUESTED");
+            any_approved && !any_blocking
+        }
         Err(e) => {
             warn!(pr, error = %e, "Could not list PR reviews — treating as no human approval");
             false
@@ -339,7 +356,7 @@ pub(crate) async fn post_merge_actions(
         .await
         {
             lines.push(
-                "🩺 Post-merge health check scheduled — I'll watch the deploy checks and flag any NEW failures.".to_string(),
+                "🩺 Post-merge health check scheduled — I'll watch the deploy checks, keep watching for 15 minutes after they go green, and flag any NEW failures immediately.".to_string(),
             );
         }
     }

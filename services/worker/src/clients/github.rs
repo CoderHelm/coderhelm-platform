@@ -918,7 +918,29 @@ impl GitHubClient {
         let resp = req.send().await?;
 
         if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            // Branch already exists — reset it to the target ref
+            // Branch already exists. INVARIANT: a branch with an OPEN PR is
+            // never force-reset to base — resetting makes the head identical to
+            // base, which empties the PR's diff and makes GitHub AUTO-CLOSE the
+            // PR (observed live: a conflict-resolution run wiped a PR this way).
+            // With an open PR we continue from the branch's current head; only
+            // a stale, PR-less leftover branch is reset.
+            let prs_url = format!(
+                "{API_BASE}/repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open&per_page=1"
+            );
+            let has_open_pr = self
+                .get(&prs_url)
+                .await
+                .ok()
+                .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+                .unwrap_or(false);
+            if has_open_pr {
+                let head = self.get_ref(owner, repo, branch).await?;
+                tracing::info!(
+                    branch,
+                    "Branch has an open PR — continuing from its head, NOT resetting to base"
+                );
+                return Ok(head);
+            }
             let update_url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
             let data = self
                 .patch(

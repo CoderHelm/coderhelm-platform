@@ -19,6 +19,14 @@ use tracing::{info, warn};
 /// most deploys without watching forever.
 const MAX_ATTEMPTS: u32 = 15;
 const RETRY_DELAY_SECS: i32 = 90;
+/// A green result does NOT end the check — it STARTS the watch window. A deploy
+/// that looks fine one minute after checks pass can start failing ten minutes
+/// in; 💚 posts only after the base branch stays clean for this long. A new
+/// failure at ANY tick alerts immediately.
+const WATCH_WINDOW_SECS: i64 = 15 * 60;
+/// Hard ceiling on total re-enqueues (adaptive wait + watch window ticks).
+const TOTAL_MAX_ATTEMPTS: u32 =
+    MAX_ATTEMPTS + (WATCH_WINDOW_SECS as u32 / RETRY_DELAY_SECS as u32) + 2;
 
 /// Names of base-branch check runs currently in a failing conclusion.
 pub async fn failing_checks(
@@ -113,7 +121,28 @@ pub async fn run(
             new_failures.join(", ")
         )
     } else {
-        format!("💚 **Post-merge health check passed** — deploy checks green for `{short}` (no new failures vs. baseline).")
+        // Green — but one look proves nothing. Start (or continue) the watch
+        // window and only declare success once the base branch stayed clean for
+        // the full window. Any new failure on a later tick hits the 🔴 branch
+        // above immediately.
+        let now = chrono::Utc::now().timestamp();
+        let since = msg.green_since.unwrap_or(now);
+        if now - since < WATCH_WINDOW_SECS && msg.attempts < TOTAL_MAX_ATTEMPTS {
+            let mut next = msg.clone();
+            next.green_since = Some(since);
+            info!(
+                pr = msg.pr_number,
+                watched_secs = now - since,
+                "Health check green — continuing watch window"
+            );
+            reenqueue(state, &next).await;
+            return Ok(());
+        }
+        format!(
+            "💚 **Post-merge health check passed** — deploy checks for `{short}` stayed green for \
+             the full {}-minute watch window (no new failures vs. baseline).",
+            WATCH_WINDOW_SECS / 60
+        )
     };
 
     let _ = github
@@ -152,6 +181,7 @@ pub async fn schedule(
         merge_sha: merge_sha.to_string(),
         baseline_failed,
         attempts: 0,
+        green_since: None,
     };
     reenqueue(state, &msg).await
 }

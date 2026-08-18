@@ -211,6 +211,11 @@ pub struct HealthCheckMessage {
     /// (bounds the adaptive wait — no user-set timer).
     #[serde(default)]
     pub attempts: u32,
+    /// Epoch seconds when the deploy checks FIRST went green. A green result
+    /// starts the ≥15-minute watch window; 💚 posts only after the window ends
+    /// with no new failures. None until first observed green.
+    #[serde(default)]
+    pub green_since: Option<i64>,
 }
 
 /// A label-triggered code-review job for an existing PR. Keyed by (pr_number,
