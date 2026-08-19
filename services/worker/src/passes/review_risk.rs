@@ -93,37 +93,87 @@ fn is_generated_path(p: &str) -> bool {
 /// Sensitive-change classification → (score 0-100, human detail, hard-override reason).
 pub fn classify_sensitive(files: &[(String, String, String)]) -> (u8, String, Option<String>) {
     // files: (path, status, patch)
+    //
+    // Two tiers, deliberately asymmetric (learned from a live false positive:
+    // `schedule-session.service.ts` — a bookable CLASS session — substring-matched
+    // "session", and MOVED secret references matched "secret", forcing HIGH on a
+    // cache refactor):
+    //   - HARD override (forces HIGH): only precise, unambiguous signals — a DB
+    //     migration, or a path whose TOKENS say what the file IS (an `auth/`
+    //     module, a `secrets.ts`, a `payments/` dir). Never from patch content.
+    //   - SCORE-ONLY: sensitive keywords in the ADDED lines of the patch
+    //     (word-prefix matched, "author" family excluded). Context/removed lines
+    //     never count — touching a file that merely mentions "token" somewhere
+    //     is not new risk, and neither is moving existing code.
+    const HARD_PATH_TOKENS: &[&str] = &[
+        "auth",
+        "oauth",
+        "sso",
+        "secret",
+        "secrets",
+        "credential",
+        "credentials",
+        "payment",
+        "payments",
+        "billing",
+        "checkout",
+    ];
+    const PAYMENT_TOKENS: &[&str] = &["payment", "payments", "billing", "checkout"];
+    const CONTENT_KEYWORDS: &[&str] = &[
+        "auth",
+        "login",
+        "password",
+        "secret",
+        "token",
+        "jwt",
+        "crypto",
+        "oauth",
+        "credential",
+        "payment",
+        "stripe",
+        "billing",
+        "invoice",
+        "refund",
+        "checkout",
+    ];
+    const FALSE_FRIENDS: &[&str] = &["author", "authors", "authored", "authoring", "authorship"];
+
     let mut hits: Vec<&'static str> = vec![];
     let mut hard: Option<String> = None;
     let mut deletions = false;
 
     for (path, status, patch) in files {
         let l = path.to_ascii_lowercase();
-        let hay = format!("{l}\n{}", patch.to_ascii_lowercase());
         let migration = l.contains("migration")
             || l.contains("/migrate")
             || l.ends_with("schema.sql")
             || l.ends_with(".prisma")
             || l.contains("alembic");
-        let auth = [
-            "auth",
-            "login",
-            "session",
-            "password",
-            "secret",
-            "token",
-            "jwt",
-            "crypto",
-            "oauth",
-            "credential",
-        ]
-        .iter()
-        .any(|k| hay.contains(k));
-        let payment = [
-            "payment", "charge", "stripe", "billing", "invoice", "refund", "checkout",
-        ]
-        .iter()
-        .any(|k| hay.contains(k));
+        // Path tokens: `src/auth/login.ts` → [src, auth, login, ts]. Exact token
+        // equality, so `schedule-session` or `author-page` can never match.
+        let path_tokens: Vec<&str> = l
+            .split(['/', '.', '_', '-'])
+            .filter(|t| !t.is_empty())
+            .collect();
+        let hard_token = path_tokens
+            .iter()
+            .find(|t| HARD_PATH_TOKENS.contains(*t))
+            .copied();
+        // Content: ADDED lines only, split into identifier-ish tokens,
+        // word-prefix matched (so "authorization" counts, "author" does not).
+        let added: String = patch
+            .lines()
+            .filter(|ln| ln.starts_with('+') && !ln.starts_with("+++"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+        let content_tokens: Vec<&str> = added
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| t.len() >= 3)
+            .collect();
+        let content_hit = content_tokens.iter().any(|tok| {
+            !FALSE_FRIENDS.contains(tok) && CONTENT_KEYWORDS.iter().any(|kw| tok.starts_with(kw))
+        });
         let infra = l == "dockerfile"
             || l.ends_with("/dockerfile")
             || l.ends_with(".tf")
@@ -131,17 +181,23 @@ pub fn classify_sensitive(files: &[(String, String, String)]) -> (u8, String, Op
             || l.contains("k8s")
             || l.contains("cdk")
             || l.ends_with("package.json");
+
         if migration {
             hits.push("migration/schema");
             hard.get_or_insert_with(|| "touches a DB migration/schema (hard to roll back)".into());
         }
-        if auth {
-            hits.push("auth/secrets");
-            hard.get_or_insert_with(|| "touches auth/secrets".into());
-        }
-        if payment {
-            hits.push("payments");
-            hard.get_or_insert_with(|| "touches payment/billing code".into());
+        if let Some(tok) = hard_token {
+            if PAYMENT_TOKENS.contains(&tok) {
+                hits.push("payments");
+                hard.get_or_insert_with(|| format!("payment/billing path `{path}`"));
+            } else {
+                hits.push("auth/secrets");
+                hard.get_or_insert_with(|| format!("auth/secrets path `{path}`"));
+            }
+        } else if content_hit {
+            // Sensitive words in NEW code nudge the score; a human-visible flag,
+            // never a forced verdict — the agentic review judges the substance.
+            hits.push("sensitive-adjacent additions");
         }
         if infra {
             hits.push("infra/ci");
@@ -414,6 +470,60 @@ mod tests {
         assert!(detail.contains("migration"));
         let (_s, level) = combine(0, 30, 0, 0, hard.is_some());
         assert_eq!(level, "HIGH");
+    }
+
+    #[test]
+    fn class_session_and_moved_secrets_do_not_force() {
+        // The live false positive: a bookable class-session service + MOVED
+        // secret references. May nudge the score; must NEVER force HIGH.
+        let files = vec![
+            (
+                "src/graphql/services/schedule-session.service.ts".to_string(),
+                "modified".to_string(),
+                "+import { schedule } from './schedule';\n+const s = getScheduleSession(id);"
+                    .to_string(),
+            ),
+            (
+                "src/cache/redis-client.module.ts".to_string(),
+                "added".to_string(),
+                "+const redisSecret = config.get('REDIS_SECRET');".to_string(),
+            ),
+        ];
+        let (score, detail, hard) = classify_sensitive(&files);
+        assert!(hard.is_none(), "must not force HIGH, got {hard:?}");
+        // The moved secret in ADDED lines still nudges the score (visible flag).
+        assert!(score > 0);
+        assert!(detail.contains("sensitive-adjacent"));
+    }
+
+    #[test]
+    fn real_auth_path_forces() {
+        let files = vec![(
+            "src/auth/login.ts".to_string(),
+            "modified".to_string(),
+            "+return session".to_string(),
+        )];
+        let (_s, _d, hard) = classify_sensitive(&files);
+        assert!(hard.is_some());
+        let files = vec![(
+            "config/secrets.ts".to_string(),
+            "modified".to_string(),
+            "+x".to_string(),
+        )];
+        assert!(classify_sensitive(&files).2.is_some());
+    }
+
+    #[test]
+    fn author_is_not_auth_and_context_lines_dont_count() {
+        // "author" must not prefix-match "auth"; non-added lines never count.
+        let files = vec![(
+            "src/pr/metadata.ts".to_string(),
+            "modified".to_string(),
+            "+const author = pr.author;\n-const oldToken = x;\n const ctxSecret = y;".to_string(),
+        )];
+        let (score, _d, hard) = classify_sensitive(&files);
+        assert_eq!(score, 0, "author/context/removed lines must not score");
+        assert!(hard.is_none());
     }
 
     #[test]
