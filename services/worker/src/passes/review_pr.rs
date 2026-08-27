@@ -534,7 +534,7 @@ pub async fn run(
         }
         b
     };
-    store_review_record(
+    let record_sk = store_review_record(
         state,
         &msg,
         &head_sha,
@@ -585,17 +585,26 @@ pub async fn run(
                     &report.summary,
                 )
                 .await;
-            store_review_record(
-                state,
-                &msg,
-                &head_sha,
-                verdict,
-                &risk,
-                &record_body,
-                effective_event,
-                &report.summary,
-            )
-            .await;
+            // Attach the action summary to the record we JUST wrote — an
+            // UPDATE, not a second put. A second put (timestamp-keyed) showed
+            // up as a duplicate "review" in the dashboard for every armed
+            // APPROVE (observed on three PRs before being root-caused here).
+            let upd = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", attr_s(&msg.team_id))
+                .key("sk", attr_s(&record_sk))
+                .update_expression("SET action_summary = :a")
+                .expression_attribute_values(
+                    ":a",
+                    attr_s(&common::head_tail_str(&report.summary, 8_000)),
+                )
+                .send()
+                .await;
+            if let Err(e) = upd {
+                warn!(pr = msg.pr_number, error = %e, "Failed to attach action summary (non-fatal)");
+            }
         }
     } else if self_authored {
         // CoderHelm reviewed its OWN PR and wants changes → hand the findings to the
@@ -897,6 +906,9 @@ async fn last_review_verdict(state: &WorkerState, msg: &ReviewMessage) -> Option
 
 /// ratings/actions can attach. Keyed pk=team_id, sk=REVIEW#{repo}#{pr:06}#{ts}.
 /// Best-effort: a storage failure must never break the actual GitHub review.
+/// Returns the record's sort key so follow-up steps can UPDATE this record
+/// (e.g. attach the auto-merge action summary) instead of writing a second one
+/// — one review execution must never produce two dashboard records.
 #[allow(clippy::too_many_arguments)]
 async fn store_review_record(
     state: &WorkerState,
@@ -907,7 +919,7 @@ async fn store_review_record(
     body: &str,
     posted_as: &str,
     action_summary: &str,
-) {
+) -> String {
     let created_at = chrono::Utc::now().to_rfc3339();
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let sk = format!("REVIEW#{repo}#{:0>6}#{created_at}", msg.pr_number);
@@ -941,4 +953,5 @@ async fn store_review_record(
     if let Err(e) = put.send().await {
         warn!(pr = msg.pr_number, error = %e, "Failed to persist review record (non-fatal)");
     }
+    sk
 }
