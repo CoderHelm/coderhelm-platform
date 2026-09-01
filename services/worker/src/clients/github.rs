@@ -1637,9 +1637,13 @@ impl GitHubClient {
         self.get(&url).await
     }
 
-    /// Create a lightweight tag ref pointing at `sha` (e.g. a release tag after
-    /// an approved merge). Idempotency is the caller's job — GitHub 422s on a
-    /// ref that already exists.
+    /// Create an ANNOTATED tag pointing at `sha` (a release tag after an
+    /// approved merge): first the tag OBJECT (tagger + message — what `git
+    /// cat-file -t` reports as `tag`), then the ref pointing at that object.
+    /// Lightweight tags (a bare ref at the commit) break org release
+    /// conventions and some tag-triggered deploy setups, so we never cut them.
+    /// Idempotency is the caller's job — GitHub 422s on a ref that already
+    /// exists.
     pub async fn create_tag_ref(
         &self,
         owner: &str,
@@ -1647,10 +1651,30 @@ impl GitHubClient {
         tag: &str,
         sha: &str,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let obj_url = format!("{API_BASE}/repos/{owner}/{repo}/git/tags");
+        let tag_obj = self
+            .post(
+                &obj_url,
+                &serde_json::json!({
+                    "tag": tag,
+                    "message": format!("Release {tag}\n\nCut automatically by CoderHelm after an approved merge."),
+                    "object": sha,
+                    "type": "commit",
+                    "tagger": {
+                        "name": "coderhelm[bot]",
+                        "email": "coderhelm[bot]@users.noreply.github.com",
+                        "date": chrono::Utc::now().to_rfc3339(),
+                    }
+                }),
+            )
+            .await?;
+        let obj_sha = tag_obj["sha"]
+            .as_str()
+            .ok_or("Missing sha in tag object response")?;
         let url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs");
         self.post(
             &url,
-            &serde_json::json!({ "ref": format!("refs/tags/{tag}"), "sha": sha }),
+            &serde_json::json!({ "ref": format!("refs/tags/{tag}"), "sha": obj_sha }),
         )
         .await
     }
