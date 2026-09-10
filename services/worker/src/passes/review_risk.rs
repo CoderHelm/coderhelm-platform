@@ -181,10 +181,31 @@ pub fn classify_sensitive(files: &[(String, String, String)]) -> (u8, String, Op
             || l.contains("k8s")
             || l.contains("cdk")
             || l.ends_with("package.json");
+        // Terraform lifecycle guards: REMOVING `ignore_changes` / `prevent_destroy`
+        // makes Terraform treat the previously-shielded LIVE attribute as drift
+        // and DESTROY it on the next apply (live incident: a CloudFront
+        // Lambda@Edge association wiped this way). Removed lines only — ADDING
+        // a guard is safe and must not trip this.
+        let removes_lifecycle_guard = l.ends_with(".tf")
+            && patch.lines().any(|ln| {
+                ln.starts_with('-')
+                    && !ln.starts_with("---")
+                    && (ln.contains("ignore_changes") || ln.contains("prevent_destroy"))
+            });
 
         if migration {
             hits.push("migration/schema");
             hard.get_or_insert_with(|| "touches a DB migration/schema (hard to roll back)".into());
+        }
+        if removes_lifecycle_guard {
+            hits.push("terraform lifecycle guard removed");
+            hard.get_or_insert_with(|| {
+                format!(
+                    "removes a Terraform lifecycle guard in `{path}` — attributes it shielded \
+                     become drift and are DESTROYED on apply; require an explicit replacement \
+                     block and a plan proving zero destroys"
+                )
+            });
         }
         if let Some(tok) = hard_token {
             if PAYMENT_TOKENS.contains(&tok) {
@@ -494,6 +515,35 @@ mod tests {
         // The moved secret in ADDED lines still nudges the score (visible flag).
         assert!(score > 0);
         assert!(detail.contains("sensitive-adjacent"));
+    }
+
+    #[test]
+    fn removing_terraform_lifecycle_guard_forces() {
+        // The #272 incident: dropping ignore_changes destroyed a live
+        // Lambda@Edge association on apply. Removal = forced HIGH.
+        let files = vec![(
+            "envs/staging/media.tf".to_string(),
+            "modified".to_string(),
+            "-    ignore_changes = [default_cache_behavior[0].lambda_function_association]\n+    # guard removed"
+                .to_string(),
+        )];
+        let (_s, detail, hard) = classify_sensitive(&files);
+        assert!(hard.is_some(), "guard removal must force HIGH");
+        assert!(detail.contains("lifecycle guard"));
+        // ADDING a guard is safe — no force.
+        let files = vec![(
+            "envs/staging/media.tf".to_string(),
+            "modified".to_string(),
+            "+    ignore_changes = [tags]".to_string(),
+        )];
+        assert!(classify_sensitive(&files).2.is_none());
+        // Same removed text outside .tf never trips the rule.
+        let files = vec![(
+            "docs/notes.md".to_string(),
+            "modified".to_string(),
+            "-  ignore_changes = [x]".to_string(),
+        )];
+        assert!(classify_sensitive(&files).2.is_none());
     }
 
     #[test]
