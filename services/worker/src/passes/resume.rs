@@ -1736,6 +1736,27 @@ pub(crate) async fn mark_pr_ready(
                     info!(pr_number, "PR already not a draft — skipping mark_pr_ready");
                     return;
                 }
+                // A person put this PR back into draft: that is their call, not
+                // something a later CI pass or run completion should undo. Only
+                // a draft CoderHelm opened is ours to mark ready. If the
+                // timeline can't be read, leave the draft alone this time.
+                match github
+                    .list_issue_timeline(repo_owner, repo_name, pr_number)
+                    .await
+                {
+                    Ok(timeline) => {
+                        if let Some(who) =
+                            crate::clients::github::human_converted_to_draft(&timeline)
+                        {
+                            info!(pr_number, converted_by = %who, "PR was put back into draft by a person — not marking ready");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(pr_number, error = %e, "Could not read PR timeline — leaving the draft as is");
+                        return;
+                    }
+                }
                 // Final squash: collapse the run's whole history — the initial
                 // implementation AND every CI-fix cycle (including any
                 // restore/refix churn) — into ONE clean commit before the PR

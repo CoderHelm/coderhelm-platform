@@ -6,7 +6,20 @@
 /// run's upload, silently resurrecting deleted memories).
 pub mod memlock;
 
+/// Expiring once-only claims (dedup markers, leases) on the settings table.
+/// Shared so every claim compares its expiry the same way.
+pub mod claim;
+
+/// The auto-merge gate's per-PR record (worker runs the gate, gateway re-arms it).
+pub mod merge_gate;
+
 use sha2::{Digest, Sha256};
+
+/// Stable SHA-256 hex digest of a string (e.g. to skip rewriting a comment
+/// whose rendered body has not changed).
+pub fn content_hash(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
 
 /// Stable content hash for a ticket's context: title + body + image keys.
 ///

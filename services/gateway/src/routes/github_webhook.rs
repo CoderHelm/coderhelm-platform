@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use super::coderhelm_command::{self, Command};
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
     AwaitMergeMessage, FeedbackMessage, GraphIndexMessage, MarkReadyMessage, OnboardMessage,
@@ -14,6 +15,7 @@ use crate::models::{
     TicketSource, WorkerMessage,
 };
 use crate::AppState;
+use common::merge_gate;
 
 /// Look up team_id by GitHub installation_id using the teams table GSI.
 /// Returns None if no team has linked this installation yet.
@@ -45,20 +47,17 @@ pub async fn resolve_team_by_installation(
     let items = result.items();
 
     // If multiple teams share this installation, prefer the one with the
-    // most members — orphan auto-created teams have 0-1 users. Returning
-    // whichever DynamoDB listed first routed webhooks to the wrong tenant.
+    // most members — orphan auto-created teams have 0-1 users. Ties go to the
+    // lowest team id so the choice never depends on query order, and a failed
+    // count routes nowhere (the delivery fails visibly) rather than to a team
+    // that merely looked biggest because the real one could not be counted.
     if items.len() > 1 {
-        tracing::warn!(
-            installation_id,
-            team_count = items.len(),
-            "Multiple teams found for installation — selecting by member count"
-        );
-        let mut best: Option<(String, i32)> = None;
+        let mut counted: Vec<(String, i32)> = Vec::with_capacity(items.len());
         for item in items {
             let Some(team_id) = item.get("team_id").and_then(|v| v.as_s().ok()).cloned() else {
                 continue;
             };
-            let count = state
+            let count = match state
                 .dynamo
                 .query()
                 .table_name(&state.config.users_table_name)
@@ -68,18 +67,36 @@ pub async fn resolve_team_by_installation(
                 .select(aws_sdk_dynamodb::types::Select::Count)
                 .send()
                 .await
-                .map(|r| r.count)
-                .unwrap_or(0);
-            if best.as_ref().is_none_or(|(_, c)| count > *c) {
-                best = Some((team_id, count));
-            }
+            {
+                Ok(r) => r.count,
+                Err(e) => {
+                    tracing::error!(installation_id, team_id, error = %e, "Could not count team members — not routing this delivery");
+                    return None;
+                }
+            };
+            counted.push((team_id, count));
         }
-        return best.map(|(t, _)| t);
+        let chosen = pick_team(counted);
+        tracing::info!(
+            installation_id,
+            team_count = items.len(),
+            team_id = chosen.as_deref().unwrap_or(""),
+            "Multiple teams share this installation — routed by member count"
+        );
+        return chosen;
     }
 
     items
         .first()
         .and_then(|item| item.get("team_id").and_then(|v| v.as_s().ok()).cloned())
+}
+
+/// Pure: the team with the most members; ties go to the lowest team id.
+fn pick_team(counted: Vec<(String, i32)>) -> Option<String> {
+    counted
+        .into_iter()
+        .max_by(|(a_id, a_n), (b_id, b_n)| a_n.cmp(b_n).then_with(|| b_id.cmp(a_id)))
+        .map(|(id, _)| id)
 }
 
 /// Look up ALL team_ids linked to a GitHub installation_id.
@@ -143,7 +160,22 @@ pub async fn handle(
         .as_u64()
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    info!(event_type, installation_id, "GitHub webhook received");
+    // Unique per event and kept by GitHub's redeliveries, so it identifies one
+    // deliberate action (e.g. a re-added label) across retries.
+    let delivery = headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    info!(
+        event_type,
+        installation_id,
+        delivery = %delivery,
+        action = payload["action"].as_str().unwrap_or(""),
+        repo = payload["repository"]["full_name"].as_str().unwrap_or(""),
+        "GitHub webhook received"
+    );
 
     // Installation events handle their own team resolution/creation
     if event_type == "installation" {
@@ -168,15 +200,20 @@ pub async fn handle(
     match event_type {
         "issues" => handle_issue_event(&state, &payload, installation_id, &team_id).await,
         "issue_comment" => handle_issue_comment(&state, &payload, installation_id, &team_id).await,
-        "pull_request" => handle_pull_request(&state, &payload, installation_id, &team_id).await,
+        "pull_request" => {
+            handle_pull_request(&state, &payload, installation_id, &team_id, &delivery).await
+        }
         "pull_request_review" => {
             handle_pr_review(&state, &payload, installation_id, &team_id).await
         }
-        "pull_request_review_comment" | "pull_request_review_thread" => {
-            info!(
-                event_type,
-                "Review comment event — handled via pull_request_review"
-            );
+        // Inline review comments: on CoderHelm's own PRs they reach the fix loop
+        // through the `pull_request_review` event; on other PRs an inline
+        // `@coderhelm …` is answered in its thread.
+        "pull_request_review_comment" => {
+            handle_review_comment(&state, &payload, installation_id, &team_id).await
+        }
+        "pull_request_review_thread" => {
+            info!(event_type, "Review thread event — no action");
             Ok(StatusCode::OK)
         }
         "push" => handle_push(&state, &payload, installation_id, &team_id).await,
@@ -298,25 +335,103 @@ async fn handle_issue_comment(
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
-    if action != "created" {
+    let body = payload["comment"]["body"].as_str().unwrap_or("");
+    let comment_id = payload["comment"]["id"].as_u64().unwrap_or(0);
+    let commenter = payload["comment"]["user"]["login"].as_str().unwrap_or("");
+
+    // CoderHelm's own comments (and other bots') are never instructions — its
+    // answers even carry an "@coderhelm re-review" hint in their footer.
+    if is_bot_user(&payload["comment"]["user"]) {
         return Ok(StatusCode::OK);
     }
 
-    let body = payload["comment"]["body"].as_str().unwrap_or("");
-    let commenter = payload["comment"]["user"]["login"].as_str().unwrap_or("");
+    // A new comment, or an edit that adds a command the earlier text lacked
+    // (e.g. someone fixing "@CoderHelm" after posting). The edit gets its own
+    // dedup key so it runs exactly once.
+    let dedup_key = match action {
+        "created" => format!("reply#{comment_id}"),
+        "edited" => {
+            let before = payload["changes"]["body"]["from"].as_str().unwrap_or("");
+            if coderhelm_command::parse(before).is_some()
+                || coderhelm_command::parse(body).is_none()
+            {
+                return Ok(StatusCode::OK);
+            }
+            format!(
+                "reply#{comment_id}#edit#{}",
+                payload["comment"]["updated_at"].as_str().unwrap_or("")
+            )
+        }
+        _ => return Ok(StatusCode::OK),
+    };
+    let command = coderhelm_command::parse(body);
 
-    // If this comment is on a PR opened by coderhelm, treat as feedback
     if payload["issue"]["pull_request"].is_object() {
-        let pr_user = payload["issue"]["user"]["login"].as_str().unwrap_or("");
-        if pr_user.contains("coderhelm") && !commenter.contains("coderhelm") {
-            let repo = &payload["repository"];
-            let owner = repo["owner"]["login"].as_str().unwrap_or("");
-            let name = repo["name"].as_str().unwrap_or("");
-            let pr_number = payload["issue"]["number"].as_u64().unwrap_or(0);
+        let repo = &payload["repository"];
+        let owner = repo["owner"]["login"].as_str().unwrap_or("");
+        let name = repo["name"].as_str().unwrap_or("");
+        let pr_number = payload["issue"]["number"].as_u64().unwrap_or(0);
+        let is_bot_pr = payload["issue"]["user"]["login"]
+            .as_str()
+            .unwrap_or("")
+            .contains("coderhelm");
 
+        // An explicit re-review always gets a fresh verdict. Other asks go to the
+        // reviewer on people's PRs; on CoderHelm's own PRs the fix loop handles
+        // them, because it can change the code it wrote.
+        let review_job = match &command {
+            Some(Command::Rereview) => Some(None),
+            Some(Command::Ask(q)) if !is_bot_pr => Some(Some(q.clone())),
+            _ => None,
+        };
+        if let Some(question) = review_job {
+            let cfg = load_review_config(state, team_id, owner, name).await?;
+            if cfg.enabled && !cfg.killed && pr_number != 0 {
+                if let Some(reason) = check_run_budget(state, team_id).await {
+                    post_limit_comment(state, installation_id, owner, name, pr_number, &reason)
+                        .await;
+                    return Ok(StatusCode::OK);
+                }
+                info!(
+                    owner,
+                    name,
+                    pr_number,
+                    commenter,
+                    rereview = question.is_none(),
+                    "Reviewer: comment → review job"
+                );
+                // Empty head_sha: the worker reviews the PR's current head. The
+                // dedup key is the comment (or the edit), so a redelivered
+                // webhook runs once and every new ask runs again.
+                let message = WorkerMessage::Review(ReviewMessage {
+                    team_id: team_id.to_string(),
+                    installation_id,
+                    repo_owner: owner.to_string(),
+                    repo_name: name.to_string(),
+                    pr_number,
+                    head_sha: String::new(),
+                    label: cfg.label,
+                    question,
+                    trigger: "reply".to_string(),
+                    dedup_key,
+                    attempt: 0,
+                    reply_to_comment_id: None,
+                });
+                return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+            }
+            info!(
+                owner,
+                name, pr_number, "Mention on a PR in a repo with review off — not a review job"
+            );
+        }
+
+        if is_bot_pr {
             let run_id = lookup_run_by_pr(state, team_id, owner, name, pr_number).await;
             if run_id.is_empty() {
-                warn!(pr_number, "No run found for PR comment — skipping");
+                warn!(
+                    owner,
+                    name, pr_number, "No run found for PR comment — skipping"
+                );
                 return Ok(StatusCode::OK);
             }
 
@@ -333,7 +448,10 @@ async fn handle_issue_comment(
             )
             .await;
 
-            info!(pr_number, commenter, "PR comment → feedback queue");
+            info!(
+                owner,
+                name, pr_number, commenter, "PR comment → feedback queue"
+            );
             let message = WorkerMessage::Feedback(FeedbackMessage {
                 team_id: team_id.to_string(),
                 installation_id,
@@ -344,84 +462,27 @@ async fn handle_issue_comment(
                 review_id: 0,
                 review_body: body.to_string(),
                 comments: vec![],
+                // Reply on the PR only to people who addressed CoderHelm; other
+                // conversation is still applied, without a reply to each remark.
+                trigger_author: if command.is_some() {
+                    commenter.to_string()
+                } else {
+                    String::new()
+                },
             });
-            // Budget gate — the review-feedback path checks this, but the comment
-            // path didn't, letting over-limit teams keep spending via PR comments.
-            if check_run_budget(state, team_id).await.is_some() {
+            // Budget gate — same as every other enqueue path.
+            if let Some(reason) = check_run_budget(state, team_id).await {
                 info!(team_id, "PR comment feedback skipped — token limit reached");
+                post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
                 return Ok(StatusCode::OK);
             }
             return send_to_queue(state, &state.config.feedback_queue_url, &message).await;
         }
-
-        // Reviewer reply-handling: on a PR the reviewer covers, a human addressing
-        // the bot ("@coderhelm re-review" or "@coderhelm <question>") re-runs the
-        // review or answers the question — instead of opening a brand-new ticket.
-        // Requires an explicit mention/command so unrelated PR chatter never fires.
-        if !commenter.contains("coderhelm")
-            && (body.contains("@coderhelm") || body.trim_start().starts_with("/coderhelm"))
-        {
-            let repo = &payload["repository"];
-            let owner = repo["owner"]["login"].as_str().unwrap_or("");
-            let name = repo["name"].as_str().unwrap_or("");
-            let pr_number = payload["issue"]["number"].as_u64().unwrap_or(0);
-            let cfg = load_review_config(state, team_id, owner, name).await;
-            if cfg.enabled && !cfg.killed && pr_number != 0 {
-                if let Some(reason) = check_run_budget(state, team_id).await {
-                    post_limit_comment(state, installation_id, owner, name, pr_number, &reason)
-                        .await;
-                    return Ok(StatusCode::OK);
-                }
-                // Strip the address token to recover the human's actual message.
-                let cleaned = body
-                    .replace("@coderhelm", " ")
-                    .trim()
-                    .trim_start_matches("/coderhelm")
-                    .trim()
-                    .to_string();
-                let lower = cleaned.to_lowercase();
-                let is_rereview = lower.contains("re-review")
-                    || lower.contains("rereview")
-                    || lower.contains("review again")
-                    || lower == "review";
-                // Re-review → fresh verdict; anything else → a question the reviewer
-                // answers. Empty head_sha makes the worker resolve the PR's current
-                // head, so a reply always targets the latest code.
-                let question = if is_rereview || cleaned.is_empty() {
-                    None
-                } else {
-                    Some(cleaned)
-                };
-                info!(
-                    owner,
-                    name, pr_number, is_rereview, "Reviewer: reply → review job"
-                );
-                // Idempotency key = this comment's id. A webhook GitHub delivers
-                // more than once (at-least-once) carries the SAME comment id, so
-                // the worker runs the review exactly once; a genuinely new
-                // `@coderhelm re-review` comment has a new id and re-runs.
-                let comment_id = payload["comment"]["id"].as_u64().unwrap_or(0);
-                let message = WorkerMessage::Review(ReviewMessage {
-                    team_id: team_id.to_string(),
-                    installation_id,
-                    repo_owner: owner.to_string(),
-                    repo_name: name.to_string(),
-                    pr_number,
-                    head_sha: String::new(),
-                    label: cfg.label,
-                    question,
-                    trigger: "reply".to_string(),
-                    dedup_key: format!("reply#{comment_id}"),
-                });
-                return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
-            }
-        }
     }
 
-    // Trigger on `/coderhelm` slash command or @coderhelm mention (issues or non-bot PRs)
-    let is_slash = body.starts_with("/coderhelm");
-    let is_mention = body.contains("@coderhelm");
-    if !is_slash && !is_mention {
+    // `/coderhelm` or an @coderhelm mention on an issue (or on a person's PR in a
+    // repo without review) starts a ticket run.
+    if command.is_none() {
         return Ok(StatusCode::OK);
     }
 
@@ -469,12 +530,19 @@ async fn handle_issue_comment(
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
 
+/// Is this GitHub user a bot (an App, or a `[bot]`/CoderHelm login)?
+fn is_bot_user(user: &Value) -> bool {
+    let login = user["login"].as_str().unwrap_or("");
+    user["type"].as_str() == Some("Bot") || login.ends_with("[bot]") || login.contains("coderhelm")
+}
+
 /// Track PR merges for Coderhelm branches — updates run status to "merged".
 async fn handle_pull_request(
     state: &AppState,
     payload: &Value,
     installation_id: u64,
     team_id: &str,
+    delivery: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
 
@@ -498,8 +566,12 @@ async fn handle_pull_request(
         let owner = repo["owner"]["login"].as_str().unwrap_or("");
         let name = repo["name"].as_str().unwrap_or("");
         let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
-        let cfg = load_review_config(state, team_id, owner, name).await;
+        let cfg = load_review_config(state, team_id, owner, name).await?;
         if !cfg.enabled || cfg.killed || pr_number == 0 {
+            info!(
+                owner,
+                name, pr_number, "Re-request ignored — review is off for this repo"
+            );
             return Ok(StatusCode::OK);
         }
         if let Some(reason) = check_run_budget(state, team_id).await {
@@ -527,7 +599,11 @@ async fn handle_pull_request(
             label: cfg.label,
             question: None,
             trigger: "rerequest".to_string(),
-            dedup_key: format!("rerequest#{req_head}"),
+            // Every click is a deliberate ask; a redelivery of the same click
+            // keeps its delivery id.
+            dedup_key: format!("rerequest#{req_head}#{delivery}"),
+            attempt: 0,
+            reply_to_comment_id: None,
         });
         return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
     }
@@ -538,7 +614,8 @@ async fn handle_pull_request(
         || action == "reopened"
         || action == "ready_for_review"
     {
-        return handle_review_trigger(state, payload, installation_id, team_id, action).await;
+        return handle_review_trigger(state, payload, installation_id, team_id, action, delivery)
+            .await;
     }
 
     let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
@@ -639,6 +716,32 @@ async fn handle_pr_review(
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let pr = &payload["pull_request"];
+    let pr_number = pr["number"].as_u64().unwrap_or(0);
+
+    // A dismissal (of CoderHelm's review or of a person's approval) changes
+    // what the merge gate may do: re-evaluate an existing gate right away so it
+    // never merges on a withdrawn key and its status comment says so.
+    if action == "dismissed" {
+        rearm_gate(
+            state,
+            team_id,
+            installation_id,
+            owner,
+            name,
+            pr_number,
+            pr["head"]["sha"].as_str().unwrap_or(""),
+            |gate_state| {
+                gate_state != merge_gate::STATE_MERGED && gate_state != merge_gate::STATE_CLOSED
+            },
+            "review dismissed",
+        )
+        .await?;
+        return Ok(StatusCode::OK);
+    }
     if action != "submitted" {
         return Ok(StatusCode::OK);
     }
@@ -652,47 +755,44 @@ async fn handle_pr_review(
         return Ok(StatusCode::OK);
     }
 
-    let repo = &payload["repository"];
-    let owner = repo["owner"]["login"].as_str().unwrap_or("");
-    let name = repo["name"].as_str().unwrap_or("");
-    let pr = &payload["pull_request"];
-    let pr_number = pr["number"].as_u64().unwrap_or(0);
-
-    // A human APPROVED review is the second key for armed auto-merge. Re-arm the
+    // A human APPROVED review is the second key for armed auto-merge. Arm the
     // gate so an approval that arrives AFTER the bot review still triggers the
-    // merge — the review-time arming only had the bot's own key. This applies to
-    // human PRs too, not just bot PRs. The worker's await_merge gate remains the
-    // sole authority on whether auto_merge is on, both keys are present, and every
-    // CI check is green before it merges (it waits for pending checks like a
-    // staging deploy and never merges on failing CI). Here we only gate on the
-    // repo having review enabled, so approvals on non-review repos are ignored.
+    // merge. The worker's gate remains the sole authority on whether auto_merge
+    // is on, both keys are present, and every CI check is green; here we only
+    // gate on the repo having review enabled.
     if review_state == "approved" {
-        let cfg = load_review_config(state, team_id, owner, name).await;
+        let cfg = load_review_config(state, team_id, owner, name).await?;
         let head_sha = pr["head"]["sha"].as_str().unwrap_or("").to_string();
         let base_branch = pr["base"]["ref"].as_str().unwrap_or("").to_string();
-        if cfg.enabled && !cfg.killed && pr_number != 0 && !head_sha.is_empty() {
-            let self_authored = pr["user"]["login"]
-                .as_str()
-                .unwrap_or("")
-                .contains("coderhelm");
+        if !cfg.enabled || cfg.killed || pr_number == 0 || head_sha.is_empty() {
             info!(
                 owner,
-                name, pr_number, "Human approval — arming auto-merge gate"
+                name, pr_number, "Human approval ignored — review is off for this repo"
             );
-            let message = WorkerMessage::AwaitMerge(AwaitMergeMessage {
-                team_id: team_id.to_string(),
-                installation_id,
-                repo_owner: owner.to_string(),
-                repo_name: name.to_string(),
-                pr_number,
-                head_sha,
-                base_branch,
-                self_authored,
-                attempts: 0,
-            });
-            let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+            return Ok(StatusCode::OK);
         }
-        return Ok(StatusCode::OK);
+        let self_authored = pr["user"]["login"]
+            .as_str()
+            .unwrap_or("")
+            .contains("coderhelm");
+        info!(
+            owner,
+            name, pr_number, reviewer, "Human approval — arming auto-merge gate"
+        );
+        let message = WorkerMessage::AwaitMerge(AwaitMergeMessage {
+            team_id: team_id.to_string(),
+            installation_id,
+            repo_owner: owner.to_string(),
+            repo_name: name.to_string(),
+            pr_number,
+            head_sha,
+            base_branch,
+            self_authored,
+            attempts: 0,
+            chain_id: String::new(),
+        });
+        // A lost arming is a lost merge: surface the failure to GitHub.
+        return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
     }
 
     // Feedback loop: act on "changes_requested" or "commented" reviews (covers
@@ -746,9 +846,87 @@ async fn handle_pr_review(
         review_id,
         review_body,
         comments: vec![],
+        // A review with a written body gets an answer on the PR when it has no
+        // inline threads to answer in.
+        trigger_author: if payload["review"]["body"]
+            .as_str()
+            .is_some_and(|b| !b.trim().is_empty())
+        {
+            reviewer.to_string()
+        } else {
+            String::new()
+        },
     });
 
     send_to_queue(state, &state.config.feedback_queue_url, &message).await
+}
+
+/// Re-arm an existing merge gate for this PR from its stored record, when the
+/// record is for `head_sha` and its state passes `wake`. No record, another
+/// head, or a state `wake` rejects: nothing to do. A failed read or enqueue is
+/// returned as 500 so GitHub shows the failed delivery.
+#[allow(clippy::too_many_arguments)]
+async fn rearm_gate(
+    state: &AppState,
+    team_id: &str,
+    installation_id: u64,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+    head_sha: &str,
+    wake: impl Fn(&str) -> bool,
+    reason: &str,
+) -> Result<(), StatusCode> {
+    if pr_number == 0 || head_sha.is_empty() {
+        return Ok(());
+    }
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&merge_gate::record_sk(owner, name, pr_number)))
+        .send()
+        .await
+        .map_err(|e| {
+            error!(owner, name, pr_number, error = %e, "Could not read merge gate record");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item()
+        .cloned();
+    let Some(item) = item else {
+        return Ok(());
+    };
+    let get_s = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let gate_state = get_s("state");
+    if get_s("head_sha") != head_sha || !wake(&gate_state) {
+        return Ok(());
+    }
+    info!(owner, name, pr_number, gate_state = %gate_state, reason, "Re-arming merge gate");
+    let message = WorkerMessage::AwaitMerge(AwaitMergeMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
+        head_sha: head_sha.to_string(),
+        base_branch: get_s("base_branch"),
+        self_authored: item
+            .get("self_authored")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false),
+        attempts: 0,
+        chain_id: String::new(),
+    });
+    send_to_queue(state, &state.config.ticket_queue_url, &message)
+        .await
+        .map(|_| ())
 }
 
 async fn handle_check_run(
@@ -1097,28 +1275,55 @@ async fn handle_installation_repos(
 
 /// Handle check_suite events — delegated to workflow_run handler.
 async fn handle_check_suite(
-    _state: &AppState,
+    state: &AppState,
     payload: &Value,
-    _installation_id: u64,
-    _team_id: &str,
+    installation_id: u64,
+    team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     if action != "completed" {
         return Ok(StatusCode::OK);
     }
+    let suite = &payload["check_suite"];
+    let branch = suite["head_branch"].as_str().unwrap_or("");
+    let conclusion = suite["conclusion"].as_str().unwrap_or("");
+    let head_sha = suite["head_sha"].as_str().unwrap_or("");
 
-    let branch = payload["check_suite"]["head_branch"].as_str().unwrap_or("");
-    if !branch.starts_with("coderhelm/") {
-        return Ok(StatusCode::OK);
+    // CI finished on a PR's head: wake that PR's merge gate if it is waiting on
+    // (or was stopped by) CI, on any branch. The gate re-reads every check
+    // itself, so a flaky job re-run to green, or a deploy slower than the
+    // gate's poll window, still merges.
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    for pr in suite["pull_requests"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+    {
+        let pr_number = pr["number"].as_u64().unwrap_or(0);
+        rearm_gate(
+            state,
+            team_id,
+            installation_id,
+            owner,
+            name,
+            pr_number,
+            head_sha,
+            merge_gate::wakes_on_ci,
+            "check suite completed",
+        )
+        .await?;
     }
 
-    let conclusion = payload["check_suite"]["conclusion"].as_str().unwrap_or("");
-    // All CI result handling is done by the workflow_run event handler.
-    // check_suite just logs for observability.
-    info!(
-        branch,
-        conclusion, "check_suite completed — workflow_run handler will process"
-    );
+    if branch.starts_with("coderhelm/") {
+        // CI result handling for CoderHelm's own runs is done by the
+        // workflow_run handler; this is for observability.
+        info!(
+            branch,
+            conclusion, "check_suite completed — workflow_run handler will process"
+        );
+    }
     Ok(StatusCode::OK)
 }
 
@@ -1509,12 +1714,15 @@ impl Default for ReviewConfig {
     }
 }
 
+/// The repo's reviewer config. A missing item is the defaults (review off); a
+/// failed read is logged and returned as 500, so it is never mistaken for
+/// "review off" and GitHub shows the failed delivery.
 async fn load_review_config(
     state: &AppState,
     team_id: &str,
     owner: &str,
     name: &str,
-) -> ReviewConfig {
+) -> Result<ReviewConfig, StatusCode> {
     let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
     let item = state
         .dynamo
@@ -1524,13 +1732,17 @@ async fn load_review_config(
         .key("sk", attr_s(&sk))
         .send()
         .await
-        .ok()
-        .and_then(|o| o.item().cloned());
+        .map_err(|e| {
+            error!(team_id, owner, name, error = %e, "Could not read review config");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item()
+        .cloned();
     let Some(item) = item else {
-        return ReviewConfig::default();
+        return Ok(ReviewConfig::default());
     };
     let d = ReviewConfig::default();
-    ReviewConfig {
+    Ok(ReviewConfig {
         enabled: item
             .get("enabled")
             .and_then(|v| v.as_bool().ok())
@@ -1547,7 +1759,7 @@ async fn load_review_config(
             .and_then(|v| v.as_bool().ok())
             .copied()
             .unwrap_or(d.killed),
-    }
+    })
 }
 
 /// Push to a branch: if the repo's code graph is enabled and the push is to the
@@ -1646,6 +1858,7 @@ async fn handle_review_trigger(
     installation_id: u64,
     team_id: &str,
     action: &str,
+    delivery: &str,
 ) -> Result<StatusCode, StatusCode> {
     let pr = &payload["pull_request"];
     let pr_number = pr["number"].as_u64().unwrap_or(0);
@@ -1657,7 +1870,7 @@ async fn handle_review_trigger(
     let owner = repo["owner"]["login"].as_str().unwrap_or("");
     let name = repo["name"].as_str().unwrap_or("");
 
-    let cfg = load_review_config(state, team_id, owner, name).await;
+    let cfg = load_review_config(state, team_id, owner, name).await?;
     if !cfg.enabled || cfg.killed {
         return Ok(StatusCode::OK);
     }
@@ -1667,24 +1880,23 @@ async fn handle_review_trigger(
     // present. `labeled`: the just-added label must BE the trigger label.
     // `opened`/`reopened`/`ready_for_review`/`synchronize`: the PR must already
     // carry the label (covers a PR opened with it, and re-review on a new commit).
-    // Draft PRs are NEVER reviewed here (see the draft gate below): CoderHelm opens
-    // its own PRs as draft and self-labels them at once, and a human may label a
-    // draft to queue it. Either way the review waits for the PR to actually be
-    // ready — GitHub re-fires this path as `ready_for_review` (draft=false) once the
-    // author clicks "Ready for review" or the pipeline marks it ready.
+    // Label names are case-insensitive on GitHub, so the match is too.
     let is_bot_pr = pr["user"]["login"]
         .as_str()
         .unwrap_or("")
         .contains("coderhelm");
+    let is_trigger_label = |n: &str| n.eq_ignore_ascii_case(&cfg.label);
     let carries_label = pr["labels"]
         .as_array()
         .map(|ls| {
             ls.iter()
-                .any(|l| l["name"].as_str() == Some(cfg.label.as_str()))
+                .any(|l| l["name"].as_str().is_some_and(is_trigger_label))
         })
         .unwrap_or(false);
     let triggered = match action {
-        "labeled" => payload["label"]["name"].as_str() == Some(cfg.label.as_str()),
+        "labeled" => payload["label"]["name"]
+            .as_str()
+            .is_some_and(is_trigger_label),
         "synchronize" | "opened" | "reopened" | "ready_for_review" => carries_label,
         _ => false,
     };
@@ -1692,14 +1904,10 @@ async fn handle_review_trigger(
         return Ok(StatusCode::OK);
     }
 
-    // Draft gate — never review a PR that is still a draft. This is the difference
-    // between "reviewed the instant CoderHelm self-labeled its own half-built draft"
-    // and "reviewed once the PR is genuinely ready". A draft carrying the label is a
-    // queued request, not a live one: when it flips to ready GitHub fires
-    // `ready_for_review` (draft=false) and we land back here with the label present.
-    // An explicit `@coderhelm review` comment still works on a draft — that path is
-    // separate (handle_issue_comment) — for a human who deliberately wants an early
-    // look.
+    // Draft gate — never review a PR that is still a draft. A draft carrying the
+    // label is a queued request: when it flips to ready GitHub fires
+    // `ready_for_review` (draft=false) and we land back here with the label
+    // present. An explicit `@coderhelm review` comment still works on a draft.
     if pr["draft"].as_bool().unwrap_or(false) {
         info!(
             owner,
@@ -1711,113 +1919,188 @@ async fn handle_review_trigger(
         return Ok(StatusCode::OK);
     }
 
-    // Same-head dedup — collapse a burst of events for ONE commit into ONE review.
-    // GitHub fires several `pull_request` events (opened, labeled, synchronize,
-    // ready_for_review) for the same head within a second — CoderHelm's own
-    // self-label on PR creation is a frequent trigger. Each event used to enqueue
-    // its own review, so one commit was reviewed N times (observed: 4 identical
-    // reviews of the same head in 1.3s). The claim is per (repo, pr, head): only the
-    // first event through wins. A genuinely NEW commit has a different head → a
-    // different key → reviews normally; an explicit `@coderhelm review` comment
-    // bypasses this path entirely (handle_issue_comment).
-    if !claim_review_slot(state, team_id, owner, name, pr_number, &head_sha).await {
-        info!(
-            owner,
-            name,
-            pr_number,
-            action,
-            "Reviewer skipped — this head was already claimed by a sibling event (dedup)"
-        );
-        return Ok(StatusCode::OK);
-    }
-
-    // Budget gate — same as every other enqueue path, so an over-limit team
-    // can't keep spending tokens via label-triggered reviews.
+    // Budget before any claim, so a refused trigger never uses up the commit.
     if let Some(reason) = check_run_budget(state, team_id).await {
         info!(team_id, pr_number, "Reviewer skipped — token limit reached");
         post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
         return Ok(StatusCode::OK);
     }
 
+    // A person re-adding the label is a deliberate ask for a fresh review of
+    // this commit: it gets its own key. Everything else collapses into one
+    // review per commit — GitHub fires several events (opened, labeled,
+    // synchronize, ready_for_review) for the same head within seconds.
+    let deliberate = is_deliberate_relabel(
+        action,
+        is_bot_user(&payload["sender"]),
+        pr["created_at"].as_str(),
+        chrono::Utc::now(),
+    ) && !delivery.is_empty();
+    let dedup_key = if deliberate {
+        format!("label#{delivery}")
+    } else {
+        let claim_sk = review_claim_sk(owner, name, pr_number, &head_sha);
+        match common::claim::claim(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            team_id,
+            &claim_sk,
+            REVIEW_BURST_WINDOW_SECS,
+        )
+        .await
+        {
+            common::claim::Claim::Won => {}
+            common::claim::Claim::Held => {
+                info!(
+                    owner,
+                    name,
+                    pr_number,
+                    action,
+                    "Reviewer skipped — this head was already claimed by a sibling event (dedup)"
+                );
+                return Ok(StatusCode::OK);
+            }
+            common::claim::Claim::Failed(e) => {
+                // A transient DynamoDB error must never silently drop a review.
+                warn!(owner, name, pr_number, error = %e, "Review dedup claim errored — allowing review (fail-open)");
+            }
+        }
+        format!("head#{head_sha}")
+    };
+
     info!(
         owner,
-        name, pr_number, is_bot_pr, action, "Reviewer: trigger matched — enqueuing review job"
+        name,
+        pr_number,
+        is_bot_pr,
+        action,
+        deliberate,
+        "Reviewer: trigger matched — enqueuing review job"
     );
-    let dedup_key = format!("head#{head_sha}");
     let message = WorkerMessage::Review(ReviewMessage {
         team_id: team_id.to_string(),
         installation_id,
         repo_owner: owner.to_string(),
         repo_name: name.to_string(),
         pr_number,
-        head_sha,
+        head_sha: head_sha.clone(),
         label: cfg.label,
         question: None,
         trigger: action.to_string(),
         dedup_key,
+        attempt: 0,
+        reply_to_comment_id: None,
     });
-    send_to_queue(state, &state.config.ticket_queue_url, &message).await
+    let sent = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+    if sent.is_err() && !deliberate {
+        // Not queued: free the commit so a redelivery or re-label can retry.
+        common::claim::release(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            team_id,
+            &review_claim_sk(owner, name, pr_number, &head_sha),
+        )
+        .await;
+    }
+    sent
 }
 
-/// How long a review claim blocks re-review of the SAME head. Sized to comfortably
-/// outlast the burst of webhook events GitHub fires for one commit (seconds), while
-/// still self-expiring so a stuck/failed review can be re-driven later (push a new
-/// commit, or `@coderhelm review`). The claim is keyed by head_sha, so a new commit
-/// is never blocked regardless of this window.
-const REVIEW_DEDUP_TTL_SECS: u64 = 3600;
+/// How long one commit's review claim collapses sibling events. GitHub sends
+/// the burst for one commit within seconds; after this window a same-commit
+/// trigger (reopen, ready again) is treated as new.
+const REVIEW_BURST_WINDOW_SECS: u64 = 10 * 60;
 
-/// Atomically claim the review slot for (team, repo, pr, head). Returns `true` if
-/// THIS caller won the claim (should proceed to enqueue), `false` if a sibling
-/// event already claimed this exact head (skip — it is already being reviewed).
-/// Uses a conditional write so concurrent webhook deliveries race safely: exactly
-/// one wins. Fails OPEN on any non-conditional error so a transient DynamoDB blip
-/// never silently drops a legitimate review.
-async fn claim_review_slot(
-    state: &AppState,
-    team_id: &str,
-    owner: &str,
-    name: &str,
-    pr_number: u64,
-    head_sha: &str,
+fn review_claim_sk(owner: &str, name: &str, pr_number: u64, head_sha: &str) -> String {
+    format!("REVIEWCLAIM#{owner}/{name}#{pr_number:06}#{head_sha}")
+}
+
+/// Pure: is this `labeled` event a person re-adding the review label to an
+/// existing PR, rather than part of the event burst of a PR opened with it?
+fn is_deliberate_relabel(
+    action: &str,
+    sender_is_bot: bool,
+    pr_created_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    let now = chrono::Utc::now();
-    let sk = format!("REVIEWCLAIM#{owner}/{name}#{pr_number:06}#{head_sha}");
-    match state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(team_id))
-        .item("sk", attr_s(&sk))
-        .item(
-            "ttl",
-            attr_n(now.timestamp() as u64 + REVIEW_DEDUP_TTL_SECS),
-        )
-        .item("created_at", attr_s(&now.to_rfc3339()))
-        .condition_expression("attribute_not_exists(pk)")
-        .send()
-        .await
-    {
-        Ok(_) => true,
-        Err(e) => {
-            // ConditionalCheckFailed => a sibling event already claimed this head.
-            // Any other error (network/throttle/etc.) fails OPEN so a transient blip
-            // never silently drops a real review. `as_service_error` (not
-            // `into_service_error`) so a non-service error can't panic here.
-            let already_claimed = e
-                .as_service_error()
-                .map(|se| se.is_conditional_check_failed_exception())
-                .unwrap_or(false);
-            if already_claimed {
-                false
-            } else {
-                warn!(
-                    owner,
-                    name, pr_number, "Review dedup claim errored — allowing review (fail-open)"
-                );
-                true
-            }
-        }
+    const OPEN_BURST_SECS: i64 = 60;
+    action == "labeled"
+        && !sender_is_bot
+        && pr_created_at
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .is_some_and(|created| {
+                (now - created.with_timezone(&chrono::Utc)).num_seconds() > OPEN_BURST_SECS
+            })
+}
+
+/// Inline review comment. On a person's PR in a repo with review on, an
+/// `@coderhelm …` in a thread is answered in that thread (or re-reviews).
+/// CoderHelm's own PRs route thread comments to the fix loop through the
+/// `pull_request_review` event instead.
+async fn handle_review_comment(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+) -> Result<StatusCode, StatusCode> {
+    if payload["action"].as_str() != Some("created") || is_bot_user(&payload["comment"]["user"]) {
+        return Ok(StatusCode::OK);
     }
+    let pr = &payload["pull_request"];
+    if pr["user"]["login"]
+        .as_str()
+        .unwrap_or("")
+        .contains("coderhelm")
+    {
+        return Ok(StatusCode::OK);
+    }
+    let Some(command) = coderhelm_command::parse(payload["comment"]["body"].as_str().unwrap_or(""))
+    else {
+        return Ok(StatusCode::OK);
+    };
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let pr_number = pr["number"].as_u64().unwrap_or(0);
+    let comment_id = payload["comment"]["id"].as_u64().unwrap_or(0);
+    let cfg = load_review_config(state, team_id, owner, name).await?;
+    if !cfg.enabled || cfg.killed || pr_number == 0 || comment_id == 0 {
+        info!(
+            owner,
+            name, pr_number, "Inline mention ignored — review is off for this repo"
+        );
+        return Ok(StatusCode::OK);
+    }
+    if let Some(reason) = check_run_budget(state, team_id).await {
+        post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
+        return Ok(StatusCode::OK);
+    }
+    let (question, reply_to) = match command {
+        Command::Rereview => (None, None),
+        Command::Ask(q) => (Some(q), Some(comment_id)),
+    };
+    info!(
+        owner,
+        name,
+        pr_number,
+        comment_id,
+        rereview = question.is_none(),
+        "Reviewer: inline comment → review job"
+    );
+    let message = WorkerMessage::Review(ReviewMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
+        head_sha: String::new(),
+        label: cfg.label,
+        question,
+        trigger: "reply".to_string(),
+        dedup_key: format!("reviewcomment#{comment_id}"),
+        attempt: 0,
+        reply_to_comment_id: reply_to,
+    });
+    send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
 
 async fn send_to_queue(
@@ -2201,5 +2484,79 @@ async fn post_limit_comment(
         .await
     {
         warn!("Failed to post limit comment: {e}");
+    }
+}
+
+#[cfg(test)]
+mod trigger_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.timestamp_opt(1_800_000_000 + secs, 0).unwrap()
+    }
+
+    #[test]
+    fn relabel_by_a_person_on_an_existing_pr_is_deliberate() {
+        let created = at(0).to_rfc3339();
+        assert!(is_deliberate_relabel(
+            "labeled",
+            false,
+            Some(&created),
+            at(3600)
+        ));
+    }
+
+    #[test]
+    fn opening_burst_bots_and_other_actions_are_not() {
+        let created = at(0).to_rfc3339();
+        // PR opened with the label: the labeled event arrives with the open.
+        assert!(!is_deliberate_relabel(
+            "labeled",
+            false,
+            Some(&created),
+            at(5)
+        ));
+        // CoderHelm labeling its own PR.
+        assert!(!is_deliberate_relabel(
+            "labeled",
+            true,
+            Some(&created),
+            at(3600)
+        ));
+        assert!(!is_deliberate_relabel(
+            "synchronize",
+            false,
+            Some(&created),
+            at(3600)
+        ));
+        assert!(!is_deliberate_relabel("labeled", false, None, at(3600)));
+    }
+
+    #[test]
+    fn team_pick_is_largest_then_lowest_id() {
+        let teams = vec![
+            ("TEAM#b".to_string(), 1),
+            ("TEAM#real".to_string(), 10),
+            ("TEAM#a".to_string(), 1),
+        ];
+        assert_eq!(pick_team(teams).as_deref(), Some("TEAM#real"));
+        let tie = vec![("TEAM#b".to_string(), 3), ("TEAM#a".to_string(), 3)];
+        assert_eq!(pick_team(tie).as_deref(), Some("TEAM#a"));
+        assert_eq!(pick_team(vec![]), None);
+    }
+
+    #[test]
+    fn bot_users_are_recognized() {
+        assert!(is_bot_user(
+            &serde_json::json!({"login": "coderhelm[bot]", "type": "Bot"})
+        ));
+        assert!(is_bot_user(&serde_json::json!({"login": "sentry[bot]"})));
+        assert!(is_bot_user(
+            &serde_json::json!({"login": "renovate", "type": "Bot"})
+        ));
+        assert!(!is_bot_user(
+            &serde_json::json!({"login": "carolaQuintana", "type": "User"})
+        ));
     }
 }

@@ -5,43 +5,86 @@
 //! hardcoded) deploy label, CoderHelm's own PRs carry it from PR creation (the PR
 //! maker adds it) so the repo's deploy/preview CI runs from the start; human PRs
 //! get it added here once approved. Either way the gate waits for that deploy's CI
-//! before merging. It waits (self-scheduling, bounded) for pending checks —
-//! e.g. a Terraform staging-apply — and NEVER merges on failing or still-running
-//! CI. Bound to the reviewed head: a later commit aborts (the fresh review
-//! re-arms). Reuses the two-key + post-merge (tag/health) logic from review_actions.
+//! before merging, and NEVER merges on failing, still-running or unreadable CI.
+//! Bound to the reviewed head: a later commit stops the gate (the fresh review
+//! re-arms).
+//!
+//! Event-driven with a bounded poll as the backstop:
+//! - Waiting on a person (an approval) does not poll. The approval webhook, a
+//!   new review verdict, or a dismissal re-arms the gate.
+//! - Waiting on CI polls for up to `WATCH_WINDOW_SECS`, and the gateway also
+//!   re-arms the gate whenever a check suite on the PR's head completes. So a
+//!   slow deploy, or a flaky job re-run to green, still merges.
+//! - Transient GitHub or DynamoDB errors re-poll instead of ending the gate.
+//!
+//! State lives in one record per PR (`MERGEGATE#…`), and the PR shows ONE
+//! status comment that is edited in place with exactly what the gate is
+//! waiting on. Each arming starts a new chain; a tick from an older chain
+//! stops, so a PR never has two polling loops.
 
-use crate::clients::github::GitHubClient;
+use crate::clients::github::{GitHubClient, MergeOutcome};
 use crate::models::AwaitMergeMessage;
 use crate::passes::review_actions::{
-    human_approval_present, post_merge_actions, should_merge, OnApproveConfig,
+    fetch_approvals, post_merge_actions, should_merge, OnApproveConfig,
 };
+use crate::passes::{attr_n, attr_s};
 use crate::WorkerState;
+use aws_sdk_dynamodb::types::AttributeValue;
+use common::merge_gate::{
+    record_sk as gate_sk, STATE_BLOCKED_CI, STATE_CLOSED, STATE_DECLINED, STATE_HEAD_MOVED,
+    STATE_MERGED, STATE_PAUSED, STATE_WAITING_APPROVAL, STATE_WAITING_CI,
+};
+use std::collections::HashMap;
 use tracing::{info, warn};
 
-/// Bounded wait: 40 × 90s ≈ 60 min — enough for a slow staging deploy /
-/// Lambda@Edge replication without arming forever.
-const MAX_ATTEMPTS: u32 = 40;
-const RETRY_DELAY_SECS: i32 = 90;
-const SETTLE_DELAY_SECS: i32 = 45;
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Delay between polls while CI runs.
+const POLL_DELAY_SECS: i32 = 90;
+/// Delay before the first evaluation after a bot APPROVE, so checks triggered
+/// by the reviewed push have registered.
+const SETTLE_DELAY_SECS: i32 = 45;
+/// How long one arming keeps polling CI before it pauses. CI completion
+/// re-arms a paused gate, so this bounds cost, not correctness.
+const WATCH_WINDOW_SECS: i64 = 60 * 60;
+/// Hard ceiling on polls per chain (errors included).
+const MAX_POLLS: u32 = 80;
+/// After the gate adds deploy labels, how long a "green" CI result is not
+/// trusted unless a check has started since the labels were added.
+const LABEL_CI_GRACE_SECS: i64 = 180;
+/// How long a gate record is kept after its last write.
+const RECORD_TTL_SECS: u64 = 30 * 86_400;
+
+/// Hidden marker that identifies the gate's status comment.
+pub const STATUS_MARKER: &str = "<!-- coderhelm:merge-status -->";
+
+// ─── CI ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq, Eq)]
 enum Ci {
     Green,
-    Pending,
-    Failing(String),
+    Pending(Vec<String>),
+    Failing(Vec<String>),
 }
 
-/// Pure classification of a ref's GitHub check-runs → (any_pending, failing_names).
+/// Pure summary of a ref's check-runs.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CheckSummary {
+    pending: Vec<String>,
+    failing: Vec<String>,
+    /// Latest `started_at` across the kept runs (RFC 3339), if any.
+    latest_start: Option<String>,
+}
+
+/// Pure classification of a ref's GitHub check-runs.
 /// GitHub returns EVERY check-run for a ref, including superseded ones: a re-run or
 /// a concurrency-cancel leaves the stale earlier run behind, so one check name can
 /// appear several times (e.g. a `cancelled` plus a later `success`). We keep only
 /// the LATEST run per name so a stale duplicate can't veto the current result, and
 /// `cancelled` is treated as NEUTRAL — GitHub cancels superseded / concurrency-
 /// grouped runs and fail-fast matrix siblings as a matter of course, and a genuine
-/// failure always surfaces as `failure`/`timed_out` on its own check. Counting
-/// `cancelled` as failing was producing false "CI is failing" aborts on PRs whose
-/// checks had actually passed.
-fn classify_check_runs(runs: &[serde_json::Value]) -> (bool, Vec<String>) {
-    use std::collections::HashMap;
+/// failure always surfaces as `failure`/`timed_out` on its own check.
+fn classify_check_runs(runs: &[serde_json::Value]) -> CheckSummary {
     let mut latest: HashMap<&str, &serde_json::Value> = HashMap::new();
     for r in runs {
         let name = r["name"].as_str().unwrap_or("check");
@@ -55,170 +98,424 @@ fn classify_check_runs(runs: &[serde_json::Value]) -> (bool, Vec<String>) {
             latest.insert(name, r);
         }
     }
-    let mut pending = false;
-    let mut failing: Vec<String> = vec![];
-    for r in latest.values() {
+    let mut out = CheckSummary::default();
+    for (name, r) in &latest {
+        if let Some(ts) = r["started_at"].as_str() {
+            if out.latest_start.as_deref().is_none_or(|cur| cur < ts) {
+                out.latest_start = Some(ts.to_string());
+            }
+        }
         if r["status"].as_str() != Some("completed") {
-            pending = true;
+            out.pending.push(name.to_string());
             continue;
         }
-        match r["conclusion"].as_str().unwrap_or("") {
-            "failure" | "timed_out" | "startup_failure" | "action_required" => {
-                failing.push(r["name"].as_str().unwrap_or("check").to_string())
-            }
-            _ => {}
+        if matches!(
+            r["conclusion"].as_str().unwrap_or(""),
+            "failure" | "timed_out" | "startup_failure" | "action_required"
+        ) {
+            out.failing.push(name.to_string());
         }
     }
-    (pending, failing)
+    out.pending.sort();
+    out.failing.sort();
+    out
 }
 
 /// Combine GitHub Actions check-runs + legacy commit statuses into one verdict.
-/// No checks at all ⇒ Green (nothing to gate on).
-async fn ci_state(github: &GitHubClient, owner: &str, repo: &str, sha: &str) -> Ci {
-    let mut pending = false;
-    let mut failing: Vec<String> = vec![];
+/// No checks at all ⇒ Green (nothing to gate on). An API error is an error —
+/// never a green light.
+async fn ci_state(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+) -> Result<(Ci, CheckSummary), BoxError> {
+    let runs = github.list_check_runs_for_ref(owner, repo, sha).await?;
+    let runs = runs["check_runs"].as_array().cloned().unwrap_or_default();
+    let mut summary = classify_check_runs(&runs);
 
-    if let Ok(v) = github.list_check_runs_for_ref(owner, repo, sha).await {
-        let runs = v["check_runs"].as_array().cloned().unwrap_or_default();
-        let (p, f) = classify_check_runs(&runs);
-        pending |= p;
-        failing.extend(f);
-    }
     // Legacy commit statuses (external CI that posts a status, e.g. staging apply).
     // Only meaningful when there's at least one status — an empty set reports
     // state "pending", which would otherwise wedge repos that use only check-runs.
-    if let Ok(v) = github.get_commit_status(owner, repo, sha).await {
-        let statuses = v["statuses"].as_array().cloned().unwrap_or_default();
-        if !statuses.is_empty() {
-            match v["state"].as_str().unwrap_or("") {
-                "failure" | "error" => failing.push("commit status".to_string()),
-                "pending" => pending = true,
-                _ => {}
-            }
+    let status = github.get_commit_status(owner, repo, sha).await?;
+    let statuses = status["statuses"].as_array().cloned().unwrap_or_default();
+    for st in &statuses {
+        let ctx = st["context"]
+            .as_str()
+            .unwrap_or("commit status")
+            .to_string();
+        match st["state"].as_str().unwrap_or("") {
+            "failure" | "error" => summary.failing.push(ctx),
+            "pending" => summary.pending.push(ctx),
+            _ => {}
         }
     }
 
-    // Wait for CI to FULLY settle before ever declaring a failure: while anything
-    // is still running the verdict isn't final, so keep waiting rather than
-    // shouting "CI is failing" mid-run (and re-posting it on every re-check). Only
-    // once every check is terminal do we decide fail vs green.
-    if pending {
-        Ci::Pending
-    } else if !failing.is_empty() {
-        Ci::Failing(failing.join(", "))
+    // While anything is still running the verdict isn't final — keep waiting
+    // rather than declaring a failure mid-run.
+    let ci = if !summary.pending.is_empty() {
+        Ci::Pending(summary.pending.clone())
+    } else if !summary.failing.is_empty() {
+        Ci::Failing(summary.failing.clone())
     } else {
         Ci::Green
+    };
+    Ok((ci, summary))
+}
+
+/// Pure: may a green result be trusted yet, given when the gate added deploy
+/// labels? Label-triggered workflows take a moment to register their checks;
+/// until one has started (or the grace period passed) green means "not yet".
+fn label_ci_settled(labels_added_at: Option<i64>, latest_start: Option<i64>, now: i64) -> bool {
+    match labels_added_at {
+        None => true,
+        Some(added) => {
+            now - added >= LABEL_CI_GRACE_SECS || latest_start.is_some_and(|s| s >= added)
+        }
     }
 }
 
-/// Claim the right to post a given auto-merge status notice (aborted / declined /
-/// failed) for this exact head + kind, so each is posted at most once. The gate
-/// re-arms on many CI events; without this a head would collect a fresh status
-/// comment on every re-check. First caller for a (repo, pr, head, kind) wins;
-/// later ones skip. Fails OPEN — only a definitive "already posted"
-/// (ConditionalCheckFailed) suppresses; a transient DynamoDB error still posts, so
-/// a real first notice is never lost.
-async fn claim_notice(
-    state: &WorkerState,
-    team_id: &str,
-    owner: &str,
-    repo: &str,
-    pr: u64,
-    head: &str,
-    kind: &str,
-) -> bool {
-    let sk = format!("AWAITNOTICE#{owner}/{repo}#{pr:06}#{head}#{kind}");
-    let ttl = chrono::Utc::now().timestamp() as u64 + 7 * 86_400;
-    match state
+// ─── Gate record ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default)]
+struct GateRecord {
+    chain_id: String,
+    armed_at: i64,
+    status_comment_id: Option<u64>,
+    status_hash: String,
+    status_body: String,
+    labels_added_head: String,
+    labels_added_at: Option<i64>,
+}
+
+fn num(item: &HashMap<String, AttributeValue>, k: &str) -> Option<i64> {
+    item.get(k)?.as_n().ok()?.parse().ok()
+}
+
+fn text(item: &HashMap<String, AttributeValue>, k: &str) -> String {
+    item.get(k)
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn load_record(state: &WorkerState, msg: &AwaitMergeMessage) -> Result<GateRecord, BoxError> {
+    let out = state
         .dynamo
-        .put_item()
+        .get_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", super::attr_s(team_id))
-        .item("sk", super::attr_s(&sk))
-        .item("ttl", super::attr_n(ttl))
-        .condition_expression("attribute_not_exists(pk)")
+        .key("pk", attr_s(&msg.team_id))
+        .key(
+            "sk",
+            attr_s(&gate_sk(&msg.repo_owner, &msg.repo_name, msg.pr_number)),
+        )
+        .consistent_read(true)
         .send()
-        .await
-    {
-        Ok(_) => true,
-        Err(e) => !e
+        .await?;
+    let Some(item) = out.item() else {
+        return Ok(GateRecord::default());
+    };
+    Ok(GateRecord {
+        chain_id: text(item, "chain_id"),
+        armed_at: num(item, "armed_at").unwrap_or(0),
+        status_comment_id: num(item, "status_comment_id").map(|n| n as u64),
+        status_hash: text(item, "status_hash"),
+        status_body: text(item, "status_body"),
+        labels_added_head: text(item, "labels_added_head"),
+        labels_added_at: num(item, "labels_added_at"),
+    })
+}
+
+/// Start a new chain for this arming: it becomes the only current chain.
+/// Keeps the status comment and label bookkeeping.
+async fn start_chain(
+    state: &WorkerState,
+    msg: &AwaitMergeMessage,
+    now: i64,
+) -> Result<(), BoxError> {
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key(
+            "sk",
+            attr_s(&gate_sk(&msg.repo_owner, &msg.repo_name, msg.pr_number)),
+        )
+        .update_expression(
+            "SET chain_id = :c, head_sha = :h, base_branch = :b, self_authored = :sa, \
+             installation_id = :i, armed_at = :now, #st = :st, #ttl = :ttl",
+        )
+        .expression_attribute_names("#st", "state")
+        .expression_attribute_names("#ttl", "ttl")
+        .expression_attribute_values(":c", attr_s(&msg.chain_id))
+        .expression_attribute_values(":h", attr_s(&msg.head_sha))
+        .expression_attribute_values(":b", attr_s(&msg.base_branch))
+        .expression_attribute_values(":sa", AttributeValue::Bool(msg.self_authored))
+        .expression_attribute_values(":i", attr_n(msg.installation_id))
+        .expression_attribute_values(":now", attr_n(now))
+        .expression_attribute_values(":st", attr_s(STATE_WAITING_CI))
+        .expression_attribute_values(":ttl", attr_n(now as u64 + RECORD_TTL_SECS))
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Record the gate's state, only while this chain is still the current one.
+async fn set_state(state: &WorkerState, msg: &AwaitMergeMessage, gate_state: &str, detail: &str) {
+    let res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key(
+            "sk",
+            attr_s(&gate_sk(&msg.repo_owner, &msg.repo_name, msg.pr_number)),
+        )
+        .update_expression("SET #st = :st, detail = :d, updated_at = :t")
+        .condition_expression("chain_id = :c")
+        .expression_attribute_names("#st", "state")
+        .expression_attribute_values(":st", attr_s(gate_state))
+        .expression_attribute_values(":d", attr_s(common::truncate_str(detail, 1000)))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .expression_attribute_values(":c", attr_s(&msg.chain_id))
+        .send()
+        .await;
+    if let Err(e) = res {
+        let superseded = e
             .as_service_error()
             .map(|se| se.is_conditional_check_failed_exception())
-            .unwrap_or(false),
+            .unwrap_or(false);
+        if !superseded {
+            warn!(pr = msg.pr_number, error = %e, "await-merge: could not record gate state");
+        }
     }
 }
 
-/// Was CoderHelm's OWN latest verdict for this head an APPROVE? This is the bot
-/// key of the two-key rule, read from the persisted review record — uniform
-/// across human PRs (where the bot posts a real APPROVE review) and bot-authored
-/// PRs (where GitHub forbids self-approve, so the verdict lives only in the
+async fn record_labels_added(state: &WorkerState, msg: &AwaitMergeMessage, now: i64) {
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key(
+            "sk",
+            attr_s(&gate_sk(&msg.repo_owner, &msg.repo_name, msg.pr_number)),
+        )
+        .update_expression("SET labels_added_head = :h, labels_added_at = :t")
+        .expression_attribute_values(":h", attr_s(&msg.head_sha))
+        .expression_attribute_values(":t", attr_n(now))
+        .send()
+        .await;
+}
+
+// ─── Status comment ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Done,
+    Waiting,
+    Blocked,
+}
+
+impl Mark {
+    fn icon(self) -> &'static str {
+        match self {
+            Mark::Done => "✅",
+            Mark::Waiting => "⏳",
+            Mark::Blocked => "🔴",
+        }
+    }
+}
+
+/// Pure: the status comment body. No timestamps, so an unchanged state renders
+/// byte-identically and the comment is not rewritten.
+fn render_status(head: &str, base: &str, lines: &[(Mark, String)], note: Option<&str>) -> String {
+    let short = &head[..head.len().min(7)];
+    let mut body = format!("{STATUS_MARKER}\n### 🚦 Auto-merge status — `{short}` → `{base}`\n\n");
+    for (mark, line) in lines {
+        body.push_str(&format!("- {} {line}\n", mark.icon()));
+    }
+    if let Some(note) = note {
+        body.push_str(&format!("\n{note}\n"));
+    }
+    body.push_str(STATUS_FOOTER);
+    body
+}
+
+const STATUS_FOOTER: &str =
+    "\n<sub>I merge automatically once every item is ✅. This comment updates in place.</sub>";
+
+/// Pure: the last status body with `note` added above the footer (used when
+/// the gate pauses, so the checklist of what it was waiting on stays visible).
+fn with_note(last_body: &str, head: &str, base: &str, note: &str) -> String {
+    match last_body.strip_suffix(STATUS_FOOTER) {
+        Some(main) if last_body.starts_with(STATUS_MARKER) => {
+            format!("{}\n{note}\n{STATUS_FOOTER}", main.trim_end())
+        }
+        _ => render_status(head, base, &[], Some(note)),
+    }
+}
+
+/// Create or update the PR's single status comment. Skips the write when the
+/// rendered body is unchanged.
+async fn publish_status(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &AwaitMergeMessage,
+    record: &mut GateRecord,
+    body: &str,
+) {
+    let hash = common::content_hash(body);
+    if record.status_hash == hash {
+        return;
+    }
+    let (owner, repo) = (&msg.repo_owner, &msg.repo_name);
+    let mut comment_id = None;
+    if let Some(id) = record.status_comment_id {
+        match github.edit_issue_comment(owner, repo, id, body).await {
+            Ok(_) => comment_id = Some(id),
+            Err(e) => {
+                warn!(pr = msg.pr_number, error = %e, "await-merge: status comment edit failed — posting a new one")
+            }
+        }
+    }
+    if comment_id.is_none() {
+        // Two chains can briefly overlap; only one may create the comment.
+        let create_sk = format!("MERGESTATUSCREATE#{owner}/{repo}#{:06}", msg.pr_number);
+        let claim = common::claim::claim(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &create_sk,
+            60,
+        )
+        .await;
+        if !claim.won_or_failed_open() {
+            return;
+        }
+        match github
+            .create_issue_comment(owner, repo, msg.pr_number, body)
+            .await
+        {
+            Ok(v) => comment_id = v["id"].as_u64(),
+            Err(e) => {
+                warn!(pr = msg.pr_number, error = %e, "await-merge: status comment post failed");
+                return;
+            }
+        }
+    }
+    let Some(id) = comment_id else { return };
+    record.status_comment_id = Some(id);
+    record.status_hash = hash.clone();
+    record.status_body = body.to_string();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&gate_sk(owner, repo, msg.pr_number)))
+        .update_expression("SET status_comment_id = :id, status_hash = :h, status_body = :b")
+        .expression_attribute_values(":id", attr_n(id))
+        .expression_attribute_values(":h", attr_s(&hash))
+        .expression_attribute_values(":b", attr_s(body))
+        .send()
+        .await;
+}
+
+// ─── Bot key ────────────────────────────────────────────────────────────────
+
+/// CoderHelm's own latest verdict for this head, from the persisted review
+/// records (uniform across human PRs, where the bot posts a real review, and
+/// bot PRs, where GitHub forbids self-approval so the verdict lives only in the
 /// record). Records are keyed `REVIEW#{owner}/{repo}#{pr:06}#{rfc3339}`, so a
-/// descending scan yields newest-first; we take the newest real verdict for this
-/// exact head. Missing/unreadable/other-head ⇒ false (fail-closed: the gate then
-/// waits rather than merges).
-async fn bot_approved_at_head(
+/// descending query yields newest-first. None = no verdict for this head yet.
+async fn bot_verdict_at_head(
     state: &WorkerState,
     team_id: &str,
     owner: &str,
     repo: &str,
     pr: u64,
     head_sha: &str,
-) -> bool {
+) -> Result<Option<String>, BoxError> {
     let prefix = format!("REVIEW#{owner}/{repo}#{pr:0>6}#");
-    let out = state
-        .dynamo
-        .query()
-        .table_name(&state.config.settings_table_name)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :sk)")
-        .expression_attribute_values(":pk", super::attr_s(team_id))
-        .expression_attribute_values(":sk", super::attr_s(&prefix))
-        .scan_index_forward(false) // newest review first
-        .limit(15)
-        .send()
-        .await;
-    let resp = match out {
-        Ok(o) => o,
-        Err(e) => {
-            warn!(pr, error = %e, "await-merge: could not read review records — bot key treated as absent");
-            return false;
+    let mut start: Option<HashMap<String, AttributeValue>> = None;
+    // Page through the newest records until one for this head is found; the
+    // records of other heads and question answers are skipped.
+    for _ in 0..5 {
+        let resp = state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :sk)")
+            .expression_attribute_values(":pk", attr_s(team_id))
+            .expression_attribute_values(":sk", attr_s(&prefix))
+            .scan_index_forward(false)
+            .limit(25)
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await?;
+        for it in resp.items() {
+            let verdict = text(it, "verdict");
+            if verdict != "APPROVE" && verdict != "REQUEST_CHANGES" {
+                continue;
+            }
+            if text(it, "head_sha") == head_sha {
+                return Ok(Some(verdict));
+            }
         }
-    };
-    for it in resp.items() {
-        let verdict = it
-            .get("verdict")
-            .and_then(|a| a.as_s().ok())
-            .map(String::as_str)
-            .unwrap_or("");
-        // Only real verdicts count; skip QUESTION (reply-answer) records.
-        if verdict != "APPROVE" && verdict != "REQUEST_CHANGES" {
-            continue;
-        }
-        let rec_head = it
-            .get("head_sha")
-            .and_then(|a| a.as_s().ok())
-            .map(String::as_str)
-            .unwrap_or("");
-        if rec_head == head_sha {
-            return verdict == "APPROVE";
+        match resp.last_evaluated_key() {
+            Some(k) => start = Some(k.clone()),
+            None => break,
         }
     }
-    false
+    Ok(None)
 }
 
-pub async fn run(
-    state: &WorkerState,
-    msg: AwaitMergeMessage,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let owner = &msg.repo_owner;
-    let repo = &msg.repo_name;
-    let cfg = OnApproveConfig::load(state, &msg.team_id, owner, repo).await;
-    if !cfg.auto_merge {
-        info!(
-            pr = msg.pr_number,
-            "auto_merge disabled — dropping await-merge"
-        );
-        return Ok(());
-    }
+// ─── Gate ───────────────────────────────────────────────────────────────────
+
+enum Next {
+    /// Evaluate again after a delay.
+    Poll,
+    /// Nothing to poll for; an event re-arms the gate if needed.
+    Stop,
+}
+
+pub async fn run(state: &WorkerState, mut msg: AwaitMergeMessage) -> Result<(), BoxError> {
+    let now = chrono::Utc::now().timestamp();
+    let mut record = if msg.chain_id.is_empty() {
+        msg.chain_id = ulid::Ulid::new().to_string();
+        msg.attempts = 0;
+        if let Err(e) = start_chain(state, &msg, now).await {
+            // Without a chain record the gate cannot guard against a second
+            // loop; retry the arming shortly instead of dropping it.
+            warn!(pr = msg.pr_number, error = %e, "await-merge: could not start chain — retrying");
+            msg.chain_id.clear();
+            send(state, &msg, msg.attempts, POLL_DELAY_SECS).await;
+            return Ok(());
+        }
+        let mut r = load_record(state, &msg).await.unwrap_or_default();
+        r.armed_at = now;
+        r.chain_id = msg.chain_id.clone();
+        r
+    } else {
+        match load_record(state, &msg).await {
+            Ok(r) if r.chain_id != msg.chain_id => {
+                info!(
+                    pr = msg.pr_number,
+                    "await-merge: superseded by a newer arming — stopping"
+                );
+                return Ok(());
+            }
+            Ok(r) => r,
+            Err(e) => {
+                warn!(pr = msg.pr_number, error = %e, "await-merge: could not read gate record — retrying");
+                poll_again(state, &msg, now, now).await;
+                return Ok(());
+            }
+        }
+    };
+
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
         &state.secrets.github_private_key,
@@ -226,36 +523,137 @@ pub async fn run(
         &state.http,
     )?;
 
+    match evaluate(state, &github, &msg, &mut record, now).await {
+        Ok(Next::Stop) => {}
+        Ok(Next::Poll) => {
+            if !poll_again(state, &msg, now, record.armed_at).await {
+                pause(state, &github, &msg, &mut record, None).await;
+            }
+        }
+        Err(e) => {
+            warn!(pr = msg.pr_number, attempt = msg.attempts, error = %e, "await-merge: evaluation failed — will retry");
+            let err = e.to_string();
+            if !poll_again(state, &msg, now, record.armed_at).await {
+                pause(state, &github, &msg, &mut record, Some(&err)).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Queue the next poll unless the window or poll budget is spent. Returns
+/// false when the gate should pause instead.
+async fn poll_again(state: &WorkerState, msg: &AwaitMergeMessage, now: i64, armed_at: i64) -> bool {
+    if msg.attempts >= MAX_POLLS || (armed_at > 0 && now - armed_at >= WATCH_WINDOW_SECS) {
+        return false;
+    }
+    send(state, msg, msg.attempts + 1, POLL_DELAY_SECS).await
+}
+
+/// Stop polling and say so on the PR. A completed check suite, an approval or
+/// a new commit re-arms the gate.
+async fn pause(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &AwaitMergeMessage,
+    record: &mut GateRecord,
+    last_error: Option<&str>,
+) {
+    info!(
+        pr = msg.pr_number,
+        attempts = msg.attempts,
+        "await-merge: pausing — waiting for the next CI or review event"
+    );
+    set_state(
+        state,
+        msg,
+        STATE_PAUSED,
+        last_error.unwrap_or("poll window elapsed"),
+    )
+    .await;
+    let mut note = format!(
+        "⏸️ I stopped checking after {} minutes. I'll pick this up again automatically when CI \
+         finishes on this commit, or on a new approval or commit.",
+        WATCH_WINDOW_SECS / 60
+    );
+    if let Some(err) = last_error {
+        note.push_str(&format!(
+            "\n\nLast check failed with: `{}`",
+            common::truncate_str(err, 300)
+        ));
+    }
+    let body = with_note(&record.status_body, &msg.head_sha, &msg.base_branch, &note);
+    publish_status(state, github, msg, record, &body).await;
+}
+
+async fn evaluate(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &AwaitMergeMessage,
+    record: &mut GateRecord,
+    now: i64,
+) -> Result<Next, BoxError> {
+    let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
+    let cfg = OnApproveConfig::try_load(state, &msg.team_id, owner, repo).await?;
+    if !cfg.auto_merge {
+        info!(
+            pr = msg.pr_number,
+            "auto_merge disabled — dropping await-merge"
+        );
+        return Ok(Next::Stop);
+    }
+
     let pr = github.get_pull_request(owner, repo, msg.pr_number).await?;
+    let watched = msg.self_authored
+        || pr["labels"].as_array().is_some_and(|ls| {
+            ls.iter().any(|l| {
+                l["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(&cfg.review_label))
+            })
+        });
+
     if pr["state"].as_str() != Some("open") {
         info!(pr = msg.pr_number, "PR not open — stop await-merge");
-        return Ok(());
+        set_state(state, msg, STATE_CLOSED, "").await;
+        if record.status_comment_id.is_some() {
+            let note = if pr["merged"].as_bool() == Some(true) {
+                "✋ Merged outside the gate — nothing left to do."
+            } else {
+                "✋ PR closed — nothing left to do."
+            };
+            let body = render_status(&msg.head_sha, &msg.base_branch, &[], Some(note));
+            publish_status(state, github, msg, record, &body).await;
+        }
+        return Ok(Next::Stop);
     }
-    // Bound to the reviewed head: a new commit invalidates the review, so abort
-    // and let the fresh review re-arm.
+
+    // Bound to the reviewed head: a new commit invalidates the review.
     let cur_head = pr["head"]["sha"].as_str().unwrap_or("");
     if cur_head != msg.head_sha {
         info!(
             pr = msg.pr_number,
-            "head moved — abort await-merge (fresh review re-arms)"
+            armed = %msg.head_sha,
+            current = cur_head,
+            "head moved — stop await-merge (the review of the new commit re-arms)"
         );
-        return Ok(());
+        set_state(state, msg, STATE_HEAD_MOVED, cur_head).await;
+        if watched {
+            let note = format!(
+                "🔁 New commit `{}` — waiting for CoderHelm's review of it before merging.",
+                &cur_head[..cur_head.len().min(7)]
+            );
+            let body = render_status(&msg.head_sha, &msg.base_branch, &[], Some(&note));
+            publish_status(state, github, msg, record, &body).await;
+        }
+        return Ok(Next::Stop);
     }
 
-    // A self-authored (bot) PR forces the human key on regardless of config.
+    // ── Gate 1: both keys. Waiting on people never polls. ──
+    let short = &msg.head_sha[..msg.head_sha.len().min(7)];
     let require_human = cfg.require_human_approval || msg.self_authored;
-    let human_present = if require_human {
-        human_approval_present(&github, owner, repo, msg.pr_number).await
-    } else {
-        false // ignored by should_merge when require_human is false
-    };
-    // The bot key of the two-key rule: CoderHelm's OWN latest verdict for this
-    // head must be APPROVE. The run_on_approve arming path only fires on a bot
-    // APPROVE, but the gateway also arms on ANY human approval — so a human
-    // approving a PR the bot flagged (REQUEST_CHANGES) would otherwise merge.
-    // Verify it explicitly instead of assuming; fail-closed (no/other verdict →
-    // not approved → the gate waits, never merges).
-    let bot_approved = bot_approved_at_head(
+    let approvals = fetch_approvals(github, owner, repo, msg.pr_number, &msg.head_sha).await?;
+    let verdict = bot_verdict_at_head(
         state,
         &msg.team_id,
         owner,
@@ -263,31 +661,70 @@ pub async fn run(
         msg.pr_number,
         &msg.head_sha,
     )
-    .await;
-    // Gate 1 — approvals. Until BOTH keys are in (bot APPROVE + human approval),
-    // just keep waiting: never touch CI or add a deploy label on an unapproved PR.
-    if !should_merge(cfg.auto_merge, require_human, bot_approved, human_present) {
-        wait_more(state, &msg).await;
-        return Ok(());
+    .await?;
+    let bot_approved = verdict.as_deref() == Some("APPROVE") && !approvals.bot_dismissed_at_head;
+    let human_present = approvals.human_key();
+
+    let mut lines: Vec<(Mark, String)> = Vec::new();
+    lines.push(match (verdict.as_deref(), approvals.bot_dismissed_at_head) {
+        (Some("APPROVE"), false) => (Mark::Done, format!("CoderHelm approved `{short}`")),
+        (Some("APPROVE"), true) => (
+            Mark::Blocked,
+            format!("CoderHelm's approval of `{short}` was dismissed — reply `@coderhelm re-review` to review again"),
+        ),
+        (Some(_), _) => (
+            Mark::Blocked,
+            format!("CoderHelm requested changes on `{short}`"),
+        ),
+        (None, _) => (
+            Mark::Waiting,
+            format!("Waiting for CoderHelm's review of `{short}`"),
+        ),
+    });
+    if require_human {
+        lines.push(if human_present {
+            (
+                Mark::Done,
+                format!("Approved by {}", mention_list(&approvals.approved_by)),
+            )
+        } else if !approvals.blocking_by.is_empty() {
+            (
+                Mark::Blocked,
+                format!(
+                    "Changes requested by {}",
+                    mention_list(&approvals.blocking_by)
+                ),
+            )
+        } else {
+            (Mark::Waiting, "Waiting for a human approval".to_string())
+        });
     }
 
-    // Gate 2 — optional deploy label(s). CoderHelm's OWN PRs already carry these
-    // from PR creation (the PR maker adds them alongside the review label), so this
-    // is a no-op for them and we fall straight through to the CI check. It still
-    // matters for HUMAN-authored PRs: add the operator-configured label(s) now that
-    // the PR is cleared to merge so the repo's OWN CI runs (deploy / staging /
-    // preview / E2E suites), then wait a tick for that CI to register before we
-    // judge it. `deploy_label` is a comma-separated list (e.g. `E2E:IOS,E2E:ANDROID`).
-    // Idempotent — only the MISSING labels are added; once all are present we fall
-    // through to the CI check. Never merges as a side effect here.
+    if !should_merge(cfg.auto_merge, require_human, bot_approved, human_present) {
+        info!(
+            pr = msg.pr_number,
+            bot_approved,
+            human_present,
+            "await-merge: waiting on approvals — stopping until the next review event"
+        );
+        set_state(state, msg, STATE_WAITING_APPROVAL, "").await;
+        if watched {
+            let body = render_status(&msg.head_sha, &msg.base_branch, &lines, None);
+            publish_status(state, github, msg, record, &body).await;
+        }
+        return Ok(Next::Stop);
+    }
+
+    // ── Gate 2: deploy label(s), added once per head. ──
     let want_labels: Vec<String> = cfg
         .deploy_label
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    let mut labels_added_at = None;
     if !want_labels.is_empty() {
-        let present: std::collections::HashSet<String> = pr["labels"]
+        let present: Vec<String> = pr["labels"]
             .as_array()
             .map(|a| {
                 a.iter()
@@ -297,189 +734,173 @@ pub async fn run(
             .unwrap_or_default();
         let missing: Vec<String> = want_labels
             .iter()
-            .filter(|l| !present.contains(*l))
+            .filter(|l| !present.iter().any(|p| p.eq_ignore_ascii_case(l)))
             .cloned()
             .collect();
-        if !missing.is_empty() {
-            let joined = missing
-                .iter()
-                .map(|l| format!("`{l}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            match github
-                .add_labels(owner, repo, msg.pr_number, &missing)
-                .await
-            {
-                Ok(_) => {
-                    let _ = github
-                        .create_issue_comment(
-                            owner,
-                            repo,
-                            msg.pr_number,
-                            &format!(
-                                "🏷️ Cleared to merge — added {joined} to kick off CI. I'll merge \
-                                 once all of it passes."
-                            ),
-                        )
-                        .await;
-                    info!(pr = msg.pr_number, labels = %joined, "await-merge: added deploy label(s)");
-                }
-                Err(e) => {
-                    warn!(pr = msg.pr_number, error = %e, "await-merge: failed to add deploy label(s)");
-                    let _ = github
-                        .create_issue_comment(
-                            owner,
-                            repo,
-                            msg.pr_number,
-                            &format!("⚠️ Couldn't add the deploy label(s) {joined}: {e}"),
-                        )
-                        .await;
-                }
-            }
-            // Give the label-triggered CI time to register before judging CI, so
-            // we don't see the pre-CI checks as green and merge early.
-            wait_more(state, &msg).await;
-            return Ok(());
+        let joined = want_labels
+            .iter()
+            .map(|l| format!("`{l}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let added_for_this_head = record.labels_added_head == msg.head_sha;
+        if added_for_this_head {
+            labels_added_at = record.labels_added_at;
         }
+        if !missing.is_empty() && !added_for_this_head {
+            github
+                .add_labels(owner, repo, msg.pr_number, &missing)
+                .await?;
+            record_labels_added(state, msg, now).await;
+            record.labels_added_head = msg.head_sha.clone();
+            record.labels_added_at = Some(now);
+            info!(pr = msg.pr_number, labels = %joined, "await-merge: added deploy label(s)");
+            lines.push((
+                Mark::Waiting,
+                format!("Added {joined} — waiting for its CI to start"),
+            ));
+            set_state(state, msg, STATE_WAITING_CI, "deploy labels added").await;
+            let body = render_status(&msg.head_sha, &msg.base_branch, &lines, None);
+            publish_status(state, github, msg, record, &body).await;
+            return Ok(Next::Poll);
+        }
+        // Present, or added earlier for this head and since removed by the
+        // repo's own workflow — never re-add in a loop.
+        lines.push((Mark::Done, format!("Deploy label {joined} applied")));
     }
 
-    // Gate 3 — all CI green (now includes the deploy CI the label triggered).
-    match ci_state(&github, owner, repo, &msg.head_sha).await {
+    // ── Gate 3: CI. ──
+    let (ci, summary) = ci_state(github, owner, repo, &msg.head_sha).await?;
+    let latest_start = summary
+        .latest_start
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.timestamp());
+    let ci = match ci {
+        Ci::Green if !label_ci_settled(labels_added_at, latest_start, now) => {
+            Ci::Pending(vec!["label-triggered CI (not started yet)".to_string()])
+        }
+        other => other,
+    };
+    match ci {
+        Ci::Pending(names) => {
+            lines.push((Mark::Waiting, format!("CI running: {}", code_list(&names))));
+            set_state(state, msg, STATE_WAITING_CI, &names.join(", ")).await;
+            let body = render_status(&msg.head_sha, &msg.base_branch, &lines, None);
+            publish_status(state, github, msg, record, &body).await;
+            Ok(Next::Poll)
+        }
         Ci::Failing(names) => {
-            // Post the abort notice at most once per head (the gate re-arms on many
-            // events). CI is only reported failing once every check is terminal, so
-            // this fires on a genuine, settled failure — not mid-run.
-            if claim_notice(
+            info!(pr = msg.pr_number, failing = %names.join(", "), "await-merge: CI failing — waiting for a re-run or a new commit");
+            lines.push((Mark::Blocked, format!("CI failing: {}", code_list(&names))));
+            set_state(state, msg, STATE_BLOCKED_CI, &names.join(", ")).await;
+            let body = render_status(
+                &msg.head_sha,
+                &msg.base_branch,
+                &lines,
+                Some("Not merging. Re-run the failed checks or push a fix — I pick it up again as soon as CI finishes."),
+            );
+            publish_status(state, github, msg, record, &body).await;
+            Ok(Next::Stop)
+        }
+        Ci::Green => {
+            lines.push((Mark::Done, "CI green".to_string()));
+            merge(state, github, msg, record, &cfg, lines).await
+        }
+    }
+}
+
+async fn merge(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &AwaitMergeMessage,
+    record: &mut GateRecord,
+    cfg: &OnApproveConfig,
+    mut lines: Vec<(Mark, String)>,
+) -> Result<Next, BoxError> {
+    let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
+    match github
+        .merge_pull_request(owner, repo, msg.pr_number, &msg.head_sha, &cfg.merge_method)
+        .await?
+    {
+        MergeOutcome::Merged => {
+            set_state(state, msg, STATE_MERGED, "").await;
+            let merged_lines = post_merge_actions(
                 state,
+                github,
+                cfg,
                 &msg.team_id,
+                msg.installation_id,
                 owner,
                 repo,
                 msg.pr_number,
                 &msg.head_sha,
-                "aborted",
+                &msg.base_branch,
             )
-            .await
-            {
-                let _ = github
-                    .create_issue_comment(
-                        owner,
-                        repo,
-                        msg.pr_number,
-                        &format!(
-                            "🔴 **Auto-merge aborted** — CI is failing ({names}). Not merging; \
-                             push a fix and it will re-arm."
-                        ),
-                    )
-                    .await;
-            }
-            info!(pr = msg.pr_number, "await-merge: CI failing, aborted");
+            .await;
+            let _ = github
+                .create_issue_comment(
+                    owner,
+                    repo,
+                    msg.pr_number,
+                    &format!("### 🚀 Auto-merged\n\n{}", merged_lines.join("\n")),
+                )
+                .await;
+            lines.push((Mark::Done, format!("Merged into `{}`", msg.base_branch)));
+            let body = render_status(&msg.head_sha, &msg.base_branch, &lines, None);
+            publish_status(state, github, msg, record, &body).await;
+            info!(pr = msg.pr_number, "Armed auto-merge: merged");
+            Ok(Next::Stop)
         }
-        Ci::Green => {
-            match github
-                .merge_pull_request(owner, repo, msg.pr_number, &msg.head_sha, &cfg.merge_method)
-                .await
-            {
-                Ok(true) => {
-                    let lines = post_merge_actions(
-                        state,
-                        &github,
-                        &cfg,
-                        &msg.team_id,
-                        msg.installation_id,
-                        owner,
-                        repo,
-                        msg.pr_number,
-                        &msg.head_sha,
-                        &msg.base_branch,
-                    )
-                    .await;
-                    let _ = github
-                        .create_issue_comment(
-                            owner,
-                            repo,
-                            msg.pr_number,
-                            &format!("### 🚀 Auto-merged\n\n{}", lines.join("\n")),
-                        )
-                        .await;
-                    info!(pr = msg.pr_number, "Armed auto-merge: merged");
-                }
-                Ok(false) => {
-                    // GitHub refused the merge — almost always a branch-protection
-                    // requirement not yet met (most often a required approving review
-                    // still pending), occasionally a conflict. Do NOT tell the user to
-                    // merge by hand: keep waiting (bounded) and re-attempt, so it
-                    // merges on its own once the requirement clears. Note once per head.
-                    if claim_notice(
-                        state,
-                        &msg.team_id,
-                        owner,
-                        repo,
-                        msg.pr_number,
-                        &msg.head_sha,
-                        "declined",
-                    )
-                    .await
-                    {
-                        let _ = github
-                            .create_issue_comment(
-                                owner,
-                                repo,
-                                msg.pr_number,
-                                "⏸️ Auto-merge is waiting — GitHub won't allow the merge yet (a \
-                                 required approval or branch-protection check isn't satisfied, or \
-                                 there's a conflict). I'll merge automatically once that clears.",
-                            )
-                            .await;
-                    }
-                    wait_more(state, &msg).await;
-                }
-                Err(e) => {
-                    warn!(pr = msg.pr_number, error = %e, "Auto-merge failed");
-                    if claim_notice(
-                        state,
-                        &msg.team_id,
-                        owner,
-                        repo,
-                        msg.pr_number,
-                        &msg.head_sha,
-                        "failed",
-                    )
-                    .await
-                    {
-                        let _ = github
-                            .create_issue_comment(
-                                owner,
-                                repo,
-                                msg.pr_number,
-                                &format!("⚠️ Auto-merge failed: {e}"),
-                            )
-                            .await;
-                    }
-                }
-            }
+        MergeOutcome::NotMergeable(reason) => {
+            // Branch protection, a required check GitHub still counts as
+            // missing, or a conflict. Keep polling: most of these clear on their
+            // own, and the reason is on the PR for the ones that don't.
+            warn!(pr = msg.pr_number, reason = %reason, "await-merge: GitHub declined the merge");
+            lines.push((
+                Mark::Waiting,
+                format!(
+                    "GitHub won't merge yet: {}",
+                    common::truncate_str(&reason, 300)
+                ),
+            ));
+            set_state(state, msg, STATE_DECLINED, &reason).await;
+            let body = render_status(&msg.head_sha, &msg.base_branch, &lines, None);
+            publish_status(state, github, msg, record, &body).await;
+            Ok(Next::Poll)
         }
-        // CI still running → keep waiting (bounded).
-        Ci::Pending => {
-            wait_more(state, &msg).await;
+        MergeOutcome::HeadMoved(reason) => {
+            info!(pr = msg.pr_number, reason = %reason, "await-merge: head moved at merge time — stopping");
+            set_state(state, msg, STATE_HEAD_MOVED, &reason).await;
+            Ok(Next::Stop)
         }
-    }
-    Ok(())
-}
-
-/// Re-enqueue the gate for another tick, or give up once the attempt bound is hit.
-async fn wait_more(state: &WorkerState, msg: &AwaitMergeMessage) {
-    if msg.attempts < MAX_ATTEMPTS {
-        send(state, msg, msg.attempts + 1, RETRY_DELAY_SECS).await;
-    } else {
-        info!(
-            pr = msg.pr_number,
-            "await-merge: gave up after cap (still waiting on approval/deploy/CI)"
-        );
     }
 }
 
-/// Arm the gate for a PR (called at review time and on a human approval). Returns
-/// false if the queue isn't configured.
+fn mention_list(logins: &[String]) -> String {
+    logins
+        .iter()
+        .map(|l| format!("@{l}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn code_list(names: &[String]) -> String {
+    const SHOW: usize = 8;
+    let mut out = names
+        .iter()
+        .take(SHOW)
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > SHOW {
+        out.push_str(&format!(" and {} more", names.len() - SHOW));
+    }
+    out
+}
+
+/// Arm the gate for a PR (called at review time; the gateway arms on human
+/// approvals, dismissals and completed check suites). Every arming starts a new
+/// chain. Returns false if the queue isn't configured.
 #[allow(clippy::too_many_arguments)]
 pub async fn arm(
     state: &WorkerState,
@@ -502,6 +923,7 @@ pub async fn arm(
         base_branch: base_branch.to_string(),
         self_authored,
         attempts: 0,
+        chain_id: String::new(),
     };
     send(state, &msg, 0, SETTLE_DELAY_SECS).await
 }
@@ -536,7 +958,7 @@ async fn send(state: &WorkerState, msg: &AwaitMergeMessage, attempts: u32, delay
     {
         Ok(_) => true,
         Err(e) => {
-            warn!(error = %e, "await-merge: enqueue failed");
+            warn!(pr = msg.pr_number, error = %e, "await-merge: enqueue failed");
             false
         }
     }
@@ -544,7 +966,7 @@ async fn send(state: &WorkerState, msg: &AwaitMergeMessage, attempts: u32, delay
 
 #[cfg(test)]
 mod ci_tests {
-    use super::classify_check_runs;
+    use super::*;
     use serde_json::json;
 
     fn cr(name: &str, status: &str, conclusion: &str, started_at: &str) -> serde_json::Value {
@@ -553,8 +975,8 @@ mod ci_tests {
 
     #[test]
     fn cancelled_duplicate_does_not_fail() {
-        // The incident: a superseded `cancelled` run alongside a later `success`
-        // for the same check must NOT be reported as failing.
+        // A superseded `cancelled` run alongside a later `success` for the same
+        // check must NOT be reported as failing.
         let runs = vec![
             cr(
                 "Web App Lint",
@@ -569,11 +991,12 @@ mod ci_tests {
                 "2026-08-11T09:00:00Z",
             ),
         ];
-        let (pending, failing) = classify_check_runs(&runs);
-        assert!(!pending);
+        let s = classify_check_runs(&runs);
+        assert!(s.pending.is_empty());
         assert!(
-            failing.is_empty(),
-            "cancelled dup must not fail: {failing:?}"
+            s.failing.is_empty(),
+            "cancelled dup must not fail: {:?}",
+            s.failing
         );
     }
 
@@ -585,29 +1008,27 @@ mod ci_tests {
             "cancelled",
             "2026-08-11T10:00:00Z",
         )];
-        let (pending, failing) = classify_check_runs(&runs);
-        assert!(!pending);
-        assert!(failing.is_empty());
+        let s = classify_check_runs(&runs);
+        assert!(s.pending.is_empty());
+        assert!(s.failing.is_empty());
     }
 
     #[test]
     fn real_failure_is_reported() {
         let runs = vec![cr("Lint", "completed", "failure", "2026-08-11T10:00:00Z")];
-        let (_, failing) = classify_check_runs(&runs);
-        assert_eq!(failing, vec!["Lint".to_string()]);
+        assert_eq!(classify_check_runs(&runs).failing, vec!["Lint".to_string()]);
     }
 
     #[test]
-    fn in_progress_is_pending() {
-        let runs = vec![cr(
-            "Deploy Preview",
-            "in_progress",
-            "",
-            "2026-08-11T10:00:00Z",
-        )];
-        let (pending, failing) = classify_check_runs(&runs);
-        assert!(pending);
-        assert!(failing.is_empty());
+    fn in_progress_is_pending_by_name() {
+        let runs = vec![
+            cr("Deploy Preview", "in_progress", "", "2026-08-11T10:00:00Z"),
+            cr("Lint", "completed", "success", "2026-08-11T09:00:00Z"),
+        ];
+        let s = classify_check_runs(&runs);
+        assert_eq!(s.pending, vec!["Deploy Preview".to_string()]);
+        assert!(s.failing.is_empty());
+        assert_eq!(s.latest_start.as_deref(), Some("2026-08-11T10:00:00Z"));
     }
 
     #[test]
@@ -617,7 +1038,60 @@ mod ci_tests {
             cr("Lint", "completed", "success", "2026-08-11T09:00:00Z"),
             cr("Lint", "completed", "failure", "2026-08-11T10:00:00Z"),
         ];
-        let (_, failing) = classify_check_runs(&runs);
-        assert_eq!(failing, vec!["Lint".to_string()]);
+        assert_eq!(classify_check_runs(&runs).failing, vec!["Lint".to_string()]);
+    }
+
+    #[test]
+    fn green_is_not_trusted_until_label_ci_starts() {
+        let added = 1_000;
+        // Just added, nothing started since: not settled.
+        assert!(!label_ci_settled(Some(added), Some(added - 50), added + 30));
+        // A check started after the labels: settled.
+        assert!(label_ci_settled(Some(added), Some(added + 10), added + 30));
+        // Grace period over: settled even if the label triggered nothing.
+        assert!(label_ci_settled(
+            Some(added),
+            None,
+            added + LABEL_CI_GRACE_SECS
+        ));
+        // No labels added by the gate: nothing to wait for.
+        assert!(label_ci_settled(None, None, added));
+    }
+
+    #[test]
+    fn status_renders_marks_and_is_stable() {
+        let lines = vec![
+            (Mark::Done, "CoderHelm approved `abc1234`".to_string()),
+            (Mark::Waiting, "Waiting for a human approval".to_string()),
+        ];
+        let a = render_status("abc1234def", "main", &lines, None);
+        let b = render_status("abc1234def", "main", &lines, None);
+        assert_eq!(a, b, "same state must render identically (no rewrite)");
+        assert!(a.starts_with(STATUS_MARKER));
+        assert!(a.contains("`abc1234` → `main`"));
+        assert!(a.contains("- ✅ CoderHelm approved"));
+        assert!(a.contains("- ⏳ Waiting for a human approval"));
+    }
+
+    #[test]
+    fn pause_note_keeps_the_checklist() {
+        let lines = vec![(Mark::Waiting, "CI running: `Deploy`".to_string())];
+        let last = render_status("abc1234", "main", &lines, None);
+        let paused = with_note(&last, "abc1234", "main", "⏸️ paused");
+        assert!(paused.contains("CI running: `Deploy`"));
+        assert!(paused.contains("⏸️ paused"));
+        assert!(paused.ends_with(STATUS_FOOTER));
+        // No previous body: the note alone.
+        let fresh = with_note("", "abc1234", "main", "⏸️ paused");
+        assert!(fresh.starts_with(STATUS_MARKER) && fresh.contains("⏸️ paused"));
+    }
+
+    #[test]
+    fn long_check_lists_are_capped() {
+        let names: Vec<String> = (1..=10).map(|i| format!("c{i}")).collect();
+        let out = code_list(&names);
+        assert!(out.contains("`c8`"));
+        assert!(!out.contains("`c9`"));
+        assert!(out.ends_with("and 2 more"));
     }
 }

@@ -49,6 +49,9 @@ pub struct OnApproveConfig {
     /// that CI to go green before merging. Empty = no label step. The value is
     /// operator-configured per repo — never hardcoded here.
     pub deploy_label: String,
+    /// The label that opts a human-authored PR into review (and so into the
+    /// merge gate's status comment). Default `ch-review`.
+    pub review_label: String,
 }
 
 impl Default for OnApproveConfig {
@@ -63,12 +66,33 @@ impl Default for OnApproveConfig {
             tag_batch_minutes: 15,
             health_check: false,
             deploy_label: String::new(),
+            review_label: "ch-review".to_string(),
         }
     }
 }
 
 impl OnApproveConfig {
+    /// Load the repo's config; a read failure falls back to the safe defaults
+    /// (nothing enabled). Use `try_load` where a failed read must not be
+    /// mistaken for "disabled".
     pub async fn load(state: &WorkerState, team_id: &str, owner: &str, name: &str) -> Self {
+        match Self::try_load(state, team_id, owner, name).await {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                warn!(owner, name, error = %e, "Could not read review config — using safe defaults");
+                Self::default()
+            }
+        }
+    }
+
+    /// Load the repo's config. A missing item is the defaults; a failed read
+    /// is an error.
+    pub async fn try_load(
+        state: &WorkerState,
+        team_id: &str,
+        owner: &str,
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
         let item = state
             .dynamo
@@ -77,11 +101,11 @@ impl OnApproveConfig {
             .key("pk", super::attr_s(team_id))
             .key("sk", super::attr_s(&sk))
             .send()
-            .await
-            .ok()
-            .and_then(|o| o.item().cloned());
+            .await?
+            .item()
+            .cloned();
         let Some(item) = item else {
-            return Self::default();
+            return Ok(Self::default());
         };
         let d = Self::default();
         let get_bool = |k: &str, dv: bool| {
@@ -120,7 +144,13 @@ impl OnApproveConfig {
             .and_then(|s| s.parse::<u32>().ok())
             .map(|m| m.min(360))
             .unwrap_or(d.tag_batch_minutes);
-        Self {
+        let review_label = item
+            .get("label")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(d.review_label);
+        Ok(Self {
             auto_merge: get_bool("auto_merge", d.auto_merge),
             merge_method,
             require_human_approval: get_bool("require_human_approval", d.require_human_approval),
@@ -130,7 +160,8 @@ impl OnApproveConfig {
             tag_batch_minutes,
             health_check: get_bool("health_check", d.health_check),
             deploy_label,
-        }
+            review_label,
+        })
     }
 }
 
@@ -191,48 +222,76 @@ pub struct ActionReport {
     pub summary: String,
 }
 
-/// Is there at least one human APPROVED review on the PR (not the bot's)?
-pub(crate) async fn human_approval_present(
+/// Approval state of a PR, from its full review list.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Approvals {
+    /// Humans whose latest verdict is APPROVED.
+    pub approved_by: Vec<String>,
+    /// Reviewers (humans or other bots) whose latest verdict is CHANGES_REQUESTED.
+    pub blocking_by: Vec<String>,
+    /// CoderHelm's own review of `head` was dismissed and not re-approved.
+    pub bot_dismissed_at_head: bool,
+}
+
+impl Approvals {
+    pub fn human_key(&self) -> bool {
+        !self.approved_by.is_empty() && self.blocking_by.is_empty()
+    }
+}
+
+/// Pure: derive approval state from GitHub's review list (oldest first).
+///
+/// Latest-verdict-per-reviewer semantics, which is what GitHub uses for merge
+/// eligibility: a reviewer who approved and later requested changes is
+/// blocking; COMMENTED and PENDING never supersede a verdict; DISMISSED clears
+/// one. CoderHelm's own reviews are not a human key; a dismissal of its review
+/// on the current head withdraws the bot key.
+pub fn approval_state(reviews: &serde_json::Value, head_sha: &str) -> Approvals {
+    let mut latest: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
+    let mut bot_at_head: Option<&str> = None;
+    for r in reviews.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let login = r["user"]["login"].as_str().unwrap_or("");
+        let state = r["state"].as_str().unwrap_or("");
+        if login.is_empty() {
+            continue;
+        }
+        if login.contains("coderhelm") {
+            if r["commit_id"].as_str() == Some(head_sha)
+                && matches!(state, "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED")
+            {
+                bot_at_head = Some(state);
+            }
+            continue;
+        }
+        if matches!(state, "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED") {
+            latest.insert(login.to_string(), state);
+        }
+    }
+    Approvals {
+        approved_by: latest
+            .iter()
+            .filter(|(_, s)| **s == "APPROVED")
+            .map(|(l, _)| l.clone())
+            .collect(),
+        blocking_by: latest
+            .iter()
+            .filter(|(_, s)| **s == "CHANGES_REQUESTED")
+            .map(|(l, _)| l.clone())
+            .collect(),
+        bot_dismissed_at_head: bot_at_head == Some("DISMISSED"),
+    }
+}
+
+/// Fetch every review on the PR and derive its approval state.
+pub(crate) async fn fetch_approvals(
     github: &GitHubClient,
     owner: &str,
     repo: &str,
     pr: u64,
-) -> bool {
-    match github.list_pr_reviews(owner, repo, pr).await {
-        Ok(v) => {
-            // LATEST-review-per-reviewer semantics (what GitHub itself uses for
-            // merge eligibility). A human who approved and LATER requested
-            // changes keeps the old review's state "APPROVED" in history — a
-            // simple any(APPROVED) would count that stale approval as the human
-            // key against the reviewer's CURRENT objection. COMMENTED reviews
-            // don't supersede a verdict; DISMISSED clears one. And any
-            // reviewer whose current verdict is CHANGES_REQUESTED blocks — a
-            // standing objection can't be outvoted by someone else's approval.
-            let mut latest: std::collections::HashMap<String, &str> =
-                std::collections::HashMap::new();
-            for r in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
-                let login = r["user"]["login"].as_str().unwrap_or("");
-                if login.is_empty() || login.contains("coderhelm") {
-                    continue;
-                }
-                // list_pr_reviews returns chronological order — the last
-                // meaningful state per reviewer wins. COMMENTED/PENDING never
-                // supersede a verdict.
-                if let s @ ("APPROVED" | "CHANGES_REQUESTED" | "DISMISSED") =
-                    r["state"].as_str().unwrap_or("")
-                {
-                    latest.insert(login.to_string(), s);
-                }
-            }
-            let any_approved = latest.values().any(|s| *s == "APPROVED");
-            let any_blocking = latest.values().any(|s| *s == "CHANGES_REQUESTED");
-            any_approved && !any_blocking
-        }
-        Err(e) => {
-            warn!(pr, error = %e, "Could not list PR reviews — treating as no human approval");
-            false
-        }
-    }
+    head_sha: &str,
+) -> Result<Approvals, Box<dyn std::error::Error + Send + Sync>> {
+    let reviews = github.list_pr_reviews(owner, repo, pr).await?;
+    Ok(approval_state(&reviews, head_sha))
 }
 
 /// On an APPROVE verdict, ARM the async auto-merge gate (if the repo enabled it).
@@ -271,11 +330,9 @@ pub async fn run_on_approve(
     )
     .await
     {
-        report.summary =
-            "### 🚀 Auto-merge armed\n\n🤝 I'll merge this automatically once a human \
-             approves **and** every CI check passes — I wait for pending checks (like the staging \
-             deploy) and never merge on failing or still-running CI."
-                .to_string();
+        report.summary = "Auto-merge armed: merges once a human approves and every CI check \
+                          passes. Progress is tracked in the PR's auto-merge status comment."
+            .to_string();
     }
     report
 }
@@ -426,27 +483,19 @@ async fn schedule_tag_sweep(
 ) -> bool {
     let marker = format!("TAGSWEEP#{owner}/{repo}");
     // TTL past the window so a crashed sweep can't wedge the marker for long.
-    let ttl = chrono::Utc::now().timestamp() as u64 + (cfg.tag_batch_minutes as u64 * 60) + 3_600;
-    let claimed = match state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.settings_table_name)
-        .item("pk", super::attr_s(team_id))
-        .item("sk", super::attr_s(&marker))
-        .item("ttl", super::attr_n(ttl))
-        .condition_expression("attribute_not_exists(pk)")
-        .send()
-        .await
+    let ttl_secs = (cfg.tag_batch_minutes as u64 * 60) + 3_600;
+    let claimed = match common::claim::claim(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+        &marker,
+        ttl_secs,
+    )
+    .await
     {
-        Ok(_) => true,
-        Err(e) => {
-            let conflict = e
-                .as_service_error()
-                .map(|se| se.is_conditional_check_failed_exception())
-                .unwrap_or(false);
-            if conflict {
-                return false; // a sweep is already armed — fold in silently
-            }
+        common::claim::Claim::Won => true,
+        common::claim::Claim::Held => return false, // a sweep is already armed — fold in silently
+        common::claim::Claim::Failed(e) => {
             warn!(error = %e, "Tag sweep claim errored — arming anyway (fail-open)");
             true
         }
@@ -592,6 +641,61 @@ pub async fn run_tag_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rv(login: &str, state: &str, commit: &str) -> serde_json::Value {
+        serde_json::json!({"user": {"login": login}, "state": state, "commit_id": commit})
+    }
+
+    #[test]
+    fn later_change_request_blocks_earlier_approval() {
+        let reviews = serde_json::json!([
+            rv("alice", "APPROVED", "h1"),
+            rv("bob", "APPROVED", "h1"),
+            rv("alice", "COMMENTED", "h1"),
+            rv("bob", "CHANGES_REQUESTED", "h1"),
+        ]);
+        let a = approval_state(&reviews, "h1");
+        assert_eq!(a.approved_by, vec!["alice".to_string()]);
+        assert_eq!(a.blocking_by, vec!["bob".to_string()]);
+        assert!(!a.human_key());
+    }
+
+    #[test]
+    fn dismissal_clears_a_verdict() {
+        let reviews = serde_json::json!([
+            rv("bob", "CHANGES_REQUESTED", "h1"),
+            rv("bob", "DISMISSED", "h1"),
+            rv("alice", "APPROVED", "h2"),
+        ]);
+        let a = approval_state(&reviews, "h2");
+        assert!(a.blocking_by.is_empty());
+        assert!(a.human_key());
+    }
+
+    #[test]
+    fn bot_review_is_not_a_human_key() {
+        let reviews = serde_json::json!([rv("coderhelm[bot]", "APPROVED", "h1")]);
+        let a = approval_state(&reviews, "h1");
+        assert!(!a.human_key());
+        assert!(!a.bot_dismissed_at_head);
+    }
+
+    #[test]
+    fn dismissed_bot_review_withdraws_bot_key_for_that_head_only() {
+        let dismissed = serde_json::json!([
+            rv("coderhelm[bot]", "DISMISSED", "h1"),
+            rv("alice", "APPROVED", "h1"),
+        ]);
+        assert!(approval_state(&dismissed, "h1").bot_dismissed_at_head);
+        // A dismissal of an older head says nothing about the current one.
+        assert!(!approval_state(&dismissed, "h2").bot_dismissed_at_head);
+        // Re-approved after the dismissal: key restored.
+        let reapproved = serde_json::json!([
+            rv("coderhelm[bot]", "DISMISSED", "h1"),
+            rv("coderhelm[bot]", "APPROVED", "h1"),
+        ]);
+        assert!(!approval_state(&reapproved, "h1").bot_dismissed_at_head);
+    }
 
     #[test]
     fn no_merge_when_disabled() {

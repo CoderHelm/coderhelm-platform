@@ -191,6 +191,11 @@ pub struct AwaitMergeMessage {
     pub self_authored: bool,
     #[serde(default)]
     pub attempts: u32,
+    /// Which arming this tick belongs to. Re-arming starts a new chain; a tick
+    /// whose chain is no longer current stops, so one PR never runs two
+    /// polling loops. Empty on messages from before chains existed.
+    #[serde(default)]
+    pub chain_id: String,
 }
 
 /// Post-merge health check job. Baseline = checks already failing at merge time,
@@ -242,6 +247,13 @@ pub struct ReviewMessage {
     /// Empty ⇒ no dedup (old in-flight messages / paths that don't set it).
     #[serde(default)]
     pub dedup_key: String,
+    /// Retry count for a review that failed on a transient error.
+    #[serde(default)]
+    pub attempt: u32,
+    /// Set when the ask came from an inline review thread: the answer is posted
+    /// as a reply in that thread instead of a top-level comment.
+    #[serde(default)]
+    pub reply_to_comment_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -340,6 +352,12 @@ pub struct FeedbackMessage {
     pub review_id: u64,
     pub review_body: String,
     pub comments: Vec<ReviewComment>,
+    /// Login of the human whose comment or review body triggered this feedback.
+    /// Empty for automated feedback (CI results, CoderHelm's own review). When
+    /// set and there is no inline thread to answer, the reply is posted as a PR
+    /// comment addressed to them.
+    #[serde(default)]
+    pub trigger_author: String,
     /// How many times this feedback has been re-enqueued because the per-run
     /// writer slot was busy. Absent on messages from the gateway (defaults to 0);
     /// bounds the defer loop so a wedged slot can't churn indefinitely.
@@ -471,11 +489,34 @@ mod tests {
                 is_context: false,
             }],
             defer_count: 2,
+            trigger_author: String::new(),
         });
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();
         match parsed {
             WorkerMessage::Feedback(f) => assert_eq!(f.defer_count, 2),
+            _ => panic!("expected feedback"),
+        }
+    }
+
+    #[test]
+    fn messages_queued_before_new_fields_still_parse() {
+        let review = r#"{"type":"review","team_id":"T","installation_id":1,"repo_owner":"o","repo_name":"r","pr_number":2,"head_sha":"h","label":"ch-review"}"#;
+        match serde_json::from_str::<WorkerMessage>(review).unwrap() {
+            WorkerMessage::Review(m) => {
+                assert_eq!(m.attempt, 0);
+                assert_eq!(m.reply_to_comment_id, None);
+            }
+            _ => panic!("expected review"),
+        }
+        let gate = r#"{"type":"await_merge","team_id":"T","installation_id":1,"repo_owner":"o","repo_name":"r","pr_number":2,"head_sha":"h","base_branch":"main","attempts":3}"#;
+        match serde_json::from_str::<WorkerMessage>(gate).unwrap() {
+            WorkerMessage::AwaitMerge(m) => assert!(m.chain_id.is_empty()),
+            _ => panic!("expected await_merge"),
+        }
+        let feedback = r#"{"type":"feedback","team_id":"T","installation_id":1,"run_id":"x","repo_owner":"o","repo_name":"r","pr_number":2,"review_id":0,"review_body":"hi","comments":[]}"#;
+        match serde_json::from_str::<WorkerMessage>(feedback).unwrap() {
+            WorkerMessage::Feedback(m) => assert!(m.trigger_author.is_empty()),
             _ => panic!("expected feedback"),
         }
     }

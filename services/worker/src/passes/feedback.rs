@@ -445,7 +445,19 @@ Rules:
         .filter(|c| c.comment_id.is_some() && !c.is_context)
         .collect();
 
-    if actionable_comments.is_empty() {
+    if actionable_comments.is_empty() && !msg.trigger_author.is_empty() {
+        // A person's top-level comment (or review body) with no inline thread to
+        // answer in: reply on the PR, addressed to them, so they see it was handled.
+        let reply = format!(
+            "@{} {}",
+            msg.trigger_author,
+            common::truncate_str(response.trim(), 60_000)
+        );
+        github
+            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
+            .await?;
+        info!(run_id = %msg.run_id, author = %msg.trigger_author, "Replied to a top-level PR comment");
+    } else if actionable_comments.is_empty() {
         // CI-only fix — the commit diff speaks for itself, no comment needed
         info!(run_id = %msg.run_id, "CI-only feedback — skipping PR comment (commit is the communication)");
     } else if sections.len() == actionable_comments.len() {
