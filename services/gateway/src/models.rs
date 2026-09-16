@@ -165,7 +165,7 @@ pub struct GraphIndexMessage {
 /// on a review-enabled PR; the worker's await_merge gate is the sole authority on
 /// whether auto-merge is actually on, whether both keys are present, and whether
 /// every CI check is green before it merges. Bound to the reviewed head SHA.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AwaitMergeMessage {
     pub team_id: String,
     pub installation_id: u64,
@@ -179,6 +179,11 @@ pub struct AwaitMergeMessage {
     pub self_authored: bool,
     #[serde(default)]
     pub attempts: u32,
+    /// Which arming this tick belongs to. Re-arming starts a new chain; a tick
+    /// whose chain is no longer current stops, so one PR never runs two
+    /// polling loops. Empty on messages from before chains existed.
+    #[serde(default)]
+    pub chain_id: String,
 }
 
 /// A label-triggered code-review job for an existing PR. Keyed by (pr_number,
@@ -209,6 +214,13 @@ pub struct ReviewMessage {
     /// Empty ⇒ no dedup (old in-flight messages / paths that don't set it).
     #[serde(default)]
     pub dedup_key: String,
+    /// Retry count for a review that failed on a transient error.
+    #[serde(default)]
+    pub attempt: u32,
+    /// Set when the ask came from an inline review thread: the answer is posted
+    /// as a reply in that thread instead of a top-level comment.
+    #[serde(default)]
+    pub reply_to_comment_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -291,6 +303,12 @@ pub struct FeedbackMessage {
     pub review_id: u64,
     pub review_body: String,
     pub comments: Vec<ReviewComment>,
+    /// Login of the human whose comment or review body triggered this feedback.
+    /// Empty for automated feedback (CI results, CoderHelm's own review). When
+    /// set and there is no inline thread to answer, the reply is posted as a PR
+    /// comment addressed to them.
+    #[serde(default)]
+    pub trigger_author: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

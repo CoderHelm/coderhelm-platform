@@ -488,6 +488,7 @@ pub async fn generate_review(
     graph: Option<&super::code_graph::Graph>,
     graph_context: &str,
     usage: &mut TokenUsage,
+    deadline: std::time::Instant,
 ) -> ReviewOutput {
     let graph_note = if graph.is_some() {
         "\nThis repo has a CODE GRAPH: prefer graph_definition/graph_callers/graph_impact for \
@@ -556,7 +557,9 @@ pub async fn generate_review(
         llm::ConverseOptions {
             max_turns: 30,
             max_tokens: 8192,
-            deadline: None,
+            // Wrap up before the review's budget runs out, so the review posts
+            // instead of the Lambda being killed mid-review.
+            deadline: Some(deadline),
         },
         None,
         None,
@@ -765,6 +768,7 @@ pub async fn verify_in_sandbox(
     repo: &str,
     head_sha: &str,
     changed_files: &[String],
+    deadline: std::time::Instant,
 ) -> Option<(bool, String)> {
     if state.config.sandbox_bucket_name.is_empty() || state.config.sandbox_project_name.is_empty() {
         return None;
@@ -797,7 +801,7 @@ pub async fn verify_in_sandbox(
     .replace('/', "-");
 
     match sandbox
-        .run_checks(&run_id, 0, tarball, &cmd, node.as_deref(), None)
+        .run_checks(&run_id, 0, tarball, &cmd, node.as_deref(), Some(deadline))
         .await
     {
         Ok(o) if o.ran => {

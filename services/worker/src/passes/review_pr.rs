@@ -27,8 +27,14 @@ struct ReviewConfig {
     verify_tests: bool,
 }
 
-async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str) -> ReviewConfig {
+async fn load_config(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> Result<ReviewConfig, Box<dyn std::error::Error + Send + Sync>> {
     let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
+    // A failed read is an error (retried), never "disabled".
     let item = state
         .dynamo
         .get_item()
@@ -36,18 +42,18 @@ async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str
         .key("pk", attr_s(team_id))
         .key("sk", attr_s(&sk))
         .send()
-        .await
-        .ok()
-        .and_then(|o| o.item().cloned());
+        .await?
+        .item()
+        .cloned();
     let Some(item) = item else {
-        return ReviewConfig {
+        return Ok(ReviewConfig {
             enabled: false,
             killed: false,
             instructions: String::new(),
             verify_tests: false,
-        };
+        });
     };
-    ReviewConfig {
+    Ok(ReviewConfig {
         enabled: item
             .get("enabled")
             .and_then(|v| v.as_bool().ok())
@@ -68,7 +74,7 @@ async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str
             .and_then(|v| v.as_bool().ok())
             .copied()
             .unwrap_or(false),
-    }
+    })
 }
 
 /// The repo's review trigger label IF the reviewer is enabled (and not killed),
@@ -137,18 +143,28 @@ const RATING_FOOTER: &str =
 CoderHelm dashboard so the reviewer learns. Reply **@coderhelm re-review** to re-run against the \
 latest commit, or **@coderhelm <question>** to ask._";
 
-/// How long a processed review trigger stays claimed (consume-once dedup). Long
-/// enough to outlast any duplicate webhook / SQS redelivery of the SAME trigger
-/// (seconds–minutes apart), short enough that a review which errored out can be
-/// re-driven for the same head once it expires. Keys that are unique per action
-/// (a comment id) are unaffected by the length; head-based keys get this window.
-const REVIEW_JOB_DEDUP_TTL_SECS: u64 = 6 * 3600;
+/// Consume-once dedup for review triggers. GitHub webhooks AND SQS are both
+/// at-least-once, so one user action (a comment, a label, a push) can arrive
+/// twice; the gateway stamps a `dedup_key` that is stable per action and the
+/// worker claims it here before any GitHub or model work.
+///
+/// The claim is a lease while the review runs, so an invocation that dies
+/// (timeout, crash) does not block the retry, and becomes a longer "done"
+/// marker once the review finished. A failed review releases it.
+const REVIEW_LEASE_SECS: u64 = 16 * 60;
+const REVIEW_DONE_SECS: u64 = 6 * 3600;
+/// Transient failures are retried this many times before the PR is told.
+const MAX_REVIEW_RETRIES: u32 = 2;
+const REVIEW_RETRY_DELAY_SECS: i32 = 90;
+/// Time budget for one review. The Lambda is killed at 15 minutes; the agent
+/// wraps up and the sandbox stops waiting well before that.
+const REVIEW_BUDGET: std::time::Duration = std::time::Duration::from_secs(12 * 60);
+const REVIEW_AGENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(8 * 60);
 
-pub async fn run(
-    state: &WorkerState,
-    msg: ReviewMessage,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cfg = load_config(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+pub async fn run(state: &WorkerState, msg: ReviewMessage) -> Result<(), BoxError> {
+    let cfg = load_config(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await?;
     if !cfg.enabled || cfg.killed {
         info!(
             pr = msg.pr_number,
@@ -157,22 +173,23 @@ pub async fn run(
         return Ok(());
     }
 
-    // Consume-once idempotency. GitHub webhooks AND SQS are both at-least-once, so
-    // the same trigger (a `@coderhelm re-review` comment, a native re-request, a
-    // label event) can be delivered more than once — each delivery would post
-    // another full review + auto-merge-arm (observed: one re-review comment
-    // produced two approvals + two arms). The gateway stamps a `dedup_key` that is
-    // stable per user action (comment id / head sha); the first delivery claims it
-    // and any duplicate is dropped here, before any GitHub/model work. Empty key
-    // (old in-flight messages) or a transient DynamoDB error falls through to
-    // processing — `claim_once_ttl` fails OPEN, so a real review is never lost. The
-    // short TTL lets a failed review be re-driven later.
-    if !msg.dedup_key.is_empty() {
-        let sk = format!(
+    let claim_sk = (!msg.dedup_key.is_empty()).then(|| {
+        format!(
             "REVIEWJOB#{}/{}#{:06}#{}",
             msg.repo_owner, msg.repo_name, msg.pr_number, msg.dedup_key
-        );
-        if !claim_once_ttl(state, &msg.team_id, &sk, REVIEW_JOB_DEDUP_TTL_SECS).await {
+        )
+    });
+    // A retry re-uses the claim its first attempt released.
+    if let Some(sk) = &claim_sk {
+        let claim = common::claim::claim(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            sk,
+            REVIEW_LEASE_SECS,
+        )
+        .await;
+        if !claim.won_or_failed_open() {
             info!(
                 pr = msg.pr_number,
                 dedup_key = %msg.dedup_key,
@@ -182,6 +199,108 @@ pub async fn run(
         }
     }
 
+    let deadline = std::time::Instant::now() + REVIEW_BUDGET;
+    match review(state, &msg, cfg, deadline).await {
+        Ok(()) => {
+            if let Some(sk) = &claim_sk {
+                common::claim::extend(
+                    &state.dynamo,
+                    &state.config.settings_table_name,
+                    &msg.team_id,
+                    sk,
+                    REVIEW_DONE_SECS,
+                )
+                .await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(sk) = &claim_sk {
+                common::claim::release(
+                    &state.dynamo,
+                    &state.config.settings_table_name,
+                    &msg.team_id,
+                    sk,
+                )
+                .await;
+            }
+            if msg.attempt < MAX_REVIEW_RETRIES && requeue_review(state, &msg).await {
+                warn!(pr = msg.pr_number, attempt = msg.attempt, error = %e, "Review failed — retrying");
+                return Ok(());
+            }
+            notify_review_failed(state, &msg, &e.to_string()).await;
+            Err(e)
+        }
+    }
+}
+
+/// Re-enqueue a failed review for another attempt.
+async fn requeue_review(state: &WorkerState, msg: &ReviewMessage) -> bool {
+    if state.config.ticket_queue_url.is_empty() {
+        return false;
+    }
+    let mut next = msg.clone();
+    next.attempt += 1;
+    let Ok(mut body) = serde_json::to_value(&next) else {
+        return false;
+    };
+    if let Some(o) = body.as_object_mut() {
+        o.insert("type".to_string(), serde_json::json!("review"));
+    }
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(body.to_string())
+        .delay_seconds(REVIEW_RETRY_DELAY_SECS)
+        .send()
+        .await
+        .is_ok()
+}
+
+/// Tell the PR that a review could not be completed, once per trigger.
+async fn notify_review_failed(state: &WorkerState, msg: &ReviewMessage, error: &str) {
+    let sk = format!(
+        "REVIEWFAILNOTICE#{}/{}#{:06}#{}",
+        msg.repo_owner, msg.repo_name, msg.pr_number, msg.dedup_key
+    );
+    let claim = common::claim::claim(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+        &sk,
+        REVIEW_DONE_SECS,
+    )
+    .await;
+    if !claim.won_or_failed_open() {
+        return;
+    }
+    let Ok(github) = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    ) else {
+        return;
+    };
+    let body = format!(
+        "⚠️ I couldn't finish reviewing this PR after {} attempts (`{}`). Reply \
+         **@coderhelm re-review** to try again.",
+        msg.attempt + 1,
+        common::truncate_str(error, 300)
+    );
+    let _ = github
+        .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &body)
+        .await;
+}
+
+async fn review(
+    state: &WorkerState,
+    msg: &ReviewMessage,
+    cfg: ReviewConfig,
+    deadline: std::time::Instant,
+) -> Result<(), BoxError> {
+    let started = std::time::Instant::now();
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
         &state.secrets.github_private_key,
@@ -284,15 +403,35 @@ pub async fn run(
         )
         .await
         .unwrap_or_else(|e| format!("I couldn't answer that automatically ({e})."));
-        let body = format!("{answer}{RATING_FOOTER}");
-        github
-            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &body)
-            .await?;
+        // Asked inside an inline review thread → answer in that thread.
+        match msg.reply_to_comment_id {
+            Some(comment_id) => {
+                github
+                    .reply_to_review_comment(
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        msg.pr_number,
+                        comment_id,
+                        &answer,
+                    )
+                    .await?;
+            }
+            None => {
+                let body = format!("{answer}{RATING_FOOTER}");
+                github
+                    .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &body)
+                    .await?;
+            }
+        }
         store_review_record(
-            state, &msg, &head_sha, "QUESTION", "N/A", &answer, "COMMENT", "",
+            state, msg, &head_sha, "QUESTION", "N/A", &answer, "COMMENT", "",
         )
         .await;
-        info!(pr = msg.pr_number, "Reviewer answered a question");
+        info!(
+            pr = msg.pr_number,
+            in_thread = msg.reply_to_comment_id.is_some(),
+            "Reviewer answered a question"
+        );
         return Ok(());
     }
 
@@ -396,6 +535,7 @@ pub async fn run(
         graph.as_ref(),
         &extra_context,
         &mut usage,
+        (started + REVIEW_AGENT_BUDGET).min(deadline),
     )
     .await;
 
@@ -426,6 +566,7 @@ pub async fn run(
             &msg.repo_name,
             &head_sha,
             &changed_files,
+            deadline,
         )
         .await
         {
@@ -481,19 +622,20 @@ pub async fn run(
     }
     full_body.push_str(RATING_FOOTER);
 
-    // De-spam: only comment when there's news. If CoderHelm's last recorded verdict
-    // for this PR equals this one (e.g. still APPROVE while the self-fix loop keeps
-    // pushing commits, or a duplicate same-head event), record the new verdict but
-    // stay SILENT — no repeated "Approved"/"armed" comments, which is the main
-    // source of reviewer spam. An explicit reply / re-review (msg.question) always
-    // speaks, and a flip to/from REQUEST_CHANGES always speaks (verdict changed).
-    let prev_verdict = last_review_verdict(state, &msg).await;
-    // An explicit human ask (a reply/question or the native "Re-request review"
-    // button) always speaks, even if the verdict is unchanged — the person asked to
-    // see it. Only webhook-driven re-reviews (a self-fix commit, a re-label) get
-    // silenced when the verdict didn't change.
-    let explicit = msg.question.is_some() || msg.trigger == "reply" || msg.trigger == "rerequest";
-    let should_comment = explicit || prev_verdict.as_deref() != Some(verdict);
+    // Speak whenever there is news for a person. Silent only when this review
+    // repeats the previous verdict AND either covers the same commit (a duplicate
+    // trigger) or covers a commit CoderHelm itself pushed (its own fix loop).
+    let prev = last_review_verdict(state, msg).await;
+    let prev_verdict = prev.as_ref().map(|p| p.verdict.clone());
+    let head_by_bot = head_commit_by_bot(&compare, &head_sha);
+    let should_comment = should_post_review(
+        is_explicit_trigger(&msg.trigger, msg.question.is_some()),
+        prev.as_ref()
+            .map(|p| (p.verdict.as_str(), p.head_sha.as_str())),
+        verdict,
+        &head_sha,
+        head_by_bot,
+    );
 
     // Post ONE batched review with inline comments; fall back to body-only if
     // GitHub rejects an anchor (a bad line must never drop the whole verdict).
@@ -536,7 +678,7 @@ pub async fn run(
     };
     let record_sk = store_review_record(
         state,
-        &msg,
+        msg,
         &head_sha,
         verdict,
         &risk,
@@ -547,12 +689,16 @@ pub async fn run(
     .await;
     info!(
         pr = msg.pr_number,
+        head = %head_sha,
         verdict = verdict,
         risk = %risk,
         findings = findings.len(),
         inline = postable.inline.len(),
         posted_as = effective_event,
-        "Reviewer posted verdict"
+        posted = should_comment,
+        trigger = %msg.trigger,
+        elapsed_s = started.elapsed().as_secs(),
+        "Reviewer finished"
     );
 
     // ── Post-approval actions (opt-in, off by default) ──
@@ -573,22 +719,11 @@ pub async fn run(
             self_authored,
         )
         .await;
-        // Arm regardless (the gate is head-bound, so a new commit must re-arm),
-        // but only COMMENT the "armed" note when there's news — otherwise every
-        // re-approved commit re-posts it.
-        if should_comment && !report.summary.is_empty() {
-            let _ = github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.pr_number,
-                    &report.summary,
-                )
-                .await;
-            // Attach the action summary to the record we JUST wrote — an
-            // UPDATE, not a second put. A second put (timestamp-keyed) showed
-            // up as a duplicate "review" in the dashboard for every armed
-            // APPROVE (observed on three PRs before being root-caused here).
+        // The gate keeps its own single status comment on the PR, so the arming
+        // itself posts nothing; the summary only goes on the dashboard record.
+        if !report.summary.is_empty() {
+            // An UPDATE of the record just written, never a second put: one review
+            // execution must produce exactly one dashboard record.
             let upd = state
                 .dynamo
                 .update_item()
@@ -632,7 +767,7 @@ pub async fn run(
         .await
         {
             // Under the cap — apply the fixes. A new commit re-triggers the review.
-            feed_review_back_to_run(state, &msg, &record_body).await;
+            feed_review_back_to_run(state, msg, &record_body).await;
         } else if claim_once(
             state,
             &msg.team_id,
@@ -675,8 +810,12 @@ const MAX_SELF_REVIEW_FIX_ROUNDS: u32 = 3;
 /// Claim one self-review→fix round for this PR (atomic conditional increment).
 /// True while under MAX_SELF_REVIEW_FIX_ROUNDS (proceed with the fix); false once
 /// the cap is reached — or on ANY error (fail CLOSED, like claim_auto_fix_slot:
-/// never keep looping when the bound can't be confirmed). Self-expires via TTL so
-/// a genuinely fresh re-run of the ticket later starts over.
+/// never keep looping when the bound can't be confirmed). The counter expires
+/// after `SELF_REVIEW_ROUNDS_TTL_SECS` so a genuinely fresh re-run of the ticket
+/// later starts over; an expired counter is reset here rather than waiting for
+/// DynamoDB's lazy TTL deletion.
+const SELF_REVIEW_ROUNDS_TTL_SECS: u64 = 3 * 86_400;
+
 async fn claim_self_review_round(
     state: &WorkerState,
     team_id: &str,
@@ -685,53 +824,60 @@ async fn claim_self_review_round(
     pr: u64,
 ) -> bool {
     let sk = format!("SELFREVIEWROUNDS#{owner}/{repo}#{pr:0>6}");
-    let ttl = chrono::Utc::now().timestamp() as u64 + 3 * 86_400;
-    state
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let ttl = now + SELF_REVIEW_ROUNDS_TTL_SECS;
+    let counted = state
         .dynamo
         .update_item()
         .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(team_id))
         .key("sk", attr_s(&sk))
         .update_expression("SET #ttl = :ttl ADD rounds :one")
-        .condition_expression("attribute_not_exists(rounds) OR rounds < :max")
+        .condition_expression(
+            "(attribute_not_exists(rounds) OR rounds < :max) AND \
+             (attribute_not_exists(#ttl) OR #ttl >= :now)",
+        )
         .expression_attribute_names("#ttl", "ttl")
         .expression_attribute_values(":one", attr_n(1))
         .expression_attribute_values(":max", attr_n(u64::from(MAX_SELF_REVIEW_FIX_ROUNDS)))
         .expression_attribute_values(":ttl", attr_n(ttl))
+        .expression_attribute_values(":now", attr_n(now))
+        .send()
+        .await;
+    if counted.is_ok() {
+        return true;
+    }
+    // The counter may only have failed because it expired: start a new one.
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sk))
+        .update_expression("SET #ttl = :ttl, rounds = :one")
+        .condition_expression("#ttl < :now")
+        .expression_attribute_names("#ttl", "ttl")
+        .expression_attribute_values(":one", attr_n(1))
+        .expression_attribute_values(":ttl", attr_n(ttl))
+        .expression_attribute_values(":now", attr_n(now))
         .send()
         .await
         .is_ok()
 }
 
 /// Perform a one-time action for a key (e.g. post the handoff notice once).
-/// Conditional put: true only for the first caller. Fails OPEN (acts) on a
-/// transient error so a real one-time notice is never lost. TTL-expiring.
+/// True only for the first caller within 7 days. Fails OPEN (acts) on a
+/// transient error so a real one-time notice is never lost.
 async fn claim_once(state: &WorkerState, team_id: &str, sk: &str) -> bool {
-    claim_once_ttl(state, team_id, sk, 7 * 86_400).await
-}
-
-/// `claim_once` with a caller-chosen TTL. Short TTLs suit dedup markers that
-/// should self-heal (a failed review can be re-driven once the marker expires);
-/// long TTLs suit one-shot handoffs. Fails OPEN on a transient error.
-async fn claim_once_ttl(state: &WorkerState, team_id: &str, sk: &str, ttl_secs: u64) -> bool {
-    let ttl = chrono::Utc::now().timestamp() as u64 + ttl_secs;
-    match state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(team_id))
-        .item("sk", attr_s(sk))
-        .item("ttl", attr_n(ttl))
-        .condition_expression("attribute_not_exists(pk)")
-        .send()
-        .await
-    {
-        Ok(_) => true,
-        Err(e) => !e
-            .as_service_error()
-            .map(|se| se.is_conditional_check_failed_exception())
-            .unwrap_or(false),
-    }
+    common::claim::claim(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+        sk,
+        7 * 86_400,
+    )
+    .await
+    .won_or_failed_open()
 }
 
 /// Route a self-review's requested changes into the originating run's feedback
@@ -879,12 +1025,16 @@ async fn lookup_run_by_pr(
         .find_map(|it| it.get("run_id").and_then(|v| v.as_s().ok()).cloned())
 }
 
-/// Persist a review record to the settings table so the dashboard can list it and
+/// CoderHelm's most recent verdict on a PR.
+struct PrevVerdict {
+    verdict: String,
+    head_sha: String,
+}
+
 /// The most recent verdict CoderHelm recorded for this PR (any head), or None if
 /// it has never reviewed it. Records are keyed sk=REVIEW#{repo}#{pr:06}#{rfc3339},
-/// so a descending scan yields newest-first. Used to stay silent on an unchanged
-/// verdict so the reviewer doesn't re-comment every commit.
-async fn last_review_verdict(state: &WorkerState, msg: &ReviewMessage) -> Option<String> {
+/// so a descending query yields newest-first. Question answers are skipped.
+async fn last_review_verdict(state: &WorkerState, msg: &ReviewMessage) -> Option<PrevVerdict> {
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let prefix = format!("REVIEW#{repo}#{:0>6}#", msg.pr_number);
     let resp = state
@@ -895,15 +1045,72 @@ async fn last_review_verdict(state: &WorkerState, msg: &ReviewMessage) -> Option
         .expression_attribute_values(":pk", attr_s(&msg.team_id))
         .expression_attribute_values(":sk", attr_s(&prefix))
         .scan_index_forward(false)
-        .limit(1)
+        .limit(10)
         .send()
         .await
         .ok()?;
-    resp.items()
-        .first()
-        .and_then(|i| i.get("verdict").and_then(|v| v.as_s().ok()).cloned())
+    resp.items().iter().find_map(|i| {
+        let verdict = i.get("verdict")?.as_s().ok()?;
+        if verdict != "APPROVE" && verdict != "REQUEST_CHANGES" {
+            return None;
+        }
+        Some(PrevVerdict {
+            verdict: verdict.clone(),
+            head_sha: i
+                .get("head_sha")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_default(),
+        })
+    })
 }
 
+/// A person explicitly asked for this review (a reply, a question, or the
+/// native "Re-request review" button).
+fn is_explicit_trigger(trigger: &str, has_question: bool) -> bool {
+    has_question || trigger == "reply" || trigger == "rerequest"
+}
+
+/// Pure: post this review on the PR?
+///
+/// Always when a person asked, when the verdict changed, or when it covers a
+/// new commit a person pushed. Silent only for a repeat verdict on the same
+/// commit (a duplicate trigger) or on a commit CoderHelm pushed itself (its own
+/// fix loop, which would otherwise post a review per self-fix commit).
+fn should_post_review(
+    explicit: bool,
+    prev: Option<(&str, &str)>,
+    verdict: &str,
+    head_sha: &str,
+    head_by_bot: bool,
+) -> bool {
+    if explicit {
+        return true;
+    }
+    match prev {
+        None => true,
+        Some((prev_verdict, _)) if prev_verdict != verdict => true,
+        Some((_, prev_head)) if prev_head == head_sha => false,
+        Some(_) => !head_by_bot,
+    }
+}
+
+/// Pure: was the head commit authored by CoderHelm? Reads the compare
+/// response's commit list (oldest first).
+fn head_commit_by_bot(compare: &serde_json::Value, head_sha: &str) -> bool {
+    compare["commits"]
+        .as_array()
+        .and_then(|cs| {
+            cs.iter()
+                .rev()
+                .find(|c| c["sha"].as_str() == Some(head_sha))
+                .or_else(|| cs.last())
+        })
+        .and_then(|c| c["author"]["login"].as_str())
+        .is_some_and(|login| login.contains("coderhelm"))
+}
+
+/// Persist a review record to the settings table so the dashboard can list it and
 /// ratings/actions can attach. Keyed pk=team_id, sk=REVIEW#{repo}#{pr:06}#{ts}.
 /// Best-effort: a storage failure must never break the actual GitHub review.
 /// Returns the record's sort key so follow-up steps can UPDATE this record
@@ -954,4 +1161,83 @@ async fn store_review_record(
         warn!(pr = msg.pr_number, error = %e, "Failed to persist review record (non-fatal)");
     }
     sk
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn first_review_and_verdict_changes_always_post() {
+        assert!(should_post_review(false, None, "APPROVE", "h1", true));
+        assert!(should_post_review(
+            false,
+            Some(("APPROVE", "h1")),
+            "REQUEST_CHANGES",
+            "h2",
+            true
+        ));
+    }
+
+    #[test]
+    fn repeat_verdict_on_a_human_push_posts() {
+        // A person pushed a fix that did not change the verdict: they must
+        // still hear that the new commit was reviewed.
+        assert!(should_post_review(
+            false,
+            Some(("REQUEST_CHANGES", "h1")),
+            "REQUEST_CHANGES",
+            "h2",
+            false
+        ));
+    }
+
+    #[test]
+    fn repeat_verdict_stays_silent_for_duplicates_and_bot_pushes() {
+        // Same commit reviewed again (duplicate trigger).
+        assert!(!should_post_review(
+            false,
+            Some(("APPROVE", "h1")),
+            "APPROVE",
+            "h1",
+            false
+        ));
+        // CoderHelm's own fix-loop commit.
+        assert!(!should_post_review(
+            false,
+            Some(("APPROVE", "h1")),
+            "APPROVE",
+            "h2",
+            true
+        ));
+    }
+
+    #[test]
+    fn explicit_asks_always_post() {
+        assert!(is_explicit_trigger("reply", false));
+        assert!(is_explicit_trigger("rerequest", false));
+        assert!(is_explicit_trigger("synchronize", true));
+        assert!(!is_explicit_trigger("synchronize", false));
+        assert!(should_post_review(
+            true,
+            Some(("APPROVE", "h1")),
+            "APPROVE",
+            "h1",
+            true
+        ));
+    }
+
+    #[test]
+    fn head_commit_author_is_read_from_the_compare() {
+        let compare = json!({"commits": [
+            {"sha": "a", "author": {"login": "thinkaxelthink"}},
+            {"sha": "b", "author": {"login": "coderhelm[bot]"}},
+        ]});
+        assert!(head_commit_by_bot(&compare, "b"));
+        assert!(!head_commit_by_bot(&compare, "a"));
+        // A commit with no linked GitHub account is not the bot's.
+        let unlinked = json!({"commits": [{"sha": "c", "author": null}]});
+        assert!(!head_commit_by_bot(&unlinked, "c"));
+    }
 }

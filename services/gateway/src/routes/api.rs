@@ -1342,6 +1342,8 @@ pub async fn re_review_run(
         review_id: 0,
         review_body: String::new(),
         comments: vec![],
+        // Not a GitHub comment: nobody to address on the PR.
+        trigger_author: String::new(),
     });
 
     let body = serde_json::to_string(&message).map_err(|e| {

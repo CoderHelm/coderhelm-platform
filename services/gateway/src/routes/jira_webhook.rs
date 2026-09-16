@@ -949,6 +949,8 @@ async fn handle_jira_comment(
                 review_id: 0,
                 review_body: format!("Jira comment by {comment_author}: {comment_body}"),
                 comments: vec![],
+                // Not a GitHub comment: nobody to address on the PR.
+                trigger_author: String::new(),
             });
 
             info!(
