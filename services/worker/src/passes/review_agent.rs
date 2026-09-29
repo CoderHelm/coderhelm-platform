@@ -47,6 +47,52 @@ pub struct ReviewOutput {
     pub summary: String,
     #[serde(default)]
     pub findings: Vec<Finding>,
+    /// Status of each of CoderHelm's earlier open threads (by prompt index).
+    #[serde(default)]
+    pub prior: Vec<PriorStatus>,
+}
+
+/// The model's judgment of one earlier CoderHelm thread at the new head.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PriorStatus {
+    pub index: usize,
+    /// "fixed" | "open"
+    #[serde(default)]
+    pub status: String,
+}
+
+impl PriorStatus {
+    pub fn is_fixed(&self) -> bool {
+        self.status.eq_ignore_ascii_case("fixed")
+    }
+}
+
+/// Prompt section listing CoderHelm's earlier unresolved threads, indexed so the
+/// model can report each one as fixed or still open.
+pub fn format_prior_threads(prior: &[crate::clients::github::BotReviewThread]) -> String {
+    if prior.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "\n## Your earlier review comments (still unresolved)\n\
+         Check each against the CURRENT head — read the file with your tools. Report every \
+         index in `prior`: \"fixed\" ONLY if you verified the problem is gone at this head, \
+         otherwise \"open\". Do NOT repeat an open one as a new finding; it is still visible.\n",
+    );
+    for (i, t) in prior.iter().enumerate() {
+        s.push_str(&format!(
+            "{i}: {}:{}{} — {}\n",
+            t.path,
+            t.line,
+            if t.outdated {
+                " (lines changed since)"
+            } else {
+                ""
+            },
+            common::truncate_str(t.body.trim(), 600).replace('\n', " ")
+        ));
+    }
+    s
 }
 
 impl Finding {
@@ -487,6 +533,7 @@ pub async fn generate_review(
     instructions_block: &str,
     graph: Option<&super::code_graph::Graph>,
     graph_context: &str,
+    prior_context: &str,
     usage: &mut TokenUsage,
 ) -> ReviewOutput {
     let graph_note = if graph.is_some() {
@@ -521,11 +568,12 @@ pub async fn generate_review(
          \"summary\": \"2-4 sentence overview\",\n  \"findings\": [{{\n    \"file\": \"path\", \"line\": <int, a line present on the RIGHT side of the diff>,\n    \
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
          \"category\": \"bug|security|correctness|perf|convention|scope\", \"title\": \"short\",\n    \
-         \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}]\n}}\n\
+         \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}],\n  \
+         \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"open\"}}]  (one per earlier comment listed, if any)\n}}\n\
          Use \"blocking\" ONLY for real bugs/risks that should stop the merge. If unsure, REQUEST_CHANGES.{graph_note}"
     );
     let prompt = format!(
-        "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{graph_context}\n\
+        "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{graph_context}{prior_context}\n\
          Explore with the tools as needed, then emit the JSON review."
     );
     let mut messages = vec![(
@@ -569,11 +617,13 @@ pub async fn generate_review(
             verdict: "REQUEST_CHANGES".to_string(),
             summary: common::head_tail_str(&text, 4000),
             findings: vec![],
+            prior: vec![],
         }),
         Err(e) => ReviewOutput {
             verdict: "REQUEST_CHANGES".to_string(),
             summary: format!("Automated review could not complete ({e}). Requesting a human look."),
             findings: vec![],
+            prior: vec![],
         },
     }
 }

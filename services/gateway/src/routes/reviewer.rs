@@ -645,6 +645,7 @@ pub async fn re_review(
         question: None,
         trigger: "rerequest".to_string(),
         dedup_key: format!("dashboard#pr{}#{window}", body.pr),
+        reply_to_comment_id: None,
     });
     super::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &message).await?;
     info!(

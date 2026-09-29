@@ -1749,7 +1749,60 @@ impl GitHubClient {
             "query": "mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { isResolved } } }",
             "variables": { "id": thread_id }
         });
-        self.post("https://api.github.com/graphql", &query).await
+        let resp = self.post("https://api.github.com/graphql", &query).await?;
+        // GraphQL reports failures in-band with HTTP 200.
+        if let Some(errors) = resp.get("errors") {
+            return Err(format!("GraphQL errors: {errors}").into());
+        }
+        Ok(resp)
+    }
+
+    /// CoderHelm's own UNRESOLVED inline review threads on a PR (the thread's first
+    /// comment was written by the bot) — the prior findings a re-review checks.
+    pub async fn list_open_bot_review_threads(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<BotReviewThread>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            let query = serde_json::json!({
+                "query": "query($owner:String!,$name:String!,$pr:Int!,$after:String){ repository(owner:$owner,name:$name){ pullRequest(number:$pr){ reviewThreads(first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id isResolved isOutdated path line originalLine comments(first:1){ nodes{ author{ login } body } } } } } } }",
+                "variables": { "owner": owner, "name": repo, "pr": pr_number, "after": cursor }
+            });
+            let resp = self.post("https://api.github.com/graphql", &query).await?;
+            if let Some(errors) = resp.get("errors") {
+                return Err(format!("GraphQL errors: {errors}").into());
+            }
+            let threads = &resp["data"]["repository"]["pullRequest"]["reviewThreads"];
+            for t in threads["nodes"].as_array().into_iter().flatten() {
+                let first = &t["comments"]["nodes"][0];
+                let author = first["author"]["login"].as_str().unwrap_or("");
+                if t["isResolved"].as_bool().unwrap_or(true) || !author.contains("coderhelm") {
+                    continue;
+                }
+                out.push(BotReviewThread {
+                    id: t["id"].as_str().unwrap_or("").to_string(),
+                    path: t["path"].as_str().unwrap_or("").to_string(),
+                    line: t["line"]
+                        .as_u64()
+                        .or_else(|| t["originalLine"].as_u64())
+                        .unwrap_or(0),
+                    outdated: t["isOutdated"].as_bool().unwrap_or(false),
+                    body: first["body"].as_str().unwrap_or("").to_string(),
+                });
+            }
+            if !threads["pageInfo"]["hasNextPage"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                break;
+            }
+            cursor = threads["pageInfo"]["endCursor"].as_str().map(String::from);
+        }
+        Ok(out)
     }
 
     /// Get review thread IDs for specific comment node IDs.
@@ -2186,4 +2239,17 @@ pub enum FileOp {
 pub struct SearchResult {
     pub path: String,
     pub matches: Vec<String>,
+}
+
+/// One of CoderHelm's own unresolved inline review threads.
+#[derive(Debug, Clone)]
+pub struct BotReviewThread {
+    /// GraphQL node id (what resolveReviewThread takes).
+    pub id: String,
+    pub path: String,
+    pub line: u64,
+    /// GitHub marks a thread outdated when its anchored lines changed.
+    pub outdated: bool,
+    /// The bot's original comment.
+    pub body: String,
 }
