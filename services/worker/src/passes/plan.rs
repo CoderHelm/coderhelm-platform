@@ -315,6 +315,7 @@ After researching, output the four files using this exact format:
         },
         max_tokens: 16384,
         deadline: None,
+        effort: None,
     };
 
     let model_id = provider.primary_model_id();

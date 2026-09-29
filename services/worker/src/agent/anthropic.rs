@@ -41,6 +41,85 @@ struct MessagesRequest {
     tools: Option<Vec<ApiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
+    /// Always-thinking models only (see `ModelFamily`): adaptive thinking with
+    /// an explicit preserved-thinking binding behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<Value>,
+    /// Server-side context editing — replaces client-side history edits on
+    /// always-thinking models, where editing history invalidates thinking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_management: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallbacks: Option<Value>,
+}
+
+/// How a model must be called. `AlwaysThinking` models (Opus 5.x, Sonnet 5.x,
+/// Fable) think on every request and reject `budget_tokens`, disabled thinking
+/// and edited history, so they get adaptive thinking, an explicit effort and
+/// server-side context editing. Everything else keeps the legacy request shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ModelFamily {
+    Legacy,
+    AlwaysThinking,
+}
+
+impl ModelFamily {
+    fn of(model_id: &str) -> Self {
+        if common::is_always_thinking_model(model_id) {
+            ModelFamily::AlwaysThinking
+        } else {
+            ModelFamily::Legacy
+        }
+    }
+}
+
+/// Models that accept the server-side `fallbacks: "default"` refusal fallback.
+fn supports_default_fallback(model_id: &str) -> bool {
+    matches!(
+        model_id,
+        "claude-opus-5-5" | "claude-opus-5" | "claude-fable-5-1" | "claude-sonnet-5-5"
+    )
+}
+
+const BETA_PROMPT_CACHING: &str = "prompt-caching-2024-07-31";
+const BETA_THINKING_BINDING: &str = "thinking-binding-controls-2026-08-01";
+const BETA_CONTEXT_MANAGEMENT: &str = "context-management-2025-06-27";
+const BETA_FALLBACK_DEFAULT: &str = "server-side-fallback-2026-07-01";
+
+/// Fill the model-family fields of a request. `effort` None → "high".
+fn apply_model_family(request: &mut MessagesRequest, effort: Option<&str>, tool_loop: bool) {
+    if ModelFamily::of(&request.model) != ModelFamily::AlwaysThinking {
+        return;
+    }
+    // drop_block: a history edit degrades (the API drops the stale thinking
+    // blocks) instead of failing the request with a 400.
+    request.thinking = Some(json!({
+        "type": "adaptive",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+    }));
+    request.output_config = Some(json!({"effort": effort.unwrap_or("high")}));
+    if tool_loop {
+        request.context_management = Some(json!({"edits": [{"type": "clear_tool_uses_20250919"}]}));
+    }
+    if supports_default_fallback(&request.model) {
+        request.fallbacks = Some(json!("default"));
+    }
+}
+
+fn beta_header(request: &MessagesRequest) -> String {
+    let mut betas = vec![BETA_PROMPT_CACHING];
+    if request.thinking.is_some() {
+        betas.push(BETA_THINKING_BINDING);
+    }
+    if request.context_management.is_some() {
+        betas.push(BETA_CONTEXT_MANAGEMENT);
+    }
+    if request.fallbacks.is_some() {
+        betas.push(BETA_FALLBACK_DEFAULT);
+    }
+    betas.join(",")
 }
 
 #[derive(Serialize)]
@@ -62,7 +141,9 @@ struct CacheControl {
 #[derive(Serialize, Clone)]
 struct ApiMessage {
     role: String,
-    content: Vec<ContentBlock>,
+    /// Raw blocks, sent back exactly as received: thinking/fallback blocks must
+    /// be echoed unchanged, so history is never round-tripped through a typed enum.
+    content: Vec<Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -105,9 +186,40 @@ struct ApiTool {
 
 #[derive(Deserialize, Debug)]
 struct MessagesResponse {
-    content: Vec<ContentBlock>,
+    /// Raw blocks — includes `thinking` / `fallback` blocks the typed
+    /// `ContentBlock` doesn't model; see `blocks()` for the typed view.
+    content: Vec<Value>,
     stop_reason: Option<String>,
+    #[serde(default)]
+    stop_details: Option<Value>,
     usage: ApiUsage,
+}
+
+impl MessagesResponse {
+    /// Typed view of the blocks the loop acts on (text, tool_use); other block
+    /// types are skipped here but kept verbatim in `content`.
+    fn blocks(&self) -> Vec<ContentBlock> {
+        self.content
+            .iter()
+            .filter_map(|b| serde_json::from_value(b.clone()).ok())
+            .collect()
+    }
+
+    /// A safety-classifier decline (HTTP 200, `stop_reason: "refusal"`).
+    fn refusal(&self) -> Option<String> {
+        if self.stop_reason.as_deref() != Some("refusal") {
+            return None;
+        }
+        let category = self
+            .stop_details
+            .as_ref()
+            .and_then(|d| d.get("category"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("unspecified");
+        Some(format!(
+            "The model declined this request (refusal, category: {category})."
+        ))
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -144,7 +256,7 @@ pub async fn converse_simple(
     user_message: &str,
     usage: &mut crate::models::TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let request = MessagesRequest {
+    let mut request = MessagesRequest {
         model: model_id.to_string(),
         max_tokens: 16384,
         system: vec![SystemBlock::Text {
@@ -155,13 +267,19 @@ pub async fn converse_simple(
         }],
         messages: vec![ApiMessage {
             role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: user_message.to_string(),
-            }],
+            content: vec![json!({
+                "type": "text",
+                "text": user_message,
+            })],
         }],
         tools: None,
         cache_control: None,
+        thinking: None,
+        output_config: None,
+        context_management: None,
+        fallbacks: None,
     };
+    apply_model_family(&mut request, None, false);
 
     let resp = send_request(client, &request).await?;
     usage.add(
@@ -170,7 +288,10 @@ pub async fn converse_simple(
         resp.usage.cache_read_input_tokens,
         resp.usage.cache_creation_input_tokens,
     );
-    extract_text(&resp.content)
+    if let Some(refusal) = resp.refusal() {
+        return Err(refusal.into());
+    }
+    extract_text(&resp.blocks())
 }
 
 /// Agentic tool-use loop. Equivalent to `converse_with_opts` for Bedrock.
@@ -186,9 +307,11 @@ pub async fn converse_tool_loop(
     max_turns: usize,
     max_tokens: i32,
     deadline: Option<std::time::Instant>,
+    effort: Option<&str>,
     on_tool_call: Option<&super::llm::OnToolCall>,
     mut conversation_log: Option<&mut Vec<Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let family = ModelFamily::of(model_id);
     let api_tools: Vec<ApiTool> = tools
         .iter()
         .enumerate()
@@ -269,14 +392,11 @@ pub async fn converse_tool_loop(
             .iter()
             .map(|(role, content)| ApiMessage {
                 role: role.clone(),
-                content: content
-                    .iter()
-                    .filter_map(|c| serde_json::from_value(c.clone()).ok())
-                    .collect(),
+                content: content.clone(),
             })
             .collect();
 
-        let request = MessagesRequest {
+        let mut request = MessagesRequest {
             model: model_id.to_string(),
             max_tokens,
             system: vec![SystemBlock::Text {
@@ -296,7 +416,12 @@ pub async fn converse_tool_loop(
             cache_control: Some(CacheControl {
                 r#type: "ephemeral".to_string(),
             }),
+            thinking: None,
+            output_config: None,
+            context_management: None,
+            fallbacks: None,
         };
+        apply_model_family(&mut request, effort, true);
 
         let response = send_with_retry(client, &request, model_id).await?;
 
@@ -308,17 +433,28 @@ pub async fn converse_tool_loop(
             response.usage.cache_creation_input_tokens,
         );
 
+        if let Some(refusal) = response.refusal() {
+            return Err(refusal.into());
+        }
+
         // Context compaction — aggressively clear old tool results every turn.
         // The model has already consumed them; keeping them in history is pure token waste.
         // Keep the last `keep_recent` turn-pairs uncompacted so the model has recent context.
+        // Always-thinking models: history must stay append-only (an edit
+        // invalidates every later thinking block), so the server clears old
+        // tool results instead (`context_management` in apply_model_family).
         let keep_recent = 4; // keep last 4 turn-pairs (~8 messages)
-        compact_messages(messages, keep_recent);
+        if family == ModelFamily::Legacy {
+            compact_messages(messages, keep_recent);
+        }
 
         // Emergency compaction: if context is huge despite per-turn compaction, drop more
         let input_tokens = response.usage.input_tokens;
         let model_limit: u64 = 200_000;
         let context_pct = input_tokens as f64 / model_limit as f64;
-        if context_pct > 0.60 {
+        if family == ModelFamily::AlwaysThinking {
+            // server-side context editing owns trimming
+        } else if context_pct > 0.60 {
             info!(
                 "Context at {:.0}%, emergency compaction",
                 context_pct * 100.0
@@ -332,18 +468,12 @@ pub async fn converse_tool_loop(
             compact_messages(messages, 3);
         }
 
-        // Serialize response content blocks
-        let response_blocks: Vec<Value> = response
-            .content
-            .iter()
-            .map(|b| serde_json::to_value(b).unwrap_or(Value::Null))
-            .collect();
-
-        messages.push(("assistant".to_string(), response_blocks));
+        // Keep the response blocks verbatim (thinking signatures must round-trip).
+        messages.push(("assistant".to_string(), response.content.clone()));
 
         // Extract tool uses
-        let tool_uses: Vec<_> = response
-            .content
+        let blocks = response.blocks();
+        let tool_uses: Vec<_> = blocks
             .iter()
             .filter_map(|b| match b {
                 ContentBlock::ToolUse { id, name, input } => {
@@ -359,7 +489,7 @@ pub async fn converse_tool_loop(
                 log.push(json!({
                     "turn": turns,
                     "role": "assistant",
-                    "content": response.content.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>(),
+                    "content": response.content,
                     "usage": {
                         "input_tokens": response.usage.input_tokens,
                         "output_tokens": response.usage.output_tokens,
@@ -369,7 +499,7 @@ pub async fn converse_tool_loop(
                     "stop_reason": response.stop_reason
                 }));
             }
-            return extract_text(&response.content);
+            return extract_text(&blocks);
         }
 
         // Execute tools
@@ -417,7 +547,7 @@ pub async fn converse_tool_loop(
             log.push(json!({
                 "turn": turns,
                 "role": "assistant",
-                "content": response.content.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>(),
+                "content": response.content,
                 "usage": {
                     "input_tokens": response.usage.input_tokens,
                     "output_tokens": response.usage.output_tokens,
@@ -484,7 +614,7 @@ async fn send_request(
         .post(ANTHROPIC_API_URL)
         .header("x-api-key", &client.api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("anthropic-beta", "prompt-caching-2024-07-31")
+        .header("anthropic-beta", beta_header(request))
         .json(request)
         .send()
         .await?;
@@ -584,5 +714,124 @@ fn compact_messages(messages: &mut [(String, Vec<Value>)], keep_last: usize) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(model: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            system: vec![],
+            messages: vec![],
+            tools: None,
+            cache_control: None,
+            thinking: None,
+            output_config: None,
+            context_management: None,
+            fallbacks: None,
+        }
+    }
+
+    #[test]
+    fn model_family_by_id() {
+        for m in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "claude-opus-5",
+        ] {
+            assert_eq!(ModelFamily::of(m), ModelFamily::AlwaysThinking, "{m}");
+        }
+        for m in ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"] {
+            assert_eq!(ModelFamily::of(m), ModelFamily::Legacy, "{m}");
+        }
+    }
+
+    #[test]
+    fn legacy_models_keep_the_old_request_shape() {
+        let mut r = request("claude-opus-4-8");
+        apply_model_family(&mut r, None, true);
+        let v = serde_json::to_value(&r).unwrap();
+        for k in [
+            "thinking",
+            "output_config",
+            "context_management",
+            "fallbacks",
+        ] {
+            assert!(v.get(k).is_none(), "{k} must not be sent to a legacy model");
+        }
+        assert_eq!(beta_header(&r), BETA_PROMPT_CACHING);
+    }
+
+    #[test]
+    fn thinking_models_get_adaptive_binding_effort_and_server_trimming() {
+        let mut r = request("claude-opus-5-5");
+        apply_model_family(&mut r, None, true);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["thinking"]["type"], "adaptive");
+        assert_eq!(
+            v["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            "drop_block"
+        );
+        assert_eq!(v["output_config"]["effort"], "high");
+        assert_eq!(
+            v["context_management"]["edits"][0]["type"],
+            "clear_tool_uses_20250919"
+        );
+        assert_eq!(v["fallbacks"], "default");
+        assert!(v.get("temperature").is_none());
+        let betas = beta_header(&r);
+        for b in [
+            BETA_THINKING_BINDING,
+            BETA_CONTEXT_MANAGEMENT,
+            BETA_FALLBACK_DEFAULT,
+        ] {
+            assert!(betas.contains(b), "missing beta {b}");
+        }
+    }
+
+    #[test]
+    fn one_shot_calls_skip_context_editing_and_honor_effort() {
+        let mut r = request("claude-sonnet-5-5");
+        apply_model_family(&mut r, Some("low"), false);
+        assert!(r.context_management.is_none());
+        assert_eq!(r.output_config.unwrap()["effort"], "low");
+    }
+
+    #[test]
+    fn response_keeps_thinking_blocks_verbatim() {
+        let raw = json!({
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sig=="},
+                {"type": "text", "text": "hi"},
+                {"type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "a"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let resp: MessagesResponse = serde_json::from_value(raw.clone()).unwrap();
+        // History echo is byte-identical, thinking signature included.
+        assert_eq!(Value::Array(resp.content.clone()), raw["content"]);
+        let blocks = resp.blocks();
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(blocks[1], ContentBlock::ToolUse { .. }));
+        assert_eq!(extract_text(&blocks).unwrap(), "hi");
+        assert!(resp.refusal().is_none());
+    }
+
+    #[test]
+    fn refusal_is_an_error_not_empty_text() {
+        let resp: MessagesResponse = serde_json::from_value(json!({
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber"},
+            "usage": {"input_tokens": 1, "output_tokens": 0}
+        }))
+        .unwrap();
+        assert!(resp.refusal().unwrap().contains("cyber"));
     }
 }

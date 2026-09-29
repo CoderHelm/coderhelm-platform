@@ -6,6 +6,21 @@
 /// run's upload, silently resurrecting deleted memories).
 pub mod memlock;
 
+/// True for Claude models that think on every request (Opus 5.x, Sonnet 5.x,
+/// Fable, Mythos). They reject non-default sampling params, `budget_tokens` and
+/// disabled thinking, lead responses with `thinking` blocks that must be echoed
+/// back unchanged, and default to effort "medium"/"high" per model — so callers
+/// set effort explicitly and never send `temperature`.
+pub fn is_always_thinking_model(model_id: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-",
+        "claude-mythos-",
+    ];
+    PREFIXES.iter().any(|p| model_id.starts_with(p))
+}
+
 use sha2::{Digest, Sha256};
 
 /// Stable content hash for a ticket's context: title + body + image keys.
@@ -234,5 +249,15 @@ mod tests {
             ticket_context_hash("ab", "c", &[]),
             ticket_context_hash("a", "bc", &[])
         );
+    }
+
+    #[test]
+    fn always_thinking_models() {
+        assert!(is_always_thinking_model("claude-opus-5-5"));
+        assert!(is_always_thinking_model("claude-sonnet-5-5"));
+        assert!(is_always_thinking_model("claude-fable-5-1"));
+        assert!(!is_always_thinking_model("claude-opus-4-8"));
+        assert!(!is_always_thinking_model("claude-sonnet-4-6"));
+        assert!(!is_always_thinking_model("claude-haiku-4-5"));
     }
 }

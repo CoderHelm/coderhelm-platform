@@ -58,12 +58,12 @@ impl ModelProvider {
             .get("primary_model")
             .and_then(|v| v.as_s().ok())
             .cloned()
-            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+            .unwrap_or_else(|| "claude-sonnet-5-5".to_string());
         let heavy_model = item
             .get("heavy_model")
             .and_then(|v| v.as_s().ok())
             .cloned()
-            .unwrap_or_else(|| "claude-opus-4-8".to_string());
+            .unwrap_or_else(|| "claude-opus-5-5".to_string());
 
         info!(team_id, "Loaded Anthropic provider");
         Ok(Self {
@@ -120,6 +120,7 @@ pub async fn converse(
         opts.max_turns,
         opts.max_tokens,
         opts.deadline,
+        opts.effort,
         on_tool_call,
         conversation_log,
     )

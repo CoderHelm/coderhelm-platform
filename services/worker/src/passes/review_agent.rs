@@ -557,6 +557,7 @@ pub async fn generate_review(
             max_turns: 30,
             max_tokens: 8192,
             deadline: None,
+            effort: None,
         },
         None,
         None,

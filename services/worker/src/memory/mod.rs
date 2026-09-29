@@ -310,13 +310,19 @@ impl AgentMemory {
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&serde_json::json!({
-                // Team-configured model — the hardcoded model id silently
-                // broke extraction for teams whose keys lack access to it.
-                "model": model_id,
-                "max_tokens": 1024,
-                "messages": [{"role": "user", "content": extraction_prompt}],
-            }))
+            .json(&{
+                let mut body = serde_json::json!({
+                    // Team-configured model — the hardcoded model id silently
+                    // broke extraction for teams whose keys lack access to it.
+                    "model": model_id,
+                    "max_tokens": 4096,
+                    "messages": [{"role": "user", "content": extraction_prompt}],
+                });
+                if common::is_always_thinking_model(model_id) {
+                    body["output_config"] = serde_json::json!({"effort": "low"});
+                }
+                body
+            })
             .send()
             .await
         {
@@ -335,9 +341,10 @@ impl AgentMemory {
             }
         };
 
+        // First TEXT block — thinking models lead with a `thinking` block.
         let text = body["content"]
             .as_array()
-            .and_then(|arr| arr.first())
+            .and_then(|arr| arr.iter().find(|b| b["type"] == "text"))
             .and_then(|b| b["text"].as_str())
             .unwrap_or("");
 

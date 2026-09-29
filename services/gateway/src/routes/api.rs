@@ -3006,7 +3006,10 @@ pub async fn update_notification_prefs(
 // ─── Instructions ───────────────────────────────────────────────────
 
 /// Look up the GitHub installation ID from the team's META record in the main table.
-async fn get_team_installation_id(state: &AppState, team_id: &str) -> Result<u64, StatusCode> {
+pub(crate) async fn get_team_installation_id(
+    state: &AppState,
+    team_id: &str,
+) -> Result<u64, StatusCode> {
     let result = state
         .dynamo
         .get_item()
@@ -3650,6 +3653,9 @@ pub async fn update_workflow_settings(
 
 /// Allowed model IDs for the Anthropic provider.
 const ALLOWED_MODELS: &[&str] = &[
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
@@ -3765,18 +3771,15 @@ pub async fn update_model_provider(
             .ok_or(StatusCode::BAD_REQUEST)?
     };
 
-    // Validate the API key by making a minimal test call to Anthropic.
+    // Validate the key (and its access to the chosen model) via the Models API
+    // — no generation, so it works the same for thinking and non-thinking models.
     let client = reqwest::Client::new();
     let test_resp = client
-        .post("https://api.anthropic.com/v1/messages")
+        .get(format!(
+            "https://api.anthropic.com/v1/models/{primary_model}"
+        ))
         .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&serde_json::json!({
-            "model": primary_model,
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 1
-        }))
         .send()
         .await
         .map_err(|e| {

@@ -165,6 +165,7 @@ async fn main() -> Result<(), Error> {
         .route("/reviewer/reviews", get(routes::reviewer::list_reviews))
         .route("/reviewer/review", get(routes::reviewer::get_review))
         .route("/reviewer/review/rate", post(routes::reviewer::rate_review))
+        .route("/reviewer/re-review", post(routes::reviewer::re_review))
         // Code graph — its own feature (serves the reviewer AND the PR maker)
         .route("/graph/repos", get(routes::graph::list_repos))
         .route("/graph/status", get(routes::graph::status))

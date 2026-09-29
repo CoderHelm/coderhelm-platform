@@ -10,9 +10,9 @@ use axum::{http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info};
 
-use crate::models::Claims;
+use crate::models::{Claims, ReviewMessage, WorkerMessage};
 use crate::AppState;
 
 fn attr_s(val: &str) -> AttributeValue {
@@ -591,4 +591,67 @@ mod tests {
         truncate_on_boundary(&mut s, 4000);
         assert_eq!(s, "short review");
     }
+}
+
+#[derive(serde::Deserialize)]
+pub struct ReReviewBody {
+    /// "owner/name"
+    pub repo: String,
+    pub pr: u64,
+}
+
+/// Double-click window: one dashboard click ⇒ one review job, even if the
+/// button is pressed again (or the request retried) within this many seconds.
+const RE_REVIEW_DEDUP_SECS: i64 = 30;
+
+/// POST /api/reviewer/re-review — review a PR's CURRENT head now, from the
+/// dashboard (no GitHub label/comment needed). Same job the GitHub
+/// "@coderhelm re-review" path enqueues: trigger "rerequest" (explicit ask →
+/// the worker bypasses the label/draft gates), empty head_sha (worker resolves
+/// the live head), and a dedup key so a double click can't double-review.
+pub async fn re_review(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<ReReviewBody>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+
+    validate_repo(&body.repo)?;
+    let (owner, name) = body.repo.split_once('/').ok_or(StatusCode::BAD_REQUEST)?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') || body.pr == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let cfg = super::github_webhook::load_review_config(&state, &claims.team_id, owner, name).await;
+    if !cfg.enabled || cfg.killed {
+        return Ok(Json(json!({
+            "status": "skipped",
+            "reason": "Review is off for this repo — enable it in Reviewer settings."
+        })));
+    }
+    if let Some(reason) = super::github_webhook::check_run_budget(&state, &claims.team_id).await {
+        return Ok(Json(json!({ "status": "skipped", "reason": reason })));
+    }
+    let installation_id = super::api::get_team_installation_id(&state, &claims.team_id).await?;
+
+    let window = chrono::Utc::now().timestamp() / RE_REVIEW_DEDUP_SECS;
+    let message = WorkerMessage::Review(ReviewMessage {
+        team_id: claims.team_id.clone(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number: body.pr,
+        head_sha: String::new(),
+        label: cfg.label,
+        question: None,
+        trigger: "rerequest".to_string(),
+        dedup_key: format!("dashboard#pr{}#{window}", body.pr),
+    });
+    super::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &message).await?;
+    info!(
+        owner,
+        name,
+        pr = body.pr,
+        "Reviewer: dashboard re-review → review job"
+    );
+    Ok(Json(json!({ "status": "queued" })))
 }

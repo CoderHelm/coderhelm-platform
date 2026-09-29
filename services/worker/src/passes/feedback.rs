@@ -419,6 +419,7 @@ Rules:
             max_turns: 40,
             max_tokens: 16384,
             deadline: None,
+            effort: None,
         },
         None,
         None,
