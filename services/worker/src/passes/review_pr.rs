@@ -285,9 +285,25 @@ pub async fn run(
         .await
         .unwrap_or_else(|e| format!("I couldn't answer that automatically ({e})."));
         let body = format!("{answer}{RATING_FOOTER}");
-        github
-            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &body)
-            .await?;
+        // Asked inside an inline review thread → answer in that thread.
+        match msg.reply_to_comment_id {
+            Some(comment_id) => {
+                github
+                    .reply_to_review_comment(
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        msg.pr_number,
+                        comment_id,
+                        &body,
+                    )
+                    .await?;
+            }
+            None => {
+                github
+                    .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &body)
+                    .await?;
+            }
+        }
         store_review_record(
             state, &msg, &head_sha, "QUESTION", "N/A", &answer, "COMMENT", "",
         )
@@ -381,6 +397,20 @@ pub async fn run(
     };
     let extra_context = format!("{graph_context}{ci_context}");
 
+    // CoderHelm's own still-open threads from earlier reviews: the re-review
+    // reports each as fixed (→ resolved below) or open (not re-posted).
+    let prior_threads = match github
+        .list_open_bot_review_threads(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "Could not list earlier review threads");
+            Vec::new()
+        }
+    };
+    let prior_context = review_agent::format_prior_threads(&prior_threads);
+
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(
         state,
@@ -395,9 +425,13 @@ pub async fn run(
         &instructions_block,
         graph.as_ref(),
         &extra_context,
+        &prior_context,
         &mut usage,
     )
     .await;
+    let fixed_threads: Vec<&crate::clients::github::BotReviewThread> =
+        fixed_prior_threads(&prior_threads, &output.prior);
+    let still_open = prior_threads.len() - fixed_threads.len();
 
     // 2) Critic pass drops weak/false findings.
     let findings =
@@ -479,6 +513,13 @@ pub async fn run(
             postable.unanchored_md
         ));
     }
+    if !prior_threads.is_empty() {
+        full_body.push_str(&format!(
+            "\n\n#### Earlier comments\n{} fixed and resolved · {} still open",
+            fixed_threads.len(),
+            still_open
+        ));
+    }
     full_body.push_str(RATING_FOOTER);
 
     // De-spam: only comment when there's news. If CoderHelm's last recorded verdict
@@ -493,7 +534,13 @@ pub async fn run(
     // see it. Only webhook-driven re-reviews (a self-fix commit, a re-label) get
     // silenced when the verdict didn't change.
     let explicit = msg.question.is_some() || msg.trigger == "reply" || msg.trigger == "rerequest";
-    let should_comment = explicit || prev_verdict.as_deref() != Some(verdict);
+    // News = the verdict changed, OR there are new findings, OR earlier comments
+    // got fixed. A same-verdict re-review that fixed one of three issues (and
+    // found nothing new) used to be silently dropped here.
+    let has_news = prev_verdict.as_deref() != Some(verdict)
+        || !findings.is_empty()
+        || !fixed_threads.is_empty();
+    let should_comment = explicit || has_news;
 
     // Post ONE batched review with inline comments; fall back to body-only if
     // GitHub rejects an anchor (a bad line must never drop the whole verdict).
@@ -520,6 +567,13 @@ pub async fn run(
                     &full_body,
                 )
                 .await?;
+        }
+        // Resolve the earlier threads this head fixed (after the review is up, so
+        // the "N fixed" note is visible when they collapse).
+        for t in &fixed_threads {
+            if let Err(e) = github.resolve_review_thread(&t.id).await {
+                warn!(pr = msg.pr_number, thread = %t.id, error = %e, "Failed to resolve fixed thread");
+            }
         }
     }
 
@@ -551,8 +605,16 @@ pub async fn run(
         risk = %risk,
         findings = findings.len(),
         inline = postable.inline.len(),
+        prior_open = prior_threads.len(),
+        prior_fixed = fixed_threads.len(),
         posted_as = effective_event,
-        "Reviewer posted verdict"
+        posted = should_comment,
+        "{}",
+        if should_comment {
+            "Reviewer posted verdict"
+        } else {
+            "Reviewer verdict unchanged — not posted (nothing new)"
+        }
     );
 
     // ── Post-approval actions (opt-in, off by default) ──
@@ -954,4 +1016,63 @@ async fn store_review_record(
         warn!(pr = msg.pr_number, error = %e, "Failed to persist review record (non-fatal)");
     }
     sk
+}
+
+/// Earlier threads the model reported fixed. Indices that are out of range or
+/// duplicated are ignored; anything not explicitly "fixed" stays open.
+fn fixed_prior_threads<'a>(
+    prior: &'a [crate::clients::github::BotReviewThread],
+    statuses: &[review_agent::PriorStatus],
+) -> Vec<&'a crate::clients::github::BotReviewThread> {
+    let mut seen = std::collections::HashSet::new();
+    statuses
+        .iter()
+        .filter(|s| s.is_fixed() && s.index < prior.len() && seen.insert(s.index))
+        .map(|s| &prior[s.index])
+        .collect()
+}
+
+#[cfg(test)]
+mod prior_thread_tests {
+    use super::*;
+    use crate::clients::github::BotReviewThread;
+    use review_agent::PriorStatus;
+
+    fn t(id: &str) -> BotReviewThread {
+        BotReviewThread {
+            id: id.into(),
+            path: "a.rs".into(),
+            line: 1,
+            outdated: false,
+            body: "x".into(),
+        }
+    }
+    fn st(index: usize, status: &str) -> PriorStatus {
+        PriorStatus {
+            index,
+            status: status.into(),
+        }
+    }
+
+    #[test]
+    fn only_explicit_fixed_in_range_once() {
+        let prior = vec![t("A"), t("B"), t("C")];
+        let statuses = vec![
+            st(0, "fixed"),
+            st(1, "open"),
+            st(0, "FIXED"), // duplicate
+            st(9, "fixed"), // out of range
+        ];
+        let got: Vec<&str> = fixed_prior_threads(&prior, &statuses)
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(got, vec!["A"]);
+    }
+
+    #[test]
+    fn missing_statuses_mean_nothing_resolved() {
+        let prior = vec![t("A"), t("B")];
+        assert!(fixed_prior_threads(&prior, &[]).is_empty());
+    }
 }

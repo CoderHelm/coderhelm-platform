@@ -242,6 +242,10 @@ pub struct ReviewMessage {
     /// Empty ⇒ no dedup (old in-flight messages / paths that don't set it).
     #[serde(default)]
     pub dedup_key: String,
+    /// Set when the ask came from a reply inside an inline review thread: the
+    /// answer is posted back into that thread instead of the conversation.
+    #[serde(default)]
+    pub reply_to_comment_id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

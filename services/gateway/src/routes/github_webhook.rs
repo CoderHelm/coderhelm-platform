@@ -172,13 +172,10 @@ pub async fn handle(
         "pull_request_review" => {
             handle_pr_review(&state, &payload, installation_id, &team_id).await
         }
-        "pull_request_review_comment" | "pull_request_review_thread" => {
-            info!(
-                event_type,
-                "Review comment event — handled via pull_request_review"
-            );
-            Ok(StatusCode::OK)
+        "pull_request_review_comment" => {
+            handle_review_comment(&state, &payload, installation_id, &team_id).await
         }
+        "pull_request_review_thread" => Ok(StatusCode::OK),
         "push" => handle_push(&state, &payload, installation_id, &team_id).await,
         "check_run" => handle_check_run(&state, &payload, installation_id, &team_id).await,
         "check_suite" => handle_check_suite(&state, &payload, installation_id, &team_id).await,
@@ -291,6 +288,127 @@ async fn handle_issue_event(
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
 
+/// A comment addressed to the reviewer: `@coderhelm …` anywhere (any case — GitHub
+/// autocompletes the display name, e.g. `@CoderHelm`), or `/coderhelm …` at the start.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReviewerAsk {
+    /// Asked for a fresh verdict ("re-review", "rereview", "review again", "review").
+    pub rereview: bool,
+    /// Anything else is a question for the reviewer to answer.
+    pub question: Option<String>,
+}
+
+pub(crate) fn parse_reviewer_ask(body: &str) -> Option<ReviewerAsk> {
+    const MENTION: &str = "@coderhelm";
+    const SLASH: &str = "/coderhelm";
+    // ASCII lowercasing keeps byte offsets identical to `body`.
+    let lower = body.to_ascii_lowercase();
+    let slash = lower.trim_start().starts_with(SLASH);
+    if !slash && !lower.contains(MENTION) {
+        return None;
+    }
+    // Strip every address token (and a trailing "[bot]") to recover the message.
+    let mut cleaned = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        if lower[i..].starts_with(MENTION) {
+            i += MENTION.len();
+            if lower[i..].starts_with("[bot]") {
+                i += "[bot]".len();
+            }
+            cleaned.push(' ');
+            continue;
+        }
+        let ch = body[i..].chars().next().unwrap_or(' ');
+        cleaned.push(ch);
+        i += ch.len_utf8();
+    }
+    let mut cleaned = cleaned.trim().to_string();
+    if cleaned.to_ascii_lowercase().starts_with(SLASH) {
+        cleaned = cleaned[SLASH.len()..].trim().to_string();
+    }
+    let l = cleaned.to_lowercase();
+    let rereview = l.contains("re-review")
+        || l.contains("rereview")
+        || l.contains("review again")
+        || l == "review"
+        || l.is_empty();
+    Some(ReviewerAsk {
+        rereview,
+        question: if rereview { None } else { Some(cleaned) },
+    })
+}
+
+/// A reply inside an inline review thread (`pull_request_review_comment`). Same
+/// asks as a conversation comment — `@coderhelm re-review` / `@coderhelm <question>` —
+/// and the answer goes back into that thread. On CoderHelm's own PRs only a
+/// re-review ask is handled here; other thread replies there are fix requests,
+/// handled by the feedback path (pull_request_review).
+async fn handle_review_comment(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+) -> Result<StatusCode, StatusCode> {
+    if payload["action"].as_str() != Some("created") {
+        return Ok(StatusCode::OK);
+    }
+    let commenter = payload["comment"]["user"]["login"].as_str().unwrap_or("");
+    if commenter.contains("coderhelm") {
+        return Ok(StatusCode::OK);
+    }
+    let body = payload["comment"]["body"].as_str().unwrap_or("");
+    let Some(ask) = parse_reviewer_ask(body) else {
+        return Ok(StatusCode::OK);
+    };
+    let pr = &payload["pull_request"];
+    let bot_pr = pr["user"]["login"]
+        .as_str()
+        .unwrap_or("")
+        .contains("coderhelm");
+    if bot_pr && !ask.rereview {
+        return Ok(StatusCode::OK);
+    }
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let pr_number = pr["number"].as_u64().unwrap_or(0);
+    let comment_id = payload["comment"]["id"].as_u64().unwrap_or(0);
+    let cfg = load_review_config(state, team_id, owner, name).await;
+    if !cfg.enabled || cfg.killed || pr_number == 0 || comment_id == 0 {
+        info!(
+            owner,
+            name, pr_number, "Reviewer: thread reply ignored — review is off for this repo"
+        );
+        return Ok(StatusCode::OK);
+    }
+    if let Some(reason) = check_run_budget(state, team_id).await {
+        post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
+        return Ok(StatusCode::OK);
+    }
+    info!(
+        owner,
+        name,
+        pr_number,
+        is_rereview = ask.rereview,
+        "Reviewer: thread reply → review job"
+    );
+    let message = WorkerMessage::Review(ReviewMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
+        head_sha: String::new(),
+        label: cfg.label,
+        question: ask.question,
+        trigger: "reply".to_string(),
+        dedup_key: format!("reply#{comment_id}"),
+        reply_to_comment_id: Some(comment_id),
+    });
+    send_to_queue(state, &state.config.ticket_queue_url, &message).await
+}
+
 async fn handle_issue_comment(
     state: &AppState,
     payload: &Value,
@@ -305,10 +423,19 @@ async fn handle_issue_comment(
     let body = payload["comment"]["body"].as_str().unwrap_or("");
     let commenter = payload["comment"]["user"]["login"].as_str().unwrap_or("");
 
-    // If this comment is on a PR opened by coderhelm, treat as feedback
+    // A comment addressed to the bot ("@CoderHelm …" in any case, or "/coderhelm …").
+    let ask = if commenter.contains("coderhelm") {
+        None
+    } else {
+        parse_reviewer_ask(body)
+    };
+
+    // If this comment is on a PR opened by coderhelm, treat as feedback — except an
+    // explicit re-review ask, which is the reviewer's job (falls through below).
     if payload["issue"]["pull_request"].is_object() {
         let pr_user = payload["issue"]["user"]["login"].as_str().unwrap_or("");
-        if pr_user.contains("coderhelm") && !commenter.contains("coderhelm") {
+        let rereview_ask = ask.as_ref().is_some_and(|a| a.rereview);
+        if pr_user.contains("coderhelm") && !commenter.contains("coderhelm") && !rereview_ask {
             let repo = &payload["repository"];
             let owner = repo["owner"]["login"].as_str().unwrap_or("");
             let name = repo["name"].as_str().unwrap_or("");
@@ -358,9 +485,7 @@ async fn handle_issue_comment(
         // the bot ("@coderhelm re-review" or "@coderhelm <question>") re-runs the
         // review or answers the question — instead of opening a brand-new ticket.
         // Requires an explicit mention/command so unrelated PR chatter never fires.
-        if !commenter.contains("coderhelm")
-            && (body.contains("@coderhelm") || body.trim_start().starts_with("/coderhelm"))
-        {
+        if let Some(ask) = ask {
             let repo = &payload["repository"];
             let owner = repo["owner"]["login"].as_str().unwrap_or("");
             let name = repo["name"].as_str().unwrap_or("");
@@ -372,26 +497,11 @@ async fn handle_issue_comment(
                         .await;
                     return Ok(StatusCode::OK);
                 }
-                // Strip the address token to recover the human's actual message.
-                let cleaned = body
-                    .replace("@coderhelm", " ")
-                    .trim()
-                    .trim_start_matches("/coderhelm")
-                    .trim()
-                    .to_string();
-                let lower = cleaned.to_lowercase();
-                let is_rereview = lower.contains("re-review")
-                    || lower.contains("rereview")
-                    || lower.contains("review again")
-                    || lower == "review";
                 // Re-review → fresh verdict; anything else → a question the reviewer
                 // answers. Empty head_sha makes the worker resolve the PR's current
                 // head, so a reply always targets the latest code.
-                let question = if is_rereview || cleaned.is_empty() {
-                    None
-                } else {
-                    Some(cleaned)
-                };
+                let is_rereview = ask.rereview;
+                let question = ask.question;
                 info!(
                     owner,
                     name, pr_number, is_rereview, "Reviewer: reply → review job"
@@ -412,15 +522,25 @@ async fn handle_issue_comment(
                     question,
                     trigger: "reply".to_string(),
                     dedup_key: format!("reply#{comment_id}"),
+                    reply_to_comment_id: None,
                 });
                 return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+            } else {
+                info!(
+                    owner,
+                    name,
+                    pr_number,
+                    "Reviewer: @coderhelm reply ignored — review is off for this repo"
+                );
             }
+            return Ok(StatusCode::OK);
         }
     }
 
     // Trigger on `/coderhelm` slash command or @coderhelm mention (issues or non-bot PRs)
-    let is_slash = body.starts_with("/coderhelm");
-    let is_mention = body.contains("@coderhelm");
+    let lower_body = body.to_ascii_lowercase();
+    let is_slash = lower_body.trim_start().starts_with("/coderhelm");
+    let is_mention = lower_body.contains("@coderhelm");
     if !is_slash && !is_mention {
         return Ok(StatusCode::OK);
     }
@@ -528,6 +648,7 @@ async fn handle_pull_request(
             question: None,
             trigger: "rerequest".to_string(),
             dedup_key: format!("rerequest#{req_head}"),
+            reply_to_comment_id: None,
         });
         return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
     }
@@ -1689,6 +1810,15 @@ async fn handle_review_trigger(
         _ => false,
     };
     if !triggered {
+        if action == "synchronize" {
+            info!(
+                owner,
+                name,
+                pr_number,
+                label = %cfg.label,
+                "Reviewer skipped — new commit on a PR without the review label"
+            );
+        }
         return Ok(StatusCode::OK);
     }
 
@@ -1755,6 +1885,7 @@ async fn handle_review_trigger(
         question: None,
         trigger: action.to_string(),
         dedup_key,
+        reply_to_comment_id: None,
     });
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
@@ -2201,5 +2332,60 @@ async fn post_limit_comment(
         .await
     {
         warn!("Failed to post limit comment: {e}");
+    }
+}
+
+#[cfg(test)]
+mod reviewer_ask_tests {
+    use super::{parse_reviewer_ask, ReviewerAsk};
+
+    fn rereview() -> Option<ReviewerAsk> {
+        Some(ReviewerAsk {
+            rereview: true,
+            question: None,
+        })
+    }
+
+    #[test]
+    fn mention_is_case_insensitive() {
+        assert_eq!(parse_reviewer_ask("@CoderHelm re-review"), rereview());
+        assert_eq!(parse_reviewer_ask("@CODERHELM rereview please"), rereview());
+        assert_eq!(parse_reviewer_ask("@coderhelm review again"), rereview());
+        assert_eq!(parse_reviewer_ask("@coderhelm[bot] re-review"), rereview());
+        assert_eq!(parse_reviewer_ask("@CoderHelm"), rereview());
+    }
+
+    #[test]
+    fn slash_command() {
+        assert_eq!(parse_reviewer_ask("/coderhelm review"), rereview());
+        assert_eq!(parse_reviewer_ask("  /CoderHelm re-review"), rereview());
+    }
+
+    #[test]
+    fn question_keeps_original_text() {
+        assert_eq!(
+            parse_reviewer_ask("@CoderHelm why is `refund` unsafe here?"),
+            Some(ReviewerAsk {
+                rereview: false,
+                question: Some("why is `refund` unsafe here?".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn unaddressed_comments_are_ignored() {
+        assert_eq!(parse_reviewer_ask("lgtm, merging"), None);
+        assert_eq!(parse_reviewer_ask("see coderhelm docs"), None);
+    }
+
+    #[test]
+    fn non_ascii_body_is_safe() {
+        assert_eq!(
+            parse_reviewer_ask("@CoderHelm ¿por qué? 🚀"),
+            Some(ReviewerAsk {
+                rereview: false,
+                question: Some("¿por qué? 🚀".into()),
+            })
+        );
     }
 }
