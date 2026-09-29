@@ -7,6 +7,10 @@ pub struct ConverseOptions {
     /// Optional deadline (wall-clock Instant). When <120s remain, the loop
     /// injects a "wrap up now" message and allows one final turn before exiting.
     pub deadline: Option<std::time::Instant>,
+    /// Reasoning effort on always-thinking models ("low" | "medium" | "high" |
+    /// "xhigh" | "max"); None → "high". Ignored by older models. Set "low" for
+    /// short single-answer calls so thinking doesn't eat a small `max_tokens`.
+    pub effort: Option<&'static str>,
 }
 
 const DEFAULT_MAX_TURNS: usize = 40;
@@ -17,6 +21,7 @@ impl Default for ConverseOptions {
             max_turns: DEFAULT_MAX_TURNS,
             max_tokens: 16384,
             deadline: None,
+            effort: None,
         }
     }
 }

@@ -436,20 +436,15 @@ fn sanitize_error(msg: &str) -> String {
             break;
         }
     }
-    // Remove model IDs
-    let patterns = [
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-        "claude-opus-4-20250514",
-        "claude-sonnet-4-6",
-        "claude-sonnet-4-5",
-        "claude-sonnet-4-20250514",
-        "claude-haiku-4-5",
-    ];
-    for p in &patterns {
-        s = s.replace(p, "");
-    }
+    // Remove model IDs — any `claude-…` token, so new models never leak.
+    s = s
+        .split(' ')
+        .filter(|w| {
+            !w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-')
+                .starts_with("claude-")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     s = s.replace("Anthropic API error", "An error occurred during processing");
     // Collapse extra whitespace
     s.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -5110,6 +5105,7 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
                 max_turns: 1,
                 max_tokens: 128,
                 deadline: None,
+                effort: Some("low"),
             },
             None,
             None,
@@ -5809,6 +5805,7 @@ If everything is clean, respond with "CLEAN" and nothing else."#,
             max_turns: 15,
             max_tokens: 8192,
             deadline: None,
+            effort: None,
         },
         None,
         None,
@@ -5838,5 +5835,20 @@ If everything is clean, respond with "CLEAN" and nothing else."#,
              Do NOT remove existing functionality — only fix what's broken.\n\n{}",
             response
         )
+    }
+}
+
+#[cfg(test)]
+mod sanitize_error_tests {
+    use super::sanitize_error;
+
+    #[test]
+    fn strips_any_model_id() {
+        let out = sanitize_error("Anthropic API error 400 (model=claude-opus-5-5): bad model claude-fable-5-1, try claude-sonnet-5-5.");
+        assert!(!out.contains("claude-"), "{out}");
+        assert!(
+            out.starts_with("An error occurred during processing"),
+            "{out}"
+        );
     }
 }

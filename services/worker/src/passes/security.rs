@@ -96,6 +96,7 @@ Output format:
             max_turns: 35,
             max_tokens: 8192,
             deadline: None,
+            effort: None,
         },
         None,
         None,

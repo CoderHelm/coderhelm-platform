@@ -1491,12 +1491,12 @@ fn extract_repos_from_installation(payload: &Value) -> Vec<OnboardRepo> {
 
 /// Per-repo reviewer-agent config. OFF by default — the bulletproof default so
 /// the reviewer never touches a repo until a human explicitly opts it in.
-struct ReviewConfig {
-    enabled: bool,
+pub(crate) struct ReviewConfig {
+    pub(crate) enabled: bool,
     /// PR label that triggers a review.
-    label: String,
+    pub(crate) label: String,
     /// Hard kill switch — blocks ALL reviewer action regardless of `enabled`.
-    killed: bool,
+    pub(crate) killed: bool,
 }
 
 impl Default for ReviewConfig {
@@ -1509,7 +1509,7 @@ impl Default for ReviewConfig {
     }
 }
 
-async fn load_review_config(
+pub(crate) async fn load_review_config(
     state: &AppState,
     team_id: &str,
     owner: &str,
@@ -1820,7 +1820,7 @@ async fn claim_review_slot(
     }
 }
 
-async fn send_to_queue(
+pub(crate) async fn send_to_queue(
     state: &AppState,
     queue_url: &str,
     message: &WorkerMessage,

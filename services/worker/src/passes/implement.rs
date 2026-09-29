@@ -450,6 +450,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         },
         max_tokens: 16384,
         deadline,
+        effort: None,
     };
 
     let on_tool: Option<Box<llm::OnToolCall>> = if let Some(rid) = run_id {
@@ -604,6 +605,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
                 max_turns: 20,
                 max_tokens: 16384,
                 deadline,
+                effort: None,
             };
             if let Err(e) = provider::converse(
                 state,

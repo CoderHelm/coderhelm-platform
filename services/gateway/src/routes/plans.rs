@@ -2389,7 +2389,7 @@ pub async fn plan_chat(
                 .or_else(|| item.get("primary_model").and_then(|v| v.as_s().ok()))
         })
         .cloned()
-        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+        .unwrap_or_else(|| "claude-sonnet-5-5".to_string());
 
     // Agentic loop — up to 5 tool-use turns for plan chat (gateway has 30s timeout)
     let max_turns = 5;
@@ -2403,13 +2403,14 @@ pub async fn plan_chat(
     for turn in 0..max_turns {
         let mut body = json!({
             "model": model_id,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
             "system": [{"type": "text", "text": ctx.system_prompt, "cache_control": {"type": "ephemeral"}}],
             "messages": api_messages,
         });
-        // Opus models don't support temperature
-        if !model_id.contains("opus") {
-            body["temperature"] = json!(0.7);
+        // No sampling params: current models reject non-default temperature.
+        // Always-thinking models: explicit effort (defaults differ per model).
+        if common::is_always_thinking_model(&model_id) {
+            body["output_config"] = json!({"effort": "medium"});
         }
         if !ctx.tools.is_empty() {
             body["tools"] = json!(ctx.tools);
@@ -2673,14 +2674,15 @@ async fn run_anthropic_stream(
     for turn in 0..max_turns {
         let mut body = json!({
             "model": model_id,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
             "stream": true,
             "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
             "messages": messages,
         });
-        // Opus models don't support temperature
-        if !model_id.contains("opus") {
-            body["temperature"] = json!(0.7);
+        // No sampling params: current models reject non-default temperature.
+        // Always-thinking models: explicit effort (defaults differ per model).
+        if common::is_always_thinking_model(model_id) {
+            body["output_config"] = json!({"effort": "medium"});
         }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
@@ -2751,6 +2753,11 @@ async fn run_anthropic_stream(
         let mut active_tool_name = String::new();
         let mut active_tool_input = String::new();
         let mut stop_reason = String::new();
+        // Every content block by stream index, rebuilt verbatim (thinking text +
+        // signature included) — thinking blocks must go back unchanged.
+        let mut blocks: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+        let mut block_json: std::collections::HashMap<u64, String> =
+            std::collections::HashMap::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -2779,6 +2786,8 @@ async fn run_anthropic_stream(
                 match event["type"].as_str() {
                     Some("content_block_start") => {
                         if let Some(cb) = event.get("content_block") {
+                            let idx = event["index"].as_u64().unwrap_or(0);
+                            blocks.insert(idx, cb.clone());
                             if cb["type"].as_str() == Some("tool_use") {
                                 active_tool_id = cb["id"].as_str().unwrap_or("").to_string();
                                 active_tool_name = cb["name"].as_str().unwrap_or("").to_string();
@@ -2799,6 +2808,10 @@ async fn run_anthropic_stream(
                     }
                     Some("content_block_delta") => {
                         if let Some(delta) = event.get("delta") {
+                            let idx = event["index"].as_u64().unwrap_or(0);
+                            if let Some(block) = blocks.get_mut(&idx) {
+                                accumulate_delta(block, delta, block_json.entry(idx).or_default());
+                            }
                             match delta["type"].as_str() {
                                 Some("text_delta") => {
                                     if let Some(text) = delta["text"].as_str() {
@@ -2818,6 +2831,14 @@ async fn run_anthropic_stream(
                         }
                     }
                     Some("content_block_stop") => {
+                        let idx = event["index"].as_u64().unwrap_or(0);
+                        if let (Some(block), Some(raw)) =
+                            (blocks.get_mut(&idx), block_json.get(&idx))
+                        {
+                            if block["type"].as_str() == Some("tool_use") {
+                                block["input"] = serde_json::from_str(raw).unwrap_or(json!({}));
+                            }
+                        }
                         if !active_tool_id.is_empty() {
                             tool_uses.push((
                                 active_tool_id.clone(),
@@ -2850,19 +2871,15 @@ async fn run_anthropic_stream(
             }
         }
 
-        // Build assistant message content for conversation state
-        let mut assistant_content: Vec<Value> = Vec::new();
-        if !assistant_text.is_empty() {
-            assistant_content.push(json!({"type": "text", "text": assistant_text}));
-        }
-        for (tu_id, tu_name, tu_input) in &tool_uses {
-            let input: Value = serde_json::from_str(tu_input).unwrap_or(json!({}));
-            assistant_content.push(json!({
-                "type": "tool_use",
-                "id": tu_id,
-                "name": tu_name,
-                "input": input
-            }));
+        // Assistant turn for conversation state: every block, in order, verbatim.
+        let assistant_content: Vec<Value> = blocks.into_values().collect();
+        if stop_reason == "refusal" && assistant_text.is_empty() {
+            let _ = tx
+                .send(sse_event(
+                    "text_delta",
+                    json!({"text": "The model declined this request. Try rephrasing it."}),
+                ))
+                .await;
         }
         if !assistant_content.is_empty() {
             messages.push(json!({"role": "assistant", "content": assistant_content}));
@@ -3081,7 +3098,7 @@ pub async fn plan_chat_stream(
                 .or_else(|| item.get("primary_model").and_then(|v| v.as_s().ok()))
         })
         .cloned()
-        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+        .unwrap_or_else(|| "claude-sonnet-5-5".to_string());
 
     // Move everything into the streaming task
     let team_id = claims.team_id.clone();
@@ -3712,5 +3729,88 @@ async fn github_list_directory(
         Ok(r) if r.status().as_u16() == 404 => format!("Directory not found: {path}"),
         Ok(r) => format!("GitHub API error: {}", r.status()),
         Err(e) => format!("Request failed: {e}"),
+    }
+}
+
+/// Apply one streaming `content_block_delta` to the block it belongs to.
+/// Tool input arrives as partial JSON and is parsed at `content_block_stop`.
+fn accumulate_delta(block: &mut Value, delta: &Value, partial_json: &mut String) {
+    let append = |block: &mut Value, field: &str, piece: &str| {
+        let cur = block[field].as_str().unwrap_or("").to_string();
+        block[field] = Value::String(cur + piece);
+    };
+    match delta["type"].as_str() {
+        Some("text_delta") => append(block, "text", delta["text"].as_str().unwrap_or("")),
+        Some("thinking_delta") => {
+            append(block, "thinking", delta["thinking"].as_str().unwrap_or(""))
+        }
+        Some("signature_delta") => {
+            block["signature"] = delta["signature"].clone();
+        }
+        Some("input_json_delta") => {
+            partial_json.push_str(delta["partial_json"].as_str().unwrap_or(""));
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod stream_block_tests {
+    use super::*;
+
+    #[test]
+    fn thinking_block_rebuilt_with_signature() {
+        let mut block = json!({"type": "thinking", "thinking": "", "signature": ""});
+        let mut raw = String::new();
+        accumulate_delta(
+            &mut block,
+            &json!({"type": "thinking_delta", "thinking": "a"}),
+            &mut raw,
+        );
+        accumulate_delta(
+            &mut block,
+            &json!({"type": "thinking_delta", "thinking": "b"}),
+            &mut raw,
+        );
+        accumulate_delta(
+            &mut block,
+            &json!({"type": "signature_delta", "signature": "s=="}),
+            &mut raw,
+        );
+        assert_eq!(
+            block,
+            json!({"type": "thinking", "thinking": "ab", "signature": "s=="})
+        );
+    }
+
+    #[test]
+    fn text_and_tool_json_accumulate() {
+        let mut text = json!({"type": "text", "text": ""});
+        let mut raw = String::new();
+        accumulate_delta(
+            &mut text,
+            &json!({"type": "text_delta", "text": "he"}),
+            &mut raw,
+        );
+        accumulate_delta(
+            &mut text,
+            &json!({"type": "text_delta", "text": "llo"}),
+            &mut raw,
+        );
+        assert_eq!(text["text"], "hello");
+
+        let mut tool = json!({"type": "tool_use", "id": "t", "name": "n", "input": {}});
+        let mut raw = String::new();
+        accumulate_delta(
+            &mut tool,
+            &json!({"type": "input_json_delta", "partial_json": "{\"a\":"}),
+            &mut raw,
+        );
+        accumulate_delta(
+            &mut tool,
+            &json!({"type": "input_json_delta", "partial_json": "1}"}),
+            &mut raw,
+        );
+        assert_eq!(raw, "{\"a\":1}");
     }
 }
