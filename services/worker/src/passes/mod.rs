@@ -476,6 +476,7 @@ pub mod resume;
 mod review;
 pub mod review_actions;
 pub mod review_agent;
+pub mod review_labels;
 pub mod review_pr;
 pub mod review_reminder;
 pub mod review_risk;

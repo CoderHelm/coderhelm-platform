@@ -50,6 +50,9 @@ pub struct ReviewOutput {
     /// Status of each of CoderHelm's earlier open threads (by prompt index).
     #[serde(default)]
     pub prior: Vec<PriorStatus>,
+    /// PR labels the model picked (only when the repo turned label picking on).
+    #[serde(default)]
+    pub labels: Vec<super::review_labels::LabelPick>,
 }
 
 /// The model's judgment of one earlier CoderHelm thread at the new head.
@@ -66,6 +69,26 @@ impl PriorStatus {
         self.status.eq_ignore_ascii_case("fixed")
     }
 }
+
+/// Prompt section for repos that require tests with behavior changes.
+pub const REQUIRE_TESTS_SECTION: &str = "\n## Tests are required in this repo\n\
+     A PR that ADDS behavior (a feature, endpoint, UI flow, option, job) must add tests that \
+     exercise it. A PR that CHANGES or FIXES behavior must add or UPDATE the tests covering that \
+     code so they assert the new behavior (a bug fix needs a test that would have caught it). \
+     Use your tools: find where this code is already tested (search for the changed symbols / \
+     files in test directories) and check the diff touches those tests. If tests are missing or \
+     stale, add ONE finding with category \"tests\" and severity \"blocking\", anchored on the \
+     main changed line, saying exactly what behavior needs a test and which existing test file \
+     to add it to or update (or where similar tests live). Not required for: pure refactors with \
+     no behavior change, docs, comments, formatting, config/infra values, dependency bumps, and \
+     generated files.\n";
+
+/// The critic's note for a repo that requires tests — so a correct
+/// "tests missing" finding isn't dropped as a style nit.
+pub const REQUIRE_TESTS_CRITIC_NOTE: &str = " This repo REQUIRES tests with behavior changes: a \
+     `tests` finding is REAL (keep it) when the diff adds or changes behavior and no added or \
+     updated test in the diff exercises it; drop it only if the diff does include such a test or \
+     the change has no behavior effect.";
 
 /// Prompt section listing CoderHelm's earlier unresolved threads, indexed so the
 /// model can report each one as fixed or still open.
@@ -567,9 +590,10 @@ pub async fn generate_review(
          {{\n  \"verdict\": \"APPROVE\" | \"REQUEST_CHANGES\",\n  \"risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n  \
          \"summary\": \"2-4 sentence overview\",\n  \"findings\": [{{\n    \"file\": \"path\", \"line\": <int, a line present on the RIGHT side of the diff>,\n    \
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
-         \"category\": \"bug|security|correctness|perf|convention|scope\", \"title\": \"short\",\n    \
+         \"category\": \"bug|security|correctness|perf|convention|scope|tests\", \"title\": \"short\",\n    \
          \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}],\n  \
-         \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"open\"}}]  (one per earlier comment listed, if any)\n}}\n\
+         \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"open\"}}]  (one per earlier comment listed, if any),\n  \
+         \"labels\": [{{\"name\": \"label\", \"reason\": \"changed file(s) that need it\"}}]  (only if a PR-labels section is given)\n}}\n\
          Use \"blocking\" ONLY for real bugs/risks that should stop the merge. If unsure, REQUEST_CHANGES.{graph_note}"
     );
     let prompt = format!(
@@ -618,12 +642,14 @@ pub async fn generate_review(
             summary: common::head_tail_str(&text, 4000),
             findings: vec![],
             prior: vec![],
+            labels: vec![],
         }),
         Err(e) => ReviewOutput {
             verdict: "REQUEST_CHANGES".to_string(),
             summary: format!("Automated review could not complete ({e}). Requesting a human look."),
             findings: vec![],
             prior: vec![],
+            labels: vec![],
         },
     }
 }
@@ -649,6 +675,7 @@ pub async fn critique_findings(
     provider: &ModelProvider,
     diff: &str,
     findings: Vec<Finding>,
+    require_tests: bool,
     usage: &mut TokenUsage,
 ) -> Vec<Finding> {
     if findings.is_empty() {
@@ -669,12 +696,18 @@ pub async fn critique_findings(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let system =
+    let base_system =
         "You are a strict code-review auditor. For each candidate finding, decide if it is \
                   a REAL, correct problem grounded in the diff — not a hallucination, not a style \
                   nit dressed as a bug, not a false claim about code that isn't shown. Default to \
                   DROP when uncertain. Output ONLY a fenced ```json block: \
                   {\"verdicts\":[{\"index\":<int>,\"keep\":<bool>}]} for every index.";
+    let system = if require_tests {
+        format!("{base_system}{REQUIRE_TESTS_CRITIC_NOTE}")
+    } else {
+        base_system.to_string()
+    };
+    let system = system.as_str();
     let prompt = format!("## Diff\n{diff}\n\n## Candidate findings\n{list}");
     let mut messages = vec![(
         "user".to_string(),
