@@ -167,7 +167,16 @@ pub fn prompt_section(candidates: &[RepoLabel], current: &[String], rules: &Labe
          that it needs (read the repo's docs / mapping files with your tools when they define \
          which code a label covers). Pick ONLY from this list, add nothing that isn't needed, \
          and give a one-line reason naming the changed file(s). Report them in `labels`; \
-         an empty list is a valid answer.\n",
+         an empty list is a valid answer.\n\
+         Be strict: a file path matching a label's area is NOT enough. Add a label only when \
+         the diff can change the BEHAVIOR that label's tests exercise — logic, data flow, API / \
+         payment calls, form validation, state, routing, feature flags, error handling. Purely \
+         presentational changes do not qualify, even inside that area: copy/text, fonts, \
+         colors, spacing, classNames/styles, icons, comments, renames with no behavior effect. \
+         Be strictest with labels that deploy (e.g. staging): they cost a shared environment, \
+         so add them only for a functional change that needs them. In the reason, name the \
+         behavior that changed (e.g. \"join checkout now sends startDate to createAccount\"), \
+         not just the file.\n",
     );
     for l in candidates {
         if l.description.trim().is_empty() {
@@ -493,6 +502,9 @@ mod tests {
         assert!(s.contains("Already on the PR: ch-review"));
         assert!(s.contains("E2E:join → CI:DEPLOY_STAGING"));
         assert!(s.contains("Payment tests need staging."));
+        // strict: path match alone isn't enough; cosmetic changes don't qualify
+        assert!(s.contains("a file path matching a label's area is NOT enough"));
+        assert!(s.contains("Purely presentational changes do not qualify"));
         assert_eq!(prompt_section(&[], &[], &r), "");
     }
 }
