@@ -451,9 +451,7 @@ pub async fn run(
                 .collect()
         })
         .unwrap_or_default();
-    let repo_labels: Vec<super::review_labels::RepoLabel> = if cfg.auto_labels
-        && !cfg.label_rules.allow.is_empty()
-    {
+    let repo_labels: Vec<super::review_labels::RepoLabel> = if cfg.auto_labels {
         match github
             .list_repo_labels(&msg.repo_owner, &msg.repo_name)
             .await
@@ -470,9 +468,18 @@ pub async fn run(
     } else {
         Vec::new()
     };
-    let label_candidates = super::review_labels::candidates(&repo_labels, &cfg.label_rules);
+    // Allowed labels: the settings' list, or (when empty) the labels the repo's
+    // own docs name — read in full here, since the prompt copy is size-capped.
+    let label_rules = if repo_labels.is_empty() || !cfg.label_rules.allow.is_empty() {
+        cfg.label_rules.clone()
+    } else {
+        let docs =
+            super::load_repo_docs_full(&github, &msg.repo_owner, &msg.repo_name, &head_sha).await;
+        super::review_labels::effective_rules(&cfg.label_rules, &repo_labels, &docs)
+    };
+    let label_candidates = super::review_labels::candidates(&repo_labels, &label_rules);
     let label_context =
-        super::review_labels::prompt_section(&label_candidates, &current_labels, &cfg.label_rules);
+        super::review_labels::prompt_section(&label_candidates, &current_labels, &label_rules);
     let tests_context = if cfg.require_tests {
         review_agent::REQUIRE_TESTS_SECTION
     } else {
@@ -504,12 +511,7 @@ pub async fn run(
     let label_decision = if label_candidates.is_empty() {
         super::review_labels::LabelDecision::default()
     } else {
-        super::review_labels::decide(
-            &output.labels,
-            &repo_labels,
-            &current_labels,
-            &cfg.label_rules,
-        )
+        super::review_labels::decide(&output.labels, &repo_labels, &current_labels, &label_rules)
     };
     for (name, why) in &label_decision.refused {
         info!(pr = msg.pr_number, label = %name, why = %why, "Reviewer label refused");

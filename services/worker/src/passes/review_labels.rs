@@ -86,6 +86,66 @@ fn pattern_matches(pattern: &str, label: &str) -> bool {
     }
 }
 
+/// The rules actually used for a review. With an explicit allow list in the
+/// repo's CoderHelm settings, that list is used as-is. Without one, the repo's
+/// own docs decide: a repo label is allowed when its docs (AGENTS.md, CLAUDE.md…)
+/// name it — exactly (`CI:DEPLOY_STAGING`) or as a family (`E2E:<area>`,
+/// `E2E:*`). So documenting a new label is all a team does to make it available.
+/// Doc-derived lists never include production labels (name contains "prod");
+/// those must be allowed explicitly in settings.
+pub fn effective_rules(
+    configured: &LabelRules,
+    repo_labels: &[RepoLabel],
+    docs: &str,
+) -> LabelRules {
+    if !configured.allow.is_empty() {
+        return configured.clone();
+    }
+    let allow = repo_labels
+        .iter()
+        .filter(|l| documented(&l.name, docs) && !is_production(&l.name))
+        .map(|l| l.name.clone())
+        .collect();
+    LabelRules {
+        allow,
+        ..configured.clone()
+    }
+}
+
+/// The docs mention this label by name, or its family (`PREFIX:<…>` / `PREFIX:*`).
+fn documented(name: &str, docs: &str) -> bool {
+    if name.trim().is_empty() {
+        return false;
+    }
+    let docs_l = docs.to_ascii_lowercase();
+    let name_l = name.to_ascii_lowercase();
+    if contains_token(&docs_l, &name_l) {
+        return true;
+    }
+    match name_l.find(':') {
+        Some(i) if i > 0 => {
+            let prefix = &name_l[..=i];
+            docs_l.contains(&format!("{prefix}<")) || docs_l.contains(&format!("{prefix}*"))
+        }
+        _ => false,
+    }
+}
+
+/// `needle` appears in `hay` not as part of a longer label-ish word
+/// (so `CI:E2E` doesn't match inside `CI:E2E_NIGHTLY`).
+fn contains_token(hay: &str, needle: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '/');
+    hay.match_indices(needle).any(|(i, _)| {
+        let before = hay[..i].chars().next_back();
+        let after = hay[i + needle.len()..].chars().next();
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
+}
+
+fn is_production(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("prod")
+}
+
 /// Labels the model may choose from: the repo's labels that `allow` permits.
 pub fn candidates(repo_labels: &[RepoLabel], rules: &LabelRules) -> Vec<RepoLabel> {
     repo_labels
@@ -384,6 +444,44 @@ mod tests {
                 ("CI:DEPLOY_STAGING".into(), "c".into()),
             ]
         );
+    }
+
+    #[test]
+    fn empty_allow_uses_labels_the_repo_docs_name() {
+        let docs = "| `CI:E2E` | every test |\n| `E2E:<area>` | that area |\n\
+                    Payment tests (`E2E:join`) need staging: add `CI:DEPLOY_STAGING`.\n\
+                    Never touch CI:DEPLOY_PRODUCTION from a review.";
+        let r = effective_rules(&LabelRules::default(), &repo(), docs);
+        assert_eq!(
+            r.allow,
+            vec![
+                "CI:E2E",
+                "E2E:join",
+                "E2E:classes",
+                "E2E:auto",
+                "CI:DEPLOY_STAGING"
+            ]
+        );
+        // production is never doc-derived, even when the docs name it
+        assert!(!r.allowed("CI:DEPLOY_PRODUCTION"));
+        // undocumented labels stay out
+        assert!(!r.allowed("ch-review"));
+    }
+
+    #[test]
+    fn explicit_allow_wins_and_can_include_production() {
+        let explicit = LabelRules::parse("CI:DEPLOY_PRODUCTION", "", "");
+        let r = effective_rules(&explicit, &repo(), "E2E:<area>");
+        assert_eq!(r.allow, vec!["CI:DEPLOY_PRODUCTION"]);
+    }
+
+    #[test]
+    fn exact_names_must_be_whole_tokens() {
+        assert!(documented("CI:E2E", "add `CI:E2E` to run all"));
+        assert!(!documented("CI:E2E", "add CI:E2E_NIGHTLY instead"));
+        assert!(documented("E2E:mobile", "labels: E2E:* for areas"));
+        assert!(!documented("E2E:mobile", "nothing relevant"));
+        assert!(!documented("ch-review", "use ch-reviewer"));
     }
 
     #[test]
