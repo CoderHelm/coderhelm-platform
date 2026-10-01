@@ -136,6 +136,10 @@ pub enum WorkerMessage {
     /// branch's current HEAD — skipping if that commit is already tagged.
     #[serde(rename = "tag_sweep")]
     TagSweep(TagSweepMessage),
+    /// Release notes for a release tag CoderHelm just cut (or a re-send from the
+    /// dashboard): GitHub Release + Confluence changelog entry + IT email.
+    #[serde(rename = "release_notes")]
+    ReleaseNotes(ReleaseNotesMessage),
     /// Code-graph index pass: full (on enable / repair) or incremental (a push
     /// to the default branch re-indexes only the changed files).
     #[serde(rename = "graph_index")]
@@ -158,6 +162,24 @@ pub struct GraphIndexMessage {
 
 /// A coalesced release-tag sweep. Carries only routing + the batch clock; the
 /// per-repo tag config is re-read at fire time so late config edits win.
+/// Write + publish release notes for one release tag. Idempotent per tag: each
+/// step's result is recorded, so a retry or re-send only redoes what's missing
+/// (or what `resend` asks for).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ReleaseNotesMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub tag: String,
+    /// Commit the tag points at.
+    pub sha: String,
+    /// Dashboard re-send: "" (normal run), "email" (send the email again),
+    /// "all" (regenerate the notes and re-publish every step).
+    #[serde(default)]
+    pub resend: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TagSweepMessage {
     pub team_id: String,

@@ -28,6 +28,8 @@ resolver.define("saveConfig", async ({ payload }) => {
     const listProjectsUrl = await webTrigger.getUrl("list-projects-trigger");
     const createTicketUrl = await webTrigger.getUrl("create-ticket-trigger");
     const addCommentUrl = await webTrigger.getUrl("add-comment-trigger");
+    const publishReleaseUrl = await webTrigger.getUrl("publish-release-trigger");
+    const getIssuesUrl = await webTrigger.getUrl("get-issues-trigger");
 
     // Get the Jira site URL (e.g. https://mysite.atlassian.net)
     let siteUrl = "";
@@ -50,6 +52,8 @@ resolver.define("saveConfig", async ({ payload }) => {
         list_projects_url: listProjectsUrl,
         create_ticket_url: createTicketUrl,
         add_comment_url: addCommentUrl,
+        publish_release_url: publishReleaseUrl,
+        get_issues_url: getIssuesUrl,
         site_url: siteUrl,
       }),
     });

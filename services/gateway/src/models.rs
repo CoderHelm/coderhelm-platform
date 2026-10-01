@@ -146,6 +146,8 @@ pub enum WorkerMessage {
     /// a push to the graph's branch.
     #[serde(rename = "graph_index")]
     GraphIndex(GraphIndexMessage),
+    #[serde(rename = "release_notes")]
+    ReleaseNotes(ReleaseNotesMessage),
 }
 
 /// A code-graph index job. `changed_files: None` ⇒ full index; `Some(paths)` ⇒
@@ -475,4 +477,18 @@ mod tests {
         assert_eq!(parsed.sub, "user1");
         assert_eq!(parsed.aud, "coderhelm-dashboard");
     }
+}
+
+/// Write/publish release notes for a tag (dashboard send). Mirrors the worker's
+/// ReleaseNotesMessage.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ReleaseNotesMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub tag: String,
+    pub sha: String,
+    #[serde(default)]
+    pub resend: String,
 }

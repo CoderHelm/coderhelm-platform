@@ -16,6 +16,10 @@ modules:
       function: addCommentHandler
     - key: get-site-url-trigger
       function: getSiteUrlHandler
+    - key: publish-release-trigger
+      function: publishReleaseHandler
+    - key: get-issues-trigger
+      function: getIssuesHandler
   jira:adminPage:
     - key: coderhelm-admin-page
       resource: adminPage
@@ -35,6 +39,10 @@ modules:
       handler: index.addCommentHandler
     - key: getSiteUrlHandler
       handler: index.getSiteUrlHandler
+    - key: publishReleaseHandler
+      handler: release.publishReleaseHandler
+    - key: getIssuesHandler
+      handler: release.getIssuesHandler
 resources:
   - key: adminPage
     path: resources/admin/build
@@ -44,6 +52,8 @@ permissions:
     - write:jira-work
     - storage:app
     - read:attachment:jira
+    - read:page:confluence
+    - write:page:confluence
   external:
     fetch:
       backend:
