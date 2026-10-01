@@ -75,6 +75,43 @@ impl LabelRules {
     pub fn allowed(&self, label: &str) -> bool {
         self.allow.iter().any(|p| pattern_matches(p, label))
     }
+
+    /// Allowed label families (`E2E:*`). A family's labels may be added before
+    /// they exist in GitHub — adding one creates it — because repos often define
+    /// them in a mapping file (e.g. one e2e area per label) and GitHub only
+    /// creates a label the first time it is used.
+    pub fn families(&self) -> Vec<String> {
+        self.allow
+            .iter()
+            .filter(|p| p.len() > 1 && p.ends_with('*'))
+            .cloned()
+            .collect()
+    }
+
+    fn in_family(&self, label: &str) -> bool {
+        self.families().iter().any(|p| pattern_matches(p, label))
+    }
+}
+
+/// A name GitHub will accept as a new label, and that clearly extends its
+/// family (non-empty after the prefix): `E2E:camps`, not `E2E:` or `E2E: x y`.
+fn valid_new_label(name: &str, rules: &LabelRules) -> bool {
+    let n = name.trim();
+    if n.is_empty() || n.len() > 50 {
+        return false;
+    }
+    if !n
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_' | '.' | '/'))
+    {
+        return false;
+    }
+    rules.families().iter().any(|p| {
+        let prefix = p.trim_end_matches('*');
+        n.len() > prefix.len()
+            && n.to_ascii_lowercase()
+                .starts_with(&prefix.to_ascii_lowercase())
+    })
 }
 
 /// `E2E:*` matches any label starting with `E2E:`; otherwise exact. Case-insensitive.
@@ -101,11 +138,18 @@ pub fn effective_rules(
     if !configured.allow.is_empty() {
         return configured.clone();
     }
-    let allow = repo_labels
+    let mut allow: Vec<String> = repo_labels
         .iter()
         .filter(|l| documented(&l.name, docs) && !is_production(&l.name))
         .map(|l| l.name.clone())
         .collect();
+    // Families the docs describe (`E2E:<area>`, `E2E:*`) — usable even before
+    // each member label exists in GitHub.
+    for fam in doc_families(docs) {
+        if !is_production(&fam) && !allow.iter().any(|a| a.eq_ignore_ascii_case(&fam)) {
+            allow.push(fam);
+        }
+    }
     LabelRules {
         allow,
         ..configured.clone()
@@ -129,6 +173,30 @@ fn documented(name: &str, docs: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Label families written in the docs as `PREFIX:<…>` or `PREFIX:*` → `PREFIX:*`.
+fn doc_families(docs: &str) -> Vec<String> {
+    let bytes = docs.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    for (i, w) in bytes.windows(2).enumerate() {
+        if w[0] != b':' || !(w[1] == b'<' || w[1] == b'*') {
+            continue;
+        }
+        let mut s = i;
+        while s > 0 && (bytes[s - 1].is_ascii_alphanumeric() || matches!(bytes[s - 1], b'_' | b'-'))
+        {
+            s -= 1;
+        }
+        if s == i {
+            continue;
+        }
+        let fam = format!("{}:*", &docs[s..i]);
+        if !out.iter().any(|f| f.eq_ignore_ascii_case(&fam)) {
+            out.push(fam);
+        }
+    }
+    out
 }
 
 /// `needle` appears in `hay` not as part of a longer label-ish word
@@ -158,7 +226,8 @@ pub fn candidates(repo_labels: &[RepoLabel], rules: &LabelRules) -> Vec<RepoLabe
 /// Prompt section: the candidate labels (with the repo's own descriptions), the
 /// labels already on the PR, the companion rules and the repo's guidance.
 pub fn prompt_section(candidates: &[RepoLabel], current: &[String], rules: &LabelRules) -> String {
-    if candidates.is_empty() {
+    let families = rules.families();
+    if candidates.is_empty() && families.is_empty() {
         return String::new();
     }
     let mut s = String::from(
@@ -167,7 +236,8 @@ pub fn prompt_section(candidates: &[RepoLabel], current: &[String], rules: &Labe
          that it needs (read the repo's docs / mapping files with your tools when they define \
          which code a label covers). Pick ONLY from this list, add nothing that isn't needed, \
          and give a one-line reason naming the changed file(s). Report them in `labels`; \
-         an empty list is a valid answer.\n\
+         an empty list is a valid answer. If a label is needed, ADD it yourself — never \
+         tell the author to add a label.\n\
          Be strict: a file path matching a label's area is NOT enough. Add a label only when \
          the diff can change the BEHAVIOR that label's tests exercise — logic, data flow, API / \
          payment calls, form validation, state, routing, feature flags, error handling. Purely \
@@ -190,6 +260,18 @@ pub fn prompt_section(candidates: &[RepoLabel], current: &[String], rules: &Labe
         } else {
             s.push_str(&format!("- {} — {}\n", l.name, l.description.trim()));
         }
+    }
+    if !families.is_empty() {
+        s.push_str(&format!(
+            "You may also add any label in these families, even if it isn't listed above yet \
+             (adding it creates it): {}. Use ONLY names the repo's docs or mapping files define \
+             (e.g. the area names in its test map) — never invent one.\n",
+            families
+                .iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     if !current.is_empty() {
         s.push_str(&format!("Already on the PR: {}\n", current.join(", ")));
@@ -215,6 +297,22 @@ pub struct LabelDecision {
     pub refused: Vec<(String, String)>,
 }
 
+/// A requested label → the name to add: the repo's existing label (exact
+/// casing) when allowed, or a new label in an allowed family.
+fn resolve(name: &str, repo_labels: &[RepoLabel], rules: &LabelRules) -> Result<String, String> {
+    match repo_labels
+        .iter()
+        .find(|l| l.name.eq_ignore_ascii_case(name.trim()))
+    {
+        Some(l) if rules.allowed(&l.name) => Ok(l.name.clone()),
+        Some(l) => Err(format!("{} is not in this repo's allowed labels", l.name)),
+        None if rules.in_family(name.trim()) && valid_new_label(name, rules) => {
+            Ok(name.trim().to_string())
+        }
+        None => Err("no such label in the repo".to_string()),
+    }
+}
+
 /// Validate the model's picks against the repo's live labels and the config,
 /// then apply the companion rules. Pure: no I/O.
 pub fn decide(
@@ -223,12 +321,6 @@ pub fn decide(
     current: &[String],
     rules: &LabelRules,
 ) -> LabelDecision {
-    let find = |name: &str| {
-        repo_labels
-            .iter()
-            .find(|l| l.name.eq_ignore_ascii_case(name.trim()))
-            .map(|l| l.name.clone())
-    };
     let on_pr: HashSet<String> = current.iter().map(|c| c.to_ascii_lowercase()).collect();
     let mut out = LabelDecision::default();
     let mut chosen: Vec<(String, String)> = Vec::new();
@@ -239,14 +331,9 @@ pub fn decide(
     };
 
     for p in picks {
-        match find(&p.name) {
-            None => out
-                .refused
-                .push((p.name.clone(), "no such label in the repo".into())),
-            Some(name) if !rules.allowed(&name) => out
-                .refused
-                .push((name, "not in this repo's allowed labels".into())),
-            Some(name) => push(&mut chosen, name, p.reason.trim().to_string()),
+        match resolve(&p.name, repo_labels, rules) {
+            Ok(name) => push(&mut chosen, name, p.reason.trim().to_string()),
+            Err(why) => out.refused.push((p.name.clone(), why)),
         }
     }
 
@@ -263,16 +350,11 @@ pub fn decide(
                 continue;
             }
             for c in comps {
-                match find(c) {
-                    None => out.refused.push((
-                        c.clone(),
-                        format!("required by {label}, but no such label in the repo"),
-                    )),
-                    Some(name) if !rules.allowed(&name) => out.refused.push((
-                        name,
-                        format!("required by {label}, but not in this repo's allowed labels"),
-                    )),
-                    Some(name) => push(&mut chosen, name, format!("required by {label}")),
+                match resolve(c, repo_labels, rules) {
+                    Ok(name) => push(&mut chosen, name, format!("required by {label}")),
+                    Err(why) => out
+                        .refused
+                        .push((c.clone(), format!("required by {label}, but {why}"))),
                 }
             }
         }
@@ -405,7 +487,7 @@ mod tests {
     fn refuses_unknown_and_disallowed_never_adds_them() {
         let d = decide(
             &[
-                pick("E2E:payments", "made up"),
+                pick("CI:MADE_UP", "made up"),
                 pick("CI:DEPLOY_PRODUCTION", "nope"),
                 pick("E2E:classes", "FilterWrapper.tsx"),
             ],
@@ -487,7 +569,8 @@ mod tests {
                 "E2E:join",
                 "E2E:classes",
                 "E2E:auto",
-                "CI:DEPLOY_STAGING"
+                "CI:DEPLOY_STAGING",
+                "E2E:*"
             ]
         );
         // production is never doc-derived, even when the docs name it
@@ -542,6 +625,62 @@ mod tests {
     }
 
     #[test]
+    fn family_labels_can_be_added_before_they_exist() {
+        // Only CI:E2E / CI:DEPLOY_STAGING exist in GitHub; E2E:camps doesn't yet.
+        let existing: Vec<RepoLabel> = repo()
+            .into_iter()
+            .filter(|l| !l.name.starts_with("E2E:"))
+            .collect();
+        let d = decide(
+            &[pick("E2E:camps", "Sold out / waitlist state")],
+            &existing,
+            &[],
+            &rules(),
+        );
+        assert_eq!(
+            d.add,
+            vec![("E2E:camps".into(), "Sold out / waitlist state".into())]
+        );
+        // a new family member still has to be a sane label name
+        let bad = decide(
+            &[pick("E2E:", "x"), pick("E2E: two words", "x")],
+            &existing,
+            &[],
+            &rules(),
+        );
+        assert!(bad.add.is_empty());
+        assert_eq!(bad.refused.len(), 2);
+        // outside any family: still refused
+        let other = decide(&[pick("CI:NEW_THING", "x")], &existing, &[], &rules());
+        assert!(other.add.is_empty());
+    }
+
+    #[test]
+    fn docs_families_become_allowed_without_existing_labels() {
+        let existing: Vec<RepoLabel> = repo()
+            .into_iter()
+            .filter(|l| !l.name.starts_with("E2E:"))
+            .collect();
+        let docs = "| `E2E:<area>` | that area's tests |\n| `CI:E2E` | all |\nPROD:<x> never";
+        let r = effective_rules(&LabelRules::default(), &existing, docs);
+        assert!(r.allow.contains(&"E2E:*".to_string()));
+        assert!(!r.allow.iter().any(|a| a.to_lowercase().starts_with("prod")));
+        assert_eq!(r.families(), vec!["E2E:*".to_string()]);
+        let d = decide(&[pick("E2E:join", "x")], &existing, &[], &r);
+        assert_eq!(d.add[0].0, "E2E:join");
+    }
+
+    #[test]
+    fn prompt_offers_families_and_forbids_deferring_to_author() {
+        let r = rules();
+        let s = prompt_section(&[], &[], &r);
+        assert!(s.contains("`E2E:*`"));
+        assert!(
+            s.contains("never \n         tell the author") || s.contains("never tell the author")
+        );
+    }
+
+    #[test]
     fn prompt_lists_candidates_rules_and_guide() {
         let r = rules();
         let s = prompt_section(&candidates(&repo(), &r), &["ch-review".into()], &r);
@@ -554,6 +693,8 @@ mod tests {
         assert!(s.contains("a file path matching a label's area is NOT enough"));
         assert!(s.contains("Purely presentational changes do not qualify"));
         assert!(s.contains("Also write `tests_note`"));
-        assert_eq!(prompt_section(&[], &[], &r), "");
+        // nothing to pick (no allowed labels, no families) → no section
+        let none = LabelRules::parse("CI:E2E", "", "");
+        assert_eq!(prompt_section(&[], &[], &none), "");
     }
 }

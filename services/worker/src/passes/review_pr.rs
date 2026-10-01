@@ -521,7 +521,10 @@ pub async fn run(
     let fixed_threads: Vec<&crate::clients::github::BotReviewThread> =
         fixed_prior_threads(&prior_threads, &output.prior);
     let still_open = prior_threads.len() - fixed_threads.len();
-    let label_decision = if label_candidates.is_empty() {
+    // Label picking is live when there's something to pick: existing allowed
+    // labels, or an allowed family whose labels may not exist yet.
+    let labels_live = !label_candidates.is_empty() || !label_rules.families().is_empty();
+    let label_decision = if !labels_live {
         super::review_labels::LabelDecision::default()
     } else {
         super::review_labels::decide(&output.labels, &repo_labels, &current_labels, &label_rules)
@@ -633,7 +636,7 @@ pub async fn run(
         ));
     }
     full_body.push_str(&super::review_labels::markdown(
-        !label_candidates.is_empty(),
+        labels_live,
         &label_decision,
         &output.tests_note,
     ));
