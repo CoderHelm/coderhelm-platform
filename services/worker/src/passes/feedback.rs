@@ -317,6 +317,15 @@ pub async fn run(
         format!(" Match the team's voice and tone as described below:\n{voice}")
     };
 
+    // Code changes made while addressing comments follow the same test rule.
+    let tests_block =
+        if super::review_pr::tests_required(state, &msg.team_id, &msg.repo_owner, &msg.repo_name)
+            .await
+        {
+            super::TESTS_REQUIRED_CODER_SECTION
+        } else {
+            ""
+        };
     let system = format!(
         "You are a feedback agent for the {owner}/{repo} repository. \
          You respond to reviewer comments on pull requests by reading and writing files \
@@ -325,7 +334,7 @@ pub async fn run(
          (the default, and the ONLY safe option for a few lines in a large file), and write_file \
          or batch_write only for new files or whole-file rewrites — then confirm briefly. \
          If a comment asks a question, read the code and answer clearly. \
-         Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}",
+         Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}{tests_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );

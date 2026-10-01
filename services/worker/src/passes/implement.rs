@@ -54,9 +54,17 @@ pub async fn run(
         repo_instructions
     };
     let instructions_block = super::format_instructions_block(trimmed_instructions);
+    let tests_block =
+        if super::review_pr::tests_required(state, &msg.team_id, &msg.repo_owner, &msg.repo_name)
+            .await
+        {
+            super::TESTS_REQUIRED_CODER_SECTION
+        } else {
+            ""
+        };
     let system = format!(
         "You are an implementation agent for the {owner}/{repo} repository. \
-         Implement each task from the checklist. Follow existing code patterns exactly.{rules_block}{instructions_block}",
+         Implement each task from the checklist. Follow existing code patterns exactly.{rules_block}{instructions_block}{tests_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );

@@ -64,12 +64,29 @@ pub async fn run(
         )
     };
 
+    // Repos with "Require tests" on: the checklist carries the test tasks, so the
+    // implementation pass (which works task by task) writes them.
+    let tests_block =
+        if super::review_pr::tests_required(state, &msg.team_id, &msg.repo_owner, &msg.repo_name)
+            .await
+        {
+            "\n\n## Tests are required in this repo\n\
+         tasks.md MUST include the test work: for every task that adds or changes behavior, add a \
+         task that adds or updates the tests covering it, at the exact test file path, following \
+         the repo's test conventions from AGENTS.md / CLAUDE.md (and nested ones such as \
+         `e2e/CLAUDE.md`) — find the nearest existing test for the same code with your tools. \
+         Include any e2e coverage bookkeeping the repo documents (e.g. adding a new spec to its \
+         test map). No test tasks for pure refactors, docs, copy, styling, config values, \
+         dependency bumps or generated files."
+        } else {
+            ""
+        };
     let system = format!(
         "You are a planning agent for the {owner}/{repo} repository. \
          Research the codebase using the provided tools, then generate an implementation plan.\n\n\
          You have access to these repos:\n{repos_list}\n\n\
          All tools default to {owner}/{repo} when the `repo` parameter is omitted. \
-         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{instructions_block}",
+         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{instructions_block}{tests_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );

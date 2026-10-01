@@ -100,6 +100,19 @@ async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str
     }
 }
 
+/// True when the repo turned on "Require tests" (and review isn't off/killed).
+/// The same switch makes the reviewer block untested behavior changes and makes
+/// CoderHelm's own coding passes write those tests.
+pub(crate) async fn tests_required(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> bool {
+    let cfg = load_config(state, team_id, owner, name).await;
+    cfg.enabled && !cfg.killed && cfg.require_tests
+}
+
 /// The repo's review trigger label IF the reviewer is enabled (and not killed),
 /// else None. Lets CoderHelm self-label the PRs it opens: the reviewer gates
 /// EVERY PR on the label, so a bot PR must carry it to be reviewed + self-fixed.

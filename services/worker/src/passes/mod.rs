@@ -3797,6 +3797,25 @@ async fn fail_run(
     }
 }
 
+/// Coding-agent instructions for repos with "Require tests" on: the agent writes
+/// the tests the reviewer will look for, following the repo's own conventions.
+pub(crate) const TESTS_REQUIRED_CODER_SECTION: &str = "\n\n## Tests are required in this repo\n\
+Every change that adds or changes behavior must ship with tests in this same branch:\n\
+- New behavior (a feature, endpoint, UI state, option, job): add tests that exercise it.\n\
+- Changed or fixed behavior: update the existing tests that cover that code so they assert the \
+new behavior. A bug fix gets a test that fails without the fix.\n\
+- Follow the repo's own testing conventions exactly: framework, where tests live and how they're \
+named, helpers and fixtures, how mocks are done, which command runs them. They are in AGENTS.md / \
+CLAUDE.md and in nested ones next to the code (e.g. `e2e/CLAUDE.md`, a package's CLAUDE.md): read \
+them with your tools BEFORE writing tests, then copy the pattern of the nearest existing test for \
+the same code (search the test directories for the changed symbols or files).\n\
+- If the repo documents end-to-end coverage rules (e.g. a test map or spec index that new flows \
+must be added to), follow those too.\n\
+- No tests needed for pure refactors with no behavior change, docs, comments, copy, styling, \
+config values, dependency bumps or generated files.\n\
+- Never weaken, skip, or delete an existing test to make it pass; fix the code, or update the \
+test only when the behavior change is intended.\n";
+
 pub(crate) fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
 }
