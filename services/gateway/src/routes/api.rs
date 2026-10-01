@@ -2063,6 +2063,16 @@ pub async fn forge_register_urls(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let site_url = body.get("site_url").and_then(|v| v.as_str()).unwrap_or("");
+    // Newer app versions also register the release-notes triggers (Confluence
+    // publish + Jira issue lookup). Older installs omit them → stored empty.
+    let https_or_empty = |k: &str| -> &str {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|u| u.starts_with("https://"))
+            .unwrap_or("")
+    };
+    let publish_release_url = https_or_empty("publish_release_url");
+    let get_issues_url = https_or_empty("get_issues_url");
 
     // Verify the team exists
     state
@@ -2126,8 +2136,10 @@ pub async fn forge_register_urls(
         .key("pk", attr_s(&team_id))
         .key("sk", attr_s("JIRA#config"))
         .update_expression(
-            "SET list_projects_url = :lpu, create_ticket_url = :ctu, add_comment_url = :acu, site_url = :su, updated_at = :ua",
+            "SET list_projects_url = :lpu, create_ticket_url = :ctu, add_comment_url = :acu, site_url = :su, publish_release_url = :pru, get_issues_url = :giu, updated_at = :ua",
         )
+        .expression_attribute_values(":pru", attr_s(publish_release_url))
+        .expression_attribute_values(":giu", attr_s(get_issues_url))
         .expression_attribute_values(":lpu", attr_s(list_projects_url))
         .expression_attribute_values(":ctu", attr_s(create_ticket_url))
         .expression_attribute_values(":acu", attr_s(add_comment_url))

@@ -1661,6 +1661,104 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// Commits in `base...head` (oldest first), up to `max` (GitHub caps a
+    /// compare page at 250; we page with per_page=100).
+    pub async fn compare_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+        max: usize,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        for page in 1..=10u32 {
+            let url = format!(
+                "{API_BASE}/repos/{owner}/{repo}/compare/{base}...{head}?per_page=100&page={page}"
+            );
+            let data = self.get(&url).await?;
+            let batch = data["commits"].as_array().cloned().unwrap_or_default();
+            let done = batch.len() < 100;
+            out.extend(batch);
+            if done || out.len() >= max {
+                break;
+            }
+        }
+        out.truncate(max);
+        Ok(out)
+    }
+
+    /// Recent commits on `sha` (newest first) — used when there is no previous
+    /// release tag to compare against.
+    pub async fn recent_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+        max: usize,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/commits?sha={sha}&per_page={}",
+            max.min(100)
+        );
+        Ok(self
+            .get(&url)
+            .await?
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Pull requests associated with a commit (the PR that merged it).
+    pub async fn pulls_for_commit(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/commits/{sha}/pulls?per_page=10");
+        Ok(self
+            .get(&url)
+            .await?
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// The GitHub Release for `tag`, if one exists (any error → None).
+    pub async fn get_release_by_tag(
+        &self,
+        owner: &str,
+        repo: &str,
+        tag: &str,
+    ) -> Option<serde_json::Value> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/releases/tags/{tag}");
+        self.get(&url).await.ok()
+    }
+
+    /// Create a GitHub Release for an existing tag.
+    pub async fn create_release(
+        &self,
+        owner: &str,
+        repo: &str,
+        tag: &str,
+        name: &str,
+        body: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/releases");
+        self.post(
+            &url,
+            &serde_json::json!({
+                "tag_name": tag,
+                "name": name,
+                "body": body,
+                "draft": false,
+                "prerelease": false,
+            }),
+        )
+        .await
+    }
+
     /// Create an ANNOTATED tag pointing at `sha` (a release tag after an
     /// approved merge): first the tag OBJECT (tagger + message — what `git
     /// cat-file -t` reports as `tag`), then the ref pointing at that object.

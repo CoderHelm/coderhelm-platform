@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info};
 
-use crate::models::{Claims, ReviewMessage, WorkerMessage};
+use crate::models::{Claims, ReleaseNotesMessage, ReviewMessage, WorkerMessage};
 use crate::AppState;
 
 fn attr_s(val: &str) -> AttributeValue {
@@ -161,6 +161,14 @@ pub async fn get_config(
         "auto_label_allow": item_str(&item, "auto_label_allow", ""),
         "auto_label_requires": item_str(&item, "auto_label_requires", ""),
         "auto_label_guide": item_str(&item, "auto_label_guide", ""),
+        "release_notes": item_bool(&item, "release_notes", false),
+        "release_notes_branch": item_str(&item, "release_notes_branch", ""),
+        "release_notes_confluence_space": item_str(&item, "release_notes_confluence_space", ""),
+        "release_notes_confluence_parent_id": item_str(&item, "release_notes_confluence_parent_id", ""),
+        "release_notes_confluence_container": item_str(&item, "release_notes_confluence_container", "Changelog"),
+        "release_notes_email_webhook_url": item_str(&item, "release_notes_email_webhook_url", ""),
+        "release_notes_guide": item_str(&item, "release_notes_guide", ""),
+        "release_notes_instructions": item_str(&item, "release_notes_instructions", ""),
         "graph_enabled": item_bool(&item, "graph_enabled", false),
         "deploy_label": item_str(&item, "deploy_label", ""),
         "health_log_groups": log_groups,
@@ -251,6 +259,21 @@ pub async fn update_config(
     let auto_label_allow = bounded("auto_label_allow", 1_000);
     let auto_label_requires = bounded("auto_label_requires", 2_000);
     let auto_label_guide = bounded("auto_label_guide", 5_000);
+    // Release notes. The email webhook must be https (it's POSTed to by the
+    // worker); the Confluence parent is a numeric page id.
+    let rn_email = bounded("release_notes_email_webhook_url", 1_000);
+    if !rn_email.is_empty() && !rn_email.starts_with("https://") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let rn_parent = bounded("release_notes_confluence_parent_id", 30);
+    if !rn_parent.chars().all(|c| c.is_ascii_digit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let rn_branch = bounded("release_notes_branch", 200);
+    let rn_space = bounded("release_notes_confluence_space", 100);
+    let rn_container = bounded("release_notes_confluence_container", 200);
+    let rn_guide = bounded("release_notes_guide", 300);
+    let rn_instructions = bounded("release_notes_instructions", 5_000);
     let reminder_cooldown_hours = body["reminder_cooldown_hours"]
         .as_u64()
         .unwrap_or(4)
@@ -322,6 +345,17 @@ pub async fn update_config(
         .item("auto_label_allow", attr_s(&auto_label_allow))
         .item("auto_label_requires", attr_s(&auto_label_requires))
         .item("auto_label_guide", attr_s(&auto_label_guide))
+        .item(
+            "release_notes",
+            attr_bool(body["release_notes"].as_bool().unwrap_or(false)),
+        )
+        .item("release_notes_branch", attr_s(&rn_branch))
+        .item("release_notes_confluence_space", attr_s(&rn_space))
+        .item("release_notes_confluence_parent_id", attr_s(&rn_parent))
+        .item("release_notes_confluence_container", attr_s(&rn_container))
+        .item("release_notes_email_webhook_url", attr_s(&rn_email))
+        .item("release_notes_guide", attr_s(&rn_guide))
+        .item("release_notes_instructions", attr_s(&rn_instructions))
         .item(
             "reminders_enabled",
             attr_bool(body["reminders_enabled"].as_bool().unwrap_or(false)),
@@ -684,6 +718,118 @@ pub async fn re_review(
         name,
         pr = body.pr,
         "Reviewer: dashboard re-review → review job"
+    );
+    Ok(Json(json!({ "status": "queued" })))
+}
+
+/// GET /api/releases?repo=owner/name — release-notes records, newest first.
+pub async fn list_releases(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, StatusCode> {
+    let prefix = match params.get("repo").filter(|r| !r.is_empty()) {
+        Some(repo) => {
+            validate_repo(repo)?;
+            format!("RELEASE#{repo}#")
+        }
+        None => "RELEASE#".to_string(),
+    };
+    let out = state
+        .dynamo
+        .query()
+        .table_name(&state.config.settings_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
+        .expression_attribute_values(":p", attr_s(&prefix))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to list releases: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let mut releases: Vec<Value> = out
+        .items()
+        .iter()
+        .map(|item| {
+            let sk = item_str(item, "sk", "");
+            // RELEASE#{owner}/{name}#{tag}
+            let rest = sk.trim_start_matches("RELEASE#");
+            let (repo, tag) = rest.rsplit_once('#').unwrap_or((rest, ""));
+            json!({
+                "repo": repo,
+                "tag": tag,
+                "prev_tag": item_str(item, "prev_tag", ""),
+                "pr_count": item_str(item, "pr_count", "0").parse::<u64>().unwrap_or(0),
+                "headline": item_str(item, "headline", ""),
+                "entry_md": item_str(item, "entry_md", ""),
+                "github_release_md": item_str(item, "github_release_md", ""),
+                "unclear": item_str(item, "unclear", ""),
+                "github_release_url": item_str(item, "github_release_url", ""),
+                "confluence_url": item_str(item, "confluence_url", ""),
+                "email_sent_at": item_str(item, "email_sent_at", ""),
+                "updated_at": item_str(item, "updated_at", ""),
+            })
+        })
+        .collect();
+    releases.sort_by(|a, b| {
+        b["updated_at"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(a["updated_at"].as_str().unwrap_or(""))
+    });
+    Ok(Json(json!({ "releases": releases })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ReleaseSendBody {
+    /// "owner/name"
+    pub repo: String,
+    pub tag: String,
+    /// "" = write + publish whatever is missing (also: generate for an existing
+    /// tag); "email" = send the email again; "all" = rewrite and re-publish.
+    #[serde(default)]
+    pub resend: String,
+}
+
+/// POST /api/releases/send — write/publish release notes for a tag from the
+/// dashboard (first time for an older tag, or again). Member+.
+pub async fn send_release(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<ReleaseSendBody>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?;
+    validate_repo(&body.repo)?;
+    let (owner, name) = body.repo.split_once('/').ok_or(StatusCode::BAD_REQUEST)?;
+    let tag = body.tag.trim();
+    if tag.is_empty()
+        || tag.len() > 200
+        || !tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | '/'))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let resend = match body.resend.as_str() {
+        r @ ("" | "email" | "all") => r,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let installation_id = super::api::get_team_installation_id(&state, &claims.team_id).await?;
+    let message = WorkerMessage::ReleaseNotes(ReleaseNotesMessage {
+        team_id: claims.team_id.clone(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        tag: tag.to_string(),
+        // The tag resolves as a ref everywhere the worker needs a commit.
+        sha: tag.to_string(),
+        resend: resend.to_string(),
+    });
+    super::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &message).await?;
+    info!(
+        owner,
+        name, tag, resend, "Release notes: queued from dashboard"
     );
     Ok(Json(json!({ "status": "queued" })))
 }

@@ -28,6 +28,7 @@ aws-sdk-cloudwatchlogs = "1"
 aws-smithy-types = "1"
 
 # HTTP client (GitHub API, Jira API)
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # Auth

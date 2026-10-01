@@ -325,7 +325,21 @@ pub(crate) async fn post_merge_actions(
             ));
         } else {
             match cut_tag_if_new(github, cfg, owner, repo, head_sha).await {
-                Ok(Some(tag)) => lines.push(format!("🏷️ Tagged `{tag}`.")),
+                Ok(Some(tag)) => {
+                    super::release_notes::after_tag(
+                        state,
+                        github,
+                        team_id,
+                        installation_id,
+                        owner,
+                        repo,
+                        base_branch,
+                        &tag,
+                        head_sha,
+                    )
+                    .await;
+                    lines.push(format!("🏷️ Tagged `{tag}`."));
+                }
                 Ok(None) => {
                     lines.push("🏷️ This commit is already tagged — no new release cut.".to_string())
                 }
@@ -560,6 +574,18 @@ pub async fn run_tag_sweep(
     match cut_tag_if_new(&github, &cfg, owner, repo, &head).await {
         Ok(Some(tag)) => {
             info!(%tag, repo = %format!("{owner}/{repo}"), "Batched release tag cut");
+            super::release_notes::after_tag(
+                state,
+                &github,
+                &msg.team_id,
+                msg.installation_id,
+                owner,
+                repo,
+                &msg.base_branch,
+                &tag,
+                &head,
+            )
+            .await;
             // Prod deploy fires off the tag → schedule the health guard now.
             if cfg.health_check {
                 let baseline =

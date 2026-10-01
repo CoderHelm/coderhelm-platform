@@ -471,6 +471,7 @@ pub mod onboard;
 mod plan;
 pub mod plan_execute;
 mod pr;
+pub mod release_notes;
 mod resolve;
 pub mod resume;
 mod review;
