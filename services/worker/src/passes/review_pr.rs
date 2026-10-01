@@ -25,6 +25,11 @@ struct ReviewConfig {
     instructions: String,
     /// Run the affected tests/build in the sandbox and attach pass/fail receipts.
     verify_tests: bool,
+    /// New or changed behavior must come with new/updated tests (blocking finding).
+    require_tests: bool,
+    /// Reviewer picks CI labels for the PR (see review_labels).
+    auto_labels: bool,
+    label_rules: super::review_labels::LabelRules,
 }
 
 async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str) -> ReviewConfig {
@@ -45,7 +50,16 @@ async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str
             killed: false,
             instructions: String::new(),
             verify_tests: false,
+            require_tests: false,
+            auto_labels: false,
+            label_rules: super::review_labels::LabelRules::default(),
         };
+    };
+    let s = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
     };
     ReviewConfig {
         enabled: item
@@ -68,6 +82,21 @@ async fn load_config(state: &WorkerState, team_id: &str, owner: &str, name: &str
             .and_then(|v| v.as_bool().ok())
             .copied()
             .unwrap_or(false),
+        require_tests: item
+            .get("require_tests")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false),
+        auto_labels: item
+            .get("auto_labels")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false),
+        label_rules: super::review_labels::LabelRules::parse(
+            &s("auto_label_allow"),
+            &s("auto_label_requires"),
+            &s("auto_label_guide"),
+        ),
     }
 }
 
@@ -411,6 +440,53 @@ pub async fn run(
     };
     let prior_context = review_agent::format_prior_threads(&prior_threads);
 
+    // Repo-defined CI labels the reviewer may pick (opt-in). Candidates are the
+    // repo's live labels filtered by the allow-list, so the set follows whatever
+    // labels the team has today.
+    let current_labels: Vec<String> = pr["labels"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|l| l["name"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let repo_labels: Vec<super::review_labels::RepoLabel> = if cfg.auto_labels {
+        match github
+            .list_repo_labels(&msg.repo_owner, &msg.repo_name)
+            .await
+        {
+            Ok(ls) => ls
+                .into_iter()
+                .map(|(name, description)| super::review_labels::RepoLabel { name, description })
+                .collect(),
+            Err(e) => {
+                warn!(pr = msg.pr_number, error = %e, "Could not list repo labels — skipping label picks");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    // Allowed labels: the settings' list, or (when empty) the labels the repo's
+    // own docs name — read in full here, since the prompt copy is size-capped.
+    let label_rules = if repo_labels.is_empty() || !cfg.label_rules.allow.is_empty() {
+        cfg.label_rules.clone()
+    } else {
+        let docs =
+            super::load_repo_docs_full(&github, &msg.repo_owner, &msg.repo_name, &head_sha).await;
+        super::review_labels::effective_rules(&cfg.label_rules, &repo_labels, &docs)
+    };
+    let label_candidates = super::review_labels::candidates(&repo_labels, &label_rules);
+    let label_context =
+        super::review_labels::prompt_section(&label_candidates, &current_labels, &label_rules);
+    let tests_context = if cfg.require_tests {
+        review_agent::REQUIRE_TESTS_SECTION
+    } else {
+        ""
+    };
+    let prior_context = format!("{prior_context}{label_context}{tests_context}");
+
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(
         state,
@@ -432,10 +508,25 @@ pub async fn run(
     let fixed_threads: Vec<&crate::clients::github::BotReviewThread> =
         fixed_prior_threads(&prior_threads, &output.prior);
     let still_open = prior_threads.len() - fixed_threads.len();
+    let label_decision = if label_candidates.is_empty() {
+        super::review_labels::LabelDecision::default()
+    } else {
+        super::review_labels::decide(&output.labels, &repo_labels, &current_labels, &label_rules)
+    };
+    for (name, why) in &label_decision.refused {
+        info!(pr = msg.pr_number, label = %name, why = %why, "Reviewer label refused");
+    }
 
     // 2) Critic pass drops weak/false findings.
-    let findings =
-        review_agent::critique_findings(state, &provider, &diff, output.findings, &mut usage).await;
+    let findings = review_agent::critique_findings(
+        state,
+        &provider,
+        &diff,
+        output.findings,
+        cfg.require_tests,
+        &mut usage,
+    )
+    .await;
 
     // 3) Map to inline comments (only diff-anchored lines) + summary bullets.
     let postable = review_agent::to_postable(&findings, &changed);
@@ -513,6 +604,7 @@ pub async fn run(
             postable.unanchored_md
         ));
     }
+    full_body.push_str(&super::review_labels::markdown(&label_decision));
     if !prior_threads.is_empty() {
         full_body.push_str(&format!(
             "\n\n#### Earlier comments\n{} fixed and resolved · {} still open",
@@ -539,7 +631,8 @@ pub async fn run(
     // found nothing new) used to be silently dropped here.
     let has_news = prev_verdict.as_deref() != Some(verdict)
         || !findings.is_empty()
-        || !fixed_threads.is_empty();
+        || !fixed_threads.is_empty()
+        || !label_decision.add.is_empty();
     let should_comment = explicit || has_news;
 
     // Post ONE batched review with inline comments; fall back to body-only if
@@ -574,6 +667,19 @@ pub async fn run(
             if let Err(e) = github.resolve_review_thread(&t.id).await {
                 warn!(pr = msg.pr_number, thread = %t.id, error = %e, "Failed to resolve fixed thread");
             }
+        }
+    }
+
+    // Add the picked labels in ONE call (each label event re-runs the repo's CI).
+    // Add-only: the issues API appends, it never replaces the PR's labels.
+    if !label_decision.add.is_empty() {
+        let names: Vec<String> = label_decision.add.iter().map(|(n, _)| n.clone()).collect();
+        match github
+            .add_labels(&msg.repo_owner, &msg.repo_name, msg.pr_number, &names)
+            .await
+        {
+            Ok(_) => info!(pr = msg.pr_number, labels = ?names, "Reviewer added labels"),
+            Err(e) => warn!(pr = msg.pr_number, error = %e, "Failed to add reviewer labels"),
         }
     }
 

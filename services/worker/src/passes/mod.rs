@@ -476,6 +476,7 @@ pub mod resume;
 mod review;
 pub mod review_actions;
 pub mod review_agent;
+pub mod review_labels;
 pub mod review_pr;
 pub mod review_reminder;
 pub mod review_risk;
@@ -4693,6 +4694,32 @@ pub async fn load_repo_instructions_at_ref(
         }
     }
 
+    combined
+}
+
+/// The repo's instruction files (AGENTS.md, CLAUDE.md, …) at `git_ref`, in full
+/// (bounded at 256KB). For scanning what the repo documents — e.g. which PR
+/// labels it uses — not for prompts (see load_repo_instructions_at_ref).
+pub async fn load_repo_docs_full(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> String {
+    const MAX_TOTAL_BYTES: usize = 256_000;
+    let mut combined = String::new();
+    for path in INSTRUCTION_FILES {
+        if combined.len() >= MAX_TOTAL_BYTES {
+            break;
+        }
+        if let Ok(content) = github.read_file(owner, repo, path, git_ref).await {
+            combined.push_str(common::truncate_str(
+                &content,
+                MAX_TOTAL_BYTES - combined.len(),
+            ));
+            combined.push('\n');
+        }
+    }
     combined
 }
 

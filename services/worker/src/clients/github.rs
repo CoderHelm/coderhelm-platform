@@ -1438,6 +1438,30 @@ impl GitHubClient {
             .await
     }
 
+    /// Every label defined in the repo (name + description), all pages.
+    pub async fn list_repo_labels(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        for page in 1..=10u32 {
+            let url = format!("{API_BASE}/repos/{owner}/{repo}/labels?per_page=100&page={page}");
+            let batch: Vec<serde_json::Value> = serde_json::from_value(self.get(&url).await?)?;
+            let done = batch.len() < 100;
+            out.extend(batch.iter().map(|l| {
+                (
+                    l["name"].as_str().unwrap_or("").to_string(),
+                    l["description"].as_str().unwrap_or("").to_string(),
+                )
+            }));
+            if done {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     // ─── Pull requests ─────────────────────────────────────────
 
     /// Get a single pull request.

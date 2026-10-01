@@ -156,6 +156,11 @@ pub async fn get_config(
         "tag_batch_minutes": item_num(&item, "tag_batch_minutes", 15),
         "health_check": item_bool(&item, "health_check", false),
         "verify_tests": item_bool(&item, "verify_tests", false),
+        "require_tests": item_bool(&item, "require_tests", false),
+        "auto_labels": item_bool(&item, "auto_labels", false),
+        "auto_label_allow": item_str(&item, "auto_label_allow", ""),
+        "auto_label_requires": item_str(&item, "auto_label_requires", ""),
+        "auto_label_guide": item_str(&item, "auto_label_guide", ""),
         "graph_enabled": item_bool(&item, "graph_enabled", false),
         "deploy_label": item_str(&item, "deploy_label", ""),
         "health_log_groups": log_groups,
@@ -231,6 +236,21 @@ pub async fn update_config(
             return Err(StatusCode::BAD_REQUEST);
         }
     };
+    // Reviewer-picked CI labels: free text, bounded. The worker parses + enforces
+    // (allow-list and companion rules) — nothing outside `auto_label_allow` is
+    // ever added.
+    let bounded = |k: &str, max: usize| -> String {
+        body[k]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(max)
+            .collect()
+    };
+    let auto_label_allow = bounded("auto_label_allow", 1_000);
+    let auto_label_requires = bounded("auto_label_requires", 2_000);
+    let auto_label_guide = bounded("auto_label_guide", 5_000);
     let reminder_cooldown_hours = body["reminder_cooldown_hours"]
         .as_u64()
         .unwrap_or(4)
@@ -291,6 +311,17 @@ pub async fn update_config(
             attr_bool(body["verify_tests"].as_bool().unwrap_or(false)),
         )
         .item("deploy_label", attr_s(&deploy_label))
+        .item(
+            "require_tests",
+            attr_bool(body["require_tests"].as_bool().unwrap_or(false)),
+        )
+        .item(
+            "auto_labels",
+            attr_bool(body["auto_labels"].as_bool().unwrap_or(false)),
+        )
+        .item("auto_label_allow", attr_s(&auto_label_allow))
+        .item("auto_label_requires", attr_s(&auto_label_requires))
+        .item("auto_label_guide", attr_s(&auto_label_guide))
         .item(
             "reminders_enabled",
             attr_bool(body["reminders_enabled"].as_bool().unwrap_or(false)),
