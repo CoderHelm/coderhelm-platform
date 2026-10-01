@@ -604,7 +604,11 @@ pub async fn run(
             postable.unanchored_md
         ));
     }
-    full_body.push_str(&super::review_labels::markdown(&label_decision));
+    full_body.push_str(&super::review_labels::markdown(
+        !label_candidates.is_empty(),
+        &label_decision,
+        &output.tests_note,
+    ));
     if !prior_threads.is_empty() {
         full_body.push_str(&format!(
             "\n\n#### Earlier comments\n{} fixed and resolved · {} still open",

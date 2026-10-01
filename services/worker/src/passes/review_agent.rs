@@ -53,6 +53,10 @@ pub struct ReviewOutput {
     /// PR labels the model picked (only when the repo turned label picking on).
     #[serde(default)]
     pub labels: Vec<super::review_labels::LabelPick>,
+    /// For the PR author: which tests the PR's labels will run and where, or why
+    /// none are needed (only when the repo turned label picking on).
+    #[serde(default)]
+    pub tests_note: String,
 }
 
 /// The model's judgment of one earlier CoderHelm thread at the new head.
@@ -593,7 +597,8 @@ pub async fn generate_review(
          \"category\": \"bug|security|correctness|perf|convention|scope|tests\", \"title\": \"short\",\n    \
          \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}],\n  \
          \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"open\"}}]  (one per earlier comment listed, if any),\n  \
-         \"labels\": [{{\"name\": \"label\", \"reason\": \"changed file(s) that need it\"}}]  (only if a PR-labels section is given)\n}}\n\
+         \"labels\": [{{\"name\": \"label\", \"reason\": \"changed file(s) that need it\"}}]  (only if a PR-labels section is given),\n  \
+         \"tests_note\": \"which tests will run and where, or why none are needed\"  (only if a PR-labels section is given)\n}}\n\
          Use \"blocking\" ONLY for real bugs/risks that should stop the merge. If unsure, REQUEST_CHANGES.{graph_note}"
     );
     let prompt = format!(
@@ -643,6 +648,7 @@ pub async fn generate_review(
             findings: vec![],
             prior: vec![],
             labels: vec![],
+            tests_note: String::new(),
         }),
         Err(e) => ReviewOutput {
             verdict: "REQUEST_CHANGES".to_string(),
@@ -650,6 +656,7 @@ pub async fn generate_review(
             findings: vec![],
             prior: vec![],
             labels: vec![],
+            tests_note: String::new(),
         },
     }
 }

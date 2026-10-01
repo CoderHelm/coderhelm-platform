@@ -176,7 +176,13 @@ pub fn prompt_section(candidates: &[RepoLabel], current: &[String], rules: &Labe
          Be strictest with labels that deploy (e.g. staging): they cost a shared environment, \
          so add them only for a functional change that needs them. In the reason, name the \
          behavior that changed (e.g. \"join checkout now sends startDate to createAccount\"), \
-         not just the file.\n",
+         not just the file.\n\
+         Also write `tests_note` for the PR author, ALWAYS (even when you add nothing): one or \
+         two sentences saying which tests this PR's labels will run — the labels you add plus \
+         those already on the PR — named the way the repo's mapping names them (areas / tags, \
+         e.g. `@join`), and WHERE they run (the PR preview or staging, per the repo docs). If no \
+         tests are needed, say so and why (e.g. \"No e2e: only copy and styles changed in \
+         JoinHeader.tsx\").\n",
     );
     for l in candidates {
         if l.description.trim().is_empty() {
@@ -279,18 +285,31 @@ pub fn decide(
     out
 }
 
-/// Markdown for the review body.
-pub fn markdown(decision: &LabelDecision) -> String {
-    if decision.add.is_empty() {
+/// The review's "Tests" section, shown on every review when label picking is on:
+/// the labels added (with why), then what will run and where — or why nothing is
+/// needed — so the author never has to guess whether tests were considered.
+pub fn markdown(enabled: bool, decision: &LabelDecision, tests_note: &str) -> String {
+    if !enabled {
         return String::new();
     }
-    let mut s = String::from("\n\n#### Labels added\n");
-    for (name, reason) in &decision.add {
-        if reason.is_empty() {
-            s.push_str(&format!("- `{name}`\n"));
-        } else {
-            s.push_str(&format!("- `{name}` — {reason}\n"));
+    let mut s = String::from("\n\n#### Tests\n");
+    if !decision.add.is_empty() {
+        s.push_str("Labels added:\n");
+        for (name, reason) in &decision.add {
+            if reason.is_empty() {
+                s.push_str(&format!("- `{name}`\n"));
+            } else {
+                s.push_str(&format!("- `{name}` — {reason}\n"));
+            }
         }
+        s.push('\n');
+    }
+    let note = tests_note.trim();
+    if !note.is_empty() {
+        s.push_str(note);
+        s.push('\n');
+    } else if decision.add.is_empty() {
+        s.push_str("No test labels needed for this change.\n");
     }
     s
 }
@@ -494,6 +513,35 @@ mod tests {
     }
 
     #[test]
+    fn tests_section_always_present_when_enabled() {
+        let added = LabelDecision {
+            add: vec![
+                ("E2E:join".into(), "checkout now sends startDate".into()),
+                ("CI:DEPLOY_STAGING".into(), "required by E2E:join".into()),
+            ],
+            refused: vec![],
+        };
+        let s = markdown(true, &added, "Runs @join on staging after the deploy.");
+        assert!(s.contains("#### Tests"));
+        assert!(s.contains("- `E2E:join` — checkout now sends startDate"));
+        assert!(s.contains("Runs @join on staging after the deploy."));
+
+        let none = markdown(
+            true,
+            &LabelDecision::default(),
+            "No e2e: only styles changed in JoinHeader.tsx.",
+        );
+        assert!(none.contains("#### Tests"));
+        assert!(none.contains("only styles changed"));
+        assert!(!none.contains("Labels added"));
+
+        // model gave no note and added nothing → still an explicit line
+        assert!(markdown(true, &LabelDecision::default(), " ").contains("No test labels needed"));
+        // feature off → nothing
+        assert_eq!(markdown(false, &added, "x"), "");
+    }
+
+    #[test]
     fn prompt_lists_candidates_rules_and_guide() {
         let r = rules();
         let s = prompt_section(&candidates(&repo(), &r), &["ch-review".into()], &r);
@@ -505,6 +553,7 @@ mod tests {
         // strict: path match alone isn't enough; cosmetic changes don't qualify
         assert!(s.contains("a file path matching a label's area is NOT enough"));
         assert!(s.contains("Purely presentational changes do not qualify"));
+        assert!(s.contains("Also write `tests_note`"));
         assert_eq!(prompt_section(&[], &[], &r), "");
     }
 }
