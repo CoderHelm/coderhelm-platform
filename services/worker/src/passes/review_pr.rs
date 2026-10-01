@@ -516,6 +516,21 @@ pub async fn run(
     for (name, why) in &label_decision.refused {
         info!(pr = msg.pr_number, label = %name, why = %why, "Reviewer label refused");
     }
+    // Every label decision is logged — including "added nothing" — with the
+    // reviewer's own reason, so "why didn't it add labels" is answerable from logs.
+    if cfg.auto_labels {
+        let picked: Vec<&str> = output.labels.iter().map(|l| l.name.as_str()).collect();
+        let to_add: Vec<&str> = label_decision.add.iter().map(|(n, _)| n.as_str()).collect();
+        info!(
+            pr = msg.pr_number,
+            candidates = label_candidates.len(),
+            on_pr = ?current_labels,
+            picked = ?picked,
+            to_add = ?to_add,
+            tests_note = %common::truncate_str(output.tests_note.trim(), 600),
+            "Reviewer label decision"
+        );
+    }
 
     // 2) Critic pass drops weak/false findings.
     let findings = review_agent::critique_findings(
