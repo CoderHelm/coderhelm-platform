@@ -127,7 +127,10 @@ SECRET_PATTERNS = [
     # JWTs (3 base64 segments separated by dots)
     (re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"), "[JWT_TOKEN]"),
     # GitHub tokens
-    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{36,}"), "[GITHUB_TOKEN]"),
+    # Includes "." and "-": GitHub's stateless installation tokens are
+    # JWT-style (ghs_xxx.yyy.zzz, ~520 chars) — the old class stopped at the
+    # first dot and leaked the rest.
+    (re.compile(r"gh[pousr]_[A-Za-z0-9.\-_]{36,}"), "[GITHUB_TOKEN]"),
     # Slack tokens
     (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), "[SLACK_TOKEN]"),
     # Generic password fields

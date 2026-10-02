@@ -120,7 +120,7 @@ impl GitHubClient {
         }
 
         let jwt = self.generate_jwt()?;
-        let resp: TokenResponse = self
+        let mut req = self
             .http
             .post(format!(
                 "{API_BASE}/app/installations/{}/access_tokens",
@@ -128,12 +128,13 @@ impl GitHubClient {
             ))
             .header("Authorization", format!("Bearer {jwt}"))
             .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        // Pin the token format (stateless JWT-style by default) instead of
+        // following GitHub's rollout; tokens are handled as opaque strings.
+        if let Some(mode) = common::stateless_s2s_token_mode() {
+            req = req.header(common::STATELESS_S2S_TOKEN_HEADER, mode);
+        }
+        let resp: TokenResponse = req.send().await?.error_for_status()?.json().await?;
 
         let mut cache = self.token_cache.lock().unwrap();
         *cache = Some(CachedToken {
@@ -2374,4 +2375,22 @@ pub struct BotReviewThread {
     pub outdated: bool,
     /// The bot's original comment.
     pub body: String,
+}
+
+#[cfg(test)]
+mod token_format_tests {
+    /// GitHub's stateless installation tokens are ~520-char JWT-style strings
+    /// (`ghs_…` with two dots). They must work as an opaque Authorization value.
+    #[test]
+    fn stateless_installation_token_is_a_valid_auth_header() {
+        let token = format!(
+            "ghs_{}.{}.{}",
+            "a".repeat(40),
+            "b".repeat(300),
+            "c-_9".repeat(44)
+        );
+        assert!(token.len() >= 520);
+        let v: reqwest::header::HeaderValue = format!("token {token}").parse().unwrap();
+        assert_eq!(v.to_str().unwrap(), format!("token {token}"));
+    }
 }

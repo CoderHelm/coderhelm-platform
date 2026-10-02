@@ -6,6 +6,30 @@
 /// run's upload, silently resurrecting deleted memories).
 pub mod memlock;
 
+/// GitHub's per-request override for the installation-token format, sent on
+/// `POST /app/installations/{id}/access_tokens`. GitHub is moving installation
+/// tokens from short opaque strings to ~520-char stateless JWT-style `ghs_…`
+/// tokens (two dots); this header pins the format instead of following the
+/// rollout. CoderHelm treats tokens as opaque strings, so it opts in by default.
+/// The header is temporary — GitHub will deprecate it.
+pub const STATELESS_S2S_TOKEN_HEADER: &str = "X-GitHub-Stateless-S2S-Token";
+
+/// The value to send for [`STATELESS_S2S_TOKEN_HEADER`], from the
+/// `GITHUB_STATELESS_S2S_TOKEN` env var: `enabled` (default) or `disabled` pin
+/// the format; `default` sends no header (GitHub's rollout decides).
+pub fn stateless_s2s_token_mode() -> Option<&'static str> {
+    stateless_s2s_token_mode_from(std::env::var("GITHUB_STATELESS_S2S_TOKEN").ok().as_deref())
+}
+
+pub fn stateless_s2s_token_mode_from(v: Option<&str>) -> Option<&'static str> {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("enabled") => Some("enabled"),
+        Some("disabled") => Some("disabled"),
+        // "default" / anything else: no header, GitHub's rollout applies.
+        _ => None,
+    }
+}
+
 /// True for Claude models that think on every request (Opus 5.x, Sonnet 5.x,
 /// Fable, Mythos). They reject non-default sampling params, `budget_tokens` and
 /// disabled thinking, lead responses with `thinking` blocks that must be echoed
@@ -259,5 +283,21 @@ mod tests {
         assert!(!is_always_thinking_model("claude-opus-4-8"));
         assert!(!is_always_thinking_model("claude-sonnet-4-6"));
         assert!(!is_always_thinking_model("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn stateless_s2s_mode_defaults_to_enabled() {
+        assert_eq!(stateless_s2s_token_mode_from(None), Some("enabled"));
+        assert_eq!(stateless_s2s_token_mode_from(Some("")), Some("enabled"));
+        assert_eq!(
+            stateless_s2s_token_mode_from(Some(" Enabled ")),
+            Some("enabled")
+        );
+        assert_eq!(
+            stateless_s2s_token_mode_from(Some("disabled")),
+            Some("disabled")
+        );
+        assert_eq!(stateless_s2s_token_mode_from(Some("default")), None);
+        assert_eq!(stateless_s2s_token_mode_from(Some("bogus")), None);
     }
 }

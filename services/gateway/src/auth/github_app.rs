@@ -35,19 +35,20 @@ pub async fn get_installation_token(
     let key = EncodingKey::from_rsa_pem(state.secrets.github_private_key.as_bytes())?;
     let jwt = encode(&Header::new(Algorithm::RS256), &claims, &key)?;
 
-    let resp: TokenResponse = state
+    let mut req = state
         .http
         .post(format!(
             "https://api.github.com/app/installations/{installation_id}/access_tokens"
         ))
         .header("Authorization", format!("Bearer {jwt}"))
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "Coderhelm-bot")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+        .header("User-Agent", "Coderhelm-bot");
+    // Pin the token format (stateless JWT-style by default) instead of
+    // following GitHub's rollout; tokens are handled as opaque strings.
+    if let Some(mode) = common::stateless_s2s_token_mode() {
+        req = req.header(common::STATELESS_S2S_TOKEN_HEADER, mode);
+    }
+    let resp: TokenResponse = req.send().await?.error_for_status()?.json().await?;
 
     Ok(resp.token)
 }
