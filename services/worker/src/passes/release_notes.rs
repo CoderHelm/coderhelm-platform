@@ -160,9 +160,29 @@ pub async fn after_tag(
             tag: tag.to_string(),
             sha: sha.to_string(),
             resend: String::new(),
+            check_branch: false,
         },
     )
     .await;
+}
+
+/// The branch whose tags get notes: the configured one, else the default branch.
+async fn release_branch(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    cfg: &ReleaseNotesConfig,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if cfg.branch.trim().is_empty() {
+        github.get_default_branch(owner, repo).await
+    } else {
+        Ok(cfg.branch.trim().to_string())
+    }
+}
+
+/// A tag is a release of `branch` when the branch contains the tag's commit.
+pub fn tag_on_branch(compare_status_branch_vs_tag: &str) -> bool {
+    matches!(compare_status_branch_vs_tag, "ahead" | "identical")
 }
 
 pub async fn enqueue(state: &WorkerState, msg: &ReleaseNotesMessage) -> bool {
@@ -630,6 +650,17 @@ async fn run_locked(
         &state.http,
     )?;
 
+    // Tags CoderHelm didn't cut (pushed by a person or CI) only get notes when
+    // they're on the release branch — not tags on feature or hotfix branches.
+    if msg.check_branch {
+        let branch = release_branch(&github, owner, repo, cfg).await?;
+        let status = github.compare_status(owner, repo, tag, &branch).await?;
+        if !tag_on_branch(&status) {
+            info!(%tag, %branch, %status, "Release notes: tag isn't on the release branch — skipped");
+            return Ok(());
+        }
+    }
+
     // 1) Notes — reuse the stored ones unless regenerating.
     let notes = if !regenerate && !rec.get("entry_md").is_none_or(|s| s.is_empty()) {
         Notes {
@@ -956,6 +987,17 @@ mod tests {
             "not a key: UTF-8, X-1, ABCD-",
         ]);
         assert_eq!(k, vec!["CPM-8344", "CPM-12", "CPM-7001", "UTF-8"]);
+    }
+
+    #[test]
+    fn tag_counts_as_release_only_when_branch_contains_it() {
+        // compare(tag...branch): branch "ahead" of / "identical" to the tag
+        assert!(tag_on_branch("ahead"));
+        assert!(tag_on_branch("identical"));
+        // tag on another branch, or newer than the branch
+        assert!(!tag_on_branch("diverged"));
+        assert!(!tag_on_branch("behind"));
+        assert!(!tag_on_branch(""));
     }
 
     #[test]

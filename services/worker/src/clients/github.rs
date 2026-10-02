@@ -1689,6 +1689,22 @@ impl GitHubClient {
         Ok(out)
     }
 
+    /// GitHub's comparison status of `head` against `base`: "ahead", "behind",
+    /// "identical" or "diverged". `head` contains `base` when "ahead"/"identical".
+    pub async fn compare_status(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/compare/{base}...{head}?per_page=1");
+        Ok(self.get(&url).await?["status"]
+            .as_str()
+            .unwrap_or("")
+            .to_string())
+    }
+
     /// Recent commits on `sha` (newest first) — used when there is no previous
     /// release tag to compare against.
     pub async fn recent_commits(

@@ -10,8 +10,8 @@ use tracing::{error, info, warn};
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
     AwaitMergeMessage, FeedbackMessage, GraphIndexMessage, MarkReadyMessage, OnboardMessage,
-    OnboardRepo, PlanTaskContinueMessage, ResumeMessage, ReviewMessage, TicketMessage,
-    TicketSource, WorkerMessage,
+    OnboardRepo, PlanTaskContinueMessage, ReleaseNotesMessage, ResumeMessage, ReviewMessage,
+    TicketMessage, TicketSource, WorkerMessage,
 };
 use crate::AppState;
 
@@ -1675,6 +1675,78 @@ pub(crate) async fn load_review_config(
 /// DEFAULT branch, enqueue an INCREMENTAL graph index for exactly the files the
 /// push touched (added/modified/removed across its commits). This is what keeps
 /// the graph permanently fresh without scheduled rebuilds.
+/// A tag pushed by a person or by CI (`refs/tags/…` push, `created`). When the
+/// repo has release notes on, queue the same release-notes job CoderHelm runs
+/// after cutting its own tag. Tags CoderHelm cuts itself are skipped here (the
+/// tag cut already queued them; the worker's per-tag record would no-op anyway).
+/// The worker checks the tag is on the repo's release branch before writing.
+#[allow(clippy::too_many_arguments)]
+async fn handle_tag_push(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    tag: &str,
+) -> Result<StatusCode, StatusCode> {
+    let created = payload["created"].as_bool().unwrap_or(false);
+    let deleted = payload["deleted"].as_bool().unwrap_or(false);
+    if !created || deleted || tag.is_empty() {
+        return Ok(StatusCode::OK);
+    }
+    let sender = payload["sender"]["login"].as_str().unwrap_or("");
+    let pusher = payload["pusher"]["name"].as_str().unwrap_or("");
+    if is_coderhelm_actor(sender) || is_coderhelm_actor(pusher) {
+        return Ok(StatusCode::OK);
+    }
+    let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
+    let enabled = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sk))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned())
+        .map(|it| {
+            let b = |k: &str| {
+                it.get(k)
+                    .and_then(|v| v.as_bool().ok())
+                    .copied()
+                    .unwrap_or(false)
+            };
+            b("release_notes") && !b("killed")
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(StatusCode::OK);
+    }
+    info!(
+        owner,
+        name, tag, sender, "Release notes: tag pushed outside CoderHelm → release notes job"
+    );
+    let message = WorkerMessage::ReleaseNotes(ReleaseNotesMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        tag: tag.to_string(),
+        // The tag resolves as a ref everywhere the worker needs a commit.
+        sha: tag.to_string(),
+        resend: String::new(),
+        check_branch: true,
+    });
+    send_to_queue(state, &state.config.ticket_queue_url, &message).await
+}
+
+/// The CoderHelm app's own GitHub identity (`coderhelm[bot]`, any case).
+fn is_coderhelm_actor(login: &str) -> bool {
+    login.to_ascii_lowercase().starts_with("coderhelm")
+}
+
 async fn handle_push(
     state: &AppState,
     payload: &Value,
@@ -1691,6 +1763,10 @@ async fn handle_push(
     let git_ref = payload["ref"].as_str().unwrap_or("");
     if owner.is_empty() || name.is_empty() {
         return Ok(StatusCode::OK);
+    }
+    // A new tag → release notes (for tags CoderHelm didn't cut itself).
+    if let Some(tag) = git_ref.strip_prefix("refs/tags/") {
+        return handle_tag_push(state, payload, installation_id, team_id, owner, name, tag).await;
     }
     // Only the branch the graph tracks.
     if git_ref != format!("refs/heads/{default_branch}") {
