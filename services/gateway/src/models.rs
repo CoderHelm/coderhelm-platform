@@ -491,4 +491,8 @@ pub struct ReleaseNotesMessage {
     pub sha: String,
     #[serde(default)]
     pub resend: String,
+    /// Set for tags CoderHelm didn't cut (pushed by a person or CI): only write
+    /// notes when the tag's commit is on the repo's release branch.
+    #[serde(default)]
+    pub check_branch: bool,
 }

@@ -825,6 +825,8 @@ pub async fn send_release(
         // The tag resolves as a ref everywhere the worker needs a commit.
         sha: tag.to_string(),
         resend: resend.to_string(),
+        // Asked for explicitly from the dashboard: no branch check.
+        check_branch: false,
     });
     super::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &message).await?;
     info!(
