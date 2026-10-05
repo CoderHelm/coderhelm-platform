@@ -549,7 +549,7 @@ pub async fn run(
     }
 
     // 2) Critic pass drops weak/false findings.
-    let findings = review_agent::critique_findings(
+    let mut findings = review_agent::critique_findings(
         state,
         &provider,
         &diff,
@@ -560,6 +560,12 @@ pub async fn run(
     .await;
 
     // 3) Map to inline comments (only diff-anchored lines) + summary bullets.
+    // With "Require tests" on, a missing/stale-tests finding blocks the merge
+    // whatever severity the model gave it (it sometimes rated them medium/low
+    // and the PR was approved without the tests).
+    if cfg.require_tests {
+        review_agent::enforce_required_tests(&mut findings);
+    }
     let postable = review_agent::to_postable(&findings, &changed);
 
     // 4) Optional sandbox verification ("receipts"): actually run the affected

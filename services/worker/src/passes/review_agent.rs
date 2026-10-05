@@ -122,6 +122,15 @@ pub fn format_prior_threads(prior: &[crate::clients::github::BotReviewThread]) -
     s
 }
 
+/// "Require tests": every `tests` finding is blocking.
+pub fn enforce_required_tests(findings: &mut [Finding]) {
+    for f in findings.iter_mut() {
+        if f.category.eq_ignore_ascii_case("tests") {
+            f.severity = "blocking".to_string();
+        }
+    }
+}
+
 impl Finding {
     fn is_blocking(&self) -> bool {
         self.severity.eq_ignore_ascii_case("blocking")
@@ -974,5 +983,37 @@ mod tests {
         assert!(p.inline[0].body.contains("```suggestion"));
         assert_eq!(p.blocking_count, 1);
         assert!(p.unanchored_md.contains("a.rs:99"));
+    }
+}
+
+#[cfg(test)]
+mod required_tests_tests {
+    use super::*;
+
+    fn f(category: &str, severity: &str) -> Finding {
+        Finding {
+            file: "a.tsx".into(),
+            line: 1,
+            end_line: None,
+            severity: severity.into(),
+            category: category.into(),
+            title: "t".into(),
+            body: "b".into(),
+            suggestion: None,
+        }
+    }
+
+    #[test]
+    fn tests_findings_become_blocking_others_untouched() {
+        let mut v = vec![
+            f("tests", "medium"),
+            f("Tests", "low"),
+            f("bug", "medium"),
+            f("convention", "nit"),
+        ];
+        enforce_required_tests(&mut v);
+        assert!(v[0].is_blocking() && v[1].is_blocking());
+        assert_eq!(v[2].severity, "medium");
+        assert_eq!(v[3].severity, "nit");
     }
 }
