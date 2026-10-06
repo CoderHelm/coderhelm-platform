@@ -167,6 +167,8 @@ pub async fn get_config(
         "release_notes_confluence_parent_id": item_str(&item, "release_notes_confluence_parent_id", ""),
         "release_notes_confluence_container": item_str(&item, "release_notes_confluence_container", "Changelog"),
         "release_notes_email_webhook_url": item_str(&item, "release_notes_email_webhook_url", ""),
+        // Never returned; the dashboard only learns whether one is set.
+        "release_notes_email_webhook_secret_set": !item_str(&item, "release_notes_email_webhook_secret", "").is_empty(),
         "release_notes_guide": item_str(&item, "release_notes_guide", ""),
         "release_notes_instructions": item_str(&item, "release_notes_instructions", ""),
         "graph_enabled": item_bool(&item, "graph_enabled", false),
@@ -369,7 +371,7 @@ pub async fn update_config(
     // saving reviewer config would silently disable the graph. The OFF→ON
     // transition (only possible when the body explicitly sets it) still kicks
     // off the initial full index.
-    let was_enabled = state
+    let prior = state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
@@ -378,13 +380,32 @@ pub async fn update_config(
         .send()
         .await
         .ok()
-        .and_then(|o| o.item().cloned())
+        .and_then(|o| o.item().cloned());
+    let was_enabled = prior
+        .as_ref()
         .and_then(|it| {
             it.get("graph_enabled")
                 .and_then(|v| v.as_bool().ok())
                 .copied()
         })
         .unwrap_or(false);
+    // The email-webhook secret is write-only: a PUT sets it only when the body
+    // carries a new value, clears it on `release_notes_email_webhook_secret_clear`,
+    // and otherwise keeps the stored one (GET never returns it, so the page
+    // can't send it back).
+    let prior_secret = prior
+        .as_ref()
+        .map(|it| item_str(it, "release_notes_email_webhook_secret", ""))
+        .unwrap_or_default();
+    let new_secret = bounded("release_notes_email_webhook_secret", 500);
+    let rn_secret = if body["release_notes_email_webhook_secret_clear"].as_bool() == Some(true) {
+        String::new()
+    } else if !new_secret.is_empty() {
+        new_secret
+    } else {
+        prior_secret
+    };
+    put = put.item("release_notes_email_webhook_secret", attr_s(&rn_secret));
     let graph_enabled = body["graph_enabled"].as_bool().unwrap_or(was_enabled);
     put = put.item("graph_enabled", attr_bool(graph_enabled));
     put = put.item("health_log_groups", AttributeValue::L(log_groups));
