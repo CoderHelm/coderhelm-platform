@@ -596,16 +596,14 @@ pub async fn run(
         }
     }
 
-    // Verdict: a surviving blocking finding OR a failed verification forces
-    // REQUEST_CHANGES; otherwise the model's verdict, fail-closed to
-    // REQUEST_CHANGES on anything non-APPROVE.
-    let verdict: &'static str = if postable.blocking_count > 0 || verify_failed {
-        "REQUEST_CHANGES"
-    } else if output.verdict.eq_ignore_ascii_case("APPROVE") {
-        "APPROVE"
-    } else {
-        "REQUEST_CHANGES"
-    };
+    // Verdict: CoderHelm approves only when it has nothing left to ask for.
+    // Any surviving finding (any severity), an earlier CoderHelm comment still
+    // open, or a failed verification → REQUEST_CHANGES; otherwise the model's
+    // verdict, fail-closed to REQUEST_CHANGES on anything non-APPROVE. An
+    // approval is what arms auto-merge, so "approve with notes" would merge a PR
+    // with changes still requested.
+    let verdict: &'static str =
+        final_verdict(findings.len(), still_open, verify_failed, &output.verdict);
     // Computed, explainable risk (blast-radius-weighted) — overrides the model's
     // guess and drives the displayed level.
     let risk_report = review_risk::assess(
@@ -632,6 +630,17 @@ pub async fn run(
         output.summary.clone()
     };
     let mut full_body = format!("{verdict_line}\n\n{summary}\n\n{}", risk_report.markdown());
+    // "Approve with notes" no longer exists: say plainly why changes are
+    // requested when nothing on its own is blocking.
+    if verdict == "REQUEST_CHANGES" && postable.blocking_count == 0 && !verify_failed {
+        let open = findings.len() + still_open;
+        if open > 0 {
+            full_body.push_str(&format!(
+                "\n\n> Nothing here is blocking on its own, but {open} requested change(s) are still open — \
+                 CoderHelm approves (and auto-merge proceeds) once they're addressed or their threads resolved."
+            ));
+        }
+    }
     if !verify_md.is_empty() {
         full_body.push_str(&format!("\n\n{verify_md}"));
     }
@@ -1221,5 +1230,45 @@ mod prior_thread_tests {
     fn missing_statuses_mean_nothing_resolved() {
         let prior = vec![t("A"), t("B")];
         assert!(fixed_prior_threads(&prior, &[]).is_empty());
+    }
+}
+
+/// The review verdict. APPROVE only when nothing is left to change: no
+/// findings of any severity, none of CoderHelm's earlier comments still open,
+/// verification not failed, and the model itself approved.
+fn final_verdict(
+    findings: usize,
+    prior_still_open: usize,
+    verify_failed: bool,
+    model_verdict: &str,
+) -> &'static str {
+    if findings == 0
+        && prior_still_open == 0
+        && !verify_failed
+        && model_verdict.eq_ignore_ascii_case("APPROVE")
+    {
+        "APPROVE"
+    } else {
+        "REQUEST_CHANGES"
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::final_verdict;
+
+    #[test]
+    fn approves_only_with_nothing_left_to_change() {
+        assert_eq!(final_verdict(0, 0, false, "APPROVE"), "APPROVE");
+        // gangway-api#447: a low + a nit, model said "approving with notes"
+        assert_eq!(final_verdict(2, 0, false, "APPROVE"), "REQUEST_CHANGES");
+        // an earlier CoderHelm comment still open
+        assert_eq!(final_verdict(0, 1, false, "APPROVE"), "REQUEST_CHANGES");
+        assert_eq!(final_verdict(0, 0, true, "APPROVE"), "REQUEST_CHANGES");
+        assert_eq!(
+            final_verdict(0, 0, false, "REQUEST_CHANGES"),
+            "REQUEST_CHANGES"
+        );
+        assert_eq!(final_verdict(0, 0, false, ""), "REQUEST_CHANGES");
     }
 }
