@@ -34,6 +34,8 @@ use crate::models::{ReleaseNotesMessage, TokenUsage};
 use crate::WorkerState;
 
 const MAX_PRS: usize = 80;
+/// Atlassian Automation's header for an incoming webhook's secret.
+const EMAIL_WEBHOOK_SECRET_HEADER: &str = "X-Automation-Webhook-Token";
 const MAX_COMMITS: usize = 500;
 
 /// Files a repo may keep its release-notes writing guide in, checked in order.
@@ -62,6 +64,9 @@ pub struct ReleaseNotesConfig {
     /// HTTPS webhook that sends the email (e.g. Atlassian Automation). Empty =
     /// no email step.
     pub email_webhook_url: String,
+    /// Sent as `X-Automation-Webhook-Token` (Atlassian Automation incoming
+    /// webhooks with a secret). Empty = no header.
+    pub email_webhook_secret: String,
     /// Repo path of the writing guide. Empty = auto-detect (GUIDE_CANDIDATES).
     pub guide_path: String,
     /// Extra free-text instructions (audience, tone, product name…).
@@ -110,6 +115,7 @@ impl ReleaseNotesConfig {
                 container
             },
             email_webhook_url: s("release_notes_email_webhook_url"),
+            email_webhook_secret: s("release_notes_email_webhook_secret"),
             guide_path: s("release_notes_guide"),
             instructions: s("release_notes_instructions"),
             teams_webhook_url: s("teams_webhook_url"),
@@ -805,12 +811,11 @@ async fn run_locked(
             "confluence_url": rec.get("confluence_url").cloned().unwrap_or_default(),
             "release_url": release_url,
         });
-        let resp = state
-            .http
-            .post(cfg.email_webhook_url.trim())
-            .json(&payload)
-            .send()
-            .await?;
+        let mut req = state.http.post(cfg.email_webhook_url.trim()).json(&payload);
+        if !cfg.email_webhook_secret.trim().is_empty() {
+            req = req.header(EMAIL_WEBHOOK_SECRET_HEADER, cfg.email_webhook_secret.trim());
+        }
+        let resp = req.send().await?;
         if !resp.status().is_success() {
             return Err(format!("Email webhook returned {}", resp.status()).into());
         }
