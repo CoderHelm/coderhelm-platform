@@ -559,6 +559,29 @@ pub async fn run(
     )
     .await;
 
+    // 2b) A suggestion is a one-click commit of its text over the anchored
+    // lines; keep it only when that is a safe in-place edit of the file at this
+    // head.
+    let mut head_files = std::collections::HashMap::new();
+    for f in findings.iter().filter(|f| f.suggestion.is_some()) {
+        if head_files.contains_key(&f.file) {
+            continue;
+        }
+        if let Ok(content) = github
+            .read_file(&msg.repo_owner, &msg.repo_name, &f.file, &head_sha)
+            .await
+        {
+            head_files.insert(f.file.clone(), content);
+        }
+    }
+    let dropped = review_agent::vet_suggestions(&mut findings, &head_files);
+    if dropped > 0 {
+        info!(
+            pr = msg.pr_number,
+            dropped, "Reviewer dropped unsafe suggestions"
+        );
+    }
+
     // 3) Map to inline comments (only diff-anchored lines) + summary bullets.
     // With "Require tests" on, a missing/stale-tests finding blocks the merge
     // whatever severity the model gave it (it sometimes rated them medium/low

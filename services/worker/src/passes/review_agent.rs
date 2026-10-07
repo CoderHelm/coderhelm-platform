@@ -608,6 +608,10 @@ pub async fn generate_review(
          \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"open\"}}]  (one per earlier comment listed, if any),\n  \
          \"labels\": [{{\"name\": \"label\", \"reason\": \"changed file(s) that need it\"}}]  (only if a PR-labels section is given),\n  \
          \"tests_note\": \"which tests will run and where, or why none are needed\"  (only if a PR-labels section is given)\n}}\n\
+         A `suggestion` becomes a one-click GitHub \"Commit suggestion\": it REPLACES lines `line`..`end_line` \
+         (just `line` without end_line) at the PR head with exactly its text. Give one ONLY when the whole fix is \
+         that in-place replacement: the full new text of every anchored line, nothing outside them. A fix that \
+         moves code, or changes more than one place, gets NO suggestion; describe it in the body instead.\n\
          Use \"blocking\" ONLY for real bugs/risks that should stop the merge. If unsure, REQUEST_CHANGES.{graph_note}"
     );
     let prompt = format!(
@@ -776,6 +780,53 @@ pub struct PostableReview {
     /// Findings that couldn't be anchored to a diff line — folded into the body.
     pub unanchored_md: String,
     pub blocking_count: usize,
+}
+
+/// Net bracket depth of `text` per bracket pair: (), [], {}.
+fn bracket_balance(text: &str) -> [i64; 3] {
+    let mut b = [0i64; 3];
+    for c in text.chars() {
+        match c {
+            '(' => b[0] += 1,
+            ')' => b[0] -= 1,
+            '[' => b[1] += 1,
+            ']' => b[1] -= 1,
+            '{' => b[2] += 1,
+            '}' => b[2] -= 1,
+            _ => {}
+        }
+    }
+    b
+}
+
+/// Drop a finding's suggestion unless it is a safe in-place edit of the file at
+/// the PR head. A GitHub suggestion replaces exactly lines `line..=end_line`, so
+/// the replacement must keep the bracket balance of the lines it replaces: a
+/// suggestion that removes half a block (an entry's body and closing `}` but not
+/// its `{`) would commit broken code in one click. `files` maps path → head
+/// content; a file that couldn't be read loses its suggestions. Returns how many
+/// suggestions were dropped.
+pub fn vet_suggestions(findings: &mut [Finding], files: &HashMap<String, String>) -> usize {
+    let mut dropped = 0;
+    for f in findings.iter_mut() {
+        let Some(sugg) = f.suggestion.as_ref() else {
+            continue;
+        };
+        let keep = files.get(&f.file).is_some_and(|content| {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = f.line as usize;
+            let end = f.end_line.filter(|e| *e >= f.line).unwrap_or(f.line) as usize;
+            if start == 0 || end > lines.len() {
+                return false;
+            }
+            bracket_balance(&lines[start - 1..end].join("\n")) == bracket_balance(sugg)
+        });
+        if !keep {
+            f.suggestion = None;
+            dropped += 1;
+        }
+    }
+    dropped
 }
 
 /// Map findings to inline comments, keeping only those anchored to a real RIGHT
@@ -1015,5 +1066,41 @@ mod required_tests_tests {
         assert!(v[0].is_blocking() && v[1].is_blocking());
         assert_eq!(v[2].severity, "medium");
         assert_eq!(v[3].severity, "nit");
+    }
+
+    fn sugg(line: u64, end_line: Option<u64>, s: &str) -> Finding {
+        Finding {
+            file: "outputs.tf".into(),
+            line,
+            end_line,
+            severity: "blocking".into(),
+            category: "bug".into(),
+            title: "t".into(),
+            body: "b".into(),
+            suggestion: Some(s.into()),
+        }
+    }
+
+    // terraform_devops#291: the new entry is lines 2-5. A suggestion over 3-5
+    // that deletes its body and `},` but keeps its `{` must not be offered.
+    const TF: &str = "  rules = [\n    {\n      cidr_block  = \"67.80.16.247/32\"\n      description = \"Home\"\n    },\n    {\n      cidr_block  = \"104.42.41.203/32\"\n    }\n  ]";
+
+    #[test]
+    fn vet_suggestions_drops_half_block_edits_and_keeps_safe_ones() {
+        let files = HashMap::from([("outputs.tf".to_string(), TF.to_string())]);
+        let mut fs = vec![
+            sugg(3, Some(5), ""),                                 // leaves a bare `{`
+            sugg(2, Some(5), ""),                                 // removes the whole entry
+            sugg(3, None, "      cidr_block  = \"10.0.0.1/32\""), // one-line edit
+            sugg(2, Some(5), "    {"),                            // keeps `{`, drops `},`
+            sugg(40, None, "x"),                                  // past the end of the file
+        ];
+        assert_eq!(vet_suggestions(&mut fs, &files), 3);
+        let kept: Vec<bool> = fs.iter().map(|f| f.suggestion.is_some()).collect();
+        assert_eq!(kept, vec![false, true, true, false, false]);
+
+        let mut unread = vec![sugg(3, None, "x")];
+        assert_eq!(vet_suggestions(&mut unread, &HashMap::new()), 1);
+        assert!(unread[0].suggestion.is_none());
     }
 }
