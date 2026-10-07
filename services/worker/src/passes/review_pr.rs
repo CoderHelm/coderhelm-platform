@@ -244,7 +244,7 @@ pub async fn run(
     // commit ("asking too fast"). Reply/question reviews resolve the head fresh
     // (msg.head_sha empty) and are never skipped here.
     let current_head = pr["head"]["sha"].as_str().unwrap_or("");
-    if msg.question.is_none() && !msg.head_sha.is_empty() && current_head != msg.head_sha {
+    if superseded(&msg, current_head) {
         info!(
             pr = msg.pr_number,
             enqueued = %msg.head_sha,
@@ -686,6 +686,28 @@ pub async fn run(
         ));
     }
     full_body.push_str(RATING_FOOTER);
+
+    // Check the head again before speaking: the review takes minutes, and a
+    // commit pushed seconds before this one started may not have been the PR's
+    // head yet when the check above ran. Posting now would put a verdict on code
+    // that's already replaced — and if the newer commit's review finished first,
+    // overturn it (speedboat#1322: APPROVE on the head, then REQUEST_CHANGES on
+    // the commit before it).
+    if let Ok(latest) = github
+        .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    {
+        let latest_head = latest["head"]["sha"].as_str().unwrap_or("");
+        if superseded(&msg, latest_head) {
+            info!(
+                pr = msg.pr_number,
+                reviewed = %msg.head_sha,
+                current = latest_head,
+                "Not posting superseded review — the PR moved on while reviewing"
+            );
+            return Ok(());
+        }
+    }
 
     // De-spam: only comment when there's news. If CoderHelm's last recorded verdict
     // for this PR equals this one (e.g. still APPROVE while the self-fix loop keeps
@@ -1259,6 +1281,17 @@ mod prior_thread_tests {
 /// The review verdict. APPROVE only when nothing is left to change: no
 /// findings of any severity, none of CoderHelm's earlier comments still open,
 /// verification not failed, and the model itself approved.
+/// A verdict review is superseded once the PR's head is no longer the commit it
+/// was enqueued for; that commit's own review covers the latest code. Reviews
+/// that answer a question, or that resolve the head themselves (empty
+/// head_sha), always speak.
+fn superseded(msg: &ReviewMessage, current_head: &str) -> bool {
+    msg.question.is_none()
+        && !msg.head_sha.is_empty()
+        && !current_head.is_empty()
+        && current_head != msg.head_sha
+}
+
 fn final_verdict(
     findings: usize,
     prior_still_open: usize,
@@ -1273,6 +1306,40 @@ fn final_verdict(
         "APPROVE"
     } else {
         "REQUEST_CHANGES"
+    }
+}
+
+#[cfg(test)]
+mod superseded_tests {
+    use super::superseded;
+    use crate::models::ReviewMessage;
+
+    fn msg(head: &str, question: Option<&str>) -> ReviewMessage {
+        ReviewMessage {
+            team_id: "T".into(),
+            installation_id: 1,
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 1322,
+            head_sha: head.into(),
+            label: "ch-review".into(),
+            question: question.map(String::from),
+            trigger: "synchronize".into(),
+            dedup_key: String::new(),
+            reply_to_comment_id: None,
+        }
+    }
+
+    #[test]
+    fn only_a_verdict_for_an_older_commit_is_superseded() {
+        // speedboat#1322: b20e26f's review must not post once cc15ab8 is the head.
+        assert!(superseded(&msg("b20e26f", None), "cc15ab8"));
+        assert!(!superseded(&msg("cc15ab8", None), "cc15ab8"));
+        // A question is answered whatever the head; an empty head_sha targets the latest.
+        assert!(!superseded(&msg("b20e26f", Some("why?")), "cc15ab8"));
+        assert!(!superseded(&msg("", None), "cc15ab8"));
+        // An unreadable head never silences a review.
+        assert!(!superseded(&msg("b20e26f", None), ""));
     }
 }
 
