@@ -1963,8 +1963,32 @@ async fn handle_review_trigger(
         dedup_key,
         reply_to_comment_id: None,
     });
-    send_to_queue(state, &state.config.ticket_queue_url, &message).await
+    send_to_queue_after(
+        state,
+        &state.config.ticket_queue_url,
+        &message,
+        review_delay_secs(action),
+    )
+    .await
 }
+
+/// How long a review started by a pull_request event waits in the queue. A push
+/// (`synchronize`) waits [`REVIEW_PUSH_SETTLE_SECS`] so a burst of commits settles
+/// first: by the time the worker reads the PR, GitHub lists the real latest
+/// head, every superseded commit's review is skipped before it starts, and only
+/// the last commit is reviewed. Undelayed, two commits pushed 2s apart were both
+/// reviewed and the older one's verdict posted last (speedboat#1322). Other
+/// events (label added, opened, ready for review) are single, deliberate steps
+/// and start at once.
+fn review_delay_secs(action: &str) -> i32 {
+    if action == "synchronize" {
+        REVIEW_PUSH_SETTLE_SECS
+    } else {
+        0
+    }
+}
+
+const REVIEW_PUSH_SETTLE_SECS: i32 = 60;
 
 /// How long a review claim blocks re-review of the SAME head. Sized to comfortably
 /// outlast the burst of webhook events GitHub fires for one commit (seconds), while
@@ -2032,6 +2056,17 @@ pub(crate) async fn send_to_queue(
     queue_url: &str,
     message: &WorkerMessage,
 ) -> Result<StatusCode, StatusCode> {
+    send_to_queue_after(state, queue_url, message, 0).await
+}
+
+/// [`send_to_queue`], delivered to the worker after `delay_secs` (SQS allows up
+/// to 900).
+pub(crate) async fn send_to_queue_after(
+    state: &AppState,
+    queue_url: &str,
+    message: &WorkerMessage,
+    delay_secs: i32,
+) -> Result<StatusCode, StatusCode> {
     let body = serde_json::to_string(message).map_err(|e| {
         error!("Failed to serialize message: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -2042,6 +2077,7 @@ pub(crate) async fn send_to_queue(
         .send_message()
         .queue_url(queue_url)
         .message_body(&body)
+        .delay_seconds(delay_secs)
         .send()
         .await
         .map_err(|e| {
@@ -2408,6 +2444,21 @@ async fn post_limit_comment(
         .await
     {
         warn!("Failed to post limit comment: {e}");
+    }
+}
+
+#[cfg(test)]
+mod review_delay_tests {
+    use super::{review_delay_secs, REVIEW_PUSH_SETTLE_SECS};
+
+    #[test]
+    fn only_push_reviews_wait_for_the_burst_to_settle() {
+        assert_eq!(review_delay_secs("synchronize"), REVIEW_PUSH_SETTLE_SECS);
+        for action in ["labeled", "opened", "reopened", "ready_for_review"] {
+            assert_eq!(review_delay_secs(action), 0, "{action}");
+        }
+        // Within SQS's 900s per-message cap.
+        assert!((1..=900).contains(&REVIEW_PUSH_SETTLE_SECS));
     }
 }
 
