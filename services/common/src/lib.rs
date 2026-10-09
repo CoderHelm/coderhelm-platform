@@ -6,6 +6,10 @@
 /// run's upload, silently resurrecting deleted memories).
 pub mod memlock;
 
+/// Expiring once-only claims (dedup markers, leases) on the settings table.
+/// Shared so every claim compares its expiry the same way.
+pub mod claim;
+
 /// GitHub's per-request override for the installation-token format, sent on
 /// `POST /app/installations/{id}/access_tokens`. GitHub is moving installation
 /// tokens from short opaque strings to ~520-char stateless JWT-style `ghs_…`
@@ -46,6 +50,11 @@ pub fn is_always_thinking_model(model_id: &str) -> bool {
 }
 
 use sha2::{Digest, Sha256};
+
+/// Stable SHA-256 hex digest of a string.
+pub fn content_hash(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
 
 /// Stable content hash for a ticket's context: title + body + image keys.
 ///

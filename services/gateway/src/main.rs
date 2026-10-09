@@ -162,6 +162,12 @@ async fn main() -> Result<(), Error> {
             "/reviewer/config/:owner/:name",
             get(routes::reviewer::get_config).put(routes::reviewer::update_config),
         )
+        .route(
+            "/alert-routes",
+            get(routes::alerts::list_routes)
+                .put(routes::alerts::put_route)
+                .delete(routes::alerts::delete_route),
+        )
         .route("/reviewer/reviews", get(routes::reviewer::list_reviews))
         .route("/reviewer/review", get(routes::reviewer::get_review))
         .route("/reviewer/review/rate", post(routes::reviewer::rate_review))
@@ -397,7 +403,8 @@ async fn main() -> Result<(), Error> {
     let webhook_routes = Router::new()
         .route("/github", post(routes::github_webhook::handle))
         .route("/jira/:token", post(routes::jira_webhook::handle))
-        .route("/jira", post(routes::jira_webhook::handle_forge));
+        .route("/jira", post(routes::jira_webhook::handle_forge))
+        .route("/alerts/sns", post(routes::alerts::handle_sns));
 
     // Auth routes (public, rate-limited)
     let auth_routes = Router::new()

@@ -50,7 +50,7 @@ pub async fn run(
 
     let ticket_ref = match msg.source {
         TicketSource::Github => format!("#{}", msg.issue_number),
-        TicketSource::Jira => msg.ticket_id.clone(),
+        TicketSource::Jira | TicketSource::Alert => msg.ticket_id.clone(),
     };
 
     let template_block = if let Some(ref tmpl) = pr_template {
@@ -161,7 +161,7 @@ Return ONLY the markdown body text."#,
     // Create PR title
     let mut title = match msg.source {
         TicketSource::Github => format!("#{}: {}", msg.issue_number, msg.title),
-        TicketSource::Jira => format!("{}: {}", msg.ticket_id, msg.title),
+        TicketSource::Jira | TicketSource::Alert => format!("{}: {}", msg.ticket_id, msg.title),
     };
     if title.len() > 72 {
         // char-boundary-safe: String::truncate panics mid-codepoint, and
@@ -219,7 +219,7 @@ Return ONLY the markdown body text."#,
             "{}: {}",
             match msg.source {
                 TicketSource::Github => format!("#{}", msg.issue_number),
-                TicketSource::Jira => msg.ticket_id.clone(),
+                TicketSource::Jira | TicketSource::Alert => msg.ticket_id.clone(),
             },
             msg.title
         );

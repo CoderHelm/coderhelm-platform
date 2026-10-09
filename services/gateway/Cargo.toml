@@ -33,7 +33,11 @@ aws-sdk-lambda = "1"
 # Auth
 jsonwebtoken = "9"
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
+# SNS message signature verification (alert intake)
+rsa = "0.9"
+sha1 = { version = "0.10", features = ["oid"] }
+x509-cert = "0.2"
 hex = "0.4"
 base64 = "0.22"
 
@@ -64,3 +68,7 @@ mentedb = { git = "https://github.com/nambok/mentedb.git", rev = "b4db4447d62384
 mentedb-core = { git = "https://github.com/nambok/mentedb.git", rev = "b4db4447d62384cf3b30153787295a70dae4a6a5" }
 flate2 = "1"
 tar = "0.4"
+
+[dev-dependencies]
+# rsa 0.9 key generation needs the rand 0.8 RNG traits (tests only)
+rand08 = { package = "rand", version = "0.8" }

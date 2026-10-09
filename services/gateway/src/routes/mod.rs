@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod api;
 pub mod auth;
 pub mod banners;
@@ -11,5 +12,6 @@ pub mod memory;
 pub mod plans;
 pub mod plugins;
 pub mod reviewer;
+pub mod sns;
 pub mod trigger_gate;
 pub mod users;
