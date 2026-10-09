@@ -190,6 +190,7 @@ pub async fn run(
     state: &WorkerState,
     msg: ReviewMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let job_started = chrono::Utc::now().to_rfc3339();
     let cfg = load_config(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
     if !cfg.enabled || cfg.killed {
         info!(
@@ -715,7 +716,8 @@ pub async fn run(
     // stay SILENT — no repeated "Approved"/"armed" comments, which is the main
     // source of reviewer spam. An explicit reply / re-review (msg.question) always
     // speaks, and a flip to/from REQUEST_CHANGES always speaks (verdict changed).
-    let prev_verdict = last_review_verdict(state, &msg).await;
+    let prev = last_review(state, &msg).await;
+    let prev_verdict = prev.as_ref().map(|p| p.verdict.clone());
     // An explicit human ask (a reply/question or the native "Re-request review"
     // button) always speaks, even if the verdict is unchanged — the person asked to
     // see it. Only webhook-driven re-reviews (a self-fix commit, a re-label) get
@@ -728,7 +730,21 @@ pub async fn run(
         || !findings.is_empty()
         || !fixed_threads.is_empty()
         || !label_decision.add.is_empty();
-    let should_comment = explicit || has_news;
+    // A person pushed a commit: they hear that it was reviewed, even when the
+    // verdict and the open findings are unchanged — otherwise they are left
+    // asking for a re-review. Only CoderHelm's own commits and duplicate
+    // reviews of the same commit stay quiet.
+    let new_human_commit = prev.as_ref().is_some_and(|p| p.head_sha != head_sha)
+        && !head_commit_by_bot(&compare, &head_sha);
+    // A push and a re-review ask for the same commit run two reviews; the
+    // first to finish speaks for both.
+    let already_answered = prev
+        .as_ref()
+        .is_some_and(|p| p.head_sha == head_sha && p.created_at >= job_started);
+    let should_comment = !already_answered && (explicit || has_news || new_human_commit);
+    if already_answered {
+        info!(pr = msg.pr_number, head = %head_sha, "Another review of this commit was just posted — not posting a duplicate");
+    }
 
     // Post ONE batched review with inline comments; fall back to body-only if
     // GitHub rejects an anchor (a bad line must never drop the whole verdict).
@@ -1142,12 +1158,17 @@ async fn lookup_run_by_pr(
         .find_map(|it| it.get("run_id").and_then(|v| v.as_s().ok()).cloned())
 }
 
-/// Persist a review record to the settings table so the dashboard can list it and
+/// CoderHelm's most recent review of a PR.
+struct LastReview {
+    verdict: String,
+    head_sha: String,
+    created_at: String,
+}
+
 /// The most recent verdict CoderHelm recorded for this PR (any head), or None if
 /// it has never reviewed it. Records are keyed sk=REVIEW#{repo}#{pr:06}#{rfc3339},
-/// so a descending scan yields newest-first. Used to stay silent on an unchanged
-/// verdict so the reviewer doesn't re-comment every commit.
-async fn last_review_verdict(state: &WorkerState, msg: &ReviewMessage) -> Option<String> {
+/// so a descending query yields newest-first. Question answers are skipped.
+async fn last_review(state: &WorkerState, msg: &ReviewMessage) -> Option<LastReview> {
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let prefix = format!("REVIEW#{repo}#{:0>6}#", msg.pr_number);
     let resp = state
@@ -1158,15 +1179,44 @@ async fn last_review_verdict(state: &WorkerState, msg: &ReviewMessage) -> Option
         .expression_attribute_values(":pk", attr_s(&msg.team_id))
         .expression_attribute_values(":sk", attr_s(&prefix))
         .scan_index_forward(false)
-        .limit(1)
+        .consistent_read(true)
+        .limit(10)
         .send()
         .await
         .ok()?;
-    resp.items()
-        .first()
-        .and_then(|i| i.get("verdict").and_then(|v| v.as_s().ok()).cloned())
+    let get = |i: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+               k: &str| {
+        i.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    resp.items().iter().find_map(|i| {
+        let verdict = get(i, "verdict");
+        (verdict == "APPROVE" || verdict == "REQUEST_CHANGES").then(|| LastReview {
+            verdict,
+            head_sha: get(i, "head_sha"),
+            created_at: get(i, "created_at"),
+        })
+    })
 }
 
+/// Pure: was the head commit authored by CoderHelm? Reads the compare
+/// response's commit list (oldest first).
+fn head_commit_by_bot(compare: &serde_json::Value, head_sha: &str) -> bool {
+    compare["commits"]
+        .as_array()
+        .and_then(|cs| {
+            cs.iter()
+                .rev()
+                .find(|c| c["sha"].as_str() == Some(head_sha))
+                .or_else(|| cs.last())
+        })
+        .and_then(|c| c["author"]["login"].as_str())
+        .is_some_and(|login| login.contains("coderhelm"))
+}
+
+/// Persist a review record to the settings table so the dashboard can list it and
 /// ratings/actions can attach. Keyed pk=team_id, sk=REVIEW#{repo}#{pr:06}#{ts}.
 /// Best-effort: a storage failure must never break the actual GitHub review.
 /// Returns the record's sort key so follow-up steps can UPDATE this record
@@ -1360,5 +1410,26 @@ mod verdict_tests {
             "REQUEST_CHANGES"
         );
         assert_eq!(final_verdict(0, 0, false, ""), "REQUEST_CHANGES");
+    }
+}
+
+#[cfg(test)]
+mod head_author_tests {
+    use super::head_commit_by_bot;
+    use serde_json::json;
+
+    #[test]
+    fn head_commit_author_is_read_from_the_compare() {
+        let compare = json!({"commits": [
+            {"sha": "a", "author": {"login": "namwork"}},
+            {"sha": "b", "author": {"login": "coderhelm[bot]"}},
+        ]});
+        assert!(head_commit_by_bot(&compare, "b"));
+        assert!(!head_commit_by_bot(&compare, "a"));
+        // A commit with no linked GitHub account is not CoderHelm's.
+        assert!(!head_commit_by_bot(
+            &json!({"commits": [{"sha": "c", "author": null}]}),
+            "c"
+        ));
     }
 }
