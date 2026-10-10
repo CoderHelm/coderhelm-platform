@@ -426,6 +426,8 @@ pub async fn update_config(
 pub struct ListReviewsQuery {
     repo: Option<String>,
     limit: Option<i32>,
+    /// `next` from the previous page.
+    cursor: Option<String>,
 }
 
 /// Truncate to at most `max` bytes on a char boundary (String::truncate panics
@@ -475,8 +477,8 @@ fn review_item_to_json(item: &HashMap<String, AttributeValue>, truncate_body: bo
     })
 }
 
-/// GET /api/reviewer/reviews?repo=&limit= — list reviews (newest first). `repo`
-/// filters to one repo; omitted lists the whole team.
+/// GET /api/reviewer/reviews?repo=&limit=&cursor= — reviews, newest first, one
+/// page at a time. `repo` filters to one repo; omitted lists the whole team.
 pub async fn list_reviews(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -489,38 +491,23 @@ pub async fn list_reviews(
         }
         None => "REVIEW#".to_string(),
     };
-    let limit = q.limit.unwrap_or(100).clamp(1, 500);
-
-    let result = state
-        .dynamo
-        .query()
-        .table_name(&state.config.settings_table_name)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :pfx)")
-        .expression_attribute_values(":pk", attr_s(&claims.team_id))
-        .expression_attribute_values(":pfx", attr_s(&prefix))
-        .scan_index_forward(false)
-        .limit(limit)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to list reviews: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let mut reviews: Vec<Value> = result
-        .items()
+    let limit = q.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let page = super::paging::newest_first(
+        &state,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        &prefix,
+        "created_at",
+        q.cursor.as_deref(),
+        limit,
+    )
+    .await?;
+    let reviews: Vec<Value> = page
+        .items
         .iter()
         .map(|i| review_item_to_json(i, true))
         .collect();
-    // sk sorts by (repo, pr, time); re-sort by created_at for a true recency feed.
-    reviews.sort_by(|a, b| {
-        b["created_at"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(a["created_at"].as_str().unwrap_or(""))
-    });
-
-    Ok(Json(json!({ "reviews": reviews })))
+    Ok(Json(json!({ "reviews": reviews, "next": page.next })))
 }
 
 #[derive(serde::Deserialize)]
@@ -743,7 +730,8 @@ pub async fn re_review(
     Ok(Json(json!({ "status": "queued" })))
 }
 
-/// GET /api/releases?repo=owner/name — release-notes records, newest first.
+/// GET /api/releases?repo=owner/name&cursor= — release-notes records, newest
+/// first, one page at a time.
 pub async fn list_releases(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -756,21 +744,23 @@ pub async fn list_releases(
         }
         None => "RELEASE#".to_string(),
     };
-    let out = state
-        .dynamo
-        .query()
-        .table_name(&state.config.settings_table_name)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
-        .expression_attribute_values(":pk", attr_s(&claims.team_id))
-        .expression_attribute_values(":p", attr_s(&prefix))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to list releases: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    let mut releases: Vec<Value> = out
-        .items()
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(25)
+        .clamp(1, 100);
+    let page = super::paging::newest_first(
+        &state,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        &prefix,
+        "updated_at",
+        params.get("cursor").map(String::as_str),
+        limit,
+    )
+    .await?;
+    let releases: Vec<Value> = page
+        .items
         .iter()
         .map(|item| {
             let sk = item_str(item, "sk", "");
@@ -793,13 +783,7 @@ pub async fn list_releases(
             })
         })
         .collect();
-    releases.sort_by(|a, b| {
-        b["updated_at"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(a["updated_at"].as_str().unwrap_or(""))
-    });
-    Ok(Json(json!({ "releases": releases })))
+    Ok(Json(json!({ "releases": releases, "next": page.next })))
 }
 
 #[derive(serde::Deserialize)]
