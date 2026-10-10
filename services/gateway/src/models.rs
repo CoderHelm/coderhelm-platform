@@ -284,6 +284,8 @@ pub struct TicketMessage {
 pub enum TicketSource {
     Github,
     Jira,
+    /// A monitoring alert (e.g. a CloudWatch alarm) routed to a repo.
+    Alert,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -511,6 +511,13 @@ export class ApiStack extends cdk.Stack {
       integration: lambdaIntegration,
     });
 
+    // Alert intake: an SNS HTTPS subscription (messages verified by signature)
+    httpApi.addRoutes({
+      path: "/webhooks/alerts/sns",
+      methods: [apigatewayv2.HttpMethod.POST],
+      integration: lambdaIntegration,
+    });
+
     httpApi.addRoutes({
       path: "/integrations/jira/forge-register",
       methods: [apigatewayv2.HttpMethod.POST],

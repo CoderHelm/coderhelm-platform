@@ -954,6 +954,7 @@ pub async fn retry_run(
         .unwrap_or("github");
     let source = match ticket_source {
         "jira" => TicketSource::Jira,
+        "alert" => TicketSource::Alert,
         _ => TicketSource::Github,
     };
 
@@ -976,7 +977,7 @@ pub async fn retry_run(
     };
 
     // For Jira, restore the ticket body from the run record (GitHub re-fetches from API)
-    let body = if matches!(source, TicketSource::Jira) {
+    let body = if matches!(source, TicketSource::Jira | TicketSource::Alert) {
         item.get("ticket_body")
             .and_then(|v| v.as_s().ok())
             .map(|s| s.to_string())
@@ -1173,6 +1174,7 @@ pub async fn reset_and_rerun(
         .unwrap_or("github");
     let source = match ticket_source {
         "jira" => TicketSource::Jira,
+        "alert" => TicketSource::Alert,
         _ => TicketSource::Github,
     };
     let ticket_id = item
@@ -1193,7 +1195,7 @@ pub async fn reset_and_rerun(
     } else {
         (parts[0].to_string(), parts[1].to_string())
     };
-    let body = if matches!(source, TicketSource::Jira) {
+    let body = if matches!(source, TicketSource::Jira | TicketSource::Alert) {
         item.get("ticket_body")
             .and_then(|v| v.as_s().ok())
             .map(|s| s.to_string())

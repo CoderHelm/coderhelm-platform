@@ -1696,10 +1696,10 @@ async fn handle_wrong_repo(
         .cloned()
         .unwrap_or_default();
 
-    let source = if ticket_source == "jira" {
-        TicketSource::Jira
-    } else {
-        TicketSource::Github
+    let source = match ticket_source.as_str() {
+        "jira" => TicketSource::Jira,
+        "alert" => TicketSource::Alert,
+        _ => TicketSource::Github,
     };
 
     // Load image attachments from the run record (stored as JSON string)

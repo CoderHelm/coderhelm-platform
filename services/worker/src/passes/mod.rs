@@ -3326,6 +3326,7 @@ async fn create_run_record(
             attr_s(match msg.source {
                 TicketSource::Github => "github",
                 TicketSource::Jira => "jira",
+                TicketSource::Alert => "alert",
             }),
         )
         .item("ticket_id", attr_s(&msg.ticket_id))
@@ -3334,14 +3335,17 @@ async fn create_run_record(
         .item("installation_id", attr_n(msg.installation_id))
         .item("issue_number", attr_n(msg.issue_number))
         .item("base_branch", attr_s(&msg.base_branch))
-        // Store body for Jira tickets so retry can re-use it (GitHub re-fetches from API)
+        // Store the body for Jira and alert tickets so a retry can re-use it
+        // (GitHub re-fetches from the API)
         .item(
             "ticket_body",
-            attr_s(if matches!(msg.source, TicketSource::Jira) {
-                &msg.body
-            } else {
-                ""
-            }),
+            attr_s(
+                if matches!(msg.source, TicketSource::Jira | TicketSource::Alert) {
+                    &msg.body
+                } else {
+                    ""
+                },
+            ),
         )
         .item(
             "image_attachments",
