@@ -376,6 +376,10 @@ async fn main() -> Result<(), Error> {
             get(routes::log_analyzer::list_recommendations),
         )
         .route(
+            "/recommendations/notify",
+            get(routes::log_analyzer::get_rec_notify).put(routes::log_analyzer::put_rec_notify),
+        )
+        .route(
             "/recommendations/:id/plan",
             post(routes::log_analyzer::create_plan_from_recommendation),
         )

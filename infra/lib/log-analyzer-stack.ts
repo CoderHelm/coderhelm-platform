@@ -65,6 +65,7 @@ export class LogAnalyzerStack extends cdk.Stack {
         MODEL_ID: "claude-sonnet-5-5",
         CODERHELM_ACCOUNT_ID: this.account,
         LOOKBACK_HOURS: "6",
+        DASHBOARD_URL: props.stage === "prod" ? "https://app.coderhelm.com" : "http://localhost:3000",
       },
     });
 

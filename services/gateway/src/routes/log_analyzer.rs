@@ -24,7 +24,6 @@ fn attr_s(val: &str) -> AttributeValue {
 pub struct CreateConnectionRequest {
     role_arn: String,
     region: Option<String>,
-    external_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -50,6 +49,96 @@ fn validate_role_arn(arn: &str) -> Result<&str, StatusCode> {
     }
 }
 
+/// Pure: an AWS region name such as `us-east-1` or `ap-southeast-2`.
+pub fn valid_region(region: &str) -> bool {
+    let parts: Vec<&str> = region.split('-').collect();
+    region.len() <= 25
+        && parts.len() >= 3
+        && parts[0].len() == 2
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        })
+        && parts
+            .last()
+            .is_some_and(|p| p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Pure: a CloudWatch log group name (AWS allows `[.\-_/#A-Za-z0-9]`, 1–512).
+pub fn valid_log_group(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 512
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '#'))
+}
+
+/// The team's External ID for the CoderHelmLogReader role trust policy:
+/// created once per team and stored, so the console stack, a manually made
+/// role and a page reload all agree on it, and a client can't pick it.
+async fn team_external_id(state: &AppState, team_id: &str) -> Result<String, StatusCode> {
+    let table = &state.config.aws_insights_table_name;
+    let read = || async {
+        state
+            .dynamo
+            .get_item()
+            .table_name(table)
+            .key("pk", attr_s(team_id))
+            .key("sk", attr_s("AWS_EXTERNAL_ID"))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to read external id: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })
+            .map(|o| {
+                o.item()
+                    .and_then(|i| i.get("external_id"))
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+            })
+    };
+    if let Some(id) = read().await? {
+        return Ok(id);
+    }
+    // A team that connected before this was stored keeps the ID its
+    // existing role already trusts.
+    let inherited = state
+        .dynamo
+        .query()
+        .table_name(table)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+        .expression_attribute_values(":pk", attr_s(team_id))
+        .expression_attribute_values(":p", attr_s("AWS_CONN#"))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| {
+            o.items()
+                .iter()
+                .find_map(|i| i.get("external_id").and_then(|v| v.as_s().ok()).cloned())
+        });
+    let fresh = inherited.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let put = state
+        .dynamo
+        .put_item()
+        .table_name(table)
+        .item("pk", attr_s(team_id))
+        .item("sk", attr_s("AWS_EXTERNAL_ID"))
+        .item("external_id", attr_s(&fresh))
+        .item("created_at", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .condition_expression("attribute_not_exists(pk)")
+        .send()
+        .await;
+    match put {
+        Ok(_) => Ok(fresh),
+        // Another request created it first: use theirs.
+        Err(_) => read().await?.ok_or(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 /// Extract AWS account ID from role ARN.
 fn account_id_from_arn(arn: &str) -> Option<&str> {
     // arn:aws:iam::123456789012:role/Name → extract 123456789012
@@ -71,9 +160,11 @@ pub async fn create_connection(
 
     let account_id = account_id_from_arn(&body.role_arn).ok_or(StatusCode::BAD_REQUEST)?;
     let region = body.region.as_deref().unwrap_or("us-east-1");
-    let external_id = body
-        .external_id
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if !valid_region(region) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // The team's stored External ID, never one the client chooses.
+    let external_id = team_external_id(&state, &claims.team_id).await?;
     let now = chrono::Utc::now().to_rfc3339();
     let conn_id = format!("AWS_CONN#{account_id}");
 
@@ -106,22 +197,28 @@ pub async fn create_connection(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Save connection
+    // Save connection. Reconnecting an account keeps its selected log groups.
     state
         .dynamo
-        .put_item()
+        .update_item()
         .table_name(&state.config.aws_insights_table_name)
-        .item("pk", attr_s(&claims.team_id))
-        .item("sk", attr_s(&conn_id))
-        .item("role_arn", attr_s(&body.role_arn))
-        .item("external_id", attr_s(&external_id))
-        .item("region", attr_s(region))
-        .item("account_id", attr_s(account_id))
-        .item("status", attr_s("active"))
-        .item("log_groups", AttributeValue::L(vec![]))
-        .item("created_at", attr_s(&now))
-        .item("updated_at", attr_s(&now))
-        .item("created_by", attr_s(&claims.email))
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&conn_id))
+        .update_expression(
+            "SET role_arn = :r, external_id = :x, #region = :reg, account_id = :a, #s = :active, \
+             log_groups = if_not_exists(log_groups, :empty), created_at = if_not_exists(created_at, :t), \
+             updated_at = :t, created_by = if_not_exists(created_by, :u) REMOVE last_error, last_error_at",
+        )
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#region", "region")
+        .expression_attribute_values(":r", attr_s(&body.role_arn))
+        .expression_attribute_values(":x", attr_s(&external_id))
+        .expression_attribute_values(":reg", attr_s(region))
+        .expression_attribute_values(":a", attr_s(account_id))
+        .expression_attribute_values(":active", attr_s("active"))
+        .expression_attribute_values(":empty", AttributeValue::L(vec![]))
+        .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":u", attr_s(&claims.email))
         .send()
         .await
         .map_err(|e| {
@@ -190,6 +287,9 @@ pub async fn list_connections(
                 "region": item.get("region").and_then(|v| v.as_s().ok()).map(|v| v.as_str()).unwrap_or("us-east-1"),
                 "status": item.get("status").and_then(|v| v.as_s().ok()).map(|v| v.as_str()).unwrap_or("active"),
                 "log_groups": log_groups,
+                "error_message": item.get("last_error").and_then(|v| v.as_s().ok()),
+                "last_error_at": item.get("last_error_at").and_then(|v| v.as_s().ok()),
+                "last_analyzed_at": item.get("last_analyzed_at").and_then(|v| v.as_s().ok()),
                 "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
                 "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
             }))
@@ -223,11 +323,17 @@ pub async fn update_connection(
     }
 
     if let Some(ref region) = body.region {
+        if !valid_region(region) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
         update_expr.push("region = :reg".to_string());
         expr_values.push((":reg".to_string(), attr_s(region)));
     }
 
     if let Some(ref log_groups) = body.log_groups {
+        if log_groups.len() > 200 || !log_groups.iter().all(|g| valid_log_group(g)) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
         update_expr.push("log_groups = :lg".to_string());
         let lg_vals: Vec<AttributeValue> = log_groups.iter().map(|g| attr_s(g)).collect();
         expr_values.push((":lg".to_string(), AttributeValue::L(lg_vals)));
@@ -346,7 +452,7 @@ pub async fn test_connection(
                 .table_name(&state.config.aws_insights_table_name)
                 .key("pk", attr_s(&claims.team_id))
                 .key("sk", attr_s(&sk))
-                .update_expression("SET #s = :s, updated_at = :t")
+                .update_expression("SET #s = :s, updated_at = :t REMOVE last_error, last_error_at")
                 .expression_attribute_names("#s", "status")
                 .expression_attribute_values(":s", attr_s("active"))
                 .expression_attribute_values(":t", attr_s(&now))
@@ -492,14 +598,14 @@ pub async fn discover_log_groups(
 
 /// GET /api/aws-connections/cfn-url — get CloudFormation quick-create URL
 pub async fn get_cfn_url(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
     if !is_admin_or_owner(&claims.role) {
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let external_id = Uuid::new_v4().to_string();
+    let external_id = team_external_id(&state, &claims.team_id).await?;
     let template_url = "https://coderhelm-public.s3.amazonaws.com/cfn/coderhelm-log-reader.yaml";
     let stack_name = "CoderHelmLogReader";
 
@@ -536,65 +642,91 @@ pub async fn list_recommendations(
     Extension(claims): Extension<Claims>,
     Query(params): Query<RecommendationsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let limit = params.limit.unwrap_or(50).min(100);
+    let limit = params.limit.unwrap_or(50).clamp(1, 100) as usize;
+    let valid = |v: &Option<String>| {
+        v.as_deref()
+            .is_none_or(|x| x.len() <= 20 && x.chars().all(|c| c.is_ascii_lowercase()))
+    };
+    if !valid(&params.status) || !valid(&params.severity) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
-    let result = state
-        .dynamo
-        .query()
-        .table_name(&state.config.aws_insights_table_name)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.team_id))
-        .expression_attribute_values(":prefix", attr_s("REC#"))
-        .scan_index_forward(false)
-        .limit(limit)
-        .set_exclusive_start_key(
-            params
-                .cursor
-                .as_deref()
-                .filter(|c| c.starts_with("REC#") && c.len() <= 400)
-                .map(|c| {
-                    std::collections::HashMap::from([
-                        ("pk".to_string(), attr_s(&claims.team_id)),
-                        ("sk".to_string(), attr_s(c)),
-                    ])
-                }),
-        )
-        .send()
-        .await
-        .map_err(|e| {
+    // Filters run in DynamoDB, which applies them after its page limit, so
+    // keep reading pages until this page is full or the items run out.
+    let mut filters = Vec::new();
+    if params.status.is_some() {
+        filters.push("#s = :status");
+    }
+    if params.severity.is_some() {
+        filters.push("severity = :sev");
+    }
+    let mut start = params
+        .cursor
+        .as_deref()
+        .filter(|c| c.starts_with("REC#") && c.len() <= 400)
+        .map(|c| {
+            std::collections::HashMap::from([
+                ("pk".to_string(), attr_s(&claims.team_id)),
+                ("sk".to_string(), attr_s(c)),
+            ])
+        });
+    let mut items = Vec::new();
+    let mut next: Option<String> = None;
+    for _ in 0..10 {
+        let mut q = state
+            .dynamo
+            .query()
+            .table_name(&state.config.aws_insights_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":pk", attr_s(&claims.team_id))
+            .expression_attribute_values(":prefix", attr_s("REC#"))
+            .scan_index_forward(false)
+            .limit(100)
+            .set_exclusive_start_key(start.take());
+        if !filters.is_empty() {
+            q = q.filter_expression(filters.join(" AND "));
+        }
+        if let Some(st) = &params.status {
+            q = q
+                .expression_attribute_names("#s", "status")
+                .expression_attribute_values(":status", attr_s(st));
+        }
+        if let Some(sev) = &params.severity {
+            q = q.expression_attribute_values(":sev", attr_s(sev));
+        }
+        let out = q.send().await.map_err(|e| {
             error!("Failed to list recommendations: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
-    let recommendations: Vec<Value> = result
-        .items()
-        .iter()
-        .filter(|item| {
-            // Filter by status if provided
-            if let Some(ref status) = params.status {
-                if let Some(s) = item.get("status").and_then(|v| v.as_s().ok()) {
-                    if s != status {
-                        return false;
-                    }
-                }
+        for it in out.items() {
+            if items.len() == limit {
+                break;
             }
-            // Filter by severity if provided
-            if let Some(ref sev) = params.severity {
-                if let Some(s) = item.get("severity").and_then(|v| v.as_s().ok()) {
-                    if s != sev {
-                        return false;
-                    }
-                }
-            }
-            true
-        })
-        .filter_map(rec_from_item)
-        .collect();
+            items.push(it.clone());
+        }
+        let page_end = out.last_evaluated_key().cloned();
+        if items.len() == limit {
+            // Resume after the last item returned.
+            next = items
+                .last()
+                .and_then(|i| i.get("sk"))
+                .and_then(|v| v.as_s().ok())
+                .cloned();
+            break;
+        }
+        match page_end {
+            Some(k) if !k.is_empty() => start = Some(k),
+            _ => break,
+        }
+    }
+    if next.is_none() {
+        if let Some(k) = start {
+            next = k.get("sk").and_then(|v| v.as_s().ok()).cloned();
+        }
+    }
 
-    let next = result
-        .last_evaluated_key()
-        .and_then(|k| k.get("sk"))
-        .and_then(|v| v.as_s().ok());
+    let recommendations: Vec<Value> = items.iter().filter_map(rec_from_item).collect();
+
     Ok(Json(
         json!({ "recommendations": recommendations, "next": next }),
     ))
@@ -606,8 +738,9 @@ pub async fn create_plan_from_recommendation(
     Extension(claims): Extension<Claims>,
     Path(rec_id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    if !is_admin_or_owner(&claims.role) {
-        return Err(StatusCode::FORBIDDEN);
+    claims.require_role(1)?; // member+ — same as dismiss
+    if rec_id.len() > 64 || !rec_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let sk = format!("REC#{rec_id}");
@@ -627,6 +760,11 @@ pub async fn create_plan_from_recommendation(
         })?;
 
     let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
+
+    // A second click opens the plan already made, instead of another one.
+    if let Some(existing) = item.get("plan_id").and_then(|v| v.as_s().ok()) {
+        return Ok(Json(json!({ "plan_id": existing, "status": "exists" })));
+    }
 
     let title = item
         .get("title")
@@ -710,7 +848,9 @@ pub async fn create_plan_from_recommendation(
         .table_name(&state.config.aws_insights_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
-        .update_expression("SET #s = :s, plan_id = :pid, updated_at = :t")
+        // Approved findings are kept (no TTL) so the plan's source stays visible.
+        .update_expression("SET #s = :s, plan_id = :pid, updated_at = :t REMOVE #ttl")
+        .expression_attribute_names("#ttl", "ttl")
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":s", attr_s("approved"))
         .expression_attribute_values(":pid", attr_s(&plan_id))
@@ -764,6 +904,92 @@ pub async fn dismiss_recommendation(
 }
 
 // ────────────────────────────────────────────────────────────────
+// Teams notifications for new recommendations
+// ────────────────────────────────────────────────────────────────
+
+/// Settings-table key of the recommendation notification setting (read by
+/// the log analyzer Lambda).
+const REC_NOTIFY_SK: &str = "REC_NOTIFY";
+
+/// GET /api/recommendations/notify — where new findings post (admin+).
+pub async fn get_rec_notify(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?;
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(REC_NOTIFY_SK))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to read recommendation notify setting: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item()
+        .cloned()
+        .unwrap_or_default();
+    let s = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
+    Ok(Json(json!({
+        "notify_mode": s("notify_mode").unwrap_or_else(|| "off".to_string()),
+        "teams_webhook_url": s("teams_webhook_url").unwrap_or_default(),
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct RecNotifyBody {
+    notify_mode: String,
+    #[serde(default)]
+    teams_webhook_url: String,
+}
+
+/// PUT /api/recommendations/notify — "team" (the team's alert channel),
+/// "custom" (its own channel) or "off" (admin+).
+pub async fn put_rec_notify(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<RecNotifyBody>,
+) -> Result<Json<Value>, StatusCode> {
+    use common::alert_notify::{valid_webhook_url, MODE_CUSTOM, MODE_OFF, MODE_TEAM};
+    claims.require_role(3)?;
+    let mode = body.notify_mode.trim();
+    if ![MODE_TEAM, MODE_CUSTOM, MODE_OFF].contains(&mode) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let url = body.teams_webhook_url.trim();
+    if mode == MODE_CUSTOM && !valid_webhook_url(url) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(&claims.team_id))
+        .item("sk", attr_s(REC_NOTIFY_SK))
+        .item("notify_mode", attr_s(mode))
+        .item(
+            "teams_webhook_url",
+            attr_s(if mode == MODE_CUSTOM { url } else { "" }),
+        )
+        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .item("updated_by", attr_s(&claims.email))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to save recommendation notify setting: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    info!(
+        team_id = claims.team_id,
+        mode, "Recommendation notifications saved"
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────
 
@@ -790,4 +1016,24 @@ fn rec_from_item(item: &std::collections::HashMap<String, AttributeValue>) -> Op
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
         "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regions_and_log_groups_are_validated() {
+        assert!(valid_region("us-east-1"));
+        assert!(valid_region("ap-southeast-2"));
+        assert!(valid_region("us-gov-west-1"));
+        assert!(!valid_region("us-east"));
+        assert!(!valid_region("US-EAST-1"));
+        assert!(!valid_region("us-east-1.evil.com"));
+        assert!(valid_log_group("/aws/lambda/my-fn"));
+        assert!(valid_log_group("API-Gateway-Execution-Logs_abc/prod"));
+        assert!(!valid_log_group(""));
+        assert!(!valid_log_group("bad name"));
+        assert!(!valid_log_group(&"a".repeat(513)));
+    }
 }
