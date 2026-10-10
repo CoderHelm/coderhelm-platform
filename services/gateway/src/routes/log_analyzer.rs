@@ -526,6 +526,8 @@ pub struct RecommendationsQuery {
     status: Option<String>,
     severity: Option<String>,
     limit: Option<i32>,
+    /// `next` from the previous page.
+    cursor: Option<String>,
 }
 
 /// GET /api/recommendations — list recommendations for team
@@ -545,6 +547,18 @@ pub async fn list_recommendations(
         .expression_attribute_values(":prefix", attr_s("REC#"))
         .scan_index_forward(false)
         .limit(limit)
+        .set_exclusive_start_key(
+            params
+                .cursor
+                .as_deref()
+                .filter(|c| c.starts_with("REC#") && c.len() <= 400)
+                .map(|c| {
+                    std::collections::HashMap::from([
+                        ("pk".to_string(), attr_s(&claims.team_id)),
+                        ("sk".to_string(), attr_s(c)),
+                    ])
+                }),
+        )
         .send()
         .await
         .map_err(|e| {
@@ -577,7 +591,13 @@ pub async fn list_recommendations(
         .filter_map(rec_from_item)
         .collect();
 
-    Ok(Json(json!({ "recommendations": recommendations })))
+    let next = result
+        .last_evaluated_key()
+        .and_then(|k| k.get("sk"))
+        .and_then(|v| v.as_s().ok());
+    Ok(Json(
+        json!({ "recommendations": recommendations, "next": next }),
+    ))
 }
 
 /// POST /api/recommendations/:id/plan — create a plan from a recommendation

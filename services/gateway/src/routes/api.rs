@@ -442,6 +442,8 @@ pub async fn remove_from_allowlist(
 pub struct RunsQuery {
     source: Option<String>,
     limit: Option<i32>,
+    /// `next` from the previous page (the last run id it covered).
+    cursor: Option<String>,
 }
 
 /// GET /api/runs — list runs for the team (from runs table).
@@ -459,6 +461,12 @@ pub async fn list_runs(
         .expression_attribute_values(":tid", attr_s(&claims.team_id))
         .scan_index_forward(false) // newest first (ULID sorts lexicographically)
         .limit(query_limit)
+        .set_exclusive_start_key(params.cursor.as_deref().filter(|c| c.len() <= 64).map(|c| {
+            std::collections::HashMap::from([
+                ("team_id".to_string(), attr_s(&claims.team_id)),
+                ("run_id".to_string(), attr_s(c)),
+            ])
+        }))
         .send()
         .await
         .map_err(|e| {
@@ -504,8 +512,14 @@ pub async fn list_runs(
             })
         })
         .collect();
+    // Archived and source-filtered runs are dropped after the read, so a page
+    // can be short; `next` still continues where the read stopped.
+    let next = result
+        .last_evaluated_key()
+        .and_then(|k| k.get("run_id"))
+        .and_then(|v| v.as_s().ok());
 
-    Ok(Json(json!({ "runs": runs })))
+    Ok(Json(json!({ "runs": runs, "next": next })))
 }
 
 /// GET /api/runs/:run_id — get single run detail (from runs table).
