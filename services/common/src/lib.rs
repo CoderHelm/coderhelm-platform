@@ -10,6 +10,9 @@ pub mod memlock;
 /// Shared so every claim compares its expiry the same way.
 pub mod claim;
 
+/// Teams notifications for alerts: channel resolution and Adaptive Cards.
+pub mod alert_notify;
+
 /// GitHub's per-request override for the installation-token format, sent on
 /// `POST /app/installations/{id}/access_tokens`. GitHub is moving installation
 /// tokens from short opaque strings to ~520-char stateless JWT-style `ghs_…`

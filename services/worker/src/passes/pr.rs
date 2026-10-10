@@ -1,3 +1,4 @@
+use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{info, warn};
 
 use crate::agent::provider::ModelProvider;
@@ -264,6 +265,9 @@ Return ONLY the markdown body text."#,
             .unwrap_or("")
             .to_string();
         info!(pr_number = number, pr_url = %url, "PR created");
+        if matches!(msg.source, TicketSource::Alert) {
+            notify_alert_pr(state, msg, number, &title, &url).await;
+        }
         (number, url, nid)
     };
 
@@ -318,6 +322,70 @@ Return ONLY the markdown body text."#,
         draft: true,
         node_id,
     })
+}
+
+/// For a run started by an alert, post a follow-up card with the new PR's link
+/// to the alert's Teams channel. Best effort: never affects the run.
+async fn notify_alert_pr(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    number: u64,
+    title: &str,
+    url: &str,
+) {
+    let table = &state.config.settings_table_name;
+    let Some(ticket) = state
+        .dynamo
+        .get_item()
+        .table_name(table)
+        .key("pk", AttributeValue::S(msg.team_id.clone()))
+        .key(
+            "sk",
+            AttributeValue::S(format!("ALERT_TICKET#{}", msg.ticket_id)),
+        )
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned())
+    else {
+        return;
+    };
+    let s = |k: &str| {
+        ticket
+            .get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let Some(webhook) =
+        common::alert_notify::notify_target(&state.dynamo, table, &msg.team_id, &s("topic_arn"))
+            .await
+    else {
+        return;
+    };
+    let base = if state.config.stage == "prod" {
+        "https://app.coderhelm.com"
+    } else {
+        "http://localhost:3000"
+    };
+    let alert_id = s("alert_id");
+    let alert_url = if alert_id.is_empty() {
+        String::new()
+    } else {
+        format!("{base}/alerts/detail?id={alert_id}")
+    };
+    let alert_title = Some(s("title"))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| msg.title.clone());
+    let card = common::alert_notify::fix_card(
+        &alert_title,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        number,
+        title,
+        url,
+        &alert_url,
+    );
+    common::alert_notify::send(&state.http, &webhook, &card, "alert_pr").await;
 }
 
 /// Reopen the branch's prior closed-unmerged PR, if any. A ticket-update
