@@ -6,6 +6,7 @@ Triggered by EventBridge every 6 hours. For each team with an AWS connection:
 2. Run pre-built CloudWatch Logs Insights queries
 3. Send error summaries to Anthropic Claude for analysis
 4. Deduplicate and store recommendations in DynamoDB
+5. Post new findings to the team's Teams channel, when turned on
 
 No raw logs are stored — only error summaries and recommendations.
 """
@@ -30,6 +31,7 @@ SETTINGS_TABLE = os.environ.get("SETTINGS_TABLE_NAME", "coderhelm-prod-settings"
 MODEL_ID = os.environ.get("MODEL_ID", "claude-sonnet-4-6")
 CODERHELM_ACCOUNT_ID = os.environ["CODERHELM_ACCOUNT_ID"]
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://app.coderhelm.com")
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
@@ -187,10 +189,9 @@ def handler(event, context):
                 f"Failed to analyze connection {conn['team_id']}/{conn['account_id']}: {e}",
                 exc_info=True,
             )
-            # Update connection status to error
-            update_connection_status(
-                conn["team_id"], conn["account_id"], "error", str(e)
-            )
+            # Keep the connection active so the next run retries; a transient
+            # failure must not stop analysis until someone presses Test.
+            record_connection_error(conn["team_id"], conn["account_id"], str(e))
 
     logger.info(f"Log analyzer complete — {total_recs} new recommendations")
     return {"statusCode": 200, "total_recommendations": total_recs}
@@ -288,8 +289,10 @@ def analyze_connection(conn):
         log_groups = discover_log_groups(cw_logs)
         logger.info(f"Auto-discovered {len(log_groups)} log groups")
 
-    # Run queries and collect results
+    # Run queries and collect results. A query that fails is not "no errors":
+    # when any fails, nothing is auto-resolved this run.
     all_results = []
+    any_query_failed = False
     for query_def in INSIGHTS_QUERIES:
         matching_groups = filter_log_groups(log_groups, query_def.get("log_group_pattern"))
         if not matching_groups:
@@ -299,26 +302,39 @@ def analyze_connection(conn):
         for batch in chunk_list(matching_groups, 50):
             try:
                 results = run_insights_query(cw_logs, batch, query_def["query"])
-                if results:
-                    all_results.append(
-                        {
-                            "query_name": query_def["name"],
-                            "description": query_def["description"],
-                            "log_groups": batch,
-                            "results": results,
-                        }
-                    )
             except Exception as e:
                 logger.warning(f"Query {query_def['name']} failed: {e}")
+                results = None
+            if results is None:
+                any_query_failed = True
+                continue
+            if results:
+                all_results.append(
+                    {
+                        "query_name": query_def["name"],
+                        "description": query_def["description"],
+                        "log_groups": batch,
+                        "results": results,
+                    }
+                )
+
+    existing = list_pending_recommendations(team_id, account_id)
 
     if not all_results:
+        record_connection_success(team_id, account_id)
+        if any_query_failed:
+            logger.warning(f"{team_id}/{account_id}: queries failed and none returned rows, skipping resolution")
+            return 0
         logger.info(f"No errors found for {team_id}/{account_id}")
-        # Resolve any existing findings since nothing is erroring anymore
-        resolve_stale_recommendations(team_id, account_id, set())
+        # Every query ran and found nothing: the findings are no longer erroring.
+        resolve_stale_recommendations(team_id, existing, set())
         return 0
 
     # Reorganize results grouped by log group
     all_results = group_results_by_log_group(all_results)
+
+    seen_ids = set()
+    new_recs = []
 
     # Check for secrets/tokens in raw results and create advisory if found
     raw_text = json.dumps(all_results, default=str)
@@ -350,42 +366,38 @@ def analyze_connection(conn):
             "source_log_group": "multiple",
             "error_pattern": f"secrets_in_logs_{account_id}",
         }
-        if store_recommendation(team_id, account_id, advisory_rec):
-            new_recs = 1
-        else:
-            new_recs = 0
-    else:
-        new_recs = 0
+        rec_id, is_new = store_recommendation(team_id, account_id, advisory_rec, existing)
+        if rec_id:
+            seen_ids.add(rec_id)
+        if is_new:
+            new_recs.append(advisory_rec)
 
     # Send to Anthropic for analysis
-    recommendations = analyze_with_anthropic(all_results, account_id, api_key)
+    recommendations = analyze_with_anthropic(all_results, account_id, api_key, existing)
 
-    # If Anthropic failed (empty response), don't resolve anything —
-    # we can't distinguish "no issues" from "API error"
-    if not recommendations and all_results:
-        logger.warning(f"{team_id}/{account_id}: Anthropic returned no recommendations despite having errors, skipping resolution")
-        return new_recs
+    # None = the analysis failed: we can't tell "no issues" from "API error",
+    # so nothing is resolved.
+    if recommendations is None:
+        logger.warning(f"{team_id}/{account_id}: analysis failed, skipping resolution")
+        notify_new_recommendations(team_id, account_id, new_recs)
+        return len(new_recs)
 
-    # Track all error hashes seen this run (for resolution)
-    seen_hashes = set()
+    record_connection_success(team_id, account_id)
 
-    # Deduplicate and store
     for rec in recommendations:
-        raw = f"{account_id}:{rec.get('source_log_group', '')}:{rec.get('error_pattern', rec.get('title', ''))}"
-        seen_hashes.add(hashlib.sha256(raw.encode()).hexdigest()[:16])
-        if store_recommendation(team_id, account_id, rec):
-            new_recs += 1
+        rec_id, is_new = store_recommendation(team_id, account_id, rec, existing)
+        if rec_id:
+            seen_ids.add(rec_id)
+        if is_new:
+            new_recs.append(rec)
 
-    # Also track the secrets advisory hash if it was emitted
-    if secrets_found > 0:
-        raw = f"{account_id}:multiple:secrets_in_logs_{account_id}"
-        seen_hashes.add(hashlib.sha256(raw.encode()).hexdigest()[:16])
+    # Resolve findings that no longer appear — only after a complete run.
+    if not any_query_failed:
+        resolve_stale_recommendations(team_id, existing, seen_ids)
 
-    # Resolve findings that no longer appear
-    resolve_stale_recommendations(team_id, account_id, seen_hashes)
-
-    logger.info(f"{team_id}/{account_id}: {new_recs} new recommendations")
-    return new_recs
+    notify_new_recommendations(team_id, account_id, new_recs)
+    logger.info(f"{team_id}/{account_id}: {len(new_recs)} new recommendations")
+    return len(new_recs)
 
 
 def discover_log_groups(cw_logs):
@@ -405,7 +417,8 @@ def filter_log_groups(log_groups, pattern):
     """Filter log groups by pattern."""
     if not pattern:
         return log_groups
-    return [g for g in log_groups if pattern in g]
+    pattern = pattern.lower()
+    return [g for g in log_groups if pattern in g.lower()]
 
 
 def run_insights_query(cw_logs, log_groups, query_string):
@@ -422,7 +435,7 @@ def run_insights_query(cw_logs, log_groups, query_string):
         )
     except ClientError as e:
         logger.warning(f"StartQuery failed: {e}")
-        return []
+        return None
 
     query_id = response["queryId"]
 
@@ -436,7 +449,7 @@ def run_insights_query(cw_logs, log_groups, query_string):
             return format_query_results(result.get("results", []))
         elif status in ("Failed", "Cancelled", "Timeout"):
             logger.warning(f"Query {query_id} ended with status: {status}")
-            return []
+            return None
 
     # Timed out waiting — stop the query
     try:
@@ -444,7 +457,8 @@ def run_insights_query(cw_logs, log_groups, query_string):
     except Exception:
         pass
 
-    return []
+    logger.warning(f"Query {query_id} did not finish in time")
+    return None
 
 
 def format_query_results(results):
@@ -456,7 +470,55 @@ def format_query_results(results):
     return lines
 
 
-def analyze_with_anthropic(query_results, account_id, api_key):
+def is_always_thinking_model(model_id):
+    """Claude models that think on every request reject `temperature` and lead
+    their response with thinking blocks (mirrors common::is_always_thinking_model)."""
+    return model_id.startswith(("claude-opus-5", "claude-sonnet-5", "claude-fable-", "claude-mythos-"))
+
+
+def build_request_body(prompt):
+    body = {
+        "model": MODEL_ID,
+        "max_tokens": 16000,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if is_always_thinking_model(MODEL_ID):
+        body["output_config"] = {"effort": "medium"}
+    else:
+        body["max_tokens"] = 4096
+        body["temperature"] = 0.1
+    return body
+
+
+def response_text(response_data):
+    """Concatenate the text blocks of a Messages API response (skips thinking)."""
+    return "".join(
+        block.get("text", "")
+        for block in response_data.get("content", [])
+        if block.get("type") == "text"
+    )
+
+
+def parse_recommendations(output_text):
+    """Parse the model's JSON array (tolerates a fenced code block). None if invalid."""
+    text = output_text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end < start:
+        return None
+    try:
+        recs = json.loads(text[start : end + 1])
+    except ValueError:
+        return None
+    if not isinstance(recs, list):
+        return None
+    return [r for r in recs if isinstance(r, dict)][:10]
+
+
+def analyze_with_anthropic(query_results, account_id, api_key, existing=None):
     """Send log error summaries to Anthropic Claude for analysis."""
     # Scrub any secrets/tokens from the data before sending to AI
     scrubbed_results = scrub_query_results(query_results)
@@ -467,6 +529,17 @@ def analyze_with_anthropic(query_results, account_id, api_key):
     # Truncate if too large (keep under 100K tokens)
     if len(context) > 50000:
         context = context[:50000] + "\n... (truncated)"
+
+    known = [
+        {
+            "id": r["rec_id"],
+            "title": r.get("title", ""),
+            "source_log_group": r.get("source_log_group", ""),
+            "error_pattern": r.get("error_pattern", "")[:300],
+        }
+        for r in (existing or [])
+    ]
+    known_json = json.dumps(known, indent=2)
 
     prompt = f"""You are a senior SRE analyzing CloudWatch Logs error summaries for AWS account {account_id}.
 
@@ -494,6 +567,12 @@ Return a JSON array of recommendations. Each must have:
 - "suggested_action": Concrete steps — not generic advice. Reference actual service names, error codes, log groups.
 - "source_log_group": The primary log group where this was detected
 - "error_pattern": A representative error string for deduplication
+- "existing_id": If this is the same underlying issue as one of the already-open findings below, that finding's "id"; otherwise null. Reuse an id only for the same issue, even if the wording differs.
+
+Already-open findings for this account:
+<open_findings>
+{known_json}
+</open_findings>
 
 Severity guide:
 - critical = service down/crashing, data loss risk, active security breach
@@ -509,12 +588,7 @@ Rules:
 Return ONLY the JSON array, no surrounding text."""
 
     try:
-        request_body = json.dumps({
-            "model": MODEL_ID,
-            "max_tokens": 4096,
-            "temperature": 0.1,
-            "messages": [{"role": "user", "content": prompt}],
-        }).encode("utf-8")
+        request_body = json.dumps(build_request_body(prompt)).encode("utf-8")
 
         req = Request(
             ANTHROPIC_API_URL,
@@ -527,162 +601,302 @@ Return ONLY the JSON array, no surrounding text."""
             method="POST",
         )
 
-        with urlopen(req, timeout=60) as resp:
+        with urlopen(req, timeout=120) as resp:
             response_data = json.loads(resp.read().decode("utf-8"))
 
-        output_text = response_data["content"][0]["text"]
-
-        # Parse JSON from response (handle markdown code blocks)
-        output_text = output_text.strip()
-        if output_text.startswith("```"):
-            output_text = output_text.split("\n", 1)[1]
-            if output_text.endswith("```"):
-                output_text = output_text[:-3]
-
-        recommendations = json.loads(output_text)
-        if not isinstance(recommendations, list):
+        recommendations = parse_recommendations(response_text(response_data))
+        if recommendations is None:
             logger.error("Anthropic response was not a JSON array")
-            return []
-
-        return recommendations[:10]  # Cap at 10
+        return recommendations
 
     except HTTPError as e:
         error_body = e.read().decode("utf-8") if e.fp else ""
         logger.error(f"Anthropic API error ({e.code}): {error_body}")
-        return []
+        return None
     except Exception as e:
         logger.error(f"Anthropic analysis failed: {e}", exc_info=True)
-        return []
+        return None
 
 
-def resolve_stale_recommendations(team_id, account_id, seen_hashes):
-    """Mark recommendations as resolved if their error hash was not seen this run."""
-    try:
-        now = datetime.now(timezone.utc).isoformat()
-        resolved_count = 0
-        last_key = None
-
-        while True:
-            query_kwargs = {
-                "KeyConditionExpression": "pk = :pk AND begins_with(sk, :prefix)",
-                "FilterExpression": "#s = :pending AND source_account_id = :acct",
-                "ExpressionAttributeNames": {"#s": "status"},
-                "ExpressionAttributeValues": {
-                    ":pk": team_id,
-                    ":prefix": "REC#",
-                    ":pending": "pending",
-                    ":acct": account_id,
-                },
-            }
-            if last_key:
-                query_kwargs["ExclusiveStartKey"] = last_key
-
-            result = aws_insights_table.query(**query_kwargs)
-
-            for item in result.get("Items", []):
-                error_hash = item.get("error_hash", "")
-                if error_hash and error_hash not in seen_hashes:
-                    aws_insights_table.update_item(
-                        Key={"pk": team_id, "sk": item["sk"]},
-                        UpdateExpression="SET #s = :s, resolved_at = :t, updated_at = :t",
-                        ExpressionAttributeNames={"#s": "status"},
-                        ExpressionAttributeValues={
-                            ":s": "resolved",
-                            ":t": now,
-                        },
-                    )
-                    resolved_count += 1
-
-            last_key = result.get("LastEvaluatedKey")
-            if not last_key:
-                break
-
-        if resolved_count:
-            logger.info(f"{team_id}/{account_id}: {resolved_count} recommendations resolved")
-
-    except Exception as e:
-        logger.warning(f"Failed to resolve stale recommendations: {e}")
-
-
-def store_recommendation(team_id, account_id, rec):
-    """Deduplicate and store a recommendation. Returns True if new."""
-    # Create error hash for dedup: hash(account_id + log_group + error_pattern)
-    raw = f"{account_id}:{rec.get('source_log_group', '')}:{rec.get('error_pattern', rec.get('title', ''))}"
-    error_hash = hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-    # Check if we already have a non-dismissed rec with this hash
-    rec_id = ulid_now()
-    sk = f"REC#{rec_id}"
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Query existing recs with same hash
-    try:
-        existing = aws_insights_table.query(
-            KeyConditionExpression="pk = :pk AND begins_with(sk, :prefix)",
-            FilterExpression="error_hash = :hash AND #s IN (:pending, :approved)",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
+def list_pending_recommendations(team_id, account_id):
+    """All pending findings for this account (paginated)."""
+    items = []
+    last_key = None
+    while True:
+        query_kwargs = {
+            "KeyConditionExpression": "pk = :pk AND begins_with(sk, :prefix)",
+            "FilterExpression": "#s = :pending AND source_account_id = :acct",
+            "ExpressionAttributeNames": {"#s": "status"},
+            "ExpressionAttributeValues": {
                 ":pk": team_id,
                 ":prefix": "REC#",
-                ":hash": error_hash,
                 ":pending": "pending",
-                ":approved": "approved",
+                ":acct": account_id,
             },
-        )
-        if existing.get("Items"):
-            logger.info(f"Skipping duplicate recommendation (hash={error_hash})")
-            return False
-    except Exception as e:
-        logger.warning(f"Dedup check failed: {e}")
+        }
+        if last_key:
+            query_kwargs["ExclusiveStartKey"] = last_key
+        result = aws_insights_table.query(**query_kwargs)
+        for item in result.get("Items", []):
+            item["rec_id"] = item["sk"][len("REC#"):]
+            items.append(item)
+        last_key = result.get("LastEvaluatedKey")
+        if not last_key:
+            break
+    return items
 
-    # Store new recommendation
+
+def resolve_stale_recommendations(team_id, existing, seen_ids):
+    """Mark open findings resolved when this complete run didn't see them."""
+    now = datetime.now(timezone.utc).isoformat()
+    resolved_count = 0
+    for item in existing:
+        if item["rec_id"] in seen_ids:
+            continue
+        try:
+            aws_insights_table.update_item(
+                Key={"pk": team_id, "sk": item["sk"]},
+                UpdateExpression="SET #s = :s, resolved_at = :t, updated_at = :t",
+                ConditionExpression="#s = :pending",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": "resolved", ":t": now, ":pending": "pending"},
+            )
+            resolved_count += 1
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                logger.warning(f"Failed to resolve {item['sk']}: {e}")
+    if resolved_count:
+        logger.info(f"{team_id}: {resolved_count} recommendations resolved")
+
+
+def error_hash_for(account_id, rec):
+    raw = f"{account_id}:{rec.get('source_log_group', '')}:{rec.get('error_pattern', rec.get('title', ''))}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def match_existing(rec, existing, error_hash):
+    """The open finding this recommendation is the same issue as, if any: the
+    model's existing_id when it names an open finding, else the same hash."""
+    by_id = {e["rec_id"]: e for e in existing}
+    claimed = rec.get("existing_id")
+    if isinstance(claimed, str) and claimed in by_id:
+        return by_id[claimed]
+    for e in existing:
+        if e.get("error_hash") == error_hash:
+            return e
+    return None
+
+
+def store_recommendation(team_id, account_id, rec, existing):
+    """Store a finding, or refresh the open one it repeats.
+    Returns (rec_id, is_new); rec_id is None when the write failed."""
+    error_hash = error_hash_for(account_id, rec)
+    now = datetime.now(timezone.utc).isoformat()
+    # Open findings stay as long as they keep appearing.
+    ttl_epoch = int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp())
+
+    match = match_existing(rec, existing, error_hash)
+    if match:
+        try:
+            aws_insights_table.update_item(
+                Key={"pk": team_id, "sk": match["sk"]},
+                UpdateExpression="SET last_seen_at = :t, updated_at = :t, #ttl = :ttl ADD seen_count :one",
+                ExpressionAttributeNames={"#ttl": "ttl"},
+                ExpressionAttributeValues={":t": now, ":ttl": ttl_epoch, ":one": 1},
+            )
+        except Exception as e:
+            logger.warning(f"Failed to refresh {match['sk']}: {e}")
+        return match["rec_id"], False
+
+    rec_id = ulid_now()
     try:
-        ttl_epoch = int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp())
         aws_insights_table.put_item(
             Item={
                 "pk": team_id,
-                "sk": sk,
+                "sk": f"REC#{rec_id}",
                 "status": "pending",
                 "severity": rec.get("severity", "info"),
-                "title": rec.get("title", "Untitled")[:200],
-                "summary": rec.get("summary", "")[:2000],
-                "suggested_action": rec.get("suggested_action", "")[:2000],
-                "source_log_group": rec.get("source_log_group", "")[:500],
+                "title": str(rec.get("title", "Untitled"))[:200],
+                "summary": str(rec.get("summary", ""))[:2000],
+                "suggested_action": str(rec.get("suggested_action", ""))[:2000],
+                "source_log_group": str(rec.get("source_log_group", ""))[:500],
                 "source_account_id": account_id,
-                "error_pattern": rec.get("error_pattern", "")[:500],
+                "error_pattern": str(rec.get("error_pattern", ""))[:500],
                 "error_hash": error_hash,
                 "created_at": now,
                 "updated_at": now,
+                "last_seen_at": now,
+                "seen_count": 1,
                 "ttl": ttl_epoch,
             }
         )
-        return True
+        existing.append({"rec_id": rec_id, "sk": f"REC#{rec_id}", "error_hash": error_hash})
+        return rec_id, True
     except Exception as e:
         logger.error(f"Failed to store recommendation: {e}")
-        return False
+        return None, False
 
 
-def update_connection_status(team_id, account_id, status, error_msg=None):
-    """Update the status of an AWS connection."""
+def record_connection_error(team_id, account_id, error_msg):
+    """Note a failed analysis on the connection without disabling it."""
     try:
-        update_expr = "SET #s = :s, updated_at = :t"
-        expr_values = {
-            ":s": status,
-            ":t": datetime.now(timezone.utc).isoformat(),
-        }
-
-        if error_msg:
-            update_expr += ", last_error = :e"
-            expr_values[":e"] = error_msg[:500]
-
+        now = datetime.now(timezone.utc).isoformat()
         aws_insights_table.update_item(
             Key={"pk": team_id, "sk": f"AWS_CONN#{account_id}"},
-            UpdateExpression=update_expr,
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues=expr_values,
+            UpdateExpression="SET last_error = :e, last_error_at = :t",
+            ConditionExpression="attribute_exists(pk)",
+            ExpressionAttributeValues={":e": error_msg[:500], ":t": now},
         )
     except Exception as e:
-        logger.error(f"Failed to update connection status: {e}")
+        logger.error(f"Failed to record connection error: {e}")
+
+
+def record_connection_success(team_id, account_id):
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        aws_insights_table.update_item(
+            Key={"pk": team_id, "sk": f"AWS_CONN#{account_id}"},
+            UpdateExpression="SET last_analyzed_at = :t REMOVE last_error, last_error_at",
+            ConditionExpression="attribute_exists(pk)",
+            ExpressionAttributeValues={":t": now},
+        )
+    except Exception as e:
+        logger.warning(f"Failed to record connection success: {e}")
+
+
+# ─── Teams notifications for new recommendations ──────────────────────────
+
+REC_NOTIFY_SK = "REC_NOTIFY"
+TEAM_CHANNEL_SK = "ALERT_NOTIFY"  # the team's alert channel (common::alert_notify)
+WEBHOOK_HOST_SUFFIXES = (".powerplatform.com", ".logic.azure.com", ".webhook.office.com")
+SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
+SEVERITY_ICON = {"critical": "🔴", "warning": "🟠", "info": "🔵"}
+
+
+def valid_webhook_url(url):
+    """https on a Microsoft webhook host (mirrors common::alert_notify)."""
+    if not isinstance(url, str) or not url.startswith("https://") or len(url) > 1000:
+        return False
+    if any(c.isspace() for c in url):
+        return False
+    authority = url[len("https://"):].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" in authority:
+        return False
+    host = authority.split(":", 1)[0].lower()
+    return host.endswith(WEBHOOK_HOST_SUFFIXES)
+
+
+def pick_webhook(mode, own_url, team_url, team_enabled):
+    """The channel new recommendations post to. Off unless the team turned it on."""
+    if mode == "custom":
+        return own_url if valid_webhook_url(own_url) else None
+    if mode == "team":
+        return team_url if team_enabled and valid_webhook_url(team_url) else None
+    return None
+
+
+def recommendations_card(account_id, recs, dashboard_url):
+    """Adaptive Card (Teams Workflows webhook) listing new findings."""
+    recs = sorted(recs, key=lambda r: SEVERITY_ORDER.get(r.get("severity"), 3))
+    worst = recs[0].get("severity", "info") if recs else "info"
+    style, color = {
+        "critical": ("attention", "Attention"),
+        "warning": ("warning", "Warning"),
+    }.get(worst, ("accent", "Accent"))
+    n = len(recs)
+    body = [
+        {
+            "type": "Container",
+            "bleed": True,
+            "style": style,
+            "items": [{
+                "type": "TextBlock",
+                "text": f"🔎 {n} new log finding{'s' if n != 1 else ''}",
+                "weight": "Bolder", "size": "Large", "color": color, "wrap": True,
+            }],
+        },
+        {
+            "type": "TextBlock",
+            "text": f"CloudWatch Logs · AWS account {account_id}",
+            "isSubtle": True, "spacing": "Small", "wrap": True,
+        },
+    ]
+    for r in recs[:5]:
+        sev = r.get("severity", "info")
+        items = [
+            {
+                "type": "TextBlock",
+                "text": f"{SEVERITY_ICON.get(sev, '⚪')} {str(r.get('title', 'Finding'))[:150]}",
+                "weight": "Bolder", "wrap": True,
+            },
+            {
+                "type": "TextBlock",
+                "text": str(r.get("summary", ""))[:400],
+                "wrap": True, "spacing": "Small",
+            },
+        ]
+        if r.get("source_log_group"):
+            items.append({
+                "type": "TextBlock",
+                "text": str(r["source_log_group"])[:200],
+                "isSubtle": True, "size": "Small", "spacing": "None", "wrap": True,
+            })
+        body.append({"type": "Container", "separator": True, "spacing": "Medium", "items": items})
+    if n > 5:
+        body.append({"type": "TextBlock", "text": f"+{n - 5} more", "isSubtle": True, "wrap": True})
+    return {
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "contentUrl": None,
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "msteams": {"width": "Full"},
+                "body": body,
+                "actions": [{
+                    "type": "Action.OpenUrl",
+                    "title": "Review findings",
+                    "url": f"{dashboard_url}/settings/aws",
+                }],
+            },
+        }],
+    }
+
+
+def notify_new_recommendations(team_id, account_id, recs):
+    """Post one card for this run's new findings. Best effort."""
+    if not recs:
+        return
+    try:
+        own = settings_table.get_item(Key={"pk": team_id, "sk": REC_NOTIFY_SK}).get("Item") or {}
+        mode = own.get("notify_mode", "off")
+        if mode == "off":
+            return
+        team = settings_table.get_item(Key={"pk": team_id, "sk": TEAM_CHANNEL_SK}).get("Item") or {}
+        url = pick_webhook(
+            mode,
+            own.get("teams_webhook_url", ""),
+            team.get("teams_webhook_url", ""),
+            bool(team.get("enabled", False)),
+        )
+        if not url:
+            return
+        card = recommendations_card(account_id, recs, DASHBOARD_URL)
+        req = Request(
+            url,
+            data=json.dumps(card).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=10) as resp:
+            if resp.status >= 300:
+                logger.warning(f"Teams webhook returned {resp.status}")
+    except HTTPError as e:
+        logger.warning(f"Teams notification failed ({e.code})")
+    except Exception as e:
+        logger.warning(f"Teams notification failed: {e}")
 
 
 def ulid_now():
