@@ -168,6 +168,11 @@ async fn main() -> Result<(), Error> {
                 .put(routes::alerts::put_route)
                 .delete(routes::alerts::delete_route),
         )
+        .route(
+            "/alert-notify",
+            get(routes::alerts::get_notify).put(routes::alerts::put_notify),
+        )
+        .route("/alert-notify/test", post(routes::alerts::test_notify))
         .route("/alerts", get(routes::alerts::list_events))
         .route("/alerts/event", get(routes::alerts::get_event))
         .route("/reviewer/reviews", get(routes::reviewer::list_reviews))
