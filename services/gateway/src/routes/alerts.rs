@@ -421,56 +421,147 @@ async fn confirm_subscription(
     Ok(StatusCode::OK)
 }
 
+/// What CoderHelm did with one alert. Stored on the alert's record so anyone
+/// with the alert's link can see why it did or didn't start a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    RunStarted,
+    RoutePaused,
+    NotAlarm,
+    NoMatch,
+    Duplicate,
+    Budget,
+    DailyCap,
+    InFlight,
+    Misconfigured,
+    Error,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::RunStarted => "run_started",
+            Outcome::RoutePaused => "route_paused",
+            Outcome::NotAlarm => "not_alarm",
+            Outcome::NoMatch => "no_match",
+            Outcome::Duplicate => "duplicate",
+            Outcome::Budget => "budget",
+            Outcome::DailyCap => "daily_cap",
+            Outcome::InFlight => "in_flight",
+            Outcome::Misconfigured => "misconfigured",
+            Outcome::Error => "error",
+        }
+    }
+}
+
+/// Days an alert's record (and so its link) stays available.
+const EVENT_RETENTION_SECS: u64 = 90 * DAY_SECS;
+
+fn event_sk(id: &str) -> String {
+    format!("ALERT_EVENT#{id}")
+}
+
+/// Pure: the alert's id — a ULID whose time part is when SNS published it and
+/// whose random part is derived from the SNS message id. Ids sort by time, and
+/// an SNS redelivery of the same message maps to the same record.
+pub fn event_id(sns_timestamp: &str, message_id: &str) -> String {
+    let ms = chrono::DateTime::parse_from_rfc3339(sns_timestamp)
+        .map(|t| t.timestamp_millis().max(0) as u64)
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis().max(0) as u64);
+    let digest = common::content_hash(message_id);
+    let random = u128::from_str_radix(&digest[..32], 16).unwrap_or(0);
+    ulid::Ulid::from_parts(ms, random).to_string()
+}
+
+/// Pure: a valid alert id (what [`event_id`] produces).
+pub fn is_event_id(id: &str) -> bool {
+    ulid::Ulid::from_string(id).is_ok()
+}
+
 async fn handle_notification(
     state: &AppState,
     msg: &SnsMessage,
     route: &Route,
 ) -> Result<StatusCode, StatusCode> {
     let alert = normalize(msg.subject.as_deref(), &msg.message);
-    let topic = msg.topic_arn.as_str();
     let tid = ticket_id(&alert.fingerprint);
+    let result = decide(state, msg, route, &alert, &tid).await;
+    let outcome = match &result {
+        Ok(o) => *o,
+        Err(_) => Outcome::Error,
+    };
+    record_event(state, msg, route, &alert, &tid, outcome).await;
+    result.map(|_| StatusCode::OK)
+}
+
+async fn decide(
+    state: &AppState,
+    msg: &SnsMessage,
+    route: &Route,
+    alert: &Alert,
+    tid: &str,
+) -> Result<Outcome, StatusCode> {
+    let topic = msg.topic_arn.as_str();
     if !route.enabled {
         info!(topic, ticket = %tid, "Alert ignored — route disabled");
-        return Ok(StatusCode::OK);
+        return Ok(Outcome::RoutePaused);
     }
     if !alert.actionable {
         info!(topic, ticket = %tid, title = %alert.title, "Alert ignored — not an alarm state");
-        return Ok(StatusCode::OK);
+        return Ok(Outcome::NotAlarm);
     }
-    if !route_matches(&route.match_terms, &alert) {
+    if !route_matches(&route.match_terms, alert) {
         info!(topic, ticket = %tid, title = %alert.title, "Alert ignored — no match term");
-        return Ok(StatusCode::OK);
+        return Ok(Outcome::NoMatch);
     }
 
     let table = &state.config.settings_table_name;
     // SNS retries deliveries and alarms re-notify: one alert, one run.
+    let seen_sk = format!("ALERTSEEN#{}", common::content_hash(&alert.fingerprint));
     let seen = common::claim::claim(
         &state.dynamo,
         table,
         &route.team_id,
-        &format!("ALERTSEEN#{}", common::content_hash(&alert.fingerprint)),
+        &seen_sk,
         REPEAT_WINDOW_SECS,
     )
     .await;
     if !seen.won_or_failed_open() {
         info!(topic, ticket = %tid, "Alert ignored — same alert already handled recently");
-        return Ok(StatusCode::OK);
+        return Ok(Outcome::Duplicate);
     }
 
+    let started = start_run(state, msg, route, alert, tid).await;
+    if !matches!(started, Ok(Outcome::RunStarted)) {
+        // Nothing was enqueued: let the next delivery of this alert (an SNS
+        // retry or the alarm re-notifying) try again.
+        common::claim::release(&state.dynamo, table, &route.team_id, &seen_sk).await;
+    }
+    started
+}
+
+async fn start_run(
+    state: &AppState,
+    msg: &SnsMessage,
+    route: &Route,
+    alert: &Alert,
+    tid: &str,
+) -> Result<Outcome, StatusCode> {
+    let topic = msg.topic_arn.as_str();
     if let Some(reason) = super::github_webhook::check_run_budget(state, &route.team_id).await {
         warn!(topic, ticket = %tid, reason = %reason, "Alert ignored — token budget reached");
-        return Ok(StatusCode::OK);
+        return Ok(Outcome::Budget);
     }
     if !take_daily_slot(state, &route.team_id, topic).await {
         warn!(topic, ticket = %tid, "Alert ignored — route reached its daily run cap");
-        return Ok(StatusCode::OK);
+        return Ok(Outcome::DailyCap);
     }
 
     let context_hash = common::ticket_context_hash(&alert.title, &alert.body, &[]);
     match super::trigger_gate::gate_ticket_trigger(
         state,
         &route.team_id,
-        &tid,
+        tid,
         Some(&context_hash),
         false,
     )
@@ -479,22 +570,22 @@ async fn handle_notification(
         super::trigger_gate::TicketGate::Enqueue => {}
         _ => {
             info!(topic, ticket = %tid, "Alert ignored — a run for this alert is in flight or already done");
-            return Ok(StatusCode::OK);
+            return Ok(Outcome::InFlight);
         }
     }
 
     let Some((owner, name)) = route.repo.split_once('/') else {
         error!(topic, repo = %route.repo, "Alert route has a malformed repo");
-        return Ok(StatusCode::OK);
+        return Ok(Outcome::Misconfigured);
     };
     let installation_id = super::api::get_team_installation_id(state, &route.team_id).await?;
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: route.team_id.clone(),
         installation_id,
         source: TicketSource::Alert,
-        ticket_id: tid.clone(),
+        ticket_id: tid.to_string(),
         title: common::truncate_str(&alert.title, 200).to_string(),
-        body: ticket_body(topic, &alert, &route.instructions),
+        body: ticket_body(topic, alert, &route.instructions),
         repo_owner: owner.to_string(),
         repo_name: name.to_string(),
         issue_number: 0,
@@ -521,7 +612,50 @@ async fn handle_notification(
         title = %alert.title,
         "Alert → run enqueued"
     );
-    Ok(StatusCode::OK)
+    Ok(Outcome::RunStarted)
+}
+
+/// Store the alert and what was done with it, under its own id, so it has a
+/// link. Best effort: a failed write never blocks or retries the alert itself.
+async fn record_event(
+    state: &AppState,
+    msg: &SnsMessage,
+    route: &Route,
+    alert: &Alert,
+    tid: &str,
+    outcome: Outcome,
+) {
+    let id = event_id(&msg.timestamp, &msg.message_id);
+    let now = chrono::Utc::now();
+    let received_at = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .unwrap_or(now)
+        .to_rfc3339();
+    let ttl = now.timestamp().max(0) as u64 + EVENT_RETENTION_SECS;
+    let written = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(&route.team_id))
+        .item("sk", attr_s(&event_sk(&id)))
+        .item("id", attr_s(&id))
+        .item("received_at", attr_s(&received_at))
+        .item("topic_arn", attr_s(&msg.topic_arn))
+        .item("repo", attr_s(&route.repo))
+        .item("kind", attr_s(alert.kind))
+        .item("title", attr_s(common::truncate_str(&alert.title, 300)))
+        .item(
+            "body",
+            attr_s(common::truncate_str(&alert.body, MAX_ALERT_BODY)),
+        )
+        .item("outcome", attr_s(outcome.as_str()))
+        .item("ticket_id", attr_s(tid))
+        .item("ttl", AttributeValue::N(ttl.to_string()))
+        .send()
+        .await;
+    if let Err(e) = written {
+        warn!(topic = %msg.topic_arn, ticket = %tid, error = %e, "Could not record alert event");
+    }
 }
 
 /// Count one run against the route's rolling daily cap. Fails closed: when the
@@ -759,6 +893,138 @@ pub async fn delete_route(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ─── Alert history ──────────────────────────────────────────────────────────
+
+fn event_summary(it: &HashMap<String, AttributeValue>) -> Value {
+    let s = |k: &str| it.get(k).and_then(|v| v.as_s().ok());
+    json!({
+        "id": s("id"),
+        "received_at": s("received_at"),
+        "topic_arn": s("topic_arn"),
+        "repo": s("repo"),
+        "kind": s("kind"),
+        "title": s("title"),
+        "outcome": s("outcome"),
+        "ticket_id": s("ticket_id"),
+    })
+}
+
+#[derive(Deserialize)]
+pub struct ListEventsQuery {
+    /// The last id of the previous page.
+    after: Option<String>,
+}
+
+/// GET /api/alerts — the team's alerts, newest first, 50 per page.
+pub async fn list_events(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<ListEventsQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?;
+    let mut query = state
+        .dynamo
+        .query()
+        .table_name(&state.config.settings_table_name)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+        .expression_attribute_values(":pk", attr_s(&claims.team_id))
+        .expression_attribute_values(":p", attr_s("ALERT_EVENT#"))
+        .projection_expression("id, received_at, topic_arn, repo, kind, title, outcome, ticket_id")
+        .scan_index_forward(false)
+        .limit(50);
+    if let Some(after) = q.after.as_deref() {
+        if !is_event_id(after) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        query = query
+            .exclusive_start_key("pk", attr_s(&claims.team_id))
+            .exclusive_start_key("sk", attr_s(&event_sk(after)));
+    }
+    let out = query.send().await.map_err(|e| {
+        error!(error = %e, "Could not list alerts");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let alerts: Vec<Value> = out.items().iter().map(event_summary).collect();
+    let next = out
+        .last_evaluated_key()
+        .and_then(|k| k.get("sk"))
+        .and_then(|v| v.as_s().ok())
+        .and_then(|sk| sk.strip_prefix("ALERT_EVENT#"))
+        .map(str::to_string);
+    Ok(Json(json!({ "alerts": alerts, "next": next })))
+}
+
+#[derive(Deserialize)]
+pub struct EventQuery {
+    id: String,
+}
+
+/// GET /api/alerts/event?id= — one alert: its text, what CoderHelm did with
+/// it, and the runs (and PRs) started for it.
+pub async fn get_event(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<EventQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?;
+    if !is_event_id(&q.id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let out = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&event_sk(&q.id)))
+        .send()
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Could not read alert");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let item = out.item().ok_or(StatusCode::NOT_FOUND)?;
+    let mut alert = event_summary(item);
+    alert["body"] = json!(item.get("body").and_then(|v| v.as_s().ok()));
+
+    // Repeats of an alert share its ticket, so this lists every run the alert
+    // has had; the page marks the one this delivery started.
+    let ticket = item.get("ticket_id").and_then(|v| v.as_s().ok());
+    let mut runs: Vec<Value> = Vec::new();
+    if let Some(ticket) = ticket {
+        let found = state
+            .dynamo
+            .query()
+            .table_name(&state.config.runs_table_name)
+            .index_name("ticket-index")
+            .key_condition_expression("team_id = :tid AND ticket_id = :ticket")
+            .expression_attribute_values(":tid", attr_s(&claims.team_id))
+            .expression_attribute_values(":ticket", attr_s(ticket))
+            .send()
+            .await;
+        match found {
+            Ok(r) => {
+                runs = r
+                    .items()
+                    .iter()
+                    .map(|it| {
+                        let s = |k: &str| it.get(k).and_then(|v| v.as_s().ok());
+                        json!({
+                            "run_id": s("run_id"),
+                            "status": s("status"),
+                            "title": s("title"),
+                            "pr_url": s("pr_url"),
+                            "created_at": s("created_at"),
+                        })
+                    })
+                    .collect();
+                runs.sort_by(|a, b| b["run_id"].as_str().cmp(&a["run_id"].as_str()));
+            }
+            Err(e) => warn!(error = %e, "Could not list runs for alert"),
+        }
+    }
+    Ok(Json(json!({ "alert": alert, "runs": runs })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,5 +1152,16 @@ mod tests {
         assert_eq!(topic_account("arn:aws:sns:us-east-1:1234:alarms"), None);
         assert_eq!(topic_account("arn:aws:sns:us-east-1:111122223333:"), None);
         assert!(ticket_id("abc").starts_with("ALERT-") && ticket_id("abc").len() == 14);
+    }
+
+    #[test]
+    fn alert_ids_are_stable_per_message_and_sort_by_time() {
+        let a = event_id("2026-10-09T23:00:00.000Z", "m-1");
+        assert_eq!(a, event_id("2026-10-09T23:00:00.000Z", "m-1"));
+        assert_ne!(a, event_id("2026-10-09T23:00:00.000Z", "m-2"));
+        assert!(event_id("2026-10-09T23:00:01.000Z", "m-0") > a);
+        assert!(is_event_id(&a));
+        assert!(!is_event_id("../ALERTTOPIC#x"));
+        assert!(!is_event_id(""));
     }
 }
