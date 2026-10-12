@@ -238,8 +238,31 @@ fn plain(subject: Option<&str>, message: &str) -> Alert {
         kind: "message",
         fingerprint: format!("message:{title}"),
         title,
-        body: message.to_string(),
+        body: message
+            .lines()
+            .map(as_fact_line)
+            .collect::<Vec<_>>()
+            .join("\n"),
         actionable: true,
+    }
+}
+
+/// Pure: a plain-message line like `DAG: nightly_load` as a `- DAG: nightly_load`
+/// fact. Keys are short labels (letters, digits, spaces, `_` or `-`), so prose
+/// and URLs stay as text.
+fn as_fact_line(line: &str) -> String {
+    let is_label = |k: &str| {
+        !k.is_empty()
+            && k.len() <= 30
+            && k.starts_with(|c: char| c.is_ascii_alphabetic())
+            && k.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-'))
+    };
+    match line.split_once(": ") {
+        Some((k, v)) if is_label(k) && !v.trim().is_empty() && !line.starts_with("- ") => {
+            format!("- {k}: {}", v.trim())
+        }
+        _ => line.to_string(),
     }
 }
 
@@ -1328,6 +1351,20 @@ mod tests {
             m.insert("action".to_string(), attr_s(a));
         }
         m
+    }
+
+    #[test]
+    fn plain_message_labels_become_facts() {
+        let a = normalize(
+            Some("Airflow failed: nightly_load.extract"),
+            "Load failed.\nDAG: nightly_load\nTask: extract\nError: KeyError: 'id'\nLog: https://x.example/log\nhttps://x.example/a: b",
+        );
+        assert_eq!(a.title, "Airflow failed: nightly_load.extract");
+        assert_eq!(
+            a.body,
+            "Load failed.\n- DAG: nightly_load\n- Task: extract\n- Error: KeyError: 'id'\n\
+             - Log: https://x.example/log\nhttps://x.example/a: b"
+        );
     }
 
     #[test]

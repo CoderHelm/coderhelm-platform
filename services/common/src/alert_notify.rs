@@ -281,9 +281,14 @@ fn threshold_line(facts: &[(String, String)]) -> Option<String> {
     })
 }
 
-/// Pure: the Teams card for one alert. Compact by default: a colored title,
-/// when and where, one line on what happened, the reading against its
-/// threshold, and what CoderHelm did. The raw alert fields sit behind Details.
+/// Most buttons a card shows.
+const MAX_ACTIONS: usize = 5;
+
+/// Pure: the Teams card for one alert. CloudWatch alarms are compact: a
+/// colored title, when and where, one line on what happened, the reading
+/// against its threshold, and what CoderHelm did, with the raw alarm fields
+/// behind Details. Other alerts are the sender's own message, so their text
+/// and fields stay visible. Fields that are links become buttons.
 pub fn alert_card(a: &AlertCard) -> Value {
     let sev = severity(a.kind, a.title);
     let name = a
@@ -298,7 +303,11 @@ pub fn alert_card(a: &AlertCard) -> Value {
         Severity::Info => ("emphasis", "Default", format!("⚪ {}", a.title)),
         Severity::Warning => ("warning", "Warning", format!("🟠 {name}")),
     };
-    let (facts, summary) = facts_and_summary(a.body);
+    let (all_facts, summary) = facts_and_summary(a.body);
+    let (links, facts): (Vec<_>, Vec<_>) = all_facts
+        .into_iter()
+        .partition(|(_, v)| v.starts_with("https://") && !v.contains(char::is_whitespace));
+    let compact = a.kind == "cloudwatch_alarm";
     let description = facts
         .iter()
         .find(|(k, _)| k == "Description")
@@ -309,8 +318,22 @@ pub fn alert_card(a: &AlertCard) -> Value {
         header(style, color, &label),
         json!({ "type": "TextBlock", "text": a.context, "isSubtle": true, "size": "Small", "spacing": "None", "wrap": true }),
     ];
-    if !line.is_empty() && line != name {
-        body.push(json!({ "type": "TextBlock", "text": line, "wrap": true, "spacing": "Small" }));
+    if compact {
+        if !line.is_empty() && line != name {
+            body.push(
+                json!({ "type": "TextBlock", "text": line, "wrap": true, "spacing": "Small" }),
+            );
+        }
+    } else if !summary.is_empty() {
+        body.push(
+            json!({ "type": "TextBlock", "text": summary, "wrap": true, "spacing": "Small" }),
+        );
+    }
+    if !compact && !facts.is_empty() {
+        body.push(json!({
+            "type": "FactSet", "spacing": "Small",
+            "facts": facts.iter().map(|(k, v)| json!({ "title": k, "value": v })).collect::<Vec<_>>()
+        }));
     }
     if let Some(t) = threshold_line(&facts) {
         body.push(json!({ "type": "TextBlock", "text": t, "wrap": true, "spacing": "Small" }));
@@ -323,6 +346,7 @@ pub fn alert_card(a: &AlertCard) -> Value {
     }
     let details: Vec<Value> = facts
         .iter()
+        .filter(|_| compact)
         .filter(|(k, _)| !FACTS_SHOWN_ELSEWHERE.contains(&k.as_str()))
         .map(|(k, v)| json!({ "title": k, "value": v }))
         .collect();
@@ -330,6 +354,14 @@ pub fn alert_card(a: &AlertCard) -> Value {
         vec![json!({ "type": "Action.OpenUrl", "title": "View alert", "url": a.alert_url })];
     if let Some(url) = a.console_url {
         actions.push(json!({ "type": "Action.OpenUrl", "title": "Open in AWS", "url": url }));
+    }
+    for (k, url) in links
+        .iter()
+        .take(MAX_ACTIONS.saturating_sub(actions.len() + 1))
+    {
+        actions.push(
+            json!({ "type": "Action.OpenUrl", "title": crate::truncate_str(k, 30), "url": url }),
+        );
     }
     if !details.is_empty() {
         body.push(json!({
@@ -547,6 +579,40 @@ mod tests {
             shown,
             vec!["Reason", "Metric", "Dimensions", "Statistic", "Threshold"]
         );
+    }
+
+    #[test]
+    fn message_alerts_keep_their_fields_and_links_become_buttons() {
+        let card = alert_card(&AlertCard {
+            kind: "message",
+            title: "Airflow failed: nightly_load.extract",
+            body: "- DAG: nightly_load\n- Task: extract\n- Error: KeyError: 'id'\n\
+                   - Log: https://airflow.example/log?dag_id=nightly_load",
+            outcome: "",
+            alert_url: "u",
+            console_url: None,
+            context: "us-east-1",
+        });
+        let c = &card["attachments"][0]["content"];
+        let facts: Vec<&str> = c["body"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "FactSet")
+            .unwrap()["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(facts, vec!["DAG", "Task", "Error"]);
+        let actions: Vec<&str> = c["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, vec!["View alert", "Log"]);
     }
 
     #[test]
