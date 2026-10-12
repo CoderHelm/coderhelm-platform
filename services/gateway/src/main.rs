@@ -173,6 +173,10 @@ async fn main() -> Result<(), Error> {
             get(routes::alerts::list_topic_alarms),
         )
         .route(
+            "/alert-budget",
+            get(routes::alerts::get_budget).put(routes::alerts::put_budget),
+        )
+        .route(
             "/alert-notify",
             get(routes::alerts::get_notify).put(routes::alerts::put_notify),
         )

@@ -16,7 +16,9 @@
 //!   for it), so nobody can route someone else's alerts into their runs.
 //! - Alert text is treated as data, never as instructions: alerts often quote
 //!   attacker-controlled values (user agents, request paths).
-//! - Repeats of the same alert are collapsed, and each rule has a daily cap.
+//! - Repeats of the same alert are collapsed, each rule has a daily run cap,
+//!   and alert runs stop for the day once their spend reaches the team's
+//!   alert budget.
 
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
 use axum::{
@@ -39,7 +41,14 @@ use common::alert_notify;
 /// Same alert (same fingerprint) within this window is one alert.
 const REPEAT_WINDOW_SECS: u64 = 6 * 3600;
 /// Most alert runs one rule may start per rolling day.
-const MAX_RUNS_PER_RULE_PER_DAY: u64 = 20;
+const MAX_RUNS_PER_RULE_PER_DAY: u64 = 5;
+/// Team setting: most USD alert runs may spend per rolling day.
+const BUDGET_SK: &str = "ALERT_BUDGET";
+/// Daily alert budget when a team hasn't set one.
+pub const DEFAULT_DAILY_BUDGET_USD: f64 = 25.0;
+/// What an alert run still in progress is assumed to cost, since its cost is
+/// only recorded when it finishes.
+const OPEN_RUN_RESERVE_USD: f64 = 5.0;
 const DAY_SECS: u64 = 86_400;
 /// Route actions: open a pull request for the alert, or only post it to Teams.
 pub const ACTION_FIX: &str = "fix";
@@ -561,6 +570,8 @@ pub enum Outcome {
     Notified,
     Duplicate,
     Budget,
+    /// Today's alert runs reached the team's alert budget.
+    AlertBudget,
     DailyCap,
     InFlight,
     Misconfigured,
@@ -577,6 +588,7 @@ impl Outcome {
             Outcome::Notified => "notified",
             Outcome::Duplicate => "duplicate",
             Outcome::Budget => "budget",
+            Outcome::AlertBudget => "alert_budget",
             Outcome::DailyCap => "daily_cap",
             Outcome::InFlight => "in_flight",
             Outcome::Misconfigured => "misconfigured",
@@ -642,6 +654,9 @@ pub fn notify_line(outcome: Outcome, repo: &str, post_recoveries: bool) -> Optio
         Outcome::NotAlarm => return None,
         Outcome::InFlight => "A CoderHelm run for this alert is already open.".to_string(),
         Outcome::Budget => "No fix started: the team's token limit was reached.".to_string(),
+        Outcome::AlertBudget => {
+            "No fix started: today's alert spending limit was reached.".to_string()
+        }
         Outcome::DailyCap => "No fix started: this rule reached its daily limit.".to_string(),
         Outcome::Misconfigured => "No fix started: the rule's repo is invalid.".to_string(),
         Outcome::Duplicate | Outcome::RoutePaused | Outcome::Error => return None,
@@ -808,6 +823,20 @@ async fn start_run(
         warn!(topic, ticket = %tid, reason = %reason, "Alert ignored — token budget reached");
         return Ok(Outcome::Budget);
     }
+    match alert_spend_24h(state, &route.team_id).await {
+        Some((spent, open)) => {
+            let budget = daily_budget(state, &route.team_id).await;
+            if !within_budget(spent, open, budget) {
+                warn!(topic, ticket = %tid, spent, open, budget, "Alert ignored — daily alert budget reached");
+                return Ok(Outcome::AlertBudget);
+            }
+        }
+        None => {
+            // Fail closed: when today's spend can't be read, no run starts.
+            warn!(topic, ticket = %tid, "Alert ignored — could not read today's alert spend");
+            return Ok(Outcome::AlertBudget);
+        }
+    }
     if !take_daily_slot(state, &route.team_id, topic, &rule.id).await {
         warn!(topic, ticket = %tid, rule = %rule.id, "Alert ignored — rule reached its daily run cap");
         return Ok(Outcome::DailyCap);
@@ -933,6 +962,79 @@ async fn record_event(
     if let Err(e) = written {
         warn!(topic = %msg.topic_arn, ticket = %tid, error = %e, "Could not record alert event");
     }
+}
+
+/// Pure: may another alert run start? Spent dollars plus a reserve for each
+/// run still in progress must stay under the budget.
+pub fn within_budget(spent_usd: f64, open_runs: u32, budget_usd: f64) -> bool {
+    spent_usd + f64::from(open_runs) * OPEN_RUN_RESERVE_USD < budget_usd
+}
+
+/// The team's daily alert budget in USD.
+async fn daily_budget(state: &AppState, team_id: &str) -> f64 {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(BUDGET_SK))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned())
+        .and_then(|i| i.get("daily_usd").and_then(|v| v.as_n().ok()).cloned())
+        .and_then(|n| n.parse::<f64>().ok())
+        .filter(|b| b.is_finite() && *b >= 0.0)
+        .unwrap_or(DEFAULT_DAILY_BUDGET_USD)
+}
+
+/// What the team's alert runs cost in the last 24 hours, and how many are
+/// still in progress. Run ids are ULIDs, so the window is a key range. None
+/// when the runs can't be read.
+async fn alert_spend_24h(state: &AppState, team_id: &str) -> Option<(f64, u32)> {
+    let since_ms = (chrono::Utc::now().timestamp_millis() - 86_400_000).max(0) as u64;
+    let from = ulid::Ulid::from_parts(since_ms, 0).to_string();
+    let mut spent = 0.0;
+    let mut open = 0u32;
+    let mut start: Option<HashMap<String, AttributeValue>> = None;
+    loop {
+        let out = state
+            .dynamo
+            .query()
+            .table_name(&state.config.runs_table_name)
+            .key_condition_expression("team_id = :t AND run_id >= :from")
+            .filter_expression("begins_with(ticket_id, :alert)")
+            .expression_attribute_values(":t", attr_s(team_id))
+            .expression_attribute_values(":from", attr_s(&from))
+            .expression_attribute_values(":alert", attr_s("ALERT-"))
+            .projection_expression("cost_usd, #s")
+            .expression_attribute_names("#s", "status")
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| error!(error = %e, "Could not read alert run spend"))
+            .ok()?;
+        for item in out.items() {
+            let cost = item
+                .get("cost_usd")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let status = item
+                .get("status")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str);
+            spent += cost;
+            if matches!(status, Some("pending" | "queued" | "running")) {
+                open += 1;
+            }
+        }
+        match out.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    Some((spent, open))
 }
 
 /// Count one run against the rule's rolling daily cap. Fails closed: when the
@@ -1094,6 +1196,9 @@ fn valid_rule_id(id: &str) -> bool {
 
 /// Pure: the rules a request saves, cleaned and checked. Err = bad request.
 pub fn rules_from_request(req: &PutRouteRequest) -> Result<Vec<Rule>, StatusCode> {
+    // A saved rule must name what it takes: an empty rule would take every
+    // alert on the topic and start a paid run for each.
+    let explicit = req.rules.is_some();
     let requested = match &req.rules {
         Some(rules) => rules.clone(),
         None => match req.action.trim() {
@@ -1138,13 +1243,17 @@ pub fn rules_from_request(req: &PutRouteRequest) -> Result<Vec<Rule>, StatusCode
                 .filter(|id| valid_rule_id(id) && !seen.contains(id))
                 .unwrap_or_else(|| ulid::Ulid::new().to_string().to_lowercase());
             seen.insert(id.clone());
-            Ok(Rule {
+            let rule = Rule {
                 id,
                 alarms: clean(&r.alarms, MAX_RULE_ALARMS)?,
                 terms: clean(&r.terms, MAX_RULE_TERMS)?,
                 repo,
                 instructions: r.instructions,
-            })
+            };
+            if explicit && rule.alarms.is_empty() && rule.terms.is_empty() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Ok(rule)
         })
         .collect()
 }
@@ -1419,6 +1528,62 @@ pub async fn put_notify(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// GET /api/alert-budget — the team's daily alert budget and today's spend (admin+).
+pub async fn get_budget(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?;
+    let budget = daily_budget(&state, &claims.team_id).await;
+    let (spent, open) = alert_spend_24h(&state, &claims.team_id)
+        .await
+        .unwrap_or((0.0, 0));
+    Ok(Json(json!({
+        "daily_usd": budget,
+        "spent_24h_usd": (spent * 100.0).round() / 100.0,
+        "open_runs": open,
+        "max_runs_per_rule_per_day": MAX_RUNS_PER_RULE_PER_DAY,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct PutBudgetRequest {
+    daily_usd: f64,
+}
+
+/// PUT /api/alert-budget — set the team's daily alert budget in USD; 0 stops
+/// every alert run (admin+).
+pub async fn put_budget(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<PutBudgetRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?;
+    if !req.daily_usd.is_finite() || !(0.0..=10_000.0).contains(&req.daily_usd) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(&claims.team_id))
+        .item("sk", attr_s(BUDGET_SK))
+        .item(
+            "daily_usd",
+            AttributeValue::N(format!("{:.2}", req.daily_usd)),
+        )
+        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .item("updated_by", attr_s(&claims.email))
+        .send()
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Could not save alert budget");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    info!(team_id = %claims.team_id, daily_usd = req.daily_usd, "Alert budget saved");
+    Ok(Json(json!({ "ok": true })))
+}
+
 #[derive(Deserialize)]
 pub struct TestNotifyRequest {
     teams_webhook_url: String,
@@ -1650,6 +1815,7 @@ mod tests {
                 },
                 RuleRequest {
                     id: "keep-me".into(),
+                    alarms: vec!["b".into()],
                     repo: "o/r2".into(),
                     ..Default::default()
                 },
@@ -1661,6 +1827,17 @@ mod tests {
         assert_eq!(rules[0].alarms, vec!["a"]);
         // A duplicate id gets a fresh one so caps stay separate.
         assert_ne!(rules[1].id, "keep-me");
+        let catch_all = PutRouteRequest {
+            rules: Some(vec![RuleRequest {
+                repo: "o/r".into(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert!(
+            rules_from_request(&catch_all).is_err(),
+            "a rule must name what it takes"
+        );
         let bad = PutRouteRequest {
             rules: Some(vec![RuleRequest {
                 repo: "not-a-repo".into(),
@@ -1719,6 +1896,17 @@ mod tests {
             "Load failed.\n- DAG: nightly_load\n- Task: extract\n- Error: KeyError: 'id'\n\
              - Log: https://x.example/log\nhttps://x.example/a: b"
         );
+    }
+
+    #[test]
+    fn alert_runs_stop_at_the_budget_counting_open_runs() {
+        assert!(within_budget(0.0, 0, 25.0));
+        assert!(within_budget(14.0, 2, 25.0));
+        // 14 spent + 2 open runs reserved at 5 each = 24; a third open run tips it.
+        assert!(!within_budget(14.0, 3, 25.0));
+        assert!(!within_budget(25.0, 0, 25.0));
+        // A zero budget stops every run.
+        assert!(!within_budget(0.0, 0, 0.0));
     }
 
     #[test]
