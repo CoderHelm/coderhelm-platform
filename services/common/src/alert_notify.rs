@@ -215,7 +215,7 @@ fn header(style: &str, color: &str, text: &str) -> Value {
         "style": style,
         "items": [{
             "type": "TextBlock", "text": text, "weight": "Bolder",
-            "size": "Large", "color": color, "wrap": true
+            "size": "Medium", "color": color, "wrap": true
         }]
     })
 }
@@ -234,7 +234,56 @@ pub struct AlertCard<'a> {
     pub context: &'a str,
 }
 
-/// Pure: the Teams card for one alert.
+/// Facts the card already shows in its title and headline, left out of the
+/// details.
+const FACTS_SHOWN_ELSEWHERE: [&str; 4] = ["Alarm", "State", "Description", "Region"];
+
+/// Pure: the alert's description as one plain line. Markdown headings and
+/// blank lines are dropped, and a bare heading gives way to the sentence after
+/// it ("# Airflow Task Failure\nA task has failed…" reads as the second line).
+fn headline(description: &str, summary: &str) -> String {
+    let text = [description, summary]
+        .iter()
+        .flat_map(|t| t.lines())
+        .map(|l| l.trim().trim_start_matches('#').trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>();
+    let line = match text.as_slice() {
+        [heading, next, ..] if !heading.ends_with('.') && next.len() > heading.len() => next,
+        [first, ..] => first,
+        [] => return String::new(),
+    };
+    crate::truncate_str(line, 200).to_string()
+}
+
+/// Pure: a CloudWatch threshold reason as "Metric: **5** (alarms above 1)".
+fn threshold_line(facts: &[(String, String)]) -> Option<String> {
+    let get = |k: &str| facts.iter().find(|(f, _)| f == k).map(|(_, v)| v.as_str());
+    let value = get("Reason")?
+        .split_once('[')?
+        .1
+        .split([' ', ']', '('])
+        .next()
+        .filter(|v| !v.is_empty())?;
+    let (op, threshold) = get("Threshold")?.split_once(' ')?;
+    let op = match op {
+        "GreaterThanThreshold" => "above",
+        "GreaterThanOrEqualToThreshold" => "at or above",
+        "LessThanThreshold" => "below",
+        "LessThanOrEqualToThreshold" => "at or below",
+        _ => return None,
+    };
+    let num = |n: &str| n.trim_end_matches(".0").to_string();
+    let reading = format!("**{}** (alarms {op} {})", num(value), num(threshold));
+    Some(match get("Metric") {
+        Some(m) => format!("{}: {reading}", m.rsplit('/').next().unwrap_or(m).trim()),
+        None => reading,
+    })
+}
+
+/// Pure: the Teams card for one alert. Compact by default: a colored title,
+/// when and where, one line on what happened, the reading against its
+/// threshold, and what CoderHelm did. The raw alert fields sit behind Details.
 pub fn alert_card(a: &AlertCard) -> Value {
     let sev = severity(a.kind, a.title);
     let name = a
@@ -244,38 +293,52 @@ pub fn alert_card(a: &AlertCard) -> Value {
         .map(|(_, n)| n)
         .unwrap_or(a.title);
     let (style, color, label) = match sev {
-        Severity::Alarm => ("attention", "Attention", format!("🔴 ALARM · {name}")),
-        Severity::Resolved => ("good", "Good", format!("✅ RESOLVED · {name}")),
+        Severity::Alarm => ("attention", "Attention", format!("🔴 {name}")),
+        Severity::Resolved => ("good", "Good", format!("✅ Resolved · {name}")),
         Severity::Info => ("emphasis", "Default", format!("⚪ {}", a.title)),
         Severity::Warning => ("warning", "Warning", format!("🟠 {name}")),
     };
     let (facts, summary) = facts_and_summary(a.body);
+    let description = facts
+        .iter()
+        .find(|(k, _)| k == "Description")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let line = headline(description, &summary);
     let mut body = vec![
         header(style, color, &label),
-        json!({ "type": "TextBlock", "text": a.context, "isSubtle": true, "spacing": "Small", "wrap": true }),
+        json!({ "type": "TextBlock", "text": a.context, "isSubtle": true, "size": "Small", "spacing": "None", "wrap": true }),
     ];
-    if !summary.is_empty() {
-        body.push(
-            json!({ "type": "TextBlock", "text": summary, "wrap": true, "spacing": "Medium" }),
-        );
+    if !line.is_empty() && line != name {
+        body.push(json!({ "type": "TextBlock", "text": line, "wrap": true, "spacing": "Small" }));
     }
-    if !facts.is_empty() {
-        body.push(json!({
-            "type": "FactSet",
-            "spacing": "Medium",
-            "facts": facts.iter().map(|(k, v)| json!({ "title": k, "value": v })).collect::<Vec<_>>()
-        }));
+    if let Some(t) = threshold_line(&facts) {
+        body.push(json!({ "type": "TextBlock", "text": t, "wrap": true, "spacing": "Small" }));
     }
     if !a.outcome.is_empty() {
         body.push(json!({
             "type": "TextBlock", "text": format!("🤖 {}", a.outcome),
-            "isSubtle": true, "wrap": true, "spacing": "Medium"
+            "isSubtle": true, "size": "Small", "wrap": true, "spacing": "Small"
         }));
     }
+    let details: Vec<Value> = facts
+        .iter()
+        .filter(|(k, _)| !FACTS_SHOWN_ELSEWHERE.contains(&k.as_str()))
+        .map(|(k, v)| json!({ "title": k, "value": v }))
+        .collect();
     let mut actions =
         vec![json!({ "type": "Action.OpenUrl", "title": "View alert", "url": a.alert_url })];
     if let Some(url) = a.console_url {
         actions.push(json!({ "type": "Action.OpenUrl", "title": "Open in AWS", "url": url }));
+    }
+    if !details.is_empty() {
+        body.push(json!({
+            "type": "Container", "id": "details", "isVisible": false, "spacing": "Medium",
+            "items": [{ "type": "FactSet", "facts": details }]
+        }));
+        actions.push(json!({
+            "type": "Action.ToggleVisibility", "title": "Details", "targetElements": ["details"]
+        }));
     }
     wrap(json!({
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -415,8 +478,9 @@ mod tests {
         let c = &card["attachments"][0]["content"];
         assert_eq!(c["version"], "1.5");
         assert_eq!(c["body"][0]["style"], "attention");
-        assert_eq!(c["body"][0]["items"][0]["text"], "🔴 ALARM · prod-db-cpu");
-        assert_eq!(c["actions"].as_array().unwrap().len(), 2);
+        assert_eq!(c["body"][0]["items"][0]["text"], "🔴 prod-db-cpu");
+        // View alert, Open in AWS, Details.
+        assert_eq!(c["actions"].as_array().unwrap().len(), 3);
         let resolved = alert_card(&AlertCard {
             title: "OK: prod-db-cpu",
             console_url: None,
@@ -433,6 +497,55 @@ mod tests {
         assert_eq!(
             resolved["attachments"][0]["content"]["body"][0]["style"],
             "good"
+        );
+    }
+
+    #[test]
+    fn alarm_card_is_compact_with_details_hidden() {
+        let body = "A task has failed to run. Please check MWAA for more information.\n\
+            - Alarm: Airflow Task Failures\n\
+            - State: ALARM (was INSUFFICIENT_DATA)\n\
+            - Description: # Airflow Task Failure\n\
+            - Reason: Threshold Crossed: 1 out of the last 1 datapoints [5.0 (12/10/26 16:54:00)] was greater than the threshold (1.0)\n\
+            - Metric: AmazonMWAA / TaskInstanceFailures\n\
+            - Dimensions: Task=All, Environment=prod-bi-airflow, DAG=All\n\
+            - Statistic: AVERAGE\n\
+            - Threshold: GreaterThanThreshold 1\n";
+        let card = alert_card(&AlertCard {
+            kind: "cloudwatch_alarm",
+            title: "ALARM: Airflow Task Failures",
+            body,
+            outcome: "",
+            alert_url: "u",
+            console_url: None,
+            context: "us-east-1 · 2026-10-12 17:09 UTC",
+        });
+        let c = &card["attachments"][0]["content"];
+        let texts: Vec<&str> = c["body"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "us-east-1 · 2026-10-12 17:09 UTC",
+                "A task has failed to run. Please check MWAA for more information.",
+                "TaskInstanceFailures: **5** (alarms above 1)",
+            ]
+        );
+        let details = c["body"].as_array().unwrap().last().unwrap();
+        assert_eq!(details["isVisible"], false);
+        let shown: Vec<&str> = details["items"][0]["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["Reason", "Metric", "Dimensions", "Statistic", "Threshold"]
         );
     }
 
