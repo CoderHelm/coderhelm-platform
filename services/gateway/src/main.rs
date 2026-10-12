@@ -169,6 +169,10 @@ async fn main() -> Result<(), Error> {
                 .delete(routes::alerts::delete_route),
         )
         .route(
+            "/alert-routes/alarms",
+            get(routes::alerts::list_topic_alarms),
+        )
+        .route(
             "/alert-notify",
             get(routes::alerts::get_notify).put(routes::alerts::put_notify),
         )

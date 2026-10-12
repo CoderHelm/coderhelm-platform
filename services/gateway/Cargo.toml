@@ -28,6 +28,7 @@ aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-cognitoidentityprovider = "1"
 aws-sdk-sts = "1"
 aws-sdk-cloudwatchlogs = "1"
+aws-sdk-cloudwatch = "1"
 aws-sdk-lambda = "1"
 
 # Auth

@@ -55,6 +55,11 @@ Resources:
                   - "logs:FilterLogEvents"
                   - "logs:GetLogEvents"
                 Resource: "arn:aws:logs:*:*:log-group:*"
+              - Sid: ReadAlarms
+                Effect: Allow
+                Action:
+                  - "cloudwatch:DescribeAlarms"
+                Resource: "*"
               - Sid: VerifyIdentity
                 Effect: Allow
                 Action:
