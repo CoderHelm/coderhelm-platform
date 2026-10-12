@@ -1081,7 +1081,7 @@ mod required_tests_tests {
         }
     }
 
-    // terraform_devops#291: the new entry is lines 2-5. A suggestion over 3-5
+    // The new entry is lines 2-5. A suggestion over 3-5
     // that deletes its body and `},` but keeps its `{` must not be offered.
     const TF: &str = "  rules = [\n    {\n      cidr_block  = \"67.80.16.247/32\"\n      description = \"Home\"\n    },\n    {\n      cidr_block  = \"104.42.41.203/32\"\n    }\n  ]";
 

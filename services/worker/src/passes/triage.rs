@@ -254,7 +254,7 @@ pub async fn select_repo(
                   Rules: \
                   1. Read the repository descriptions and languages carefully — match the ticket to the repo that OWNS that feature area. \
                   2. Data/analytics/ETL/pipeline repos (e.g. airflow, dbt) are ONLY for data pipeline work, NOT for application features or API integrations. \
-                  3. If the ticket mentions specific services, APIs, SDKs, or integrations (e.g. Adyen, Exerp API, billing), pick the repo that implements or calls those services — typically an API/backend repo, not a data repo. \
+                  3. If the ticket mentions specific services, APIs, SDKs, or integrations (e.g. a payments provider, a member-management API, billing), pick the repo that implements or calls those services — typically an API/backend repo, not a data repo. \
                   4. Terraform/infrastructure repos are ONLY for infra changes (IAM, networking, deployment config). \
                   5. When unsure, prefer application/API repos over data or infrastructure repos. \
                   Think step by step: (1) what is this ticket about, (2) which repo owns that area, (3) return ONLY the repo in owner/name format.";
@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn extracts_distinctive_identifiers() {
-        // CPM-7881: the Tailwind token ticket that mis-routed. The kebab tokens
+        // The Tailwind token ticket that mis-routed. The kebab tokens
         // are the signal that would find the repo containing them.
         let terms = extract_ticket_search_terms(
             "Override Tailwind \"tighter\" letter-spacing token",
@@ -560,7 +560,7 @@ mod tests {
         );
         assert!(terms.iter().any(|t| t == "letter-spacing"), "got {terms:?}");
 
-        // CPM-7838: PascalCase component names are the signal.
+        // PascalCase component names are the signal.
         let terms = extract_ticket_search_terms(
             "render ClassRow tags as styled badges to match GroupCard",
             "Style the tags in ClassRow to match the badges in GroupCard.",
@@ -578,11 +578,11 @@ mod tests {
 
     #[test]
     fn repo_choice_parsing() {
-        let repos = vec!["Org/speedboat".to_string(), "Org/mobile".to_string()];
+        let repos = vec!["Org/web-app".to_string(), "Org/mobile".to_string()];
         // Plain last line
         assert_eq!(
-            extract_repo_choice("reasoning...\nOrg/speedboat", &repos).as_deref(),
-            Some("Org/speedboat")
+            extract_repo_choice("reasoning...\nOrg/web-app", &repos).as_deref(),
+            Some("Org/web-app")
         );
         // Markdown + prose wrapping
         assert_eq!(
@@ -592,18 +592,18 @@ mod tests {
         // Truncated mid-reasoning but an earlier line names the repo
         assert_eq!(
             extract_repo_choice(
-                "The ticket belongs to Org/speedboat because the pages",
+                "The ticket belongs to Org/web-app because the pages",
                 &repos
             )
             .as_deref(),
-            Some("Org/speedboat")
+            Some("Org/web-app")
         );
         // Nothing matches
         assert_eq!(extract_repo_choice("no idea", &repos), None);
         // Case-insensitive
         assert_eq!(
-            extract_repo_choice("org/SPEEDBOAT", &repos).as_deref(),
-            Some("Org/speedboat")
+            extract_repo_choice("org/WEB-APP", &repos).as_deref(),
+            Some("Org/web-app")
         );
     }
 }

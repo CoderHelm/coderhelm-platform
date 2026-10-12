@@ -540,7 +540,7 @@ mod tests {
             - Description: # Airflow Task Failure\n\
             - Reason: Threshold Crossed: 1 out of the last 1 datapoints [5.0 (12/10/26 16:54:00)] was greater than the threshold (1.0)\n\
             - Metric: AmazonMWAA / TaskInstanceFailures\n\
-            - Dimensions: Task=All, Environment=prod-bi-airflow, DAG=All\n\
+            - Dimensions: Task=All, Environment=prod-etl, DAG=All\n\
             - Statistic: AVERAGE\n\
             - Threshold: GreaterThanThreshold 1\n";
         let card = alert_card(&AlertCard {

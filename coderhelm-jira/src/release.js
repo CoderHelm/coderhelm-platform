@@ -161,7 +161,7 @@ exports.publishReleaseHandler = async (request) => {
   }
 };
 
-/** POST { forge_secret, keys: ["CPM-1", ...] } → { issues: [{key, summary, type, status}] } */
+/** POST { forge_secret, keys: ["ABC-1", ...] } → { issues: [{key, summary, type, status}] } */
 exports.getIssuesHandler = async (request) => {
   try {
     const body = JSON.parse(request.body || "{}");

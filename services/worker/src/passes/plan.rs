@@ -161,7 +161,7 @@ set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reason>`.
 Otherwise, generate four openspec files:
 
 1. **proposal.md** — Problem statement, proposed approach, scope boundaries, risks
-2. **design.md** — Technical design: which files to modify/create (use full paths from repo root e.g. `src/services/adyen.ts`), patterns to follow, data flow
+2. **design.md** — Technical design: which files to modify/create (use full paths from repo root e.g. `src/services/payments.ts`), patterns to follow, data flow
 3. **tasks.md** — Step-by-step implementation checklist. Each task MUST follow this format:
    `- [ ] <file_path>: <description>` (e.g. `- [ ] src/resolvers/join.ts: Add optional billingAddress param to OnlineJoin mutation`)
    Tasks should be atomic and ordered. Include the full file path from the repo root in every task. \

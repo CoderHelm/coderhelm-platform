@@ -4951,7 +4951,7 @@ async fn validate_plan(
     //    plan means the planner found the right repo. Bare repo names are
     //    demoted to a HINT for the LLM check below: repos named after common
     //    words make bare-name counting actively wrong (a ticket about LCP
-    //    "for mobile" — the device — routed speedboat work into the repo
+    //    "for mobile" — the device — routed web work into the repo
     //    named "mobile" because \bmobile\b matched twice).
     let mut mention_hint: Option<String> = None;
     if switch_repo.is_none() {
@@ -5118,7 +5118,7 @@ Does this plan belong in {current_repo}, or should it be in one of the other rep
 Rules:
 - Consider what each repo is FOR based on its name, description, directory structure, and AGENTS context.
 - Data/ETL/pipeline repos are for data work only, NOT application features.
-- If the plan mentions a specific service or API (e.g. "gangway", "adyen webhook"), match it to the repo that OWNS that code.
+- If the plan mentions a specific service or API (e.g. "billing-api", "payments webhook"), match it to the repo that OWNS that code.
 - A repo name appearing as an ordinary word in prose (e.g. "mobile", "web", "data") is NOT evidence the work belongs there.
 - If the plan clearly belongs in the current repo, respond: CORRECT
 - If it belongs in a different repo, respond: SWITCH owner/name

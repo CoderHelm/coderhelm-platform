@@ -1977,7 +1977,7 @@ async fn handle_review_trigger(
 /// first: by the time the worker reads the PR, GitHub lists the real latest
 /// head, every superseded commit's review is skipped before it starts, and only
 /// the last commit is reviewed. Undelayed, two commits pushed 2s apart were both
-/// reviewed and the older one's verdict posted last (speedboat#1322). Other
+/// reviewed and the older one's verdict posted last. Other
 /// events (label added, opened, ready for review) are single, deliberate steps
 /// and start at once.
 fn review_delay_secs(action: &str) -> i32 {

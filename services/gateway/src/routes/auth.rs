@@ -26,7 +26,7 @@ use std::collections::HashMap;
 /// into, they should land THERE — where the model key and repos live — not on
 /// their empty personal team. The old logic just took the first non-`invited`
 /// record, and the always-active personal team usually won, so an invited user
-/// (e.g. a Chelsea Piers teammate) got prompted for their own Anthropic key.
+/// (e.g. a teammate invited to a company team) got prompted for their own Anthropic key.
 ///
 /// Preference order (all restricted to active, non-`invited` `USER#` records):
 ///   1. a team the user was ADDED to — `role != "owner"` (member/admin). This
@@ -1697,21 +1697,21 @@ mod team_select_tests {
 
     #[test]
     fn prefers_joined_team_over_personal() {
-        // cgaba: owner of his personal team, member of chelseapiers (both active).
+        // A user who owns a personal team and is a member of a company team (both active).
         let sub = "7498f458";
         let items = vec![
             rec("TEAM#7498f458", "USER#7498f458", "owner", None),
-            rec("TEAM#Google_115", "USER#7498f458", "member", None),
+            rec("TEAM#Google_123", "USER#7498f458", "member", None),
         ];
         assert_eq!(
             pk_of(select_session_team(&items, sub).unwrap()),
-            "TEAM#Google_115"
+            "TEAM#Google_123"
         );
         // Order must not matter.
         let items_rev: Vec<_> = items.into_iter().rev().collect();
         assert_eq!(
             pk_of(select_session_team(&items_rev, sub).unwrap()),
-            "TEAM#Google_115"
+            "TEAM#Google_123"
         );
     }
 
