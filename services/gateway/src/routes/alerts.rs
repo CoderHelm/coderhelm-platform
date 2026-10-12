@@ -349,6 +349,9 @@ struct Route {
     notify_mode: String,
     /// The route's own channel when `notify_mode` is "custom".
     teams_webhook_url: String,
+    /// Post recoveries and other non-alarm state changes to Teams. Off by
+    /// default: they are still recorded on the alert's page.
+    post_recoveries: bool,
 }
 
 fn route_from_item(item: &HashMap<String, AttributeValue>) -> Option<Route> {
@@ -387,6 +390,11 @@ fn route_from_item(item: &HashMap<String, AttributeValue>) -> Option<Route> {
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| alert_notify::MODE_TEAM.to_string()),
         teams_webhook_url: s("teams_webhook_url"),
+        post_recoveries: item
+            .get("post_recoveries")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false),
     })
 }
 
@@ -544,15 +552,17 @@ async fn handle_notification(
 }
 
 /// Pure: the card's line on what CoderHelm did. None = don't notify (a repeat
-/// of an alert already posted, a paused route, or a failure SNS will retry).
-pub fn notify_line(outcome: Outcome, repo: &str) -> Option<String> {
+/// of an alert already posted, a paused route, a failure SNS will retry, or a
+/// recovery on a route that doesn't post them).
+pub fn notify_line(outcome: Outcome, repo: &str, post_recoveries: bool) -> Option<String> {
     Some(match outcome {
         Outcome::RunStarted => {
             format!("CoderHelm is working on a fix in {repo}. A follow-up card will link the pull request.")
         }
         Outcome::NoMatch => "Notification only: no automatic fix for this alert.".to_string(),
         Outcome::Notified => String::new(),
-        Outcome::NotAlarm => String::new(),
+        Outcome::NotAlarm if post_recoveries => String::new(),
+        Outcome::NotAlarm => return None,
         Outcome::InFlight => "A CoderHelm run for this alert is already open.".to_string(),
         Outcome::Budget => "No fix started: the team's token limit was reached.".to_string(),
         Outcome::DailyCap => "No fix started: this route reached its daily limit.".to_string(),
@@ -577,7 +587,7 @@ async fn notify_teams(
     alert: &Alert,
     outcome: Outcome,
 ) {
-    let Some(line) = notify_line(outcome, &route.repo) else {
+    let Some(line) = notify_line(outcome, &route.repo, route.post_recoveries) else {
         return;
     };
     let team = team_notify_settings(state, &route.team_id).await;
@@ -921,6 +931,7 @@ pub async fn list_routes(
                 "enabled": r.enabled,
                 "notify_mode": r.notify_mode,
                 "teams_webhook_url": r.teams_webhook_url,
+                "post_recoveries": r.post_recoveries,
                 "updated_at": it.get("updated_at").and_then(|v| v.as_s().ok()),
             }))
         })
@@ -949,6 +960,9 @@ pub struct PutRouteRequest {
     notify_mode: String,
     #[serde(default)]
     teams_webhook_url: String,
+    /// Post recoveries to Teams (default off).
+    #[serde(default)]
+    post_recoveries: bool,
 }
 
 fn notify_mode_of(req: &PutRouteRequest) -> Option<&'static str> {
@@ -1039,6 +1053,7 @@ pub async fn put_route(
             .item("enabled", AttributeValue::Bool(req.enabled))
             .item("notify_mode", attr_s(notify_mode))
             .item("teams_webhook_url", attr_s(route_webhook))
+            .item("post_recoveries", AttributeValue::Bool(req.post_recoveries))
             .item("updated_at", attr_s(&now))
             .item("updated_by", attr_s(&claims.email));
         if sk == "ROUTE" {
@@ -1516,14 +1531,21 @@ mod tests {
 
     #[test]
     fn notifications_skip_repeats_and_retries() {
-        assert!(notify_line(Outcome::RunStarted, "o/r")
+        assert!(notify_line(Outcome::RunStarted, "o/r", false)
             .unwrap()
             .contains("o/r"));
-        assert_eq!(notify_line(Outcome::NotAlarm, "o/r").as_deref(), Some(""));
-        assert!(notify_line(Outcome::NoMatch, "o/r").is_some());
-        assert_eq!(notify_line(Outcome::Notified, "").as_deref(), Some(""));
-        assert!(notify_line(Outcome::Duplicate, "o/r").is_none());
-        assert!(notify_line(Outcome::RoutePaused, "o/r").is_none());
-        assert!(notify_line(Outcome::Error, "o/r").is_none());
+        assert_eq!(
+            notify_line(Outcome::NotAlarm, "o/r", true).as_deref(),
+            Some("")
+        );
+        assert!(notify_line(Outcome::NotAlarm, "o/r", false).is_none());
+        assert!(notify_line(Outcome::NoMatch, "o/r", false).is_some());
+        assert_eq!(
+            notify_line(Outcome::Notified, "", false).as_deref(),
+            Some("")
+        );
+        assert!(notify_line(Outcome::Duplicate, "o/r", false).is_none());
+        assert!(notify_line(Outcome::RoutePaused, "o/r", false).is_none());
+        assert!(notify_line(Outcome::Error, "o/r", false).is_none());
     }
 }
