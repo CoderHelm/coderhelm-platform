@@ -489,6 +489,64 @@ pub async fn test_connection(
     }
 }
 
+/// AWS config with credentials for the team's CoderHelm role in `account`, in
+/// `region`. None when the team has no connection for that account.
+pub async fn assumed_config(
+    state: &AppState,
+    team_id: &str,
+    account: &str,
+    region: &str,
+    session: &str,
+) -> Result<Option<aws_config::SdkConfig>, StatusCode> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.aws_insights_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&format!("AWS_CONN#{account}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch AWS connection: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let Some(item) = item.item() else {
+        return Ok(None);
+    };
+    let field = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
+    let (Some(role_arn), Some(external_id)) = (field("role_arn"), field("external_id")) else {
+        return Ok(None);
+    };
+    let base = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let assumed = aws_sdk_sts::Client::new(&base)
+        .assume_role()
+        .role_arn(role_arn)
+        .role_session_name(session)
+        .external_id(external_id)
+        .duration_seconds(900)
+        .send()
+        .await
+        .map_err(|e| {
+            warn!("AssumeRole failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+    let creds = assumed
+        .credentials()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.to_string()))
+        .credentials_provider(aws_sdk_sts::config::Credentials::new(
+            creds.access_key_id(),
+            creds.secret_access_key(),
+            Some(creds.session_token().to_string()),
+            Some(std::time::SystemTime::now() + std::time::Duration::from_secs(900)),
+            "coderhelm-assumed",
+        ))
+        .load()
+        .await;
+    Ok(Some(config))
+}
+
 /// GET /api/aws-connections/:id/log-groups — discover log groups in customer account
 pub async fn discover_log_groups(
     State(state): State<Arc<AppState>>,

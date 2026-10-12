@@ -2,12 +2,13 @@
 //!
 //! A team subscribes CoderHelm's HTTPS endpoint to an SNS topic that carries
 //! its monitoring alerts (CloudWatch alarm notifications, AWS Chatbot custom
-//! notifications, EventBridge events, plain messages) and maps that topic to a
-//! repository with instructions on how to act. Each verified, actionable alert
-//! becomes a ticket run against that repository: CoderHelm analyzes it, makes
-//! the change the instructions call for, and opens a pull request. The PR goes
-//! through the normal review, and a CoderHelm-authored PR never merges without
-//! a person's approval.
+//! notifications, EventBridge events, plain messages) and adds rules to the
+//! topic's route: each rule names the alarms (or alert text) it takes, the
+//! repository to fix them in, and how to act. An alert a rule takes becomes a
+//! ticket run against that rule's repository: CoderHelm analyzes it, makes the
+//! change the instructions call for, and opens a pull request. Alerts no rule
+//! takes are only posted to Teams. The PR goes through the normal review, and a
+//! CoderHelm-authored PR never merges without a person's approval.
 //!
 //! Safety:
 //! - Every message must carry a valid SNS signature, and its topic must be
@@ -15,7 +16,7 @@
 //!   for it), so nobody can route someone else's alerts into their runs.
 //! - Alert text is treated as data, never as instructions: alerts often quote
 //!   attacker-controlled values (user agents, request paths).
-//! - Repeats of the same alert are collapsed, and each route has a daily cap.
+//! - Repeats of the same alert are collapsed, and each rule has a daily cap.
 
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
 use axum::{
@@ -37,15 +38,23 @@ use common::alert_notify;
 
 /// Same alert (same fingerprint) within this window is one alert.
 const REPEAT_WINDOW_SECS: u64 = 6 * 3600;
-/// Most alert runs one route may start per rolling day.
-const MAX_RUNS_PER_ROUTE_PER_DAY: u64 = 20;
+/// Most alert runs one rule may start per rolling day.
+const MAX_RUNS_PER_RULE_PER_DAY: u64 = 20;
 const DAY_SECS: u64 = 86_400;
 /// Route actions: open a pull request for the alert, or only post it to Teams.
 pub const ACTION_FIX: &str = "fix";
 pub const ACTION_NOTIFY: &str = "notify";
 
-/// Longest instructions a route may store.
+/// Longest instructions a rule may store.
 const MAX_INSTRUCTIONS: usize = 8_000;
+/// Most rules on one route.
+const MAX_RULES: usize = 20;
+/// Most alarms one rule may name, and match terms it may hold.
+const MAX_RULE_ALARMS: usize = 100;
+const MAX_RULE_TERMS: usize = 20;
+/// Id of the rule a route saved before rules existed becomes. Its daily cap
+/// keeps the counter it had as a route.
+const LEGACY_RULE_ID: &str = "default";
 /// Most alert text passed to a run.
 const MAX_ALERT_BODY: usize = 12_000;
 
@@ -281,6 +290,37 @@ pub fn route_matches(terms: &[String], alert: &Alert) -> bool {
     terms.iter().any(|t| hay.contains(t.as_str()))
 }
 
+/// One rule on a route: the alerts it takes open a pull request in `repo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    /// Stable within the route; keys the rule's daily run cap.
+    pub id: String,
+    /// CloudWatch alarm names this rule takes.
+    pub alarms: Vec<String>,
+    /// Or: alerts whose text contains any of these (case-insensitive).
+    pub terms: Vec<String>,
+    pub repo: String,
+    pub instructions: String,
+}
+
+/// Pure: the CloudWatch alarm an alert is about, when it is one.
+pub fn alarm_name(alert: &Alert) -> Option<&str> {
+    (alert.kind == "cloudwatch_alarm")
+        .then(|| alert.title.split_once(": ").map(|(_, n)| n))
+        .flatten()
+}
+
+/// Pure: the first rule that takes this alert. A rule naming no alarms and no
+/// terms takes every alert.
+pub fn pick_rule<'a>(rules: &'a [Rule], alert: &Alert) -> Option<&'a Rule> {
+    rules.iter().find(|r| {
+        let has_terms = r.terms.iter().any(|t| !t.trim().is_empty());
+        let by_alarm = alarm_name(alert).is_some_and(|n| r.alarms.iter().any(|a| a == n));
+        let by_terms = has_terms && route_matches(&r.terms, alert);
+        (r.alarms.is_empty() && !has_terms) || by_alarm || by_terms
+    })
+}
+
 /// Pure: the ticket a run receives. The alert is fenced and labelled as data;
 /// only the route's own instructions are instructions.
 pub fn ticket_body(topic_arn: &str, alert: &Alert, instructions: &str) -> String {
@@ -338,12 +378,9 @@ pub fn topic_account(topic_arn: &str) -> Option<&str> {
 #[derive(Debug, Clone)]
 struct Route {
     team_id: String,
-    /// `ACTION_FIX` opens a pull request; `ACTION_NOTIFY` only posts to Teams.
-    action: String,
-    /// Where fixes go. Empty on notify-only routes.
-    repo: String,
-    instructions: String,
-    match_terms: Vec<String>,
+    /// Alerts the first matching rule takes open a PR; the rest only post to
+    /// Teams. No rules = a notify-only route.
+    rules: Vec<Rule>,
     enabled: bool,
     /// Teams notifications: "team" (the team channel), "custom" or "off".
     notify_mode: String,
@@ -354,6 +391,40 @@ struct Route {
     post_recoveries: bool,
 }
 
+fn strings(v: Option<&AttributeValue>) -> Vec<String> {
+    v.and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
+        .unwrap_or_default()
+}
+
+fn rule_from_map(m: &HashMap<String, AttributeValue>) -> Option<Rule> {
+    let s = |k: &str| {
+        m.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let rule = Rule {
+        id: s("id"),
+        alarms: strings(m.get("alarms")),
+        terms: strings(m.get("terms")),
+        repo: s("repo"),
+        instructions: s("instructions"),
+    };
+    (!rule.id.is_empty() && !rule.repo.is_empty()).then_some(rule)
+}
+
+fn rule_to_attr(r: &Rule) -> AttributeValue {
+    let list = |v: &[String]| AttributeValue::L(v.iter().map(|x| attr_s(x)).collect());
+    AttributeValue::M(HashMap::from([
+        ("id".to_string(), attr_s(&r.id)),
+        ("alarms".to_string(), list(&r.alarms)),
+        ("terms".to_string(), list(&r.terms)),
+        ("repo".to_string(), attr_s(&r.repo)),
+        ("instructions".to_string(), attr_s(&r.instructions)),
+    ]))
+}
+
 fn route_from_item(item: &HashMap<String, AttributeValue>) -> Option<Route> {
     let s = |k: &str| {
         item.get(k)
@@ -362,25 +433,29 @@ fn route_from_item(item: &HashMap<String, AttributeValue>) -> Option<Route> {
             .unwrap_or_default()
     };
     let team_id = s("team_id");
-    let repo = s("repo");
-    let action = if s("action") == ACTION_NOTIFY {
-        ACTION_NOTIFY
-    } else {
-        ACTION_FIX
-    };
-    if team_id.is_empty() || (action == ACTION_FIX && repo.is_empty()) {
+    if team_id.is_empty() {
         return None;
     }
+    let rules = match item.get("rules").and_then(|v| v.as_l().ok()) {
+        Some(list) => list
+            .iter()
+            .filter_map(|r| r.as_m().ok())
+            .filter_map(rule_from_map)
+            .collect(),
+        // Saved before rules: the route's own repo and instructions are its
+        // one rule, and a notify route has none.
+        None if s("action") != ACTION_NOTIFY && !s("repo").is_empty() => vec![Rule {
+            id: LEGACY_RULE_ID.to_string(),
+            alarms: vec![],
+            terms: strings(item.get("match_terms")),
+            repo: s("repo"),
+            instructions: s("instructions"),
+        }],
+        None => vec![],
+    };
     Some(Route {
         team_id,
-        action: action.to_string(),
-        repo,
-        instructions: s("instructions"),
-        match_terms: item
-            .get("match_terms")
-            .and_then(|v| v.as_l().ok())
-            .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
-            .unwrap_or_default(),
+        rules,
         enabled: item
             .get("enabled")
             .and_then(|v| v.as_bool().ok())
@@ -541,13 +616,15 @@ async fn handle_notification(
 ) -> Result<StatusCode, StatusCode> {
     let alert = normalize(msg.subject.as_deref(), &msg.message);
     let tid = ticket_id(&alert.fingerprint);
-    let result = decide(state, msg, route, &alert, &tid).await;
+    let rule = pick_rule(&route.rules, &alert);
+    let result = decide(state, msg, route, rule, &alert, &tid).await;
     let outcome = match &result {
         Ok(o) => *o,
         Err(_) => Outcome::Error,
     };
-    record_event(state, msg, route, &alert, &tid, outcome).await;
-    notify_teams(state, msg, route, &alert, outcome).await;
+    let repo = rule.map(|r| r.repo.as_str()).unwrap_or("");
+    record_event(state, msg, route, repo, &alert, &tid, outcome).await;
+    notify_teams(state, msg, route, repo, &alert, outcome).await;
     result.map(|_| StatusCode::OK)
 }
 
@@ -565,8 +642,8 @@ pub fn notify_line(outcome: Outcome, repo: &str, post_recoveries: bool) -> Optio
         Outcome::NotAlarm => return None,
         Outcome::InFlight => "A CoderHelm run for this alert is already open.".to_string(),
         Outcome::Budget => "No fix started: the team's token limit was reached.".to_string(),
-        Outcome::DailyCap => "No fix started: this route reached its daily limit.".to_string(),
-        Outcome::Misconfigured => "No fix started: the route's repo is invalid.".to_string(),
+        Outcome::DailyCap => "No fix started: this rule reached its daily limit.".to_string(),
+        Outcome::Misconfigured => "No fix started: the rule's repo is invalid.".to_string(),
         Outcome::Duplicate | Outcome::RoutePaused | Outcome::Error => return None,
     })
 }
@@ -584,10 +661,11 @@ async fn notify_teams(
     state: &AppState,
     msg: &SnsMessage,
     route: &Route,
+    repo: &str,
     alert: &Alert,
     outcome: Outcome,
 ) {
-    let Some(line) = notify_line(outcome, &route.repo, route.post_recoveries) else {
+    let Some(line) = notify_line(outcome, repo, route.post_recoveries) else {
         return;
     };
     let team = team_notify_settings(state, &route.team_id).await;
@@ -670,6 +748,7 @@ async fn decide(
     state: &AppState,
     msg: &SnsMessage,
     route: &Route,
+    rule: Option<&Rule>,
     alert: &Alert,
     tid: &str,
 ) -> Result<Outcome, StatusCode> {
@@ -682,14 +761,14 @@ async fn decide(
         info!(topic, ticket = %tid, title = %alert.title, "Alert ignored — not an alarm state");
         return Ok(Outcome::NotAlarm);
     }
-    if route.action == ACTION_NOTIFY {
-        info!(topic, ticket = %tid, title = %alert.title, "Alert posted — route only notifies");
-        return Ok(Outcome::Notified);
-    }
-    if !route_matches(&route.match_terms, alert) {
-        info!(topic, ticket = %tid, title = %alert.title, "Alert ignored — no match term");
+    let Some(rule) = rule else {
+        if route.rules.is_empty() {
+            info!(topic, ticket = %tid, title = %alert.title, "Alert posted — route only notifies");
+            return Ok(Outcome::Notified);
+        }
+        info!(topic, ticket = %tid, title = %alert.title, "Alert posted — no rule takes it");
         return Ok(Outcome::NoMatch);
-    }
+    };
 
     let table = &state.config.settings_table_name;
     // SNS retries deliveries and alarms re-notify: one alert, one run.
@@ -707,7 +786,7 @@ async fn decide(
         return Ok(Outcome::Duplicate);
     }
 
-    let started = start_run(state, msg, route, alert, tid).await;
+    let started = start_run(state, msg, route, rule, alert, tid).await;
     if !matches!(started, Ok(Outcome::RunStarted)) {
         // Nothing was enqueued: let the next delivery of this alert (an SNS
         // retry or the alarm re-notifying) try again.
@@ -720,6 +799,7 @@ async fn start_run(
     state: &AppState,
     msg: &SnsMessage,
     route: &Route,
+    rule: &Rule,
     alert: &Alert,
     tid: &str,
 ) -> Result<Outcome, StatusCode> {
@@ -728,8 +808,8 @@ async fn start_run(
         warn!(topic, ticket = %tid, reason = %reason, "Alert ignored — token budget reached");
         return Ok(Outcome::Budget);
     }
-    if !take_daily_slot(state, &route.team_id, topic).await {
-        warn!(topic, ticket = %tid, "Alert ignored — route reached its daily run cap");
+    if !take_daily_slot(state, &route.team_id, topic, &rule.id).await {
+        warn!(topic, ticket = %tid, rule = %rule.id, "Alert ignored — rule reached its daily run cap");
         return Ok(Outcome::DailyCap);
     }
 
@@ -750,8 +830,8 @@ async fn start_run(
         }
     }
 
-    let Some((owner, name)) = route.repo.split_once('/') else {
-        error!(topic, repo = %route.repo, "Alert route has a malformed repo");
+    let Some((owner, name)) = rule.repo.split_once('/') else {
+        error!(topic, repo = %rule.repo, "Alert rule has a malformed repo");
         return Ok(Outcome::Misconfigured);
     };
     let installation_id = super::api::get_team_installation_id(state, &route.team_id).await?;
@@ -780,7 +860,7 @@ async fn start_run(
         source: TicketSource::Alert,
         ticket_id: tid.to_string(),
         title: common::truncate_str(&alert.title, 200).to_string(),
-        body: ticket_body(topic, alert, &route.instructions),
+        body: ticket_body(topic, alert, &rule.instructions),
         repo_owner: owner.to_string(),
         repo_name: name.to_string(),
         issue_number: 0,
@@ -803,7 +883,8 @@ async fn start_run(
         topic,
         ticket = %tid,
         kind = alert.kind,
-        repo = %route.repo,
+        repo = %rule.repo,
+        rule = %rule.id,
         title = %alert.title,
         "Alert → run enqueued"
     );
@@ -816,6 +897,7 @@ async fn record_event(
     state: &AppState,
     msg: &SnsMessage,
     route: &Route,
+    repo: &str,
     alert: &Alert,
     tid: &str,
     outcome: Outcome,
@@ -836,7 +918,7 @@ async fn record_event(
         .item("id", attr_s(&id))
         .item("received_at", attr_s(&received_at))
         .item("topic_arn", attr_s(&msg.topic_arn))
-        .item("repo", attr_s(&route.repo))
+        .item("repo", attr_s(repo))
         .item("kind", attr_s(alert.kind))
         .item("title", attr_s(common::truncate_str(&alert.title, 300)))
         .item(
@@ -853,11 +935,15 @@ async fn record_event(
     }
 }
 
-/// Count one run against the route's rolling daily cap. Fails closed: when the
+/// Count one run against the rule's rolling daily cap. Fails closed: when the
 /// cap can't be confirmed, no run starts.
-async fn take_daily_slot(state: &AppState, team_id: &str, topic_arn: &str) -> bool {
+async fn take_daily_slot(state: &AppState, team_id: &str, topic_arn: &str, rule_id: &str) -> bool {
     let now = chrono::Utc::now().timestamp().max(0) as u64;
-    let sk = format!("ALERTRUNS#{topic_arn}");
+    let sk = if rule_id == LEGACY_RULE_ID {
+        format!("ALERTRUNS#{topic_arn}")
+    } else {
+        format!("ALERTRUNS#{topic_arn}#{rule_id}")
+    };
     let table = &state.config.settings_table_name;
     let counted = state
         .dynamo
@@ -869,7 +955,7 @@ async fn take_daily_slot(state: &AppState, team_id: &str, topic_arn: &str) -> bo
         .condition_expression("(attribute_not_exists(runs) OR runs < :max) AND (attribute_not_exists(#ttl) OR #ttl >= :now)")
         .expression_attribute_names("#ttl", "ttl")
         .expression_attribute_values(":one", AttributeValue::N("1".into()))
-        .expression_attribute_values(":max", AttributeValue::N(MAX_RUNS_PER_ROUTE_PER_DAY.to_string()))
+        .expression_attribute_values(":max", AttributeValue::N(MAX_RUNS_PER_RULE_PER_DAY.to_string()))
         .expression_attribute_values(":ttl", AttributeValue::N((now + DAY_SECS).to_string()))
         .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
         .send()
@@ -924,10 +1010,14 @@ pub async fn list_routes(
             let topic = it.get("topic_arn").and_then(|v| v.as_s().ok()).cloned()?;
             Some(json!({
                 "topic_arn": topic,
-                "action": r.action,
-                "repo": r.repo,
-                "instructions": r.instructions,
-                "match_terms": r.match_terms,
+                "action": if r.rules.is_empty() { ACTION_NOTIFY } else { ACTION_FIX },
+                "rules": r.rules.iter().map(|x| json!({
+                    "id": x.id,
+                    "alarms": x.alarms,
+                    "terms": x.terms,
+                    "repo": x.repo,
+                    "instructions": x.instructions,
+                })).collect::<Vec<_>>(),
                 "enabled": r.enabled,
                 "notify_mode": r.notify_mode,
                 "teams_webhook_url": r.teams_webhook_url,
@@ -941,9 +1031,28 @@ pub async fn list_routes(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, Default)]
+pub struct RuleRequest {
+    /// Kept from a saved rule so its daily cap carries over; new rules get one.
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    alarms: Vec<String>,
+    #[serde(default)]
+    terms: Vec<String>,
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    instructions: String,
+}
+
+#[derive(Deserialize, Default)]
 pub struct PutRouteRequest {
     topic_arn: String,
+    /// The route's rules. When absent, `action`, `repo`, `instructions` and
+    /// `match_terms` describe a single rule (or none, for "notify").
+    #[serde(default)]
+    rules: Option<Vec<RuleRequest>>,
     /// "fix" (default) or "notify".
     #[serde(default)]
     action: String,
@@ -974,6 +1083,72 @@ fn notify_mode_of(req: &PutRouteRequest) -> Option<&'static str> {
     }
 }
 
+fn valid_repo(repo: &str) -> bool {
+    repo.split_once('/')
+        .is_some_and(|(o, n)| !o.is_empty() && !n.is_empty() && !n.contains('/'))
+}
+
+fn valid_rule_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 40 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Pure: the rules a request saves, cleaned and checked. Err = bad request.
+pub fn rules_from_request(req: &PutRouteRequest) -> Result<Vec<Rule>, StatusCode> {
+    let requested = match &req.rules {
+        Some(rules) => rules.clone(),
+        None => match req.action.trim() {
+            ACTION_NOTIFY => vec![],
+            "" | ACTION_FIX => vec![RuleRequest {
+                id: LEGACY_RULE_ID.to_string(),
+                alarms: vec![],
+                terms: req.match_terms.clone(),
+                repo: req.repo.clone(),
+                instructions: req.instructions.clone(),
+            }],
+            _ => return Err(StatusCode::BAD_REQUEST),
+        },
+    };
+    if requested.len() > MAX_RULES {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut seen = std::collections::HashSet::new();
+    requested
+        .into_iter()
+        .map(|r| {
+            let clean = |v: &[String], max: usize| -> Result<Vec<String>, StatusCode> {
+                let mut out: Vec<String> = Vec::new();
+                for x in v.iter().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+                    if x.len() > 255 {
+                        return Err(StatusCode::BAD_REQUEST);
+                    }
+                    if !out.iter().any(|y| y == x) {
+                        out.push(x.to_string());
+                    }
+                }
+                if out.len() > max {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                Ok(out)
+            };
+            let repo = r.repo.trim().to_string();
+            if !valid_repo(&repo) || r.instructions.len() > MAX_INSTRUCTIONS {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            let id = Some(r.id.trim().to_string())
+                .filter(|id| valid_rule_id(id) && !seen.contains(id))
+                .unwrap_or_else(|| ulid::Ulid::new().to_string().to_lowercase());
+            seen.insert(id.clone());
+            Ok(Rule {
+                id,
+                alarms: clean(&r.alarms, MAX_RULE_ALARMS)?,
+                terms: clean(&r.terms, MAX_RULE_TERMS)?,
+                repo,
+                instructions: r.instructions,
+            })
+        })
+        .collect()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -987,20 +1162,8 @@ pub async fn put_route(
     claims.require_role(3)?;
     let topic = req.topic_arn.trim();
     let account = topic_account(topic).ok_or(StatusCode::BAD_REQUEST)?;
-    let action = match req.action.trim() {
-        "" | ACTION_FIX => ACTION_FIX,
-        ACTION_NOTIFY => ACTION_NOTIFY,
-        _ => return Err(StatusCode::BAD_REQUEST),
-    };
-    let repo = req.repo.trim();
-    let valid_repo = repo
-        .split_once('/')
-        .is_some_and(|(o, n)| !o.is_empty() && !n.is_empty() && !n.contains('/'));
-    let repo_ok = valid_repo || (action == ACTION_NOTIFY && repo.is_empty());
-    if !repo_ok || req.instructions.len() > MAX_INSTRUCTIONS {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    if action == ACTION_NOTIFY && notify_mode_of(&req) == Some(alert_notify::MODE_OFF) {
+    let rules = rules_from_request(&req)?;
+    if rules.is_empty() && notify_mode_of(&req) == Some(alert_notify::MODE_OFF) {
         // A route that neither fixes nor notifies would do nothing.
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -1030,14 +1193,7 @@ pub async fn put_route(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let terms: Vec<AttributeValue> = req
-        .match_terms
-        .iter()
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .take(20)
-        .map(attr_s)
-        .collect();
+    let rules_attr = AttributeValue::L(rules.iter().map(rule_to_attr).collect());
     let now = chrono::Utc::now().to_rfc3339();
     let fields = |pk: &str, sk: &str| {
         let mut b = Put::builder()
@@ -1046,10 +1202,7 @@ pub async fn put_route(
             .item("sk", attr_s(sk))
             .item("team_id", attr_s(&claims.team_id))
             .item("topic_arn", attr_s(topic))
-            .item("action", attr_s(action))
-            .item("repo", attr_s(repo))
-            .item("instructions", attr_s(&req.instructions))
-            .item("match_terms", AttributeValue::L(terms.clone()))
+            .item("rules", rules_attr.clone())
             .item("enabled", AttributeValue::Bool(req.enabled))
             .item("notify_mode", attr_s(notify_mode))
             .item("teams_webhook_url", attr_s(route_webhook))
@@ -1085,13 +1238,94 @@ pub async fn put_route(
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         })?;
-    info!(team_id = %claims.team_id, topic, action, repo, enabled = req.enabled, "Alert route saved");
+    info!(team_id = %claims.team_id, topic, rules = rules.len(), enabled = req.enabled, "Alert route saved");
     Ok(Json(json!({ "ok": true, "endpoint_path": ENDPOINT_PATH })))
 }
 
 #[derive(Deserialize)]
 pub struct DeleteRouteQuery {
     topic_arn: String,
+}
+
+/// GET /api/alert-routes/alarms?topic_arn=… — the CloudWatch alarms whose
+/// ALARM action publishes to the topic, read through the team's AWS
+/// connection for the topic's account. A missing permission or connection is
+/// reported in `error`, not as a failure, so the page can say what to fix.
+pub async fn list_topic_alarms(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<DeleteRouteQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?;
+    let topic = q.topic_arn.trim();
+    let account = topic_account(topic).ok_or(StatusCode::BAD_REQUEST)?;
+    let region = topic.split(':').nth(3).unwrap_or("us-east-1");
+    let Some(config) = super::log_analyzer::assumed_config(
+        &state,
+        &claims.team_id,
+        account,
+        region,
+        "coderhelm-alarms",
+    )
+    .await?
+    else {
+        return Ok(Json(json!({ "alarms": [], "error": "not_connected" })));
+    };
+    let cw = aws_sdk_cloudwatch::Client::new(&config);
+    let mut alarms: Vec<Value> = Vec::new();
+    let mut next: Option<String> = None;
+    loop {
+        let out = cw
+            .describe_alarms()
+            .action_prefix(topic)
+            .alarm_types(aws_sdk_cloudwatch::types::AlarmType::MetricAlarm)
+            .alarm_types(aws_sdk_cloudwatch::types::AlarmType::CompositeAlarm)
+            .max_records(100)
+            .set_next_token(next.take())
+            .send()
+            .await;
+        let out = match out {
+            Ok(o) => o,
+            Err(e) => {
+                let denied = format!("{e:?}").contains("AccessDenied");
+                warn!(topic, error = %e, "Could not list the topic's alarms");
+                let error = if denied { "permission" } else { "unavailable" };
+                return Ok(Json(json!({ "alarms": [], "error": error })));
+            }
+        };
+        // The prefix also matches longer topic names; keep exact targets.
+        let targets = |actions: &[String]| actions.iter().any(|a| a == topic);
+        for a in out
+            .metric_alarms()
+            .iter()
+            .filter(|a| targets(a.alarm_actions()))
+        {
+            alarms.push(json!({
+                "name": a.alarm_name(),
+                "state": a.state_value().map(|s| s.as_str()),
+                "description": a.alarm_description(),
+                "metric": a.metric_name(),
+            }));
+        }
+        for a in out
+            .composite_alarms()
+            .iter()
+            .filter(|a| targets(a.alarm_actions()))
+        {
+            alarms.push(json!({
+                "name": a.alarm_name(),
+                "state": a.state_value().map(|s| s.as_str()),
+                "description": a.alarm_description(),
+                "metric": null,
+            }));
+        }
+        next = out.next_token().map(str::to_string);
+        if next.is_none() || alarms.len() >= 1000 {
+            break;
+        }
+    }
+    alarms.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(Json(json!({ "alarms": alarms })))
 }
 
 /// DELETE /api/alert-routes?topic_arn=… (admin+).
@@ -1358,6 +1592,111 @@ pub async fn get_event(
 mod tests {
     use super::*;
 
+    fn alarm(name: &str) -> Alert {
+        Alert {
+            kind: "cloudwatch_alarm",
+            title: format!("ALARM: {name}"),
+            body: String::new(),
+            fingerprint: name.to_string(),
+            actionable: true,
+        }
+    }
+
+    fn rule(id: &str, alarms: &[&str], terms: &[&str], repo: &str) -> Rule {
+        Rule {
+            id: id.to_string(),
+            alarms: alarms.iter().map(|s| s.to_string()).collect(),
+            terms: terms.iter().map(|s| s.to_string()).collect(),
+            repo: repo.to_string(),
+            instructions: String::new(),
+        }
+    }
+
+    #[test]
+    fn first_rule_naming_the_alarm_or_its_text_wins() {
+        let rules = vec![
+            rule("waf", &[], &["crawler TLS fingerprint"], "o/infra"),
+            rule("redis", &["prod-gangway-redis-memory"], &[], "o/infra"),
+            rule("web", &["prod-speedboat-graphql-502"], &[], "o/web"),
+        ];
+        let pick = |a: &Alert| pick_rule(&rules, a).map(|r| r.id.as_str());
+        assert_eq!(pick(&alarm("prod-gangway-redis-memory")), Some("redis"));
+        assert_eq!(pick(&alarm("prod-speedboat-graphql-502")), Some("web"));
+        assert_eq!(pick(&alarm("prod-gangway-db-cpu-utilization")), None);
+        let mut fp = alarm("x");
+        fp.kind = "chatbot_custom";
+        fp.title = "New crawler TLS fingerprint".into();
+        assert_eq!(pick(&fp), Some("waf"));
+        // Alarm names match exactly, not by prefix.
+        assert_eq!(pick(&alarm("prod-gangway-redis-memory-2")), None);
+        // A rule naming nothing takes everything, in order.
+        let all = vec![rule("all", &[], &[], "o/r")];
+        assert_eq!(
+            pick_rule(&all, &alarm("anything")).map(|r| r.id.as_str()),
+            Some("all")
+        );
+    }
+
+    #[test]
+    fn request_rules_are_cleaned_and_legacy_fields_become_one_rule() {
+        let req = PutRouteRequest {
+            topic_arn: "arn:aws:sns:us-east-1:123456789012:t".into(),
+            rules: Some(vec![
+                RuleRequest {
+                    id: "keep-me".into(),
+                    alarms: vec![" a ".into(), "a".into(), "".into()],
+                    repo: "o/r".into(),
+                    ..Default::default()
+                },
+                RuleRequest {
+                    id: "keep-me".into(),
+                    repo: "o/r2".into(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let rules = rules_from_request(&req).unwrap();
+        assert_eq!(rules[0].id, "keep-me");
+        assert_eq!(rules[0].alarms, vec!["a"]);
+        // A duplicate id gets a fresh one so caps stay separate.
+        assert_ne!(rules[1].id, "keep-me");
+        let bad = PutRouteRequest {
+            rules: Some(vec![RuleRequest {
+                repo: "not-a-repo".into(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert!(rules_from_request(&bad).is_err());
+        let legacy = PutRouteRequest {
+            repo: "o/r".into(),
+            match_terms: vec!["fingerprint".into()],
+            ..Default::default()
+        };
+        let rules = rules_from_request(&legacy).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, LEGACY_RULE_ID);
+        assert_eq!(rules[0].terms, vec!["fingerprint"]);
+        let notify = PutRouteRequest {
+            action: "notify".into(),
+            ..Default::default()
+        };
+        assert!(rules_from_request(&notify).unwrap().is_empty());
+    }
+
+    #[test]
+    fn saved_rules_round_trip_through_dynamo() {
+        let r = rule("r1", &["a", "b"], &["t"], "o/r");
+        let mut item = HashMap::new();
+        item.insert("team_id".to_string(), attr_s("TEAM#t"));
+        item.insert(
+            "rules".to_string(),
+            AttributeValue::L(vec![rule_to_attr(&r)]),
+        );
+        assert_eq!(route_from_item(&item).unwrap().rules, vec![r]);
+    }
+
     fn route_item(action: Option<&str>, repo: &str) -> HashMap<String, AttributeValue> {
         let mut m = HashMap::new();
         m.insert("team_id".to_string(), attr_s("TEAM#t"));
@@ -1383,14 +1722,20 @@ mod tests {
     }
 
     #[test]
-    fn notify_only_routes_need_no_repo() {
+    fn routes_saved_before_rules_keep_working() {
+        // Notify-only: no rules.
         let r = route_from_item(&route_item(Some(ACTION_NOTIFY), "")).unwrap();
-        assert_eq!(r.action, ACTION_NOTIFY);
-        // Routes saved before the action existed keep opening PRs.
+        assert!(r.rules.is_empty());
+        // A fix route: its repo becomes the one legacy rule.
         let r = route_from_item(&route_item(None, "o/r")).unwrap();
-        assert_eq!(r.action, ACTION_FIX);
-        assert!(route_from_item(&route_item(None, "")).is_none());
-        assert!(route_from_item(&route_item(Some(ACTION_FIX), "")).is_none());
+        assert_eq!(r.rules.len(), 1);
+        assert_eq!(r.rules[0].id, LEGACY_RULE_ID);
+        assert_eq!(r.rules[0].repo, "o/r");
+        // A fix route without a repo has nothing to fix in: notify only.
+        assert!(route_from_item(&route_item(None, ""))
+            .unwrap()
+            .rules
+            .is_empty());
     }
 
     #[test]
