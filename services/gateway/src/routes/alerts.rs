@@ -17,8 +17,8 @@
 //! - Alert text is treated as data, never as instructions: alerts often quote
 //!   attacker-controlled values (user agents, request paths).
 //! - Repeats of the same alert are collapsed, each rule has a daily run cap,
-//!   and alert runs stop for the day once their spend reaches the team's
-//!   alert budget.
+//!   and alert runs stop for the day once their tokens reach the team's daily
+//!   alert token budget.
 
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
 use axum::{
@@ -42,13 +42,16 @@ use common::alert_notify;
 const REPEAT_WINDOW_SECS: u64 = 6 * 3600;
 /// Most alert runs one rule may start per rolling day.
 const MAX_RUNS_PER_RULE_PER_DAY: u64 = 5;
-/// Team setting: most USD alert runs may spend per rolling day.
+/// Team setting: most tokens alert runs may use per rolling day, counted like
+/// the team's monthly token limit (input + output).
 const BUDGET_SK: &str = "ALERT_BUDGET";
-/// Daily alert budget when a team hasn't set one.
-pub const DEFAULT_DAILY_BUDGET_USD: f64 = 25.0;
-/// What an alert run still in progress is assumed to cost, since its cost is
-/// only recorded when it finishes.
-const OPEN_RUN_RESERVE_USD: f64 = 5.0;
+/// Daily alert token budget when a team hasn't set one.
+pub const DEFAULT_DAILY_TOKENS: u64 = 500_000;
+/// Most a team may set.
+const MAX_DAILY_TOKENS: u64 = 100_000_000;
+/// Tokens an alert run still in progress is assumed to use, since its usage is
+/// only recorded when it finishes (about the 90th percentile of a run).
+const OPEN_RUN_RESERVE_TOKENS: u64 = 50_000;
 const DAY_SECS: u64 = 86_400;
 /// Route actions: open a pull request for the alert, or only post it to Teams.
 pub const ACTION_FIX: &str = "fix";
@@ -655,7 +658,7 @@ pub fn notify_line(outcome: Outcome, repo: &str, post_recoveries: bool) -> Optio
         Outcome::InFlight => "A CoderHelm run for this alert is already open.".to_string(),
         Outcome::Budget => "No fix started: the team's token limit was reached.".to_string(),
         Outcome::AlertBudget => {
-            "No fix started: today's alert spending limit was reached.".to_string()
+            "No fix started: today's alert token budget was reached.".to_string()
         }
         Outcome::DailyCap => "No fix started: this rule reached its daily limit.".to_string(),
         Outcome::Misconfigured => "No fix started: the rule's repo is invalid.".to_string(),
@@ -823,17 +826,17 @@ async fn start_run(
         warn!(topic, ticket = %tid, reason = %reason, "Alert ignored — token budget reached");
         return Ok(Outcome::Budget);
     }
-    match alert_spend_24h(state, &route.team_id).await {
-        Some((spent, open)) => {
+    match alert_tokens_24h(state, &route.team_id).await {
+        Some((used, open)) => {
             let budget = daily_budget(state, &route.team_id).await;
-            if !within_budget(spent, open, budget) {
-                warn!(topic, ticket = %tid, spent, open, budget, "Alert ignored — daily alert budget reached");
+            if !within_budget(used, open, budget) {
+                warn!(topic, ticket = %tid, used, open, budget, "Alert ignored — daily alert token budget reached");
                 return Ok(Outcome::AlertBudget);
             }
         }
         None => {
-            // Fail closed: when today's spend can't be read, no run starts.
-            warn!(topic, ticket = %tid, "Alert ignored — could not read today's alert spend");
+            // Fail closed: when today's usage can't be read, no run starts.
+            warn!(topic, ticket = %tid, "Alert ignored — could not read today's alert token usage");
             return Ok(Outcome::AlertBudget);
         }
     }
@@ -964,14 +967,14 @@ async fn record_event(
     }
 }
 
-/// Pure: may another alert run start? Spent dollars plus a reserve for each
-/// run still in progress must stay under the budget.
-pub fn within_budget(spent_usd: f64, open_runs: u32, budget_usd: f64) -> bool {
-    spent_usd + f64::from(open_runs) * OPEN_RUN_RESERVE_USD < budget_usd
+/// Pure: may another alert run start? Tokens used plus a reserve for each run
+/// still in progress must stay under the budget.
+pub fn within_budget(used_tokens: u64, open_runs: u32, budget_tokens: u64) -> bool {
+    used_tokens.saturating_add(u64::from(open_runs) * OPEN_RUN_RESERVE_TOKENS) < budget_tokens
 }
 
-/// The team's daily alert budget in USD.
-async fn daily_budget(state: &AppState, team_id: &str) -> f64 {
+/// The team's daily alert token budget.
+async fn daily_budget(state: &AppState, team_id: &str) -> u64 {
     state
         .dynamo
         .get_item()
@@ -982,19 +985,18 @@ async fn daily_budget(state: &AppState, team_id: &str) -> f64 {
         .await
         .ok()
         .and_then(|o| o.item().cloned())
-        .and_then(|i| i.get("daily_usd").and_then(|v| v.as_n().ok()).cloned())
-        .and_then(|n| n.parse::<f64>().ok())
-        .filter(|b| b.is_finite() && *b >= 0.0)
-        .unwrap_or(DEFAULT_DAILY_BUDGET_USD)
+        .and_then(|i| i.get("daily_tokens").and_then(|v| v.as_n().ok()).cloned())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DAILY_TOKENS)
 }
 
-/// What the team's alert runs cost in the last 24 hours, and how many are
-/// still in progress. Run ids are ULIDs, so the window is a key range. None
-/// when the runs can't be read.
-async fn alert_spend_24h(state: &AppState, team_id: &str) -> Option<(f64, u32)> {
+/// Tokens the team's alert runs used in the last 24 hours (input + output), and
+/// how many runs are still in progress. Run ids are ULIDs, so the window is a
+/// key range. None when the runs can't be read.
+async fn alert_tokens_24h(state: &AppState, team_id: &str) -> Option<(u64, u32)> {
     let since_ms = (chrono::Utc::now().timestamp_millis() - 86_400_000).max(0) as u64;
     let from = ulid::Ulid::from_parts(since_ms, 0).to_string();
-    let mut spent = 0.0;
+    let mut used = 0u64;
     let mut open = 0u32;
     let mut start: Option<HashMap<String, AttributeValue>> = None;
     loop {
@@ -1007,24 +1009,25 @@ async fn alert_spend_24h(state: &AppState, team_id: &str) -> Option<(f64, u32)> 
             .expression_attribute_values(":t", attr_s(team_id))
             .expression_attribute_values(":from", attr_s(&from))
             .expression_attribute_values(":alert", attr_s("ALERT-"))
-            .projection_expression("cost_usd, #s")
+            .projection_expression("tokens_in, tokens_out, #s")
             .expression_attribute_names("#s", "status")
             .set_exclusive_start_key(start.take())
             .send()
             .await
-            .map_err(|e| error!(error = %e, "Could not read alert run spend"))
+            .map_err(|e| error!(error = %e, "Could not read alert run token usage"))
             .ok()?;
         for item in out.items() {
-            let cost = item
-                .get("cost_usd")
-                .and_then(|v| v.as_n().ok())
-                .and_then(|n| n.parse::<f64>().ok())
-                .unwrap_or(0.0);
+            let n = |k: &str| {
+                item.get(k)
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
             let status = item
                 .get("status")
                 .and_then(|v| v.as_s().ok())
                 .map(String::as_str);
-            spent += cost;
+            used = used.saturating_add(n("tokens_in") + n("tokens_out"));
             if matches!(status, Some("pending" | "queued" | "running")) {
                 open += 1;
             }
@@ -1034,7 +1037,7 @@ async fn alert_spend_24h(state: &AppState, team_id: &str) -> Option<(f64, u32)> 
             _ => break,
         }
     }
-    Some((spent, open))
+    Some((used, open))
 }
 
 /// Count one run against the rule's rolling daily cap. Fails closed: when the
@@ -1356,10 +1359,53 @@ pub struct DeleteRouteQuery {
     topic_arn: String,
 }
 
+/// Titles of alerts on the topic that aren't CloudWatch alarms (custom
+/// notifications, events, plain messages), from the alerts CoderHelm has
+/// received. These have no alarm to pick, so rules match them by text.
+async fn seen_message_titles(state: &AppState, team_id: &str, topic: &str) -> Vec<String> {
+    let mut titles: Vec<String> = Vec::new();
+    let mut start: Option<HashMap<String, AttributeValue>> = None;
+    loop {
+        let Ok(out) = state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .filter_expression("topic_arn = :topic AND kind <> :cw")
+            .expression_attribute_values(":pk", attr_s(team_id))
+            .expression_attribute_values(":p", attr_s("ALERT_EVENT#"))
+            .expression_attribute_values(":topic", attr_s(topic))
+            .expression_attribute_values(":cw", attr_s("cloudwatch_alarm"))
+            .projection_expression("title")
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+        else {
+            break;
+        };
+        for t in out
+            .items()
+            .iter()
+            .filter_map(|i| i.get("title")?.as_s().ok())
+        {
+            if !titles.contains(t) && titles.len() < 50 {
+                titles.push(t.clone());
+            }
+        }
+        match out.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    titles.sort();
+    titles
+}
+
 /// GET /api/alert-routes/alarms?topic_arn=… — the CloudWatch alarms whose
 /// ALARM action publishes to the topic, read through the team's AWS
-/// connection for the topic's account. A missing permission or connection is
-/// reported in `error`, not as a failure, so the page can say what to fix.
+/// connection for the topic's account, plus the titles of other alerts seen
+/// on the topic. A missing permission or connection is reported in `error`,
+/// not as a failure, so the page can say what to fix.
 pub async fn list_topic_alarms(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -1369,6 +1415,7 @@ pub async fn list_topic_alarms(
     let topic = q.topic_arn.trim();
     let account = topic_account(topic).ok_or(StatusCode::BAD_REQUEST)?;
     let region = topic.split(':').nth(3).unwrap_or("us-east-1");
+    let messages = seen_message_titles(&state, &claims.team_id, topic).await;
     let Some(config) = super::log_analyzer::assumed_config(
         &state,
         &claims.team_id,
@@ -1378,7 +1425,9 @@ pub async fn list_topic_alarms(
     )
     .await?
     else {
-        return Ok(Json(json!({ "alarms": [], "error": "not_connected" })));
+        return Ok(Json(
+            json!({ "alarms": [], "messages": messages, "error": "not_connected" }),
+        ));
     };
     let cw = aws_sdk_cloudwatch::Client::new(&config);
     let mut alarms: Vec<Value> = Vec::new();
@@ -1399,7 +1448,9 @@ pub async fn list_topic_alarms(
                 let denied = format!("{e:?}").contains("AccessDenied");
                 warn!(topic, error = %e, "Could not list the topic's alarms");
                 let error = if denied { "permission" } else { "unavailable" };
-                return Ok(Json(json!({ "alarms": [], "error": error })));
+                return Ok(Json(
+                    json!({ "alarms": [], "messages": messages, "error": error }),
+                ));
             }
         };
         // The prefix also matches longer topic names; keep exact targets.
@@ -1434,7 +1485,7 @@ pub async fn list_topic_alarms(
         }
     }
     alarms.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    Ok(Json(json!({ "alarms": alarms })))
+    Ok(Json(json!({ "alarms": alarms, "messages": messages })))
 }
 
 /// DELETE /api/alert-routes?topic_arn=… (admin+).
@@ -1528,30 +1579,32 @@ pub async fn put_notify(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// GET /api/alert-budget — the team's daily alert budget and today's spend (admin+).
+/// GET /api/alert-budget — the team's daily alert token budget and the last
+/// 24 hours' usage (admin+).
 pub async fn get_budget(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(3)?;
     let budget = daily_budget(&state, &claims.team_id).await;
-    let (spent, open) = alert_spend_24h(&state, &claims.team_id)
+    let (used, open) = alert_tokens_24h(&state, &claims.team_id)
         .await
-        .unwrap_or((0.0, 0));
+        .unwrap_or((0, 0));
     Ok(Json(json!({
-        "daily_usd": budget,
-        "spent_24h_usd": (spent * 100.0).round() / 100.0,
+        "daily_tokens": budget,
+        "used_24h_tokens": used,
         "open_runs": open,
+        "open_run_reserve_tokens": OPEN_RUN_RESERVE_TOKENS,
         "max_runs_per_rule_per_day": MAX_RUNS_PER_RULE_PER_DAY,
     })))
 }
 
 #[derive(Deserialize)]
 pub struct PutBudgetRequest {
-    daily_usd: f64,
+    daily_tokens: u64,
 }
 
-/// PUT /api/alert-budget — set the team's daily alert budget in USD; 0 stops
+/// PUT /api/alert-budget — set the team's daily alert token budget; 0 stops
 /// every alert run (admin+).
 pub async fn put_budget(
     State(state): State<Arc<AppState>>,
@@ -1559,7 +1612,7 @@ pub async fn put_budget(
     Json(req): Json<PutBudgetRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(3)?;
-    if !req.daily_usd.is_finite() || !(0.0..=10_000.0).contains(&req.daily_usd) {
+    if req.daily_tokens > MAX_DAILY_TOKENS {
         return Err(StatusCode::BAD_REQUEST);
     }
     state
@@ -1569,8 +1622,8 @@ pub async fn put_budget(
         .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(BUDGET_SK))
         .item(
-            "daily_usd",
-            AttributeValue::N(format!("{:.2}", req.daily_usd)),
+            "daily_tokens",
+            AttributeValue::N(req.daily_tokens.to_string()),
         )
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
         .item("updated_by", attr_s(&claims.email))
@@ -1580,7 +1633,7 @@ pub async fn put_budget(
             error!(error = %e, "Could not save alert budget");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    info!(team_id = %claims.team_id, daily_usd = req.daily_usd, "Alert budget saved");
+    info!(team_id = %claims.team_id, daily_tokens = req.daily_tokens, "Alert token budget saved");
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1900,13 +1953,13 @@ mod tests {
 
     #[test]
     fn alert_runs_stop_at_the_budget_counting_open_runs() {
-        assert!(within_budget(0.0, 0, 25.0));
-        assert!(within_budget(14.0, 2, 25.0));
-        // 14 spent + 2 open runs reserved at 5 each = 24; a third open run tips it.
-        assert!(!within_budget(14.0, 3, 25.0));
-        assert!(!within_budget(25.0, 0, 25.0));
+        assert!(within_budget(0, 0, 500_000));
+        // 380k used + 2 open runs reserved at 50k each = 480k; a third tips it.
+        assert!(within_budget(380_000, 2, 500_000));
+        assert!(!within_budget(380_000, 3, 500_000));
+        assert!(!within_budget(500_000, 0, 500_000));
         // A zero budget stops every run.
-        assert!(!within_budget(0.0, 0, 0.0));
+        assert!(!within_budget(0, 0, 0));
     }
 
     #[test]
