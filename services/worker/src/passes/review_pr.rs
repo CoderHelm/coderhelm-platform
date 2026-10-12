@@ -692,7 +692,7 @@ pub async fn run(
     // commit pushed seconds before this one started may not have been the PR's
     // head yet when the check above ran. Posting now would put a verdict on code
     // that's already replaced — and if the newer commit's review finished first,
-    // overturn it (speedboat#1322: APPROVE on the head, then REQUEST_CHANGES on
+    // overturn it (APPROVE on the head, then REQUEST_CHANGES on
     // the commit before it).
     if let Ok(latest) = github
         .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
@@ -1382,7 +1382,7 @@ mod superseded_tests {
 
     #[test]
     fn only_a_verdict_for_an_older_commit_is_superseded() {
-        // speedboat#1322: b20e26f's review must not post once cc15ab8 is the head.
+        // b20e26f's review must not post once cc15ab8 is the head.
         assert!(superseded(&msg("b20e26f", None), "cc15ab8"));
         assert!(!superseded(&msg("cc15ab8", None), "cc15ab8"));
         // A question is answered whatever the head; an empty head_sha targets the latest.
@@ -1400,7 +1400,7 @@ mod verdict_tests {
     #[test]
     fn approves_only_with_nothing_left_to_change() {
         assert_eq!(final_verdict(0, 0, false, "APPROVE"), "APPROVE");
-        // gangway-api#447: a low + a nit, model said "approving with notes"
+        // A low + a nit, model said "approving with notes"
         assert_eq!(final_verdict(2, 0, false, "APPROVE"), "REQUEST_CHANGES");
         // an earlier CoderHelm comment still open
         assert_eq!(final_verdict(0, 1, false, "APPROVE"), "REQUEST_CHANGES");

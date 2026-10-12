@@ -126,7 +126,7 @@ mod stall_tests {
 
     #[test]
     fn eslint_failures_are_recognized_and_stable() {
-        // The 01KYAZ failure mode: speedboat CI fails on pre-existing ESLint
+        // A known failure mode: a repo's CI fails on pre-existing ESLint
         // warnings-as-errors. Real GitHub Actions logs prefix EVERY line with an
         // ISO timestamp (which differs every cycle) — the signature must strip it
         // so the same two lint findings hash identically across cycles and stall
@@ -811,7 +811,7 @@ pub async fn run(
 
     if has_ci_fail {
         // A workflow failed — try to fix. A failure takes precedence over any
-        // pass: on a multi-workflow repo (e.g. speedboat's Lint + Test Suite),
+        // pass: on a multi-workflow repo (e.g. Lint + Test Suite),
         // Lint passing must NOT mask Test Suite failing. The old guard
         // (`has_ci_fail && !has_ci_pass`) skipped this path whenever any workflow
         // passed, shipping red PRs as "completed" (run 01KZ5AJW).

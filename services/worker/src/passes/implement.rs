@@ -131,7 +131,7 @@ pub async fn run(
     // config values, copy blocks, JSON, long lists). The planner routinely
     // writes tasks like "merge the mappings provided in the issue", but the
     // implement agent never saw msg.body, so it concluded the data "wasn't
-    // provided" and gave up with zero changes (CPM-7958). Give implement the
+    // provided" and gave up with zero changes. Give implement the
     // ORIGINAL ticket text as the authoritative data source so it transcribes
     // real values instead of refusing to fabricate them. Bounded via head_tail
     // so a pathological body can't blow the context (the head+tail keep the
@@ -220,8 +220,8 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         None
     };
     // The repo's own unit-test command (faithful CI replica). run_checks scopes
-    // it to the changed test files each call. Root cause of shipped red PRs
-    // (CPM-7805): run_checks ran only typecheck+build, so a broken test the agent
+    // it to the changed test files each call. Root cause of shipped red PRs:
+    // run_checks ran only typecheck+build, so a broken test the agent
     // wrote sailed through the sandbox gate and only failed once CI ran vitest.
     let test_cmd = if sandbox.is_some() {
         super::detect_ci_test(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await
@@ -579,7 +579,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     // Gate: never finish an implement pass that left the affected tests RED.
     // run_checks now runs them, but the agent can still stop on red — force one
     // bounded remediation pass with the real failure before returning. (The
-    // whole reason CPM-7805 shipped a red PR: the broken test was never surfaced
+    // whole reason a red PR shipped: the broken test was never surfaced
     // in-sandbox, so the agent believed it was done.)
     if !executor
         .write_executor
@@ -1499,7 +1499,7 @@ impl<'a> WriteToolExecutor<'a> {
         // Extend the check command with the repo's unit tests, scoped to the
         // test files THIS change touched. run_checks used to run only
         // typecheck+build, so a broken test the agent wrote passed the sandbox
-        // gate and shipped a red PR (CPM-7805). Scoped + --passWithNoTests keeps
+        // gate and shipped a red PR. Scoped + --passWithNoTests keeps
         // it fast and avoids false-REDs from unrelated/service-dependent suites.
         let changed: Vec<String> = self
             .files_modified
@@ -1794,7 +1794,7 @@ fn generated_file_reject(path: &str) -> String {
 /// collected errors are returned so the caller can surface them. Shared by the
 /// implement and feedback passes so review-response edits get the same proven
 /// surgical-edit path (its absence in the feedback pass is what left large-file
-/// review fixes unfixable — CPM-7956 / PR #1093). Pure + unit-tested.
+/// review fixes unfixable). Pure + unit-tested.
 pub(crate) fn apply_text_edits(
     content: &str,
     edits: &[serde_json::Value],
@@ -1878,7 +1878,7 @@ mod apply_text_edits_tests {
 
     #[test]
     fn surgical_edit_on_a_large_file_body() {
-        // the CPM-7956 shape: one unique line changed inside a big file
+        // one unique line changed inside a big file
         let big = (0..2000)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()

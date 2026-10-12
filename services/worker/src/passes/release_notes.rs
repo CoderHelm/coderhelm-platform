@@ -260,7 +260,7 @@ pub fn previous_tag(tag: &str, all: &[String]) -> Option<String> {
     }
 }
 
-/// Jira-style keys (`CPM-123`) in the given texts, deduplicated, in order.
+/// Jira-style keys (`ABC-123`) in the given texts, deduplicated, in order.
 pub fn jira_keys(texts: &[&str]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
@@ -986,12 +986,12 @@ mod tests {
     #[test]
     fn jira_keys_found_once_in_order() {
         let k = jira_keys(&[
-            "CPM-8344: browse tests",
-            "fixes CPM-12 and cpm-99 (lowercase ignored), see CPM-8344",
-            "branch feat/CPM-7001-join",
+            "ABC-8344: browse tests",
+            "fixes ABC-12 and abc-99 (lowercase ignored), see ABC-8344",
+            "branch feat/ABC-7001-join",
             "not a key: UTF-8, X-1, ABCD-",
         ]);
-        assert_eq!(k, vec!["CPM-8344", "CPM-12", "CPM-7001", "UTF-8"]);
+        assert_eq!(k, vec!["ABC-8344", "ABC-12", "ABC-7001", "UTF-8"]);
     }
 
     #[test]
@@ -1035,7 +1035,7 @@ mod tests {
     fn prompt_carries_sources_and_guide() {
         let prs = vec![ReleasePr {
             number: 12,
-            title: "CPM-1: start date".into(),
+            title: "ABC-1: start date".into(),
             body: String::new(),
             branch: "feat/x".into(),
             labels: vec!["Deploy".into()],
@@ -1051,15 +1051,15 @@ mod tests {
             "v2",
             Some("v1"),
             &prs,
-            &[("CPM-1".into(), "Start date [Story]".into())],
+            &[("ABC-1".into(), "Start date [Story]".into())],
             Some("hand notes"),
             Some(&guide),
             "Product: Fitness app",
         );
         assert!(p.contains("changes since v1"));
-        assert!(p.contains("### #12 CPM-1: start date"));
+        assert!(p.contains("### #12 ABC-1: start date"));
         assert!(p.contains("(no description)"));
-        assert!(p.contains("- CPM-1: Start date [Story]"));
+        assert!(p.contains("- ABC-1: Start date [Story]"));
         assert!(p.contains("hand notes"));
         assert!(p.contains("Write for business readers."));
         assert!(p.contains("Product: Fitness app"));

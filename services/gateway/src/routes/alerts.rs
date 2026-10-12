@@ -1834,19 +1834,19 @@ mod tests {
     fn first_rule_naming_the_alarm_or_its_text_wins() {
         let rules = vec![
             rule("waf", &[], &["crawler TLS fingerprint"], "o/infra"),
-            rule("redis", &["prod-gangway-redis-memory"], &[], "o/infra"),
-            rule("web", &["prod-speedboat-graphql-502"], &[], "o/web"),
+            rule("redis", &["prod-api-redis-memory"], &[], "o/infra"),
+            rule("web", &["prod-web-graphql-502"], &[], "o/web"),
         ];
         let pick = |a: &Alert| pick_rule(&rules, a).map(|r| r.id.as_str());
-        assert_eq!(pick(&alarm("prod-gangway-redis-memory")), Some("redis"));
-        assert_eq!(pick(&alarm("prod-speedboat-graphql-502")), Some("web"));
-        assert_eq!(pick(&alarm("prod-gangway-db-cpu-utilization")), None);
+        assert_eq!(pick(&alarm("prod-api-redis-memory")), Some("redis"));
+        assert_eq!(pick(&alarm("prod-web-graphql-502")), Some("web"));
+        assert_eq!(pick(&alarm("prod-api-db-cpu")), None);
         let mut fp = alarm("x");
         fp.kind = "chatbot_custom";
         fp.title = "New crawler TLS fingerprint".into();
         assert_eq!(pick(&fp), Some("waf"));
         // Alarm names match exactly, not by prefix.
-        assert_eq!(pick(&alarm("prod-gangway-redis-memory-2")), None);
+        assert_eq!(pick(&alarm("prod-api-redis-memory-2")), None);
         // A rule naming nothing takes everything, in order.
         let all = vec![rule("all", &[], &[], "o/r")];
         assert_eq!(

@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn validate_repo_accepts_normal_and_rejects_injection() {
-        assert!(validate_repo("Chelsea-Piers-Engineering/speedboat").is_ok());
+        assert!(validate_repo("Example-Org/web-app").is_ok());
         assert!(validate_repo("a_b.c/d-e").is_ok());
         assert!(validate_repo("").is_err());
         assert!(validate_repo("foo/../bar").is_err());
