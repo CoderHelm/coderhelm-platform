@@ -40,6 +40,10 @@ const REPEAT_WINDOW_SECS: u64 = 6 * 3600;
 /// Most alert runs one route may start per rolling day.
 const MAX_RUNS_PER_ROUTE_PER_DAY: u64 = 20;
 const DAY_SECS: u64 = 86_400;
+/// Route actions: open a pull request for the alert, or only post it to Teams.
+pub const ACTION_FIX: &str = "fix";
+pub const ACTION_NOTIFY: &str = "notify";
+
 /// Longest instructions a route may store.
 const MAX_INSTRUCTIONS: usize = 8_000;
 /// Most alert text passed to a run.
@@ -311,6 +315,9 @@ pub fn topic_account(topic_arn: &str) -> Option<&str> {
 #[derive(Debug, Clone)]
 struct Route {
     team_id: String,
+    /// `ACTION_FIX` opens a pull request; `ACTION_NOTIFY` only posts to Teams.
+    action: String,
+    /// Where fixes go. Empty on notify-only routes.
     repo: String,
     instructions: String,
     match_terms: Vec<String>,
@@ -330,11 +337,17 @@ fn route_from_item(item: &HashMap<String, AttributeValue>) -> Option<Route> {
     };
     let team_id = s("team_id");
     let repo = s("repo");
-    if team_id.is_empty() || repo.is_empty() {
+    let action = if s("action") == ACTION_NOTIFY {
+        ACTION_NOTIFY
+    } else {
+        ACTION_FIX
+    };
+    if team_id.is_empty() || (action == ACTION_FIX && repo.is_empty()) {
         return None;
     }
     Some(Route {
         team_id,
+        action: action.to_string(),
         repo,
         instructions: s("instructions"),
         match_terms: item
@@ -438,6 +451,8 @@ pub enum Outcome {
     RoutePaused,
     NotAlarm,
     NoMatch,
+    /// The route only notifies: the alert was posted to Teams, no run.
+    Notified,
     Duplicate,
     Budget,
     DailyCap,
@@ -453,6 +468,7 @@ impl Outcome {
             Outcome::RoutePaused => "route_paused",
             Outcome::NotAlarm => "not_alarm",
             Outcome::NoMatch => "no_match",
+            Outcome::Notified => "notified",
             Outcome::Duplicate => "duplicate",
             Outcome::Budget => "budget",
             Outcome::DailyCap => "daily_cap",
@@ -512,6 +528,7 @@ pub fn notify_line(outcome: Outcome, repo: &str) -> Option<String> {
             format!("CoderHelm is working on a fix in {repo}. A follow-up card will link the pull request.")
         }
         Outcome::NoMatch => "Notification only: no automatic fix for this alert.".to_string(),
+        Outcome::Notified => String::new(),
         Outcome::NotAlarm => String::new(),
         Outcome::InFlight => "A CoderHelm run for this alert is already open.".to_string(),
         Outcome::Budget => "No fix started: the team's token limit was reached.".to_string(),
@@ -631,6 +648,10 @@ async fn decide(
     if !alert.actionable {
         info!(topic, ticket = %tid, title = %alert.title, "Alert ignored — not an alarm state");
         return Ok(Outcome::NotAlarm);
+    }
+    if route.action == ACTION_NOTIFY {
+        info!(topic, ticket = %tid, title = %alert.title, "Alert posted — route only notifies");
+        return Ok(Outcome::Notified);
     }
     if !route_matches(&route.match_terms, alert) {
         info!(topic, ticket = %tid, title = %alert.title, "Alert ignored — no match term");
@@ -870,6 +891,7 @@ pub async fn list_routes(
             let topic = it.get("topic_arn").and_then(|v| v.as_s().ok()).cloned()?;
             Some(json!({
                 "topic_arn": topic,
+                "action": r.action,
                 "repo": r.repo,
                 "instructions": r.instructions,
                 "match_terms": r.match_terms,
@@ -888,6 +910,10 @@ pub async fn list_routes(
 #[derive(Deserialize)]
 pub struct PutRouteRequest {
     topic_arn: String,
+    /// "fix" (default) or "notify".
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
     repo: String,
     #[serde(default)]
     instructions: String,
@@ -900,6 +926,15 @@ pub struct PutRouteRequest {
     notify_mode: String,
     #[serde(default)]
     teams_webhook_url: String,
+}
+
+fn notify_mode_of(req: &PutRouteRequest) -> Option<&'static str> {
+    match req.notify_mode.trim() {
+        "" | alert_notify::MODE_TEAM => Some(alert_notify::MODE_TEAM),
+        alert_notify::MODE_CUSTOM => Some(alert_notify::MODE_CUSTOM),
+        alert_notify::MODE_OFF => Some(alert_notify::MODE_OFF),
+        _ => None,
+    }
 }
 
 fn default_true() -> bool {
@@ -915,19 +950,24 @@ pub async fn put_route(
     claims.require_role(3)?;
     let topic = req.topic_arn.trim();
     let account = topic_account(topic).ok_or(StatusCode::BAD_REQUEST)?;
+    let action = match req.action.trim() {
+        "" | ACTION_FIX => ACTION_FIX,
+        ACTION_NOTIFY => ACTION_NOTIFY,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
     let repo = req.repo.trim();
     let valid_repo = repo
         .split_once('/')
         .is_some_and(|(o, n)| !o.is_empty() && !n.is_empty() && !n.contains('/'));
-    if !valid_repo || req.instructions.len() > MAX_INSTRUCTIONS {
+    let repo_ok = valid_repo || (action == ACTION_NOTIFY && repo.is_empty());
+    if !repo_ok || req.instructions.len() > MAX_INSTRUCTIONS {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let notify_mode = match req.notify_mode.trim() {
-        "" | alert_notify::MODE_TEAM => alert_notify::MODE_TEAM,
-        alert_notify::MODE_CUSTOM => alert_notify::MODE_CUSTOM,
-        alert_notify::MODE_OFF => alert_notify::MODE_OFF,
-        _ => return Err(StatusCode::BAD_REQUEST),
-    };
+    if action == ACTION_NOTIFY && notify_mode_of(&req) == Some(alert_notify::MODE_OFF) {
+        // A route that neither fixes nor notifies would do nothing.
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let notify_mode = notify_mode_of(&req).ok_or(StatusCode::BAD_REQUEST)?;
     let route_webhook = req.teams_webhook_url.trim();
     if notify_mode == alert_notify::MODE_CUSTOM && !alert_notify::valid_webhook_url(route_webhook) {
         return Err(StatusCode::BAD_REQUEST);
@@ -969,6 +1009,7 @@ pub async fn put_route(
             .item("sk", attr_s(sk))
             .item("team_id", attr_s(&claims.team_id))
             .item("topic_arn", attr_s(topic))
+            .item("action", attr_s(action))
             .item("repo", attr_s(repo))
             .item("instructions", attr_s(&req.instructions))
             .item("match_terms", AttributeValue::L(terms.clone()))
@@ -1006,7 +1047,7 @@ pub async fn put_route(
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         })?;
-    info!(team_id = %claims.team_id, topic, repo, enabled = req.enabled, "Alert route saved");
+    info!(team_id = %claims.team_id, topic, action, repo, enabled = req.enabled, "Alert route saved");
     Ok(Json(json!({ "ok": true, "endpoint_path": ENDPOINT_PATH })))
 }
 
@@ -1279,6 +1320,27 @@ pub async fn get_event(
 mod tests {
     use super::*;
 
+    fn route_item(action: Option<&str>, repo: &str) -> HashMap<String, AttributeValue> {
+        let mut m = HashMap::new();
+        m.insert("team_id".to_string(), attr_s("TEAM#t"));
+        m.insert("repo".to_string(), attr_s(repo));
+        if let Some(a) = action {
+            m.insert("action".to_string(), attr_s(a));
+        }
+        m
+    }
+
+    #[test]
+    fn notify_only_routes_need_no_repo() {
+        let r = route_from_item(&route_item(Some(ACTION_NOTIFY), "")).unwrap();
+        assert_eq!(r.action, ACTION_NOTIFY);
+        // Routes saved before the action existed keep opening PRs.
+        let r = route_from_item(&route_item(None, "o/r")).unwrap();
+        assert_eq!(r.action, ACTION_FIX);
+        assert!(route_from_item(&route_item(None, "")).is_none());
+        assert!(route_from_item(&route_item(Some(ACTION_FIX), "")).is_none());
+    }
+
     #[test]
     fn cloudwatch_alarm_is_normalized_and_only_alarm_state_acts() {
         let msg = json!({
@@ -1422,6 +1484,7 @@ mod tests {
             .contains("o/r"));
         assert_eq!(notify_line(Outcome::NotAlarm, "o/r").as_deref(), Some(""));
         assert!(notify_line(Outcome::NoMatch, "o/r").is_some());
+        assert_eq!(notify_line(Outcome::Notified, "").as_deref(), Some(""));
         assert!(notify_line(Outcome::Duplicate, "o/r").is_none());
         assert!(notify_line(Outcome::RoutePaused, "o/r").is_none());
         assert!(notify_line(Outcome::Error, "o/r").is_none());
