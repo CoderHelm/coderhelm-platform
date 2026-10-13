@@ -440,10 +440,12 @@ pub async fn run(
     };
     let extra_context = format!("{graph_context}{ci_context}");
 
-    // CoderHelm's own still-open threads from earlier reviews: the re-review
-    // reports each as fixed (→ resolved below) or open (not re-posted).
-    let prior_threads = match github
-        .list_open_bot_review_threads(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+    // CoderHelm's own threads from earlier reviews, with the replies under them.
+    // Still-open ones: the re-review reports each as fixed or answered (→ resolved
+    // below) or open (not re-posted). Ones a person resolved are settled and are
+    // shown so the same concern isn't raised again.
+    let bot_threads = match github
+        .list_bot_review_threads(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await
     {
         Ok(t) => t,
@@ -452,7 +454,33 @@ pub async fn run(
             Vec::new()
         }
     };
-    let prior_context = review_agent::format_prior_threads(&prior_threads);
+    let prior_threads: Vec<&crate::clients::github::BotReviewThread> =
+        bot_threads.iter().filter(|t| !t.resolved).collect();
+    let settled_threads: Vec<&crate::clients::github::BotReviewThread> = bot_threads
+        .iter()
+        .filter(|t| t.resolved_by_person)
+        .collect();
+    // What people wrote in the PR conversation, including the text of a
+    // re-review ask.
+    let discussion = match github
+        .list_issue_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    {
+        Ok(c) => human_comments(&c, review_agent::MAX_DISCUSSION_COMMENTS),
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "Could not list PR conversation comments");
+            Vec::new()
+        }
+    };
+    let answered_context = format!(
+        "{}{}",
+        review_agent::format_settled_threads(&settled_threads),
+        review_agent::format_discussion(&discussion)
+    );
+    let prior_context = format!(
+        "{}{answered_context}",
+        review_agent::format_prior_threads(&prior_threads)
+    );
 
     // Repo-defined CI labels the reviewer may pick (opt-in). Candidates are the
     // repo's live labels filtered by the allow-list, so the set follows whatever
@@ -520,7 +548,7 @@ pub async fn run(
     )
     .await;
     let fixed_threads: Vec<&crate::clients::github::BotReviewThread> =
-        fixed_prior_threads(&prior_threads, &output.prior);
+        settled_prior_threads(&prior_threads, &output.prior);
     let still_open = prior_threads.len() - fixed_threads.len();
     // Label picking is live when there's something to pick: existing allowed
     // labels, or an allowed family whose labels may not exist yet.
@@ -556,6 +584,7 @@ pub async fn run(
         &diff,
         output.findings,
         cfg.require_tests,
+        &answered_context,
         &mut usage,
     )
     .await;
@@ -620,14 +649,14 @@ pub async fn run(
         }
     }
 
-    // Verdict: CoderHelm approves only when it has nothing left to ask for.
+    // Verdict: CoderHelm approves exactly when it has nothing left to ask for.
     // Any surviving finding (any severity), an earlier CoderHelm comment still
-    // open, or a failed verification → REQUEST_CHANGES; otherwise the model's
-    // verdict, fail-closed to REQUEST_CHANGES on anything non-APPROVE. An
-    // approval is what arms auto-merge, so "approve with notes" would merge a PR
-    // with changes still requested.
+    // open, a failed verification, or a review that didn't finish →
+    // REQUEST_CHANGES. An approval is what arms auto-merge, so "approve with
+    // notes" would merge a PR with changes still requested; and changes
+    // requested with no finding would leave the author nothing to answer.
     let verdict: &'static str =
-        final_verdict(findings.len(), still_open, verify_failed, &output.verdict);
+        final_verdict(findings.len(), still_open, verify_failed, output.incomplete);
     // Computed, explainable risk (blast-radius-weighted) — overrides the model's
     // guess and drives the displayed level.
     let risk_report = review_risk::assess(
@@ -681,7 +710,7 @@ pub async fn run(
     ));
     if !prior_threads.is_empty() {
         full_body.push_str(&format!(
-            "\n\n#### Earlier comments\n{} fixed and resolved · {} still open",
+            "\n\n#### Earlier comments\n{} settled and resolved · {} still open",
             fixed_threads.len(),
             still_open
         ));
@@ -824,6 +853,9 @@ pub async fn run(
         inline = postable.inline.len(),
         prior_open = prior_threads.len(),
         prior_fixed = fixed_threads.len(),
+        prior_settled_by_person = settled_threads.len(),
+        discussion = discussion.len(),
+        model_verdict = %output.verdict,
         posted_as = effective_event,
         posted = should_comment,
         "{}",
@@ -1114,7 +1146,7 @@ async fn load_learning_context(
             }
             let rating = v["rating"].as_str().unwrap_or("");
             let tag = if rating == "down" { "👎" } else { "📝" };
-            notes.push(format!("- {tag} {}", common::truncate_str(text, 240)));
+            notes.push(format!("- {tag} {}", common::truncate_str(text, 1000)));
             if notes.len() >= 15 {
                 break;
             }
@@ -1269,17 +1301,34 @@ async fn store_review_record(
     sk
 }
 
-/// Earlier threads the model reported fixed. Indices that are out of range or
-/// duplicated are ignored; anything not explicitly "fixed" stays open.
-fn fixed_prior_threads<'a>(
-    prior: &'a [crate::clients::github::BotReviewThread],
+/// The last `max` conversation comments written by people, as `(author, body)`
+/// pairs, oldest first. Bot comments are left out.
+fn human_comments(comments: &[serde_json::Value], max: usize) -> Vec<(String, String)> {
+    let human: Vec<(String, String)> = comments
+        .iter()
+        .filter(|c| c["user"]["type"].as_str() != Some("Bot"))
+        .filter_map(|c| {
+            let author = c["user"]["login"].as_str()?;
+            let body = c["body"].as_str()?.trim();
+            (!author.contains("coderhelm") && !body.is_empty())
+                .then(|| (author.to_string(), body.to_string()))
+        })
+        .collect();
+    let skip = human.len().saturating_sub(max);
+    human.into_iter().skip(skip).collect()
+}
+
+/// Earlier threads the model reported fixed or answered. Indices that are out
+/// of range or duplicated are ignored; anything else stays open.
+fn settled_prior_threads<'a>(
+    prior: &[&'a crate::clients::github::BotReviewThread],
     statuses: &[review_agent::PriorStatus],
 ) -> Vec<&'a crate::clients::github::BotReviewThread> {
     let mut seen = std::collections::HashSet::new();
     statuses
         .iter()
-        .filter(|s| s.is_fixed() && s.index < prior.len() && seen.insert(s.index))
-        .map(|s| &prior[s.index])
+        .filter(|s| s.is_settled() && s.index < prior.len() && seen.insert(s.index))
+        .map(|s| prior[s.index])
         .collect()
 }
 
@@ -1296,6 +1345,9 @@ mod prior_thread_tests {
             line: 1,
             outdated: false,
             body: "x".into(),
+            replies: vec![],
+            resolved: false,
+            resolved_by_person: false,
         }
     }
     fn st(index: usize, status: &str) -> PriorStatus {
@@ -1306,31 +1358,83 @@ mod prior_thread_tests {
     }
 
     #[test]
-    fn only_explicit_fixed_in_range_once() {
-        let prior = vec![t("A"), t("B"), t("C")];
+    fn only_explicit_fixed_or_answered_in_range_once() {
+        let threads = [t("A"), t("B"), t("C"), t("D")];
+        let prior: Vec<&BotReviewThread> = threads.iter().collect();
         let statuses = vec![
             st(0, "fixed"),
             st(1, "open"),
             st(0, "FIXED"), // duplicate
             st(9, "fixed"), // out of range
+            st(3, "answered"),
         ];
-        let got: Vec<&str> = fixed_prior_threads(&prior, &statuses)
+        let got: Vec<&str> = settled_prior_threads(&prior, &statuses)
             .iter()
             .map(|t| t.id.as_str())
             .collect();
-        assert_eq!(got, vec!["A"]);
+        assert_eq!(got, vec!["A", "D"]);
     }
 
     #[test]
     fn missing_statuses_mean_nothing_resolved() {
-        let prior = vec![t("A"), t("B")];
-        assert!(fixed_prior_threads(&prior, &[]).is_empty());
+        let threads = [t("A"), t("B")];
+        let prior: Vec<&BotReviewThread> = threads.iter().collect();
+        assert!(settled_prior_threads(&prior, &[]).is_empty());
+    }
+
+    #[test]
+    fn replies_and_resolved_threads_reach_the_prompt() {
+        let mut open = t("A");
+        open.replies = vec![crate::clients::github::ThreadReply {
+            author: "dev".into(),
+            by_bot: false,
+            body: "The API change is live\nin production.".into(),
+        }];
+        let s = review_agent::format_prior_threads(&[&open]);
+        assert!(s.contains("0: a.rs:1 — x"));
+        assert!(s.contains("reply from dev: The API change is live in production."));
+        assert!(s.contains("\"answered\""));
+
+        let mut resolved = t("B");
+        resolved.resolved = true;
+        resolved.resolved_by_person = true;
+        let s = review_agent::format_settled_threads(&[&resolved]);
+        assert!(s.contains("a person resolved"));
+        assert!(s.contains("- a.rs:1 — x"));
+        assert!(review_agent::format_settled_threads(&[]).is_empty());
+    }
+
+    #[test]
+    fn only_the_latest_human_comments_are_kept() {
+        let c = |login: &str, kind: &str, body: &str| serde_json::json!({"user": {"login": login, "type": kind}, "body": body});
+        let comments = vec![
+            c("dev", "User", "first"),
+            c("coderhelm[bot]", "Bot", "review"),
+            c("ci-bot", "Bot", "build ok"),
+            c("dev", "User", "  "),
+            c(
+                "lead",
+                "User",
+                "@coderhelm re-review — the API change is deployed",
+            ),
+            c("dev", "User", "third"),
+        ];
+        let got = human_comments(&comments, 2);
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "lead".to_string(),
+                    "@coderhelm re-review — the API change is deployed".to_string()
+                ),
+                ("dev".to_string(), "third".to_string()),
+            ]
+        );
+        let s = review_agent::format_discussion(&got);
+        assert!(s.contains("- lead: @coderhelm re-review — the API change is deployed"));
     }
 }
 
-/// The review verdict. APPROVE only when nothing is left to change: no
-/// findings of any severity, none of CoderHelm's earlier comments still open,
-/// verification not failed, and the model itself approved.
 /// A verdict review is superseded once the PR's head is no longer the commit it
 /// was enqueued for; that commit's own review covers the latest code. Reviews
 /// that answer a question, or that resolve the head themselves (empty
@@ -1342,17 +1446,18 @@ fn superseded(msg: &ReviewMessage, current_head: &str) -> bool {
         && current_head != msg.head_sha
 }
 
+/// The review verdict. APPROVE exactly when nothing is left to change: no
+/// findings of any severity, none of CoderHelm's earlier comments still open,
+/// verification not failed, and the review finished. Every reason to hold a
+/// merge is a finding or an open thread, so the author always has something to
+/// answer or resolve.
 fn final_verdict(
     findings: usize,
     prior_still_open: usize,
     verify_failed: bool,
-    model_verdict: &str,
+    incomplete: bool,
 ) -> &'static str {
-    if findings == 0
-        && prior_still_open == 0
-        && !verify_failed
-        && model_verdict.eq_ignore_ascii_case("APPROVE")
-    {
+    if findings == 0 && prior_still_open == 0 && !verify_failed && !incomplete {
         "APPROVE"
     } else {
         "REQUEST_CHANGES"
@@ -1399,17 +1504,14 @@ mod verdict_tests {
 
     #[test]
     fn approves_only_with_nothing_left_to_change() {
-        assert_eq!(final_verdict(0, 0, false, "APPROVE"), "APPROVE");
-        // A low + a nit, model said "approving with notes"
-        assert_eq!(final_verdict(2, 0, false, "APPROVE"), "REQUEST_CHANGES");
+        assert_eq!(final_verdict(0, 0, false, false), "APPROVE");
+        // A low + a nit
+        assert_eq!(final_verdict(2, 0, false, false), "REQUEST_CHANGES");
         // an earlier CoderHelm comment still open
-        assert_eq!(final_verdict(0, 1, false, "APPROVE"), "REQUEST_CHANGES");
-        assert_eq!(final_verdict(0, 0, true, "APPROVE"), "REQUEST_CHANGES");
-        assert_eq!(
-            final_verdict(0, 0, false, "REQUEST_CHANGES"),
-            "REQUEST_CHANGES"
-        );
-        assert_eq!(final_verdict(0, 0, false, ""), "REQUEST_CHANGES");
+        assert_eq!(final_verdict(0, 1, false, false), "REQUEST_CHANGES");
+        assert_eq!(final_verdict(0, 0, true, false), "REQUEST_CHANGES");
+        // the review errored or its output couldn't be read
+        assert_eq!(final_verdict(0, 0, false, true), "REQUEST_CHANGES");
     }
 }
 
