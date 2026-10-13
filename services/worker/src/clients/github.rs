@@ -1837,6 +1837,29 @@ impl GitHubClient {
         Ok(resp)
     }
 
+    /// Conversation comments on an issue or PR, oldest first.
+    pub async fn list_issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut comments: Vec<serde_json::Value> = Vec::new();
+        for page in 1..=5u32 {
+            let url = format!(
+                "{API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100&page={page}"
+            );
+            let data = self.get(&url).await?;
+            let batch: Vec<serde_json::Value> = serde_json::from_value(data)?;
+            let done = batch.len() < 100;
+            comments.extend(batch);
+            if done {
+                break;
+            }
+        }
+        Ok(comments)
+    }
+
     /// Get review comments on a PR.
     pub async fn get_review_comments(
         &self,
@@ -1896,9 +1919,9 @@ impl GitHubClient {
         Ok(resp)
     }
 
-    /// CoderHelm's own UNRESOLVED inline review threads on a PR (the thread's first
-    /// comment was written by the bot) — the prior findings a re-review checks.
-    pub async fn list_open_bot_review_threads(
+    /// CoderHelm's own inline review threads on a PR (the thread's first comment
+    /// was written by the bot), open and resolved, each with the replies under it.
+    pub async fn list_bot_review_threads(
         &self,
         owner: &str,
         repo: &str,
@@ -1908,7 +1931,7 @@ impl GitHubClient {
         let mut cursor: Option<String> = None;
         for _ in 0..10 {
             let query = serde_json::json!({
-                "query": "query($owner:String!,$name:String!,$pr:Int!,$after:String){ repository(owner:$owner,name:$name){ pullRequest(number:$pr){ reviewThreads(first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id isResolved isOutdated path line originalLine comments(first:1){ nodes{ author{ login } body } } } } } } }",
+                "query": "query($owner:String!,$name:String!,$pr:Int!,$after:String){ repository(owner:$owner,name:$name){ pullRequest(number:$pr){ reviewThreads(first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id isResolved isOutdated path line originalLine resolvedBy{ login } comments(first:30){ nodes{ author{ login } body } } } } } } }",
                 "variables": { "owner": owner, "name": repo, "pr": pr_number, "after": cursor }
             });
             let resp = self.post("https://api.github.com/graphql", &query).await?;
@@ -1917,12 +1940,31 @@ impl GitHubClient {
             }
             let threads = &resp["data"]["repository"]["pullRequest"]["reviewThreads"];
             for t in threads["nodes"].as_array().into_iter().flatten() {
-                let first = &t["comments"]["nodes"][0];
-                let author = first["author"]["login"].as_str().unwrap_or("");
-                if t["isResolved"].as_bool().unwrap_or(true) || !author.contains("coderhelm") {
+                let comments = t["comments"]["nodes"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let Some(first) = comments.first() else {
+                    continue;
+                };
+                let login =
+                    |c: &serde_json::Value| c["author"]["login"].as_str().unwrap_or("").to_string();
+                if !login(first).contains("coderhelm") {
                     continue;
                 }
+                let resolved = t["isResolved"].as_bool().unwrap_or(false);
+                let resolved_by = t["resolvedBy"]["login"].as_str().unwrap_or("");
                 out.push(BotReviewThread {
+                    replies: comments[1..]
+                        .iter()
+                        .map(|c| ThreadReply {
+                            by_bot: login(c).contains("coderhelm"),
+                            author: login(c),
+                            body: c["body"].as_str().unwrap_or("").to_string(),
+                        })
+                        .collect(),
+                    resolved,
+                    resolved_by_person: resolved && !resolved_by.contains("coderhelm"),
                     id: t["id"].as_str().unwrap_or("").to_string(),
                     path: t["path"].as_str().unwrap_or("").to_string(),
                     line: t["line"]
@@ -2380,7 +2422,15 @@ pub struct SearchResult {
     pub matches: Vec<String>,
 }
 
-/// One of CoderHelm's own unresolved inline review threads.
+/// A comment written under the first one in a review thread.
+#[derive(Debug, Clone)]
+pub struct ThreadReply {
+    pub author: String,
+    pub by_bot: bool,
+    pub body: String,
+}
+
+/// One of CoderHelm's own inline review threads.
 #[derive(Debug, Clone)]
 pub struct BotReviewThread {
     /// GraphQL node id (what resolveReviewThread takes).
@@ -2391,6 +2441,11 @@ pub struct BotReviewThread {
     pub outdated: bool,
     /// The bot's original comment.
     pub body: String,
+    /// What was written under it, oldest first.
+    pub replies: Vec<ThreadReply>,
+    pub resolved: bool,
+    /// A person (not CoderHelm) resolved the thread.
+    pub resolved_by_person: bool,
 }
 
 #[cfg(test)]
