@@ -250,7 +250,8 @@ pub fn prompt_section(candidates: &[RepoLabel], current: &[String], rules: &Labe
          Also write `tests_note` for the PR author, ALWAYS (even when you add nothing): one or \
          two sentences saying which tests this PR's labels will run — the labels you add plus \
          those already on the PR — named the way the repo's mapping names them (areas / tags, \
-         e.g. `@join`), and WHERE they run (the PR preview or staging, per the repo docs). If no \
+         e.g. `@join`), and WHERE they run (the PR preview or staging, per the team's label \
+         rules below when given, otherwise the repo docs). If no \
          tests are needed, say so and why (e.g. \"No e2e: only copy and styles changed in \
          JoinHeader.tsx\").\n",
     );
@@ -283,7 +284,13 @@ pub fn prompt_section(candidates: &[RepoLabel], current: &[String], rules: &Labe
         }
     }
     if !rules.guide.is_empty() {
-        s.push_str(&format!("Repo guidance: {}\n", rules.guide));
+        s.push_str(&format!(
+            "The team's label rules for this repo: {}\n\
+             These rules are the team's current decision. Where the repo's docs or a label's \
+             description say something different, follow these rules: the docs may be out of \
+             date.\n",
+            rules.guide
+        ));
     }
     s
 }
@@ -689,6 +696,9 @@ mod tests {
         assert!(s.contains("Already on the PR: ch-review"));
         assert!(s.contains("E2E:join → CI:DEPLOY_STAGING"));
         assert!(s.contains("Payment tests need staging."));
+        // the team's rules outrank the repo's docs and label descriptions
+        assert!(s.contains("The team's label rules for this repo: "));
+        assert!(s.contains("follow these rules: the docs may be out of date"));
         // strict: path match alone isn't enough; cosmetic changes don't qualify
         assert!(s.contains("a file path matching a label's area is NOT enough"));
         assert!(s.contains("Purely presentational changes do not qualify"));
