@@ -10,8 +10,9 @@
 //! - **One address.** Requests go to the registered HTTPS address and nowhere
 //!   else: redirects are not followed and addresses that resolve inside a
 //!   private network are refused ([`net`]).
-//! - **Hidden fields stay hidden.** Values of sensitive-looking fields are
-//!   replaced before the result is shown or handed to a model ([`redact`]).
+//! - **Hidden fields stay hidden.** A lookup that asks for a field a team has
+//!   hidden is refused, and anything hidden that still comes back is replaced
+//!   before the result is shown or handed to a model ([`redact`]).
 //! - **Keys are sealed.** A team's API key is encrypted for that team alone
 //!   before it is stored ([`secret`]), and every lookup is logged ([`store`]).
 

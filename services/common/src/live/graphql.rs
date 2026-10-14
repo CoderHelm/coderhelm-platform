@@ -8,6 +8,7 @@ use graphql_parser::query::{
 };
 use serde_json::Value;
 
+use super::redact::{hidden_terms, is_hidden, DEFAULT_HIDDEN};
 use super::StepError;
 
 const MAX_QUERY_BYTES: usize = 16_000;
@@ -21,6 +22,9 @@ pub struct ReadQuery {
     pub text: String,
     /// The top-level fields it reads, for the activity log.
     pub fields: Vec<String>,
+    /// Every field it asks for at any depth, by its real name (an alias does
+    /// not change it). Lets callers refuse fields a team has hidden.
+    pub all_fields: Vec<String>,
 }
 
 fn refuse(message: &str) -> StepError {
@@ -74,7 +78,10 @@ pub fn check_read_only(text: &str) -> Result<ReadQuery, StepError> {
     };
 
     let mut count = 0usize;
-    walk(root, &fragments, 1, &mut count)?;
+    let mut all_fields: Vec<String> = Vec::new();
+    walk(root, &fragments, 1, &mut count, &mut all_fields)?;
+    all_fields.sort();
+    all_fields.dedup();
 
     let mut fields: Vec<String> = Vec::new();
     top_fields(root, &fragments, 0, &mut fields);
@@ -82,6 +89,7 @@ pub fn check_read_only(text: &str) -> Result<ReadQuery, StepError> {
     Ok(ReadQuery {
         text: text.to_string(),
         fields,
+        all_fields,
     })
 }
 
@@ -90,6 +98,7 @@ fn walk(
     fragments: &HashMap<&str, &FragmentDefinition<String>>,
     depth: usize,
     count: &mut usize,
+    names: &mut Vec<String>,
 ) -> Result<(), StepError> {
     if set.items.is_empty() {
         return Ok(());
@@ -103,12 +112,17 @@ fn walk(
             return Err(refuse("The lookup asks for too many fields."));
         }
         match item {
-            Selection::Field(f) => walk(&f.selection_set, fragments, depth + 1, count)?,
-            Selection::InlineFragment(f) => walk(&f.selection_set, fragments, depth + 1, count)?,
+            Selection::Field(f) => {
+                names.push(f.name.clone());
+                walk(&f.selection_set, fragments, depth + 1, count, names)?
+            }
+            Selection::InlineFragment(f) => {
+                walk(&f.selection_set, fragments, depth + 1, count, names)?
+            }
             // Following the spread at depth + 1 means a fragment that refers to
             // itself runs into the depth cap instead of looping forever.
             Selection::FragmentSpread(s) => match fragments.get(s.fragment_name.as_str()) {
-                Some(f) => walk(&f.selection_set, fragments, depth + 1, count)?,
+                Some(f) => walk(&f.selection_set, fragments, depth + 1, count, names)?,
                 None => return Err(refuse("The lookup refers to a fragment it doesn't define.")),
             },
         }
@@ -273,6 +287,14 @@ pub fn schema_from_introspection(body: &Value) -> Option<Schema> {
         }
     }
 
+    // Samples never ask for a field that is hidden by default: such a lookup
+    // would be refused.
+    let hidden = hidden_terms(
+        &DEFAULT_HIDDEN
+            .iter()
+            .map(|h| h.to_string())
+            .collect::<Vec<_>>(),
+    );
     let query_fields = query_type["fields"].as_array().cloned().unwrap_or_default();
     let mut samples = Vec::new();
     for f in &query_fields {
@@ -282,6 +304,9 @@ pub fn schema_from_introspection(body: &Value) -> Option<Schema> {
         let Some(name) = f["name"].as_str() else {
             continue;
         };
+        if is_hidden(name, &hidden) {
+            continue;
+        }
         let args = f["args"].as_array().cloned().unwrap_or_default();
         // Skip lookups that need an input we can't guess.
         if args.iter().any(|a| a["type"]["kind"] == "NON_NULL") {
@@ -307,6 +332,7 @@ pub fn schema_from_introspection(body: &Value) -> Option<Schema> {
                                     && x["args"].as_array().map(|a| a.is_empty()).unwrap_or(true)
                             })
                             .filter_map(|x| x["name"].as_str())
+                            .filter(|n| !is_hidden(n, &hidden))
                             .take(5)
                             .collect()
                     })
@@ -393,6 +419,18 @@ mod tests {
     }
 
     #[test]
+    fn every_field_is_reported_by_its_real_name() {
+        let q = check_read_only(
+            "{ people { x: email ...P ... on Person { phone } } } fragment P on Person { card { last4 } }",
+        )
+        .unwrap();
+        assert_eq!(
+            q.all_fields,
+            vec!["card", "email", "last4", "people", "phone"]
+        );
+    }
+
+    #[test]
     fn writes_are_refused() {
         assert!(refused("mutation { deleteOrder(id: 1) { id } }").contains("change data"));
         assert!(refused("mutation M { __typename }").contains("change data"));
@@ -458,6 +496,7 @@ mod tests {
                 { "kind": "OBJECT", "name": "Order", "fields": [
                     { "name": "id", "args": [], "type": nn(scalar("ID")) },
                     { "name": "refundedAt", "args": [], "type": scalar("DateTime") },
+                    { "name": "customerEmail", "args": [], "type": scalar("String") },
                     { "name": "customer", "args": [], "type": obj("Customer") }
                 ] },
                 { "kind": "OBJECT", "name": "Customer", "fields": [

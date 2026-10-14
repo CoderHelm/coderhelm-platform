@@ -9,7 +9,7 @@ use super::graphql::{
     check_read_only, introspection_query, schema_from_introspection, Schema, INTROSPECTION_LEVELS,
 };
 use super::net::{parse_endpoint, resolve_public};
-use super::redact::{hidden_terms, redact};
+use super::redact::{hidden_terms, is_hidden, redact};
 use super::StepError;
 
 const TIMEOUT: Duration = Duration::from_secs(8);
@@ -116,6 +116,8 @@ async fn send(
     };
     let client = reqwest::Client::builder()
         .https_only(true)
+        // Never route through a proxy named in the environment.
+        .no_proxy()
         // A redirect could point anywhere, including inside a private network.
         .redirect(reqwest::redirect::Policy::none())
         // Connect to the address that was checked, not whatever the name
@@ -381,6 +383,17 @@ pub async fn run_lookup(
     max_result_chars: usize,
 ) -> Result<Lookup, StepError> {
     let read = check_read_only(query)?;
+    // A hidden field is refused outright, so its value never leaves the team's
+    // system. Checked by real field name: renaming it with an alias (which
+    // would slip past hiding by name in the response) changes nothing.
+    let terms = hidden_terms(hidden);
+    if let Some(field) = read.all_fields.iter().find(|f| is_hidden(f, &terms)) {
+        return Err(StepError::new(
+            "read_only",
+            format!("That lookup asks for a hidden field ({field})."),
+            "Hidden fields can't be read. Remove it from the lookup. Nothing was sent.",
+        ));
+    }
     let started = Instant::now();
     let r = send(&src.url, Some((src.auth, &src.key)), &read.text, variables).await?;
     let ms = started.elapsed().as_millis();
@@ -410,7 +423,9 @@ pub async fn run_lookup(
         ));
     };
 
-    let hidden_count = redact(&mut data, &hidden_terms(hidden));
+    // Second line of defence for values nested inside a field the query
+    // couldn't name (a JSON-typed field, say).
+    let hidden_count = redact(&mut data, &terms);
     let pretty = serde_json::to_string_pretty(&data).unwrap_or_default();
     Ok(Lookup {
         query: read.text,
@@ -454,6 +469,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hidden_field_is_refused_even_behind_an_alias() {
+        let hidden = vec!["email".to_string()];
+        let unreachable = src("https://10.0.0.1/graphql");
+        for q in [
+            "{ people { email } }",
+            "{ people { x: email } }",
+            "{ people { ...P } } fragment P on Person { contactEmail }",
+        ] {
+            let e = run_lookup(&unreachable, q, None, &hidden, 1000)
+                .await
+                .unwrap_err();
+            assert!(e.is_refusal(), "{q}");
+            assert!(e.message.contains("hidden field"), "{q}");
+        }
+        // Without it hidden, the same lookup gets as far as the address check.
+        let e = run_lookup(&unreachable, "{ people { email } }", None, &[], 1000)
+            .await
+            .unwrap_err();
+        assert_eq!(e.step, "reach");
+    }
+
+    #[tokio::test]
     async fn private_addresses_are_refused() {
         for url in [
             "https://10.0.0.1/graphql",
@@ -489,9 +526,14 @@ mod tests {
         assert!(schema.text.starts_with("type Query {"));
 
         let hidden = vec!["capital".to_string()];
+        let asks_hidden = "{ country(code: \"BR\") { name capital } }";
+        let e = run_lookup(&src(PUBLIC_API), asks_hidden, None, &hidden, 2000)
+            .await
+            .unwrap_err();
+        assert!(e.is_refusal());
         let l = run_lookup(
             &src(PUBLIC_API),
-            "{ country(code: \"BR\") { name capital } }",
+            "{ country(code: \"BR\") { name } }",
             None,
             &hidden,
             2000,
@@ -500,8 +542,7 @@ mod tests {
         .unwrap();
         assert_eq!(l.fields, vec!["country"]);
         assert!(l.result.contains("Brazil"));
-        assert!(l.result.contains("[hidden]") && !l.result.contains("Bras"));
-        assert_eq!(l.hidden_count, 1);
+        assert_eq!(l.hidden_count, 0);
 
         for (_, q) in &schema.samples {
             assert!(check_read_only(q).is_ok());

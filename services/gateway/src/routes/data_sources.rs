@@ -11,7 +11,9 @@ use axum::{
     Extension, Json,
 };
 use common::live::api::{self, ApiSource, ConnectReport};
+use common::live::graphql::check_read_only;
 use common::live::net::parse_endpoint;
+use common::live::redact::{hidden_terms, is_hidden};
 use common::live::store::{self, Activity, Source};
 use common::live::{secret, StepError};
 use serde_json::{json, Value};
@@ -396,9 +398,18 @@ pub async fn samples(
 ) -> Reply {
     admin(&claims)?;
     let source = load(&state, &claims.team_id, &id).await?;
+    // A sample that asks for a field this team has since hidden would be
+    // refused, so it isn't offered.
+    let hidden = hidden_terms(&source.hidden_fields);
+    let allowed = |query: &str| {
+        check_read_only(query)
+            .map(|q| !q.all_fields.iter().any(|f| is_hidden(f, &hidden)))
+            .unwrap_or(false)
+    };
     let mut samples: Vec<Value> = source
         .samples
         .iter()
+        .filter(|(_, query)| allowed(query))
         .map(|(label, query)| json!({ "label": label, "query": query }))
         .collect();
     if samples.is_empty() {
