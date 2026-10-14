@@ -297,6 +297,21 @@ After researching, output the four files using this exact format:
         }
     }
 
+    // Live systems the team connected for this repo, if any: read-only lookups
+    // so the plan and the code rest on the system's real shape.
+    let live = super::live_sources::LiveSources::load(
+        state,
+        super::live_sources::Role::Planner,
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        0,
+    )
+    .await;
+    if let Some(l) = &live {
+        tools.extend(l.tools());
+        full_system.push_str(&l.prompt_section());
+    }
+
     let executor = CombinedToolExecutor {
         read_only: ReadOnlyToolExecutor {
             github,
@@ -308,6 +323,8 @@ After researching, output the four files using this exact format:
         mcp_plugins: &loaded_mcp_plugins,
         lambda: &state.lambda,
         mcp_proxy_function_name: &state.config.mcp_proxy_function_name,
+        live: live.as_ref(),
+        state,
     };
 
     let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
@@ -718,6 +735,9 @@ struct CombinedToolExecutor<'a> {
     mcp_plugins: &'a [mcp::McpPlugin],
     lambda: &'a aws_sdk_lambda::Client,
     mcp_proxy_function_name: &'a str,
+    /// The team's connected live systems, read-only.
+    live: Option<&'a super::live_sources::LiveSources>,
+    state: &'a WorkerState,
 }
 
 #[async_trait::async_trait]
@@ -727,6 +747,11 @@ impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(live) = self.live {
+            if let Some(out) = live.handle(self.state, name, input).await {
+                return Ok(serde_json::json!(out));
+            }
+        }
         // Check if this is an MCP tool (prefixed with server_id__)
         if let Some((server_id, tool_name)) = name.split_once("__") {
             let plugin = self

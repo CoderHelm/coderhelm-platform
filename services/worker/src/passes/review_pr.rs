@@ -532,6 +532,7 @@ pub async fn run(
     // Live systems the team connected for this repo, if any.
     let live = super::live_sources::LiveSources::load(
         state,
+        super::live_sources::Role::Reviewer,
         &msg.team_id,
         &format!("{}/{}", msg.repo_owner, msg.repo_name),
         msg.pr_number,
