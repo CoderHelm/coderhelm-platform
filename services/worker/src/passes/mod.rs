@@ -467,6 +467,7 @@ pub mod formatter;
 pub mod health_check;
 mod implement;
 pub mod infra_analyze;
+pub mod live_sources;
 pub mod onboard;
 mod plan;
 pub mod plan_execute;

@@ -10,6 +10,7 @@ import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as kms from "aws-cdk-lib/aws-kms";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as ses from "aws-cdk-lib/aws-ses";
@@ -27,6 +28,7 @@ interface ApiStackProps extends cdk.StackProps {
   jiraConfigTable: dynamodb.TableV2;
   reposTable: dynamodb.TableV2;
   settingsTable: dynamodb.TableV2;
+  secretsKey: kms.Key;
   infraTable: dynamodb.TableV2;
   billingTable: dynamodb.TableV2; // Retained — cross-stack ref still needed for CF migration
   bannersTable: dynamodb.TableV2;
@@ -298,6 +300,7 @@ export class ApiStack extends cdk.Stack {
         JIRA_CONFIG_TABLE_NAME: props.jiraConfigTable.tableName,
         REPOS_TABLE_NAME: props.reposTable.tableName,
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
+        SECRETS_KEY_ID: props.secretsKey.keyId,
         AWS_INSIGHTS_TABLE_NAME: props.awsInsightsTable.tableName,
         MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
         INFRA_TABLE_NAME: props.infraTable.tableName,
@@ -356,6 +359,7 @@ export class ApiStack extends cdk.Stack {
     props.jiraConfigTable.grantReadWriteData(this.gatewayFunction);
     props.reposTable.grantReadWriteData(this.gatewayFunction);
     props.settingsTable.grantReadWriteData(this.gatewayFunction);
+    props.secretsKey.grantEncryptDecrypt(this.gatewayFunction);
     props.awsInsightsTable.grantReadWriteData(this.gatewayFunction);
     props.infraTable.grantReadWriteData(this.gatewayFunction);
     props.billingTable.grantReadWriteData(this.gatewayFunction); // Retained for CF migration

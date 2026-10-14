@@ -45,6 +45,7 @@ const api = new ApiStack(app, `${prefix}-api`, {
   jiraConfigTable: database.jiraConfigTable,
   reposTable: database.reposTable,
   settingsTable: database.settingsTable,
+  secretsKey: database.secretsKey,
   infraTable: database.infraTable,
   billingTable: database.billingTable,
   bannersTable: database.bannersTable,
@@ -75,6 +76,7 @@ const worker = new WorkerStack(app, `${prefix}-worker`, {
   feedbackQueue: api.feedbackQueue,
   mcpProxyFunction: api.mcpProxyFunction,
   encryptionKey: database.encryptionKey,
+  secretsKey: database.secretsKey,
 });
 
 // --- Email ---

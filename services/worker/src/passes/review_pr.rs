@@ -529,6 +529,15 @@ pub async fn run(
     };
     let prior_context = format!("{prior_context}{label_context}{tests_context}");
 
+    // Live systems the team connected for this repo, if any.
+    let live = super::live_sources::LiveSources::load(
+        state,
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        msg.pr_number,
+    )
+    .await;
+
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(
         state,
@@ -544,6 +553,7 @@ pub async fn run(
         graph.as_ref(),
         &extra_context,
         &prior_context,
+        live.as_ref(),
         &mut usage,
     )
     .await;
@@ -578,13 +588,17 @@ pub async fn run(
     }
 
     // 2) Critic pass drops weak/false findings.
+    let live_evidence = live.as_ref().map(|l| l.evidence()).unwrap_or_default();
     let mut findings = review_agent::critique_findings(
         state,
         &provider,
         &diff,
         output.findings,
-        cfg.require_tests,
-        &answered_context,
+        review_agent::CriticContext {
+            require_tests: cfg.require_tests,
+            answered: &answered_context,
+            live_evidence: &live_evidence,
+        },
         &mut usage,
     )
     .await;
