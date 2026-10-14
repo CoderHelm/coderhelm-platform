@@ -398,7 +398,23 @@ Rules:
         super::write_guard::ScopeGuard::unscoped()
     };
 
-    let tools = feedback_tools();
+    let mut tools = feedback_tools();
+    let mut full_system = system.clone();
+    // Live systems the team connected for this repo, if any: read-only lookups
+    // so the fix rests on the system's real shape.
+    let live = super::live_sources::LiveSources::load(
+        state,
+        super::live_sources::Role::Coder,
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        msg.pr_number,
+    )
+    .await;
+    if let Some(l) = &live {
+        tools.extend(l.tools());
+        full_system.push_str(&l.prompt_section());
+    }
+
     let executor = FeedbackToolExecutor {
         github: &github,
         owner: &msg.repo_owner,
@@ -407,6 +423,8 @@ Rules:
         base_branch: &base,
         files_modified: std::sync::Mutex::new(false),
         scope_guard,
+        live: live.as_ref(),
+        state,
     };
 
     let mut messages = vec![(
@@ -419,7 +437,7 @@ Rules:
         state,
         &provider,
         model_id,
-        &system,
+        &full_system,
         &mut messages,
         &tools,
         &executor,
@@ -1202,6 +1220,9 @@ struct FeedbackToolExecutor<'a> {
     /// Ticket-scope guard: CI-only cycles may only write files the PR already
     /// changed (bounded escape). Human-directed feedback is unscoped.
     scope_guard: super::write_guard::ScopeGuard,
+    /// The team's connected live systems, read-only.
+    live: Option<&'a super::live_sources::LiveSources>,
+    state: &'a WorkerState,
 }
 
 #[async_trait::async_trait]
@@ -1211,6 +1232,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(live) = self.live {
+            if let Some(out) = live.handle(self.state, name, input).await {
+                return Ok(serde_json::json!(out));
+            }
+        }
         match name {
             "read_tree" => {
                 let tree = self
