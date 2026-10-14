@@ -34,6 +34,7 @@ interface WorkerStackProps extends cdk.StackProps {
   feedbackQueue: sqs.Queue;
   mcpProxyFunction: lambda.Function;
   encryptionKey: kms.Key;
+  secretsKey: kms.Key;
 }
 
 export class WorkerStack extends cdk.Stack {
@@ -127,6 +128,8 @@ export class WorkerStack extends cdk.Stack {
     props.jiraConfigTable.grantReadData(this.workerFunction);
     props.reposTable.grantReadWriteData(this.workerFunction);
     props.settingsTable.grantReadWriteData(this.workerFunction);
+    // Data-source keys: the worker reads them to run lookups, never writes them.
+    props.secretsKey.grantDecrypt(this.workerFunction);
     props.mcpConfigsTable.grantReadData(this.workerFunction);
     props.infraTable.grantReadWriteData(this.workerFunction);
     props.billingTable.grantReadWriteData(this.workerFunction); // Retained for CF migration

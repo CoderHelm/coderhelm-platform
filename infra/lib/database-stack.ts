@@ -29,6 +29,7 @@ export class DatabaseStack extends cdk.Stack {
   public readonly tracesTable: dynamodb.TableV2;
   public readonly checkpointsTable: dynamodb.TableV2;
   public readonly encryptionKey: kms.Key;
+  public readonly secretsKey: kms.Key;
 
   constructor(scope: Construct, id: string, props: DatabaseStackProps) {
     super(scope, id, props);
@@ -39,6 +40,16 @@ export class DatabaseStack extends cdk.Stack {
     this.encryptionKey = new kms.Key(this, "TableKey", {
       alias: `coderhelm-${props.stage}-dynamo`,
       description: "Coderhelm DynamoDB encryption key",
+      enableKeyRotation: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // KMS key that seals the keys teams give Coderhelm for their own systems
+    // (data sources). Separate from the table key so each service gets only the
+    // direction it needs: the gateway seals and opens, the worker only opens.
+    this.secretsKey = new kms.Key(this, "SecretsKey", {
+      alias: `coderhelm-${props.stage}-secrets`,
+      description: "Coderhelm: seals team-provided keys for data sources",
       enableKeyRotation: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });

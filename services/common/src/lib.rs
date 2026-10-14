@@ -13,6 +13,10 @@ pub mod claim;
 /// Teams notifications for alerts: channel resolution and Adaptive Cards.
 pub mod alert_notify;
 
+/// Read-only lookups against a team's own systems (their API today). Shared so
+/// the dashboard's test path and the reviewer's tool path enforce the same rules.
+pub mod live;
+
 /// GitHub's per-request override for the installation-token format, sent on
 /// `POST /app/installations/{id}/access_tokens`. GitHub is moving installation
 /// tokens from short opaque strings to ~520-char stateless JWT-style `ghs_…`

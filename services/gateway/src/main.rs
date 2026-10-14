@@ -22,6 +22,7 @@ pub struct AppState {
     pub s3: aws_sdk_s3::Client,
     pub cognito: aws_sdk_cognitoidentityprovider::Client,
     pub lambda: aws_sdk_lambda::Client,
+    pub kms: aws_sdk_kms::Client,
     pub http: reqwest::Client,
     pub secrets: models::Secrets,
     pub config: models::Config,
@@ -44,6 +45,7 @@ async fn main() -> Result<(), Error> {
     let s3 = aws_sdk_s3::Client::new(&aws_config);
     let cognito = aws_sdk_cognitoidentityprovider::Client::new(&aws_config);
     let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
+    let kms = aws_sdk_kms::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
 
     // Load secrets from Secrets Manager
@@ -76,6 +78,7 @@ async fn main() -> Result<(), Error> {
         s3,
         cognito,
         lambda: lambda_client,
+        kms,
         http: reqwest::Client::new(),
         secrets,
         config,
@@ -406,6 +409,32 @@ async fn main() -> Result<(), Error> {
         )
         .route("/plugins/:id/prompt", put(routes::plugins::update_prompt))
         .route("/plugins/:id/test", post(routes::plugins::test_connection))
+        // Data sources (read-only lookups for the reviewer)
+        .route("/data-sources", get(routes::data_sources::list))
+        .route(
+            "/data-sources/activity",
+            get(routes::data_sources::activity),
+        )
+        .route("/data-sources/api/probe", post(routes::data_sources::probe))
+        .route("/data-sources/api/check", post(routes::data_sources::check))
+        .route("/data-sources/api", post(routes::data_sources::create))
+        .route(
+            "/data-sources/:id",
+            put(routes::data_sources::update).delete(routes::data_sources::remove),
+        )
+        .route(
+            "/data-sources/:id/key",
+            post(routes::data_sources::replace_key),
+        )
+        .route("/data-sources/:id/test", post(routes::data_sources::test))
+        .route(
+            "/data-sources/:id/samples",
+            get(routes::data_sources::samples),
+        )
+        .route(
+            "/data-sources/:id/try",
+            post(routes::data_sources::try_lookup),
+        )
         // Memory browser
         .route("/memories", get(routes::memory::list_memories))
         .route("/memories/stats", get(routes::memory::memory_stats))

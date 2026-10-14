@@ -376,6 +376,8 @@ pub struct PrReviewToolExecutor<'a> {
     /// definition/caller/impact tools. None ⇒ those tools aren't offered.
     pub state: &'a WorkerState,
     pub graph: Option<&'a super::code_graph::Graph>,
+    /// The team's connected live systems this review may read from, if any.
+    pub live: Option<&'a super::live_sources::LiveSources>,
 }
 
 /// Structural lookup tools backed by the persistent code graph. Offered only
@@ -433,6 +435,11 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
         if let Some(out) = super::code_graph::handle_tool(self.state, self.graph, name, input).await
         {
             return Ok(json!(common::head_tail_str(&out, 8_000)));
+        }
+        if let Some(live) = self.live {
+            if let Some(out) = live.handle(self.state, name, input).await {
+                return Ok(json!(out));
+            }
         }
         match name {
             "read_file" => {
@@ -640,6 +647,7 @@ pub async fn generate_review(
     graph: Option<&super::code_graph::Graph>,
     graph_context: &str,
     prior_context: &str,
+    live: Option<&super::live_sources::LiveSources>,
     usage: &mut TokenUsage,
 ) -> ReviewOutput {
     let graph_note = if graph.is_some() {
@@ -670,7 +678,8 @@ pub async fn generate_review(
          PR has merged — is raised ONCE, as one finding with category \"question\" that says \
          exactly what has to be confirmed. Never state it as a fact, never repeat it in a second \
          finding, and do not raise it at all once a person has answered it. A search that finds \
-         nothing in other repositories is not evidence that something is undeployed. \
+         nothing in other repositories is not evidence that something is undeployed. When a \
+         LIVE SOURCE listed below can settle it, look it up instead of asking. \
          {REPLIES_RULE}\
          CI EVIDENCE: this PR's current CI results are provided below. Never claim an install, \
          build, or typecheck \"will fail\" when a GREEN check on this same head already ran it — \
@@ -695,8 +704,9 @@ pub async fn generate_review(
          nothing. If you are unsure whether something is a real problem, read more code until you \
          know.{graph_note}"
     );
+    let live_context = live.map(|l| l.prompt_section()).unwrap_or_default();
     let prompt = format!(
-        "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{graph_context}{prior_context}\n\
+        "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{graph_context}{prior_context}{live_context}\n\
          Explore with the tools as needed, then emit the JSON review."
     );
     let mut messages = vec![(
@@ -710,10 +720,14 @@ pub async fn generate_review(
         head_sha,
         state,
         graph,
+        live,
     };
     let mut tools = review_tools();
     if graph.is_some() {
         tools.extend(graph_tools());
+    }
+    if let Some(live) = live {
+        tools.extend(live.tools());
     }
     let reply = provider::converse(
         state,
@@ -777,6 +791,20 @@ const ANSWERED_CRITIC_NOTE: &str = " The prompt lists what people already resolv
      that changed since. A reply stating a fact outside the repository (a deploy is live, a \
      setting is in production) answers a candidate that only asks whether that fact holds.";
 
+const LIVE_CRITIC_NOTE: &str = " The prompt lists facts the reviewer looked up in the team's own \
+     running systems during this review. A candidate that rests on one of them is grounded even \
+     though the diff alone does not show it; judge it against what came back. A candidate that \
+     contradicts what came back is wrong: DROP it.";
+
+/// What the critic is told beyond the diff and the candidate findings.
+pub struct CriticContext<'a> {
+    pub require_tests: bool,
+    /// What people already resolved or answered on the PR.
+    pub answered: &'a str,
+    /// Facts looked up in the team's live systems during this review.
+    pub live_evidence: &'a str,
+}
+
 /// Critic pass: score each finding against the diff with claim-only context and
 /// DROP the weak/unsupported ones, and the ones people already settled on the
 /// PR (`answered_context`: the resolved threads and the conversation). Fail-open
@@ -786,10 +814,14 @@ pub async fn critique_findings(
     provider: &ModelProvider,
     diff: &str,
     findings: Vec<Finding>,
-    require_tests: bool,
-    answered_context: &str,
+    ctx: CriticContext<'_>,
     usage: &mut TokenUsage,
 ) -> Vec<Finding> {
+    let CriticContext {
+        require_tests,
+        answered: answered_context,
+        live_evidence,
+    } = ctx;
     if findings.is_empty() {
         return findings;
     }
@@ -823,8 +855,13 @@ pub async fn critique_findings(
     if !answered_context.is_empty() {
         system.push_str(ANSWERED_CRITIC_NOTE);
     }
+    if !live_evidence.is_empty() {
+        system.push_str(LIVE_CRITIC_NOTE);
+    }
     let system = system.as_str();
-    let prompt = format!("## Diff\n{diff}\n{answered_context}\n## Candidate findings\n{list}");
+    let prompt = format!(
+        "## Diff\n{diff}\n{answered_context}{live_evidence}\n## Candidate findings\n{list}"
+    );
     let mut messages = vec![(
         "user".to_string(),
         vec![json!({"type": "text", "text": prompt})],

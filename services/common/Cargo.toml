@@ -13,4 +13,10 @@ tracing = "0.1"
 # alert_notify: Teams cards for alerts
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-tokio = { version = "1", features = ["macros", "time"] }
+tokio = { version = "1", features = ["macros", "time", "net"] }
+# live: read-only lookups against a team's own systems
+graphql-parser = "0.4"
+url = "2"
+aws-sdk-kms = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }

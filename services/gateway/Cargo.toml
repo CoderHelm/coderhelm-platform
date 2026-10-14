@@ -30,6 +30,7 @@ aws-sdk-sts = "1"
 aws-sdk-cloudwatchlogs = "1"
 aws-sdk-cloudwatch = "1"
 aws-sdk-lambda = "1"
+aws-sdk-kms = "1"
 
 # Auth
 jsonwebtoken = "9"
