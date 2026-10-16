@@ -312,7 +312,7 @@ pub async fn run(
              something up that you can check yourself, and never say you can't see a file. \
              Answer what was asked and nothing more, in at most five short sentences or bullets, \
              with no headings and no tables. This is a reply, not a review: do not add new \
-             concerns, re-raise earlier ones, or say what must happen before merge. When the \
+             concerns or re-raise earlier ones. When the \
              person confirms a fact or a decision, accept it and say so in one line. {}{}{}{}{}",
             msg.repo_owner,
             msg.repo_name,
