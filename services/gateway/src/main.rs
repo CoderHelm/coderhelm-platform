@@ -23,6 +23,7 @@ pub struct AppState {
     pub cognito: aws_sdk_cognitoidentityprovider::Client,
     pub lambda: aws_sdk_lambda::Client,
     pub kms: aws_sdk_kms::Client,
+    pub sts: aws_sdk_sts::Client,
     pub http: reqwest::Client,
     pub secrets: models::Secrets,
     pub config: models::Config,
@@ -46,6 +47,7 @@ async fn main() -> Result<(), Error> {
     let cognito = aws_sdk_cognitoidentityprovider::Client::new(&aws_config);
     let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
     let kms = aws_sdk_kms::Client::new(&aws_config);
+    let sts = aws_sdk_sts::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
 
     // Load secrets from Secrets Manager
@@ -79,6 +81,7 @@ async fn main() -> Result<(), Error> {
         cognito,
         lambda: lambda_client,
         kms,
+        sts,
         http: reqwest::Client::new(),
         secrets,
         config,
@@ -418,6 +421,22 @@ async fn main() -> Result<(), Error> {
         .route("/data-sources/api/probe", post(routes::data_sources::probe))
         .route("/data-sources/api/check", post(routes::data_sources::check))
         .route("/data-sources/api", post(routes::data_sources::create))
+        .route(
+            "/data-sources/aws/setup",
+            get(routes::data_sources::aws_setup),
+        )
+        .route(
+            "/data-sources/aws/connect",
+            post(routes::data_sources::aws_connect),
+        )
+        .route(
+            "/data-sources/logs",
+            post(routes::data_sources::create_logs),
+        )
+        .route(
+            "/data-sources/database",
+            post(routes::data_sources::create_database),
+        )
         .route(
             "/data-sources/:id",
             put(routes::data_sources::update).delete(routes::data_sources::remove),

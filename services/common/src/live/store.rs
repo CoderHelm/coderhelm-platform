@@ -6,20 +6,51 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use serde_json::{json, Value};
 
 use super::api::AuthStyle;
+use super::aws::{new_external_id, AwsTarget};
 use super::redact::DEFAULT_HIDDEN;
 
 const SOURCE_PREFIX: &str = "DATASOURCE#";
 const LOG_PREFIX: &str = "DSLOG#";
+const EXTERNAL_ID_SK: &str = "DSAWS#external-id";
 /// Lookups stay in the activity log this long.
 const LOG_DAYS: i64 = 180;
 pub const MAX_SOURCES: usize = 20;
 
 type Item = HashMap<String, AttributeValue>;
 
-/// A connected source. Only the API kind exists today.
+/// What a source is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A GraphQL API, read with a key.
+    Api,
+    /// Log groups in the team's AWS account.
+    Logs,
+    /// A PostgreSQL database in the team's AWS account.
+    Database,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Api => "api",
+            Kind::Logs => "logs",
+            Kind::Database => "database",
+        }
+    }
+    pub fn parse(s: &str) -> Kind {
+        match s {
+            "logs" => Kind::Logs,
+            "database" => Kind::Database,
+            _ => Kind::Api,
+        }
+    }
+}
+
+/// A connected source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub id: String,
+    pub kind: Kind,
     pub name: String,
     pub url: String,
     pub auth: AuthStyle,
@@ -41,6 +72,8 @@ pub struct Source {
     pub last_checked_at: String,
     pub created_at: String,
     pub created_by: String,
+    /// Where in the team's AWS account a logs or database source reads.
+    pub aws: Option<AwsTarget>,
 }
 
 fn s(item: &Item, k: &str) -> String {
@@ -86,7 +119,7 @@ impl Source {
                 av_s(&format!("{SOURCE_PREFIX}{}", self.id)),
             ),
             ("record_type".to_string(), av_s("data_source")),
-            ("kind".to_string(), av_s("api")),
+            ("kind".to_string(), av_s(self.kind.as_str())),
             ("name".to_string(), av_s(&self.name)),
             ("url".to_string(), av_s(&self.url)),
             ("auth".to_string(), av_s(self.auth.as_str())),
@@ -117,6 +150,12 @@ impl Source {
         if let Some(k) = self.kinds {
             item.insert("kinds".to_string(), AttributeValue::N(k.to_string()));
         }
+        if let Some(a) = &self.aws {
+            item.insert(
+                "aws".to_string(),
+                av_s(&serde_json::to_string(a).unwrap_or_default()),
+            );
+        }
         item
     }
 
@@ -124,6 +163,7 @@ impl Source {
         let id = s(item, "sk").strip_prefix(SOURCE_PREFIX)?.to_string();
         Some(Source {
             id,
+            kind: Kind::parse(&s(item, "kind")),
             name: s(item, "name"),
             url: s(item, "url"),
             auth: AuthStyle::parse(&s(item, "auth")),
@@ -145,14 +185,26 @@ impl Source {
             last_checked_at: s(item, "last_checked_at"),
             created_at: s(item, "created_at"),
             created_by: s(item, "created_by"),
+            aws: serde_json::from_str(&s(item, "aws")).ok(),
         })
     }
 
     /// What a browser may see. The sealed key is never part of it.
     pub fn public_json(&self) -> Value {
+        let aws = self.aws.as_ref().map(|a| {
+            json!({
+                "account": a.account(),
+                "region": a.region,
+                "role_arn": a.role_arn,
+                "log_groups": a.log_groups,
+                "cluster": a.cluster_arn.rsplit(':').next().unwrap_or(""),
+                "database": a.database,
+            })
+        });
         json!({
             "id": self.id,
-            "kind": "api",
+            "kind": self.kind.as_str(),
+            "aws": aws,
             "name": self.name,
             "url": self.url,
             "status": self.status,
@@ -244,6 +296,49 @@ pub async fn delete_source(
         .await
         .map(|_| ())
         .map_err(|e| format!("delete data source: {e}"))
+}
+
+/// The team's private ID for AWS roles, made on first use and never changed.
+/// Only Coderhelm knows which team an ID belongs to, so a role that requires it
+/// can only be used on that team's behalf.
+pub async fn external_id(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+) -> Result<String, String> {
+    let get = || async {
+        dynamo
+            .get_item()
+            .table_name(table)
+            .key("pk", av_s(team_id))
+            .key("sk", av_s(EXTERNAL_ID_SK))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| format!("get external id: {e}"))
+            .map(|o| {
+                o.item()
+                    .map(|i| s(i, "external_id"))
+                    .filter(|x| !x.is_empty())
+            })
+    };
+    if let Some(id) = get().await? {
+        return Ok(id);
+    }
+    // Two first visits at once must end with one ID: only the first write lands.
+    let _ = dynamo
+        .put_item()
+        .table_name(table)
+        .item("pk", av_s(team_id))
+        .item("sk", av_s(EXTERNAL_ID_SK))
+        .item("record_type", av_s("data_source_external_id"))
+        .item("external_id", av_s(&new_external_id()))
+        .condition_expression("attribute_not_exists(pk)")
+        .send()
+        .await;
+    get()
+        .await?
+        .ok_or_else(|| "external id was not saved".to_string())
 }
 
 /// One lookup, as recorded. Written for every attempt, including refused ones.
@@ -362,6 +457,7 @@ mod tests {
     fn source() -> Source {
         Source {
             id: "01ABC".into(),
+            kind: Kind::Api,
             name: "api.example.com".into(),
             url: "https://api.example.com/graphql".into(),
             auth: AuthStyle::Bearer,
@@ -380,6 +476,7 @@ mod tests {
             last_checked_at: "2026-01-01T00:00:00Z".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             created_by: "a@example.com".into(),
+            aws: None,
         }
     }
 
@@ -389,6 +486,34 @@ mod tests {
         let item = src.to_item("TEAM#1");
         assert_eq!(s(&item, "sk"), "DATASOURCE#01ABC");
         assert_eq!(Source::from_item(&item).unwrap(), src);
+    }
+
+    #[test]
+    fn an_aws_source_round_trips() {
+        let mut src = source();
+        src.kind = Kind::Database;
+        src.key_sealed = String::new();
+        src.aws = Some(AwsTarget {
+            role_arn: "arn:aws:iam::123456789012:role/CoderhelmReadOnly".into(),
+            region: "us-east-1".into(),
+            cluster_arn: "arn:aws:rds:us-east-1:123456789012:cluster:app-db".into(),
+            secret_arn:
+                "arn:aws:secretsmanager:us-east-1:123456789012:secret:coderhelm-readonly-app-db-x"
+                    .into(),
+            database: "app".into(),
+            ..Default::default()
+        });
+        let item = src.to_item("TEAM#1");
+        assert_eq!(s(&item, "kind"), "database");
+        assert_eq!(Source::from_item(&item).unwrap(), src);
+        let v = src.public_json();
+        assert_eq!(v["kind"], "database");
+        assert_eq!(v["aws"]["cluster"], "app-db");
+        assert_eq!(v["aws"]["account"], "123456789012");
+        // An item saved before kinds existed reads as an API.
+        let mut old = source().to_item("TEAM#1");
+        old.remove("kind");
+        assert_eq!(Source::from_item(&old).unwrap().kind, Kind::Api);
     }
 
     #[test]

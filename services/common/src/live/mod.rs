@@ -5,8 +5,11 @@
 //! reviewer mid-review):
 //!
 //! - **Reads only.** A request is parsed and refused unless it is a single
-//!   GraphQL query ([`graphql::check_read_only`]). The request body is built
-//!   here from the checked text, so nothing else can ride along.
+//!   GraphQL query ([`graphql::check_read_only`]), a single SQL SELECT
+//!   ([`sql::check_read_only_sql`]) or a Logs Insights search over the log
+//!   groups a team shared ([`logs::check_search`]). What is sent is built here
+//!   from the checked text, so nothing else can ride along. SQL also runs in a
+//!   rolled-back read-only transaction as a user that can only read ([`db`]).
 //! - **One address.** Requests go to the registered HTTPS address and nowhere
 //!   else: redirects are not followed and addresses that resolve inside a
 //!   private network are refused ([`net`]).
@@ -15,12 +18,19 @@
 //!   before the result is shown or handed to a model ([`redact`]).
 //! - **Keys are sealed.** A team's API key is encrypted for that team alone
 //!   before it is stored ([`secret`]), and every lookup is logged ([`store`]).
+//! - **AWS through a read-only role.** Logs and databases are reached through a
+//!   role the team creates in its own account, usable only with that team's
+//!   private ID and only able to read ([`aws`]).
 
 pub mod api;
+pub mod aws;
+pub mod db;
 pub mod graphql;
+pub mod logs;
 pub mod net;
 pub mod redact;
 pub mod secret;
+pub mod sql;
 pub mod store;
 
 use serde::Serialize;
