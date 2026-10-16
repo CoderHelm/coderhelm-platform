@@ -65,6 +65,25 @@ where
     }
 }
 
+const READ_ONLY_PROOF: &str = "SELECT current_setting('transaction_read_only') AS ro";
+
+fn not_read_only() -> StepError {
+    StepError::new(
+        "read_only",
+        "The database didn't confirm this lookup was read-only, so it wasn't run.",
+        "Nothing was sent. Run the connection check again.",
+    )
+}
+
+/// True only when the database answered that the transaction is read-only.
+fn confirms_read_only(records: Option<&str>) -> bool {
+    records
+        .and_then(|r| serde_json::from_str::<Vec<Row>>(r).ok())
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|row| row.get("ro").and_then(|v| v.as_str()).map(|v| v == "on"))
+        .unwrap_or(false)
+}
+
 /// Runs `sql` inside a read-only transaction that is always rolled back.
 /// `sql` must already be checked, or be one of this module's own reads.
 async fn read_in_rolled_back_transaction(
@@ -98,6 +117,22 @@ async fn read_in_rolled_back_transaction(
                 .send()
                 .await
                 .map_err(|e| data_api_error(&e))?;
+        }
+        // Proof from the database itself, before anything else runs, that this
+        // transaction can't write. No proof, no lookup.
+        let guard = client
+            .execute_statement()
+            .resource_arn(&t.cluster_arn)
+            .secret_arn(&t.secret_arn)
+            .database(&t.database)
+            .transaction_id(&tx_id)
+            .format_records_as(aws_sdk_rdsdata::types::RecordsFormatType::Json)
+            .sql(READ_ONLY_PROOF)
+            .send()
+            .await
+            .map_err(|e| data_api_error(&e))?;
+        if !confirms_read_only(guard.formatted_records()) {
+            return Err(not_read_only());
         }
         let out = client
             .execute_statement()
@@ -235,6 +270,61 @@ const L_SIGN_IN: &str = "Sign in to the database";
 const L_READ_ONLY: &str = "The database user can only read";
 const L_READ: &str = "Read the list of tables";
 
+/// Why the signed-in user could change something, or `None` when it can only
+/// read. Anything the database didn't answer counts against it.
+fn access_problem(access: &Row) -> Option<StepError> {
+    let who = access
+        .get("who")
+        .and_then(|v| v.as_str())
+        .unwrap_or("This user");
+    let flag = |k: &str| access.get(k).and_then(|v| v.as_bool()).unwrap_or(true);
+    let writable = access
+        .get("writable_tables")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    let fix =
+        "Run the setup script and choose this database: it creates a user that can only read.";
+    if flag("powerful") || flag("admin_member") {
+        return Some(StepError::new(
+            "read_only",
+            format!("{who} is an admin user, so it could change data."),
+            fix,
+        ));
+    }
+    if writable != 0 {
+        let n = if writable < 0 {
+            "some".to_string()
+        } else {
+            writable.to_string()
+        };
+        return Some(StepError::new(
+            "read_only",
+            format!("{who} can change {n} tables."),
+            fix,
+        ));
+    }
+    None
+}
+
+/// Checks again that the user Coderhelm signs in as can't change any table.
+/// The agents run this before their first lookup in a database, so a user
+/// given more rights after connecting is refused, not used.
+pub async fn verify_read_only_user(session: &Session, t: &AwsTarget) -> Result<(), StepError> {
+    let client = rdsdata_client(session);
+    let rows = read_in_rolled_back_transaction(&client, t, ACCESS_CHECK).await?;
+    let access = rows.into_iter().next().ok_or_else(not_read_only)?;
+    match access_problem(&access) {
+        Some(mut e) => {
+            e.message = format!(
+                "{} Coderhelm won't use this database until that's fixed.",
+                e.message
+            );
+            Err(e)
+        }
+        None => Ok(()),
+    }
+}
+
 /// The outcome of checking a database before it is connected.
 pub struct DbReport {
     pub ok: bool,
@@ -320,33 +410,7 @@ pub async fn connect_checks(session: Result<Session, StepError>, t: &AwsTarget) 
         .to_string();
     checks.push(pass("sign_in", L_SIGN_IN, format!("Signed in as {who}.")));
 
-    let flag = |k: &str| access.get(k).and_then(|v| v.as_bool()).unwrap_or(true);
-    let writable = access
-        .get("writable_tables")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(-1);
-    if flag("powerful") || flag("admin_member") {
-        let e = StepError::new(
-            "read_only",
-            format!("{who} is an admin user, so it could change data."),
-            "Run the setup script and choose this database: it creates a user that can only read.",
-        );
-        checks.push(fail("read_only", L_READ_ONLY, &e));
-        return failed(checks);
-    }
-    if writable != 0 {
-        let e = StepError::new(
-            "read_only",
-            format!(
-                "{who} can change {} tables.",
-                if writable < 0 {
-                    "some".to_string()
-                } else {
-                    writable.to_string()
-                }
-            ),
-            "Run the setup script and choose this database: it creates a user that can only read.",
-        );
+    if let Some(e) = access_problem(&access) {
         checks.push(fail("read_only", L_READ_ONLY, &e));
         return failed(checks);
     }
@@ -417,6 +481,42 @@ mod tests {
         for sql in [ACCESS_CHECK, SCHEMA_READ] {
             check_read_only_sql(sql, &[]).unwrap_or_else(|e| panic!("{e}"));
         }
+    }
+
+    #[test]
+    fn only_a_clear_yes_counts_as_read_only() {
+        assert!(confirms_read_only(Some(r#"[{"ro":"on"}]"#)));
+        for no in [
+            Some(r#"[{"ro":"off"}]"#),
+            Some("[]"),
+            Some("not json"),
+            Some(r#"[{"x":"on"}]"#),
+            None,
+        ] {
+            assert!(!confirms_read_only(no), "{no:?}");
+        }
+        check_read_only_sql(READ_ONLY_PROOF, &[]).unwrap();
+    }
+
+    #[test]
+    fn any_write_right_or_missing_answer_is_a_problem() {
+        let row = |v: Value| v.as_object().unwrap().clone();
+        let clean = json!({"who": "reader", "powerful": false, "admin_member": false, "writable_tables": 0});
+        assert!(access_problem(&row(clean.clone())).is_none());
+        let mut admin = clean.clone();
+        admin["admin_member"] = json!(true);
+        assert!(access_problem(&row(admin))
+            .unwrap()
+            .message
+            .contains("admin"));
+        let mut writes = clean.clone();
+        writes["writable_tables"] = json!(3);
+        assert!(access_problem(&row(writes))
+            .unwrap()
+            .message
+            .contains("can change 3 tables"));
+        // An answer that is missing is treated as the worst case.
+        assert!(access_problem(&row(json!({"who": "reader"}))).is_some());
     }
 
     #[tokio::test]

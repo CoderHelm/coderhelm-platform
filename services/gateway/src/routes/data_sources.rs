@@ -610,18 +610,21 @@ pub async fn try_lookup(
                 Err(e) => Err(e),
                 Ok(_) => match live_aws::assume(&state.sts, t, &claims.email).await {
                     Err(e) => Err(e),
-                    Ok(session) => {
-                        db::run_sql(&session, t, query, &source.hidden_fields, TRY_RESULT_CHARS)
-                            .await
-                            .map(|l| Tried {
-                                text: l.statement,
-                                fields: l.tables,
-                                result: l.result,
-                                hidden_count: l.hidden_count,
-                                ms: l.ms,
-                                note: format!("{} rows", l.rows),
-                            })
-                    }
+                    Ok(session) => match db::verify_read_only_user(&session, t).await {
+                        Err(e) => Err(e),
+                        Ok(()) => {
+                            db::run_sql(&session, t, query, &source.hidden_fields, TRY_RESULT_CHARS)
+                                .await
+                                .map(|l| Tried {
+                                    text: l.statement,
+                                    fields: l.tables,
+                                    result: l.result,
+                                    hidden_count: l.hidden_count,
+                                    ms: l.ms,
+                                    note: format!("{} rows", l.rows),
+                                })
+                        }
+                    },
                 },
             }
         }

@@ -80,6 +80,8 @@ pub struct LiveSources {
     loaded: Vec<Loaded>,
     lookups: AtomicUsize,
     evidence: Mutex<Vec<String>>,
+    /// Databases whose user was re-checked as read-only during this run.
+    verified: Mutex<std::collections::HashSet<String>>,
 }
 
 impl LiveSources {
@@ -144,6 +146,7 @@ impl LiveSources {
             loaded,
             lookups: AtomicUsize::new(0),
             evidence: Mutex::new(Vec::new()),
+            verified: Mutex::new(Default::default()),
         })
     }
 
@@ -398,6 +401,20 @@ impl LiveSources {
                 // Refused lookups never take on the team's role.
                 common::live::sql::check_read_only_sql(sql, &l.source.hidden_fields)?;
                 let session = live_aws::assume(&state.sts, t, &actor).await?;
+                // The user was checked when the database was connected; check
+                // again before this run's first lookup, in case someone gave it
+                // more rights since. A user that could write is never used.
+                let seen = self
+                    .verified
+                    .lock()
+                    .map(|v| v.contains(&l.source.id))
+                    .unwrap_or(false);
+                if !seen {
+                    db::verify_read_only_user(&session, t).await?;
+                    if let Ok(mut v) = self.verified.lock() {
+                        v.insert(l.source.id.clone());
+                    }
+                }
                 db::run_sql(&session, t, sql, &l.source.hidden_fields, RESULT_CHARS)
                     .await
                     .map(|r| {
@@ -631,6 +648,7 @@ mod tests {
                 .collect(),
             lookups: AtomicUsize::new(0),
             evidence: Mutex::new(Vec::new()),
+            verified: Mutex::new(Default::default()),
         }
     }
 
