@@ -125,9 +125,10 @@ pub const COPY_RULE: &str = "USER-FACING TEXT: the wording of copy, labels, mess
 /// How the reviewer sounds. It works alongside the team, so it writes like a
 /// colleague, not a gatekeeper.
 pub const TONE_RULE: &str = "TONE: write like a helpful colleague: calm, plain and brief. State \
-     a concern once, with the reason, and let the people who own the code decide. No headings, no \
-     bold, no all-caps, no ultimatums (\"must\", \"before merge\", \"I'd request changes \
-     until\"), and never argue with a decision a person has made. ";
+     a concern once, with the reason, and let the people who own the code decide. Pointing out \
+     what is worth checking before merge is a useful heads-up; phrase it as one. Never a demand: \
+     no headings, no bold, no all-caps, no ultimatums (\"must\", \"blocking\", \"I'd request \
+     changes until\"), and never argue with a decision a person has made. ";
 
 /// Most replies shown per thread, and most conversation comments shown.
 const MAX_THREAD_REPLIES: usize = 10;
@@ -1285,12 +1286,13 @@ mod copy_rule_tests {
 
     #[test]
     fn the_reviewer_writes_like_a_colleague() {
-        for banned in [
-            "No headings",
+        for rule in [
+            "no headings",
             "no ultimatums",
             "never argue with a decision",
         ] {
-            assert!(TONE_RULE.contains(banned), "{banned}");
+            assert!(TONE_RULE.contains(rule), "{rule}");
         }
+        assert!(TONE_RULE.contains("worth checking before merge is a useful heads-up"));
     }
 }
