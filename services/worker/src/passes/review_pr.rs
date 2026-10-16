@@ -306,9 +306,18 @@ pub async fn run(
         let system = format!(
             "You are a senior engineer answering a question about an open PR in {}/{}. Use the diff \
              and PR description as ground truth; be concrete and cite file:line. If the answer \
-             isn't determinable from the diff, say so.{}{}{}",
+             isn't determinable from the diff, say so. \
+             You have read-only tools to read and search the repository at the PR head. Use them \
+             to check anything the answer depends on: never ask a person to search, grep or look \
+             something up that you can check yourself, and never say you can't see a file. \
+             Answer what was asked and nothing more, in at most five short sentences or bullets, \
+             with no headings and no tables. This is a reply, not a review: do not add new \
+             concerns, re-raise earlier ones, or say what must happen before merge. When the \
+             person confirms a fact or a decision, accept it and say so in one line. {}{}{}{}{}",
             msg.repo_owner,
             msg.repo_name,
+            review_agent::COPY_RULE,
+            review_agent::TONE_RULE,
             super::format_instructions_block(&repo_instructions),
             org_block,
             extra,
@@ -317,13 +326,54 @@ pub async fn run(
             "PR #{}: {title}\n\n{pr_body}\n\n## Question from a reviewer\n{question}\n\n## Diff (base...head)\n{diff}",
             msg.pr_number,
         );
-        let answer = provider::converse_simple(
+        // The same read-only tools a review has, so an answer rests on the code
+        // instead of on what the diff happens to show.
+        let live = super::live_sources::LiveSources::load(
+            state,
+            super::live_sources::Role::Reviewer,
+            &msg.team_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            msg.pr_number,
+        )
+        .await;
+        let system = match &live {
+            Some(l) => format!("{system}{}", l.prompt_section()),
+            None => system,
+        };
+        let executor = review_agent::PrReviewToolExecutor {
+            github: &github,
+            owner: &msg.repo_owner,
+            repo: &msg.repo_name,
+            head_sha: &head_sha,
+            state,
+            graph: None,
+            live: live.as_ref(),
+        };
+        let mut tools = review_agent::review_tools();
+        if let Some(l) = &live {
+            tools.extend(l.tools());
+        }
+        let mut messages = vec![(
+            "user".to_string(),
+            vec![serde_json::json!({"type": "text", "text": prompt})],
+        )];
+        let answer = provider::converse(
             state,
             &provider,
             provider.heavy_model_id(),
             &system,
-            &prompt,
+            &mut messages,
+            &tools,
+            &executor,
             &mut usage,
+            crate::agent::llm::ConverseOptions {
+                max_turns: 12,
+                max_tokens: 2048,
+                deadline: None,
+                effort: None,
+            },
+            None,
+            None,
         )
         .await
         .unwrap_or_else(|e| format!("I couldn't answer that automatically ({e})."));
