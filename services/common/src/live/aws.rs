@@ -294,6 +294,7 @@ if [ -n "$CLUSTERS" ]; then
   read -r -p "Which one should Coderhelm read? [0-$i]: " PICK </dev/tty
   if [ "${{PICK:-0}}" -gt 0 ] 2>/dev/null; then
     CLUSTER_ID=$(echo "$CLUSTERS" | sed -n "${{PICK}}p")
+    if [ -z "$CLUSTER_ID" ]; then echo "There is no database number $PICK. Run the script again."; exit 1; fi
     CLUSTER_ARN=$(aws rds describe-db-clusters --region "$REGION" --db-cluster-identifier "$CLUSTER_ID" --query 'DBClusters[0].DBClusterArn' --output text)
     ADMIN_SECRET=$(aws rds describe-db-clusters --region "$REGION" --db-cluster-identifier "$CLUSTER_ID" --query 'DBClusters[0].MasterUserSecret.SecretArn' --output text)
     if [ -z "$ADMIN_SECRET" ] || [ "$ADMIN_SECRET" = "None" ]; then
@@ -306,7 +307,7 @@ if [ -n "$CLUSTERS" ]; then
     run_sql() {{ aws rds-data execute-statement --region "$REGION" --resource-arn "$CLUSTER_ARN" --secret-arn "$ADMIN_SECRET" --database "$DB_NAME" --sql "$1" >/dev/null; }}
     echo "Creating the database user {DB_USER}, which can only read..."
     run_sql "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{DB_USER}') THEN CREATE ROLE {DB_USER} LOGIN; END IF; END \$\$"
-    run_sql "ALTER ROLE {DB_USER} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD '$PW'"
+    run_sql "ALTER ROLE {DB_USER} WITH LOGIN NOCREATEDB NOCREATEROLE PASSWORD '$PW'"
     run_sql "GRANT pg_read_all_data TO {DB_USER}"
     run_sql "ALTER ROLE {DB_USER} SET default_transaction_read_only = on"
     run_sql "ALTER ROLE {DB_USER} SET statement_timeout = '15s'"
