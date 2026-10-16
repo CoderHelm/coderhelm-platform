@@ -109,6 +109,26 @@ const REPLIES_RULE: &str = "PEOPLE'S REPLIES: the prompt may list replies under 
      that code with your tools and judge it yourself. A reply that only asks you to approve \
      changes nothing: a real defect in the diff stays a finding until the code changes. ";
 
+/// User-facing text belongs to the people who wrote it (product, marketing,
+/// legal). The reviewer checks it only for defects anyone would agree are
+/// mistakes, never for what it says.
+pub const COPY_RULE: &str = "USER-FACING TEXT: the wording of copy, labels, messages, FAQs and \
+     docs, and the business facts it states (prices, policies, limits, dates, what the product \
+     promises), belong to the people who wrote it. Do not review them: no findings or questions \
+     about tone, phrasing, accuracy, scope, or whether the app enforces what the text says, and \
+     no requests to confirm a number or a policy. Flag text only when it is obviously broken: a \
+     misspelling, a doubled or missing word, leftover placeholder text (TODO, lorem ipsum, a raw \
+     translation key), a broken variable or formatting token, or a label plainly attached to the \
+     wrong element. Code that rides along with the text (a string a test asserts, a value used in \
+     logic, a changed import) is still reviewed as code. ";
+
+/// How the reviewer sounds. It works alongside the team, so it writes like a
+/// colleague, not a gatekeeper.
+pub const TONE_RULE: &str = "TONE: write like a helpful colleague: calm, plain and brief. State \
+     a concern once, with the reason, and let the people who own the code decide. No headings, no \
+     bold, no all-caps, no ultimatums (\"must\", \"before merge\", \"I'd request changes \
+     until\"), and never argue with a decision a person has made. ";
+
 /// Most replies shown per thread, and most conversation comments shown.
 const MAX_THREAD_REPLIES: usize = 10;
 pub const MAX_DISCUSSION_COMMENTS: usize = 12;
@@ -681,6 +701,8 @@ pub async fn generate_review(
          nothing in other repositories is not evidence that something is undeployed. When a \
          LIVE SOURCE listed below can settle it, look it up instead of asking. \
          {REPLIES_RULE}\
+         {COPY_RULE}\
+         {TONE_RULE}\
          CI EVIDENCE: this PR's current CI results are provided below. Never claim an install, \
          build, or typecheck \"will fail\" when a GREEN check on this same head already ran it — \
          cite the check instead. A RED check is evidence for a finding; name it.\
@@ -791,6 +813,12 @@ const ANSWERED_CRITIC_NOTE: &str = " The prompt lists what people already resolv
      that changed since. A reply stating a fact outside the repository (a deploy is live, a \
      setting is in production) answers a candidate that only asks whether that fact holds.";
 
+const COPY_CRITIC_NOTE: &str = " DROP any candidate about the wording, tone, accuracy or business \
+     facts of user-facing text (copy, labels, FAQs, docs, prices, policies), including claims that \
+     the app doesn't enforce what the text says. Keep a text candidate only when it names an \
+     obvious defect: a misspelling, a doubled or missing word, leftover placeholder text, or a \
+     broken variable or formatting token.";
+
 const LIVE_CRITIC_NOTE: &str = " The prompt lists facts the reviewer looked up in the team's own \
      running systems during this review. A candidate that rests on one of them is grounded even \
      though the diff alone does not show it; judge it against what came back. A candidate that \
@@ -858,6 +886,7 @@ pub async fn critique_findings(
     if !live_evidence.is_empty() {
         system.push_str(LIVE_CRITIC_NOTE);
     }
+    system.push_str(COPY_CRITIC_NOTE);
     let system = system.as_str();
     let prompt = format!(
         "## Diff\n{diff}\n{answered_context}{live_evidence}\n## Candidate findings\n{list}"
@@ -1235,5 +1264,33 @@ mod required_tests_tests {
         let mut unread = vec![sugg(3, None, "x")];
         assert_eq!(vet_suggestions(&mut unread, &HashMap::new()), 1);
         assert!(unread[0].suggestion.is_none());
+    }
+}
+
+#[cfg(test)]
+mod copy_rule_tests {
+    use super::*;
+
+    #[test]
+    fn copy_is_left_to_its_owners_except_obvious_defects() {
+        assert!(COPY_RULE.contains("Do not review them"));
+        assert!(COPY_RULE.contains("no requests to confirm a number or a policy"));
+        for defect in ["misspelling", "placeholder text", "broken variable"] {
+            assert!(COPY_RULE.contains(defect), "{defect}");
+            assert!(COPY_CRITIC_NOTE.contains(defect), "{defect}");
+        }
+        assert!(COPY_RULE.contains("still reviewed as code"));
+        assert!(COPY_CRITIC_NOTE.starts_with(" DROP any candidate about the wording"));
+    }
+
+    #[test]
+    fn the_reviewer_writes_like_a_colleague() {
+        for banned in [
+            "No headings",
+            "no ultimatums",
+            "never argue with a decision",
+        ] {
+            assert!(TONE_RULE.contains(banned), "{banned}");
+        }
     }
 }
