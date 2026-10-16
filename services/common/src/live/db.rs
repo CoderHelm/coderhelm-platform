@@ -533,4 +533,149 @@ mod tests {
             .unwrap_err();
         assert!(e.is_refusal());
     }
+
+    /// Against a real database set up by the setup script. Set LIVE_SETUP_CODE
+    /// (the `coderhelm:` line) and LIVE_EXTERNAL_ID, then run with
+    /// `cargo test -- --ignored real_database`. Tries to write five ways; every
+    /// one must fail. Point it only at a database where a stray empty table
+    /// named coderhelm_probe would be harmless, or set LIVE_READ_ONLY_PROBE to
+    /// only check and read.
+    #[tokio::test]
+    #[ignore = "needs a real AWS account"]
+    async fn real_database_reads_and_refuses_every_write() {
+        use super::super::aws;
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
+        let conf = aws_config::load_from_env().await;
+        let sts = aws_sdk_sts::Client::new(&conf);
+        let mut t = aws::parse_setup_code(&env("LIVE_SETUP_CODE")).unwrap();
+        t.external_id = env("LIVE_EXTERNAL_ID");
+        assert!(!aws::opens_without_private_id(&sts, &t).await);
+        let session = aws::assume(&sts, &t, "integration-test").await.unwrap();
+
+        let report = connect_checks(Ok(session.clone()), &t).await;
+        for c in &report.checks {
+            println!("check {} ok={} {}", c.id, c.ok, c.detail);
+        }
+        assert!(report.ok);
+        verify_read_only_user(&session, &t).await.unwrap();
+        let first = report
+            .schema
+            .as_deref()
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .trim_start_matches("table ")
+            .to_string();
+        let r = run_sql(
+            &session,
+            &t,
+            &format!("SELECT count(*) AS n FROM {first}"),
+            &[],
+            2000,
+        )
+        .await
+        .unwrap();
+        println!("read ok: {} rows in {}ms", r.rows, r.ms);
+        // On a production database, stop at reading: LIVE_READ_ONLY_PROBE=1.
+        if std::env::var("LIVE_READ_ONLY_PROBE").is_ok() {
+            return;
+        }
+
+        // 1. The checker refuses before sending.
+        assert!(run_sql(
+            &session,
+            &t,
+            "CREATE TABLE coderhelm_probe (x int)",
+            &[],
+            100
+        )
+        .await
+        .unwrap_err()
+        .is_refusal());
+        let client = rdsdata_client(&session);
+        // 2. Inside our transaction, even unchecked text can't write.
+        let e =
+            read_in_rolled_back_transaction(&client, &t, "CREATE TABLE coderhelm_probe (x int)")
+                .await
+                .unwrap_err();
+        println!("2 read-only transaction: {}", e.message);
+        assert!(e.message.contains("read-only transaction"));
+        // 3. No transaction at all: the user defaults to read-only.
+        let e = client
+            .execute_statement()
+            .resource_arn(&t.cluster_arn)
+            .secret_arn(&t.secret_arn)
+            .database(&t.database)
+            .sql("CREATE TABLE coderhelm_probe (x int)")
+            .send()
+            .await
+            .unwrap_err();
+        let m = e
+            .as_service_error()
+            .and_then(|s| aws_sdk_rdsdata::error::ProvideErrorMetadata::message(s))
+            .unwrap_or("")
+            .to_string();
+        println!("3 no transaction: {m}");
+        assert!(m.contains("read-only"));
+        // 4. Asking for a writable transaction: the user has no right to write.
+        let tx = client
+            .begin_transaction()
+            .resource_arn(&t.cluster_arn)
+            .secret_arn(&t.secret_arn)
+            .database(&t.database)
+            .send()
+            .await
+            .unwrap();
+        let tx_id = tx.transaction_id().unwrap().to_string();
+        let _ = client
+            .execute_statement()
+            .resource_arn(&t.cluster_arn)
+            .secret_arn(&t.secret_arn)
+            .database(&t.database)
+            .transaction_id(&tx_id)
+            .sql("SET TRANSACTION READ WRITE")
+            .send()
+            .await;
+        let e = client
+            .execute_statement()
+            .resource_arn(&t.cluster_arn)
+            .secret_arn(&t.secret_arn)
+            .database(&t.database)
+            .transaction_id(&tx_id)
+            .sql(format!("DELETE FROM {first} WHERE false"))
+            .send()
+            .await
+            .unwrap_err();
+        let m = e
+            .as_service_error()
+            .and_then(|s| aws_sdk_rdsdata::error::ProvideErrorMetadata::message(s))
+            .unwrap_or("")
+            .to_string();
+        println!("4 writable transaction: {m}");
+        assert!(m.contains("permission denied") || m.contains("read-only"));
+        // 5. The role may not commit anything.
+        let e = client
+            .commit_transaction()
+            .resource_arn(&t.cluster_arn)
+            .secret_arn(&t.secret_arn)
+            .transaction_id(&tx_id)
+            .send()
+            .await
+            .unwrap_err();
+        let code = e
+            .as_service_error()
+            .and_then(|s| aws_sdk_rdsdata::error::ProvideErrorMetadata::code(s))
+            .unwrap_or("")
+            .to_string();
+        println!("5 commit: {code}");
+        assert!(code.contains("AccessDenied") || code.contains("Forbidden"));
+        let _ = client
+            .rollback_transaction()
+            .resource_arn(&t.cluster_arn)
+            .secret_arn(&t.secret_arn)
+            .transaction_id(&tx_id)
+            .send()
+            .await;
+    }
 }

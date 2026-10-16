@@ -298,6 +298,12 @@ if [ -n "$CLUSTERS" ]; then
     CLUSTER_ARN=$(aws rds describe-db-clusters --region "$REGION" --db-cluster-identifier "$CLUSTER_ID" --query 'DBClusters[0].DBClusterArn' --output text)
     ADMIN_SECRET=$(aws rds describe-db-clusters --region "$REGION" --db-cluster-identifier "$CLUSTER_ID" --query 'DBClusters[0].MasterUserSecret.SecretArn' --output text)
     if [ -z "$ADMIN_SECRET" ] || [ "$ADMIN_SECRET" = "None" ]; then
+      # The AWS query editor keeps the admin login under a standard name.
+      RES_ID=$(aws rds describe-db-clusters --region "$REGION" --db-cluster-identifier "$CLUSTER_ID" --query 'DBClusters[0].DbClusterResourceId' --output text)
+      ADMIN_USER=$(aws rds describe-db-clusters --region "$REGION" --db-cluster-identifier "$CLUSTER_ID" --query 'DBClusters[0].MasterUsername' --output text)
+      ADMIN_SECRET=$(aws secretsmanager list-secrets --region "$REGION" --filters Key=name,Values="rds-db-credentials/$RES_ID/$ADMIN_USER/" --query 'SecretList[0].ARN' --output text)
+    fi
+    if [ -z "$ADMIN_SECRET" ] || [ "$ADMIN_SECRET" = "None" ]; then
       read -r -p "Paste the ARN of a secret with this database's admin login: " ADMIN_SECRET </dev/tty
     fi
     DB_NAME=$(aws rds describe-db-clusters --region "$REGION" --db-cluster-identifier "$CLUSTER_ID" --query 'DBClusters[0].DatabaseName' --output text)
@@ -319,7 +325,7 @@ if [ -n "$CLUSTERS" ]; then
       aws secretsmanager create-secret --region "$REGION" --name "$SECRET_NAME" --description "Coderhelm read-only database user" --secret-string "$SECRET_VALUE" >/dev/null
     fi
     SECRET_ARN=$(aws secretsmanager describe-secret --region "$REGION" --secret-id "$SECRET_NAME" --query ARN --output text)
-    aws iam put-role-policy --role-name "$ROLE" --policy-name coderhelm-read-database --policy-document "$(echo '{db}' | sed -e "s#CLUSTER_ARN#$CLUSTER_ARN#" -e "s#ACCOUNT_ID#$ACCOUNT#")"
+    aws iam put-role-policy --role-name "$ROLE" --policy-name "coderhelm-read-database-$CLUSTER_ID" --policy-document "$(echo '{db}' | sed -e "s#CLUSTER_ARN#$CLUSTER_ARN#" -e "s#ACCOUNT_ID#$ACCOUNT#")"
     DB_PART=",\"cluster_arn\":\"$CLUSTER_ARN\",\"secret_arn\":\"$SECRET_ARN\",\"database\":\"$DB_NAME\""
     echo "Database user ready. It can read every table and change none."
   fi
@@ -560,6 +566,8 @@ mod tests {
         assert!(s.contains("rds-data:CommitTransaction"));
         assert!(s.contains("default_transaction_read_only = on"));
         assert!(s.trim_end().ends_with("coderhelm_setup"));
+        // one permission per database, so adding a second keeps the first
+        assert!(s.contains("--policy-name \"coderhelm-read-database-$CLUSTER_ID\""));
         // nothing in the policies can write
         for p in [logs_policy(), database_policy_template("1")] {
             for st in p["Statement"].as_array().unwrap() {
@@ -601,5 +609,18 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// Writes the setup script to the file named by SETUP_SCRIPT_OUT, for
+    /// running it by hand. Needs SETUP_ACCOUNT and SETUP_EXTERNAL_ID.
+    #[test]
+    #[ignore = "writes a file"]
+    fn write_setup_script() {
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
+        std::fs::write(
+            env("SETUP_SCRIPT_OUT"),
+            setup_script(&env("SETUP_ACCOUNT"), &env("SETUP_EXTERNAL_ID")),
+        )
+        .unwrap();
     }
 }
