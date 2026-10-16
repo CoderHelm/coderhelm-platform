@@ -17,6 +17,8 @@ pub struct WorkerState {
     pub bedrock: aws_sdk_bedrockruntime::Client, // Used for Titan embeddings only (not LLM)
     pub lambda: aws_sdk_lambda::Client,
     pub kms: aws_sdk_kms::Client,
+    /// Takes on the read-only roles teams create for their logs and databases.
+    pub sts: aws_sdk_sts::Client,
     pub sqs: aws_sdk_sqs::Client,
     pub codebuild: aws_sdk_codebuild::Client,
     pub logs: aws_sdk_cloudwatchlogs::Client,
@@ -42,6 +44,7 @@ async fn main() -> Result<(), Error> {
     let codebuild = aws_sdk_codebuild::Client::new(&aws_config);
     let logs = aws_sdk_cloudwatchlogs::Client::new(&aws_config);
     let kms = aws_sdk_kms::Client::new(&aws_config);
+    let sts = aws_sdk_sts::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
 
     let config = models::Config::from_env();
@@ -54,6 +57,7 @@ async fn main() -> Result<(), Error> {
         bedrock,
         lambda: lambda_client,
         kms,
+        sts,
         sqs,
         codebuild,
         logs,

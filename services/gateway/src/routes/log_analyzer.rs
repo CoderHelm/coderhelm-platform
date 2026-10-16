@@ -77,7 +77,10 @@ pub fn valid_log_group(name: &str) -> bool {
 /// The team's External ID for the CoderHelmLogReader role trust policy:
 /// created once per team and stored, so the console stack, a manually made
 /// role and a page reload all agree on it, and a client can't pick it.
-async fn team_external_id(state: &AppState, team_id: &str) -> Result<String, StatusCode> {
+pub(crate) async fn team_external_id(
+    state: &AppState,
+    team_id: &str,
+) -> Result<String, StatusCode> {
     let table = &state.config.aws_insights_table_name;
     let read = || async {
         state

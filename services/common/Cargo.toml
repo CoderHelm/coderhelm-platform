@@ -20,3 +20,13 @@ url = "2"
 aws-sdk-kms = "1"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
+# live: a team's AWS account (logs and databases), through a role it creates
+aws-sdk-sts = "1"
+aws-sdk-rdsdata = "1"
+aws-sdk-cloudwatchlogs = "1"
+sqlparser = { version = "0.59", features = ["visitor"] }
+regex = "1"
+
+[dev-dependencies]
+# live: the ignored tests against a real AWS account
+aws-config = { version = "1", features = ["behavior-version-latest"] }

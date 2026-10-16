@@ -130,6 +130,16 @@ export class WorkerStack extends cdk.Stack {
     props.settingsTable.grantReadWriteData(this.workerFunction);
     // Data-source keys: the worker reads them to run lookups, never writes them.
     props.secretsKey.grantDecrypt(this.workerFunction);
+
+    // Data sources in a team's own AWS account (logs, a database): the agents
+    // take on the read-only role the team created. Limited to those roles'
+    // names, so the worker can't be pointed at any other role.
+    this.workerFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["sts:AssumeRole"],
+        resources: ["arn:aws:iam::*:role/CoderHelmLogReader", "arn:aws:iam::*:role/CoderhelmReadOnly*"],
+      }),
+    );
     props.mcpConfigsTable.grantReadData(this.workerFunction);
     props.infraTable.grantReadWriteData(this.workerFunction);
     props.billingTable.grantReadWriteData(this.workerFunction); // Retained for CF migration

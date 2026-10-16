@@ -379,11 +379,13 @@ export class ApiStack extends cdk.Stack {
     );
     secrets.grantRead(this.gatewayFunction);
 
-    // STS AssumeRole — gateway validates customer IAM roles on AWS connection setup
+    // STS AssumeRole — gateway validates customer IAM roles on AWS connection
+    // setup and runs data-source lookups a person tries. Only Coderhelm's own
+    // read-only roles: the log reader and the data-source role.
     this.gatewayFunction.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["sts:AssumeRole"],
-        resources: ["arn:aws:iam::*:role/CoderHelmLogReader"],
+        resources: ["arn:aws:iam::*:role/CoderHelmLogReader", "arn:aws:iam::*:role/CoderhelmReadOnly*"],
       })
     );
 
