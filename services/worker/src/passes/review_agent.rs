@@ -786,6 +786,9 @@ pub async fn generate_review(
         None,
     )
     .await;
+    if let Some(s) = skills {
+        s.drain_usage_into(usage);
+    }
 
     match reply {
         Ok(text) => extract_json(&text).unwrap_or(ReviewOutput {

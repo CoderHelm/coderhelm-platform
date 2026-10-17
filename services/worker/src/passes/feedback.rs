@@ -460,6 +460,9 @@ Rules:
         None,
     )
     .await?;
+    if let Some(s) = &skills {
+        s.drain_usage_into(&mut usage);
+    }
 
     info!(
         run_id = %msg.run_id,

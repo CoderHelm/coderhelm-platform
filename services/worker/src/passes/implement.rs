@@ -600,6 +600,9 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         Some(&mut conv_log),
     )
     .await?;
+    if let Some(s) = &skills {
+        s.drain_usage_into(usage);
+    }
 
     // Gate: never finish an implement pass that left the affected tests RED.
     // run_checks now runs them, but the agent can still stop on red — force one
@@ -656,6 +659,9 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             .await
             {
                 warn!(error = %e, "Test-remediation pass errored — proceeding with current state");
+            }
+            if let Some(s) = &skills {
+                s.drain_usage_into(usage);
             }
         }
     }
