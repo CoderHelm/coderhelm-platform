@@ -69,10 +69,42 @@ impl AwsTarget {
     /// Whether `group` is one the team chose to share.
     pub fn allows_log_group(&self, group: &str) -> bool {
         self.log_groups.iter().any(|g| match g.strip_suffix('*') {
-            Some(prefix) => group.starts_with(prefix),
+            // A short prefix saved before names were checked still matches nothing.
+            Some(prefix) => {
+                prefix.trim_matches('/').len() >= MIN_LOG_PREFIX && group.starts_with(prefix)
+            }
             None => g == group,
         })
     }
+}
+
+/// The shortest prefix a `prefix*` log group pattern may have, so one entry
+/// can't share every group in the account.
+pub const MIN_LOG_PREFIX: usize = 4;
+
+/// Checks the log groups a person chose to share: CloudWatch's own name
+/// characters, a `*` only at the end, and a real prefix before it.
+pub fn check_log_groups(groups: &[String]) -> Result<(), String> {
+    for g in groups {
+        let (name, wildcard) = match g.strip_suffix('*') {
+            Some(p) => (p, true),
+            None => (g.as_str(), false),
+        };
+        let chars_ok = !name.is_empty()
+            && name.len() <= 512
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-/#".contains(c));
+        if !chars_ok {
+            return Err(format!("{g} isn't a log group name."));
+        }
+        if wildcard && name.trim_matches('/').len() < MIN_LOG_PREFIX {
+            return Err(format!(
+                "{g} would share almost every log group. Use a longer prefix, like /aws/lambda/orders-*."
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn bad(message: impl Into<String>, fix: impl Into<String>) -> StepError {
@@ -609,6 +641,34 @@ mod tests {
     use super::*;
 
     const ROLE: &str = "arn:aws:iam::123456789012:role/CoderhelmReadOnly";
+
+    #[test]
+    fn log_groups_must_be_names_or_real_prefixes() {
+        let v =
+            |xs: &[&str]| check_log_groups(&xs.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        for bad in [
+            &["*"][..],
+            &["/*"],
+            &["/aw*"],
+            &["a*b"],
+            &["/aws/lambda/x y"],
+            &[""],
+            &["/aws/**"],
+        ] {
+            assert!(v(bad).is_err(), "{bad:?}");
+        }
+        assert!(v(&[
+            "/aws/lambda/orders",
+            "/ecs/api-*",
+            "/aws/rds/cluster/x/postgresql"
+        ])
+        .is_ok());
+        let mut t = db_target();
+        t.log_groups = vec!["*".into(), "/aw*".into()];
+        assert!(!t.allows_log_group("/aws/rds/cluster/prod/postgresql"));
+        t.log_groups = vec!["/ecs/api-*".into()];
+        assert!(t.allows_log_group("/ecs/api-orders"));
+    }
 
     fn db_target() -> AwsTarget {
         AwsTarget {

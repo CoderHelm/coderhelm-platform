@@ -304,6 +304,7 @@ pub async fn update(
                 "Keep at least one log group, or remove the source.",
             ));
         }
+        live_aws::check_log_groups(&groups).map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
         if let Some(a) = source.aws.as_mut() {
             a.log_groups = groups;
             source.kinds = Some(a.log_groups.len());
@@ -1034,6 +1035,7 @@ pub async fn create_logs(
             "Choose at least one log group to share.",
         ));
     }
+    live_aws::check_log_groups(&t.log_groups).map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
     room_for_one_more(&state, &claims.team_id).await?;
     let (checks, session) = role_checks(&state, &t, &claims.email).await;
     if session.is_err() {
