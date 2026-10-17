@@ -353,7 +353,7 @@ pub fn check_read_only_sql(sql: &str, hidden: &[String]) -> Result<CheckedSql, S
         )));
     }
 
-    let statement = stmt.to_string();
+    let statement = space_slice_colons(&stmt.to_string());
     let mut tables = scan.tables;
     tables.sort();
     tables.dedup();
@@ -364,8 +364,54 @@ pub fn check_read_only_sql(sql: &str, hidden: &[String]) -> Result<CheckedSql, S
     })
 }
 
+/// The Data API reads `:` followed by a word as a parameter, and the parser
+/// prints array slices as `[1:3]`, so a slice would be sent as an unknown
+/// parameter `:3`. Parameters are always named with a letter first, so a
+/// colon before a digit, outside quotes, gets a space (`[1: 3]`), which
+/// Postgres and Redshift read the same way.
+fn space_slice_colons(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut quote: Option<char> = None;
+    let mut chars = sql.chars().peekable();
+    let mut prev = '\0';
+    while let Some(c) = chars.next() {
+        out.push(c);
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == ':' && prev != ':' && chars.peek().is_some_and(|n| n.is_ascii_digit()) => {
+                out.push(' ')
+            }
+            None => {}
+        }
+        prev = c;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_array_slice_is_not_sent_as_a_parameter() {
+        let c = check_read_only_sql(
+            "SELECT (array_agg(id))[1:3] AS ids, '10:30' AS t, x::int FROM orders",
+            &[],
+        )
+        .unwrap();
+        assert!(c.text.contains("[1: 3]"), "{}", c.text);
+        assert!(
+            c.text.contains("'10:30'"),
+            "a quoted time is left alone: {}",
+            c.text
+        );
+        assert!(!c.text.contains("[1:3]"));
+        assert_eq!(
+            space_slice_colons("a = :name AND b::text = '1:2'"),
+            "a = :name AND b::text = '1:2'"
+        );
+    }
+
     use super::*;
 
     fn ok(sql: &str) -> CheckedSql {
