@@ -378,6 +378,9 @@ After researching, output the four files using this exact format:
         None,
     )
     .await?;
+    if let Some(s) = &skills {
+        s.drain_usage_into(usage);
+    }
 
     let files = parse_openspec_files(&response);
 
