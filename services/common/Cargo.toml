@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 # live: a team's AWS account (logs and databases), through a role it creates
 aws-sdk-sts = "1"
 aws-sdk-rdsdata = "1"
+aws-sdk-redshiftdata = "1"
 aws-sdk-cloudwatchlogs = "1"
 sqlparser = { version = "0.59", features = ["visitor"] }
 regex = "1"

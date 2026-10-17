@@ -197,8 +197,10 @@ impl Source {
                 "region": a.region,
                 "role_arn": a.role_arn,
                 "log_groups": a.log_groups,
-                "cluster": a.cluster_arn.rsplit(':').next().unwrap_or(""),
+                "cluster": if a.engine == "redshift" { a.cluster_id.as_str() } else { a.cluster_arn.rsplit(':').next().unwrap_or("") },
                 "database": a.database,
+                "engine": if a.engine.is_empty() { "postgres" } else { a.engine.as_str() },
+                "databases": a.databases,
             })
         });
         json!({

@@ -77,6 +77,18 @@ const REFUSED_TABLES: &[&str] = &[
     "pg_user_mappings",
     "pg_largeobject",
     "pg_stat_activity",
+    // Redshift: other users' query text, connection logs and user details.
+    "stl_query",
+    "stl_querytext",
+    "stl_ddltext",
+    "stl_utilitytext",
+    "stl_connection_log",
+    "svl_statementtext",
+    "svl_qlog",
+    "sys_query_history",
+    "sys_query_text",
+    "pg_user_info",
+    "svv_user_info",
 ];
 
 /// A lookup that passed every check.

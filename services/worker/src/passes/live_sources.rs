@@ -16,7 +16,7 @@ use common::live::api::{run_lookup, ApiSource};
 use common::live::aws::{self as live_aws, AwsTarget};
 use common::live::graphql::search_schema;
 use common::live::store::{self, Activity, Kind, Source};
-use common::live::{db, logs};
+use common::live::{db, logs, redshift};
 use common::live::{secret, StepError};
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -207,10 +207,11 @@ impl LiveSources {
             tools.push(ToolDefinition {
                 name: "db_query".to_string(),
                 description: format!(
-                    "Read the team's database with ONE PostgreSQL SELECT. It runs as a user that \
-                     can only read, inside a read-only transaction that is rolled back; anything \
-                     but a single SELECT is refused and never sent, and so is any column the team \
-                     hid. Filter on ids or other indexed columns, name the columns you need, and \
+                    "Read the team's PostgreSQL database or Redshift warehouse with ONE SELECT. It \
+                     runs as a user that can only read (in PostgreSQL also inside a read-only \
+                     transaction that is rolled back); anything but a single SELECT is refused and \
+                     never sent, and so is any column the team hid. For a warehouse with several \
+                     databases, pass `database`. Filter on ids or other indexed columns, name the columns you need, and \
                      keep results small (at most 200 rows come back). At most {MAX_LOOKUPS} \
                      lookups in all."
                 ),
@@ -218,7 +219,8 @@ impl LiveSources {
                     "type": "object",
                     "properties": {
                         "source": source_prop(Some(Kind::Database)),
-                        "sql": { "type": "string", "description": "one SELECT statement" }
+                        "sql": { "type": "string", "description": "one SELECT statement" },
+                        "database": { "type": "string", "description": "for a Redshift warehouse with several databases: which one (see live_describe)" }
                     },
                     "required": ["sql"]
                 }),
@@ -308,6 +310,10 @@ impl LiveSources {
             let what = match (l.source.kind, l.source.kinds) {
                 (Kind::Api, Some(n)) => format!("GraphQL API; {n} kinds of data"),
                 (Kind::Api, None) => "GraphQL API; its list of data is private, so ask for fields the code already uses".to_string(),
+                (Kind::Database, n) if l.aws().is_some_and(|a| a.engine == "redshift") => {
+                    let dbs = l.aws().map(|a| a.databases.join(", ")).unwrap_or_default();
+                    format!("Redshift warehouse; {} tables across databases {dbs}; pass `database` to db_query", n.unwrap_or(0))
+                }
                 (Kind::Database, Some(n)) => format!("PostgreSQL database; {n} tables"),
                 (Kind::Database, None) => "PostgreSQL database".to_string(),
                 (Kind::Logs, n) => format!("CloudWatch logs; {} log groups", n.unwrap_or(0)),
@@ -385,6 +391,43 @@ impl LiveSources {
                 )
                 .await
                 .map(|r| (r.query, r.result, r.hidden_count, r.ms, String::new()))
+            }
+            Kind::Database if l.aws().is_some_and(|a| a.engine == "redshift") => {
+                let t = l.aws().expect("checked");
+                let sql = input["sql"]
+                    .as_str()
+                    .or(input["query"].as_str())
+                    .unwrap_or("");
+                // Refused lookups never take on the team's role.
+                common::live::sql::check_read_only_sql(sql, &l.source.hidden_fields)?;
+                let db_name = redshift::pick_database(t, input["database"].as_str())?.to_string();
+                let session = live_aws::assume(&state.sts, t, &actor).await?;
+                // Checked once per database per run, like a PostgreSQL user.
+                let key = format!("{}#{db_name}", l.source.id);
+                let seen = self
+                    .verified
+                    .lock()
+                    .map(|v| v.contains(&key))
+                    .unwrap_or(false);
+                if !seen {
+                    redshift::verify_read_only_user(&session, t, &db_name).await?;
+                    if let Ok(mut v) = self.verified.lock() {
+                        v.insert(key);
+                    }
+                }
+                redshift::run_sql(
+                    &session,
+                    t,
+                    Some(&db_name),
+                    sql,
+                    &l.source.hidden_fields,
+                    RESULT_CHARS,
+                )
+                .await
+                .map(|r| {
+                    let note = format!("{} in {}", common::live::count(r.rows, "row"), r.database);
+                    (r.statement, r.result, r.hidden_count, r.ms, note)
+                })
             }
             Kind::Database => {
                 let t = l.aws().ok_or_else(|| {
@@ -766,6 +809,26 @@ mod tests {
         assert!(p.contains("- app logs (CloudWatch logs; 4 log groups)"));
         assert!(p.contains("`db_query` to read from a database"));
         assert!(p.contains("`logs_search` to search logs"));
+    }
+
+    #[test]
+    fn a_warehouse_is_described_with_its_databases() {
+        let mut l = mixed();
+        let mut wh = aws_source("dw", Kind::Database);
+        if let Some(a) = wh.source.aws.as_mut() {
+            a.engine = "redshift".into();
+            a.cluster_id = "analytics".into();
+            a.databases = vec!["dev".into(), "marts".into()];
+        }
+        l.loaded.push(wh);
+        let p = l.prompt_section();
+        assert!(p.contains("- dw (Redshift warehouse; 4 tables across databases dev, marts; pass `database` to db_query)"));
+        let db_tool = l
+            .tools()
+            .into_iter()
+            .find(|t| t.name == "db_query")
+            .unwrap();
+        assert!(db_tool.input_schema["properties"]["database"].is_object());
     }
 
     #[test]
