@@ -406,20 +406,30 @@ pub async fn log_activity(
         .map_err(|e| format!("log lookup: {e}"))
 }
 
-/// The most recent lookups, newest first.
+/// The most recent lookups, newest first. `before` is the `cursor` of the
+/// oldest one already shown, to page further back.
 pub async fn list_activity(
     dynamo: &aws_sdk_dynamodb::Client,
     table: &str,
     team_id: &str,
     limit: i32,
+    before: Option<&str>,
 ) -> Result<Vec<Value>, String> {
-    let out = dynamo
+    let mut q = dynamo
         .query()
         .table_name(table)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
         .expression_attribute_values(":pk", av_s(team_id))
-        .expression_attribute_values(":p", av_s(LOG_PREFIX))
-        .scan_index_forward(false)
+        .scan_index_forward(false);
+    q = q
+        .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+        .expression_attribute_values(":p", av_s(LOG_PREFIX));
+    if let Some(b) = before.filter(|b| b.starts_with(LOG_PREFIX)) {
+        // Start just after the oldest lookup already shown.
+        q = q
+            .exclusive_start_key("pk", av_s(team_id))
+            .exclusive_start_key("sk", av_s(b));
+    }
+    let out = q
         .limit(limit.clamp(1, 200))
         .send()
         .await
@@ -435,6 +445,8 @@ pub async fn list_activity(
                 "source_name": s(i, "source_name"),
                 "actor": s(i, "actor"),
                 "summary": s(i, "summary"),
+                "query": s(i, "query"),
+                "cursor": s(i, "sk"),
                 "ok": outcome == "ok",
                 "outcome": outcome,
                 "detail": s(i, "detail"),
