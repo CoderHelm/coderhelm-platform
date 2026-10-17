@@ -53,6 +53,10 @@ struct MessagesRequest {
     context_management: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fallbacks: Option<Value>,
+    /// `{"type":"none"}` on the one answer-now turn after the step budget is
+    /// used: tools stay declared (the history has tool calls) but can't be called.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
 }
 
 /// How a model must be called. `AlwaysThinking` models (Opus 5.x, Sonnet 5.x,
@@ -278,6 +282,7 @@ pub async fn converse_simple(
         output_config: None,
         context_management: None,
         fallbacks: None,
+        tool_choice: None,
     };
     apply_model_family(&mut request, None, false);
 
@@ -332,16 +337,33 @@ pub async fn converse_tool_loop(
 
     let mut turns: usize = 0;
     let mut deadline_warned = false;
+    // Set once the step budget is used: one more turn, with tools off, in
+    // which the agent must answer from what it already learned. Without it,
+    // everything a planner read was thrown away the moment it ran out.
+    let mut answer_now = false;
 
     loop {
         turns += 1;
         if turns > max_turns {
-            warn!("Hit max turn limit ({max_turns}), forcing completion");
-            return Err(format!(
-                "Reached the maximum number of steps ({max_turns}) without finishing. \
-                 The issue may need more detail or a narrower scope."
-            )
-            .into());
+            if answer_now || tools.is_empty() {
+                warn!("Hit max turn limit ({max_turns}) and the final answer turn, giving up");
+                return Err(format!(
+                    "Reached the maximum number of steps ({max_turns}) without finishing. \
+                     The issue may need more detail or a narrower scope."
+                )
+                .into());
+            }
+            answer_now = true;
+            warn!("Hit max turn limit ({max_turns}), asking for the final answer with tools off");
+            messages.push((
+                "user".to_string(),
+                vec![json!({"type": "text", "text":
+                    "[SYSTEM NOTE] You have used every tool step. Tools are now off. Write your \
+                     final answer NOW, in exactly the format you were asked for, using what you \
+                     have already learned. Where something is still unknown, say so in the \
+                     answer instead of guessing."
+                })],
+            ));
         }
 
         // Deadline check — if <120s remain, tell the LLM to wrap up
@@ -420,6 +442,7 @@ pub async fn converse_tool_loop(
             output_config: None,
             context_management: None,
             fallbacks: None,
+            tool_choice: answer_now.then(|| json!({"type": "none"})),
         };
         apply_model_family(&mut request, effort, true);
 
@@ -733,7 +756,18 @@ mod tests {
             output_config: None,
             context_management: None,
             fallbacks: None,
+            tool_choice: None,
         }
+    }
+
+    #[test]
+    fn the_answer_now_turn_keeps_tools_declared_but_off() {
+        let mut r = request("claude-opus-5-5");
+        let plain = serde_json::to_value(&r).unwrap();
+        assert!(plain.get("tool_choice").is_none());
+        r.tool_choice = Some(json!({"type": "none"}));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["tool_choice"], json!({"type": "none"}));
     }
 
     #[test]

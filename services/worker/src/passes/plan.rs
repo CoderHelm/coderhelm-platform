@@ -342,10 +342,13 @@ After researching, output the four files using this exact format:
     let mut messages = vec![("user".to_string(), content_blocks)];
 
     let plan_opts = llm::ConverseOptions {
+        // A planner reads the code before it plans; 5 and 8 steps ran out in
+        // seconds on ordinary tickets (16 failed runs). The last step is
+        // always an answer from what it read (see the agent loop).
         max_turns: match triage.complexity.as_str() {
-            "simple" => 5,
-            "medium" => 8,
-            _ => 12,
+            "simple" => 8,
+            "medium" => 15,
+            _ => 25,
         },
         max_tokens: 16384,
         deadline: None,
