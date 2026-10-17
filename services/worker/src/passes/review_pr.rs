@@ -266,6 +266,20 @@ pub async fn run(
         msg.head_sha.clone()
     };
 
+    // A reply asking for a re-review and the author's push of the same commit
+    // arrive together and used to give two reviews of one commit, sometimes
+    // with opposite verdicts a minute apart. A reply review takes the same
+    // per-commit claim push reviews use; if a push review claimed this commit
+    // in the last few minutes, that review answers it.
+    if msg.trigger == "reply"
+        && msg.question.is_none()
+        && !head_sha.is_empty()
+        && !claim_recent_head(state, &msg, &head_sha).await
+    {
+        info!(pr = msg.pr_number, head = %head_sha, "Reply re-review skipped — this commit is already being reviewed");
+        return Ok(());
+    }
+
     // Build the diff (base...head compare gives per-file patches), bounded.
     let compare = github
         .get_diff(&msg.repo_owner, &msg.repo_name, base, &head_sha)
@@ -684,6 +698,33 @@ pub async fn run(
     if cfg.require_tests {
         review_agent::enforce_required_tests(&mut findings);
     }
+    // Verdict hysteresis. Once CoderHelm approved an earlier commit, a new
+    // finding only holds the merge when it is in a file changed since that
+    // approval; one about code that hasn't changed is still worth saying, but
+    // as a note, not a flip back to "changes requested". Without this, 225
+    // approve-then-request-changes flips landed on 123 PRs in two months.
+    let mut held_since_approval: Vec<review_agent::Finding> = Vec::new();
+    if let Some(prev) = last_review(state, &msg)
+        .await
+        .filter(|p| p.verdict == "APPROVE" && !p.head_sha.is_empty() && p.head_sha != head_sha)
+    {
+        if let Ok(since) = github
+            .get_diff(&msg.repo_owner, &msg.repo_name, &prev.head_sha, &head_sha)
+            .await
+        {
+            let touched = changed_files(&since);
+            let (keep, held) = hold_unchanged(std::mem::take(&mut findings), &touched);
+            findings = keep;
+            if !held.is_empty() {
+                info!(
+                    pr = msg.pr_number,
+                    held = held.len(),
+                    "Findings on code unchanged since approval kept as notes"
+                );
+            }
+            held_since_approval = held;
+        }
+    }
     let postable = review_agent::to_postable(&findings, &changed);
 
     // 4) Optional sandbox verification ("receipts"): actually run the affected
@@ -745,7 +786,7 @@ pub async fn run(
     let summary = if output.summary.trim().is_empty() {
         "Automated review complete.".to_string()
     } else {
-        output.summary.clone()
+        short_overview(&output.summary)
     };
     let mut full_body = format!("{verdict_line}\n\n{summary}\n\n{}", risk_report.markdown());
     // "Approve with notes" no longer exists: say plainly why changes are
@@ -767,6 +808,12 @@ pub async fn run(
             "\n\n#### Additional findings\n{}",
             postable.unanchored_md
         ));
+    }
+    if !held_since_approval.is_empty() {
+        full_body.push_str("\n\n#### Also worth a look\nOn code that hasn't changed since CoderHelm approved it, so these don't change the verdict:\n");
+        for f in &held_since_approval {
+            full_body.push_str(&format!("- `{}:{}` {}\n", f.file, f.line, f.title));
+        }
     }
     full_body.push_str(&super::review_labels::markdown(
         labels_live,
@@ -1504,6 +1551,110 @@ mod prior_thread_tests {
 /// was enqueued for; that commit's own review covers the latest code. Reviews
 /// that answer a question, or that resolve the head themselves (empty
 /// head_sha), always speak.
+/// How recent another review of the same commit must be for a reply
+/// re-review to stand down.
+const SAME_COMMIT_WINDOW_SECS: i64 = 90;
+
+/// Takes the per-commit review claim (the same item the gateway writes for
+/// push reviews). False when another review claimed this commit within the
+/// last few minutes; an older claim doesn't stop an explicit re-review.
+async fn claim_recent_head(state: &WorkerState, msg: &ReviewMessage, head_sha: &str) -> bool {
+    let sk = format!(
+        "REVIEWCLAIM#{}/{}#{:06}#{head_sha}",
+        msg.repo_owner, msg.repo_name, msg.pr_number
+    );
+    let now = chrono::Utc::now();
+    let existing = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&sk))
+        .consistent_read(true)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| {
+            o.item()
+                .and_then(|i| i.get("created_at"))
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+        })
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok());
+    if let Some(at) = existing {
+        if (now - at.with_timezone(&chrono::Utc)).num_seconds() < SAME_COMMIT_WINDOW_SECS {
+            return false;
+        }
+    }
+    // Claim it, so a push event for this commit arriving now stands down.
+    let _ = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(&msg.team_id))
+        .item("sk", attr_s(&sk))
+        .item("created_at", attr_s(&now.to_rfc3339()))
+        .item(
+            "ttl",
+            aws_sdk_dynamodb::types::AttributeValue::N((now.timestamp() + 6 * 3600).to_string()),
+        )
+        .send()
+        .await;
+    true
+}
+
+/// Files a compare response says changed.
+fn changed_files(compare: &serde_json::Value) -> std::collections::HashSet<String> {
+    compare["files"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| f["filename"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Splits findings into those in a file changed since the approval (they keep
+/// their weight) and those on unchanged files (kept as notes).
+fn hold_unchanged(
+    findings: Vec<review_agent::Finding>,
+    touched: &std::collections::HashSet<String>,
+) -> (Vec<review_agent::Finding>, Vec<review_agent::Finding>) {
+    findings
+        .into_iter()
+        .partition(|f| touched.contains(&f.file))
+}
+
+/// The review's overview, held to what it is asked to be: a few sentences.
+/// Models sometimes write essays with headings here; the details belong in
+/// the findings, which are posted on the lines they are about.
+fn short_overview(text: &str) -> String {
+    const MAX_SENTENCES: usize = 4;
+    const MAX_CHARS: usize = 700;
+    let prose: String = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty() && !l.starts_with('#') && !l.starts_with('|') && !l.starts_with("```")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out = String::new();
+    for piece in prose.split_inclusive(['.', '!', '?']).take(MAX_SENTENCES) {
+        if out.len() + piece.len() > MAX_CHARS {
+            break;
+        }
+        out.push_str(piece);
+    }
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        common::truncate_str(&prose, MAX_CHARS).trim().to_string()
+    } else {
+        out
+    }
+}
+
 /// Whether the PR moved past the commit this review looked at. Unlike
 /// [`superseded`], this also covers re-reviews asked for in a reply, which
 /// resolve the head when they start: an author who answers a finding and
@@ -1572,6 +1723,31 @@ mod superseded_tests {
         assert!(!superseded(&msg("", None), "cc15ab8"));
         // An unreadable head never silences a review.
         assert!(!superseded(&msg("b20e26f", None), ""));
+    }
+
+    #[test]
+    fn the_overview_stays_a_few_sentences() {
+        let essay = "# Re-review of PR 12\n\nThe description now matches. But the change isn't only copy. It hardcodes a price. It adds policy claims. It drops the tax note.\n\n## Blocking\n\n| a | b |\n|---|---|";
+        let s = super::short_overview(essay);
+        assert_eq!(s, "The description now matches. But the change isn't only copy. It hardcodes a price. It adds policy claims.");
+        assert_eq!(super::short_overview("Looks good."), "Looks good.");
+        let long = "word ".repeat(400);
+        assert!(super::short_overview(&long).len() <= 700);
+    }
+
+    #[test]
+    fn findings_on_unchanged_files_are_held_after_an_approval() {
+        let f = |file: &str| crate::passes::review_agent::Finding {
+            file: file.into(),
+            ..Default::default()
+        };
+        let touched: std::collections::HashSet<String> = ["src/a.ts".to_string()].into();
+        let (keep, held) = super::hold_unchanged(vec![f("src/a.ts"), f("src/b.ts")], &touched);
+        assert_eq!(keep.len(), 1);
+        assert_eq!(held[0].file, "src/b.ts");
+        let compare =
+            serde_json::json!({"files": [{"filename": "src/a.ts"}, {"filename": "x.md"}]});
+        assert_eq!(super::changed_files(&compare).len(), 2);
     }
 
     #[test]
