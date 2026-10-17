@@ -967,6 +967,8 @@ pub async fn aws_connect(
         "role_arn": t.role_arn,
         "log_groups": groups,
         "database": database,
+        "warehouse": (!t.cluster_id.is_empty())
+            .then(|| json!({ "cluster": t.cluster_id, "databases": t.databases })),
     })))
 }
 
