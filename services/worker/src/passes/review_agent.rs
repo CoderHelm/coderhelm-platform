@@ -401,6 +401,8 @@ pub struct PrReviewToolExecutor<'a> {
     pub graph: Option<&'a super::code_graph::Graph>,
     /// The team's connected live systems this review may read from, if any.
     pub live: Option<&'a super::live_sources::LiveSources>,
+    /// The team's written skills, read-only.
+    pub skills: Option<&'a super::skills::TeamSkills>,
 }
 
 /// Structural lookup tools backed by the persistent code graph. Offered only
@@ -461,6 +463,11 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
         }
         if let Some(live) = self.live {
             if let Some(out) = live.handle(self.state, name, input).await {
+                return Ok(json!(out));
+            }
+        }
+        if let Some(skills) = self.skills {
+            if let Some(out) = skills.handle(self.state, name, input).await {
                 return Ok(json!(out));
             }
         }
@@ -671,6 +678,7 @@ pub async fn generate_review(
     graph_context: &str,
     prior_context: &str,
     live: Option<&super::live_sources::LiveSources>,
+    skills: Option<&super::skills::TeamSkills>,
     usage: &mut TokenUsage,
 ) -> ReviewOutput {
     let graph_note = if graph.is_some() {
@@ -730,8 +738,9 @@ pub async fn generate_review(
          know.{graph_note}"
     );
     let live_context = live.map(|l| l.prompt_section()).unwrap_or_default();
+    let skills_context = skills.map(|s| s.prompt_section()).unwrap_or_default();
     let prompt = format!(
-        "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{graph_context}{prior_context}{live_context}\n\
+        "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{graph_context}{prior_context}{live_context}{skills_context}\n\
          Explore with the tools as needed, then emit the JSON review."
     );
     let mut messages = vec![(
@@ -746,6 +755,7 @@ pub async fn generate_review(
         state,
         graph,
         live,
+        skills,
     };
     let mut tools = review_tools();
     if graph.is_some() {
@@ -753,6 +763,9 @@ pub async fn generate_review(
     }
     if let Some(live) = live {
         tools.extend(live.tools());
+    }
+    if let Some(s) = skills {
+        tools.extend(s.tools());
     }
     let reply = provider::converse(
         state,

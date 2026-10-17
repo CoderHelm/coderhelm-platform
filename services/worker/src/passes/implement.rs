@@ -383,6 +383,13 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         tools.extend(l.tools());
         full_system.push_str(&l.prompt_section());
     }
+    // The team's own written skills, read-only guidance.
+    let skills =
+        super::skills::TeamSkills::load(state, &msg.team_id, super::skills::Reader::Coder).await;
+    if let Some(s) = &skills {
+        tools.extend(s.tools());
+        full_system.push_str(&s.prompt_section());
+    }
 
     // When the execution sandbox is available, tell the agent to actually use
     // it — otherwise simple/quick changes finish without ever verifying (the
@@ -444,6 +451,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         lambda: &state.lambda,
         mcp_proxy_function_name: &state.config.mcp_proxy_function_name,
         live: live.as_ref(),
+        skills: skills.as_ref(),
         state,
     };
 
@@ -1706,6 +1714,8 @@ struct CombinedWriteToolExecutor<'a> {
     mcp_proxy_function_name: &'a str,
     /// The team's connected live systems, read-only.
     live: Option<&'a super::live_sources::LiveSources>,
+    /// The team's written skills, read-only.
+    skills: Option<&'a super::skills::TeamSkills>,
     state: &'a WorkerState,
 }
 
@@ -1718,6 +1728,11 @@ impl<'a> ToolExecutor for CombinedWriteToolExecutor<'a> {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(live) = self.live {
             if let Some(out) = live.handle(self.state, name, input).await {
+                return Ok(serde_json::json!(out));
+            }
+        }
+        if let Some(skills) = self.skills {
+            if let Some(out) = skills.handle(self.state, name, input).await {
                 return Ok(serde_json::json!(out));
             }
         }

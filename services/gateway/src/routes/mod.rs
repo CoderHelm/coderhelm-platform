@@ -15,6 +15,7 @@ pub mod paging;
 pub mod plans;
 pub mod plugins;
 pub mod reviewer;
+pub mod skills;
 pub mod sns;
 pub mod tests;
 pub mod tools;

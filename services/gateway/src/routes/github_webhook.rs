@@ -1893,6 +1893,24 @@ async fn handle_push(
         });
         let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
     }
+    // A connected skill repository: its default branch moved, so the team's
+    // skills are read again (the merged code only).
+    let full = format!("{owner}/{name}");
+    let skill_repo = common::skills::SkillStore {
+        dynamo: &state.dynamo,
+        table: &state.config.settings_table_name,
+        team: team_id,
+    }
+    .repo(&full)
+    .await;
+    if let Ok(Some(_)) = skill_repo {
+        let message = WorkerMessage::SkillSync(common::skills::SkillSyncMessage {
+            team_id: team_id.to_string(),
+            repo: full,
+            force: false,
+        });
+        let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+    }
     // Graph must be explicitly enabled for the repo.
     let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
     let graph_enabled = state
