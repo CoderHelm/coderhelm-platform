@@ -47,6 +47,18 @@ pub struct AwsTarget {
     pub secret_arn: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub database: String,
+    /// `redshift` for a data warehouse; empty for PostgreSQL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub engine: String,
+    /// The Redshift cluster's name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cluster_id: String,
+    /// The Redshift user Coderhelm signs in as, with no password.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub db_user: String,
+    /// Redshift databases the team shared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub databases: Vec<String>,
 }
 
 impl AwsTarget {
@@ -176,6 +188,50 @@ pub fn check_target(t: &AwsTarget) -> Result<(), StepError> {
             ));
         }
     }
+    if !t.cluster_id.is_empty() || t.engine == "redshift" {
+        check_warehouse(t)?;
+    }
+    Ok(())
+}
+
+fn valid_db_name(d: &str) -> bool {
+    !d.is_empty()
+        && d.len() <= 127
+        && d.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A Redshift target: a cluster name, the read-only user and nothing else,
+/// and at least one database.
+fn check_warehouse(t: &AwsTarget) -> Result<(), StepError> {
+    let id = &t.cluster_id;
+    let id_ok = !id.is_empty()
+        && id.len() <= 63
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && id.starts_with(|c: char| c.is_ascii_lowercase());
+    if t.engine != "redshift" || !id_ok {
+        return Err(bad(
+            "That warehouse name isn't valid.",
+            "Run the setup script again and choose the warehouse.",
+        ));
+    }
+    if t.db_user != DB_USER {
+        return Err(bad(
+            format!("Coderhelm only signs in to a warehouse as {DB_USER}."),
+            "Run the setup script again and choose the warehouse.",
+        ));
+    }
+    if t.databases.is_empty()
+        || t.databases.len() > 50
+        || !t.databases.iter().all(|d| valid_db_name(d))
+    {
+        return Err(bad(
+            "The list of databases isn't valid.",
+            "Run the setup script again.",
+        ));
+    }
     Ok(())
 }
 
@@ -259,6 +315,44 @@ pub fn database_policy_template(account: &str) -> serde_json::Value {
     })
 }
 
+/// Reads one Redshift warehouse: may sign in only as the read-only user, with
+/// no password, and only run single statements and read their own results.
+pub fn warehouse_policy_template(account: &str) -> serde_json::Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "SignInAsTheReadOnlyUser",
+                "Effect": "Allow",
+                "Action": "redshift:GetClusterCredentials",
+                "Resource": [
+                    format!("arn:aws:redshift:*:{account}:dbuser:RS_CLUSTER/{DB_USER}"),
+                    format!("arn:aws:redshift:*:{account}:dbname:RS_CLUSTER/*")
+                ]
+            },
+            {
+                "Sid": "RunOneStatement",
+                "Effect": "Allow",
+                "Action": "redshift-data:ExecuteStatement",
+                "Resource": format!("arn:aws:redshift:*:{account}:cluster:RS_CLUSTER")
+            },
+            {
+                "Sid": "ReadOwnResults",
+                "Effect": "Allow",
+                "Action": ["redshift-data:DescribeStatement", "redshift-data:GetStatementResult", "redshift-data:CancelStatement"],
+                "Resource": "*",
+                "Condition": { "StringEquals": { "redshift-data:statement-owner-iam-userid": "${aws:userid}" } }
+            },
+            {
+                "Sid": "NothingElse",
+                "Effect": "Deny",
+                "Action": ["redshift-data:BatchExecuteStatement", "redshift:CreateClusterUser", "redshift:GetClusterCredentialsWithIAM", "redshift:ModifyCluster*", "redshift:Delete*"],
+                "Resource": "*"
+            }
+        ]
+    })
+}
+
 /// The script a team pastes into AWS CloudShell. It creates (or updates) the
 /// role, lets them pick a database to share, creates a database user that can
 /// only read, and prints the line to paste back. It defines a function and
@@ -269,6 +363,7 @@ pub fn setup_script(our_account: &str, external_id: &str) -> String {
     let trust = trust_policy(our_account, external_id).to_string();
     let logs = logs_policy().to_string();
     let db = database_policy_template("ACCOUNT_ID").to_string();
+    let wh = warehouse_policy_template("ACCOUNT_ID").to_string();
     format!(
         r#"coderhelm_setup() (
 set -euo pipefail
@@ -330,7 +425,49 @@ if [ -n "$CLUSTERS" ]; then
     echo "Database user ready. It can read every table and change none."
   fi
 fi
-CODE=$(printf '{{"role_arn":"%s","region":"%s"%s}}' "$ROLE_ARN" "$REGION" "$DB_PART" | base64 | tr -d '\n')
+RS_PART=""
+WAREHOUSES=$(aws redshift describe-clusters --region "$REGION" --query 'Clusters[].ClusterIdentifier' --output text 2>/dev/null | tr '\t' '\n' | sed '/^$/d')
+if [ -n "$WAREHOUSES" ]; then
+  echo
+  echo "Redshift warehouses Coderhelm can read from:"
+  i=0; for c in $WAREHOUSES; do i=$((i+1)); echo "  $i) $c"; done
+  echo "  0) none for now"
+  read -r -p "Which one should Coderhelm read? [0-$i]: " PICK </dev/tty
+  if [ "${{PICK:-0}}" -gt 0 ] 2>/dev/null; then
+    RS_ID=$(echo "$WAREHOUSES" | sed -n "${{PICK}}p")
+    if [ -z "$RS_ID" ]; then echo "There is no warehouse number $PICK. Run the script again."; exit 1; fi
+    RS_ADMIN=$(aws redshift describe-clusters --region "$REGION" --cluster-identifier "$RS_ID" --query 'Clusters[0].MasterUsername' --output text)
+    RS_FIRST=$(aws redshift describe-clusters --region "$REGION" --cluster-identifier "$RS_ID" --query 'Clusters[0].DBName' --output text)
+    rs_sql() {{
+      SID=$(aws redshift-data execute-statement --region "$REGION" --cluster-identifier "$RS_ID" --db-user "$RS_ADMIN" --database "$1" --sql "$2" --query Id --output text)
+      while true; do
+        ST=$(aws redshift-data describe-statement --region "$REGION" --id "$SID" --query Status --output text)
+        case "$ST" in FINISHED) return 0;; FAILED|ABORTED) aws redshift-data describe-statement --region "$REGION" --id "$SID" --query Error --output text >&2; return 1;; esac
+        sleep 1
+      done
+    }}
+    RS_DBS=$(aws redshift-data list-databases --region "$REGION" --cluster-identifier "$RS_ID" --db-user "$RS_ADMIN" --database "$RS_FIRST" --query 'Databases' --output text | tr '\t' '\n' | grep -v -E '^(padb_harvest|template0|template1|sys:.*|awsdatacatalog)$' | sed '/^$/d')
+    echo "Creating the warehouse user {DB_USER}, which has no password and can only read..."
+    rs_sql "$RS_FIRST" "CREATE USER {DB_USER} PASSWORD DISABLE" 2>/dev/null || true
+    rs_sql "$RS_FIRST" "ALTER USER {DB_USER} NOCREATEDB NOCREATEUSER SYSLOG ACCESS RESTRICTED"
+    rs_sql "$RS_FIRST" "ALTER USER {DB_USER} SET statement_timeout TO 15000"
+    RS_JSON=""
+    for D in $RS_DBS; do
+      SCHEMAS=$(aws redshift-data list-schemas --region "$REGION" --cluster-identifier "$RS_ID" --db-user "$RS_ADMIN" --database "$D" --query 'Schemas' --output text | tr '\t' '\n' | grep -v -E '^(pg_catalog|information_schema|pg_internal|pg_auto_copy|pg_mv|pg_s3|catalog_history|pg_toast.*|pg_temp.*)$' | sed '/^$/d')
+      for S in $SCHEMAS; do
+        rs_sql "$D" "GRANT USAGE ON SCHEMA \"$S\" TO {DB_USER}" || continue
+        rs_sql "$D" "GRANT SELECT ON ALL TABLES IN SCHEMA \"$S\" TO {DB_USER}" || true
+        rs_sql "$D" "ALTER DEFAULT PRIVILEGES IN SCHEMA \"$S\" GRANT SELECT ON TABLES TO {DB_USER}" || true
+      done
+      RS_JSON="$RS_JSON${{RS_JSON:+,}}\"$D\""
+      echo "  $D: can read, can't change"
+    done
+    aws iam put-role-policy --role-name "$ROLE" --policy-name "coderhelm-read-warehouse-$RS_ID" --policy-document "$(echo '{wh}' | sed -e "s#RS_CLUSTER#$RS_ID#g" -e "s#ACCOUNT_ID#$ACCOUNT#g")"
+    RS_PART=",\"engine\":\"redshift\",\"cluster_id\":\"$RS_ID\",\"db_user\":\"{DB_USER}\",\"databases\":[$RS_JSON]"
+    echo "Warehouse user ready."
+  fi
+fi
+CODE=$(printf '{{"role_arn":"%s","region":"%s"%s%s}}' "$ROLE_ARN" "$REGION" "$DB_PART" "$RS_PART" | base64 | tr -d '\n')
 echo
 echo "Done. Copy this whole line and paste it into Coderhelm:"
 echo
@@ -482,7 +619,42 @@ mod tests {
             cluster_arn: "arn:aws:rds:us-east-1:123456789012:cluster:app-db".into(),
             secret_arn: "arn:aws:secretsmanager:us-east-1:123456789012:secret:coderhelm-readonly-app-db-AbCdEf".into(),
             database: "app".into(),
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_warehouse_signs_in_only_as_the_read_only_user() {
+        let ok = AwsTarget {
+            role_arn: ROLE.into(),
+            region: "us-east-1".into(),
+            engine: "redshift".into(),
+            cluster_id: "analytics-dw".into(),
+            db_user: DB_USER.into(),
+            databases: vec!["dev".into(), "marts".into()],
+            ..Default::default()
+        };
+        assert!(check_target(&ok).is_ok());
+        let admin = AwsTarget {
+            db_user: "awsuser".into(),
+            ..ok.clone()
+        };
+        assert!(check_target(&admin).unwrap_err().message.contains(DB_USER));
+        let none = AwsTarget {
+            databases: vec![],
+            ..ok.clone()
+        };
+        assert!(check_target(&none).is_err());
+        let bad_name = AwsTarget {
+            cluster_id: "Analytics; drop".into(),
+            ..ok.clone()
+        };
+        assert!(check_target(&bad_name).is_err());
+        let bad_db = AwsTarget {
+            databases: vec!["dev; drop".into()],
+            ..ok
+        };
+        assert!(check_target(&bad_db).is_err());
     }
 
     #[test]
@@ -568,8 +740,14 @@ mod tests {
         assert!(s.trim_end().ends_with("coderhelm_setup"));
         // one permission per database, so adding a second keeps the first
         assert!(s.contains("--policy-name \"coderhelm-read-database-$CLUSTER_ID\""));
+        assert!(s.contains("PASSWORD DISABLE"));
+        assert!(s.contains("redshift-data:BatchExecuteStatement"));
         // nothing in the policies can write
-        for p in [logs_policy(), database_policy_template("1")] {
+        for p in [
+            logs_policy(),
+            database_policy_template("1"),
+            warehouse_policy_template("1"),
+        ] {
             for st in p["Statement"].as_array().unwrap() {
                 if st["Effect"] == "Allow" {
                     let actions = st["Action"].to_string();

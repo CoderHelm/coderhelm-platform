@@ -29,6 +29,7 @@ pub mod graphql;
 pub mod logs;
 pub mod net;
 pub mod redact;
+pub mod redshift;
 pub mod secret;
 pub mod sql;
 pub mod store;

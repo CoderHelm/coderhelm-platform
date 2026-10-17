@@ -16,7 +16,7 @@ use common::live::graphql::check_read_only;
 use common::live::net::parse_endpoint;
 use common::live::redact::{hidden_terms, is_hidden};
 use common::live::store::{self, Activity, Kind, Source};
-use common::live::{db, logs};
+use common::live::{db, logs, redshift};
 use common::live::{secret, StepError};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -423,6 +423,29 @@ pub async fn test(
             let ok = checks.iter().all(|c| c.ok);
             (ok, checks.clone(), json!({ "ok": ok, "checks": checks }))
         }
+        Kind::Database if source.aws.as_ref().is_some_and(|a| a.engine == "redshift") => {
+            let t = aws_of(&source)?.clone();
+            let (mut checks, session) = role_checks(&state, &t, &claims.email).await;
+            let mut ok = false;
+            if let Ok(session) = &session {
+                let report = redshift::connect_checks(session, &t).await;
+                ok = report.ok;
+                checks.extend(report.checks);
+                if report.ok {
+                    source.kinds = report.tables;
+                    if let Some(schema) = &report.schema {
+                        source.schema_available = true;
+                        source.samples = db_samples(schema);
+                        save_db_schema(&state, &claims.team_id, &id, schema).await;
+                    }
+                }
+            }
+            (
+                ok,
+                checks.clone(),
+                json!({ "ok": ok, "checks": checks, "kinds": source.kinds }),
+            )
+        }
         Kind::Database => {
             let t = aws_of(&source)?.clone();
             let (mut checks, session) = role_checks(&state, &t, &claims.email).await;
@@ -489,7 +512,7 @@ pub async fn samples(
                 .filter(|(_, q)| {
                     common::live::sql::check_read_only_sql(q, &source.hidden_fields).is_ok()
                 })
-                .map(|(label, query)| json!({ "label": label, "query": query }))
+                .map(|(label, query)| json!({ "label": label, "query": query, "database": sample_database(label) }))
                 .collect();
             return Ok(Json(json!({ "samples": samples })));
         }
@@ -604,6 +627,44 @@ pub async fn try_lookup(
                     ms: l.ms,
                     note: String::new(),
                 })
+        }
+        Kind::Database if source.aws.as_ref().is_some_and(|a| a.engine == "redshift") => {
+            let t = aws_of(&source)?;
+            let database = body["database"].as_str();
+            match common::live::sql::check_read_only_sql(query, &source.hidden_fields)
+                .and_then(|_| redshift::pick_database(t, database).map(str::to_string))
+            {
+                Err(e) => Err(e),
+                Ok(db_name) => match live_aws::assume(&state.sts, t, &claims.email).await {
+                    Err(e) => Err(e),
+                    Ok(session) => {
+                        match redshift::verify_read_only_user(&session, t, &db_name).await {
+                            Err(e) => Err(e),
+                            Ok(()) => redshift::run_sql(
+                                &session,
+                                t,
+                                Some(&db_name),
+                                query,
+                                &source.hidden_fields,
+                                TRY_RESULT_CHARS,
+                            )
+                            .await
+                            .map(|l| Tried {
+                                text: l.statement,
+                                fields: l.tables,
+                                result: l.result,
+                                hidden_count: l.hidden_count,
+                                ms: l.ms,
+                                note: format!(
+                                    "{} in {}",
+                                    common::live::count(l.rows, "row"),
+                                    l.database
+                                ),
+                            }),
+                        }
+                    }
+                },
+            }
         }
         Kind::Database => {
             let t = aws_of(&source)?;
@@ -906,6 +967,8 @@ pub async fn aws_connect(
         "role_arn": t.role_arn,
         "log_groups": groups,
         "database": database,
+        "warehouse": (!t.cluster_id.is_empty())
+            .then(|| json!({ "cluster": t.cluster_id, "databases": t.databases })),
     })))
 }
 
@@ -1010,6 +1073,8 @@ async fn save_db_schema(state: &AppState, team_id: &str, id: &str, schema: &str)
 }
 
 fn db_samples(schema: &str) -> Vec<(String, String)> {
+    // A warehouse's blocks read "table s.t (database d)": the table is the
+    // first word, and the database stays in the label for the samples route.
     schema
         .split("\n\n")
         .filter_map(|block| {
@@ -1020,19 +1085,28 @@ fn db_samples(schema: &str) -> Vec<(String, String)> {
                 .map(str::to_string)
         })
         .take(3)
-        .flat_map(|t| {
+        .flat_map(|head| {
+            let table = head.split_whitespace().next().unwrap_or("").to_string();
+            let in_db = head.strip_prefix(&table).unwrap_or("").to_string();
             [
                 (
-                    format!("Count rows in {t}"),
-                    format!("SELECT count(*) FROM {t}"),
+                    format!("Count rows in {table}{in_db}"),
+                    format!("SELECT count(*) FROM {table}"),
                 ),
                 (
-                    format!("Look at a few rows of {t}"),
-                    format!("SELECT * FROM {t} LIMIT 5"),
+                    format!("Look at a few rows of {table}{in_db}"),
+                    format!("SELECT * FROM {table} LIMIT 5"),
                 ),
             ]
         })
         .collect()
+}
+
+/// The database a warehouse sample is for, from its label.
+fn sample_database(label: &str) -> Option<&str> {
+    label
+        .rsplit_once("(database ")
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
 }
 
 /// POST /api/data-sources/database  { code, name? } — checks the database
@@ -1044,6 +1118,16 @@ pub async fn create_database(
 ) -> Reply {
     admin(&claims)?;
     let mut t = target_from(&state, &claims.team_id, &body).await?;
+    // One pasted line can carry a PostgreSQL database and a Redshift warehouse;
+    // `engine` says which this request connects (PostgreSQL when both and unsaid).
+    let wants_warehouse = match text(&body, "engine") {
+        "redshift" => true,
+        "postgres" => false,
+        _ => t.cluster_arn.is_empty() && !t.cluster_id.is_empty(),
+    };
+    if wants_warehouse {
+        return create_warehouse(&state, &claims, &body, t).await;
+    }
     if t.cluster_arn.is_empty() {
         return Err(fail(
             StatusCode::BAD_REQUEST,
@@ -1051,6 +1135,10 @@ pub async fn create_database(
         ));
     }
     t.log_groups.clear();
+    t.engine.clear();
+    t.cluster_id.clear();
+    t.db_user.clear();
+    t.databases.clear();
     let existing = room_for_one_more(&state, &claims.team_id).await?;
     if existing.iter().any(|s| {
         s.aws
@@ -1094,9 +1182,86 @@ pub async fn create_database(
     ))
 }
 
+/// Connects a Redshift warehouse: every shared database, checked read-only.
+async fn create_warehouse(
+    state: &AppState,
+    claims: &Claims,
+    body: &Value,
+    mut t: AwsTarget,
+) -> Reply {
+    if t.cluster_id.is_empty() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "That line doesn't include a warehouse. Run the setup script again and choose one.",
+        ));
+    }
+    t.log_groups.clear();
+    t.cluster_arn.clear();
+    t.secret_arn.clear();
+    t.database.clear();
+    let existing = room_for_one_more(state, &claims.team_id).await?;
+    if existing.iter().any(|s| {
+        s.aws
+            .as_ref()
+            .is_some_and(|a| a.engine == "redshift" && a.cluster_id == t.cluster_id)
+    }) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "That warehouse is already connected.",
+        ));
+    }
+    let (mut checks, session) = role_checks(state, &t, &claims.email).await;
+    let Ok(session) = session else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "The connection checks didn't pass.", "checks": checks })),
+        ));
+    };
+    let report = redshift::connect_checks(&session, &t).await;
+    checks.extend(report.checks);
+    if !report.ok {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "The connection checks didn't pass.", "checks": checks })),
+        ));
+    }
+    let name = match text(body, "name") {
+        "" => format!("{} warehouse", t.cluster_id),
+        n => common::truncate_str(n, 80).to_string(),
+    };
+    let mut source = new_aws_source(Kind::Database, name, t, &claims.email);
+    source.kinds = report.tables;
+    if let Some(schema) = &report.schema {
+        source.schema_available = true;
+        source.samples = db_samples(schema);
+        save_db_schema(state, &claims.team_id, &source.id, schema).await;
+    }
+    save(state, &claims.team_id, &source).await?;
+    info!(team = %claims.team_id, source = %source.id, "Warehouse source connected");
+    Ok(Json(
+        json!({ "source": source.public_json(), "checks": checks }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warehouse_samples_keep_their_database() {
+        let schema = "table public.orders (database dev)\n  id: integer\n\ntable marts.daily (database marts)\n  day: date\n";
+        let s = db_samples(schema);
+        assert_eq!(
+            s[0],
+            (
+                "Count rows in public.orders (database dev)".to_string(),
+                "SELECT count(*) FROM public.orders".to_string()
+            )
+        );
+        assert_eq!(sample_database(&s[0].0), Some("dev"));
+        assert_eq!(sample_database(&s[2].0), Some("marts"));
+        assert_eq!(sample_database("Count rows in orders"), None);
+    }
 
     #[test]
     fn database_samples_come_from_the_first_tables() {
