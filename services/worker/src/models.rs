@@ -103,6 +103,8 @@ impl Secrets {
 pub enum WorkerMessage {
     #[serde(rename = "ticket")]
     Ticket(TicketMessage),
+    #[serde(rename = "tool_proposals")]
+    ToolProposals(ToolProposalsMessage),
     #[serde(rename = "feedback")]
     Feedback(FeedbackMessage),
     #[serde(rename = "onboard")]
@@ -567,4 +569,16 @@ mod tests {
         let s: Secrets = serde_json::from_str(json).unwrap();
         assert_eq!(s.github_app_id, "1");
     }
+}
+
+/// Tool definitions changed in a repo's default branch: each becomes a
+/// proposed version waiting for an admin's approval. Never approved here.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ToolProposalsMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub sha: String,
+    pub paths: Vec<String>,
 }

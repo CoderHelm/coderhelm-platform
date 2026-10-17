@@ -19,6 +19,7 @@ use super::api::Check;
 use super::aws::{rdsdata_client, AwsTarget, Session};
 use super::redact::{hidden_terms, redact_all};
 use super::sql::{check_read_only_sql, CheckedSql};
+use super::tools::{BoundParam, ParamValue};
 use super::StepError;
 
 /// Longest a lookup may run, enforced by the database itself.
@@ -91,6 +92,37 @@ async fn read_in_rolled_back_transaction(
     t: &AwsTarget,
     sql: &str,
 ) -> Result<Vec<Row>, StepError> {
+    read_with_params(client, t, sql, &[]).await
+}
+
+fn data_api_params(params: &[BoundParam]) -> Vec<aws_sdk_rdsdata::types::SqlParameter> {
+    use aws_sdk_rdsdata::types::{Field, SqlParameter, TypeHint};
+    params
+        .iter()
+        .map(|p| {
+            let (value, hint) = match &p.value {
+                ParamValue::Text(v) => (Field::StringValue(v.clone()), None),
+                ParamValue::Int(n) => (Field::LongValue(*n), None),
+                ParamValue::Date(d) => (Field::StringValue(d.clone()), Some(TypeHint::Date)),
+            };
+            SqlParameter::builder()
+                .name(&p.name)
+                .value(value)
+                .set_type_hint(hint)
+                .build()
+        })
+        .collect()
+}
+
+/// [`read_in_rolled_back_transaction`] with values bound to named
+/// parameters (`:name`) by the Data API, so no value is ever part of the SQL
+/// text.
+async fn read_with_params(
+    client: &aws_sdk_rdsdata::Client,
+    t: &AwsTarget,
+    sql: &str,
+    params: &[BoundParam],
+) -> Result<Vec<Row>, StepError> {
     let tx = client
         .begin_transaction()
         .resource_arn(&t.cluster_arn)
@@ -142,6 +174,7 @@ async fn read_in_rolled_back_transaction(
             .transaction_id(&tx_id)
             .format_records_as(aws_sdk_rdsdata::types::RecordsFormatType::Json)
             .sql(sql)
+            .set_parameters((!params.is_empty()).then(|| data_api_params(params)))
             .send()
             .await
             .map_err(|e| data_api_error(&e))?;
@@ -217,6 +250,32 @@ pub async fn run_sql(
         hidden_count,
         ms,
     })
+}
+
+/// Runs a reviewed tool's checked SQL with its inputs bound as parameters.
+/// `text` is what [`super::tools::check_tool_sql`] returned.
+pub async fn run_tool_sql(
+    session: &Session,
+    t: &AwsTarget,
+    text: &str,
+    params: &[BoundParam],
+    hidden: &[String],
+    max_result_chars: usize,
+) -> Result<(usize, String, usize, u128), StepError> {
+    let client = rdsdata_client(session);
+    let started = Instant::now();
+    let rows = read_with_params(&client, t, text, params).await?;
+    let ms = started.elapsed().as_millis();
+    let count = rows.len();
+    let mut value = Value::Array(rows.into_iter().map(Value::Object).collect());
+    let hidden_count = redact_all(&mut value, &hidden_terms(hidden));
+    let pretty = serde_json::to_string_pretty(&value).unwrap_or_default();
+    Ok((
+        count,
+        crate::head_tail_str(&pretty, max_result_chars),
+        hidden_count,
+        ms,
+    ))
 }
 
 const ACCESS_CHECK: &str = "SELECT current_user AS who, \

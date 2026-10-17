@@ -1840,6 +1840,30 @@ fn is_coderhelm_actor(login: &str) -> bool {
     login.to_ascii_lowercase().starts_with("coderhelm")
 }
 
+/// Tool definition files a push added or changed, at most 50.
+fn tool_definition_paths(payload: &Value) -> Vec<String> {
+    let mut paths: Vec<String> = payload["commits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|c| {
+            ["added", "modified"]
+                .into_iter()
+                .flat_map(move |k| c[k].as_array().cloned().unwrap_or_default())
+        })
+        .filter_map(|p| p.as_str().map(String::from))
+        .filter(|p| {
+            p.starts_with(".coderhelm/tools/")
+                && (p.ends_with(".yaml") || p.ends_with(".yml") || p.ends_with(".json"))
+                && !p.contains("..")
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths.truncate(50);
+    paths
+}
+
 async fn handle_push(
     state: &AppState,
     payload: &Value,
@@ -1864,6 +1888,21 @@ async fn handle_push(
     // Only the branch the graph tracks.
     if git_ref != format!("refs/heads/{default_branch}") {
         return Ok(StatusCode::OK);
+    }
+    // Team tool definitions in `.coderhelm/tools/` become proposals waiting
+    // for an admin's approval. A merge never turns a tool on by itself.
+    let tool_paths = tool_definition_paths(payload);
+    if !tool_paths.is_empty() {
+        let sha = payload["after"].as_str().unwrap_or("").to_string();
+        let message = WorkerMessage::ToolProposals(crate::models::ToolProposalsMessage {
+            team_id: team_id.to_string(),
+            installation_id,
+            repo_owner: owner.to_string(),
+            repo_name: name.to_string(),
+            sha,
+            paths: tool_paths,
+        });
+        let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
     }
     // Graph must be explicitly enabled for the repo.
     let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
@@ -2621,5 +2660,27 @@ mod reviewer_ask_tests {
                 question: Some("¿por qué? 🚀".into()),
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_paths_tests {
+    use super::tool_definition_paths;
+    use serde_json::json;
+
+    #[test]
+    fn only_tool_files_in_the_tools_folder_are_proposals() {
+        let p = json!({"commits": [
+            {"added": [".coderhelm/tools/find-order.yaml", "src/app.ts"], "modified": [".coderhelm/tools/x.json"]},
+            {"added": [".coderhelm/tools/../secrets.yaml", ".coderhelm/tools/notes.md", ".coderhelm/other.yaml"], "modified": [".coderhelm/tools/find-order.yaml"]}
+        ]});
+        assert_eq!(
+            tool_definition_paths(&p),
+            vec![
+                ".coderhelm/tools/find-order.yaml",
+                ".coderhelm/tools/x.json"
+            ]
+        );
+        assert!(tool_definition_paths(&json!({})).is_empty());
     }
 }
