@@ -624,6 +624,13 @@ pub async fn run(
                     run_id = msg.run_id,
                     "No CI checks found — marking PR ready and completing"
                 );
+                super::record_ci_outcome(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    super::CiOutcome::Passed,
+                )
+                .await;
                 mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
                 set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
                 return Ok(());
@@ -816,6 +823,13 @@ pub async fn run(
         // (`has_ci_fail && !has_ci_pass`) skipped this path whenever any workflow
         // passed, shipping red PRs as "completed" (run 01KZ5AJW).
         info!(run_id = msg.run_id, "CI failed — attempting fix");
+        super::record_ci_outcome(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            super::CiOutcome::FixAttempt,
+        )
+        .await;
 
         // Collect failure logs from events
         let failure_logs = collect_ci_failure_info(&events);
@@ -1062,6 +1076,15 @@ pub async fn run(
             }
         }
 
+        // The fix changed code: count it before going back to wait for CI.
+        super::record_ci_outcome(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            super::CiOutcome::FixCommitted,
+        )
+        .await;
+
         // Save checkpoint with incremented cycle, go back to awaiting_ci
         save_checkpoint(
             state,
@@ -1177,6 +1200,7 @@ pub async fn run(
             feedback_len = review_feedback.len(),
             "CI passed — running review"
         );
+        super::record_ci_outcome(state, &msg.team_id, &msg.run_id, super::CiOutcome::Passed).await;
         super::update_pass(state, &msg.team_id, &msg.run_id, "review").await?;
 
         let plan_result = plan::PlanResult {

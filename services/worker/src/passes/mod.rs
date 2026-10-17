@@ -3331,6 +3331,8 @@ async fn create_run_record(
             }),
         )
         .item("ticket_id", attr_s(&msg.ticket_id))
+        // Who asked for the work, for per-person analytics.
+        .item("sender", attr_s(&msg.sender))
         .item("title", attr_s(&msg.title))
         .item("repo", attr_s(&repo))
         .item("installation_id", attr_n(msg.installation_id))
@@ -3411,6 +3413,54 @@ pub(crate) async fn update_pass(
         .send()
         .await?;
     Ok(())
+}
+
+/// A CI result worth counting on the run record, for analytics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CiOutcome {
+    /// CI was red and Coderhelm started a fix cycle.
+    FixAttempt,
+    /// A fix cycle changed code and pushed it.
+    FixCommitted,
+    /// CI came back green.
+    Passed,
+}
+
+impl CiOutcome {
+    fn update_expression(self) -> &'static str {
+        match self {
+            CiOutcome::FixAttempt => "ADD ci_fix_attempts :one SET ci_last = :failed",
+            CiOutcome::FixCommitted => "ADD ci_fix_commits :one",
+            CiOutcome::Passed => "SET ci_last = :passed",
+        }
+    }
+}
+
+/// Counts a CI result on the run record. Never fails the run: analytics are
+/// best effort.
+pub(crate) async fn record_ci_outcome(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    outcome: CiOutcome,
+) {
+    let mut req = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(outcome.update_expression());
+    req = match outcome {
+        CiOutcome::FixAttempt => req
+            .expression_attribute_values(":one", attr_n(1))
+            .expression_attribute_values(":failed", attr_s("failed")),
+        CiOutcome::FixCommitted => req.expression_attribute_values(":one", attr_n(1)),
+        CiOutcome::Passed => req.expression_attribute_values(":passed", attr_s("passed")),
+    };
+    if let Err(e) = req.send().await {
+        warn!(run_id, error = %e, "Failed to record CI outcome (non-fatal)");
+    }
 }
 
 /// Append a timestamped progress note to the run record for live activity display.
@@ -5901,6 +5951,27 @@ mod sanitize_error_tests {
         assert!(
             out.starts_with("An error occurred during processing"),
             "{out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ci_outcome_tests {
+    use super::CiOutcome;
+
+    #[test]
+    fn each_outcome_updates_only_its_own_fields() {
+        assert_eq!(
+            CiOutcome::FixAttempt.update_expression(),
+            "ADD ci_fix_attempts :one SET ci_last = :failed"
+        );
+        assert_eq!(
+            CiOutcome::FixCommitted.update_expression(),
+            "ADD ci_fix_commits :one"
+        );
+        assert_eq!(
+            CiOutcome::Passed.update_expression(),
+            "SET ci_last = :passed"
         );
     }
 }

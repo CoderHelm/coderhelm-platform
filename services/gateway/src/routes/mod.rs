@@ -1,4 +1,5 @@
 pub mod alerts;
+pub mod analytics;
 pub mod api;
 pub mod auth;
 pub mod banners;
