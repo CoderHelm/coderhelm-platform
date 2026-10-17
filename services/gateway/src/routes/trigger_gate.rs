@@ -7,9 +7,13 @@
 //!
 //! - a run in flight (running / queued / awaiting_ci) always blocks — a new
 //!   run would force-reset the branch out from under the active one
-//! - a completed latest run blocks unless the ticket CONTENT actually
-//!   changed (context hash), in which case rework is allowed; the worker
-//!   resets the branch and reopens the existing PR
+//! - a completed latest run (its PR still open) blocks unless the ticket
+//!   CONTENT actually changed (context hash), in which case rework is
+//!   allowed; the worker resets the branch and updates that same PR
+//! - a merged latest run blocks on any ticket edit: the work shipped, and a
+//!   fresh run would rebuild it from scratch as a second PR (people closed
+//!   five of those in one afternoon). A person asks explicitly for follow-up
+//!   work, which still goes through
 //! - a failed / needs_input / retried / cancelled latest run never blocks
 //! - explicit human triggers (slash commands, comment retries) skip the
 //!   content check but still respect in-flight blocking
@@ -121,12 +125,18 @@ pub async fn gate_ticket_trigger(
 
     // "success" is a legacy terminal status from an old resume path;
     // "merged" means the PR landed — rework only on real content change.
-    if matches!(
-        status_of(latest).as_str(),
-        "completed" | "success" | "merged"
-    ) {
+    let latest_status = status_of(latest);
+    if matches!(latest_status.as_str(), "completed" | "success" | "merged") {
         let stored_hash = latest.get("context_hash").and_then(|v| v.as_s().ok());
         match (new_context_hash, stored_hash) {
+            _ if !rework_on_edit(&latest_status) => {
+                info!(
+                    team_id,
+                    ticket_id,
+                    "Trigger gate: ticket's PR already merged — an edit doesn't start a new run"
+                );
+                TicketGate::SkipUnchanged
+            }
             (Some(new), Some(stored)) if new != stored => {
                 info!(
                     team_id,
@@ -149,6 +159,13 @@ pub async fn gate_ticket_trigger(
         // failed / needs_input / retried / cancelled — allow retry
         TicketGate::Enqueue
     }
+}
+
+/// Whether editing a ticket may start a new run after its latest run ended
+/// with `status`. Only while its PR is still open: the run then updates that
+/// PR. After a merge, follow-up work is asked for explicitly.
+fn rework_on_edit(status: &str) -> bool {
+    status != "merged"
 }
 
 /// Compute the S3 keys the Jira attachment upload will produce, WITHOUT
@@ -174,4 +191,16 @@ pub fn expected_attachment_keys(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rework_on_edit;
+
+    #[test]
+    fn an_edit_reworks_an_open_pr_but_never_a_merged_one() {
+        assert!(rework_on_edit("completed"));
+        assert!(rework_on_edit("success"));
+        assert!(!rework_on_edit("merged"));
+    }
 }
