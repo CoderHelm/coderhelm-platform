@@ -2,19 +2,19 @@
 //! the rules in [`super`]. One source covers every database in the warehouse
 //! the team shared.
 //!
-//! Three locks, each enough on its own to stop a write:
+//! Four locks, each enough on its own to stop a change to existing data:
 //! 1. The lookup is parsed and refused unless it is one plain SELECT
 //!    ([`super::sql`]); what is sent is printed from what was parsed.
 //! 2. It runs as a user with no password that can only read: connecting, and
 //!    the first lookup in each database during every agent run, check that
 //!    the user is not an admin and cannot change any table.
-//! 3. The role in the team's account may only sign in as that one user and
+//! 3. It runs inside a session whose transaction is begun READ ONLY before
+//!    anything else, which the warehouse must confirm, and which is always
+//!    rolled back. This also stops creating tables, which Redshift lets every
+//!    user do in `public` unless a team has revoked it.
+//! 4. The role in the team's account may only sign in as that one user and
 //!    run single statements; batches and every other way of signing in are
 //!    denied.
-//!
-//! Redshift has no read-only transaction to roll back, so unlike PostgreSQL
-//! there is no transaction lock; the user's rights carry that weight and are
-//! checked before use.
 
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,8 @@ use super::StepError;
 /// Longest we wait for one statement before cancelling it.
 const WAIT: Duration = Duration::from_secs(25);
 const POLL: Duration = Duration::from_millis(300);
+/// How long the warehouse keeps a lookup's session open when idle.
+const SESSION_SECONDS: i32 = 60;
 /// Most columns kept per database in the description of the warehouse.
 const MAX_SCHEMA_COLUMNS: usize = 3_000;
 
@@ -96,29 +98,55 @@ fn field_value(f: &aws_sdk_redshiftdata::types::Field) -> Value {
     }
 }
 
-/// Runs one statement in `database` as the read-only user and returns its
-/// rows. `sql` must already be checked, or be one of this module's own reads.
-async fn run(
+/// One statement sent, waited for, and (when it returns rows) read.
+struct Done {
+    rows: Vec<Row>,
+    session: Option<String>,
+}
+
+fn failed(why: &str) -> StepError {
+    StepError::new(
+        "read",
+        format!(
+            "The warehouse couldn't run that: {}",
+            crate::truncate_str(why, 300)
+        ),
+        "Check table and column names with the description of this warehouse.",
+    )
+}
+
+/// Sends one statement, either opening a session (`open` = the database) or
+/// inside an open one, and waits for it.
+async fn exec(
     client: &aws_sdk_redshiftdata::Client,
     t: &AwsTarget,
-    database: &str,
+    open: Option<&str>,
+    session: Option<&str>,
     sql: &str,
-) -> Result<Vec<Row>, StepError> {
-    let started = Instant::now();
-    let out = client
+    started: Instant,
+) -> Result<Done, StepError> {
+    let mut req = client
         .execute_statement()
-        .cluster_identifier(&t.cluster_id)
-        .db_user(&t.db_user)
-        .database(database)
         .sql(sql)
-        .statement_name("coderhelm-lookup")
-        .send()
-        .await
-        .map_err(|e| api_error(&e))?;
+        .statement_name("coderhelm-lookup");
+    req = match (open, session) {
+        (Some(db), _) => req
+            .cluster_identifier(&t.cluster_id)
+            .db_user(&t.db_user)
+            .database(db)
+            .session_keep_alive_seconds(SESSION_SECONDS),
+        (None, Some(sid)) => req.session_id(sid),
+        (None, None) => return Err(failed("no session")),
+    };
+    let out = req.send().await.map_err(|e| api_error(&e))?;
     let id = out.id().unwrap_or_default().to_string();
+    let session = out
+        .session_id()
+        .map(str::to_string)
+        .or(session.map(str::to_string));
 
     use aws_sdk_redshiftdata::types::StatusString;
-    loop {
+    let has_rows = loop {
         tokio::time::sleep(POLL).await;
         let d = client
             .describe_statement()
@@ -127,22 +155,9 @@ async fn run(
             .await
             .map_err(|e| api_error(&e))?;
         match d.status() {
-            Some(StatusString::Finished) => {
-                if d.has_result_set() != Some(true) {
-                    return Ok(Vec::new());
-                }
-                break;
-            }
+            Some(StatusString::Finished) => break d.has_result_set() == Some(true),
             Some(StatusString::Failed) | Some(StatusString::Aborted) => {
-                let why = d.error().unwrap_or("it failed");
-                return Err(StepError::new(
-                    "read",
-                    format!(
-                        "The warehouse couldn't run that: {}",
-                        crate::truncate_str(why, 300)
-                    ),
-                    "Check table and column names with the description of this warehouse.",
-                ));
+                return Err(failed(d.error().unwrap_or("it failed")));
             }
             _ if started.elapsed() > WAIT => {
                 let _ = client.cancel_statement().id(&id).send().await;
@@ -154,8 +169,13 @@ async fn run(
             }
             _ => {}
         }
+    };
+    if !has_rows {
+        return Ok(Done {
+            rows: Vec::new(),
+            session,
+        });
     }
-
     let r = client
         .get_statement_result()
         .id(&id)
@@ -173,7 +193,8 @@ async fn run(
                 .unwrap_or_else(|| format!("col{i}"))
         })
         .collect();
-    Ok(r.records()
+    let rows = r
+        .records()
         .iter()
         .map(|rec| {
             names
@@ -182,7 +203,55 @@ async fn run(
                 .zip(rec.iter().map(field_value))
                 .collect::<Row>()
         })
-        .collect())
+        .collect();
+    Ok(Done { rows, session })
+}
+
+const READ_ONLY_PROOF: &str = "SELECT current_setting('transaction_read_only') AS ro";
+
+/// True only when the warehouse answered that the transaction is read-only.
+fn confirms_read_only(rows: &[Row]) -> bool {
+    rows.first()
+        .and_then(|r| r.get("ro"))
+        .and_then(|v| v.as_str())
+        .map(|v| v == "on")
+        .unwrap_or(false)
+}
+
+/// Runs `sql` in `database` as the read-only user, inside a transaction that
+/// is set read-only before anything else, proven read-only by the warehouse,
+/// and always rolled back. `sql` must already be checked, or be one of this
+/// module's own reads.
+async fn run(
+    client: &aws_sdk_redshiftdata::Client,
+    t: &AwsTarget,
+    database: &str,
+    sql: &str,
+) -> Result<Vec<Row>, StepError> {
+    let started = Instant::now();
+    let begun = exec(client, t, Some(database), None, "BEGIN READ ONLY", started).await?;
+    let Some(sid) = begun.session else {
+        return Err(failed("the warehouse opened no session"));
+    };
+    let result = async {
+        let proof = exec(client, t, None, Some(&sid), READ_ONLY_PROOF, started).await?;
+        if !confirms_read_only(&proof.rows) {
+            return Err(StepError::new(
+                "read_only",
+                "The warehouse didn't confirm this lookup was read-only, so it wasn't run.",
+                "Nothing was sent. Run the connection check again.",
+            ));
+        }
+        exec(client, t, None, Some(&sid), sql, started)
+            .await
+            .map(|d| d.rows)
+    }
+    .await;
+    // Rolled back whatever happened, so nothing a statement did can last.
+    if let Err(e) = exec(client, t, None, Some(&sid), "ROLLBACK", Instant::now()).await {
+        tracing::warn!(error = %e.message, "Rolling back a warehouse lookup failed; the session ends on its own");
+    }
+    result
 }
 
 /// The result of one warehouse lookup.
@@ -257,10 +326,13 @@ pub async fn run_sql(
 const ACCESS_CHECK: &str = "SELECT current_user AS who, \
      (SELECT usesuper OR usecreatedb FROM pg_user WHERE usename = current_user) AS powerful, \
      (SELECT count(*) FROM information_schema.tables t \
-       WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_internal') AND t.table_type = 'BASE TABLE' \
-         AND (has_table_privilege(quote_ident(t.table_schema) || '.' || quote_ident(t.table_name), 'INSERT') \
-           OR has_table_privilege(quote_ident(t.table_schema) || '.' || quote_ident(t.table_name), 'UPDATE') \
-           OR has_table_privilege(quote_ident(t.table_schema) || '.' || quote_ident(t.table_name), 'DELETE'))) AS writable_tables, \
+       WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_internal') AND t.table_schema NOT LIKE 'pg\\_%' \
+         AND t.table_type = 'BASE TABLE' \
+         AND CASE WHEN has_schema_privilege(t.table_schema, 'USAGE') THEN \
+               has_table_privilege(quote_ident(t.table_schema) || '.' || quote_ident(t.table_name), 'INSERT') \
+               OR has_table_privilege(quote_ident(t.table_schema) || '.' || quote_ident(t.table_name), 'UPDATE') \
+               OR has_table_privilege(quote_ident(t.table_schema) || '.' || quote_ident(t.table_name), 'DELETE') \
+             ELSE false END) AS writable_tables, \
      version() AS version";
 
 const SCHEMA_READ: &str =
@@ -520,8 +592,16 @@ mod tests {
     }
 
     #[test]
+    fn only_a_clear_yes_counts_as_read_only() {
+        let row = |v: Value| v.as_object().unwrap().clone();
+        assert!(confirms_read_only(&[row(json!({"ro": "on"}))]));
+        assert!(!confirms_read_only(&[row(json!({"ro": "off"}))]));
+        assert!(!confirms_read_only(&[]));
+    }
+
+    #[test]
     fn our_own_reads_pass_the_checker() {
-        for sql in [ACCESS_CHECK, SCHEMA_READ] {
+        for sql in [ACCESS_CHECK, SCHEMA_READ, READ_ONLY_PROOF] {
             check_read_only_sql(sql, &[]).unwrap_or_else(|e| panic!("{e}"));
         }
     }
@@ -600,5 +680,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.is_refusal());
+    }
+
+    /// Against a real warehouse set up by the setup script. Set
+    /// LIVE_SETUP_CODE and LIVE_EXTERNAL_ID, then run with
+    /// `cargo test -- --ignored real_warehouse`. Every write attempt runs inside
+    /// the read-only, rolled-back transaction and must fail.
+    #[tokio::test]
+    #[ignore = "needs a real AWS account"]
+    async fn real_warehouse_reads_and_refuses_writes() {
+        use super::super::aws;
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
+        let conf = aws_config::load_from_env().await;
+        let sts = aws_sdk_sts::Client::new(&conf);
+        let mut t = aws::parse_setup_code(&env("LIVE_SETUP_CODE")).unwrap();
+        t.external_id = env("LIVE_EXTERNAL_ID");
+        let session = aws::assume(&sts, &t, "integration-test").await.unwrap();
+        let report = connect_checks(&session, &t).await;
+        for c in &report.checks {
+            println!("check {} ok={} {}", c.id, c.ok, c.detail);
+        }
+        assert!(report.ok);
+        let c = client(&session);
+        for db in &t.databases {
+            let rows = run(&c, &t, db, "SELECT 1 AS one").await.unwrap();
+            assert_eq!(rows.len(), 1, "{db}");
+            // public is creatable by everyone by default; the transaction must still refuse.
+            let e = run(&c, &t, db, "CREATE TABLE public.coderhelm_probe (x int)")
+                .await
+                .unwrap_err();
+            println!("{db}: create refused: {}", e.message);
+            assert!(
+                e.message.to_lowercase().contains("read-only")
+                    || e.message.to_lowercase().contains("read only"),
+                "{db}: {}",
+                e.message
+            );
+        }
     }
 }
