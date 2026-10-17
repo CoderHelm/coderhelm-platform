@@ -660,15 +660,27 @@ fn encode_slot(v: &str) -> String {
 pub fn http_url(source_url: &str, def: &ToolDef, inputs: &Value) -> Result<String, StepError> {
     let base = parse_endpoint(source_url)?;
     let bound = bind(def, inputs)?;
+    let query_at = def.read.find('?').unwrap_or(def.read.len());
     let mut path = def.read.clone();
     for p in &bound {
         let v = p.value.as_text();
+        let slot = format!("{{{}}}", p.name);
         // `.` and `..` stay unencoded and the URL parser resolves them, so a
         // value like `..` would walk out of the tool's fixed path.
         if v == "." || v == ".." {
             return Err(refused(format!("{} can't be . or ..", p.name)));
         }
-        path = path.replace(&format!("{{{}}}", p.name), &encode_slot(&v));
+        // In the path part, some APIs decode %2F back into a slash and %2E
+        // into a dot, so a slash, backslash or escape could still reach a
+        // different page than the one approved. Query values stay encoded.
+        let in_path = def.read[..query_at].contains(&slot);
+        if in_path && v.contains(['/', '\\', '%']) {
+            return Err(refused(format!(
+                "{} can't hold / \\ or % where it goes into the address path.",
+                p.name
+            )));
+        }
+        path = path.replace(&slot, &encode_slot(&v));
     }
     let origin = format!(
         "https://{}{}",
@@ -1004,6 +1016,30 @@ max_rows: 20
         }
         let url = http_url(&api.url, &t, &json!({"order_number": "v1.2"})).unwrap();
         assert_eq!(url, "https://api.example.com/v1/orders/v1.2/status");
+    }
+
+    #[test]
+    fn threat_a_path_input_cant_carry_a_slash_or_an_escape() {
+        // Some APIs decode %2F back into a slash (and %2E into a dot), so a
+        // value in the path part must not carry either: it could reach a
+        // different page of the customer's API than the tool was approved for.
+        let api = SourceInfo {
+            kind: Some(Kind::Api),
+            url: "https://api.example.com/graphql".into(),
+            ..Default::default()
+        };
+        let mut t = order_tool();
+        t.kind = ToolKind::Http;
+        t.read = "/v1/orders/{order_number}/status?ref={order_number}".into();
+        t.inputs.get_mut("order_number").unwrap().pattern = Some(".+".into());
+        for bad in ["a/b", "../admin", "a\\b", "%2e%2e", "a%2Fb"] {
+            let r = http_url(&api.url, &t, &json!({ "order_number": bad }));
+            assert!(r.is_err(), "{bad} gave {r:?}");
+        }
+        // The same characters are fine as a query value, where they are encoded.
+        t.read = "/v1/orders?ref={order_number}".into();
+        let url = http_url(&api.url, &t, &json!({"order_number": "a/b%"})).unwrap();
+        assert_eq!(url, "https://api.example.com/v1/orders?ref=a%2Fb%25");
     }
 
     #[test]
