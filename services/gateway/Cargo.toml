@@ -31,6 +31,9 @@ aws-sdk-cloudwatchlogs = "1"
 aws-sdk-cloudwatch = "1"
 aws-sdk-lambda = "1"
 aws-sdk-kms = "1"
+# memory: embeds a memory a person adds or edits
+aws-sdk-bedrockruntime = "1"
+aws-smithy-types = "1"
 
 # Auth
 jsonwebtoken = "9"
