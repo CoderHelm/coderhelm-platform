@@ -150,7 +150,7 @@ pub async fn list(
     Ok(Json(json!({ "sources": sources })))
 }
 
-/// GET /api/data-sources/activity?limit=50
+/// GET /api/data-sources/activity?limit=50&before=<cursor>
 pub async fn activity(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -158,7 +158,8 @@ pub async fn activity(
 ) -> Reply {
     admin(&claims)?;
     let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50);
-    let events = store::list_activity(&state.dynamo, table(&state), &claims.team_id, limit)
+    let before = q.get("before").map(String::as_str);
+    let events = store::list_activity(&state.dynamo, table(&state), &claims.team_id, limit, before)
         .await
         .map_err(|e| internal("list lookups", e))?;
     Ok(Json(json!({ "events": events })))
