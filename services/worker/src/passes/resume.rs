@@ -1730,6 +1730,34 @@ pub(crate) async fn mark_pr_ready(
     repo_name: &str,
     pr_number: u64,
 ) {
+    mark_ready(github, repo_owner, repo_name, pr_number, false).await
+}
+
+/// Marks an E2E fix or generated-test PR ready once its repeat runs proved it.
+/// Those PRs are skipped by [`mark_pr_ready`]: green CI alone isn't enough.
+pub(crate) async fn mark_e2e_pr_ready(
+    github: &GitHubClient,
+    repo_owner: &str,
+    repo_name: &str,
+    pr_number: u64,
+) {
+    mark_ready(github, repo_owner, repo_name, pr_number, true).await
+}
+
+/// Whether a PR title belongs to an E2E fix or generated test, which waits for
+/// its repeat runs instead of green CI.
+pub(crate) fn is_e2e_proof_pr(title: &str) -> bool {
+    let t = title.trim_start_matches("⚠️ Partial: ");
+    t.starts_with(super::e2e::FIX_TICKET_PREFIX) || t.starts_with(super::e2e::GEN_TICKET_PREFIX)
+}
+
+async fn mark_ready(
+    github: &GitHubClient,
+    repo_owner: &str,
+    repo_name: &str,
+    pr_number: u64,
+    proven: bool,
+) {
     if pr_number == 0 {
         return;
     }
@@ -1744,6 +1772,19 @@ pub(crate) async fn mark_pr_ready(
                 // reopen/mark it ready — respect the close.
                 if pr.get("state").and_then(|v| v.as_str()) == Some("closed") {
                     info!(pr_number, "PR is closed — not marking ready");
+                    return;
+                }
+                // E2E fix and generated-test PRs wait for their repeat runs.
+                if !proven
+                    && pr
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(is_e2e_proof_pr)
+                {
+                    info!(
+                        pr_number,
+                        "E2E proof PR — stays a draft until its repeat runs pass"
+                    );
                     return;
                 }
                 // A PR reaching ready (CI + review passed) is no longer

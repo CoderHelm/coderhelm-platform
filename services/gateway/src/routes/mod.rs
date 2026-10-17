@@ -16,5 +16,6 @@ pub mod plans;
 pub mod plugins;
 pub mod reviewer;
 pub mod sns;
+pub mod tests;
 pub mod trigger_gate;
 pub mod users;

@@ -455,6 +455,29 @@ async fn main() -> Result<(), Error> {
             "/data-sources/:id/try",
             post(routes::data_sources::try_lookup),
         )
+        // E2E test intelligence
+        .route(
+            "/tests/settings",
+            get(routes::tests::get_settings).put(routes::tests::put_settings),
+        )
+        .route("/tests/summary", get(routes::tests::summary))
+        .route("/tests/runs", get(routes::tests::list_runs))
+        .route("/tests/runs/:run_key", get(routes::tests::get_run))
+        .route("/tests/failure-groups", get(routes::tests::failure_groups))
+        .route("/tests/coverage", get(routes::tests::coverage))
+        .route(
+            "/tests/recommendations/:id/accept",
+            post(routes::tests::accept_recommendation),
+        )
+        .route(
+            "/tests/recommendations/:id/dismiss",
+            post(routes::tests::dismiss_recommendation),
+        )
+        .route("/tests", get(routes::tests::list_tests))
+        .route("/tests/:id", get(routes::tests::get_test))
+        .route("/tests/:id/quarantine", post(routes::tests::quarantine))
+        .route("/tests/:id/pin", post(routes::tests::pin))
+        .route("/tests/:id/fix", post(routes::tests::fix))
         // Memory browser
         .route("/memories", get(routes::memory::list_memories))
         .route("/memories/stats", get(routes::memory::memory_stats))
@@ -472,7 +495,10 @@ async fn main() -> Result<(), Error> {
         .route("/github", post(routes::github_webhook::handle))
         .route("/jira/:token", post(routes::jira_webhook::handle))
         .route("/jira", post(routes::jira_webhook::handle_forge))
-        .route("/alerts/sns", post(routes::alerts::handle_sns));
+        .route("/alerts/sns", post(routes::alerts::handle_sns))
+        // CI calls signed with a GitHub Actions OIDC token
+        .route("/ci/tests/results", post(routes::tests::ci_upload))
+        .route("/ci/tests/quarantine", get(routes::tests::ci_quarantine));
 
     // Auth routes (public, rate-limited)
     let auth_routes = Router::new()

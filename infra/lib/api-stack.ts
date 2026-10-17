@@ -34,6 +34,7 @@ interface ApiStackProps extends cdk.StackProps {
   bannersTable: dynamodb.TableV2;
   mcpConfigsTable: dynamodb.TableV2;
   awsInsightsTable: dynamodb.TableV2;
+  testsTable: dynamodb.TableV2;
   waitlistTable: dynamodb.TableV2;
   bucket: s3.Bucket;
 }
@@ -302,6 +303,7 @@ export class ApiStack extends cdk.Stack {
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
         SECRETS_KEY_ID: props.secretsKey.keyId,
         AWS_INSIGHTS_TABLE_NAME: props.awsInsightsTable.tableName,
+        TESTS_TABLE_NAME: props.testsTable.tableName,
         MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
         INFRA_TABLE_NAME: props.infraTable.tableName,
         BILLING_TABLE_NAME: props.billingTable.tableName, // Retained for CF migration
@@ -361,6 +363,7 @@ export class ApiStack extends cdk.Stack {
     props.settingsTable.grantReadWriteData(this.gatewayFunction);
     props.secretsKey.grantEncryptDecrypt(this.gatewayFunction);
     props.awsInsightsTable.grantReadWriteData(this.gatewayFunction);
+    props.testsTable.grantReadWriteData(this.gatewayFunction);
     props.infraTable.grantReadWriteData(this.gatewayFunction);
     props.billingTable.grantReadWriteData(this.gatewayFunction); // Retained for CF migration
     props.bannersTable.grantReadData(this.gatewayFunction);

@@ -51,6 +51,7 @@ const api = new ApiStack(app, `${prefix}-api`, {
   bannersTable: database.bannersTable,
   mcpConfigsTable: database.mcpConfigsTable,
   awsInsightsTable: database.awsInsightsTable,
+  testsTable: database.testsTable,
   waitlistTable: database.waitlistTable,
   bucket: storage.bucket,
 });
@@ -70,6 +71,7 @@ const worker = new WorkerStack(app, `${prefix}-worker`, {
   tracesTable: database.tracesTable,
   checkpointsTable: database.checkpointsTable,
   eventsTable: database.eventsTable,
+  testsTable: database.testsTable,
   bucket: storage.bucket,
   ticketQueue: api.ticketQueue,
   ciFixQueue: api.ciFixQueue,

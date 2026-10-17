@@ -2351,6 +2351,148 @@ impl GitHubClient {
         Ok((number, html_url))
     }
 
+    // ─── Actions: E2E results ───────────────────────────────────
+
+    /// POST that expects no response body (GitHub answers 201/204 empty).
+    async fn post_empty(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.post(url).json(body);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        req.send().await?.error_for_status()?;
+        Ok(())
+    }
+
+    /// Artifacts a workflow run produced: (id, name, size in bytes, expired).
+    pub async fn list_run_artifacts(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: u64,
+    ) -> Result<Vec<(u64, String, u64, bool)>, Box<dyn std::error::Error + Send + Sync>> {
+        let url =
+            format!("{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts?per_page=100");
+        let data = self.get(&url).await?;
+        Ok(data["artifacts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|a| {
+                (
+                    a["id"].as_u64().unwrap_or(0),
+                    a["name"].as_str().unwrap_or("").to_string(),
+                    a["size_in_bytes"].as_u64().unwrap_or(0),
+                    a["expired"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect())
+    }
+
+    /// An artifact's zip. GitHub redirects to storage; the token is not sent
+    /// along to the other host. Refused when bigger than `max_bytes`.
+    pub async fn download_artifact(
+        &self,
+        owner: &str,
+        repo: &str,
+        artifact_id: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip");
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.get(&url);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let mut resp = req.send().await?.error_for_status()?;
+        let mut buf = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if buf.len() + chunk.len() > max_bytes {
+                return Err(
+                    format!("artifact larger than {} MB", max_bytes / (1024 * 1024)).into(),
+                );
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
+    }
+
+    /// Re-runs only the failed jobs of a run.
+    pub async fn rerun_failed_jobs(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url =
+            format!("{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs");
+        self.post_empty(&url, &serde_json::json!({})).await
+    }
+
+    /// Deletes a branch. Used only for the short-lived branches Coderhelm
+    /// makes itself to check a generated test against older code.
+    pub async fn delete_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.delete(&url);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        req.send().await?.error_for_status()?;
+        Ok(())
+    }
+
+    /// Files a compare changed, with their status and patch.
+    pub async fn compare_files_with_patches(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/compare/{base}...{head}");
+        let data = self.get(&url).await?;
+        Ok(data["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|f| {
+                (
+                    f["filename"].as_str().unwrap_or("").to_string(),
+                    f["status"].as_str().unwrap_or("").to_string(),
+                    f["patch"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect())
+    }
+
+    /// Starts a workflow by its file name on a branch, with inputs.
+    pub async fn dispatch_workflow(
+        &self,
+        owner: &str,
+        repo: &str,
+        workflow_file: &str,
+        git_ref: &str,
+        inputs: &serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url =
+            format!("{API_BASE}/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches");
+        self.post_empty(
+            &url,
+            &serde_json::json!({ "ref": git_ref, "inputs": inputs }),
+        )
+        .await
+    }
+
     /// Ensure a label exists in the repo, creating it if missing.
     pub async fn ensure_label(
         &self,

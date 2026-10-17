@@ -35,6 +35,8 @@ pub struct Config {
     pub traces_table_name: String,
     /// KMS key that seals teams' data-source keys. Empty disables saving them.
     pub secrets_key_id: String,
+    /// E2E results. Empty disables the feature.
+    pub tests_table_name: String,
 }
 
 impl Config {
@@ -86,6 +88,7 @@ impl Config {
             mcp_proxy_function_name: std::env::var("MCP_PROXY_FUNCTION_NAME").unwrap_or_default(),
             traces_table_name: std::env::var("TRACES_TABLE_NAME").unwrap_or_default(),
             secrets_key_id: std::env::var("SECRETS_KEY_ID").unwrap_or_default(),
+            tests_table_name: std::env::var("TESTS_TABLE_NAME").unwrap_or_default(),
         }
     }
 }
@@ -151,6 +154,12 @@ pub enum WorkerMessage {
     GraphIndex(GraphIndexMessage),
     #[serde(rename = "release_notes")]
     ReleaseNotes(ReleaseNotesMessage),
+    /// Read the test reports of a finished workflow run or an upload.
+    #[serde(rename = "test_ingest")]
+    TestIngest(common::e2e::messages::TestIngest),
+    /// Fix a flaky test, generate a recommended test, or file a ticket.
+    #[serde(rename = "test_action")]
+    TestAction(common::e2e::messages::TestAction),
 }
 
 /// A code-graph index job. `changed_files: None` ⇒ full index; `Some(paths)` ⇒

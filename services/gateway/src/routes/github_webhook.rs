@@ -1345,6 +1345,9 @@ async fn handle_workflow_run(
         return Ok(StatusCode::OK);
     }
 
+    // E2E results are read for every branch when the team turned them on.
+    super::tests::enqueue_ingest(state, payload, installation_id, team_id).await;
+
     let wf = &payload["workflow_run"];
     let branch = wf["head_branch"].as_str().unwrap_or("");
     if !branch.starts_with("coderhelm/") {
