@@ -1077,8 +1077,9 @@ fn build_profiles(f: &Facts) -> Vec<Profile> {
             "None yet. A 👎 or a note on a review becomes a lesson for the next ones.".into()
         } else {
             format!(
-                "{} notes people left on its reviews; it reads them before every review.",
-                lessons.len()
+                "{} note{} people left on its reviews; it reads them before every review.",
+                lessons.len(),
+                if lessons.len() == 1 { "" } else { "s" }
             )
         },
     });
