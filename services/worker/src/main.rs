@@ -217,6 +217,15 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                 if let Err(e) = passes::pr_outcomes::backfill(&state).await {
                     error!("Merged PR backfill failed: {e:?}");
                 }
+                if let Err(e) = passes::skills::sweep(&state).await {
+                    error!("Skill repository sweep failed: {e:?}");
+                }
+            }
+            models::WorkerMessage::SkillSync(msg) => {
+                info!(team_id = %msg.team_id, repo = %msg.repo, force = msg.force, "Skill repository sync");
+                if let Err(e) = passes::skills::sync(&state, msg).await {
+                    error!("Skill sync failed: {e:?}");
+                }
             }
             models::WorkerMessage::HealthCheck(msg) => {
                 info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Post-merge health check");

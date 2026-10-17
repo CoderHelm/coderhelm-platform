@@ -155,6 +155,10 @@ pub enum WorkerMessage {
     /// Fix a flaky test, generate a recommended test, or file a ticket.
     #[serde(rename = "test_action")]
     TestAction(common::e2e::messages::TestAction),
+    /// Read a connected skill repository's default branch again (a push to
+    /// it, a new connection, or an admin's "Sync now").
+    #[serde(rename = "skill_sync")]
+    SkillSync(common::skills::SkillSyncMessage),
 }
 
 /// A code-graph index job. `changed_files: None` ⇒ full index of the branch

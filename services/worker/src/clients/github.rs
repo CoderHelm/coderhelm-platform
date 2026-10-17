@@ -488,6 +488,35 @@ impl GitHubClient {
         Ok(tree)
     }
 
+    /// Every file at a commit with its size in bytes, straight from the API.
+    /// Errors when GitHub cuts the list short, so a caller never mistakes a
+    /// partial list for the whole repository.
+    pub async fn list_files_with_sizes(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/git/trees/{sha}?recursive=1");
+        let data = self.get(&url).await?;
+        if data.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
+            return Err("the repository is too large to list in one read".into());
+        }
+        Ok(data
+            .get("tree")
+            .and_then(|t| t.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("blob"))
+            .filter_map(|e| {
+                Some((
+                    e.get("path")?.as_str()?.to_string(),
+                    e.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+                ))
+            })
+            .collect())
+    }
+
     /// Read a single file (base64 decoded). Served from the repo snapshot
     /// when one is held for this ref; API otherwise (and for binary or
     /// oversized files the snapshot doesn't index).

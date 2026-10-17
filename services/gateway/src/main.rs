@@ -432,6 +432,21 @@ async fn main() -> Result<(), Error> {
         )
         .route("/tools/:name/approve", post(routes::tools::approve))
         .route("/tools/:name/preview", post(routes::tools::preview))
+        // Skills read from a connected repository (text only, never run)
+        .route("/skills", get(routes::skills::list))
+        .route("/skills/repos", post(routes::skills::connect))
+        .route(
+            "/skills/repos/:owner/:name",
+            delete(routes::skills::disconnect),
+        )
+        .route(
+            "/skills/repos/:owner/:name/sync",
+            post(routes::skills::sync),
+        )
+        .route(
+            "/skills/item",
+            get(routes::skills::item).put(routes::skills::set_enabled),
+        )
         .route("/data-sources", get(routes::data_sources::list))
         .route(
             "/data-sources/activity",

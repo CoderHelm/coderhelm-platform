@@ -354,6 +354,13 @@ pub async fn run(
             Some(l) => format!("{system}{}", l.prompt_section()),
             None => system,
         };
+        let skills =
+            super::skills::TeamSkills::load(state, &msg.team_id, super::skills::Reader::Reviewer)
+                .await;
+        let system = match &skills {
+            Some(s) => format!("{system}{}", s.prompt_section()),
+            None => system,
+        };
         let executor = review_agent::PrReviewToolExecutor {
             github: &github,
             owner: &msg.repo_owner,
@@ -362,10 +369,14 @@ pub async fn run(
             state,
             graph: None,
             live: live.as_ref(),
+            skills: skills.as_ref(),
         };
         let mut tools = review_agent::review_tools();
         if let Some(l) = &live {
             tools.extend(l.tools());
+        }
+        if let Some(s) = &skills {
+            tools.extend(s.tools());
         }
         let mut messages = vec![(
             "user".to_string(),
@@ -613,6 +624,8 @@ pub async fn run(
         msg.pr_number,
     )
     .await;
+    let skills =
+        super::skills::TeamSkills::load(state, &msg.team_id, super::skills::Reader::Reviewer).await;
 
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(
@@ -630,6 +643,7 @@ pub async fn run(
         &extra_context,
         &prior_context,
         live.as_ref(),
+        skills.as_ref(),
         &mut usage,
     )
     .await;
