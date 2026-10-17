@@ -58,6 +58,12 @@ const GENERATED_RUNS: u32 = 10;
 const TICKET_AFTER_DAYS: i64 = 14;
 /// Cause labels worked out per run, at most.
 const MAX_CLASSIFY: usize = 5;
+/// Fix PRs Coderhelm starts on its own, per repo per week (people can always
+/// start more from the Tests page). Each is a full coding run, so this keeps
+/// the token cost bounded.
+const AUTO_FIXES_PER_WEEK: u32 = 2;
+/// A flaky test is fixed on its own only when it fails this often on main...
+const AUTO_FIX_MIN_RATE: f64 = 0.05;
 
 pub const FIX_TICKET_PREFIX: &str = "E2E-FIX-";
 pub const GEN_TICKET_PREFIX: &str = "E2E-GEN-";
@@ -412,6 +418,7 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
     let mut executions = Vec::new();
     let mut lines: Vec<Line> = Vec::new();
     let mut newly_flaky: Vec<String> = Vec::new();
+    let mut auto_fix: Vec<String> = Vec::new();
     for t in &tests {
         let id = scoped_id(&repo, t);
         let before = st.record(&msg.team_id, &id).await?;
@@ -483,6 +490,12 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
             }
         }
         follow_fix(state, &gh, &msg, &mut r, t, &run).await;
+        if settings.fix_prs
+            && msg.head_branch == msg.default_branch
+            && wants_auto_fix(&r, &common::e2e::stats::stats(&r, now))
+        {
+            auto_fix.push(id.clone());
+        }
         if r.quarantined && r.ticket_url.is_none() && settings.tickets != "off" {
             let long = r
                 .quarantined_since
@@ -551,6 +564,23 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
     }
     for id in newly_flaky.iter().take(MAX_CLASSIFY) {
         classify(state, &msg.team_id, &repo, id).await;
+    }
+    for id in auto_fix {
+        if !claim_auto_fix(&st, &msg.team_id, &repo, now).await {
+            info!(repo = %repo, "Weekly cap on automatic fix PRs reached");
+            break;
+        }
+        info!(repo = %repo, test = %id, "Starting an automatic fix for a flaky test");
+        let action = crate::models::WorkerMessage::TestAction(TestAction {
+            team_id: msg.team_id.clone(),
+            repo: repo.clone(),
+            action: "fix".into(),
+            target_id: id,
+            actor: "Coderhelm (automatic)".into(),
+        });
+        if let Err(e) = enqueue(state, action).await {
+            warn!(error = %e, "Could not start an automatic fix");
+        }
     }
     Ok(())
 }
@@ -1334,6 +1364,49 @@ async fn start_fix_ticket(
             warn!(error = %e, "Could not start the fix");
         }
     }
+}
+
+/// Whether Coderhelm should start a fix PR for this test on its own: it is
+/// flaky (not broken: a broken test is a real regression for a person), it
+/// fails at least 5% of its runs on main, it cost CI time this week, and no
+/// fix is already under way or recently failed.
+fn wants_auto_fix(r: &TestRecord, s: &common::e2e::stats::Stats) -> bool {
+    let flaky = matches!(r.health, State::Flaky | State::Quarantined);
+    flaky
+        && r.fix_status.is_none()
+        && r.fix_pr_url.is_none()
+        && s.runs_30d >= 20
+        && s.fail_rate_30d + s.flake_rate_30d >= AUTO_FIX_MIN_RATE
+        && s.minutes_lost_7d > 0.0
+}
+
+/// Takes one of this repo's automatic fixes for the week; false once the
+/// week's are used.
+async fn claim_auto_fix(
+    st: &Store<'_>,
+    team: &str,
+    repo: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    let week = now.format("%G-W%V").to_string();
+    st.dynamo
+        .update_item()
+        .table_name(st.table)
+        .key("pk", AttributeValue::S(format!("TEAM#{team}#AUTOFIX")))
+        .key("sk", AttributeValue::S(format!("{repo}#{week}")))
+        .update_expression("ADD n :one SET #ttl = :ttl")
+        .condition_expression("attribute_not_exists(n) OR n < :cap")
+        .expression_attribute_names("#ttl", "ttl")
+        .expression_attribute_values(":one", AttributeValue::N("1".into()))
+        .expression_attribute_values(":cap", AttributeValue::N(AUTO_FIXES_PER_WEEK.to_string()))
+        .expression_attribute_values(
+            ":ttl",
+            AttributeValue::N((now.timestamp() + 14 * 86400).to_string()),
+        )
+        .send()
+        .await
+        .is_ok()
 }
 
 async fn enqueue(state: &WorkerState, m: crate::models::WorkerMessage) -> Result<(), Err> {
@@ -2214,5 +2287,60 @@ mod tests {
         assert!(!is_phase_run(&msg, "main", None, 2, 20), "too few attempts");
         msg.event = "push".into();
         assert!(!is_phase_run(&msg, "main", None, 20, 20));
+    }
+}
+
+#[cfg(test)]
+mod auto_fix_tests {
+    use super::*;
+    use common::e2e::stats::Stats;
+
+    fn stats(rate: f64, lost: f64, runs: u32) -> Stats {
+        Stats {
+            runs_30d: runs,
+            fail_rate_30d: 0.0,
+            flake_rate_30d: rate,
+            flips_14d: 2,
+            prs_blocked_7d: 1,
+            minutes_lost_7d: lost,
+            p50_ms: 0,
+            p95_ms: 0,
+        }
+    }
+
+    #[test]
+    fn only_a_costly_flaky_test_with_no_fix_under_way_qualifies() {
+        let t = ParsedTest {
+            framework: common::e2e::model::Framework::Playwright,
+            file: "a.spec.ts".into(),
+            suite: vec![],
+            title: "t".into(),
+            project: None,
+            tags: vec![],
+            attempts: vec![],
+        };
+        let mut r = new_record("acme/web", &t, "id", "2026-01-01T00:00:00Z");
+        r.health = State::Flaky;
+        assert!(wants_auto_fix(&r, &stats(0.08, 12.0, 40)));
+        assert!(!wants_auto_fix(&r, &stats(0.02, 12.0, 40)), "too rare");
+        assert!(
+            !wants_auto_fix(&r, &stats(0.08, 0.0, 40)),
+            "costs no CI time"
+        );
+        assert!(
+            !wants_auto_fix(&r, &stats(0.08, 12.0, 5)),
+            "too few runs to judge"
+        );
+        r.health = State::Broken;
+        assert!(
+            !wants_auto_fix(&r, &stats(0.9, 30.0, 40)),
+            "broken is a person's call"
+        );
+        r.health = State::Flaky;
+        r.fix_status = Some("fixing".into());
+        assert!(
+            !wants_auto_fix(&r, &stats(0.08, 12.0, 40)),
+            "a fix is already under way"
+        );
     }
 }
