@@ -423,7 +423,7 @@ impl LiveSources {
                             r.result,
                             r.hidden_count,
                             r.ms,
-                            format!("{} rows", r.rows),
+                            common::live::count(r.rows, "row"),
                         )
                     })
             }
@@ -456,8 +456,8 @@ impl LiveSources {
                     .await
                     .map(|r| {
                         let note = format!(
-                            "{} lines from {}{}",
-                            r.rows,
+                            "{} from {}{}",
+                            common::live::count(r.rows, "line"),
                             search.groups.join(", "),
                             if r.partial {
                                 "; the search was stopped early, so this may be incomplete"

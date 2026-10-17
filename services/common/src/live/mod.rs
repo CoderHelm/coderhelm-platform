@@ -35,6 +35,15 @@ pub mod store;
 
 use serde::Serialize;
 
+/// `1 row`, `3 rows`: a count with its noun, for notes people read.
+pub fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
 /// A failure a person can act on: which step failed, what happened, what to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StepError {
@@ -63,5 +72,15 @@ impl StepError {
 impl std::fmt::Display for StepError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.message, self.fix)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn counts_read_naturally() {
+        assert_eq!(super::count(1, "row"), "1 row");
+        assert_eq!(super::count(0, "row"), "0 rows");
+        assert_eq!(super::count(40, "line"), "40 lines");
     }
 }

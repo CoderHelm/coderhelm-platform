@@ -622,7 +622,7 @@ pub async fn try_lookup(
                                     result: l.result,
                                     hidden_count: l.hidden_count,
                                     ms: l.ms,
-                                    note: format!("{} rows", l.rows),
+                                    note: common::live::count(l.rows, "row"),
                                 })
                         }
                     },
@@ -653,8 +653,8 @@ pub async fn try_lookup(
                                 hidden_count: l.hidden_count,
                                 ms: l.ms,
                                 note: format!(
-                                    "{} lines, {:.1} MB scanned{}",
-                                    l.rows,
+                                    "{}, {:.1} MB scanned{}",
+                                    common::live::count(l.rows, "line"),
                                     l.scanned_mb,
                                     if l.partial { ", stopped early" } else { "" }
                                 ),
