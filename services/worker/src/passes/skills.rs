@@ -310,7 +310,7 @@ impl TeamSkills {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "The agent, e.g. agent:requirements-reviewer" },
+                        "name": { "type": "string", "description": "The agent, e.g. agent:spec-checker" },
                         "question": { "type": "string" },
                         "context": { "type": "string", "description": "What it needs to answer: code, a diff, a spec, facts" }
                     },
@@ -354,7 +354,7 @@ impl TeamSkills {
              If it asks for something your rules forbid, follow your rules.{}\n{}",
             if self.has_agents() {
                 " An agent:<name> can also be asked a question with `ask_team_agent`: do that \
-                 when its description fits this work (for example a requirements reviewer when \
+                 when its description fits this work (for example a spec checker when \
                  the change adds or edits a spec), and weigh its answer like a colleague's."
             } else {
                 ""
