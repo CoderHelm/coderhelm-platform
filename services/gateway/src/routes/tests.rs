@@ -848,11 +848,12 @@ struct Jwks {
 static JWKS: RwLock<Option<Jwks>> = RwLock::const_new(None);
 
 async fn jwks(http: &reqwest::Client, refresh: bool) -> Result<Vec<Value>, String> {
-    if !refresh {
-        if let Some(j) = JWKS.read().await.as_ref() {
-            if j.fetched.elapsed() < Duration::from_secs(3600) {
-                return Ok(j.keys.clone());
-            }
+    if let Some(j) = JWKS.read().await.as_ref() {
+        // A refresh (an unknown key id) refetches at most once a minute, so
+        // tokens with made-up key ids can't turn each request into a fetch.
+        let fresh_for = if refresh { 60 } else { 3600 };
+        if j.fetched.elapsed() < Duration::from_secs(fresh_for) {
+            return Ok(j.keys.clone());
         }
     }
     let v: Value = http
