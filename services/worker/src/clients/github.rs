@@ -1476,6 +1476,18 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// The commits on a pull request (first 100).
+    pub async fn list_pr_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/commits?per_page=100");
+        let v = self.get(&url).await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
     /// The login of whoever closed a PR, via the issues endpoint (the PR
     /// object doesn't carry `closed_by`). None if open, merged, or unknown.
     pub async fn get_pr_closed_by(

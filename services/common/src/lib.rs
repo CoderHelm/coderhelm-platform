@@ -18,6 +18,8 @@ pub mod alert_notify;
 pub mod e2e;
 pub mod live;
 pub mod memory_meta;
+/// What happened to a PR Coderhelm opened, read from GitHub.
+pub mod pr_outcome;
 // review_stats: time-ordered review records for analytics
 pub mod review_stats;
 

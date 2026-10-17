@@ -558,6 +558,7 @@ pub mod onboard;
 mod plan;
 pub mod plan_execute;
 mod pr;
+pub mod pr_outcomes;
 pub mod release_notes;
 mod resolve;
 pub mod resume;

@@ -214,6 +214,9 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                 if let Err(e) = passes::review_reminder::run(&state).await {
                     error!("Review reminder sweep failed: {e:?}");
                 }
+                if let Err(e) = passes::pr_outcomes::backfill(&state).await {
+                    error!("Merged PR backfill failed: {e:?}");
+                }
             }
             models::WorkerMessage::HealthCheck(msg) => {
                 info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Post-merge health check");

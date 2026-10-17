@@ -3,6 +3,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
 };
+use common::pr_outcome::human_commit_count;
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -728,7 +729,8 @@ async fn handle_pull_request(
                 .expression_attribute_values(":c", attr_s(pr["closed_at"].as_str().unwrap_or("")))
                 .expression_attribute_values(":op", attr_s(pr["created_at"].as_str().unwrap_or("")))
                 .send()
-                .await;
+                .await
+                .map_err(|e| error!(team_id, run_id, pr_number, error = %e, "Could not record the closed PR on the run"));
             info!(
                 team_id,
                 run_id, pr_number, "PR closed without merging — outcome recorded"
@@ -770,9 +772,11 @@ async fn handle_pull_request(
                 expr.push_str(", human_commits = :hc");
                 update = update.expression_attribute_values(":hc", attr_n(n));
             }
-            let _ = update.update_expression(expr).send().await;
-
-            info!(team_id, run_id, pr_number, "PR merged — run status updated");
+            if let Err(e) = update.update_expression(expr).send().await {
+                error!(team_id, run_id, pr_number, error = %e, "Could not record the merge on the run");
+            } else {
+                info!(team_id, run_id, pr_number, "PR merged — run status updated");
+            }
 
             // ── Plan task dependency continuation ──
             // If this run's issue belongs to a plan task, check for waiting dependents.
@@ -794,21 +798,6 @@ async fn handle_pull_request(
     }
 
     Ok(StatusCode::OK)
-}
-
-/// Commits on a pull request that a person pushed (not Coderhelm, not a bot).
-fn human_commit_count(commits: &[Value]) -> u64 {
-    commits
-        .iter()
-        .filter(|c| {
-            let login = c["author"]["login"]
-                .as_str()
-                .or(c["committer"]["login"].as_str())
-                .unwrap_or("");
-            let is_bot = c["author"]["type"].as_str() == Some("Bot") || login.ends_with("[bot]");
-            !login.contains("coderhelm") && !is_bot && !login.is_empty()
-        })
-        .count() as u64
 }
 
 /// Counts people's commits on a merged pull request. `None` when GitHub
