@@ -31,6 +31,47 @@ fn should_auto_continue(continuation: u32, first_attempt_ms: u64, now_ms: u64) -
     true
 }
 
+/// Other repos of the same owner that an agent tried to read or edit, by the
+/// paths it passed (`owner/other-repo/path/to/file`): a sign the ticket's
+/// files live in a repo other than the one the run is in.
+fn repos_reached_for(log: &[serde_json::Value], owner: &str, repo: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let prefix = format!("{owner}/");
+    let mut visit = |v: &serde_json::Value| {
+        if let Some(blocks) = v["content"].as_array() {
+            for b in blocks {
+                if b["type"] != "tool_use" {
+                    continue;
+                }
+                let name = b["name"].as_str().unwrap_or("");
+                if !matches!(
+                    name,
+                    "read_file" | "read_file_lines" | "edit_file" | "write_file"
+                ) {
+                    continue;
+                }
+                let Some(path) = b["input"]["path"].as_str() else {
+                    continue;
+                };
+                let Some(rest) = path.strip_prefix(&prefix) else {
+                    continue;
+                };
+                let Some((other, file)) = rest.split_once('/') else {
+                    continue;
+                };
+                if other != repo && !other.is_empty() && !file.is_empty() {
+                    let full = format!("{owner}/{other}");
+                    if !out.contains(&full) {
+                        out.push(full);
+                    }
+                }
+            }
+        }
+    };
+    log.iter().for_each(&mut visit);
+    out
+}
+
 /// The agent-loop error emitted when the step budget is exhausted
 /// (anthropic.rs: "Reached the maximum number of steps (N) without finishing").
 /// This means "needs more turns", NOT a real failure — treated like the
@@ -992,6 +1033,35 @@ async fn run_passes(
         }
     } else if msg.repo_owner.is_empty() || msg.repo_name.is_empty() {
         return Err("repo_owner and repo_name are required for GitHub tickets".into());
+    }
+
+    // The run record was written before a Jira ticket's repo was known (as
+    // "/"); record the repo now, so the run shows under it in Runs, by-repo
+    // analytics and the repo index.
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET #repo = :r, team_repo = :tr")
+        .condition_expression(
+            "attribute_exists(run_id) AND (attribute_not_exists(#repo) OR #repo <> :r)",
+        )
+        .expression_attribute_names("#repo", "repo")
+        .expression_attribute_values(":r", attr_s(&repo))
+        .expression_attribute_values(":tr", attr_s(&format!("{}#{}", msg.team_id, repo)))
+        .send()
+        .await
+    {
+        let unchanged = e
+            .as_service_error()
+            .map(|se| se.is_conditional_check_failed_exception())
+            .unwrap_or(false);
+        if !unchanged {
+            warn!(run_id, error = %e, "Could not record the run's repo");
+        }
     }
 
     // Look up the repo's default branch (main, master, develop, etc.)
@@ -2436,13 +2506,28 @@ async fn run_passes(
         // the clarification comment.
         if result.files_modified.is_empty() {
             warn!(run_id, "Implement pass produced zero file changes");
-            let raw_clarification = "I ran but produced no file changes for this issue.\n\n\
+            // The files it went for were in a different repo of the org (one
+            // this team hasn't turned on), so it could look but not change.
+            // Saying that is the useful answer; "add more detail" is not.
+            let elsewhere =
+                repos_reached_for(&result.conversation_log, &msg.repo_owner, &msg.repo_name);
+            let elsewhere_note = (!elsewhere.is_empty()).then(|| {
+                format!(
+                    "The file(s) this ticket changes look like they're in {}, not {}/{}, so I could \
+                     read them but not change them. Turn that repo on for Coderhelm (Repos page) and \
+                     re-run, or move the ticket to it.",
+                    elsewhere.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", "),
+                    msg.repo_owner,
+                    msg.repo_name
+                )
+            });
+            let raw_clarification = elsewhere_note.as_deref().unwrap_or("I ran but produced no file changes for this issue.\n\n\
                  If the issue already spells out the change (the exact file(s) and the values/content \
                  to write), this is usually a transient miss on my side — **re-run it** and it \
                  typically goes through.\n\n\
                  If details are actually missing, add them and re-trigger — for example:\n\
                  - Which file(s) or component(s) should change?\n\
-                 - The expected vs. current behavior, or the exact values/content to use?";
+                 - The expected vs. current behavior, or the exact values/content to use?");
             let clarification =
                 formatter::format_with_voice(state, &voice, raw_clarification, &provider, usage)
                     .await;
@@ -5974,5 +6059,26 @@ mod ci_outcome_tests {
             CiOutcome::Passed.update_expression(),
             "SET ci_last = :passed"
         );
+    }
+}
+
+#[cfg(test)]
+mod repos_reached_for_tests {
+    use super::repos_reached_for;
+    use serde_json::json;
+
+    #[test]
+    fn a_path_into_another_repo_of_the_org_is_noticed() {
+        let log = vec![json!({"role": "assistant", "content": [
+            {"type": "tool_use", "name": "read_file", "input": {"path": "acme/tools/skills/debug/SKILL.md"}},
+            {"type": "tool_use", "name": "read_file", "input": {"path": "src/app.ts"}},
+            {"type": "tool_use", "name": "search_code", "input": {"query": "acme/other/x"}},
+            {"type": "tool_use", "name": "read_file", "input": {"path": "acme/api/src/main.rs"}}
+        ]})];
+        assert_eq!(
+            repos_reached_for(&log, "acme", "api"),
+            vec!["acme/tools".to_string()]
+        );
+        assert!(repos_reached_for(&[], "acme", "api").is_empty());
     }
 }
