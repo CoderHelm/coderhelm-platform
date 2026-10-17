@@ -572,6 +572,7 @@ mod security;
 pub mod syntax_check;
 #[allow(dead_code)]
 mod test;
+pub mod tool_proposals;
 mod triage;
 pub mod write_guard;
 

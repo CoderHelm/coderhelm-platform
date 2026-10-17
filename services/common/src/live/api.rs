@@ -51,7 +51,7 @@ impl AuthStyle {
         }
     }
 
-    fn header(self, key: &str) -> (&'static str, String) {
+    pub(crate) fn header(self, key: &str) -> (&'static str, String) {
         match self {
             AuthStyle::XApiKey => ("x-api-key", key.to_string()),
             AuthStyle::Bearer => ("authorization", format!("Bearer {key}")),

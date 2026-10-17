@@ -24,6 +24,7 @@ use super::api::Check;
 use super::aws::{AwsTarget, Session};
 use super::redact::{hidden_terms, redact_all};
 use super::sql::{check_read_only_sql, CheckedSql};
+use super::tools::{BoundParam, ParamValue};
 use super::StepError;
 
 /// Longest we wait for one statement before cancelling it.
@@ -123,12 +124,28 @@ async fn exec(
     open: Option<&str>,
     session: Option<&str>,
     sql: &str,
+    params: &[BoundParam],
     started: Instant,
 ) -> Result<Done, StepError> {
     let mut req = client
         .execute_statement()
         .sql(sql)
         .statement_name("coderhelm-lookup");
+    if !params.is_empty() {
+        // Values travel as parameters, never as SQL text.
+        let ps = params.iter().filter_map(|p| {
+            let v = match &p.value {
+                ParamValue::Text(v) | ParamValue::Date(v) => v.clone(),
+                ParamValue::Int(n) => n.to_string(),
+            };
+            aws_sdk_redshiftdata::types::SqlParameter::builder()
+                .name(&p.name)
+                .value(v)
+                .build()
+                .ok()
+        });
+        req = req.set_parameters(Some(ps.collect()));
+    }
     req = match (open, session) {
         (Some(db), _) => req
             .cluster_identifier(&t.cluster_id)
@@ -228,13 +245,33 @@ async fn run(
     database: &str,
     sql: &str,
 ) -> Result<Vec<Row>, StepError> {
+    run_with_params(client, t, database, sql, &[]).await
+}
+
+/// [`run`] with values bound to named parameters (`:name`).
+async fn run_with_params(
+    client: &aws_sdk_redshiftdata::Client,
+    t: &AwsTarget,
+    database: &str,
+    sql: &str,
+    params: &[BoundParam],
+) -> Result<Vec<Row>, StepError> {
     let started = Instant::now();
-    let begun = exec(client, t, Some(database), None, "BEGIN READ ONLY", started).await?;
+    let begun = exec(
+        client,
+        t,
+        Some(database),
+        None,
+        "BEGIN READ ONLY",
+        &[],
+        started,
+    )
+    .await?;
     let Some(sid) = begun.session else {
         return Err(failed("the warehouse opened no session"));
     };
     let result = async {
-        let proof = exec(client, t, None, Some(&sid), READ_ONLY_PROOF, started).await?;
+        let proof = exec(client, t, None, Some(&sid), READ_ONLY_PROOF, &[], started).await?;
         if !confirms_read_only(&proof.rows) {
             return Err(StepError::new(
                 "read_only",
@@ -242,13 +279,13 @@ async fn run(
                 "Nothing was sent. Run the connection check again.",
             ));
         }
-        exec(client, t, None, Some(&sid), sql, started)
+        exec(client, t, None, Some(&sid), sql, params, started)
             .await
             .map(|d| d.rows)
     }
     .await;
     // Rolled back whatever happened, so nothing a statement did can last.
-    if let Err(e) = exec(client, t, None, Some(&sid), "ROLLBACK", Instant::now()).await {
+    if let Err(e) = exec(client, t, None, Some(&sid), "ROLLBACK", &[], Instant::now()).await {
         tracing::warn!(error = %e.message, "Rolling back a warehouse lookup failed; the session ends on its own");
     }
     result
@@ -321,6 +358,33 @@ pub async fn run_sql(
         hidden_count,
         ms,
     })
+}
+
+/// Runs a reviewed tool's checked SQL in one shared database, with its
+/// inputs bound as parameters.
+pub async fn run_tool_sql(
+    session: &Session,
+    t: &AwsTarget,
+    database: &str,
+    text: &str,
+    params: &[BoundParam],
+    hidden: &[String],
+    max_result_chars: usize,
+) -> Result<(usize, String, usize, u128), StepError> {
+    let db = pick_database(t, Some(database))?.to_string();
+    let started = Instant::now();
+    let rows = run_with_params(&client(session), t, &db, text, params).await?;
+    let ms = started.elapsed().as_millis();
+    let count = rows.len();
+    let mut value = Value::Array(rows.into_iter().map(Value::Object).collect());
+    let hidden_count = redact_all(&mut value, &hidden_terms(hidden));
+    let pretty = serde_json::to_string_pretty(&value).unwrap_or_default();
+    Ok((
+        count,
+        crate::head_tail_str(&pretty, max_result_chars),
+        hidden_count,
+        ms,
+    ))
 }
 
 const ACCESS_CHECK: &str = "SELECT current_user AS who, \

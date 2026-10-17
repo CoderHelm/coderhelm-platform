@@ -130,6 +130,8 @@ impl Secrets {
 pub enum WorkerMessage {
     #[serde(rename = "ticket")]
     Ticket(TicketMessage),
+    #[serde(rename = "tool_proposals")]
+    ToolProposals(ToolProposalsMessage),
     #[serde(rename = "feedback")]
     Feedback(FeedbackMessage),
     #[serde(rename = "onboard")]
@@ -509,4 +511,16 @@ pub struct ReleaseNotesMessage {
     /// notes when the tag's commit is on the repo's release branch.
     #[serde(default)]
     pub check_branch: bool,
+}
+
+/// Tool definitions changed in a repo's default branch: each becomes a
+/// proposed version waiting for an admin's approval. Never approved here.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ToolProposalsMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub sha: String,
+    pub paths: Vec<String>,
 }

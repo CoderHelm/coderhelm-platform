@@ -417,6 +417,21 @@ async fn main() -> Result<(), Error> {
         .route("/plugins/:id/prompt", put(routes::plugins::update_prompt))
         .route("/plugins/:id/test", post(routes::plugins::test_connection))
         // Data sources (read-only lookups for the reviewer)
+        .route(
+            "/tools",
+            get(routes::tools::list).post(routes::tools::create),
+        )
+        .route("/tools/validate", post(routes::tools::check))
+        .route("/tools/asks", get(routes::tools::asks))
+        .route("/tools/asks/:id", post(routes::tools::decide))
+        .route(
+            "/tools/:name",
+            get(routes::tools::get)
+                .put(routes::tools::update)
+                .delete(routes::tools::remove),
+        )
+        .route("/tools/:name/approve", post(routes::tools::approve))
+        .route("/tools/:name/preview", post(routes::tools::preview))
         .route("/data-sources", get(routes::data_sources::list))
         .route(
             "/data-sources/activity",

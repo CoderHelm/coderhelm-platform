@@ -33,6 +33,9 @@ pub mod redshift;
 pub mod secret;
 pub mod sql;
 pub mod store;
+pub mod tools;
+pub mod tools_run;
+pub mod tools_store;
 
 use serde::Serialize;
 
