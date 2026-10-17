@@ -24,11 +24,20 @@ fn norm(s: &str) -> String {
 }
 
 /// The normalized terms to match field names against.
+/// An entry starting with `=` matches only a field with exactly that name
+/// (`=ip` hides `ip` and `IP`, not `membership`); any other entry matches
+/// every field whose name contains it.
 pub fn hidden_terms(hidden: &[String]) -> Vec<String> {
     let mut terms: Vec<String> = hidden
         .iter()
-        .map(|h| norm(h))
-        .filter(|h| h.len() >= 2)
+        .filter_map(|h| {
+            let h = h.trim();
+            match h.strip_prefix('=') {
+                // Exact names may be short; `=` keeps them from matching inside others.
+                Some(exact) => Some(format!("={}", norm(exact))).filter(|t| t.len() >= 2),
+                None => Some(norm(h)).filter(|t| t.len() >= 2),
+            }
+        })
         .collect();
     terms.sort();
     terms.dedup();
@@ -37,7 +46,10 @@ pub fn hidden_terms(hidden: &[String]) -> Vec<String> {
 
 pub fn is_hidden(field: &str, terms: &[String]) -> bool {
     let f = norm(field);
-    terms.iter().any(|t| f.contains(t.as_str()))
+    terms.iter().any(|t| match t.strip_prefix('=') {
+        Some(exact) => f == exact,
+        None => f.contains(t.as_str()),
+    })
 }
 
 /// Replaces the value of every hidden field, at any depth, and returns how
@@ -186,6 +198,33 @@ mod tests {
         assert!(p[1]["phoneNumber"].is_null());
         assert_eq!(p[1]["apiKey"], HIDDEN_MARK);
         assert_eq!(p[1]["cardLast4"], HIDDEN_MARK);
+    }
+
+    #[test]
+    fn exact_names_match_only_themselves() {
+        let terms = hidden_terms(&[
+            "=ip".to_string(),
+            "=age".to_string(),
+            "=name".to_string(),
+            "salary".to_string(),
+        ]);
+        for hidden in ["ip", "IP", "age", "Name", "base_salary"] {
+            assert!(is_hidden(hidden, &terms), "{hidden}");
+        }
+        for visible in [
+            "membership",
+            "participant",
+            "page",
+            "percentage",
+            "stage",
+            "class_name",
+            "zip_code",
+        ] {
+            assert!(!is_hidden(visible, &terms), "{visible}");
+        }
+        let mut v = json!({"name": "A", "class_name": "Yoga", "ip": "1.2.3.4"});
+        assert_eq!(redact(&mut v, &terms), 2);
+        assert_eq!(v["class_name"], "Yoga");
     }
 
     #[test]
