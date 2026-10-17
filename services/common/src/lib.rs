@@ -17,6 +17,7 @@ pub mod alert_notify;
 /// the dashboard's test path and the reviewer's tool path enforce the same rules.
 pub mod e2e;
 pub mod live;
+pub mod memory_meta;
 // review_stats: time-ordered review records for analytics
 pub mod review_stats;
 

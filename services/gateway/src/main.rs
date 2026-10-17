@@ -24,6 +24,7 @@ pub struct AppState {
     pub lambda: aws_sdk_lambda::Client,
     pub kms: aws_sdk_kms::Client,
     pub sts: aws_sdk_sts::Client,
+    pub bedrock: aws_sdk_bedrockruntime::Client,
     pub http: reqwest::Client,
     pub secrets: models::Secrets,
     pub config: models::Config,
@@ -48,6 +49,7 @@ async fn main() -> Result<(), Error> {
     let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
     let kms = aws_sdk_kms::Client::new(&aws_config);
     let sts = aws_sdk_sts::Client::new(&aws_config);
+    let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
 
     // Load secrets from Secrets Manager
@@ -82,6 +84,7 @@ async fn main() -> Result<(), Error> {
         lambda: lambda_client,
         kms,
         sts,
+        bedrock,
         http: reqwest::Client::new(),
         secrets,
         config,
@@ -479,11 +482,16 @@ async fn main() -> Result<(), Error> {
         .route("/tests/:id/pin", post(routes::tests::pin))
         .route("/tests/:id/fix", post(routes::tests::fix))
         // Memory browser
-        .route("/memories", get(routes::memory::list_memories))
+        .route(
+            "/memories",
+            get(routes::memory::list_memories).post(routes::memory::create_memory),
+        )
+        .route("/memories/agents", get(routes::memory::agent_profiles))
+        .route("/memories/preview", post(routes::memory::preview_recall))
         .route("/memories/stats", get(routes::memory::memory_stats))
         .route(
             "/memories/:memory_id",
-            delete(routes::memory::delete_memory),
+            delete(routes::memory::delete_memory).put(routes::memory::update_memory),
         )
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

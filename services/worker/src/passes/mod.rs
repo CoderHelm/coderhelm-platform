@@ -457,6 +457,50 @@ pub(crate) fn openspec_prefix(team_id: &str, ticket_id: &str, owner: &str, repo:
 /// no-changes / clarification / needs_input / blocked-plan returns leaked the
 /// memory lock for its full 15-minute TTL, forcing subsequent runs on the
 /// repo to start stateless.
+/// Counts each recalled memory's use, so people can see which memories the
+/// agents actually lean on. Best effort: a failed count never fails a run.
+async fn record_memory_use(state: &WorkerState, msg: &TicketMessage, run_id: &str, ids: &[String]) {
+    let now = chrono::Utc::now().to_rfc3339();
+    for id in ids {
+        let sk = common::memory_meta::usage_sk(&msg.repo_owner, &msg.repo_name, id);
+        let res = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.settings_table_name)
+            .key(
+                "pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
+            )
+            .key("sk", aws_sdk_dynamodb::types::AttributeValue::S(sk))
+            .update_expression(
+                "ADD uses :one SET last_used_at = :now, last_run_id = :run, last_title = :title",
+            )
+            .expression_attribute_values(
+                ":one",
+                aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
+            )
+            .expression_attribute_values(
+                ":now",
+                aws_sdk_dynamodb::types::AttributeValue::S(now.clone()),
+            )
+            .expression_attribute_values(
+                ":run",
+                aws_sdk_dynamodb::types::AttributeValue::S(run_id.to_string()),
+            )
+            .expression_attribute_values(
+                ":title",
+                aws_sdk_dynamodb::types::AttributeValue::S(
+                    common::truncate_str(&msg.title, 120).to_string(),
+                ),
+            )
+            .send()
+            .await;
+        if let Err(e) = res {
+            warn!(run_id, error = %e, "Could not count a memory's use");
+        }
+    }
+}
+
 async fn close_memory(state: &WorkerState, mem: Option<crate::memory::AgentMemory>) {
     if let Some(mem) = mem {
         if let Err(e) = mem.close_and_upload(state).await {
@@ -1165,8 +1209,11 @@ async fn run_passes(
         AgentMemory::open(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
     let memory_context = match agent_memory.as_mut() {
         Some(mem) => {
-            mem.recall_context(&format!("{} {} {}", msg.title, msg.body, msg.repo_name), 5)
-                .await
+            let ctx = mem
+                .recall_context(&format!("{} {} {}", msg.title, msg.body, msg.repo_name), 5)
+                .await;
+            record_memory_use(state, msg, run_id, &mem.last_recalled).await;
+            ctx
         }
         None => String::new(),
     };
@@ -2990,6 +3037,11 @@ async fn run_passes(
             &impl_result.conversation_log,
             provider.api_key(),
             provider.primary_model_id(),
+            &crate::memory::LearningOrigin {
+                run_id: run_id.to_string(),
+                ticket_id: msg.ticket_id.clone(),
+                title: msg.title.clone(),
+            },
         )
         .await;
         if let Err(e) = mem.close_and_upload(state).await {

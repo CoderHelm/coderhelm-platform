@@ -1754,6 +1754,7 @@ name = "gateway"
 version = "0.1.0"
 dependencies = [
  "aws-config",
+ "aws-sdk-bedrockruntime",
  "aws-sdk-cloudwatch",
  "aws-sdk-cloudwatchlogs",
  "aws-sdk-cognitoidentityprovider",
@@ -1765,6 +1766,7 @@ dependencies = [
  "aws-sdk-sesv2",
  "aws-sdk-sqs",
  "aws-sdk-sts",
+ "aws-smithy-types",
  "axum",
  "base64",
  "chrono",

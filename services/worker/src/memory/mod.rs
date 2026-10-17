@@ -13,6 +13,9 @@ use self::embedder::embed_async;
 
 /// Wraps a MenteDB instance with S3 sync and DynamoDB locking.
 /// Provides a simple API for worker passes to store and recall memories.
+/// Most pinned memories handed to an agent on one ticket.
+const MAX_PINNED: usize = 10;
+
 pub struct AgentMemory {
     db: MenteDb,
     bedrock: aws_sdk_bedrockruntime::Client,
@@ -22,6 +25,17 @@ pub struct AgentMemory {
     repo_name: String,
     lock_token: Option<String>,
     dirty: bool,
+    /// Ids of the memories the last recall handed to an agent, pinned ones
+    /// included, so the run can count their use.
+    pub last_recalled: Vec<String>,
+}
+
+/// Where a learning came from: the run and ticket it was learned on.
+#[derive(Debug, Clone, Default)]
+pub struct LearningOrigin {
+    pub run_id: String,
+    pub ticket_id: String,
+    pub title: String,
 }
 
 impl AgentMemory {
@@ -115,6 +129,7 @@ impl AgentMemory {
                     repo_name: repo_name.to_string(),
                     lock_token: Some(lock_token),
                     dirty: false,
+                    last_recalled: Vec::new(),
                 })
             }
             Err(e) => {
@@ -176,13 +191,38 @@ impl AgentMemory {
             .into_iter()
             .filter(|(_, score)| *score >= MIN_RELEVANCE)
             .collect();
-        if results.is_empty() {
+        self.last_recalled.clear();
+
+        // Pinned memories reach the agent on every ticket: a person decided
+        // they always apply.
+        let mut pinned: Vec<(String, String)> = Vec::new();
+        for id in self.db.memory_ids() {
+            if pinned.len() >= MAX_PINNED {
+                break;
+            }
+            if let Ok(node) = self.db.get_memory(id) {
+                if node.tags.iter().any(|t| t == common::memory_meta::PINNED) {
+                    pinned.push((id.to_string(), node.content.clone()));
+                }
+            }
+        }
+        if results.is_empty() && pinned.is_empty() {
             return String::new();
         }
 
-        let mut context = String::from(
-            "## Agent Memory\nRelevant learnings from past runs on this repository:\n\n",
-        );
+        let mut context = String::from("## Agent Memory\n");
+        if !pinned.is_empty() {
+            context.push_str("Always follow these; your team pinned them for this repository:\n\n");
+            for (id, content) in &pinned {
+                context.push_str(&format!("- {content}\n"));
+                self.last_recalled.push(id.clone());
+            }
+            context.push('\n');
+        }
+        if results.is_empty() {
+            return context;
+        }
+        context.push_str("Relevant learnings from past runs on this repository:\n\n");
         for (id, score) in &results {
             if let Ok(node) = self.db.get_memory(*id) {
                 let type_label = match node.memory_type {
@@ -193,10 +233,14 @@ impl AgentMemory {
                     MemoryType::Episodic => "📝 Note",
                     MemoryType::Reasoning => "💡 Reasoning",
                 };
+                if node.tags.iter().any(|t| t == common::memory_meta::PINNED) {
+                    continue;
+                }
                 context.push_str(&format!(
                     "- **{type_label}** (relevance: {score:.2}): {}\n",
                     node.content
                 ));
+                self.last_recalled.push(id.to_string());
             }
         }
         context
@@ -250,6 +294,7 @@ impl AgentMemory {
         conversation_json: &[serde_json::Value],
         api_key: &str,
         model_id: &str,
+        origin: &LearningOrigin,
     ) {
         if conversation_json.is_empty() || api_key.is_empty() {
             return;
@@ -382,12 +427,14 @@ impl AgentMemory {
                 _ => (MemoryType::Semantic, "learned"),
             };
 
-            self.store_learning(
-                content,
-                memory_type,
-                vec![tag.to_string(), repo_tag.clone()],
-            )
-            .await;
+            let mut tags = common::memory_meta::run_tags(
+                tag,
+                &origin.run_id,
+                &origin.ticket_id,
+                &origin.title,
+            );
+            tags.push(repo_tag.clone());
+            self.store_learning(content, memory_type, tags).await;
             stored += 1;
         }
 
