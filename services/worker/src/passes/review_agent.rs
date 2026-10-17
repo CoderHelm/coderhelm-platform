@@ -17,7 +17,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 /// One review finding as emitted by the model.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Finding {
     pub file: String,
     #[serde(default)]
@@ -89,7 +89,9 @@ pub const REQUIRE_TESTS_SECTION: &str = "\n## Tests are required in this repo\n\
      files in test directories) and check the diff touches those tests. If tests are missing or \
      stale, add ONE finding with category \"tests\" and severity \"blocking\", anchored on the \
      main changed line, saying exactly what behavior needs a test and which existing test file \
-     to add it to or update (or where similar tests live). Not required for: pure refactors with \
+     to add it to or update (or where similar tests live). Ask for a test at the level the repo \
+     already tests that behavior: when a function is covered through the flow, mapper or screen \
+     test that uses it, ask for a case there, not a new test per function. Not required for: pure refactors with \
      no behavior change, docs, comments, formatting, config/infra values, dependency bumps, and \
      generated files.\n";
 
