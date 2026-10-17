@@ -28,6 +28,7 @@ interface WorkerStackProps extends cdk.StackProps {
   tracesTable: dynamodb.TableV2;
   checkpointsTable: dynamodb.TableV2;
   eventsTable: dynamodb.TableV2;
+  testsTable: dynamodb.TableV2;
   bucket: s3.Bucket;
   ticketQueue: sqs.Queue;
   ciFixQueue: sqs.Queue;
@@ -92,6 +93,7 @@ export class WorkerStack extends cdk.Stack {
         TRACES_TABLE_NAME: props.tracesTable.tableName,
         CHECKPOINTS_TABLE_NAME: props.checkpointsTable.tableName,
         EVENTS_TABLE_NAME: props.eventsTable.tableName,
+        TESTS_TABLE_NAME: props.testsTable.tableName,
         BUCKET_NAME: props.bucket.bucketName,
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         MODEL_ID: process.env.MODEL_ID || "claude-opus-5-5",
@@ -128,6 +130,7 @@ export class WorkerStack extends cdk.Stack {
     props.jiraConfigTable.grantReadData(this.workerFunction);
     props.reposTable.grantReadWriteData(this.workerFunction);
     props.settingsTable.grantReadWriteData(this.workerFunction);
+    props.testsTable.grantReadWriteData(this.workerFunction);
     // Data-source keys: the worker reads them to run lookups, never writes them.
     props.secretsKey.grantDecrypt(this.workerFunction);
 

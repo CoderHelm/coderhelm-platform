@@ -28,6 +28,7 @@ export class DatabaseStack extends cdk.Stack {
   public readonly waitlistTable: dynamodb.TableV2;
   public readonly tracesTable: dynamodb.TableV2;
   public readonly checkpointsTable: dynamodb.TableV2;
+  public readonly testsTable: dynamodb.TableV2;
   public readonly encryptionKey: kms.Key;
   public readonly secretsKey: kms.Key;
 
@@ -353,6 +354,29 @@ export class DatabaseStack extends cdk.Stack {
     // ──────────────────────────────────────────────
     this.settingsTable = new dynamodb.TableV2(this, "SettingsTable", {
       tableName: `coderhelm-${props.stage}-settings`,
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(
+        this.encryptionKey
+      ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      timeToLiveAttribute: "ttl",
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // ──────────────────────────────────────────────
+    // Tests table: E2E runs, tests, failure groups, recommendations
+    // PK/SK patterns are documented in services/common/src/e2e/store.rs.
+    // Runs and PR triage expire through `ttl`.
+    // ──────────────────────────────────────────────
+    this.testsTable = new dynamodb.TableV2(this, "TestsTable", {
+      tableName: `coderhelm-${props.stage}-tests`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),

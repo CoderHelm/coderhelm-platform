@@ -239,6 +239,18 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("Release notes failed: {e:?}");
                 }
             }
+            models::WorkerMessage::TestIngest(msg) => {
+                info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), run_id = msg.run_id, "Reading E2E results");
+                if let Err(e) = passes::e2e::ingest(&state, msg).await {
+                    error!("E2E ingest failed: {e:?}");
+                }
+            }
+            models::WorkerMessage::TestAction(msg) => {
+                info!(team_id = %msg.team_id, repo = %msg.repo, action = %msg.action, "E2E action");
+                if let Err(e) = passes::e2e::act(&state, msg).await {
+                    error!("E2E action failed: {e:?}");
+                }
+            }
             models::WorkerMessage::GraphIndex(msg) => {
                 info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), incremental = msg.changed_files.is_some(), "Code-graph index pass");
                 if let Err(e) = passes::code_graph::run(&state, msg).await {

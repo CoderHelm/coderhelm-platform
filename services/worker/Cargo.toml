@@ -50,6 +50,8 @@ mentedb-embedding = { git = "https://github.com/nambok/mentedb.git", rev = "b4db
 mentedb-extraction = { git = "https://github.com/nambok/mentedb.git", rev = "b4db4447d62384cf3b30153787295a70dae4a6a5" }
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
+# e2e: GitHub Actions artifacts are zip files
+zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"
 
 # Code graph extraction (tree-sitter grammars are C, compiled via cc — works

@@ -31,6 +31,8 @@ pub struct Config {
     /// => sandbox disabled (the agent falls back to blind CI, never worse).
     pub sandbox_bucket_name: String,
     pub sandbox_project_name: String,
+    /// E2E results. Empty disables the feature.
+    pub tests_table_name: String,
 }
 
 impl Config {
@@ -70,6 +72,7 @@ impl Config {
             feedback_queue_url: std::env::var("FEEDBACK_QUEUE_URL").unwrap_or_default(),
             sandbox_bucket_name: std::env::var("SANDBOX_BUCKET_NAME").unwrap_or_default(),
             sandbox_project_name: std::env::var("SANDBOX_PROJECT_NAME").unwrap_or_default(),
+            tests_table_name: std::env::var("TESTS_TABLE_NAME").unwrap_or_default(),
         }
     }
 }
@@ -144,6 +147,12 @@ pub enum WorkerMessage {
     /// to the default branch re-indexes only the changed files).
     #[serde(rename = "graph_index")]
     GraphIndex(GraphIndexMessage),
+    /// Read the test reports of a finished workflow run or an upload.
+    #[serde(rename = "test_ingest")]
+    TestIngest(common::e2e::messages::TestIngest),
+    /// Fix a flaky test, generate a recommended test, or file a ticket.
+    #[serde(rename = "test_action")]
+    TestAction(common::e2e::messages::TestAction),
 }
 
 /// A code-graph index job. `changed_files: None` ⇒ full index of the branch

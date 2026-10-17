@@ -831,6 +831,24 @@ pub async fn run(
         &label_decision,
         &output.tests_note,
     ));
+    full_body.push_str(
+        &super::e2e::triage_markdown(
+            state,
+            &msg.team_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            msg.pr_number,
+            &head_sha,
+            &compare["files"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|f| f["filename"].as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        )
+        .await,
+    );
     if !prior_threads.is_empty() {
         full_body.push_str(&format!(
             "\n\n#### Earlier comments\n{} settled and resolved · {} still open",
