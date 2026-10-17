@@ -793,7 +793,7 @@ pub async fn run(
         .await
     {
         let latest_head = latest["head"]["sha"].as_str().unwrap_or("");
-        if superseded(&msg, latest_head) {
+        if moved_on(&msg, &head_sha, latest_head) {
             info!(
                 pr = msg.pr_number,
                 reviewed = %msg.head_sha,
@@ -1504,6 +1504,18 @@ mod prior_thread_tests {
 /// was enqueued for; that commit's own review covers the latest code. Reviews
 /// that answer a question, or that resolve the head themselves (empty
 /// head_sha), always speak.
+/// Whether the PR moved past the commit this review looked at. Unlike
+/// [`superseded`], this also covers re-reviews asked for in a reply, which
+/// resolve the head when they start: an author who answers a finding and
+/// pushes the fix a minute later must not get a "request changes" on the code
+/// they just replaced (the new commit gets its own review).
+fn moved_on(msg: &ReviewMessage, reviewed_head: &str, latest_head: &str) -> bool {
+    msg.question.is_none()
+        && !reviewed_head.is_empty()
+        && !latest_head.is_empty()
+        && reviewed_head != latest_head
+}
+
 fn superseded(msg: &ReviewMessage, current_head: &str) -> bool {
     msg.question.is_none()
         && !msg.head_sha.is_empty()
@@ -1531,7 +1543,7 @@ fn final_verdict(
 
 #[cfg(test)]
 mod superseded_tests {
-    use super::superseded;
+    use super::{moved_on, superseded};
     use crate::models::ReviewMessage;
 
     fn msg(head: &str, question: Option<&str>) -> ReviewMessage {
@@ -1560,6 +1572,18 @@ mod superseded_tests {
         assert!(!superseded(&msg("", None), "cc15ab8"));
         // An unreadable head never silences a review.
         assert!(!superseded(&msg("b20e26f", None), ""));
+    }
+
+    #[test]
+    fn a_reply_review_does_not_post_on_code_already_replaced() {
+        // A re-review asked for in a reply resolves the head when it starts
+        // (msg.head_sha empty), so `superseded` can't see it move; `moved_on`
+        // compares the head it actually reviewed.
+        assert!(moved_on(&msg("", None), "1c20c41", "36732132"));
+        assert!(!moved_on(&msg("", None), "36732132", "36732132"));
+        // A question is an answer, not a verdict; it is always posted.
+        assert!(!moved_on(&msg("", Some("why?")), "1c20c41", "36732132"));
+        assert!(!moved_on(&msg("", None), "1c20c41", ""));
     }
 }
 
