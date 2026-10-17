@@ -58,11 +58,34 @@ where
             format!("The database couldn't run that: {}", crate::truncate_str(msg, 300)),
             "Check table and column names with the description of this database.",
         ),
-        _ => StepError::new(
-            "reach",
-            "We couldn't reach the database.",
-            "Check that the Data API is on for this database, then try again.",
+        "ValidationException" if msg.contains("Cannot find parameter") => StepError::new(
+            "read",
+            format!("The database read part of the SQL as a parameter: {}", crate::truncate_str(msg, 200)),
+            "A colon right before a name or number is taken as a parameter, so array slices like [1:3] can't be sent. Use string_agg, or pick single elements like [1].",
         ),
+        "StatementTimeoutException" => StepError::new(
+            "read",
+            "That lookup took too long, so the database stopped it.",
+            "Narrow it: filter on an indexed column, a shorter date range or fewer rows.",
+        ),
+        _ => {
+            // Keep what went wrong: a bare "couldn't reach" hides timeouts and
+            // SQL errors that arrive under other codes.
+            let why = if code.is_empty() {
+                aws_sdk_rdsdata::error::DisplayErrorContext(e).to_string()
+            } else {
+                format!("{code}: {msg}")
+            };
+            tracing::warn!(error = %why, "Database lookup failed");
+            StepError::new(
+                "reach",
+                format!(
+                    "We couldn't reach the database ({}).",
+                    crate::truncate_str(&why, 300)
+                ),
+                "Check that the Data API is on for this database, then try again.",
+            )
+        }
     }
 }
 
