@@ -289,6 +289,7 @@ pub fn summary(runs: &[&RunRow], reviews: &[&ReviewRow]) -> Value {
     let closed = with_pr.iter().filter(|r| r.pr_outcome == "closed").count();
     let failed = runs.iter().filter(|r| r.status == "failed").count();
     let cost: f64 = runs.iter().map(|r| r.cost_usd).sum();
+    let tokens: f64 = runs.iter().map(|r| r.tokens_in + r.tokens_out).sum();
     let hours: Vec<f64> = merged.iter().filter_map(|r| r.hours_to_merge()).collect();
     let edits_known: Vec<&&&RunRow> = merged
         .iter()
@@ -319,6 +320,9 @@ pub fn summary(runs: &[&RunRow], reviews: &[&ReviewRow]) -> Value {
         "cost_usd": round2(cost),
         "cost_per_run": ratio(cost, total).map(round2),
         "cost_per_merged_pr": ratio(cost, merged.len() as f64).map(round2),
+        "tokens": tokens,
+        "tokens_per_run": ratio(tokens, total).map(f64::round),
+        "tokens_per_merged_pr": ratio(tokens, merged.len() as f64).map(f64::round),
         "tokens_in": runs.iter().map(|r| r.tokens_in).sum::<f64>(),
         "tokens_out": runs.iter().map(|r| r.tokens_out).sum::<f64>(),
         "median_run_minutes": median(durations).map(round2),
@@ -370,10 +374,10 @@ pub fn build(
         .collect();
 
     // Daily series across the whole window, zero-filled.
-    let mut daily: BTreeMap<String, [f64; 6]> = BTreeMap::new();
+    let mut daily: BTreeMap<String, [f64; 7]> = BTreeMap::new();
     let mut d = window.start;
     while d < window.end {
-        daily.insert(d.format("%Y-%m-%d").to_string(), [0.0; 6]);
+        daily.insert(d.format("%Y-%m-%d").to_string(), [0.0; 7]);
         d += Duration::days(1);
     }
     for r in &cur_runs {
@@ -386,6 +390,7 @@ pub fn build(
                 e[3] += 1.0;
             }
             e[4] += r.cost_usd;
+            e[6] += r.tokens_in + r.tokens_out;
         }
     }
     // Merges land on the day they happened, when known.
@@ -406,12 +411,12 @@ pub fn build(
     }
     let daily: Vec<Value> = daily
         .into_iter()
-        .map(|(day, v)| json!({"day": day, "runs": v[0], "prs_opened": v[1], "merged": v[2], "failed": v[3], "cost_usd": round2(v[4]), "reviews": v[5]}))
+        .map(|(day, v)| json!({"day": day, "runs": v[0], "prs_opened": v[1], "merged": v[2], "failed": v[3], "cost_usd": round2(v[4]), "tokens": v[6], "reviews": v[5]}))
         .collect();
 
     // Breakdowns.
     let mut by_source: BTreeMap<String, [f64; 3]> = BTreeMap::new();
-    let mut by_repo: BTreeMap<String, [f64; 5]> = BTreeMap::new();
+    let mut by_repo: BTreeMap<String, [f64; 6]> = BTreeMap::new();
     let mut by_person: BTreeMap<String, [f64; 2]> = BTreeMap::new();
     for r in &cur_runs {
         let src = if r.source.is_empty() {
@@ -439,6 +444,7 @@ pub fn build(
             e[3] += 1.0;
         }
         e[4] += r.cost_usd;
+        e[5] += r.tokens_in + r.tokens_out;
         let who = if r.sender.is_empty() {
             String::new()
         } else {
@@ -464,7 +470,7 @@ pub fn build(
         .iter()
         .map(|(repo, v)| {
             json!({"repo": repo, "runs": v[0], "prs": v[1], "merged": v[2], "failed": v[3],
-                   "cost_usd": round2(v[4]), "merge_rate": ratio(v[2], v[1]),
+                   "cost_usd": round2(v[4]), "tokens": v[5], "merge_rate": ratio(v[2], v[1]),
                    "reviews": reviews_by_repo.get(repo).copied().unwrap_or(0)})
         })
         .collect();
@@ -996,6 +1002,8 @@ mod tests {
         assert_eq!(sm["failed_runs"], 1);
         assert_eq!(sm["cost_per_merged_pr"], 8.0);
         assert_eq!(sm["cost_per_run"], 2.0);
+        assert!(sm["tokens"].as_f64().is_some());
+        assert!(sm.get("tokens_per_merged_pr").is_some());
         assert_eq!(sm["median_hours_to_merge"], 24.0);
         assert_eq!(sm["merged_untouched"], 1);
         assert_eq!(sm["edits_known"], 1);
