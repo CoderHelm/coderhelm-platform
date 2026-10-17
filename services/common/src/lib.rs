@@ -16,6 +16,8 @@ pub mod alert_notify;
 /// Read-only lookups against a team's own systems (their API today). Shared so
 /// the dashboard's test path and the reviewer's tool path enforce the same rules.
 pub mod live;
+// review_stats: time-ordered review records for analytics
+pub mod review_stats;
 
 /// GitHub's per-request override for the installation-token format, sent on
 /// `POST /app/installations/{id}/access_tokens`. GitHub is moving installation

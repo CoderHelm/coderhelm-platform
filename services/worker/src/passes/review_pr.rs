@@ -412,7 +412,18 @@ pub async fn run(
             }
         }
         store_review_record(
-            state, &msg, &head_sha, "QUESTION", "N/A", &answer, "COMMENT", "",
+            state,
+            &msg,
+            &head_sha,
+            "QUESTION",
+            "N/A",
+            &answer,
+            "COMMENT",
+            "",
+            &common::review_stats::ReviewCounts {
+                posted: true,
+                ..Default::default()
+            },
         )
         .await;
         info!(pr = msg.pr_number, "Reviewer answered a question");
@@ -955,6 +966,14 @@ pub async fn run(
         &record_body,
         effective_event,
         "",
+        &common::review_stats::ReviewCounts {
+            findings: findings.len(),
+            prior_open: prior_threads.len(),
+            prior_fixed: fixed_threads.len(),
+            prior_settled_by_person: settled_threads.len(),
+            posted: should_comment,
+            priors_known: true,
+        },
     )
     .await;
     info!(
@@ -1376,6 +1395,7 @@ async fn store_review_record(
     body: &str,
     posted_as: &str,
     action_summary: &str,
+    counts: &common::review_stats::ReviewCounts,
 ) -> String {
     let created_at = chrono::Utc::now().to_rfc3339();
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
@@ -1409,6 +1429,27 @@ async fn store_review_record(
     }
     if let Err(e) = put.send().await {
         warn!(pr = msg.pr_number, error = %e, "Failed to persist review record (non-fatal)");
+    }
+    // A small, time-ordered copy for analytics (no body).
+    let stat = common::review_stats::stat_item(
+        &msg.team_id,
+        &created_at,
+        &repo,
+        msg.pr_number,
+        verdict,
+        risk,
+        &msg.trigger,
+        counts,
+    );
+    if let Err(e) = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .set_item(Some(stat))
+        .send()
+        .await
+    {
+        warn!(pr = msg.pr_number, error = %e, "Failed to persist review stats (non-fatal)");
     }
     sk
 }

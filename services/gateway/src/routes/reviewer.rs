@@ -620,7 +620,32 @@ pub async fn rate_review(
     req = req.update_expression(expr);
 
     match req.send().await {
-        Ok(_) => Ok(StatusCode::OK),
+        Ok(_) => {
+            // Keep the analytics copy in step. Older reviews may have none yet
+            // (the backfill copies their ratings), so a miss is fine.
+            let field = match rating {
+                "up" => Some("thumbs_up"),
+                "down" => Some("thumbs_down"),
+                _ => None,
+            };
+            if let (Some(field), Some(stat_sk)) = (
+                field,
+                common::review_stats::stat_sk_from_review_sk(&body.sk),
+            ) {
+                let _ = state
+                    .dynamo
+                    .update_item()
+                    .table_name(&state.config.settings_table_name)
+                    .key("pk", attr_s(&claims.team_id))
+                    .key("sk", attr_s(&stat_sk))
+                    .condition_expression("attribute_exists(sk)")
+                    .update_expression(format!("ADD {field} :one"))
+                    .expression_attribute_values(":one", attr_n(1))
+                    .send()
+                    .await;
+            }
+            Ok(StatusCode::OK)
+        }
         Err(e) => {
             // A missing record fails the condition check → 404, not 500.
             let msg = format!("{e:?}");

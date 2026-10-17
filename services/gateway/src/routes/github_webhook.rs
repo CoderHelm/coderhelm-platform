@@ -663,7 +663,7 @@ async fn handle_pull_request(
     }
 
     let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
-    if action != "closed" || !merged {
+    if action != "closed" {
         return Ok(StatusCode::OK);
     }
 
@@ -713,21 +713,64 @@ async fn handle_pull_request(
             .cloned()
             .unwrap_or_default();
 
-        if !run_id.is_empty() {
-            let now = chrono::Utc::now().to_rfc3339();
+        if !run_id.is_empty() && !merged {
+            // Closed without merging: the run keeps its status; analytics
+            // record the outcome so merge rate counts it honestly.
+            let pr = &payload["pull_request"];
             let _ = state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
                 .key("team_id", attr_s(team_id))
                 .key("run_id", attr_s(&run_id))
-                .update_expression("SET #status = :s, status_run_id = :sri, updated_at = :t")
+                .update_expression("SET pr_outcome = :o, pr_closed_at = :c, pr_opened_at = :op")
+                .expression_attribute_values(":o", attr_s("closed"))
+                .expression_attribute_values(":c", attr_s(pr["closed_at"].as_str().unwrap_or("")))
+                .expression_attribute_values(":op", attr_s(pr["created_at"].as_str().unwrap_or("")))
+                .send()
+                .await;
+            info!(
+                team_id,
+                run_id, pr_number, "PR closed without merging — outcome recorded"
+            );
+            return Ok(StatusCode::OK);
+        }
+        if !run_id.is_empty() {
+            let now = chrono::Utc::now().to_rfc3339();
+            let pr = &payload["pull_request"];
+            // Commits people pushed on top of Coderhelm's: none means it
+            // merged as Coderhelm wrote it.
+            let human_commits =
+                count_human_commits(state, installation_id, owner, name, pr_number).await;
+            let mut update = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key("team_id", attr_s(team_id))
+                .key("run_id", attr_s(&run_id))
                 .expression_attribute_names("#status", "status")
                 .expression_attribute_values(":s", attr_s("merged"))
                 .expression_attribute_values(":sri", attr_s(&format!("merged#{run_id}")))
                 .expression_attribute_values(":t", attr_s(&now))
-                .send()
-                .await;
+                .expression_attribute_values(":o", attr_s("merged"))
+                .expression_attribute_values(
+                    ":ma",
+                    attr_s(pr["merged_at"].as_str().unwrap_or(&now)),
+                )
+                .expression_attribute_values(":op", attr_s(pr["created_at"].as_str().unwrap_or("")))
+                .expression_attribute_values(
+                    ":mb",
+                    attr_s(pr["merged_by"]["login"].as_str().unwrap_or("")),
+                );
+            let mut expr =
+                "SET #status = :s, status_run_id = :sri, updated_at = :t, pr_outcome = :o, \
+                            merged_at = :ma, pr_opened_at = :op, merged_by = :mb"
+                    .to_string();
+            if let Some(n) = human_commits {
+                expr.push_str(", human_commits = :hc");
+                update = update.expression_attribute_values(":hc", attr_n(n));
+            }
+            let _ = update.update_expression(expr).send().await;
 
             info!(team_id, run_id, pr_number, "PR merged — run status updated");
 
@@ -751,6 +794,53 @@ async fn handle_pull_request(
     }
 
     Ok(StatusCode::OK)
+}
+
+/// Commits on a pull request that a person pushed (not Coderhelm, not a bot).
+fn human_commit_count(commits: &[Value]) -> u64 {
+    commits
+        .iter()
+        .filter(|c| {
+            let login = c["author"]["login"]
+                .as_str()
+                .or(c["committer"]["login"].as_str())
+                .unwrap_or("");
+            let is_bot = c["author"]["type"].as_str() == Some("Bot") || login.ends_with("[bot]");
+            !login.contains("coderhelm") && !is_bot && !login.is_empty()
+        })
+        .count() as u64
+}
+
+/// Counts people's commits on a merged pull request. `None` when GitHub
+/// couldn't be asked, so analytics leave the run out rather than guess.
+async fn count_human_commits(
+    state: &AppState,
+    installation_id: u64,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+) -> Option<u64> {
+    let token = crate::auth::github_app::get_installation_token(state, installation_id)
+        .await
+        .ok()?;
+    let url = format!(
+        "https://api.github.com/repos/{owner}/{name}/pulls/{pr_number}/commits?per_page=100"
+    );
+    let commits: Vec<Value> = state
+        .http
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Coderhelm-bot")
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(human_commit_count(&commits))
 }
 
 async fn handle_pr_review(
@@ -2449,6 +2539,20 @@ async fn post_limit_comment(
 
 #[cfg(test)]
 mod review_delay_tests {
+
+    #[test]
+    fn only_peoples_commits_count_as_edits() {
+        let commits = vec![
+            serde_json::json!({"author": {"login": "coderhelm[bot]", "type": "Bot"}}),
+            serde_json::json!({"author": {"login": "dependabot[bot]", "type": "Bot"}}),
+            serde_json::json!({"author": {"login": "a-person", "type": "User"}}),
+            serde_json::json!({"author": null, "committer": {"login": "another-person"}}),
+            serde_json::json!({"author": null, "committer": null}),
+        ];
+        assert_eq!(super::human_commit_count(&commits), 2);
+        assert_eq!(super::human_commit_count(&[]), 0);
+    }
+
     use super::{review_delay_secs, REVIEW_PUSH_SETTLE_SECS};
 
     #[test]
