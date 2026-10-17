@@ -402,6 +402,9 @@ pub async fn run(
         )
         .await
         .unwrap_or_else(|e| format!("I couldn't answer that automatically ({e})."));
+        if let Some(s) = &skills {
+            s.drain_usage_into(&mut usage);
+        }
         let body = format!("{answer}{RATING_FOOTER}");
         // Asked inside an inline review thread → answer in that thread.
         match msg.reply_to_comment_id {
