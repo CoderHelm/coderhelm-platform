@@ -87,7 +87,8 @@ fn reports_in_zip(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
         let Ok(mut f) = zip.by_index(i) else { continue };
         let name = f.name().to_string();
         let lower = name.to_lowercase();
-        let wanted = (lower.ends_with(".json") || lower.ends_with(".xml"))
+        // A Playwright HTML report's results are embedded in its index.html.
+        let wanted = (lower.ends_with(".json") || lower.ends_with(".xml") || lower.ends_with("index.html"))
             && !lower.contains("node_modules/")
             // Playwright's HTML report keeps per-test data here; the JSON
             // report already has it.
@@ -116,8 +117,12 @@ pub fn choose_tests(reports: &[(String, Vec<u8>)], links: &Links) -> Vec<ParsedT
             continue;
         }
         if let Some(tests) = parse_any(name, bytes, links) {
+            let html = name.to_lowercase().ends_with(".html");
             for t in tests {
                 let kind = match t.framework {
+                    // The HTML report holds the same results as a JSON report
+                    // of the same run; it counts only when there is no JSON.
+                    Framework::Playwright if html => "playwright_html",
                     Framework::Playwright => "playwright",
                     Framework::Cucumber => "cucumber",
                     Framework::Junit => "junit",
@@ -126,7 +131,7 @@ pub fn choose_tests(reports: &[(String, Vec<u8>)], links: &Links) -> Vec<ParsedT
             }
         }
     }
-    for kind in ["playwright", "cucumber", "junit"] {
+    for kind in ["playwright", "playwright_html", "cucumber", "junit"] {
         if let Some(tests) = by_kind.remove(kind) {
             return common::e2e::parse::fold_duplicates(tests);
         }

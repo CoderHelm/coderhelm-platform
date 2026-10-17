@@ -1,6 +1,8 @@
 //! Reads test reports into [`ParsedTest`]s, keeping every attempt.
 //!
-//! Supported: Playwright's JSON reporter, JUnit XML (including the
+//! Supported: Playwright's JSON reporter, Playwright's HTML report (it embeds
+//! the same results, so repos that only upload the HTML report need no
+//! change), JUnit XML (including the
 //! `flakyFailure` / `rerunFailure` elements retrying runners write) and
 //! Cucumber JSON (WebdriverIO's cucumber reporter). A test that appears more
 //! than once in one report (some reporters write each retry as its own entry)
@@ -26,7 +28,14 @@ pub struct Links {
     pub artifacts_url: Option<String>,
 }
 
+/// Terminal colour codes, which Playwright writes into error messages.
+static ANSI: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("valid pattern")
+});
+
 fn error(message: &str, stack: &str) -> AttemptError {
+    let message = ANSI.replace_all(message, "");
+    let message = message.as_ref();
     AttemptError {
         message: crate::truncate_str(message.trim(), MAX_MESSAGE).to_string(),
         signature: signature::signature(message, stack),
@@ -41,6 +50,9 @@ pub fn parse_any(name: &str, bytes: &[u8], links: &Links) -> Option<Vec<ParsedTe
         return None;
     }
     let lower = name.to_lowercase();
+    if lower.ends_with(".html") {
+        return parse_playwright_html(bytes, links);
+    }
     if lower.ends_with(".xml") {
         let text = std::str::from_utf8(bytes).ok()?;
         if !text.contains("<testsuite") && !text.contains("<testcase") {
@@ -191,6 +203,100 @@ pub fn parse_playwright(report: &Value, links: &Links) -> Vec<ParsedTest> {
         pw_walk(suite, &mut Vec::new(), links, &mut out);
     }
     fold_duplicates(out)
+}
+
+// ── Playwright HTML report ────────────────────────────────────────────────
+
+/// Most bytes read from any one file inside an HTML report's embedded zip.
+const MAX_HTML_PART: u64 = 50 * 1024 * 1024;
+
+/// The zip of results Playwright embeds in its HTML report, as a
+/// `data:application/zip;base64,` URL (in a script variable in older versions,
+/// a `<template>` element in newer ones).
+fn html_report_zip(bytes: &[u8]) -> Option<Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let text = std::str::from_utf8(bytes).ok()?;
+    const MARK: &str = "data:application/zip;base64,";
+    let rest = &text[text.find(MARK)? + MARK.len()..];
+    let end = rest.find(['<', '"', '`', '\'']).unwrap_or(rest.len());
+    STANDARD.decode(rest[..end].trim()).ok()
+}
+
+/// Reads the tests from a Playwright HTML report (`index.html`). Each test
+/// keeps every attempt, like the JSON reporter, and gets the same id.
+pub fn parse_playwright_html(bytes: &[u8], links: &Links) -> Option<Vec<ParsedTest>> {
+    use std::io::Read;
+    let zip_bytes = html_report_zip(bytes)?;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).ok()?;
+    let mut read = |name: &str| -> Option<Value> {
+        let f = zip.by_name(name).ok()?;
+        if f.size() > MAX_HTML_PART {
+            return None;
+        }
+        let mut buf = Vec::new();
+        f.take(MAX_HTML_PART).read_to_end(&mut buf).ok()?;
+        serde_json::from_slice(&buf).ok()
+    };
+    let report = read("report.json")?;
+    let mut out = Vec::new();
+    for summary in report["files"].as_array().into_iter().flatten() {
+        let Some(file_id) = summary["fileId"].as_str() else {
+            continue;
+        };
+        // The per-file part has every attempt; the summary has only the last.
+        let Some(file) = read(&format!("{file_id}.json")) else {
+            continue;
+        };
+        let file_name = file["fileName"].as_str().unwrap_or("");
+        for t in file["tests"].as_array().into_iter().flatten() {
+            if out.len() >= MAX_TESTS {
+                break;
+            }
+            let mut attempts: Vec<Attempt> = t["results"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| pw_attempt(r, links))
+                .collect();
+            if attempts.is_empty() {
+                attempts.push(Attempt {
+                    retry: 0,
+                    status: AttemptStatus::Skipped,
+                    duration_ms: 0,
+                    error: None,
+                    trace_url: None,
+                    video_url: None,
+                    screenshot_url: None,
+                });
+            }
+            out.push(ParsedTest {
+                framework: Framework::Playwright,
+                file: t["location"]["file"]
+                    .as_str()
+                    .unwrap_or(file_name)
+                    .to_string(),
+                suite: t["path"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| p.as_str().map(str::to_string))
+                    .collect(),
+                title: t["title"].as_str().unwrap_or("").to_string(),
+                project: t["projectName"]
+                    .as_str()
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string),
+                tags: t["tags"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|x| x.as_str().map(|s| s.trim_start_matches('@').to_string()))
+                    .collect(),
+                attempts,
+            });
+        }
+    }
+    Some(fold_duplicates(out))
 }
 
 // ── JUnit XML ─────────────────────────────────────────────────────────────
@@ -639,5 +745,74 @@ mod tests {
         assert!(parse_any("pom.xml", b"<project/>", &Links::default()).is_none());
         assert!(parse_any("notes.txt", b"hello", &Links::default()).is_none());
         assert!(parse_any("bad.json", b"{not json", &Links::default()).is_none());
+    }
+
+    /// A real Playwright 1.64 HTML report's embedded results (one passing,
+    /// one flaky and one failing test, retries 1), wrapped the way the report
+    /// wraps them.
+    fn html_report(template: bool) -> Vec<u8> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use std::io::Write;
+        let report = include_str!("testdata/pw_html_report.json");
+        let file = include_str!("testdata/pw_html_file.json");
+        let file_id = serde_json::from_str::<Value>(file).unwrap()["fileId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut buf = Vec::new();
+        {
+            let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let o = zip::write::SimpleFileOptions::default();
+            z.start_file("report.json", o).unwrap();
+            z.write_all(report.as_bytes()).unwrap();
+            z.start_file(format!("{file_id}.json"), o).unwrap();
+            z.write_all(file.as_bytes()).unwrap();
+            z.finish().unwrap();
+        }
+        let data = format!("data:application/zip;base64,{}", STANDARD.encode(&buf));
+        let html = if template {
+            format!("<html><body><template id=\"playwrightReportBase64\">{data}</template></body></html>")
+        } else {
+            format!("<script>window.playwrightReportBase64 = \"{data}\";</script>")
+        };
+        html.into_bytes()
+    }
+
+    #[test]
+    fn a_playwright_html_report_gives_every_attempt() {
+        for template in [true, false] {
+            let tests = parse_any(
+                "playwright-report-1/index.html",
+                &html_report(template),
+                &Links::default(),
+            )
+            .unwrap();
+            assert_eq!(tests.len(), 3);
+            let by = |t: &str| tests.iter().find(|x| x.title.starts_with(t)).unwrap();
+            assert_eq!(by("passes").attempts.len(), 1);
+            let flaky = by("flaky once");
+            assert_eq!(
+                flaky.attempts.iter().map(|a| a.status).collect::<Vec<_>>(),
+                vec![AttemptStatus::Failed, AttemptStatus::Passed]
+            );
+            assert_eq!(flaky.suite, vec!["checkout".to_string()]);
+            assert_eq!(flaky.file, "sample.spec.ts");
+            let failing = by("always fails");
+            assert_eq!(failing.attempts.len(), 2);
+            assert_eq!(failing.tags, vec!["smoke".to_string()]);
+            let msg = &failing.attempts[0].error.as_ref().unwrap().message;
+            assert!(msg.starts_with("Error: price shown"), "{msg}");
+            assert!(!msg.contains('\x1b'), "colour codes are stripped");
+        }
+        // The same test from the HTML report and the JSON reporter has one id.
+        let json = r#"{"config":{},"suites":[{"title":"sample.spec.ts","file":"sample.spec.ts","specs":[],"suites":[{"title":"checkout","file":"sample.spec.ts","specs":[{"title":"passes","file":"sample.spec.ts","tags":[],"tests":[{"projectName":"","results":[{"retry":0,"status":"passed","duration":3}]}]}]}]}]}"#;
+        let from_json = parse_any("results.json", json.as_bytes(), &Links::default()).unwrap();
+        let from_html = parse_any("index.html", &html_report(true), &Links::default()).unwrap();
+        assert_eq!(
+            from_json[0].id(),
+            from_html.iter().find(|t| t.title == "passes").unwrap().id()
+        );
+        // An HTML page with no embedded report is not a report.
+        assert!(parse_any("index.html", b"<html>hello</html>", &Links::default()).is_none());
     }
 }

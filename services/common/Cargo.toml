@@ -27,6 +27,8 @@ aws-sdk-redshiftdata = "1"
 aws-sdk-cloudwatchlogs = "1"
 sqlparser = { version = "0.59", features = ["visitor"] }
 regex = "1"
+# e2e: Playwright HTML reports carry their results as an embedded zip
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # e2e: JUnit XML test reports
 quick-xml = "0.37"
 

@@ -1183,6 +1183,7 @@ dependencies = [
  "tracing",
  "ulid",
  "url",
+ "zip",
 ]
 
 [[package]]
