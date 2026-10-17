@@ -662,7 +662,13 @@ pub fn http_url(source_url: &str, def: &ToolDef, inputs: &Value) -> Result<Strin
     let bound = bind(def, inputs)?;
     let mut path = def.read.clone();
     for p in &bound {
-        path = path.replace(&format!("{{{}}}", p.name), &encode_slot(&p.value.as_text()));
+        let v = p.value.as_text();
+        // `.` and `..` stay unencoded and the URL parser resolves them, so a
+        // value like `..` would walk out of the tool's fixed path.
+        if v == "." || v == ".." {
+            return Err(refused(format!("{} can't be . or ..", p.name)));
+        }
+        path = path.replace(&format!("{{{}}}", p.name), &encode_slot(&v));
     }
     let origin = format!(
         "https://{}{}",
@@ -979,6 +985,25 @@ max_rows: 20
             .unwrap()
             .text
             .ends_with(&format!("LIMIT {DEFAULT_MAX_ROWS}")));
+    }
+
+    #[test]
+    fn threat_dot_segments_in_an_input_cant_walk_the_path() {
+        let api = SourceInfo {
+            kind: Some(Kind::Api),
+            url: "https://api.example.com/graphql".into(),
+            ..Default::default()
+        };
+        let mut t = order_tool();
+        t.kind = ToolKind::Http;
+        t.read = "/v1/orders/{order_number}/status".into();
+        t.inputs.get_mut("order_number").unwrap().pattern = Some("[A-Za-z0-9.]+".into());
+        for bad in ["..", "."] {
+            let r = http_url(&api.url, &t, &json!({ "order_number": bad }));
+            assert!(r.is_err(), "{bad} gave {r:?}");
+        }
+        let url = http_url(&api.url, &t, &json!({"order_number": "v1.2"})).unwrap();
+        assert_eq!(url, "https://api.example.com/v1/orders/v1.2/status");
     }
 
     #[test]

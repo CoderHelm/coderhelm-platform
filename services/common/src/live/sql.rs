@@ -10,7 +10,10 @@
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, ObjectName, Query, SetExpr, Statement, TableFactor, Visit, Visitor};
+use sqlparser::ast::{
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr, Statement,
+    TableAlias, TableFactor, Visit, Visitor,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -66,7 +69,28 @@ const REFUSED_FUNCTIONS: &[&str] = &[
     "lo_import",
     "lo_export",
     "lo_get",
+    "pg_notify",
 ];
+
+/// Function name prefixes refused for the same reasons: families where every
+/// member reads server files, takes locks, touches large objects or reaches
+/// another database.
+const REFUSED_FUNCTION_PREFIXES: &[&str] = &[
+    "pg_ls_",
+    "pg_read_",
+    "pg_advisory",
+    "pg_try_advisory",
+    "lo_",
+    "dblink",
+    "pg_file",
+];
+
+fn refused_function(name: &str) -> bool {
+    REFUSED_FUNCTIONS.contains(&name)
+        || REFUSED_FUNCTION_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+}
 
 /// System tables that hold passwords, connection secrets or other sessions'
 /// statements.
@@ -89,6 +113,15 @@ const REFUSED_TABLES: &[&str] = &[
     "sys_query_text",
     "pg_user_info",
     "svv_user_info",
+    // Statement history of every session, with the literal values people typed.
+    "pg_stat_statements",
+    "pg_stat_statements_info",
+    "pg_hba_file_rules",
+    "pg_file_settings",
+    "stv_inflight",
+    "stv_recents",
+    "svv_query_inflight",
+    "sys_query_detail",
 ];
 
 /// A lookup that passed every check.
@@ -101,6 +134,14 @@ pub struct CheckedSql {
     pub statement: String,
     /// Tables read, by their own name.
     pub tables: Vec<String>,
+}
+
+const WHOLE_ROW: &str = "That lookup uses a whole row as one value. Name the columns you need.";
+const RENAMED: &str =
+    "That lookup renames columns with an alias list. Name the columns you need instead.";
+
+fn renames_columns(a: &TableAlias) -> bool {
+    !a.columns.is_empty()
 }
 
 fn refused(message: impl Into<String>) -> StepError {
@@ -152,6 +193,10 @@ impl Visitor for Scan {
         }
         if let Some(with) = &q.with {
             for cte in &with.cte_tables {
+                if renames_columns(&cte.alias) {
+                    self.problem = Some(RENAMED.into());
+                    return ControlFlow::Break(());
+                }
                 self.row_names.insert(cte.alias.name.value.to_lowercase());
             }
         }
@@ -172,7 +217,7 @@ impl Visitor for Scan {
             return ControlFlow::Break(());
         }
         // `FROM pg_sleep(5)` names a function where a table goes.
-        if REFUSED_FUNCTIONS.contains(&name.as_str()) {
+        if refused_function(&name) {
             self.problem = Some(format!("That lookup calls {name}, which isn't allowed."));
             return ControlFlow::Break(());
         }
@@ -190,7 +235,7 @@ impl Visitor for Scan {
             | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
             TableFactor::Function { name, alias, .. } => {
                 let n = last_name(name);
-                if REFUSED_FUNCTIONS.contains(&n.as_str()) {
+                if refused_function(&n) {
                     self.problem = Some(format!("That lookup calls {n}, which isn't allowed."));
                     return ControlFlow::Break(());
                 }
@@ -199,6 +244,12 @@ impl Visitor for Scan {
             _ => None,
         };
         if let Some(a) = alias {
+            // `users AS t(id, nm, x)` renames columns positionally, so a
+            // hidden column would come back under a harmless name.
+            if renames_columns(a) {
+                self.problem = Some(RENAMED.into());
+                return ControlFlow::Break(());
+            }
             self.row_names.insert(a.name.value.to_lowercase());
         }
         ControlFlow::Continue(())
@@ -216,10 +267,37 @@ impl Visitor for Scan {
             }
             Expr::Function(f) => {
                 let n = last_name(&f.name);
-                if REFUSED_FUNCTIONS.contains(&n.as_str()) {
+                if refused_function(&n) {
                     self.problem = Some(format!("That lookup calls {n}, which isn't allowed."));
                     return ControlFlow::Break(());
                 }
+                // `array_agg(u.*)`, `format('%s', u.*)`: a whole row passed as
+                // one value carries hidden columns out under the function's
+                // name. Only count(*) takes a bare star.
+                if let FunctionArguments::List(list) = &f.args {
+                    for a in &list.args {
+                        let arg = match a {
+                            FunctionArg::Unnamed(x) => x,
+                            FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
+                                arg
+                            }
+                        };
+                        let whole_row = match arg {
+                            FunctionArgExpr::QualifiedWildcard(_) => true,
+                            FunctionArgExpr::Wildcard => n != "count",
+                            FunctionArgExpr::Expr(_) => false,
+                        };
+                        if whole_row {
+                            self.problem = Some(WHOLE_ROW.into());
+                            return ControlFlow::Break(());
+                        }
+                    }
+                }
+            }
+            // `(u.*)::text`, `ROW(u.*)`: the same, outside a function call.
+            Expr::QualifiedWildcard(..) | Expr::Wildcard(..) => {
+                self.problem = Some(WHOLE_ROW.into());
+                return ControlFlow::Break(());
             }
             _ => {}
         }
@@ -236,6 +314,11 @@ pub fn check_read_only_sql(sql: &str, hidden: &[String]) -> Result<CheckedSql, S
     }
     if sql.len() > MAX_SQL_BYTES {
         return Err(refused("That lookup is too long."));
+    }
+    // U&"\0065mail" spells a name in escapes the hidden-column check can't
+    // read; no ordinary lookup needs it.
+    if sql.to_ascii_lowercase().contains("u&\"") || sql.to_ascii_lowercase().contains("u&'") {
+        return Err(refused("That lookup spells names with Unicode escapes."));
     }
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_err(|e| refused(format!("That isn't SQL we can check ({e}).")))?;
@@ -382,6 +465,58 @@ mod tests {
             "SELECT to_jsonb(u.*) FROM users u",
             "SELECT u::text FROM users u",
             "WITH x AS (SELECT * FROM users) SELECT x FROM x",
+        ] {
+            no(sql);
+        }
+    }
+
+    #[test]
+    fn whole_rows_inside_expressions_are_refused() {
+        for sql in [
+            "SELECT (u.*)::text FROM users u",
+            "SELECT ROW(u.*) FROM users u",
+            "SELECT format('%s', u.*) FROM users u",
+            "SELECT array_agg(u.*) FROM users u",
+            "SELECT string_agg(u.*::text, ',') FROM users u",
+            "SELECT jsonb_build_array(u.*) FROM users u",
+        ] {
+            no(sql);
+        }
+        // A plain `t.*` select item keeps real column names, which are redacted.
+        ok("SELECT u.* FROM users u");
+        ok("SELECT count(*) FROM users");
+    }
+
+    #[test]
+    fn column_alias_lists_are_refused() {
+        for sql in [
+            "SELECT t.* FROM users AS t(id, nm, x)",
+            "SELECT x FROM users AS t(id, nm, x)",
+            "WITH t(a, b, c) AS (SELECT * FROM users) SELECT * FROM t",
+            "SELECT * FROM (SELECT * FROM users) AS t(a, b, c)",
+        ] {
+            no(sql);
+        }
+    }
+
+    #[test]
+    fn unicode_escaped_names_are_refused() {
+        no("SELECT U&\"\\0065mail\" FROM users");
+        no("SELECT u&'\\0065' FROM users");
+    }
+
+    #[test]
+    fn more_side_effects_and_query_history_are_refused() {
+        for sql in [
+            "SELECT lo_create(0)",
+            "SELECT lo_from_bytea(0, 'x')",
+            "SELECT pg_notify('c', 'x')",
+            "SELECT pg_advisory_lock_shared(1)",
+            "SELECT * FROM pg_ls_waldir()",
+            "SELECT * FROM pg_ls_logdir()",
+            "SELECT query FROM pg_stat_statements",
+            "SELECT querytxt FROM stv_inflight",
+            "SELECT * FROM stv_recents",
         ] {
             no(sql);
         }
