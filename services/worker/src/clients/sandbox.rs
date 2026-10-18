@@ -27,6 +27,58 @@ const MAX_WAIT: Duration = Duration::from_secs(12 * 60);
 /// Leave this much runway before the pass deadline so poll + cleanup + the
 /// agent's final turn still fit. If less than this remains, don't even start.
 const DEADLINE_BUFFER: Duration = Duration::from_secs(75);
+/// What a check build realistically takes end to end (provisioning, source
+/// download, dependency install, checks). Production builds run ~150s; starting
+/// one with less runway than this got it killed mid-run by the deadline — a
+/// wasted build AND a lost verdict. Used until enough builds have been
+/// observed in this process to use their p90 instead.
+const DEFAULT_BUILD_ESTIMATE: Duration = Duration::from_secs(180);
+/// Builds observed before the measured p90 replaces the default.
+const MIN_SAMPLES_FOR_P90: usize = 5;
+/// Rolling window of observed check-build durations.
+const MAX_SAMPLES: usize = 30;
+
+static OBSERVED_BUILDS: std::sync::Mutex<std::collections::VecDeque<Duration>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Record how long a completed check build took (start_build → terminal).
+fn record_build_duration(d: Duration) {
+    if let Ok(mut q) = OBSERVED_BUILDS.lock() {
+        q.push_back(d);
+        while q.len() > MAX_SAMPLES {
+            q.pop_front();
+        }
+    }
+}
+
+/// Expected duration of the next build: the p90 of observed builds once there
+/// are enough of them, else the default. Never below 90s (a build cannot
+/// provision faster) nor above MAX_WAIT.
+fn build_estimate_from(samples: &[Duration]) -> Duration {
+    if samples.len() < MIN_SAMPLES_FOR_P90 {
+        return DEFAULT_BUILD_ESTIMATE;
+    }
+    let mut v = samples.to_vec();
+    v.sort();
+    let idx = ((v.len() as f64) * 0.9).ceil() as usize;
+    let p90 = v[idx.saturating_sub(1).min(v.len() - 1)];
+    p90.clamp(Duration::from_secs(90), MAX_WAIT)
+}
+
+fn current_build_estimate() -> Duration {
+    let samples: Vec<Duration> = OBSERVED_BUILDS
+        .lock()
+        .map(|q| q.iter().copied().collect())
+        .unwrap_or_default();
+    build_estimate_from(&samples)
+}
+
+/// Is `remaining` enough to start a build expected to take `estimate`, while
+/// still leaving the post-build buffer?
+fn enough_runway(remaining: Duration, estimate: Duration) -> bool {
+    remaining >= DEADLINE_BUFFER + estimate
+}
+
 /// Cap on how much real output we hand back to the model (char-safe tail).
 const MAX_OUTPUT_CHARS: usize = 6000;
 
@@ -117,11 +169,24 @@ impl<'a> SandboxClient<'a> {
         !self.bucket.is_empty() && !self.project.is_empty()
     }
 
-    /// True if there is enough runway before `deadline` to attempt a build.
+    /// True if there is enough runway before `deadline` to run a build to
+    /// completion: the realistic build time PLUS the post-build buffer.
+    /// (Previously only buffer + one poll interval, so a build started with
+    /// ~81s left and was killed at the deadline.)
     pub fn has_time(&self, deadline: Option<Instant>) -> bool {
         match deadline {
             Some(dl) => {
-                dl.saturating_duration_since(Instant::now()) > DEADLINE_BUFFER + POLL_INTERVAL
+                let remaining = dl.saturating_duration_since(Instant::now());
+                let estimate = current_build_estimate();
+                let ok = enough_runway(remaining, estimate);
+                if !ok {
+                    info!(
+                        remaining_s = remaining.as_secs(),
+                        estimate_s = estimate.as_secs(),
+                        "sandbox: not enough runway for a build, skipping"
+                    );
+                }
+                ok
             }
             None => true,
         }
@@ -486,6 +551,7 @@ impl<'a> SandboxClient<'a> {
             .ok_or("codebuild returned no build id")?
             .to_string();
         info!(build_id = %build_id, "sandbox: build started");
+        let build_started = Instant::now();
 
         // Poll until terminal or we run low on time. Cap by both the pass
         // deadline (minus buffer) and an absolute MAX_WAIT.
@@ -519,7 +585,13 @@ impl<'a> SandboxClient<'a> {
                     .and_then(|l| Some((l.group_name()?.to_string(), l.stream_name()?.to_string())))
                     .unzip_or_default();
                 let status_str = status.map(|s| s.as_str().to_string()).unwrap_or_default();
-                return self.read_outcome(&group, &stream, &status_str).await;
+                let outcome = self.read_outcome(&group, &stream, &status_str).await;
+                if matches!(&outcome, Ok(o) if o.ran) {
+                    let took = build_started.elapsed();
+                    record_build_duration(took);
+                    info!(build_id = %build_id, secs = took.as_secs(), "sandbox: build finished");
+                }
+                return outcome;
             }
 
             if Instant::now() >= poll_until {
@@ -662,5 +734,62 @@ trait UnzipOrDefault<A, B> {
 impl<A: Default, B: Default> UnzipOrDefault<A, B> for Option<(A, B)> {
     fn unzip_or_default(self) -> (A, B) {
         self.unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_build_needs_its_estimate_plus_the_buffer() {
+        let est = DEFAULT_BUILD_ESTIMATE;
+        // The production failure: ~81s left, checks take ~150s.
+        assert!(!enough_runway(Duration::from_secs(81), est));
+        assert!(!enough_runway(est, est), "buffer is still required");
+        assert!(enough_runway(est + DEADLINE_BUFFER, est));
+    }
+
+    #[test]
+    fn estimate_uses_default_until_enough_samples() {
+        let few = vec![Duration::from_secs(60); MIN_SAMPLES_FOR_P90 - 1];
+        assert_eq!(build_estimate_from(&few), DEFAULT_BUILD_ESTIMATE);
+    }
+
+    #[test]
+    fn estimate_is_the_p90_clamped() {
+        let mut s: Vec<Duration> = (1..=10)
+            .map(|i| Duration::from_secs(100 + i * 10))
+            .collect();
+        s.reverse();
+        // 110..=200 → p90 = 190s
+        assert_eq!(build_estimate_from(&s), Duration::from_secs(190));
+        let fast = vec![Duration::from_secs(20); 10];
+        assert_eq!(build_estimate_from(&fast), Duration::from_secs(90));
+        let slow = vec![Duration::from_secs(3600); 10];
+        assert_eq!(build_estimate_from(&slow), MAX_WAIT);
+    }
+
+    #[test]
+    fn no_deadline_always_has_time() {
+        let c = aws_sdk_codebuild::Client::from_conf(
+            aws_sdk_codebuild::Config::builder()
+                .behavior_version(aws_sdk_codebuild::config::BehaviorVersion::latest())
+                .build(),
+        );
+        let s3 = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .build(),
+        );
+        let logs = aws_sdk_cloudwatchlogs::Client::from_conf(
+            aws_sdk_cloudwatchlogs::Config::builder()
+                .behavior_version(aws_sdk_cloudwatchlogs::config::BehaviorVersion::latest())
+                .build(),
+        );
+        let sb = SandboxClient::new(&c, &s3, &logs, "b", "p");
+        assert!(sb.has_time(None));
+        assert!(!sb.has_time(Some(Instant::now() + Duration::from_secs(81))));
+        assert!(sb.has_time(Some(Instant::now() + Duration::from_secs(600))));
     }
 }

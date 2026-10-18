@@ -45,42 +45,103 @@ pub async fn resolve_team_by_installation(
 
     let items = result.items();
 
-    // If multiple teams share this installation, prefer the one with the
-    // most members — orphan auto-created teams have 0-1 users. Returning
-    // whichever DynamoDB listed first routed webhooks to the wrong tenant.
+    // Several teams can carry the same installation (older sign-ins created a
+    // fresh team per person). Pick the OWNER deterministically — never
+    // whichever DynamoDB lists first, which routed webhooks to the wrong team.
     if items.len() > 1 {
-        tracing::warn!(
-            installation_id,
-            team_count = items.len(),
-            "Multiple teams found for installation — selecting by member count"
-        );
-        let mut best: Option<(String, i32)> = None;
-        for item in items {
-            let Some(team_id) = item.get("team_id").and_then(|v| v.as_s().ok()).cloned() else {
-                continue;
-            };
-            let count = state
-                .dynamo
-                .query()
-                .table_name(&state.config.users_table_name)
-                .key_condition_expression("pk = :pk AND begins_with(sk, :u)")
-                .expression_attribute_values(":pk", attr_s(&team_id))
-                .expression_attribute_values(":u", attr_s("USER#"))
-                .select(aws_sdk_dynamodb::types::Select::Count)
-                .send()
-                .await
-                .map(|r| r.count)
-                .unwrap_or(0);
-            if best.as_ref().is_none_or(|(_, c)| count > *c) {
-                best = Some((team_id, count));
+        let mut candidates: Vec<InstallationCandidate> = items
+            .iter()
+            .filter_map(|item| {
+                let s = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
+                Some(InstallationCandidate {
+                    team_id: s("team_id")?,
+                    linked_at: s("installation_linked_at").filter(|v| !v.is_empty()),
+                    created_at: s("created_at").unwrap_or_default(),
+                    members: 0,
+                })
+            })
+            .collect();
+        // Member counts are only needed for records linked before
+        // `installation_linked_at` existed.
+        if candidates.iter().all(|c| c.linked_at.is_none()) {
+            for c in candidates.iter_mut() {
+                c.members = state
+                    .dynamo
+                    .query()
+                    .table_name(&state.config.users_table_name)
+                    .key_condition_expression("pk = :pk AND begins_with(sk, :u)")
+                    .expression_attribute_values(":pk", attr_s(&c.team_id))
+                    .expression_attribute_values(":u", attr_s("USER#"))
+                    .select(aws_sdk_dynamodb::types::Select::Count)
+                    .send()
+                    .await
+                    .map(|r| r.count)
+                    .unwrap_or(0);
             }
         }
-        return best.map(|(t, _)| t);
+        let owner = pick_installation_owner(&candidates);
+        if first_time_seen_shared(installation_id) {
+            tracing::warn!(
+                installation_id,
+                team_count = candidates.len(),
+                owner = owner.as_deref().unwrap_or(""),
+                "Installation is linked to several teams — routing to its owner"
+            );
+        }
+        return owner;
     }
 
     items
         .first()
         .and_then(|item| item.get("team_id").and_then(|v| v.as_s().ok()).cloned())
+}
+
+/// One team that carries an installation, as the owner choice sees it.
+#[derive(Debug, Clone)]
+pub struct InstallationCandidate {
+    pub team_id: String,
+    /// When this team linked the installation (set on link since the owner
+    /// rule exists; absent on older records).
+    pub linked_at: Option<String>,
+    pub created_at: String,
+    pub members: i32,
+}
+
+/// The team that owns an installation shared by several teams:
+/// 1. the FIRST to link it, when link times are recorded;
+/// 2. otherwise (records from before link times) the team with the most
+///    members — what routing used before, so existing tenants keep their
+///    webhooks — then the oldest team, then the smallest id. Always the same
+///    answer for the same records.
+pub fn pick_installation_owner(c: &[InstallationCandidate]) -> Option<String> {
+    if let Some(first) = c
+        .iter()
+        .filter(|x| x.linked_at.is_some())
+        .min_by(|a, b| (&a.linked_at, &a.team_id).cmp(&(&b.linked_at, &b.team_id)))
+    {
+        return Some(first.team_id.clone());
+    }
+    c.iter()
+        .min_by(|a, b| {
+            b.members
+                .cmp(&a.members)
+                // Empty created_at sorts last, not first.
+                .then_with(|| a.created_at.is_empty().cmp(&b.created_at.is_empty()))
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.team_id.cmp(&b.team_id))
+        })
+        .map(|x| x.team_id.clone())
+}
+
+/// True the first time this process sees `installation_id` shared, so the
+/// warning is logged once per installation, not on every webhook.
+fn first_time_seen_shared(installation_id: u64) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .map(|mut s| s.insert(installation_id))
+        .unwrap_or(false)
 }
 
 /// Look up ALL team_ids linked to a GitHub installation_id.
@@ -2710,5 +2771,60 @@ mod tool_paths_tests {
             ]
         );
         assert!(tool_definition_paths(&json!({})).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod installation_owner_tests {
+    use super::*;
+
+    fn c(id: &str, linked: Option<&str>, created: &str, members: i32) -> InstallationCandidate {
+        InstallationCandidate {
+            team_id: id.into(),
+            linked_at: linked.map(String::from),
+            created_at: created.into(),
+            members,
+        }
+    }
+
+    #[test]
+    fn first_linked_team_owns_the_installation() {
+        let v = vec![
+            c("TEAM#b", Some("2026-09-02T00:00:00Z"), "2026-01-01", 9),
+            c("TEAM#a", Some("2026-09-01T00:00:00Z"), "2026-08-01", 1),
+            c("TEAM#c", None, "2025-01-01", 20),
+        ];
+        assert_eq!(pick_installation_owner(&v).as_deref(), Some("TEAM#a"));
+    }
+
+    #[test]
+    fn older_records_keep_member_count_routing() {
+        let v = vec![
+            c("TEAM#orphan", None, "2026-10-01", 1),
+            c("TEAM#real", None, "2026-03-01", 6),
+        ];
+        assert_eq!(pick_installation_owner(&v).as_deref(), Some("TEAM#real"));
+    }
+
+    #[test]
+    fn ties_break_by_oldest_then_id_whatever_the_order() {
+        let a = c("TEAM#x", None, "2026-05-01", 2);
+        let b = c("TEAM#y", None, "2026-04-01", 2);
+        let d = c("TEAM#z", None, "", 2);
+        let one = pick_installation_owner(&[a.clone(), b.clone(), d.clone()]);
+        let two = pick_installation_owner(&[d, b, a]);
+        assert_eq!(one.as_deref(), Some("TEAM#y"));
+        assert_eq!(one, two);
+        let same = vec![
+            c("TEAM#2", None, "2026-01-01", 1),
+            c("TEAM#1", None, "2026-01-01", 1),
+        ];
+        assert_eq!(pick_installation_owner(&same).as_deref(), Some("TEAM#1"));
+    }
+
+    #[test]
+    fn shared_installation_is_logged_once() {
+        assert!(first_time_seen_shared(987_654_321));
+        assert!(!first_time_seen_shared(987_654_321));
     }
 }

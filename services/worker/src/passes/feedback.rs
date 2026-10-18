@@ -1225,8 +1225,7 @@ fn feedback_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "path": {"type": "string"},
                     "content": {"type": "string"},
-                    "message": {"type": "string"},
-                    "sha": {"type": "string"}
+                    "message": {"type": "string"}
                 },
                 "required": ["path", "content", "message"]
             }),
@@ -1488,15 +1487,13 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                         )));
                     }
                 }
-                // Auto-fetch SHA if not provided — Contents API requires it for updates
-                let sha = match input.get("sha").and_then(|v| v.as_str()) {
-                    Some(s) => Some(s.to_string()),
-                    None => self
-                        .github
-                        .get_file_sha(self.owner, self.repo, path, self.branch)
-                        .await
-                        .ok(),
-                };
+                // The blob sha is always looked up server-side — a model-supplied
+                // one is a guess, and a wrong guess is a false conflict.
+                let sha = self
+                    .github
+                    .get_file_sha(self.owner, self.repo, path, self.branch)
+                    .await
+                    .ok();
                 self.github
                     .write_file(
                         self.owner,
@@ -1958,6 +1955,9 @@ async fn fetch_ci_failures(
 /// reopening as needed, and drop the "⚠️ Partial:" salvage prefix from the
 /// title. Best-effort: failures log and fall through (comments still land on
 /// a closed PR).
+/// `cancel_reason` for a run stopped because a person closed its PR.
+const CANCEL_PR_CLOSED_BY_HUMAN: &str = "pr_closed_by_human";
+
 /// Whether the run has been cancelled (consistent read — cancel must win
 /// against a racing pass).
 /// Hand a PR to a human after the automated-fix budget is spent.
@@ -2137,10 +2137,16 @@ async fn ensure_pr_open(
                     "run_id",
                     aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
                 )
+                // Record WHY and BY WHOM, not just a note — analytics and the
+                // dashboard read these fields, and the PR's outcome is known.
                 .update_expression(
-                    "SET #s = :s, status_run_id = :sri, current_pass = :cp, updated_at = :t",
+                    "SET #s = :s, status_run_id = :sri, current_pass = :cp, updated_at = :t, \
+                     cancel_reason = :cr, cancelled_by = :cb, pr_outcome = :po",
                 )
                 .expression_attribute_names("#s", "status")
+                .expression_attribute_values(":cr", super::attr_s(CANCEL_PR_CLOSED_BY_HUMAN))
+                .expression_attribute_values(":cb", super::attr_s(who))
+                .expression_attribute_values(":po", super::attr_s("closed"))
                 .expression_attribute_values(
                     ":s",
                     aws_sdk_dynamodb::types::AttributeValue::S("cancelled".to_string()),
@@ -2266,5 +2272,17 @@ mod resume_owns_ci_tests {
         for s in ["completed", "failed", "needs_input", "cancelled", ""] {
             assert!(!resume_owns_ci(s), "{s}");
         }
+    }
+}
+
+#[cfg(test)]
+mod write_schema_tests {
+    use super::*;
+
+    #[test]
+    fn feedback_write_file_schema_has_no_sha() {
+        let tools = feedback_tools();
+        let w = tools.iter().find(|t| t.name == "write_file").unwrap();
+        assert!(w.input_schema["properties"].get("sha").is_none());
     }
 }

@@ -642,6 +642,76 @@ pub fn changed_right_lines(compare: &serde_json::Value) -> HashMap<String, HashS
     map
 }
 
+/// Per file, the hunk index of every RIGHT-side line the diff shows (added or
+/// context). GitHub accepts a multi-line comment only when `start_line` and
+/// `line` sit in the SAME hunk; anything else is a 422 that used to sink the
+/// whole inline review.
+pub fn right_line_hunks(compare: &serde_json::Value) -> HashMap<String, HashMap<u64, usize>> {
+    let mut map: HashMap<String, HashMap<u64, usize>> = HashMap::new();
+    let Some(files) = compare["files"].as_array() else {
+        return map;
+    };
+    for f in files {
+        let path = f["filename"].as_str().unwrap_or("").to_string();
+        let patch = f["patch"].as_str().unwrap_or("");
+        let mut lines: HashMap<u64, usize> = HashMap::new();
+        let mut new_ln = 0u64;
+        let mut hunk = 0usize;
+        let mut in_hunk = false;
+        for line in patch.lines() {
+            if let Some(hdr) = line.strip_prefix("@@") {
+                if in_hunk {
+                    hunk += 1;
+                }
+                in_hunk = true;
+                new_ln = hdr
+                    .split('+')
+                    .nth(1)
+                    .and_then(|plus| plus.trim().split([',', ' ']).next())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                continue;
+            }
+            if !in_hunk {
+                continue;
+            }
+            match line.chars().next() {
+                Some('-') => {}
+                Some('\\') => {} // "\ No newline at end of file"
+                _ => {
+                    lines.insert(new_ln, hunk);
+                    new_ln += 1;
+                }
+            }
+        }
+        map.insert(path, lines);
+    }
+    map
+}
+
+/// Body-only fallback: when GitHub rejects the inline anchors, the findings
+/// still have to reach the reader — fold each inline comment into the review
+/// body (suggestion fences become plain code, since a body can't apply them).
+pub fn fold_inline_into_body(body: &str, inline: &[InlineComment]) -> String {
+    if inline.is_empty() {
+        return body.to_string();
+    }
+    let mut out = body.to_string();
+    out.push_str("\n\n---\n**Findings** (could not be anchored to the diff):\n");
+    for c in inline {
+        let loc = match c.start_line {
+            Some(s) if s < c.line => format!("{}:{}-{}", c.path, s, c.line),
+            _ => format!("{}:{}", c.path, c.line),
+        };
+        out.push_str(&format!(
+            "\n**`{loc}`**\n\n{}\n",
+            c.body.replace("```suggestion", "```")
+        ));
+    }
+    // GitHub caps a review body at 65,536 characters.
+    common::truncate_str(&out, 60_000).to_string()
+}
+
 /// Build a bounded diff string for the prompt (per-file patch, head+tail capped).
 pub fn format_diff(compare: &serde_json::Value, cap: usize) -> String {
     let mut diff = String::new();
@@ -1016,6 +1086,7 @@ pub fn vet_suggestions(findings: &mut [Finding], files: &HashMap<String, String>
 pub fn to_postable(
     findings: &[Finding],
     changed: &HashMap<String, HashSet<u64>>,
+    hunks: &HashMap<String, HashMap<u64, usize>>,
 ) -> PostableReview {
     let sev_emoji = |s: &str| match s.to_ascii_lowercase().as_str() {
         "blocking" => "🛑",
@@ -1037,6 +1108,15 @@ pub fn to_postable(
                 .get(&f.file)
                 .map(|s| s.contains(&f.line))
                 .unwrap_or(false);
+        // A range is postable only when its end is in the diff AND in the
+        // same hunk as its start; otherwise collapse to the start line.
+        let range_end = f.end_line.filter(|&e| {
+            e > f.line
+                && hunks.get(&f.file).is_some_and(
+                    |h| matches!((h.get(&f.line), h.get(&e)), (Some(a), Some(b)) if a == b),
+                )
+        });
+        let collapsed = anchored && f.end_line.is_some_and(|e| e > f.line) && range_end.is_none();
         let mut body = format!(
             "{} **{}** ({})\n\n{}",
             sev_emoji(&f.severity),
@@ -1045,17 +1125,22 @@ pub fn to_postable(
             f.body
         );
         if let Some(sugg) = &f.suggestion {
-            if !sugg.contains("```") {
+            if collapsed {
+                // A multi-line replacement on a single anchored line would
+                // overwrite the wrong text — show it, don't offer to apply it.
+                body.push_str(&format!(
+                    "\n\nSuggested change for lines {}-{}:\n```\n{sugg}\n```",
+                    f.line,
+                    f.end_line.unwrap_or(f.line)
+                ));
+            } else if !sugg.contains("```") {
                 body.push_str(&format!("\n\n```suggestion\n{sugg}\n```"));
             }
         }
         if anchored {
-            let start_line = f
-                .end_line
-                .and_then(|e| if e > f.line { Some(f.line) } else { None });
-            let (line, start) = match f.end_line {
-                Some(e) if e > f.line => (e, Some(f.line)),
-                _ => (f.line, start_line),
+            let (line, start) = match range_end {
+                Some(e) => (e, Some(f.line)),
+                None => (f.line, None),
             };
             inline.push(InlineComment {
                 path: f.file.clone(),
@@ -1209,12 +1294,120 @@ mod tests {
         ];
         let mut changed = HashMap::new();
         changed.insert("a.rs".to_string(), HashSet::from([2u64, 3u64]));
-        let p = to_postable(&findings, &changed);
+        let p = to_postable(&findings, &changed, &HashMap::new());
         assert_eq!(p.inline.len(), 1);
         assert_eq!(p.inline[0].line, 2);
         assert!(p.inline[0].body.contains("```suggestion"));
         assert_eq!(p.blocking_count, 1);
         assert!(p.unanchored_md.contains("a.rs:99"));
+    }
+}
+
+#[cfg(test)]
+mod anchoring_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn finding(line: u64, end_line: Option<u64>, suggestion: Option<&str>) -> Finding {
+        Finding {
+            file: "a.rs".into(),
+            line,
+            end_line,
+            severity: "medium".into(),
+            category: "bug".into(),
+            title: "t".into(),
+            body: "b".into(),
+            suggestion: suggestion.map(String::from),
+        }
+    }
+
+    fn two_hunk_compare() -> serde_json::Value {
+        // Hunk 0 covers new lines 1-4, hunk 1 covers new lines 20-22.
+        json!({"files": [{
+            "filename": "a.rs",
+            "patch": "@@ -1,3 +1,4 @@\n ctx1\n+add2\n+add3\n ctx4\n@@ -18,2 +20,3 @@\n ctx20\n+add21\n ctx22\n"
+        }]})
+    }
+
+    #[test]
+    fn hunks_map_context_and_added_lines() {
+        let h = right_line_hunks(&two_hunk_compare());
+        let a = h.get("a.rs").unwrap();
+        assert_eq!(a.get(&1), Some(&0));
+        assert_eq!(a.get(&4), Some(&0));
+        assert_eq!(a.get(&20), Some(&1));
+        assert_eq!(a.get(&22), Some(&1));
+        assert_eq!(a.get(&10), None);
+    }
+
+    #[test]
+    fn range_in_one_hunk_stays_multiline() {
+        let c = two_hunk_compare();
+        let p = to_postable(
+            &[finding(2, Some(4), Some("x\ny\nz"))],
+            &changed_right_lines(&c),
+            &right_line_hunks(&c),
+        );
+        assert_eq!(p.inline.len(), 1);
+        assert_eq!(p.inline[0].start_line, Some(2));
+        assert_eq!(p.inline[0].line, 4);
+        assert!(p.inline[0].body.contains("```suggestion"));
+    }
+
+    #[test]
+    fn range_crossing_hunks_collapses_to_single_line() {
+        let c = two_hunk_compare();
+        let p = to_postable(
+            &[finding(3, Some(21), Some("x\ny"))],
+            &changed_right_lines(&c),
+            &right_line_hunks(&c),
+        );
+        assert_eq!(p.inline.len(), 1);
+        assert_eq!(p.inline[0].start_line, None);
+        assert_eq!(p.inline[0].line, 3);
+        assert!(
+            !p.inline[0].body.contains("```suggestion"),
+            "no misapplied suggestion"
+        );
+        assert!(p.inline[0].body.contains("x\ny"));
+    }
+
+    #[test]
+    fn range_ending_outside_the_diff_collapses() {
+        let c = two_hunk_compare();
+        let p = to_postable(
+            &[finding(2, Some(10), None)],
+            &changed_right_lines(&c),
+            &right_line_hunks(&c),
+        );
+        assert_eq!(p.inline[0].start_line, None);
+        assert_eq!(p.inline[0].line, 2);
+    }
+
+    #[test]
+    fn body_fallback_keeps_every_inline_finding() {
+        let inline = vec![
+            InlineComment {
+                path: "a.rs".into(),
+                line: 4,
+                start_line: Some(2),
+                side: "RIGHT".into(),
+                body: "first\n\n```suggestion\nfix\n```".into(),
+            },
+            InlineComment {
+                path: "b.rs".into(),
+                line: 7,
+                start_line: None,
+                side: "RIGHT".into(),
+                body: "second".into(),
+            },
+        ];
+        let out = fold_inline_into_body("Summary", &inline);
+        assert!(out.starts_with("Summary"));
+        assert!(out.contains("a.rs:2-4") && out.contains("first"));
+        assert!(out.contains("b.rs:7") && out.contains("second"));
+        assert!(!out.contains("```suggestion"));
+        assert_eq!(fold_inline_into_body("Only", &[]), "Only");
     }
 }
 

@@ -797,8 +797,7 @@ fn all_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "path": {"type": "string"},
                     "content": {"type": "string", "description": "Full file content"},
-                    "message": {"type": "string", "description": "Commit message"},
-                    "sha": {"type": "string", "description": "SHA of existing file (required for updates)"}
+                    "message": {"type": "string", "description": "Commit message"}
                 },
                 "required": ["path", "content", "message"]
             }),
@@ -996,6 +995,52 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let out = self.execute_tool(name, input).await;
+        if let Err(e) = &out {
+            // A write refused as stale must leave NO stale copy behind: the
+            // client already dropped its snapshot, and the pass cache goes too,
+            // so the re-read the error asks for sees live content (it used to
+            // re-serve the cached body, and the write looped forever).
+            if is_stale_write_error(&e.to_string()) {
+                for p in tool_write_paths(input) {
+                    self.file_cache
+                        .remove(&format!("{}:{}", self.branch, p))
+                        .await;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// True for the write refusals that mean "your copy of the file is stale".
+fn is_stale_write_error(msg: &str) -> bool {
+    msg.contains("branch advanced upstream") || msg.contains("changed concurrently")
+}
+
+/// Paths a write-tool call targets (`path`, or each `files[].path`).
+fn tool_write_paths(input: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+        out.push(p.to_string());
+    }
+    if let Some(files) = input.get("files").and_then(|v| v.as_array()) {
+        out.extend(
+            files
+                .iter()
+                .filter_map(|f| f.get("path").and_then(|v| v.as_str()))
+                .map(String::from),
+        );
+    }
+    out
+}
+
+impl<'a> WriteToolExecutor<'a> {
+    async fn execute_tool(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         // Graph lookups share one implementation with the reviewer agent.
         if let Some(out) =
             super::code_graph::handle_tool(self.state, self.graph.as_ref(), name, input).await
@@ -1151,7 +1196,15 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                         )));
                     }
                 }
-                let sha = input.get("sha").and_then(|v| v.as_str());
+                // The blob sha is looked up here, never taken from the model:
+                // it cannot know it, and a guessed/stale one made GitHub reject
+                // the write as a false "changed concurrently" conflict.
+                // A missing file (404) means a new file: no sha.
+                let sha = self
+                    .github
+                    .get_file_sha(&self.owner, &self.repo, path, &self.branch)
+                    .await
+                    .ok();
                 self.github
                     .write_file(
                         &self.owner,
@@ -1160,7 +1213,7 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
                         content,
                         &self.branch,
                         message,
-                        sha,
+                        sha.as_deref(),
                     )
                     .await?;
                 self.files_modified.lock().unwrap().insert(path.to_string());
@@ -2064,5 +2117,39 @@ mod tool_equivalents_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod write_tool_tests {
+    use super::*;
+
+    #[test]
+    fn write_file_schema_does_not_ask_the_model_for_a_sha() {
+        let tools = all_tools();
+        let w = tools.iter().find(|t| t.name == "write_file").unwrap();
+        assert!(w.input_schema["properties"].get("sha").is_none());
+    }
+
+    #[test]
+    fn stale_write_refusals_are_recognised() {
+        assert!(is_stale_write_error(
+            "branch advanced upstream: 'a.ts' was changed by a commit this pass has not read."
+        ));
+        assert!(is_stale_write_error(
+            "write_file conflict: 'a.ts' changed concurrently on 'b'."
+        ));
+        assert!(!is_stale_write_error("write_file failed: 500"));
+    }
+
+    #[test]
+    fn write_paths_cover_single_and_batch_calls() {
+        let single = serde_json::json!({"path": "a.ts", "content": "x"});
+        assert_eq!(tool_write_paths(&single), vec!["a.ts".to_string()]);
+        let batch = serde_json::json!({"files": [{"path": "a.ts"}, {"path": "b.ts"}]});
+        assert_eq!(
+            tool_write_paths(&batch),
+            vec!["a.ts".to_string(), "b.ts".to_string()]
+        );
     }
 }

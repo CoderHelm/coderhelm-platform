@@ -29,6 +29,7 @@
 use crate::clients::github::GitHubClient;
 use crate::models::GraphIndexMessage;
 use crate::WorkerState;
+use aws_sdk_dynamodb::error::{DisplayErrorContext, ProvideErrorMetadata};
 use aws_sdk_dynamodb::types::{AttributeValue, DeleteRequest, PutRequest, WriteRequest};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
@@ -178,6 +179,12 @@ pub fn extract(path: &str, source: &str) -> Option<FileFacts> {
         }
     }
 
+    // One definition per name per file: overloads, `impl` blocks and
+    // re-declarations share a name, and each name maps to ONE `NM#{name}#{path}`
+    // key — duplicates made the manifest string set and the batch write
+    // invalid. Keep the first (lowest line) occurrence.
+    dedupe_defs(&mut facts.defs);
+
     // A file referencing its own definitions is noise for caller queries.
     let own: HashSet<&str> = facts.defs.iter().map(|d| d.name.as_str()).collect();
     facts.refs = ref_names
@@ -188,6 +195,13 @@ pub fn extract(path: &str, source: &str) -> Option<FileFacts> {
     facts.imports.sort();
     facts.imports.dedup();
     Some(facts)
+}
+
+/// Keep the first (lowest-line) definition of each name.
+fn dedupe_defs(defs: &mut Vec<Def>) {
+    defs.sort_by_key(|d| d.line);
+    let mut seen: HashSet<String> = HashSet::new();
+    defs.retain(|d| seen.insert(d.name.clone()));
 }
 
 fn is_identifier(s: &str) -> bool {
@@ -353,9 +367,15 @@ pub fn pagerank(nodes: &[String], edges: &[(usize, usize)]) -> Vec<f64> {
 /// unprocessed items. Best-effort: a dropped item degrades one lookup, never
 /// the pipeline.
 async fn batch_write(state: &WorkerState, requests: Vec<WriteRequest>) {
+    // A batch may not name the same key twice — DynamoDB rejects the WHOLE
+    // request. Drop duplicates before chunking.
+    let requests = dedupe_requests(requests);
     for chunk in requests.chunks(25) {
         let mut pending = chunk.to_vec();
-        for _ in 0..3 {
+        for attempt in 0..MAX_WRITE_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(backoff(attempt)).await;
+            }
             match state
                 .dynamo
                 .batch_write_item()
@@ -373,13 +393,68 @@ async fn batch_write(state: &WorkerState, requests: Vec<WriteRequest>) {
                         break;
                     }
                 }
+                Err(e) if is_throttle_code(e.code()) && attempt + 1 < MAX_WRITE_ATTEMPTS => {
+                    warn!(attempt, "code graph: batch write throttled, backing off");
+                }
                 Err(e) => {
-                    warn!(error = %e, "code graph: batch write failed");
+                    warn!(error = %DisplayErrorContext(&e), "code graph: batch write failed");
                     break;
                 }
             }
         }
+        if !pending.is_empty() {
+            warn!(
+                dropped = pending.len(),
+                "code graph: items still unprocessed after retries"
+            );
+        }
     }
+}
+
+const MAX_WRITE_ATTEMPTS: u32 = 6;
+
+/// Exponential backoff for throttled/unprocessed writes: 100ms, 200ms, … 3.2s.
+fn backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(100u64 << attempt.min(5))
+}
+
+/// DynamoDB error codes that mean "slow down", not "this request is wrong".
+fn is_throttle_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "ProvisionedThroughputExceededException"
+                | "ThrottlingException"
+                | "RequestLimitExceeded"
+                | "Throttling"
+        )
+    )
+}
+
+/// The (pk, sk) a write request targets.
+fn request_key(r: &WriteRequest) -> Option<(String, String)> {
+    let get = |m: &HashMap<String, AttributeValue>| {
+        Some((
+            m.get("pk")?.as_s().ok()?.clone(),
+            m.get("sk")?.as_s().ok()?.clone(),
+        ))
+    };
+    if let Some(p) = r.put_request() {
+        return get(p.item());
+    }
+    r.delete_request().and_then(|d| get(d.key()))
+}
+
+/// Drop requests whose key already appeared (first one wins).
+fn dedupe_requests(requests: Vec<WriteRequest>) -> Vec<WriteRequest> {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    requests
+        .into_iter()
+        .filter(|r| match request_key(r) {
+            Some(k) => seen.insert(k),
+            None => true,
+        })
+        .collect()
 }
 
 fn put_req(pk: &str, sk: String, extra: Vec<(&str, AttributeValue)>) -> WriteRequest {
@@ -414,6 +489,7 @@ async fn query_prefix(
 ) -> Vec<HashMap<String, AttributeValue>> {
     let mut items = Vec::new();
     let mut start_key = None;
+    let mut throttled = 0u32;
     loop {
         let mut q = state
             .dynamo
@@ -422,19 +498,25 @@ async fn query_prefix(
             .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
             .expression_attribute_values(":pk", attr_s(pk))
             .expression_attribute_values(":p", attr_s(prefix));
-        if let Some(k) = start_key {
+        if let Some(k) = start_key.clone() {
             q = q.set_exclusive_start_key(Some(k));
         }
         match q.send().await {
             Ok(out) => {
+                throttled = 0;
                 items.extend(out.items().to_vec());
                 match out.last_evaluated_key() {
                     Some(k) if !k.is_empty() => start_key = Some(k.clone()),
                     _ => break,
                 }
             }
+            Err(e) if is_throttle_code(e.code()) && throttled + 1 < MAX_WRITE_ATTEMPTS => {
+                // Same page again after a pause.
+                throttled += 1;
+                tokio::time::sleep(backoff(throttled)).await;
+            }
             Err(e) => {
-                warn!(error = %e, "code graph: query failed");
+                warn!(error = %DisplayErrorContext(&e), "code graph: query failed");
                 break;
             }
         }
@@ -461,8 +543,14 @@ fn file_write_requests(
 ) -> Vec<WriteRequest> {
     let mut reqs = Vec::new();
     let mut contributed: Vec<String> = Vec::new();
+    // The manifest is a DynamoDB string SET — duplicates are rejected — and a
+    // batch may not write the same key twice. Every sk is emitted once.
+    let mut seen: HashSet<String> = HashSet::new();
     for d in &facts.defs {
         let sk = format!("NM#{}#{}", d.name, path);
+        if !seen.insert(sk.clone()) {
+            continue;
+        }
         contributed.push(sk.clone());
         reqs.push(put_req(
             pk,
@@ -476,12 +564,19 @@ fn file_write_requests(
     }
     for name in &facts.refs {
         let sk = format!("R#{name}#{path}");
+        if !seen.insert(sk.clone()) {
+            continue;
+        }
         contributed.push(sk.clone());
         reqs.push(put_req(pk, sk, vec![]));
     }
     for imp in resolved_imports {
         let fwd = format!("I#{path}#{imp}");
         let rev = format!("RI#{imp}#{path}");
+        if !seen.insert(fwd.clone()) {
+            continue;
+        }
+        seen.insert(rev.clone());
         contributed.push(fwd.clone());
         contributed.push(rev.clone());
         reqs.push(put_req(pk, fwd, vec![]));
@@ -586,11 +681,14 @@ pub async fn run(
         let Some(facts) = extract(path, &source) else {
             continue;
         };
-        let resolved: Vec<String> = facts
+        // Two specifiers (`./a` and `./a.ts`) can resolve to the same file.
+        let mut resolved: Vec<String> = facts
             .imports
             .iter()
             .filter_map(|s| resolve_import(s, path, &file_set))
             .collect();
+        resolved.sort();
+        resolved.dedup();
         extracted.push((path.clone(), facts, resolved));
     }
 
@@ -1073,5 +1171,77 @@ class OrderService { run() { this.processAll(); } }
         assert!(is_identifier("snake_case_2"));
         assert!(!is_identifier("2fast"));
         assert!(!is_identifier("a.b"));
+    }
+
+    #[test]
+    fn duplicate_definition_names_keep_the_first() {
+        // Two `impl` blocks each define `new`; the TS file overloads `run`.
+        let rs = "struct A;\nimpl A { fn new() -> A { A } }\nstruct B;\nimpl B { fn new() -> B { B } }\n";
+        let facts = extract("src/lib.rs", rs).expect("rs supported");
+        let news: Vec<&Def> = facts.defs.iter().filter(|d| d.name == "new").collect();
+        assert_eq!(news.len(), 1);
+        assert_eq!(news[0].line, 2, "keeps the first definition");
+    }
+
+    #[test]
+    fn manifest_and_writes_carry_each_key_once() {
+        let facts = FileFacts {
+            defs: vec![
+                Def {
+                    name: "run".into(),
+                    kind: "fn",
+                    line: 1,
+                },
+                Def {
+                    name: "run".into(),
+                    kind: "fn",
+                    line: 9,
+                },
+            ],
+            refs: vec!["helper".into(), "helper".into()],
+            imports: vec![],
+        };
+        let resolved = vec!["src/b.ts".to_string(), "src/b.ts".to_string()];
+        let reqs = file_write_requests("pk", "src/a.ts", &facts, &resolved, 0.1);
+        let keys: Vec<(String, String)> = reqs.iter().filter_map(request_key).collect();
+        let unique: HashSet<&(String, String)> = keys.iter().collect();
+        assert_eq!(keys.len(), unique.len(), "no duplicate keys in one batch");
+        let manifest = reqs
+            .iter()
+            .filter_map(|r| r.put_request())
+            .find(|p| {
+                p.item()
+                    .get("sk")
+                    .and_then(|v| v.as_s().ok())
+                    .map(String::as_str)
+                    == Some("F#src/a.ts")
+            })
+            .expect("manifest written");
+        let sks = manifest.item().get("sks").unwrap().as_ss().unwrap();
+        let set: HashSet<&String> = sks.iter().collect();
+        assert_eq!(sks.len(), set.len());
+        assert_eq!(sks.len(), 4); // NM#run, R#helper, I#..., RI#...
+    }
+
+    #[test]
+    fn dedupe_requests_drops_repeated_keys() {
+        let reqs = vec![
+            put_req("pk", "a".into(), vec![]),
+            del_req("pk", "a"),
+            put_req("pk", "b".into(), vec![]),
+        ];
+        assert_eq!(dedupe_requests(reqs).len(), 2);
+    }
+
+    #[test]
+    fn throttling_codes_are_retried_others_are_not() {
+        assert!(is_throttle_code(Some(
+            "ProvisionedThroughputExceededException"
+        )));
+        assert!(is_throttle_code(Some("ThrottlingException")));
+        assert!(!is_throttle_code(Some("ValidationException")));
+        assert!(!is_throttle_code(None));
+        assert!(backoff(1) < backoff(2));
+        assert_eq!(backoff(50), backoff(5));
     }
 }

@@ -45,14 +45,17 @@ async fn acquire_ticket_lock(state: &AppState, team_id: &str, ticket_id: &str) -
     match result {
         Ok(_) => true,
         Err(e) => {
-            if e.to_string().contains("ConditionalCheckFailed") {
+            // Display for a service error is only "service error"; use the typed error.
+            if e.as_service_error()
+                .is_some_and(|s| s.is_conditional_check_failed_exception())
+            {
                 info!(
                     team_id,
                     ticket_id, "Ticket lock held — skipping duplicate enqueue"
                 );
                 false
             } else {
-                warn!(team_id, ticket_id, error = %e, "Ticket lock check failed — allowing through");
+                warn!(team_id, ticket_id, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Ticket lock check failed — allowing through");
                 true
             }
         }

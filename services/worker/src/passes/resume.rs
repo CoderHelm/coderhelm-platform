@@ -1890,7 +1890,12 @@ async fn set_run_awaiting_ci(
         .await;
     match res {
         Ok(_) => Ok(true),
-        Err(e) if format!("{e}").contains("ConditionalCheckFailed") => {
+        // Display for a service error is only "service error" — classify on
+        // the typed error, or a cancelled run surfaced as a hard failure.
+        Err(e)
+            if e.as_service_error()
+                .is_some_and(|s| s.is_conditional_check_failed_exception()) =>
+        {
             info!(
                 run_id,
                 "Run is cancelled — not restoring awaiting_ci; stopping loop"

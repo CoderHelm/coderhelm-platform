@@ -1418,11 +1418,15 @@ pub async fn cancel_run(
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&claims.team_id))
         .key("run_id", attr_s(&run_id))
-        .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t")
+        .update_expression(
+            "SET #s = :s, status_run_id = :sri, updated_at = :t, cancelled_by = :cb, cancel_reason = :cr",
+        )
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":s", attr_s("cancelled"))
         .expression_attribute_values(":sri", attr_s(&format!("cancelled#{run_id}")))
         .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":cb", attr_s(&claims.email))
+        .expression_attribute_values(":cr", attr_s("cancelled_by_user"))
         .condition_expression("#s = :running")
         .expression_attribute_values(":running", attr_s("running"))
         .send()
