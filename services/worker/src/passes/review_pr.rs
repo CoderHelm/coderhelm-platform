@@ -433,7 +433,7 @@ pub async fn run(
                     .await?;
             }
         }
-        store_review_record(
+        let record_sk = store_review_record(
             state,
             &msg,
             &head_sha,
@@ -448,6 +448,7 @@ pub async fn run(
             },
         )
         .await;
+        record_review_usage(state, &msg.team_id, Some(&record_sk), &usage).await;
         info!(pr = msg.pr_number, "Reviewer answered a question");
         return Ok(());
     }
@@ -910,6 +911,8 @@ pub async fn run(
                 current = latest_head,
                 "Not posting superseded review — the PR moved on while reviewing"
             );
+            // The tokens were still spent: count them against the team.
+            record_review_usage(state, &msg.team_id, None, &usage).await;
             return Ok(());
         }
     }
@@ -1030,6 +1033,7 @@ pub async fn run(
         },
     )
     .await;
+    record_review_usage(state, &msg.team_id, Some(&record_sk), &usage).await;
     info!(
         pr = msg.pr_number,
         verdict = verdict,
@@ -1506,6 +1510,81 @@ async fn store_review_record(
     sk
 }
 
+/// Cost of a review as stored (4 decimals, like run records).
+fn review_cost_str(usage: &TokenUsage) -> String {
+    format!("{:.4}", usage.estimated_cost())
+}
+
+/// True when the review used the model at all.
+fn has_usage(usage: &TokenUsage) -> bool {
+    usage.input_tokens + usage.output_tokens + usage.cache_read_tokens + usage.cache_write_tokens
+        > 0
+}
+
+/// Persist what a review cost on its REVIEW# record, and add it to the team's
+/// usage counters — the same per-month analytics item runs add to and the token
+/// budget reads — so reviews are no longer free in the team's accounting.
+async fn record_review_usage(
+    state: &WorkerState,
+    team_id: &str,
+    record_sk: Option<&str>,
+    usage: &TokenUsage,
+) {
+    if !has_usage(usage) {
+        return;
+    }
+    let cost = review_cost_str(usage);
+    if let Some(sk) = record_sk {
+        if let Err(e) = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(team_id))
+            .key("sk", attr_s(sk))
+            // Never create a partial record if the put above failed.
+            .condition_expression("attribute_exists(sk)")
+            .update_expression(
+                "SET tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, \
+                 cache_write_tokens = :cwt, cost_usd = :c",
+            )
+            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+            .expression_attribute_values(":to", attr_n(usage.output_tokens))
+            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+            .expression_attribute_values(":c", attr_n(&cost))
+            .send()
+            .await
+        {
+            warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Failed to store review cost (non-fatal)");
+        }
+    }
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    for period in [month.as_str(), "ALL_TIME"] {
+        if let Err(e) = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.analytics_table_name)
+            .key("team_id", attr_s(team_id))
+            .key("period", attr_s(period))
+            .update_expression(
+                "ADD total_cost_usd :cost, total_tokens_in :ti, total_tokens_out :to, \
+                 cache_read_tokens :cr, cache_write_tokens :cw, \
+                 reviews :one, review_cost_usd :cost",
+            )
+            .expression_attribute_values(":cost", attr_n(&cost))
+            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+            .expression_attribute_values(":to", attr_n(usage.output_tokens))
+            .expression_attribute_values(":cr", attr_n(usage.cache_read_tokens))
+            .expression_attribute_values(":cw", attr_n(usage.cache_write_tokens))
+            .expression_attribute_values(":one", attr_n(1))
+            .send()
+            .await
+        {
+            warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Failed to add review cost to team usage (non-fatal)");
+        }
+    }
+}
+
 /// The last `max` conversation comments written by people, as `(author, body)`
 /// pairs, oldest first. Bot comments are left out.
 fn human_comments(comments: &[serde_json::Value], max: usize) -> Vec<(String, String)> {
@@ -1535,6 +1614,32 @@ fn settled_prior_threads<'a>(
         .filter(|s| s.is_settled() && s.index < prior.len() && seen.insert(s.index))
         .map(|s| prior[s.index])
         .collect()
+}
+
+#[cfg(test)]
+mod review_usage_tests {
+    use super::*;
+
+    #[test]
+    fn empty_usage_is_not_recorded() {
+        assert!(!has_usage(&TokenUsage::default()));
+        let u = TokenUsage {
+            output_tokens: 1,
+            ..Default::default()
+        };
+        assert!(has_usage(&u));
+    }
+
+    #[test]
+    fn cost_matches_the_run_formula() {
+        let u = TokenUsage {
+            input_tokens: 100_000,
+            output_tokens: 10_000,
+            ..Default::default()
+        };
+        assert_eq!(review_cost_str(&u), format!("{:.4}", u.estimated_cost()));
+        assert!(review_cost_str(&u).parse::<f64>().unwrap() > 0.0);
+    }
 }
 
 #[cfg(test)]
