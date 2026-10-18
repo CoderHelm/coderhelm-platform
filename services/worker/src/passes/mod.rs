@@ -453,6 +453,102 @@ pub(crate) fn openspec_prefix(team_id: &str, ticket_id: &str, owner: &str, repo:
     )
 }
 
+/// Line diff of two ticket texts: unchanged lines prefixed "  ", removed
+/// "- ", added "+ ". Plain LCS over lines; when the texts are too large for
+/// the quadratic table it falls back to the full old and new text.
+pub(crate) fn ticket_text_diff(old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    if a.len().saturating_mul(b.len()) > 4_000_000 {
+        return format!("### Previous ticket\n{old}\n\n### Updated ticket\n{new}");
+    }
+    // lcs[i][j] = LCS length of a[i..] and b[j..]
+    let mut lcs = vec![vec![0u32; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    while i < a.len() || j < b.len() {
+        if i < a.len() && j < b.len() && a[i] == b[j] {
+            out.push(format!("  {}", a[i]));
+            i += 1;
+            j += 1;
+        } else if j < b.len() && (i == a.len() || lcs[i][j + 1] >= lcs[i + 1][j]) {
+            out.push(format!("+ {}", b[j]));
+            j += 1;
+        } else {
+            out.push(format!("- {}", a[i]));
+            i += 1;
+        }
+    }
+    out.join("\n")
+}
+
+/// Render a GitHub compare response as a unified-style diff, bounded to
+/// `max_bytes` (head and tail kept).
+pub(crate) fn format_compare_diff(compare: &serde_json::Value, max_bytes: usize) -> String {
+    let mut out = String::new();
+    for f in compare["files"].as_array().into_iter().flatten() {
+        let name = f["filename"].as_str().unwrap_or("(unknown)");
+        let status = f["status"].as_str().unwrap_or("modified");
+        out.push_str(&format!("--- {name} ({status})\n"));
+        match f["patch"].as_str() {
+            Some(p) => out.push_str(p),
+            None => out.push_str("(no textual patch — binary or too large)"),
+        }
+        out.push_str("\n\n");
+    }
+    if out.len() > max_bytes {
+        common::head_tail_str(&out, max_bytes)
+    } else {
+        out
+    }
+}
+
+/// Instruction given to the implement agent when the ticket changed under an
+/// open PR: update the existing implementation to match, don't start over.
+pub(crate) fn ticket_update_note(
+    pr_number: u64,
+    previous_ticket: Option<&str>,
+    current_ticket: &str,
+    pr_diff: &str,
+) -> String {
+    let ticket_change = match previous_ticket {
+        Some(old) => format!(
+            "### What changed in the ticket (- old, + new)\n```diff\n{}\n```",
+            common::head_tail_str(&ticket_text_diff(old, current_ticket), 16_000)
+        ),
+        None => "### What changed in the ticket\nThe previous ticket text was not saved; \
+                 compare the updated ticket (below, under \"Original issue\") with the \
+                 existing PR diff to see what is different."
+            .to_string(),
+    };
+    let diff_block = if pr_diff.trim().is_empty() {
+        "(the PR diff could not be loaded — read the changed files on this branch)".to_string()
+    } else {
+        format!("```diff\n{pr_diff}\n```")
+    };
+    format!(
+        "\n## TICKET UPDATED — UPDATE THE EXISTING PR #{pr_number}\n\
+         This branch already holds PR #{pr_number}, built from an EARLIER version of the ticket. \
+         The ticket has since changed. Update the existing implementation so it matches the \
+         UPDATED ticket: change what the edit changed, remove what it dropped, add what it added. \
+         Keep the parts that still match. Do NOT start over and do NOT add a second, parallel \
+         implementation next to the existing one.\n\
+         If the branch already satisfies the updated ticket, make no edits and say \
+         \"PR already matches the updated ticket\".\n\n\
+         {ticket_change}\n\n\
+         ### Current PR diff (against the base branch)\n{diff_block}\n"
+    )
+}
+
 /// Persist and unlock agent memory at an early exit. Without this, the
 /// no-changes / clarification / needs_input / blocked-plan returns leaked the
 /// memory lock for its full 15-minute TTL, forcing subsequent runs on the
@@ -1288,7 +1384,7 @@ async fn run_passes(
     let context_hash = plan::compute_ticket_context_hash(msg);
 
     // Try to reuse existing plan from S3 (same ticket, repo, and content)
-    let existing_plan = load_existing_plan(
+    let lookup = load_existing_plan(
         state,
         &msg.team_id,
         &msg.ticket_id,
@@ -1297,19 +1393,22 @@ async fn run_passes(
         &context_hash,
     )
     .await;
-    let mut context_changed = existing_plan.is_none();
+    // The ticket changed ONLY when a stored hash exists and differs. A missing
+    // plan (first run) or a finished plan (no unchecked tasks) is not a ticket
+    // change; treating it as one sent untouched re-runs down the "ticket
+    // updated" path.
+    let context_changed = lookup.hash_changed;
+    let previous_ticket_text = lookup.previous_ticket_text;
     let mut plan_was_reused = false;
-    let mut plan_result = if let Some(plan) = existing_plan {
+    let mut plan_result = if let Some(plan) = lookup.plan {
         // Reuse if plan has content AND has unchecked tasks (not a completed plan from a previous run)
         let has_unchecked = plan.tasks.contains("- [ ]");
         if !plan.tasks.is_empty() && !plan.design.is_empty() && has_unchecked {
-            context_changed = false;
             plan_was_reused = true;
             info!(run_id, "Reusing existing plan from S3 — ticket unchanged");
             add_progress_note(state, &msg.team_id, run_id, "Reused existing plan").await;
             plan
         } else {
-            context_changed = true;
             plan::run(
                 state,
                 msg,
@@ -1944,6 +2043,9 @@ async fn run_passes(
             }
         }
 
+        // Set when the ticket changed under an open PR: this run updates that
+        // PR in place instead of starting over.
+        let mut ticket_update_pr: Option<u64> = None;
         // Track whether to skip branch creation (PR exists, just needs fresh implementation)
         let skip_branch_reset = if pr_lookup_failed {
             // Couldn't confirm PR state — never force-reset (would risk wiping
@@ -1954,25 +2056,50 @@ async fn run_passes(
             );
             true
         } else if context_changed && existing_pr.is_some() {
-            // Context changed (new description, images, etc.) — force reset branch for clean implementation
+            // The ticket changed while a PR is open. A branch with an open PR
+            // is never reset to base (create_branch keeps its head so GitHub
+            // doesn't auto-close the PR), so "resetting" here only pretended:
+            // the agent then found the old work on the branch and made no
+            // edits, or stacked a second implementation. Treat it as what it
+            // is: update the existing PR to match the new ticket.
             let pr_number = existing_pr
                 .as_ref()
                 .and_then(|p| p["number"].as_u64())
                 .unwrap_or(0);
             info!(
                 run_id,
-                pr_number, "Context changed — forcing branch reset for fresh implementation"
+                pr_number, "Ticket changed with an open PR — updating the PR to match"
             );
             add_progress_note(
                 state,
                 &msg.team_id,
                 run_id,
-                &format!(
-                    "Ticket updated — resetting PR #{pr_number} branch for fresh implementation"
-                ),
+                &format!("Ticket updated — updating PR #{pr_number} to match"),
             )
             .await;
-            false
+            let pr_diff = match github
+                .get_diff(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    &msg.base_branch,
+                    &branch_name,
+                )
+                .await
+            {
+                Ok(compare) => format_compare_diff(&compare, 20_000),
+                Err(e) => {
+                    warn!(run_id, error = %e, "Could not load the open PR's diff for the ticket update");
+                    String::new()
+                }
+            };
+            msg.ticket_update_note = Some(ticket_update_note(
+                pr_number,
+                previous_ticket_text.as_deref(),
+                &plan::ticket_text(&msg.title, &msg.body),
+                &pr_diff,
+            ));
+            ticket_update_pr = Some(pr_number);
+            true
         } else {
             existing_pr.as_ref().is_some_and(|pr| {
                 let pr_head = pr["head"]["sha"].as_str().unwrap_or("");
@@ -1982,7 +2109,9 @@ async fn run_passes(
             })
         };
 
-        if skip_branch_reset {
+        if ticket_update_pr.is_some() {
+            // Progress note already posted; the branch keeps the PR's head.
+        } else if skip_branch_reset {
             let pr_number = existing_pr
                 .as_ref()
                 .and_then(|p| p["number"].as_u64())
@@ -2502,6 +2631,9 @@ async fn run_passes(
             false, // initial implement — unscoped
         )
         .await?;
+        // The ticket-update note is for the main implement only; later fix
+        // passes (test/security) must not read "make no edits if it matches".
+        msg.ticket_update_note = None;
         write_pass_trace(
             state,
             &msg.team_id,
@@ -2556,6 +2688,58 @@ async fn run_passes(
         // It used to `return Err`, which routed through fail_run — marking the
         // run failed AND posting a second, generic failure comment on top of
         // the clarification comment.
+        // Ticket update on an open PR where the agent found the branch already
+        // matches the new ticket: that is a finished run, not a request for
+        // more detail. Keep the PR and complete.
+        if let (true, Some(pr_number)) = (result.files_modified.is_empty(), ticket_update_pr) {
+            info!(
+                run_id,
+                pr_number, "Ticket update: PR already matches the updated ticket"
+            );
+            let note = format!("PR #{pr_number} already matches the updated ticket");
+            add_progress_note(state, &msg.team_id, run_id, &note).await;
+            let pr_url = existing_pr
+                .as_ref()
+                .and_then(|p| p["html_url"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let duration = start.elapsed().as_secs();
+            let cost = usage.estimated_cost();
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key("team_id", attr_s(&msg.team_id))
+                .key("run_id", attr_s(run_id))
+                .update_expression(
+                    "SET #status = :s, status_run_id = :sri, pr_number = :pn, pr_url = :pu, \
+                     branch = :b, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, \
+                     cache_write_tokens = :cwt, cost_usd = :c, duration_s = :d, updated_at = :t, \
+                     current_pass = :cp",
+                )
+                .expression_attribute_names("#status", "status")
+                .condition_expression("#status <> :cancelled")
+                .expression_attribute_values(":cancelled", attr_s("cancelled"))
+                .expression_attribute_values(":s", attr_s("completed"))
+                .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
+                .expression_attribute_values(":pn", attr_n(pr_number))
+                .expression_attribute_values(":pu", attr_s(&pr_url))
+                .expression_attribute_values(":b", attr_s(&branch_name))
+                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+                .expression_attribute_values(":to", attr_n(usage.output_tokens))
+                .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+                .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+                .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+                .expression_attribute_values(":d", attr_n(duration))
+                .expression_attribute_values(":t", attr_s(&now))
+                .expression_attribute_values(":cp", attr_s("done"))
+                .send()
+                .await;
+            close_memory(state, agent_memory.take()).await;
+            return Ok(());
+        }
+
         if result.files_modified.is_empty() {
             warn!(run_id, "Implement pass produced zero file changes");
             // The files it went for were in a different repo of the org (one
@@ -5903,8 +6087,33 @@ async fn lookup_jira_project_repo(
         .cloned()
 }
 
+/// Result of looking up the cached plan for a ticket.
+struct PlanLookup {
+    /// The cached plan, when the ticket is unchanged and every file exists.
+    plan: Option<plan::PlanResult>,
+    /// True only when a stored context hash exists AND differs from the
+    /// current ticket's hash: a real ticket edit.
+    hash_changed: bool,
+    /// The ticket text (title + body) the cached plan was built from, when
+    /// the ticket changed and that text was saved.
+    previous_ticket_text: Option<String>,
+}
+
+async fn read_s3_text(state: &WorkerState, key: &str) -> Option<String> {
+    let output = state
+        .s3
+        .get_object()
+        .bucket(&state.config.bucket_name)
+        .key(key)
+        .send()
+        .await
+        .ok()?;
+    let bytes = output.body.collect().await.ok()?;
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
 /// Load an existing plan from S3 if one was already generated for this ticket.
-/// Returns None if no plan exists or any file is missing.
+/// `plan` is None if no plan exists, any file is missing, or the ticket changed.
 async fn load_existing_plan(
     state: &WorkerState,
     team_id: &str,
@@ -5912,28 +6121,34 @@ async fn load_existing_plan(
     repo_owner: &str,
     repo_name: &str,
     context_hash: &str,
-) -> Option<plan::PlanResult> {
+) -> PlanLookup {
     let prefix = openspec_prefix(team_id, ticket_id, repo_owner, repo_name);
 
     // Check if ticket context has changed (body, images, etc.)
     let hash_key = format!("{prefix}/context_hash.txt");
-    if let Ok(output) = state
-        .s3
-        .get_object()
-        .bucket(&state.config.bucket_name)
-        .key(&hash_key)
-        .send()
-        .await
-    {
-        if let Ok(bytes) = output.body.collect().await {
-            let stored_hash = String::from_utf8(bytes.to_vec()).unwrap_or_default();
-            if stored_hash.trim() != context_hash {
-                info!("Ticket context changed (hash mismatch) — forcing re-plan");
-                return None;
-            }
+    if let Some(stored_hash) = read_s3_text(state, &hash_key).await {
+        if stored_hash.trim() != context_hash {
+            info!("Ticket context changed (hash mismatch) — forcing re-plan");
+            let previous_ticket_text =
+                read_s3_text(state, &format!("{prefix}/{}", plan::TICKET_TEXT_FILE))
+                    .await
+                    .filter(|t| !t.trim().is_empty());
+            return PlanLookup {
+                plan: None,
+                hash_changed: true,
+                previous_ticket_text,
+            };
         }
     }
 
+    PlanLookup {
+        plan: load_cached_plan_files(state, &prefix).await,
+        hash_changed: false,
+        previous_ticket_text: None,
+    }
+}
+
+async fn load_cached_plan_files(state: &WorkerState, prefix: &str) -> Option<plan::PlanResult> {
     let mut files = std::collections::HashMap::new();
     for name in &["proposal.md", "design.md", "tasks.md", "spec.md"] {
         let key = format!("{prefix}/{name}");
@@ -6139,5 +6354,56 @@ mod repos_reached_for_tests {
             vec!["acme/tools".to_string()]
         );
         assert!(repos_reached_for(&[], "acme", "api").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ticket_update_tests {
+    use super::{format_compare_diff, ticket_text_diff, ticket_update_note};
+    use serde_json::json;
+
+    #[test]
+    fn diff_marks_removed_added_and_kept_lines() {
+        let old = "# Title\n\nShow the badge in red\nKeep footer";
+        let new = "# Title\n\nShow the badge in green\nKeep footer\nAdd tooltip";
+        let d = ticket_text_diff(old, new);
+        assert!(d.contains("- Show the badge in red"));
+        assert!(d.contains("+ Show the badge in green"));
+        assert!(d.contains("  Keep footer"));
+        assert!(d.contains("+ Add tooltip"));
+        assert!(!d.contains("- Keep footer"));
+    }
+
+    #[test]
+    fn diff_of_identical_texts_has_no_changes() {
+        assert_eq!(ticket_text_diff("a\nb", "a\nb"), "  a\n  b");
+    }
+
+    #[test]
+    fn compare_diff_lists_each_file_and_is_bounded() {
+        let compare = json!({"files": [
+            {"filename": "src/a.rs", "status": "modified", "patch": "@@ -1 +1 @@\n-x\n+y"},
+            {"filename": "img.png", "status": "added"}
+        ]});
+        let d = format_compare_diff(&compare, 10_000);
+        assert!(d.contains("--- src/a.rs (modified)"));
+        assert!(d.contains("+y"));
+        assert!(d.contains("--- img.png (added)"));
+        let big = json!({"files": [{"filename": "f", "patch": "x".repeat(50_000)}]});
+        assert!(format_compare_diff(&big, 1_000).len() <= 1_100);
+    }
+
+    #[test]
+    fn update_note_tells_agent_to_update_existing_pr() {
+        let n = ticket_update_note(42, Some("# T\n\nold line"), "# T\n\nnew line", "+code");
+        assert!(n.contains("UPDATE THE EXISTING PR #42"));
+        assert!(n.contains("- old line"));
+        assert!(n.contains("+ new line"));
+        assert!(n.contains("+code"));
+        assert!(n.contains("PR already matches the updated ticket"));
+        // Missing previous text still yields a usable note.
+        let n = ticket_update_note(7, None, "# T", "");
+        assert!(n.contains("previous ticket text was not saved"));
+        assert!(n.contains("could not be loaded"));
     }
 }

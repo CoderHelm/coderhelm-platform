@@ -230,15 +230,45 @@ async fn evaluate_ci_verdict(
     }
 }
 
+/// The run branch's current head commit, or None when the run record lacks
+/// repo/branch or GitHub can't be reached.
+async fn current_branch_head(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    run_record: &std::collections::HashMap<String, AttributeValue>,
+) -> Option<String> {
+    let repo = run_record.get("repo").and_then(|v| v.as_s().ok())?;
+    let (owner, name) = repo.split_once('/')?;
+    let branch = run_record
+        .get("branch")
+        .and_then(|v| v.as_s().ok())
+        .filter(|b| !b.is_empty())?;
+    let github = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    )
+    .ok()?;
+    match github.get_ref(owner, name, branch).await {
+        Ok(sha) => Some(sha),
+        Err(e) => {
+            warn!(run_id = %msg.run_id, error = %e, "Could not read branch head — CI events filtered by recency only");
+            None
+        }
+    }
+}
+
 /// Record a synthetic `ci_failed` event so a follow-up resume routes the run into
 /// the fix path. Used when GitHub's aggregate says a check failed but no
 /// `ci_failed` webhook event is present yet — a missed webhook, or a straggler
 /// that failed after a `ci_passed` already landed. The empty payload carries no
 /// `workflow_run_id`, so the fix path falls back to check-run annotations for the
 /// failure detail (see the log-collection block in the fix path).
-async fn record_synthetic_ci_failed(state: &WorkerState, run_id: &str) {
+async fn record_synthetic_ci_failed(state: &WorkerState, run_id: &str, head_sha: Option<&str>) {
     let now = chrono::Utc::now();
     let event_sk = format!("EVENT#{}#ci_failed", now.format("%Y%m%dT%H%M%S%.3fZ"));
+    let payload = serde_json::json!({ "head_sha": head_sha.unwrap_or("") });
     if let Err(e) = state
         .dynamo
         .put_item()
@@ -246,9 +276,14 @@ async fn record_synthetic_ci_failed(state: &WorkerState, run_id: &str) {
         .item("pk", attr_s(&format!("RUN#{run_id}")))
         .item("sk", attr_s(&event_sk))
         .item("event_type", attr_s("ci_failed"))
-        .item("payload", attr_s("{}"))
+        .item("payload", attr_s(&payload.to_string()))
         .item("processed", AttributeValue::Bool(false))
         .item("created_at", attr_s(&now.to_rfc3339()))
+        // The events table's TTL attribute (infra database-stack).
+        .item(
+            "expires_at",
+            attr_n((now.timestamp() as u64 + 30 * 86400).to_string()),
+        )
         .send()
         .await
     {
@@ -339,6 +374,127 @@ struct RunEvent {
     sk: String,
     event_type: String,
     payload: Value,
+}
+
+/// Split CI events into (current, stale). A ci_failed/ci_passed event is stale
+/// when it names a head_sha that is no longer the branch head (a newer push
+/// superseded it), or when a later event for the same workflow exists. Events
+/// without a head_sha (written before it was recorded) are judged only by
+/// recency. Non-CI events always stay current. `events` must be in sk order
+/// (oldest first), which is how the events query returns them.
+fn split_stale_ci_events(
+    events: Vec<RunEvent>,
+    branch_head: Option<&str>,
+) -> (Vec<RunEvent>, Vec<RunEvent>) {
+    let is_ci = |e: &RunEvent| e.event_type == "ci_failed" || e.event_type == "ci_passed";
+    let workflow_of = |e: &RunEvent| {
+        e.payload["workflow_name"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    // Index of the newest CI event per workflow.
+    let mut latest: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, e) in events.iter().enumerate() {
+        if is_ci(e) {
+            latest.insert(workflow_of(e), i);
+        }
+    }
+    let mut current = Vec::new();
+    let mut stale = Vec::new();
+    for (i, e) in events.into_iter().enumerate() {
+        if !is_ci(&e) {
+            current.push(e);
+            continue;
+        }
+        let sha = e.payload["head_sha"].as_str().unwrap_or("");
+        let old_commit = match branch_head {
+            Some(head) => !sha.is_empty() && !sha.eq_ignore_ascii_case(head),
+            None => false,
+        };
+        let superseded = latest.get(&workflow_of(&e)) != Some(&i);
+        if old_commit || superseded {
+            stale.push(e);
+        } else {
+            current.push(e);
+        }
+    }
+    (current, stale)
+}
+
+#[cfg(test)]
+mod stale_ci_event_tests {
+    use super::{split_stale_ci_events, RunEvent};
+    use serde_json::json;
+
+    fn ev(sk: &str, kind: &str, payload: serde_json::Value) -> RunEvent {
+        RunEvent {
+            sk: sk.into(),
+            event_type: kind.into(),
+            payload,
+        }
+    }
+
+    fn sks(v: &[RunEvent]) -> Vec<&str> {
+        v.iter().map(|e| e.sk.as_str()).collect()
+    }
+
+    const HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn failure_for_an_older_commit_is_stale() {
+        let events = vec![
+            ev(
+                "1",
+                "ci_failed",
+                json!({"workflow_name": "Test", "head_sha": OLD}),
+            ),
+            ev(
+                "2",
+                "ci_failed",
+                json!({"workflow_name": "Lint", "head_sha": HEAD}),
+            ),
+        ];
+        let (cur, stale) = split_stale_ci_events(events, Some(HEAD));
+        assert_eq!(sks(&cur), vec!["2"]);
+        assert_eq!(sks(&stale), vec!["1"]);
+    }
+
+    #[test]
+    fn only_the_latest_result_per_workflow_counts() {
+        let events = vec![
+            ev("1", "ci_failed", json!({"workflow_name": "Test"})),
+            ev("2", "ci_failed", json!({"workflow_name": "Test"})),
+            ev("3", "ci_passed", json!({"workflow_name": "Lint"})),
+            ev("4", "ci_passed", json!({"workflow_name": "Test"})),
+        ];
+        let (cur, stale) = split_stale_ci_events(events, None);
+        assert_eq!(sks(&cur), vec!["3", "4"]);
+        assert_eq!(sks(&stale), vec!["1", "2"]);
+    }
+
+    #[test]
+    fn events_without_head_sha_and_non_ci_events_are_kept() {
+        let events = vec![
+            ev("1", "pr_comment", json!({"body": "please rename"})),
+            ev("2", "ci_failed", json!({})),
+        ];
+        let (cur, stale) = split_stale_ci_events(events, Some(HEAD));
+        assert_eq!(sks(&cur), vec!["1", "2"]);
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn unknown_head_filters_by_recency_only() {
+        let events = vec![ev(
+            "1",
+            "ci_failed",
+            json!({"workflow_name": "Test", "head_sha": OLD}),
+        )];
+        let (cur, _) = split_stale_ci_events(events, None);
+        assert_eq!(sks(&cur), vec!["1"]);
+    }
 }
 
 /// Resume a run after receiving a webhook event (CI pass/fail, PR comment, etc).
@@ -550,6 +706,20 @@ pub async fn run(
             return Err(e);
         }
     };
+    // The branch head right now: CI results for any older commit are stale and
+    // must not be "fixed" again (that replayed failures a later push had
+    // already fixed). A failed lookup filters by recency only.
+    let branch_head = current_branch_head(state, &msg, &run_record).await;
+    let (events, stale_events) = split_stale_ci_events(events, branch_head.as_deref());
+    if !stale_events.is_empty() {
+        info!(
+            run_id = %msg.run_id,
+            stale = stale_events.len(),
+            head = branch_head.as_deref().unwrap_or(""),
+            "Dropping stale CI events (older commit or superseded by a later result)"
+        );
+        mark_events_processed(state, &msg.run_id, &stale_events).await;
+    }
     if events.is_empty() {
         // No events — webhook may have been missed or repo has no CI.
         // Only check GitHub if we've been in awaiting_ci for >90 seconds,
@@ -651,7 +821,7 @@ pub async fn run(
                     run_id = msg.run_id,
                     "CI failed (missed webhook) — writing event and re-triggering"
                 );
-                record_synthetic_ci_failed(state, &msg.run_id).await;
+                record_synthetic_ci_failed(state, &msg.run_id, branch_head.as_deref()).await;
                 send_delayed_resume(state, &msg, 0).await;
                 return Ok(());
             }
@@ -791,6 +961,7 @@ pub async fn run(
         continuation: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
+        ticket_update_note: None,
     };
 
     let provider = ModelProvider::load_for_team(
@@ -902,6 +1073,9 @@ pub async fn run(
                 run_id = msg.run_id,
                 cycle, "Fix budget reached — completing for human review"
             );
+            // Every terminal path consumes its events; left unprocessed, the
+            // next resume (e.g. after a re-review) replayed these failures.
+            mark_events_processed(state, &msg.run_id, &events).await;
             complete_run_with_status(
                 state,
                 &ticket_msg,
@@ -941,6 +1115,7 @@ pub async fn run(
             // into one clean commit here — no separate squash needed. The churn
             // only ever leaked before because a stall-blind run timed out and
             // never reached this handoff.
+            mark_events_processed(state, &msg.run_id, &events).await;
             mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
             complete_run_with_status(
                 state,
@@ -1041,6 +1216,7 @@ pub async fn run(
                         "CI fix produced no changes — completing with PR for human review"
                     );
                     // Don't hard-fail — complete the run and mark PR ready for human review
+                    mark_events_processed(state, &msg.run_id, &events).await;
                     complete_run_with_status(
                         state,
                         &ticket_msg,
@@ -1059,6 +1235,7 @@ pub async fn run(
             }
             Err(e) => {
                 error!(run_id = msg.run_id, error = %e, "CI fix implementation failed — completing with PR for human review");
+                mark_events_processed(state, &msg.run_id, &events).await;
                 complete_run_with_status(
                     state,
                     &ticket_msg,
@@ -1165,7 +1342,7 @@ pub async fn run(
                     run_id = msg.run_id,
                     "A workflow passed but another check failed — routing to the fix path"
                 );
-                record_synthetic_ci_failed(state, &msg.run_id).await;
+                record_synthetic_ci_failed(state, &msg.run_id, branch_head.as_deref()).await;
                 let still_active = set_run_awaiting_ci(
                     state,
                     &ticket_msg,

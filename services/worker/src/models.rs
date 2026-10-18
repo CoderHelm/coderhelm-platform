@@ -362,6 +362,11 @@ pub struct TicketMessage {
     /// Epoch ms of the first attempt — the wall-clock runaway backstop.
     #[serde(default)]
     pub first_attempt_ms: u64,
+    /// Set in-process when the ticket changed under an open PR: the implement
+    /// agent gets this note (old→new ticket diff + PR diff) and updates the
+    /// existing PR instead of starting over. Never serialized.
+    #[serde(skip)]
+    pub ticket_update_note: Option<String>,
 }
 
 fn default_branch() -> String {
@@ -493,6 +498,7 @@ mod tests {
             continuation: 0,
             continuation_run_id: None,
             first_attempt_ms: 0,
+            ticket_update_note: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();

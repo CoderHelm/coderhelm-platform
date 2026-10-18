@@ -410,6 +410,12 @@ async fn handle_review_comment(
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
 
+/// True when the comment's author is a bot account, read from GitHub's
+/// structured `comment.user.type` field (not the login text).
+fn is_bot_comment(payload: &serde_json::Value) -> bool {
+    payload["comment"]["user"]["type"].as_str() == Some("Bot")
+}
+
 async fn handle_issue_comment(
     state: &AppState,
     payload: &Value,
@@ -418,6 +424,13 @@ async fn handle_issue_comment(
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     if action != "created" {
+        return Ok(StatusCode::OK);
+    }
+
+    // Comments from bot accounts (CI coverage/preview/E2E reports, other apps)
+    // are never instructions. They used to reach the feedback fixer as
+    // review_id 0 and spawn unbudgeted fix cycles.
+    if is_bot_comment(payload) {
         return Ok(StatusCode::OK);
     }
 
@@ -1418,6 +1431,9 @@ async fn handle_workflow_run(
         "repo_name": repo_name,
         "logs_url": logs_url,
         "workflow_run_id": wf["id"].as_u64().unwrap_or(0),
+        // The commit this result is for. The CI fixer ignores a failure whose
+        // head_sha is no longer the branch head (stale: a newer push exists).
+        "head_sha": wf["head_sha"].as_str().unwrap_or(""),
     });
 
     if let Err(e) = state
@@ -2413,7 +2429,10 @@ async fn lookup_run_by_pr(
 ) -> String {
     // First try the repo-index GSI (fast path — works for primary repo)
     let team_repo = format!("{team_id}#{owner}/{name}");
-    let result = state
+    // Limit applies BEFORE the filter, so a single page only examined the
+    // repo's newest 50 runs and dropped events for older PRs. Follow
+    // LastEvaluatedKey until a match or the end.
+    let primary = state
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
@@ -2423,24 +2442,15 @@ async fn lookup_run_by_pr(
         .expression_attribute_values(":tr", attr_s(&team_repo))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .scan_index_forward(false)
-        // Limit applies BEFORE the filter — limit(1) only ever examined the
-        // repo's newest run, dropping feedback/merge events for older PRs.
-        .limit(50)
-        .send()
-        .await;
-
-    if let Ok(r) = &result {
-        if let Some(run_id) = r
-            .items()
-            .first()
-            .and_then(|item| item.get("run_id").and_then(|v| v.as_s().ok()).cloned())
-        {
-            return run_id;
-        }
+        .limit(50);
+    match common::paged::query_first_match(primary, common::paged::run_id_of).await {
+        Ok(Some(run_id)) => return run_id,
+        Ok(None) => {}
+        Err(e) => error!("Failed to query run by PR number: {e}"),
     }
 
     // Fallback: multi-repo runs store secondary PRs in pr_numbers list.
-    // Query the team partition and check the list attribute.
+    // Query the team partition and check the list attribute, every page.
     let fallback = state
         .dynamo
         .query()
@@ -2450,16 +2460,9 @@ async fn lookup_run_by_pr(
         .expression_attribute_values(":tid", attr_s(team_id))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .scan_index_forward(false)
-        .limit(5)
-        .send()
-        .await;
-
-    match fallback {
-        Ok(r) => r
-            .items()
-            .first()
-            .and_then(|item| item.get("run_id").and_then(|v| v.as_s().ok()).cloned())
-            .unwrap_or_default(),
+        .limit(100);
+    match common::paged::query_first_match(fallback, common::paged::run_id_of).await {
+        Ok(found) => found.unwrap_or_default(),
         Err(e) => {
             error!("Failed to query run by PR number (fallback): {e}");
             String::new()
@@ -2612,6 +2615,24 @@ mod review_delay_tests {
         }
         // Within SQS's 900s per-message cap.
         assert!((1..=900).contains(&REVIEW_PUSH_SETTLE_SECS));
+    }
+}
+
+#[cfg(test)]
+mod bot_comment_tests {
+    use super::is_bot_comment;
+    use serde_json::json;
+
+    #[test]
+    fn bot_accounts_are_detected_by_user_type() {
+        let ci = json!({"comment": {"user": {"login": "github-actions[bot]", "type": "Bot"}}});
+        assert!(is_bot_comment(&ci));
+        let person = json!({"comment": {"user": {"login": "some-dev", "type": "User"}}});
+        assert!(!is_bot_comment(&person));
+        // A person whose login merely ends in "bot" is still a person.
+        let named = json!({"comment": {"user": {"login": "robot-fan", "type": "User"}}});
+        assert!(!is_bot_comment(&named));
+        assert!(!is_bot_comment(&json!({})));
     }
 }
 

@@ -112,6 +112,8 @@ pub async fn run(
     // the CI result with no consumer (and a salvaged draft PR stuck in
     // draft forever).
     let mut conflicts_pushed = false;
+    // The run's status as this feedback cycle found it; decides who owns CI.
+    let mut run_status = String::new();
 
     // Resolve merge conflicts before processing feedback (especially on re-review)
     {
@@ -132,6 +134,11 @@ pub async fn run(
             .ok()
             .and_then(|r| r.item);
         if let Some(ref item) = run_record {
+            run_status = item
+                .get("status")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_default();
             let branch = item
                 .get("branch")
                 .and_then(|v| v.as_s().ok())
@@ -160,6 +167,7 @@ pub async fn run(
                     continuation: 0,
                     continuation_run_id: None,
                     first_attempt_ms: 0,
+                    ticket_update_note: None,
                 };
                 match super::pr::resolve_conflicts(
                     state,
@@ -216,8 +224,15 @@ pub async fn run(
     // Filter out comments the bot already replied to
     let comments = filter_unanswered(&github, &msg, comments).await;
 
-    // On re-review (review_id == 0), check CI status and include failures in the prompt
-    let ci_failure_block = if msg.review_id == 0 {
+    // On re-review (review_id == 0), check CI status and include failures in the prompt.
+    // Not while the run is awaiting_ci/running: resume owns CI then (it has the
+    // CI budget, stall detection and scope guard), and a second fixer here
+    // raced it on the same failures.
+    let resume_owns_ci = resume_owns_ci(&run_status);
+    if resume_owns_ci && msg.review_id == 0 {
+        info!(run_id = %msg.run_id, status = %run_status, "Run is awaiting CI / running — resume owns CI, not attaching CI failures");
+    }
+    let mut ci_failure_block = if msg.review_id == 0 && !resume_owns_ci {
         let branch = get_pr_branch(state, &msg).await.unwrap_or_default();
         match fetch_ci_failures(&github, &msg, &branch).await {
             Some(logs) => format!(
@@ -230,7 +245,26 @@ pub async fn run(
         String::new()
     };
 
+    // CI fixing riding along with a human comment is still an automated fix:
+    // it draws from the same per-run auto-fix budget as CI-only cycles (claimed
+    // below). Out of budget → answer the human, leave CI to a person.
+    let ci_only_cycle = comments.is_empty() && msg.review_body.trim().is_empty();
+    if !ci_failure_block.is_empty()
+        && !ci_only_cycle
+        && !super::claim_auto_fix_slot(state, &msg.team_id, &msg.run_id).await
+    {
+        info!(run_id = %msg.run_id, "Auto-fix budget spent — answering feedback without the CI fix");
+        ci_failure_block.clear();
+    }
+
     let has_ci_failures = !ci_failure_block.is_empty();
+
+    if comments.is_empty() && msg.review_body.is_empty() && !has_ci_failures && resume_owns_ci {
+        // Nothing for feedback to answer, and resume is mid-cycle on CI: leave
+        // the run's status and the PR's draft state to resume.
+        info!(run_id = %msg.run_id, "All comments already answered; resume owns CI — skipping feedback");
+        return Ok(());
+    }
 
     if comments.is_empty() && msg.review_body.is_empty() && !has_ci_failures {
         info!(run_id = %msg.run_id, "All comments already answered and CI green — skipping feedback");
@@ -1787,6 +1821,7 @@ async fn handle_wrong_repo(
         continuation: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
+        ticket_update_note: None,
     });
 
     if state.config.ticket_queue_url.is_empty() {
@@ -1846,6 +1881,12 @@ async fn handle_wrong_repo(
     );
 
     Ok(())
+}
+
+/// While a run is awaiting CI or running, the resume flow owns CI fixing
+/// (budget, stall detection, scope guard); feedback must not fix CI too.
+fn resume_owns_ci(run_status: &str) -> bool {
+    matches!(run_status, "awaiting_ci" | "running")
 }
 
 /// Check CI status for a PR branch. Returns Some(logs) if there are failures, None if CI is green or absent.
@@ -2212,4 +2253,18 @@ async fn ensure_pr_open(
     }
 
     true
+}
+
+#[cfg(test)]
+mod resume_owns_ci_tests {
+    use super::resume_owns_ci;
+
+    #[test]
+    fn only_active_runs_own_ci() {
+        assert!(resume_owns_ci("awaiting_ci"));
+        assert!(resume_owns_ci("running"));
+        for s in ["completed", "failed", "needs_input", "cancelled", ""] {
+            assert!(!resume_owns_ci(s), "{s}");
+        }
+    }
 }

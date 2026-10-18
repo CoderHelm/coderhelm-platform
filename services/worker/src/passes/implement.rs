@@ -103,7 +103,11 @@ pub async fn run(
     // A continuation resumes a run whose prior attempt already committed partial
     // work to this branch. Tell the agent so it finishes rather than restarting
     // (the snapshot reflects the branch, so the partial code is already visible).
-    let continuation_note = if msg.continuation > 0 {
+    // A ticket update on an open PR uses the same slot: the branch already
+    // holds work, and the agent must change it to match the new ticket.
+    let continuation_note = if let Some(note) = msg.ticket_update_note.as_deref() {
+        note
+    } else if msg.continuation > 0 {
         "\n## CONTINUATION — a PRIOR attempt already committed partial work to THIS branch. \
          Do NOT start over. Read the files you intend to touch to see what is already done, then \
          complete ONLY the remaining work. Reuse existing correct code; never rewrite or restore it. \
@@ -578,8 +582,10 @@ Go DIRECTLY to the target files listed in the OpenSpec.
                                 aws_sdk_dynamodb::types::AttributeValue::Bool(true),
                             )
                             .item("timestamp", aws_sdk_dynamodb::types::AttributeValue::S(now))
+                            // The events table's TTL attribute is `expires_at`
+                            // (infra database-stack); `ttl` never expired.
                             .item(
-                                "ttl",
+                                "expires_at",
                                 aws_sdk_dynamodb::types::AttributeValue::N(
                                     (chrono::Utc::now().timestamp() as u64 + 30 * 86400)
                                         .to_string(),

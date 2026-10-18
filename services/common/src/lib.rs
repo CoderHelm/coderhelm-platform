@@ -18,6 +18,8 @@ pub mod alert_notify;
 pub mod e2e;
 pub mod live;
 pub mod memory_meta;
+/// Paginated DynamoDB lookups (follow LastEvaluatedKey to a match).
+pub mod paged;
 /// What happened to a PR Coderhelm opened, read from GitHub.
 pub mod pr_outcome;
 // review_stats: time-ordered review records for analytics
@@ -78,16 +80,27 @@ pub fn content_hash(text: &str) -> String {
 /// MUST agree on the value, which is why this lives in a shared crate and
 /// uses SHA-256 rather than std's DefaultHasher (whose output is not
 /// guaranteed stable across Rust releases or compilations).
+///
+/// Title and body are whitespace-normalised first (every run of whitespace
+/// collapses to one space, ends trimmed), so an editor re-saving a ticket
+/// with different line endings, trailing spaces or re-wrapped lines does not
+/// count as a ticket change and re-run the whole pipeline.
 pub fn ticket_context_hash(title: &str, body: &str, image_keys: &[String]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(title.as_bytes());
+    hasher.update(collapse_whitespace(title).as_bytes());
     hasher.update([0u8]);
-    hasher.update(body.as_bytes());
+    hasher.update(collapse_whitespace(body).as_bytes());
     for key in image_keys {
         hasher.update([0u8]);
         hasher.update(key.as_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Collapse every run of whitespace (spaces, tabs, CR/LF) to a single space
+/// and trim both ends. Deterministic and purely lexical.
+pub fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Truncate to at most `max_bytes`, never splitting a UTF-8 codepoint.
@@ -283,6 +296,20 @@ mod tests {
             parse_verdict("The code looks fine to me!", "LGTM", "ISSUES_FOUND"),
             Verdict::Fail
         );
+    }
+
+    #[test]
+    fn ticket_context_hash_ignores_whitespace_only_edits() {
+        let a = ticket_context_hash("Fix  login", "Line one\nline two", &[]);
+        assert_eq!(
+            a,
+            ticket_context_hash(" Fix login ", "Line one \r\n\n  line two\n", &[])
+        );
+        assert_ne!(
+            a,
+            ticket_context_hash("Fix login", "Line one line three", &[])
+        );
+        assert_eq!(collapse_whitespace("  a\t b\n\nc  "), "a b c");
     }
 
     #[test]

@@ -757,6 +757,11 @@ impl GitHubClient {
         repo: &str,
         branch: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // Callers (reviewers, snapshot) also pass a full commit SHA. It is
+        // already the answer; `git/ref/heads/<sha>` is always a 404.
+        if is_commit_sha(branch) {
+            return Ok(branch.to_ascii_lowercase());
+        }
         let url = format!("{API_BASE}/repos/{owner}/{repo}/git/ref/heads/{branch}");
         let data = self.get(&url).await?;
         let sha = data
@@ -2629,6 +2634,38 @@ pub struct BotReviewThread {
     pub resolved: bool,
     /// A person (not CoderHelm) resolved the thread.
     pub resolved_by_person: bool,
+}
+
+/// A full 40-character hex commit SHA (as opposed to a branch name).
+pub(crate) fn is_commit_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod commit_sha_tests {
+    use super::is_commit_sha;
+
+    #[test]
+    fn full_hex_sha_is_a_commit_not_a_branch() {
+        assert!(is_commit_sha("0123456789abcdef0123456789abcdef01234567"));
+        assert!(is_commit_sha("0123456789ABCDEF0123456789ABCDEF01234567"));
+        assert!(!is_commit_sha("main"));
+        assert!(!is_commit_sha("coderhelm/fix-login"));
+        assert!(!is_commit_sha("0123456789abcdef")); // short SHA: let GitHub resolve
+        assert!(!is_commit_sha("g123456789abcdef0123456789abcdef01234567"));
+    }
+
+    #[tokio::test]
+    async fn get_ref_returns_a_sha_without_calling_github() {
+        // No network and no credentials: if get_ref tried the refs API this
+        // would error. A SHA is already resolved.
+        let client = super::GitHubClient::new("1", "", 0, &reqwest::Client::new()).unwrap();
+        let sha = "ABCDEF0123456789abcdef0123456789abcdef01";
+        assert_eq!(
+            client.get_ref("o", "r", sha).await.unwrap(),
+            sha.to_ascii_lowercase()
+        );
+    }
 }
 
 #[cfg(test)]

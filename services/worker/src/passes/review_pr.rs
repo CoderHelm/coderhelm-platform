@@ -1352,7 +1352,8 @@ async fn lookup_run_by_pr(
     pr_number: u64,
 ) -> Option<String> {
     let team_repo = format!("{team_id}#{owner}/{name}");
-    let result = state
+    // Limit applies before the filter: page through until a match or the end.
+    let query = state
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
@@ -1362,14 +1363,11 @@ async fn lookup_run_by_pr(
         .expression_attribute_values(":tr", attr_s(&team_repo))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .scan_index_forward(false)
-        .limit(50)
-        .send()
+        .limit(50);
+    common::paged::query_first_match(query, common::paged::run_id_of)
         .await
-        .ok()?;
-    result
-        .items()
-        .iter()
-        .find_map(|it| it.get("run_id").and_then(|v| v.as_s().ok()).cloned())
+        .ok()
+        .flatten()
 }
 
 /// CoderHelm's most recent review of a PR.
