@@ -384,8 +384,18 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         full_system.push_str(&l.prompt_section());
     }
     // The team's own written skills, read-only guidance.
-    let skills =
-        super::skills::TeamSkills::load(state, &msg.team_id, super::skills::Reader::Coder).await;
+    let skills = super::skills::TeamSkills::load(
+        state,
+        &msg.team_id,
+        super::skills::Reader::Coder,
+        super::skills::ticket_origin(
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.ticket_id,
+            msg.issue_number,
+        ),
+    )
+    .await;
     if let Some(s) = &skills {
         tools.extend(s.tools());
         full_system.push_str(&s.prompt_section());

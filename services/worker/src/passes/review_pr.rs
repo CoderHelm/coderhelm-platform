@@ -354,9 +354,13 @@ pub async fn run(
             Some(l) => format!("{system}{}", l.prompt_section()),
             None => system,
         };
-        let skills =
-            super::skills::TeamSkills::load(state, &msg.team_id, super::skills::Reader::Reviewer)
-                .await;
+        let skills = super::skills::TeamSkills::load(
+            state,
+            &msg.team_id,
+            super::skills::Reader::Reviewer,
+            format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
+        )
+        .await;
         let system = match &skills {
             Some(s) => format!("{system}{}", s.prompt_section()),
             None => system,
@@ -627,8 +631,13 @@ pub async fn run(
         msg.pr_number,
     )
     .await;
-    let skills =
-        super::skills::TeamSkills::load(state, &msg.team_id, super::skills::Reader::Reviewer).await;
+    let skills = super::skills::TeamSkills::load(
+        state,
+        &msg.team_id,
+        super::skills::Reader::Reviewer,
+        format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
+    )
+    .await;
 
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(

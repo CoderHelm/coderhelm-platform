@@ -227,6 +227,12 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("Skill sync failed: {e:?}");
                 }
             }
+            models::WorkerMessage::SkillAsk(msg) => {
+                info!(team_id = %msg.team_id, repo = %msg.repo, agent = %msg.path, "Admin trying a team agent");
+                if let Err(e) = passes::skills::try_ask(&state, msg).await {
+                    error!("Team agent try failed: {e:?}");
+                }
+            }
             models::WorkerMessage::HealthCheck(msg) => {
                 info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Post-merge health check");
                 if let Err(e) = passes::health_check::run(&state, msg).await {

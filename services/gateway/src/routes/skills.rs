@@ -6,13 +6,20 @@
 //! it, and every 20 minutes when it moved. Everyone on the team can see the
 //! items; only admins connect, disconnect, sync or switch them. Reading and
 //! limits live in `common::skills`. Nothing from a repository is ever run.
+//!
+//! An agent's page shows the questions Coderhelm's agents put to it and the
+//! answers, and lets an admin try it with a question of their own. A try runs
+//! in the worker exactly as an agent's ask does: no tools, one turn.
 
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     Extension, Json,
 };
-use common::skills::{valid_repo, SkillStore, SkillSyncMessage, MAX_REPOS};
+use common::skills::{
+    new_ask_id, valid_repo, AgentAsk, Kind, SkillAskMessage, SkillStore, SkillSyncMessage,
+    MAX_REPOS,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -263,4 +270,245 @@ pub async fn set_enabled(
     }
     info!(team_id = %claims.team_id, repo, path, enabled = on, "Skill switched");
     Ok(Json(json!({ "ok": true, "enabled": on })))
+}
+
+/// Tries one agent may take in a day, so the try box can't run up a bill.
+const TRIES_PER_DAY: usize = 20;
+const TRY_QUESTION_CHARS: usize = 8_000;
+const TRY_CONTEXT_CHARS: usize = 16_000;
+
+fn repo_and_path(
+    q: &HashMap<String, String>,
+) -> Result<(String, String), (StatusCode, Json<Value>)> {
+    let repo = q.get("repo").map(String::as_str).unwrap_or("");
+    let path = q.get("path").map(String::as_str).unwrap_or("");
+    if !valid_repo(repo) || path.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "Give a repo and a path."));
+    }
+    Ok((repo.to_string(), path.to_string()))
+}
+
+/// GET /api/skills/asks?repo=&path=[&id=] — an agent's recent asks, newest
+/// first, or the one `id` names (the page waits on a try with it).
+pub async fn asks(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Reply {
+    let (repo, path) = repo_and_path(&q)?;
+    let st = store(&state, &claims);
+    if let Some(id) = q.get("id") {
+        let Some(a) = st
+            .ask(&repo, &path, id)
+            .await
+            .map_err(|e| internal("get agent ask", e))?
+        else {
+            return Err(fail(StatusCode::NOT_FOUND, "No such ask."));
+        };
+        return Ok(Json(a.json()));
+    }
+    let list = st
+        .asks(&repo, &path, 30)
+        .await
+        .map_err(|e| internal("list agent asks", e))?;
+    Ok(Json(json!({
+        "asks": list.iter().map(|a| a.json()).collect::<Vec<_>>(),
+        "tries_per_day": TRIES_PER_DAY,
+    })))
+}
+
+/// Whether an ask was an admin's try made in the last day.
+fn try_today(a: &AgentAsk, now: chrono::DateTime<chrono::Utc>) -> bool {
+    a.by.ends_with("(try)")
+        && chrono::DateTime::parse_from_rfc3339(&a.at)
+            .map(|at| now.signed_duration_since(at) < chrono::Duration::days(1))
+            .unwrap_or(false)
+}
+
+/// Whether a try is still waiting for its answer. An answer takes at most two
+/// minutes, so one pending longer than five was lost and doesn't block.
+fn waiting(a: &AgentAsk, now: chrono::DateTime<chrono::Utc>) -> bool {
+    a.outcome == "pending"
+        && chrono::DateTime::parse_from_rfc3339(&a.at)
+            .map(|at| now.signed_duration_since(at) < chrono::Duration::minutes(5))
+            .unwrap_or(false)
+}
+
+/// POST /api/skills/asks `{repo, path, question, context?}` — an admin tries
+/// a switched-on agent. Returns the ask's id; the answer lands on it.
+pub async fn try_agent(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Reply {
+    admin(&claims)?;
+    let repo = body["repo"].as_str().unwrap_or("").to_string();
+    let path = body["path"].as_str().unwrap_or("").to_string();
+    if !valid_repo(&repo) || path.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "Give a repo and a path."));
+    }
+    let question = body["question"].as_str().unwrap_or("").trim().to_string();
+    if question.is_empty() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "Write a question for the agent.",
+        ));
+    }
+    if question.len() > TRY_QUESTION_CHARS {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "That question is too long. Keep it under 8,000 characters.",
+        ));
+    }
+    let context = body["context"].as_str().unwrap_or("").trim().to_string();
+    if context.len() > TRY_CONTEXT_CHARS {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "That context is too long. Keep it under 16,000 characters.",
+        ));
+    }
+    let st = store(&state, &claims);
+    match st
+        .item(&repo, &path)
+        .await
+        .map_err(|e| internal("get skill", e))?
+    {
+        Some((m, _)) if m.kind != Kind::Agent => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "Only agents can be asked a question.",
+            ))
+        }
+        Some((m, _)) if !m.enabled => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "Switch this agent on to try it.",
+            ))
+        }
+        Some(_) => {}
+        None => return Err(fail(StatusCode::NOT_FOUND, "No such agent.")),
+    }
+    if st
+        .repo(&repo)
+        .await
+        .map_err(|e| internal("get skill repo", e))?
+        .is_none()
+    {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "That repository isn't connected.",
+        ));
+    }
+    let recent = st
+        .asks(&repo, &path, 50)
+        .await
+        .map_err(|e| internal("list agent asks", e))?;
+    let now = chrono::Utc::now();
+    if recent.iter().any(|a| waiting(a, now)) {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "A try is still waiting for its answer.",
+        ));
+    }
+    if recent.iter().filter(|a| try_today(a, now)).count() >= TRIES_PER_DAY {
+        return Err(fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            "This agent has been tried 20 times today. Try again tomorrow.",
+        ));
+    }
+    let ask = AgentAsk {
+        id: new_ask_id(),
+        repo: repo.clone(),
+        path: path.clone(),
+        by: format!("{} (try)", claims.email),
+        question: question.clone(),
+        context_chars: context.len() as i64,
+        outcome: "pending".into(),
+        ..Default::default()
+    };
+    st.put_ask(&ask)
+        .await
+        .map_err(|e| internal("save agent try", e))?;
+    let message = WorkerMessage::SkillAsk(SkillAskMessage {
+        team_id: claims.team_id.clone(),
+        repo,
+        path,
+        id: ask.id.clone(),
+        question,
+        context,
+    });
+    if crate::routes::github_webhook::send_to_queue(
+        &state,
+        &state.config.ticket_queue_url,
+        &message,
+    )
+    .await
+    .is_err()
+    {
+        let failed = AgentAsk {
+            outcome: "failed".into(),
+            answer: "Couldn't reach the agent. Try again.".into(),
+            ..ask
+        };
+        let _ = st.put_ask(&failed).await;
+        return Err(fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't reach the agent. Try again.",
+        ));
+    }
+    info!(team_id = %claims.team_id, agent = %ask.path, "Agent try queued");
+    Ok(Json(json!({ "id": ask.id })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ask(by: &str, hours_ago: i64) -> AgentAsk {
+        AgentAsk {
+            by: by.into(),
+            at: (chrono::Utc::now() - chrono::Duration::hours(hours_ago)).to_rfc3339(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_an_admins_tries_in_the_last_day_count() {
+        let now = chrono::Utc::now();
+        assert!(try_today(&ask("a@b.co (try)", 2), now));
+        assert!(
+            !try_today(&ask("a@b.co (try)", 25), now),
+            "older than a day"
+        );
+        assert!(
+            !try_today(&ask("reviewer", 1), now),
+            "an agent's ask isn't a try"
+        );
+        assert!(!try_today(
+            &AgentAsk {
+                by: "a@b.co (try)".into(),
+                ..Default::default()
+            },
+            now
+        ));
+    }
+
+    #[test]
+    fn a_lost_try_stops_blocking_after_five_minutes() {
+        let now = chrono::Utc::now();
+        let pending = |minutes: i64| AgentAsk {
+            outcome: "pending".into(),
+            at: (now - chrono::Duration::minutes(minutes)).to_rfc3339(),
+            ..Default::default()
+        };
+        assert!(waiting(&pending(1), now));
+        assert!(!waiting(&pending(6), now));
+        assert!(!waiting(
+            &AgentAsk {
+                outcome: "answered".into(),
+                ..pending(1)
+            },
+            now
+        ));
+    }
 }

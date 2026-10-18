@@ -165,6 +165,7 @@ pub enum WorkerMessage {
     /// Read a connected skill repository's default branch again.
     #[serde(rename = "skill_sync")]
     SkillSync(common::skills::SkillSyncMessage),
+    SkillAsk(common::skills::SkillAskMessage),
 }
 
 /// A code-graph index job. `changed_files: None` ⇒ full index; `Some(paths)` ⇒
