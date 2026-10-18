@@ -519,6 +519,12 @@ pub struct SkillMeta {
     pub last_used_at: String,
     pub last_used_by: String,
     pub updated_at: String,
+    /// Questions Coderhelm's agents put to it (an admin's tries not counted).
+    pub asks: i64,
+    pub last_asked_at: String,
+    /// Who last flipped its switch, and when. Empty if never.
+    pub switched_by: String,
+    pub switched_at: String,
 }
 
 impl SkillMeta {
@@ -548,6 +554,10 @@ impl SkillMeta {
             last_used_at: s(i, "last_used_at"),
             last_used_by: s(i, "last_used_by"),
             updated_at: s(i, "updated_at"),
+            asks: n(i, "asks"),
+            last_asked_at: s(i, "last_asked_at"),
+            switched_by: s(i, "switched_by"),
+            switched_at: s(i, "switched_at"),
         })
         .filter(|m| !rest.is_empty() && !m.repo.is_empty() && !m.path.is_empty())
     }
@@ -559,6 +569,8 @@ impl SkillMeta {
             "hash": self.hash, "enabled": self.enabled, "files": self.files,
             "uses": self.uses, "last_used_at": self.last_used_at,
             "last_used_by": self.last_used_by, "updated_at": self.updated_at,
+            "asks": self.asks, "last_asked_at": self.last_asked_at,
+            "switched_by": self.switched_by, "switched_at": self.switched_at,
         })
     }
 }
@@ -574,6 +586,10 @@ pub struct AgentAsk {
     pub by: String,
     /// The work it was asked during, e.g. "owner/name#12". Empty for a try.
     pub origin: String,
+    /// The run it was asked during, for a link to its page. Empty if none.
+    pub run_id: String,
+    /// The commit of the agent's file that answered.
+    pub sha: String,
     pub question: String,
     pub context_chars: i64,
     /// "pending", "answered", "failed" or "timed_out".
@@ -596,6 +612,8 @@ impl AgentAsk {
             path: s(i, "path"),
             by: s(i, "by"),
             origin: s(i, "origin"),
+            run_id: s(i, "run_id"),
+            sha: s(i, "sha"),
             question: s(i, "question"),
             context_chars: n(i, "context_chars"),
             outcome: s(i, "outcome"),
@@ -610,13 +628,50 @@ impl AgentAsk {
 
     pub fn json(&self) -> Value {
         json!({
-            "id": self.id, "by": self.by, "origin": self.origin,
+            "id": self.id, "repo": self.repo, "path": self.path,
+            "by": self.by, "origin": self.origin,
+            "run_id": self.run_id, "sha": self.sha,
             "question": self.question, "context_chars": self.context_chars,
             "outcome": self.outcome, "answer": self.answer, "model": self.model,
             "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
             "ms": self.ms, "at": self.at,
         })
     }
+}
+
+/// How much of an agent's file it is given as instructions.
+pub const AGENT_BRIEF_CHARS: usize = 24_000;
+
+/// The instructions a team agent answers under, and its `model:` hint. Only
+/// the text after the front matter is used: the file's `tools:`, `model:` and
+/// any other settings never reach the model as instructions. The Skills page
+/// shows this exact text, so what an admin sees is what the agent gets.
+pub fn agent_system_prompt(brief: &str, asker: &str) -> (Option<String>, String) {
+    let (_, _, body) = parse_front_matter(brief);
+    let hint = front_matter_value(brief, "model").map(|v| v.to_ascii_lowercase());
+    let system = format!(
+        "You are one of this team's own agents, asked a question by Coderhelm's {}. Answer from \
+         your brief below and the question and context you're given. You have no tools: you \
+         can't read files, run commands or look anything up, so if you'd need something you \
+         weren't given, say what. Keep the answer focused, under about 600 words.\n\n\
+         ## Your brief\n{}",
+        asker,
+        crate::truncate_str(&body, AGENT_BRIEF_CHARS)
+    );
+    (hint, system)
+}
+
+/// One `key: value` from a file's front matter, unquoted. `None` when the
+/// file has no front matter or the key is missing or empty.
+pub fn front_matter_value(text: &str, key: &str) -> Option<String> {
+    let rest = text.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    rest[..end].lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        (k.trim() == key)
+            .then(|| v.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 /// A new ask id. ULIDs sort by time, so the newest asks come first.
@@ -784,7 +839,11 @@ impl SkillStore<'_> {
             .await
             .map_err(|e| format!("skill store index: {e}"))?;
         self.delete_key(&format!("{REPO}{repo}")).await?;
-        for prefix in [format!("{SKILL}{repo}#"), format!("{FILE}{repo}#")] {
+        for prefix in [
+            format!("{SKILL}{repo}#"),
+            format!("{FILE}{repo}#"),
+            format!("{ASK}{repo}#"),
+        ] {
             for i in self.query(&prefix, Some("sk")).await? {
                 self.delete_key(&s(&i, "sk")).await?;
             }
@@ -799,7 +858,8 @@ impl SkillStore<'_> {
                 SKILL,
                 Some(
                     "sk, repo, #p, kind, #n, description, sha, #h, enabled, files, uses, \
-                     last_used_at, last_used_by, updated_at",
+                     last_used_at, last_used_by, updated_at, asks, last_asked_at, \
+                     switched_by, switched_at",
                 ),
             )
             .await?
@@ -832,16 +892,24 @@ impl SkillStore<'_> {
             .map(|i| s(&i, "body")))
     }
 
-    pub async fn set_enabled(&self, repo: &str, path: &str, on: bool) -> Result<bool, String> {
+    pub async fn set_enabled(
+        &self,
+        repo: &str,
+        path: &str,
+        on: bool,
+        by: &str,
+    ) -> Result<bool, String> {
         let r = self
             .dynamo
             .update_item()
             .table_name(self.table)
             .key("pk", av(self.team))
             .key("sk", av(&format!("{SKILL}{repo}#{path}")))
-            .update_expression("SET enabled = :on")
+            .update_expression("SET enabled = :on, switched_by = :by, switched_at = :at")
             .condition_expression("attribute_exists(sk)")
             .expression_attribute_values(":on", AttributeValue::Bool(on))
+            .expression_attribute_values(":by", av(by))
+            .expression_attribute_values(":at", av(&now()))
             .send()
             .await;
         match r {
@@ -854,6 +922,23 @@ impl SkillStore<'_> {
             }
             Err(e) => Err(format!("skill store switch: {e}")),
         }
+    }
+
+    /// Counts one question Coderhelm's agents put to an agent.
+    pub async fn count_ask(&self, repo: &str, path: &str) -> Result<(), String> {
+        self.dynamo
+            .update_item()
+            .table_name(self.table)
+            .key("pk", av(self.team))
+            .key("sk", av(&format!("{SKILL}{repo}#{path}")))
+            .update_expression("ADD asks :one SET last_asked_at = :at")
+            .condition_expression("attribute_exists(sk)")
+            .expression_attribute_values(":one", AttributeValue::N("1".into()))
+            .expression_attribute_values(":at", av(&now()))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("skill store ask count: {e}"))
     }
 
     /// Counts one read by an agent, so admins see which items are used.
@@ -892,6 +977,8 @@ impl SkillStore<'_> {
             .item("path", av(&a.path))
             .item("by", av(&a.by))
             .item("origin", av(&a.origin))
+            .item("run_id", av(&a.run_id))
+            .item("sha", av(&a.sha))
             .item(
                 "question",
                 av(crate::truncate_str(&a.question, ASK_KEEP_QUESTION_CHARS)),
@@ -941,6 +1028,35 @@ impl SkillStore<'_> {
             .await
             .map_err(|e| format!("skill store asks: {e}"))?;
         Ok(r.items().iter().filter_map(AgentAsk::from_item).collect())
+    }
+
+    /// Every ask made during one run, oldest first, for the run's page. Asks
+    /// expire after 30 days, so this reads a bounded set.
+    pub async fn asks_for_run(&self, run_id: &str) -> Result<Vec<AgentAsk>, String> {
+        let mut out = Vec::new();
+        let mut start = None;
+        loop {
+            let r = self
+                .dynamo
+                .query()
+                .table_name(self.table)
+                .key_condition_expression("pk = :p AND begins_with(sk, :s)")
+                .filter_expression("run_id = :r")
+                .expression_attribute_values(":p", av(self.team))
+                .expression_attribute_values(":s", av(ASK))
+                .expression_attribute_values(":r", av(run_id))
+                .set_exclusive_start_key(start)
+                .send()
+                .await
+                .map_err(|e| format!("skill store run asks: {e}"))?;
+            out.extend(r.items().iter().filter_map(AgentAsk::from_item));
+            start = r.last_evaluated_key().cloned();
+            if start.is_none() {
+                break;
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
     }
 
     /// Records a failed sync without touching what was read before.
@@ -1326,7 +1442,26 @@ mod tests {
             last_used_at: String::new(),
             last_used_by: String::new(),
             updated_at: String::new(),
+            asks: 0,
+            last_asked_at: String::new(),
+            switched_by: String::new(),
+            switched_at: String::new(),
         }
+    }
+
+    #[test]
+    fn the_prompt_an_agent_gets_leaves_its_settings_out() {
+        let brief = "---\nname: x\ntools: Bash, Write\nmodel: \"Opus\"\n---\nCheck the spec.\n";
+        let (hint, system) = agent_system_prompt(brief, "reviewer");
+        assert_eq!(hint.as_deref(), Some("opus"));
+        assert!(system.contains("Coderhelm's reviewer"));
+        assert!(system.ends_with("## Your brief\nCheck the spec.\n"));
+        assert!(!system.contains("tools: Bash"));
+        assert_eq!(
+            front_matter_value(brief, "tools").as_deref(),
+            Some("Bash, Write")
+        );
+        assert_eq!(front_matter_value("no front matter", "tools"), None);
     }
 
     #[test]

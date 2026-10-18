@@ -203,6 +203,8 @@ pub struct TeamSkills {
     reader: Reader,
     /// The work this run is on, e.g. "owner/name#12", for the ask history.
     origin: String,
+    /// The run's id, for a link from an ask to its run. Empty if none.
+    run_id: String,
     items: Vec<(String, SkillMeta)>,
     reads: std::sync::atomic::AtomicUsize,
     asks: std::sync::atomic::AtomicUsize,
@@ -251,11 +253,18 @@ impl TeamSkills {
             team_id: team_id.to_string(),
             reader,
             origin: String::new(),
+            run_id: String::new(),
             items: names.into_iter().zip(items).collect(),
             reads: std::sync::atomic::AtomicUsize::new(0),
             asks: std::sync::atomic::AtomicUsize::new(0),
             usage: std::sync::Mutex::new(Default::default()),
         })
+    }
+
+    /// Ties this run's asks to its run page.
+    pub fn with_run(mut self, run_id: Option<&str>) -> Self {
+        self.run_id = run_id.unwrap_or_default().to_string();
+        self
     }
 
     /// Adds what asking team agents cost to the run's usage, once.
@@ -425,6 +434,8 @@ impl TeamSkills {
             path: m.path.clone(),
             by: self.reader.label().to_string(),
             origin: self.origin.clone(),
+            run_id: self.run_id.clone(),
+            sha: m.sha.clone(),
             question: question.to_string(),
             context_chars: context.len() as i64,
             ..Default::default()
@@ -446,6 +457,9 @@ impl TeamSkills {
         record.answer = reply.answer.clone().unwrap_or_default();
         if let Err(e) = st.put_ask(&record).await {
             warn!(error = %e, "Could not keep a team agent ask");
+        }
+        if let Err(e) = st.count_ask(&m.repo, &m.path).await {
+            warn!(error = %e, "Could not count a team agent ask");
         }
         let usage = reply.usage;
         if let Ok(mut u) = self.usage.lock() {
@@ -732,6 +746,7 @@ pub async fn try_ask(
     }
     let reply = match st.item(&msg.repo, &msg.path).await? {
         Some((m, body)) if m.enabled && m.kind == skills::Kind::Agent => {
+            record.sha = m.sha.clone();
             answer_as_agent(
                 state,
                 &msg.team_id,
@@ -783,39 +798,7 @@ impl crate::agent::llm::ToolExecutor for NoTools {
     }
 }
 
-/// A team agent's instructions from its brief, and its `model:` hint. Only
-/// the text after the front matter is used: the brief's `tools:`, `model:`
-/// and any other settings never reach the model as instructions.
-fn agent_system_prompt(brief: &str, asker: &str) -> (Option<String>, String) {
-    let (_, _, body) = skills::parse_front_matter(brief);
-    let hint = front_matter_field(brief, "model");
-    let system = format!(
-        "You are one of this team's own agents, asked a question by Coderhelm's {}. Answer from \
-         your brief below and the question and context you're given. You have no tools: you \
-         can't read files, run commands or look anything up, so if you'd need something you \
-         weren't given, say what. Keep the answer focused, under about 600 words.\n\n\
-         ## Your brief\n{}",
-        asker,
-        common::truncate_str(&body, READ_CHARS)
-    );
-    (hint, system)
-}
-
-fn front_matter_field(text: &str, key: &str) -> Option<String> {
-    let rest = text.strip_prefix("---")?;
-    let end = rest.find("\n---")?;
-    rest[..end].lines().find_map(|l| {
-        let (k, v) = l.split_once(':')?;
-        (k.trim() == key)
-            .then(|| {
-                v.trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_ascii_lowercase()
-            })
-            .filter(|v| !v.is_empty())
-    })
-}
+use common::skills::agent_system_prompt;
 
 /// The team's own model for a brief's hint: `opus` takes the team's heavy
 /// model, anything else its primary one. A hint never picks a model by name.
@@ -863,6 +846,10 @@ mod tests {
             last_used_at: String::new(),
             last_used_by: String::new(),
             updated_at: String::new(),
+            asks: 0,
+            last_asked_at: String::new(),
+            switched_by: String::new(),
+            switched_at: String::new(),
         }
     }
 

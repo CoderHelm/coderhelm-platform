@@ -421,7 +421,8 @@ Rules:
         super::skills::Reader::Coder,
         format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
     )
-    .await;
+    .await
+    .map(|s| s.with_run(Some(msg.run_id.as_str())));
     if let Some(s) = &skills {
         tools.extend(s.tools());
         full_system.push_str(&s.prompt_section());
