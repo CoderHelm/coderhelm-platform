@@ -27,7 +27,7 @@ const STATEMENT_TIMEOUT: &str = "8s";
 /// Longest we wait for the whole exchange.
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Most columns kept in the description of a database.
-const MAX_SCHEMA_COLUMNS: usize = 4_000;
+const MAX_SCHEMA_COLUMNS: usize = 10_000;
 
 type Row = Map<String, Value>;
 
@@ -37,55 +37,74 @@ where
 {
     let code = e.as_service_error().and_then(|s| s.code()).unwrap_or("");
     let msg = e.as_service_error().and_then(|s| s.message()).unwrap_or("");
+    // No service code: the request never got an answer (a timeout, a
+    // connection or credentials problem). Its own description says which.
+    let transport = code
+        .is_empty()
+        .then(|| aws_sdk_rdsdata::error::DisplayErrorContext(e).to_string());
+    let err = classify_data_api_error(code, msg, transport.as_deref());
+    if err.step != "read" {
+        tracing::warn!(code, error = %err.message, "Database lookup failed");
+    }
+    err
+}
+
+/// What a Data API failure means for the person or agent who asked. Every
+/// message carries the underlying error class and text (secrets and account
+/// details removed), so a cause is never hidden behind a generic sentence.
+fn classify_data_api_error(code: &str, msg: &str, transport: Option<&str>) -> StepError {
+    let why = super::error_detail(code, transport.unwrap_or(msg));
     match code {
         "AccessDeniedException" | "ForbiddenException" | "UnrecognizedClientException" => StepError::new(
             "sign_in",
-            "The role in your AWS account isn't allowed to query this database.",
+            format!("The role in your AWS account isn't allowed to query this database ({why})."),
             "Run the setup script again and choose this database.",
         ),
         "DatabaseResumingException" => StepError::new(
             "reach",
-            "The database is waking up.",
+            format!("The database is waking up ({why})."),
             "Try again in a minute.",
+        ),
+        "DatabaseNotFoundException" | "DatabaseUnavailableException" | "ServiceUnavailableError" | "InternalServerErrorException" => StepError::new(
+            "reach",
+            format!("We couldn't reach the database ({why})."),
+            "Check that the database is running and its Data API is on, then try again.",
         ),
         "BadRequestException" | "DatabaseErrorException" if msg.contains("password authentication") || msg.contains("secret") => StepError::new(
             "sign_in",
-            "The database didn't accept Coderhelm's read-only user.",
+            format!("The database didn't accept Coderhelm's read-only user ({why})."),
             "Run the setup script again and choose this database; it resets that user's password.",
+        ),
+        "BadRequestException" | "DatabaseErrorException" if msg.contains("Communications link failure") || msg.contains("is not currently available") => StepError::new(
+            "reach",
+            format!("We couldn't reach the database ({why})."),
+            "Check that the database is running and its Data API is on, then try again.",
         ),
         "BadRequestException" | "DatabaseErrorException" => StepError::new(
             "read",
-            format!("The database couldn't run that: {}", crate::truncate_str(msg, 300)),
-            "Check table and column names with the description of this database.",
+            format!("The database couldn't run that ({why})."),
+            "Check table and column names with live_describe before trying again.",
         ),
         "ValidationException" if msg.contains("Cannot find parameter") => StepError::new(
             "read",
-            format!("The database read part of the SQL as a parameter: {}", crate::truncate_str(msg, 200)),
-            "A colon right before a name or number is taken as a parameter, so array slices like [1:3] can't be sent. Use string_agg, or pick single elements like [1].",
+            format!("The database read part of the SQL as a parameter ({why})."),
+            "Every :name in the SQL must be a declared input; write casts as CAST(x AS type).",
+        ),
+        "ValidationException" => StepError::new(
+            "read",
+            format!("The Data API refused the request ({why})."),
+            "Check the SQL, then try again.",
         ),
         "StatementTimeoutException" => StepError::new(
             "read",
-            "That lookup took too long, so the database stopped it.",
+            format!("That lookup took too long, so the database stopped it ({why})."),
             "Narrow it: filter on an indexed column, a shorter date range or fewer rows.",
         ),
-        _ => {
-            // Keep what went wrong: a bare "couldn't reach" hides timeouts and
-            // SQL errors that arrive under other codes.
-            let why = if code.is_empty() {
-                aws_sdk_rdsdata::error::DisplayErrorContext(e).to_string()
-            } else {
-                format!("{code}: {msg}")
-            };
-            tracing::warn!(error = %why, "Database lookup failed");
-            StepError::new(
-                "reach",
-                format!(
-                    "We couldn't reach the database ({}).",
-                    crate::truncate_str(&why, 300)
-                ),
-                "Check that the Data API is on for this database, then try again.",
-            )
-        }
+        _ => StepError::new(
+            "reach",
+            format!("We couldn't reach the database ({why})."),
+            "Check that the Data API is on for this database, then try again.",
+        ),
     }
 }
 
@@ -189,6 +208,10 @@ async fn read_with_params(
         if !confirms_read_only(guard.formatted_records()) {
             return Err(not_read_only());
         }
+        // The Data API takes any `:word` as a parameter, even inside quotes;
+        // only the declared ones may look like that.
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        let sql = super::sql::for_rds_data_api(sql, &names);
         let out = client
             .execute_statement()
             .resource_arn(&t.cluster_arn)
@@ -319,7 +342,7 @@ const SCHEMA_READ: &str =
     "SELECT table_schema AS s, table_name AS t, column_name AS c, data_type AS d \
      FROM information_schema.columns \
      WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
-     ORDER BY table_schema, table_name, ordinal_position LIMIT 4000";
+     ORDER BY table_schema, table_name, ordinal_position LIMIT 10000";
 
 /// A database's tables and columns as text blocks, one per table, so the
 /// agents can search it the same way as an API's description.
@@ -405,6 +428,16 @@ pub async fn verify_read_only_user(session: &Session, t: &AwsTarget) -> Result<(
         }
         None => Ok(()),
     }
+}
+
+/// Reads the database's tables and columns again, as the text the agents
+/// search, and how many tables it holds. The user is re-checked as read-only
+/// first, the same as before any lookup.
+pub async fn read_schema(session: &Session, t: &AwsTarget) -> Result<(String, usize), StepError> {
+    verify_read_only_user(session, t).await?;
+    let client = rdsdata_client(session);
+    let rows = read_in_rolled_back_transaction(&client, t, SCHEMA_READ).await?;
+    Ok(schema_text(&rows))
 }
 
 /// The outcome of checking a database before it is connected.
@@ -562,6 +595,57 @@ mod tests {
         // a write into them.
         for sql in [ACCESS_CHECK, SCHEMA_READ] {
             check_read_only_sql(sql, &[]).unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+
+    #[test]
+    fn every_failure_says_what_went_wrong() {
+        // SQL errors are the agent's to fix, with the database's own words.
+        let e = classify_data_api_error(
+            "BadRequestException",
+            "ERROR: relation \"orders\" does not exist\n  Position: 15",
+            None,
+        );
+        assert_eq!(e.step, "read");
+        assert!(
+            e.message.contains("relation \"orders\" does not exist"),
+            "{}",
+            e.message
+        );
+        // A request that never got an answer keeps its own description.
+        let e =
+            classify_data_api_error("", "", Some("dispatch failure: io error: connection reset"));
+        assert_eq!(e.step, "reach");
+        assert!(e.message.contains("connection reset"), "{}", e.message);
+        // Codes nobody planned for still carry the code and the message.
+        let e = classify_data_api_error("ThrottlingException", "Rate exceeded", None);
+        assert!(
+            e.message.contains("ThrottlingException: Rate exceeded"),
+            "{}",
+            e.message
+        );
+        // A stopped database is a reach problem, not a SQL problem.
+        let e = classify_data_api_error("BadRequestException", "Communications link failure", None);
+        assert_eq!(e.step, "reach");
+        assert!(e.message.contains("Communications link failure"));
+        // Sign-in failures say which code, without the account behind it.
+        let e = classify_data_api_error(
+            "AccessDeniedException",
+            "User arn:aws:sts::123456789012:assumed-role/x is not authorized",
+            None,
+        );
+        assert_eq!(e.step, "sign_in");
+        assert!(e.message.contains("AccessDeniedException") && !e.message.contains("123456789012"));
+        // The parameter error names the parameter.
+        let e = classify_data_api_error("ValidationException", "Cannot find parameter: 3", None);
+        assert!(e.message.contains("Cannot find parameter: 3"));
+        for (code, msg) in [
+            ("DatabaseResumingException", "resuming"),
+            ("StatementTimeoutException", "timeout"),
+            ("ValidationException", "bad input"),
+        ] {
+            let e = classify_data_api_error(code, msg, None);
+            assert!(e.message.contains(code), "{code}: {}", e.message);
         }
     }
 

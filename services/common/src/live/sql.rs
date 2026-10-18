@@ -11,11 +11,12 @@ use std::collections::HashSet;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SetExpr, Statement,
-    TableAlias, TableFactor, Visit, Visitor,
+    visit_expressions_mut, CastKind, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    ObjectName, Query, SetExpr, Statement, TableAlias, TableFactor, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 
 use super::redact::{hidden_terms, is_hidden};
 use super::StepError;
@@ -353,6 +354,17 @@ pub fn check_read_only_sql(sql: &str, hidden: &[String]) -> Result<CheckedSql, S
         )));
     }
 
+    // `x::int` is printed as `CAST(x AS INT)`: the same cast, without a
+    // colon the Data API could mistake for the start of a parameter.
+    let mut stmt = stmt.clone();
+    let _ = visit_expressions_mut(&mut stmt, |e| {
+        if let Expr::Cast { kind, .. } = e {
+            if *kind == CastKind::DoubleColon {
+                *kind = CastKind::Cast;
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
     let statement = space_slice_colons(&stmt.to_string());
     let mut tables = scan.tables;
     tables.sort();
@@ -390,8 +402,225 @@ fn space_slice_colons(sql: &str) -> String {
     out
 }
 
+/// Prepares checked SQL for the RDS Data API, which reads a `:word` in the
+/// text as a named parameter (quoted text included) and fails with "Cannot
+/// find parameter" when no such parameter was sent.
+///
+/// A pass over the statement's real tokens (the parser's own tokenizer, so
+/// quotes, escapes and dollar quoting are read the way PostgreSQL reads them):
+/// - quoted text holding a colon is rewritten as an escaped string (`E'...'`)
+///   with each colon spelled `\072`. PostgreSQL reads it as exactly the same
+///   untyped literal, so `'10:30'` still compares with a time column;
+/// - a colon directly before a word or number that is not one of `params`
+///   (an array slice, say) gets a space after it.
+///
+/// Parameters in `params` and `::` casts are left alone. Text that can't be
+/// tokenized is returned unchanged.
+pub fn for_rds_data_api(sql: &str, params: &[&str]) -> String {
+    let dialect = PostgreSqlDialect {};
+    let Ok(tokens) = Tokenizer::new(&dialect, sql)
+        .with_unescape(false)
+        .tokenize_with_location()
+    else {
+        return sql.to_string();
+    };
+    let chars: Vec<char> = sql.chars().collect();
+    // Char index where each line starts, to turn a (line, column) into an index.
+    let mut line_starts = vec![0usize];
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let at = |line: u64, column: u64| -> Option<usize> {
+        let start = *line_starts.get((line as usize).checked_sub(1)?)?;
+        Some(start + (column as usize).checked_sub(1)?)
+    };
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut copied = 0usize;
+    for (i, t) in tokens.iter().enumerate() {
+        let (Some(start), Some(end)) = (
+            at(t.span.start.line, t.span.start.column),
+            at(t.span.end.line, t.span.end.column),
+        ) else {
+            return sql.to_string();
+        };
+        if start < copied || end > chars.len() || start > end {
+            return sql.to_string();
+        }
+        let source: String = chars[start..end].iter().collect();
+        let inner = || {
+            let open = source.find('\'').map(|o| o + 1).unwrap_or(0);
+            let close = source.len().saturating_sub(1).max(open);
+            source[open..close].to_string()
+        };
+        let replacement = match &t.token {
+            Token::SingleQuotedString(_) | Token::NationalStringLiteral(_)
+                if source.contains(':') =>
+            {
+                Some(format!("E'{}'", escape_plain(&inner())))
+            }
+            Token::EscapedStringLiteral(_) if source.contains(':') => {
+                Some(format!("E'{}'", escape_colons_in_escaped(&inner())))
+            }
+            Token::DollarQuotedString(d) if source.contains(':') => {
+                Some(format!("E'{}'", escape_plain(&d.value.replace('\'', "''"))))
+            }
+            Token::Colon => {
+                let next = tokens.get(i + 1).map(|n| &n.token);
+                let is_param = matches!(next, Some(Token::Word(w))
+                    if w.quote_style.is_none() && params.contains(&w.value.as_str()));
+                let glued = matches!(next, Some(Token::Word(_)) | Some(Token::Number(..)));
+                (glued && !is_param).then(|| ": ".to_string())
+            }
+            _ => None,
+        };
+        out.extend(chars[copied..start].iter());
+        out.push_str(replacement.as_deref().unwrap_or(&source));
+        copied = end;
+    }
+    out.extend(chars[copied..].iter());
+    out
+}
+
+/// Plain quoted text (no backslash escapes) as the inside of an `E'...'`.
+fn escape_plain(inner: &str) -> String {
+    inner.replace('\\', "\\\\").replace(':', "\\072")
+}
+
+/// The inside of an `E'...'` with its colons spelled `\072`. A colon that is
+/// already escaped (`\:`) is spelled the same way.
+fn escape_colons_in_escaped(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len() + 8);
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(':') => out.push_str("\\072"),
+                Some(n) => {
+                    out.push('\\');
+                    out.push(n);
+                }
+                None => out.push('\\'),
+            },
+            ':' => out.push_str("\\072"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The tables a statement reads, each with the name the statement calls it
+/// by (its alias, or its own name), both lowercase: `[("o", "public.orders")]`.
+/// Empty when the text doesn't parse.
+pub fn table_aliases(sql: &str) -> Vec<(String, String)> {
+    #[derive(Default)]
+    struct Names(Vec<(String, String)>);
+    impl Visitor for Names {
+        type Break = ();
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            if let TableFactor::Table { name, alias, .. } = t {
+                let full = name
+                    .0
+                    .iter()
+                    .filter_map(|p| p.as_ident())
+                    .map(|i| i.value.to_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let called = alias
+                    .as_ref()
+                    .map(|a| a.name.value.to_lowercase())
+                    .unwrap_or_else(|| last_name(name));
+                self.0.push((called, full));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+        return Vec::new();
+    };
+    let mut names = Names::default();
+    for s in &statements {
+        let _ = s.visit(&mut names);
+    }
+    names.0
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn data_api_text_has_no_colon_but_its_parameters() {
+        let send = for_rds_data_api;
+        // Quoted times and JSON keep their value but lose the bare colon.
+        assert_eq!(
+            send("SELECT * FROM t WHERE starts_at > '10:30'", &[]),
+            r"SELECT * FROM t WHERE starts_at > E'10\07230'"
+        );
+        assert_eq!(
+            send(r#"SELECT 1 FROM t WHERE meta @> '{"kind":3}'"#, &[]),
+            r#"SELECT 1 FROM t WHERE meta @> E'{"kind"\0723}'"#
+        );
+        // A doubled quote stays, and a backslash that was literal stays literal.
+        assert_eq!(
+            send(r"SELECT 'it''s 1:2 \ x'", &[]),
+            r"SELECT E'it''s 1\0722 \\ x'"
+        );
+        // An escaped string keeps its escapes; an escaped colon is spelled too.
+        assert_eq!(
+            send(r"SELECT E'a\tb:c\:d'", &[]),
+            r"SELECT E'a\tb\072c\072d'"
+        );
+        // Dollar quoting becomes an escaped string.
+        assert_eq!(send("SELECT $$a:b'c$$", &[]), r"SELECT E'a\072b''c'");
+        // Declared parameters and casts are left alone; a slice is spaced.
+        assert_eq!(
+            send(
+                "SELECT x[1:3], y[1:n] FROM t WHERE id = :id AND d = :day::date",
+                &["id", "day"]
+            ),
+            "SELECT x[1: 3], y[1: n] FROM t WHERE id = :id AND d = :day::date"
+        );
+        // An undeclared :word is spaced, so it is never taken as a parameter.
+        assert_eq!(send("SELECT :other", &["id"]), "SELECT : other");
+        // Text without colons in it, and quoted names, are unchanged.
+        let plain = "SELECT \"Order\".id, 'a''b' FROM \"Order\"\nWHERE x = 'é'";
+        assert_eq!(send(plain, &[]), plain);
+        assert_eq!(
+            send("SELECT 'é:1',\n 'x:y' AS b", &[]),
+            "SELECT E'é\\0721',\n E'x\\072y' AS b"
+        );
+    }
+
+    #[test]
+    fn checked_lookups_reach_the_data_api_without_stray_colons() {
+        let c = check_read_only_sql(
+            "SELECT id, created_at::date AS d FROM orders WHERE note = 'at 10:30' AND tags[1:2] = '{a}'",
+            &[],
+        )
+        .unwrap();
+        // The cast is printed without a colon at all.
+        assert!(c.text.contains("CAST(created_at AS DATE)"), "{}", c.text);
+        let sent = for_rds_data_api(&c.text, &[]);
+        assert_eq!(
+            sent.matches(':').count(),
+            1,
+            "only the spaced slice colon is left: {sent}"
+        );
+        assert!(sent.contains(r"E'at 10\07230'"), "{sent}");
+    }
+
+    #[test]
+    fn tables_are_named_as_the_statement_calls_them() {
+        assert_eq!(
+            table_aliases("SELECT o.id FROM public.orders o JOIN customers ON true"),
+            vec![
+                ("o".to_string(), "public.orders".to_string()),
+                ("customers".to_string(), "customers".to_string())
+            ]
+        );
+        assert!(table_aliases("not sql").is_empty());
+    }
+
     #[test]
     fn an_array_slice_is_not_sent_as_a_parameter() {
         let c = check_read_only_sql(

@@ -504,6 +504,15 @@ pub fn validate(def: &ToolDef, src: &SourceInfo) -> Result<Prepared, Vec<String>
     Ok(Prepared { text })
 }
 
+/// Whether a failed example run means the tool's read itself is broken, so
+/// the tool must not be saved: the source answered that it can't run that
+/// SQL or GraphQL (an unknown table, column, field or parameter). Failures
+/// to reach or sign in to the source say nothing about the read and don't
+/// block saving; that version just can't be approved until it runs.
+pub fn example_failure_blocks_save(def: &ToolDef, e: &StepError) -> bool {
+    !e.is_refusal() && e.step == "read" && matches!(def.kind, ToolKind::Sql | ToolKind::Graphql)
+}
+
 /// A value bound to an input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamValue {
@@ -906,6 +915,53 @@ max_rows: 20
             sql_params("SELECT a::text FROM t WHERE b = :x AND c = ':y'"),
             vec!["x"]
         );
+    }
+
+    #[test]
+    fn a_saved_tool_reaches_the_data_api_with_only_its_own_parameters() {
+        // Quoted times, JSON and casts: each holds a colon the Data API would
+        // otherwise take for an unknown parameter ("Cannot find parameter").
+        let mut t = order_tool();
+        t.read = "SELECT o.id, o.created_at::date AS day, o.meta->>'kind' AS kind FROM orders o \
+                  WHERE o.number = :order_number AND o.slot_start >= '10:30' \
+                  AND o.meta @> '{\"source\":3}' AND o.placed_at > :order_number::timestamp - interval '6:00'"
+            .into();
+        let p = validate(&t, &db_source()).unwrap();
+        let sent = super::super::sql::for_rds_data_api(&p.text, &["order_number"]);
+        // Remove the declared parameter; no other colon may be left.
+        let rest = sent.replace(":order_number", "");
+        assert!(!rest.contains(':'), "{sent}");
+        assert_eq!(sent.matches(":order_number").count(), 2, "{sent}");
+        assert!(sent.contains(r"E'10\07230'"), "{sent}");
+        assert!(sent.contains("CAST(o.created_at AS DATE)"), "{sent}");
+        assert!(sent.contains("CAST(:order_number AS TIMESTAMP)"), "{sent}");
+    }
+
+    #[test]
+    fn a_tool_whose_read_the_source_rejects_is_not_saved() {
+        let t = order_tool();
+        let sql_error = StepError::new(
+            "read",
+            "The database couldn't run that (relation \"x\" does not exist).",
+            "x",
+        );
+        assert!(example_failure_blocks_save(&t, &sql_error));
+        // Reaching or signing in says nothing about the read itself.
+        assert!(!example_failure_blocks_save(
+            &t,
+            &StepError::new("reach", "We couldn't reach the database (timeout).", "x")
+        ));
+        assert!(!example_failure_blocks_save(
+            &t,
+            &StepError::new("sign_in", "x", "x")
+        ));
+        assert!(!example_failure_blocks_save(
+            &t,
+            &StepError::new("read_only", "x", "x")
+        ));
+        let mut http = t.clone();
+        http.kind = ToolKind::Http;
+        assert!(!example_failure_blocks_save(&http, &sql_error));
     }
 
     // ── Threats table, one test per row ──────────────────────────────────

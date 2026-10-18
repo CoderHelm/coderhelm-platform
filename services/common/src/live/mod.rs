@@ -24,6 +24,7 @@
 
 pub mod api;
 pub mod aws;
+pub mod catalog;
 pub mod db;
 pub mod graphql;
 pub mod logs;
@@ -46,6 +47,29 @@ pub fn count(n: usize, noun: &str) -> String {
     } else {
         format!("{n} {noun}s")
     }
+}
+
+/// `Code: message` for a failure, ready to show: secrets, email addresses,
+/// AWS resource names and account numbers removed, on one line, kept short.
+/// Used so no failure is reported as a bare "couldn't reach" with its cause
+/// thrown away.
+pub fn error_detail(code: &str, message: &str) -> String {
+    static ARN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"arn:aws[a-zA-Z-]*:[^\s,;)'\x22]+").expect("valid")
+    });
+    static ACCOUNT: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\b\d{12}\b").expect("valid"));
+    let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = match (code.trim(), message.as_str()) {
+        ("", "") => "no details were given".to_string(),
+        ("", m) => m.to_string(),
+        (c, "") => c.to_string(),
+        (c, m) => format!("{c}: {m}"),
+    };
+    let (text, _) = redact::redact_text(&text);
+    let text = ARN.replace_all(&text, "[aws resource]");
+    let text = ACCOUNT.replace_all(&text, "[account]");
+    crate::truncate_str(&text, 300).to_string()
 }
 
 /// A failure a person can act on: which step failed, what happened, what to do.
@@ -86,5 +110,30 @@ mod tests {
         assert_eq!(super::count(1, "row"), "1 row");
         assert_eq!(super::count(0, "row"), "0 rows");
         assert_eq!(super::count(40, "line"), "40 lines");
+    }
+
+    #[test]
+    fn error_detail_keeps_the_cause_and_drops_account_details() {
+        assert_eq!(
+            super::error_detail(
+                "BadRequestException",
+                "ERROR: relation \"orders\"\n does not exist"
+            ),
+            "BadRequestException: ERROR: relation \"orders\" does not exist"
+        );
+        let d = super::error_detail(
+            "",
+            "dispatch failure: timeout calling arn:aws:secretsmanager:us-east-1:123456789012:secret:db-AbCd for 123456789012",
+        );
+        assert!(
+            d.starts_with("dispatch failure: timeout calling [aws resource]"),
+            "{d}"
+        );
+        assert!(
+            !d.contains("123456789012") && !d.contains("secretsmanager"),
+            "{d}"
+        );
+        assert_eq!(super::error_detail("", " "), "no details were given");
+        assert!(super::error_detail("X", &"y".repeat(1000)).len() <= 300);
     }
 }

@@ -570,10 +570,16 @@ pub async fn assume(
         .await
         .map_err(|e| {
             let code = e.as_service_error().and_then(|s| s.meta().code()).unwrap_or("").to_string();
-            tracing::info!(code = %code, "Could not take on a team's role");
+            let msg = e.as_service_error().and_then(|s| s.meta().message()).unwrap_or("").to_string();
+            let why = if code.is_empty() {
+                super::error_detail("", &aws_sdk_sts::error::DisplayErrorContext(&e).to_string())
+            } else {
+                super::error_detail(&code, &msg)
+            };
+            tracing::info!(code = %code, error = %why, "Could not take on a team's role");
             StepError::new(
                 "sign_in",
-                "Coderhelm couldn't use the role in your AWS account.",
+                format!("Coderhelm couldn't use the role in your AWS account ({why})."),
                 "Run the setup script again in AWS CloudShell. If someone changed or removed the role, the script puts it back.",
             )
         })?;
