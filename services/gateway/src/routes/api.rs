@@ -2973,32 +2973,12 @@ pub async fn get_notification_prefs(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let prefs = match result.item() {
-        Some(item) => NotificationPrefs {
-            email_run_complete: item
-                .get("email_run_complete")
-                .and_then(|v| v.as_bool().ok())
-                .copied()
-                .unwrap_or(true),
-            email_run_failed: item
-                .get("email_run_failed")
-                .and_then(|v| v.as_bool().ok())
-                .copied()
-                .unwrap_or(true),
-            email_weekly_summary: item
-                .get("email_weekly_summary")
-                .and_then(|v| v.as_bool().ok())
-                .copied()
-                .unwrap_or(true),
-        },
-        None => NotificationPrefs::default(),
-    };
+    let prefs = result
+        .item()
+        .map(NotificationPrefs::from_item)
+        .unwrap_or_default();
 
-    Ok(Json(json!({
-        "email_run_complete": prefs.email_run_complete,
-        "email_run_failed": prefs.email_run_failed,
-        "email_weekly_summary": prefs.email_weekly_summary,
-    })))
+    Ok(Json(json!(prefs)))
 }
 
 /// PUT /api/notifications — update notification preferences.
@@ -3009,24 +2989,37 @@ pub async fn update_notification_prefs(
 ) -> Result<StatusCode, StatusCode> {
     let sk = format!("NOTIFICATIONS#{}", claims.sub);
 
+    let stored = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&sk))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch notification prefs: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let prefs = stored
+        .item()
+        .map(NotificationPrefs::from_item)
+        .unwrap_or_default()
+        .merged_with(&body);
+
     state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
         .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(&sk))
-        .item(
-            "email_run_complete",
-            attr_bool(body["email_run_complete"].as_bool().unwrap_or(true)),
-        )
-        .item(
-            "email_run_failed",
-            attr_bool(body["email_run_failed"].as_bool().unwrap_or(true)),
-        )
+        .item("email_run_complete", attr_bool(prefs.email_run_complete))
+        .item("email_run_failed", attr_bool(prefs.email_run_failed))
         .item(
             "email_weekly_summary",
-            attr_bool(body["email_weekly_summary"].as_bool().unwrap_or(true)),
+            attr_bool(prefs.email_weekly_summary),
         )
+        .item("email_token_warning", attr_bool(prefs.email_token_warning))
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
         .send()
         .await
