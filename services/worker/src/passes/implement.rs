@@ -395,7 +395,8 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             msg.issue_number,
         ),
     )
-    .await;
+    .await
+    .map(|s| s.with_run(run_id));
     if let Some(s) = &skills {
         tools.extend(s.tools());
         full_system.push_str(&s.prompt_section());

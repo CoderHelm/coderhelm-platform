@@ -241,6 +241,12 @@ pub async fn item(
         return Err(fail(StatusCode::NOT_FOUND, "No such skill."));
     };
     let mut out = meta.json();
+    if meta.kind == Kind::Agent {
+        // Exactly what the agent is told when it's asked, so the page shows
+        // what it gets rather than a description of it.
+        let (_, system) = common::skills::agent_system_prompt(&body, "reviewer");
+        out["prompt"] = json!(system);
+    }
     out["body"] = json!(body);
     Ok(Json(out))
 }
@@ -262,7 +268,7 @@ pub async fn set_enabled(
         return Err(fail(StatusCode::BAD_REQUEST, "Give a repo and a path."));
     }
     let found = store(&state, &claims)
-        .set_enabled(repo, path, on)
+        .set_enabled(repo, path, on, &claims.email)
         .await
         .map_err(|e| internal("switch skill", e))?;
     if !found {
@@ -290,11 +296,21 @@ fn repo_and_path(
 
 /// GET /api/skills/asks?repo=&path=[&id=] — an agent's recent asks, newest
 /// first, or the one `id` names (the page waits on a try with it).
+/// GET /api/skills/asks?run_id= — the asks made during one run.
 pub async fn asks(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Reply {
+    if let Some(run_id) = q.get("run_id").filter(|r| !r.is_empty()) {
+        let list = store(&state, &claims)
+            .asks_for_run(run_id)
+            .await
+            .map_err(|e| internal("list run asks", e))?;
+        return Ok(Json(json!({
+            "asks": list.iter().map(|a| a.json()).collect::<Vec<_>>(),
+        })));
+    }
     let (repo, path) = repo_and_path(&q)?;
     let st = store(&state, &claims);
     if let Some(id) = q.get("id") {
@@ -311,9 +327,12 @@ pub async fn asks(
         .asks(&repo, &path, 30)
         .await
         .map_err(|e| internal("list agent asks", e))?;
+    let now = chrono::Utc::now();
+    let tried = list.iter().filter(|a| try_today(a, now)).count();
     Ok(Json(json!({
         "asks": list.iter().map(|a| a.json()).collect::<Vec<_>>(),
         "tries_per_day": TRIES_PER_DAY,
+        "tries_left": TRIES_PER_DAY.saturating_sub(tried),
     })))
 }
 
