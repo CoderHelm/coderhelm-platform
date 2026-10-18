@@ -11,8 +11,9 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use common::live::catalog;
 use common::live::store::{self, Activity, Kind, Source};
-use common::live::tools::{self, can_approve, validate, ToolDef};
+use common::live::tools::{self, can_approve, validate, ToolDef, ToolKind};
 use common::live::tools_run::{activity_text, run_tool, source_info, ToolRun};
 use common::live::tools_store::{ToolStore, MAX_TOOLS};
 use common::live::{secret, StepError};
@@ -156,6 +157,41 @@ async fn record(
         store::log_activity(&state.dynamo, &state.config.settings_table_name, team, &a).await
     {
         warn!(error = %e, "Could not record a tool run");
+    }
+}
+
+/// Real names from the source's saved description to use instead of the ones
+/// a tool's read failed on. Empty when there is no description or nothing
+/// close.
+async fn name_hints(
+    state: &AppState,
+    team: &str,
+    source: &Source,
+    def: &ToolDef,
+    e: &StepError,
+) -> Vec<String> {
+    if !catalog::is_name_error(&e.message) || !source.schema_available {
+        return Vec::new();
+    }
+    let Ok(out) = state
+        .s3
+        .get_object()
+        .bucket(&state.config.bucket_name)
+        .key(Source::schema_s3_key(team, &source.id))
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(bytes) = out.body.collect().await else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&bytes.into_bytes()).into_owned();
+    let c = catalog::Catalog::parse(&text);
+    match def.kind {
+        ToolKind::Sql => catalog::sql_hints(&c, &e.message, &def.read, &source.hidden_fields),
+        ToolKind::Graphql => catalog::graphql_hints(&c, &e.message, &source.hidden_fields),
+        _ => Vec::new(),
     }
 }
 
@@ -304,6 +340,22 @@ pub async fn save_checked(
         &run,
     )
     .await;
+    // The dry run with the examples is the save-time check that the read
+    // really runs: a tool the source can't run is not saved at all.
+    if let Err(e) = &run {
+        if tools::example_failure_blocks_save(def, e) {
+            let mut problems = vec![format!("The example run failed: {} {}", e.message, e.fix)];
+            problems.extend(name_hints(state, team, &source, def, e).await);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "The tool's read doesn't run against its source, so it wasn't saved.",
+                    "problems": problems,
+                    "example": run_json(&run),
+                })),
+            ));
+        }
+    }
     let example = run_json(&run);
     let (tool, version) = st
         .save_version(def, author, origin, &example.to_string(), run.is_ok())

@@ -82,9 +82,17 @@ impl Response {
             .map(|b| &b["data"])
             .filter(|d| !d.is_null())
     }
-    fn first_error(&self) -> Option<String> {
-        let msg = self.body.as_ref()?["errors"][0]["message"].as_str()?;
-        Some(crate::truncate_str(msg, 300).to_string())
+    /// The API's own error messages (the first few), so every wrong name in
+    /// a lookup can be fixed at once rather than one per attempt.
+    fn errors(&self) -> Option<String> {
+        let msgs: Vec<&str> = self.body.as_ref()?["errors"]
+            .as_array()?
+            .iter()
+            .filter_map(|e| e["message"].as_str())
+            .take(4)
+            .map(|m| crate::truncate_str(m, 300))
+            .collect();
+        (!msgs.is_empty()).then(|| msgs.join(" | "))
     }
     fn looks_like_graphql(&self) -> bool {
         self.body
@@ -92,6 +100,29 @@ impl Response {
             .map(|b| b.get("data").is_some() || b.get("errors").is_some())
             .unwrap_or(false)
     }
+}
+
+/// What went wrong with a request that got no usable answer: the kind of
+/// failure and the causes underneath it, without the address's query string.
+fn http_why(e: &reqwest::Error) -> String {
+    let kind = if e.is_timeout() {
+        "timed out"
+    } else if e.is_connect() {
+        "couldn't connect"
+    } else if e.is_body() || e.is_decode() {
+        "the answer was cut off"
+    } else if e.is_builder() {
+        "the request couldn't be built"
+    } else {
+        "the request failed"
+    };
+    let mut causes = Vec::new();
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        causes.push(s.to_string());
+        source = s.source();
+    }
+    super::error_detail(kind, &causes.join(": "))
 }
 
 /// Sends one checked read to the registered address. The body is built here
@@ -107,10 +138,10 @@ async fn send(
     let ep = parse_endpoint(url)?;
     let addr = resolve_public(&ep).await?;
 
-    let cant_reach = || {
+    let cant_reach = |e: reqwest::Error| {
         StepError::new(
             "reach",
-            format!("We couldn't reach {}.", ep.host),
+            format!("We couldn't reach {} ({}).", ep.host, http_why(&e)),
             "Check the address for a typo. If your API only accepts approved callers, it needs to allow Coderhelm.",
         )
     };
@@ -126,7 +157,7 @@ async fn send(
         .timeout(TIMEOUT)
         .user_agent(USER_AGENT)
         .build()
-        .map_err(|_| cant_reach())?;
+        .map_err(cant_reach)?;
 
     let mut body = json!({ "query": read.text });
     if let Some(v) = variables.filter(|v| v.is_object()) {
@@ -137,7 +168,7 @@ async fn send(
         let (name, value) = style.header(key);
         req = req.header(name, value);
     }
-    let mut resp = req.send().await.map_err(|_| cant_reach())?;
+    let mut resp = req.send().await.map_err(cant_reach)?;
     let status = resp.status().as_u16();
     if (300..400).contains(&status) {
         return Err(StepError::new(
@@ -149,7 +180,7 @@ async fn send(
 
     let mut buf: Vec<u8> = Vec::new();
     let mut truncated = false;
-    while let Some(chunk) = resp.chunk().await.map_err(|_| cant_reach())? {
+    while let Some(chunk) = resp.chunk().await.map_err(cant_reach)? {
         if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
             truncated = true;
             break;
@@ -209,6 +240,38 @@ pub async fn probe(url: &str) -> Probe {
             }
         }
     }
+}
+
+/// Asks an API to describe itself, or `None` when it keeps that private.
+///
+/// The fullest form (union members, interface implementations, enum values,
+/// deep list markers) is tried first; APIs that cap query depth or size refuse
+/// it, so shallower and plainer forms follow. The whole attempt has one time
+/// budget so a slow API can't stall the caller.
+pub async fn describe(url: &str, auth: AuthStyle, key: &str) -> Option<Schema> {
+    let attempt = async {
+        for details in [true, false] {
+            for levels in (0..=INTROSPECTION_LEVELS).rev() {
+                let found = send(
+                    url,
+                    Some((auth, key)),
+                    &introspection_query(levels, details),
+                    None,
+                )
+                .await
+                .ok()
+                .and_then(|r| r.body.as_ref().and_then(schema_from_introspection));
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        None
+    };
+    tokio::time::timeout(DESCRIBE_BUDGET, attempt)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// One named check shown to the person connecting a source.
@@ -321,22 +384,7 @@ pub async fn connect_checks(url: &str, key: &str) -> ConnectReport {
 
     // Shallower forms lose some detail about lists but pass APIs that cap depth.
     // The whole attempt has one time budget so a slow API can't stall the check.
-    let describe = async {
-        for levels in (0..=INTROSPECTION_LEVELS).rev() {
-            let found = send(url, Some((auth, key)), &introspection_query(levels), None)
-                .await
-                .ok()
-                .and_then(|r| r.body.as_ref().and_then(schema_from_introspection));
-            if found.is_some() {
-                return found;
-            }
-        }
-        None
-    };
-    let schema = tokio::time::timeout(DESCRIBE_BUDGET, describe)
-        .await
-        .ok()
-        .flatten();
+    let schema = describe(url, auth, key).await;
     checks.push(match &schema {
         Some(s) => Check::pass("read", L_READ, format!("It can look up {} kinds of data.", s.kinds)),
         None => Check::pass(
@@ -414,7 +462,7 @@ pub async fn run_lookup(
     }
     let Some(mut data) = r.data().cloned() else {
         let why = r
-            .first_error()
+            .errors()
             .unwrap_or_else(|| format!("The API answered with status {}.", r.status));
         return Err(StepError::new(
             "read",

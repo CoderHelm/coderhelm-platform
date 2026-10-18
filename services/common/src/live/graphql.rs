@@ -158,14 +158,26 @@ fn top_fields(
 /// `wrap_levels` is how far to unwrap list and required markers around a type
 /// (`[Order!]!` needs 3). APIs that cap query depth refuse the deep form, so
 /// callers start at [`INTROSPECTION_LEVELS`] and step down.
-pub fn introspection_query(wrap_levels: usize) -> String {
+///
+/// With `details`, it also asks for each union's members, each interface's
+/// implementations, enum values and input fields, so agents can see that a
+/// field returns a union and which `... on Member` fragments it takes.
+pub fn introspection_query(wrap_levels: usize, details: bool) -> String {
     let mut type_ref = String::from("kind name");
     for _ in 0..wrap_levels {
         type_ref = format!("kind name ofType {{ {type_ref} }}");
     }
+    let extra = if details {
+        format!(
+            " possibleTypes {{ name }} enumValues {{ name }} \
+             inputFields {{ name type {{ {type_ref} }} }}"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "query {{ __schema {{ queryType {{ name }} mutationType {{ name }} types {{ kind name \
-         fields {{ name args {{ name type {{ {type_ref} }} }} type {{ {type_ref} }} }} }} }} }}"
+         fields {{ name args {{ name type {{ {type_ref} }} }} type {{ {type_ref} }} }}{extra} }} }} }}"
     )
 }
 
@@ -218,6 +230,9 @@ fn humanize(name: &str) -> String {
 
 const MAX_SCHEMA_BYTES: usize = 300_000;
 
+/// The line under an interface's block that lists the types implementing it.
+pub const IMPLEMENTED_BY: &str = "# implemented by:";
+
 /// Builds a [`Schema`] from an introspection response, or `None` when the API
 /// did not describe itself (many turn this off in production).
 pub fn schema_from_introspection(body: &Value) -> Option<Schema> {
@@ -232,13 +247,69 @@ pub fn schema_from_introspection(body: &Value) -> Option<Schema> {
         .filter_map(|t| t["name"].as_str().map(|n| (n, t)))
         .collect();
 
+    let names_of = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let block = |t: &Value| -> Option<String> {
         let name = t["name"].as_str()?;
-        let fields = t["fields"].as_array()?;
-        if name.starts_with("__") || fields.is_empty() {
+        if name.starts_with("__") {
             return None;
         }
-        let mut b = format!("type {name} {{\n");
+        match t["kind"].as_str() {
+            // `union SearchResult = Order | Customer`: no fields of its own;
+            // a query picks members' fields with `... on Order { }`.
+            Some("UNION") => {
+                let members = names_of(&t["possibleTypes"]);
+                return (!members.is_empty())
+                    .then(|| format!("union {name} = {}\n", members.join(" | ")));
+            }
+            Some("ENUM") => {
+                let values = names_of(&t["enumValues"]);
+                if values.is_empty() {
+                    return None;
+                }
+                let shown: Vec<&str> = values.iter().take(60).map(String::as_str).collect();
+                let more = if values.len() > shown.len() {
+                    " | ..."
+                } else {
+                    ""
+                };
+                return Some(format!("enum {name} = {}{more}\n", shown.join(" | ")));
+            }
+            Some("INPUT_OBJECT") => {
+                let fields = t["inputFields"].as_array()?;
+                if fields.is_empty() {
+                    return None;
+                }
+                let mut b = format!("input {name} {{\n");
+                for f in fields {
+                    b.push_str(&format!(
+                        "  {}: {}\n",
+                        f["name"].as_str().unwrap_or("?"),
+                        type_ref(&f["type"])
+                    ));
+                }
+                b.push_str("}\n");
+                return Some(b);
+            }
+            _ => {}
+        }
+        let fields = t["fields"].as_array()?;
+        if fields.is_empty() {
+            return None;
+        }
+        let keyword = if t["kind"] == "INTERFACE" {
+            "interface"
+        } else {
+            "type"
+        };
+        let mut b = format!("{keyword} {name} {{\n");
         for f in fields {
             let args: Vec<String> = f["args"]
                 .as_array()
@@ -267,6 +338,13 @@ pub fn schema_from_introspection(body: &Value) -> Option<Schema> {
             ));
         }
         b.push_str("}\n");
+        let implemented_by = names_of(&t["possibleTypes"]);
+        if keyword == "interface" && !implemented_by.is_empty() {
+            b.push_str(&format!(
+                "{IMPLEMENTED_BY} {}\n",
+                implemented_by.join(" | ")
+            ));
+        }
         Some(b)
     };
 
@@ -402,10 +480,14 @@ mod tests {
         assert!(check_read_only("query Q($id: ID!) { order(id: $id) { id } }").is_ok());
         assert!(check_read_only("query { __schema { queryType { name } } }").is_ok());
         for levels in 0..=INTROSPECTION_LEVELS {
-            assert!(check_read_only(&introspection_query(levels)).is_ok());
+            for details in [true, false] {
+                assert!(check_read_only(&introspection_query(levels, details)).is_ok());
+            }
         }
-        assert!(!introspection_query(0).contains("ofType"));
-        assert_eq!(introspection_query(2).matches("ofType").count(), 4);
+        assert!(!introspection_query(0, false).contains("ofType"));
+        assert_eq!(introspection_query(2, false).matches("ofType").count(), 4);
+        assert!(introspection_query(1, true).contains("possibleTypes { name }"));
+        assert!(!introspection_query(1, false).contains("possibleTypes"));
     }
 
     #[test]
@@ -506,9 +588,39 @@ mod tests {
                     { "name": "deleteOrder", "args": [], "type": scalar("Boolean") }
                 ] },
                 { "kind": "OBJECT", "name": "__Type", "fields": [{ "name": "name", "args": [], "type": scalar("String") }] },
-                { "kind": "SCALAR", "name": "ID", "fields": null }
+                { "kind": "SCALAR", "name": "ID", "fields": null },
+                { "kind": "UNION", "name": "SearchResult", "fields": null,
+                  "possibleTypes": [{ "name": "Order" }, { "name": "Customer" }] },
+                { "kind": "INTERFACE", "name": "Node",
+                  "fields": [{ "name": "id", "args": [], "type": nn(scalar("ID")) }],
+                  "possibleTypes": [{ "name": "Order" }, { "name": "Customer" }] },
+                { "kind": "ENUM", "name": "OrderStatus", "fields": null,
+                  "enumValues": [{ "name": "OPEN" }, { "name": "SHIPPED" }] },
+                { "kind": "INPUT_OBJECT", "name": "OrderFilter", "fields": null,
+                  "inputFields": [{ "name": "status", "type": json!({ "kind": "ENUM", "name": "OrderStatus" }) }] },
+                { "kind": "UNION", "name": "Empty", "fields": null, "possibleTypes": [] }
             ]
         } } })
+    }
+
+    #[test]
+    fn unions_interfaces_enums_and_inputs_are_described() {
+        let s = schema_from_introspection(&introspection()).unwrap();
+        assert!(
+            s.text.contains("\nunion SearchResult = Order | Customer\n"),
+            "{}",
+            s.text
+        );
+        assert!(s
+            .text
+            .contains("interface Node {\n  id: ID!\n}\n# implemented by: Order | Customer\n"));
+        assert!(s.text.contains("enum OrderStatus = OPEN | SHIPPED\n"));
+        assert!(s
+            .text
+            .contains("input OrderFilter {\n  status: OrderStatus\n}\n"));
+        assert!(!s.text.contains("Empty"));
+        // Older answers without the details still describe the object types.
+        assert!(s.text.contains("type Customer {"));
     }
 
     #[test]

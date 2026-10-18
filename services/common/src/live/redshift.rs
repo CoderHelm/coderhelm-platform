@@ -61,23 +61,34 @@ where
 {
     let code = e.as_service_error().and_then(|s| s.code()).unwrap_or("");
     let msg = e.as_service_error().and_then(|s| s.message()).unwrap_or("");
+    let transport = code
+        .is_empty()
+        .then(|| aws_sdk_redshiftdata::error::DisplayErrorContext(e).to_string());
+    let err = classify_api_error(code, msg, transport.as_deref());
+    if err.step != "read" {
+        tracing::warn!(code, error = %err.message, "Warehouse lookup failed");
+    }
+    err
+}
+
+/// What a Redshift Data API failure means, always with the underlying error
+/// class and text (secrets and account details removed).
+fn classify_api_error(code: &str, msg: &str, transport: Option<&str>) -> StepError {
+    let why = super::error_detail(code, transport.unwrap_or(msg));
     match code {
         "AccessDeniedException" | "UnrecognizedClientException" => StepError::new(
             "sign_in",
-            "The role in your AWS account isn't allowed to query this warehouse.",
+            format!("The role in your AWS account isn't allowed to query this warehouse ({why})."),
             "Run the setup script again and choose this warehouse.",
         ),
         "ValidationException" | "ExecuteStatementException" => StepError::new(
             "read",
-            format!(
-                "The warehouse couldn't run that: {}",
-                crate::truncate_str(msg, 300)
-            ),
-            "Check table and column names with the description of this warehouse.",
+            format!("The warehouse couldn't run that ({why})."),
+            "Check table and column names with live_describe before trying again.",
         ),
         _ => StepError::new(
             "reach",
-            "We couldn't reach the warehouse.",
+            format!("We couldn't reach the warehouse ({why})."),
             "Check the warehouse is running, then try again.",
         ),
     }
@@ -470,6 +481,26 @@ pub async fn verify_read_only_user(
     }
 }
 
+/// Reads the tables and columns of every shared database again, each
+/// database's user re-checked as read-only first. Returns the text the agents
+/// search and the number of tables.
+pub async fn read_schema(session: &Session, t: &AwsTarget) -> Result<(String, usize), StepError> {
+    let c = client(session);
+    let mut schema = String::new();
+    let mut tables = 0;
+    for db in &t.databases {
+        verify_read_only_user(session, t, db).await?;
+        let rows = run(&c, t, db, SCHEMA_READ).await?;
+        let (text, n) = schema_text(db, &rows);
+        if !schema.is_empty() && !text.is_empty() {
+            schema.push('\n');
+        }
+        schema.push_str(&text);
+        tables += n;
+    }
+    Ok((schema, tables))
+}
+
 /// Tables and columns of every shared database, one text block per table, so
 /// the agents can search them like an API's description.
 pub fn schema_text(database: &str, rows: &[Row]) -> (String, usize) {
@@ -705,6 +736,22 @@ mod tests {
         .message
         .contains("2 tables in dev"));
         assert!(access_problem(&row(json!({"who":"r"})), "dev").is_some());
+    }
+
+    #[test]
+    fn warehouse_failures_say_what_went_wrong() {
+        let e = classify_api_error("", "", Some("dispatch failure: timeout"));
+        assert_eq!(e.step, "reach");
+        assert!(
+            e.message.contains("dispatch failure: timeout"),
+            "{}",
+            e.message
+        );
+        let e = classify_api_error("ThrottlingException", "Rate exceeded", None);
+        assert!(e.message.contains("ThrottlingException: Rate exceeded"));
+        let e = classify_api_error("ValidationException", "column \"x\" does not exist", None);
+        assert_eq!(e.step, "read");
+        assert!(e.message.contains("column \"x\" does not exist"));
     }
 
     #[test]
