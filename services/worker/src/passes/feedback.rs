@@ -443,7 +443,13 @@ Rules:
         &format!("{}/{}", msg.repo_owner, msg.repo_name),
         msg.pr_number,
     )
-    .await;
+    .await
+    .map(|l| {
+        l.with_run(
+            &msg.run_id,
+            format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
+        )
+    });
     if let Some(l) = &live {
         tools.extend(l.tools());
         full_system.push_str(&l.prompt_section());
@@ -456,7 +462,12 @@ Rules:
         format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
     )
     .await
-    .map(|s| s.with_run(Some(msg.run_id.as_str())));
+    .map(|s| {
+        s.with_run(Some(msg.run_id.as_str())).with_task(&format!(
+            "Answering review comments on PR #{}",
+            msg.pr_number
+        ))
+    });
     if let Some(s) = &skills {
         tools.extend(s.tools());
         full_system.push_str(&s.prompt_section());

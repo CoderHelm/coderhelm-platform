@@ -382,7 +382,18 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         &format!("{}/{}", msg.repo_owner, msg.repo_name),
         0,
     )
-    .await;
+    .await
+    .map(|l| {
+        l.with_run(
+            run_id.unwrap_or_default(),
+            super::skills::ticket_origin(
+                &msg.repo_owner,
+                &msg.repo_name,
+                &msg.ticket_id,
+                msg.issue_number,
+            ),
+        )
+    });
     if let Some(l) = &live {
         tools.extend(l.tools());
         full_system.push_str(&l.prompt_section());
@@ -400,7 +411,10 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         ),
     )
     .await
-    .map(|s| s.with_run(run_id));
+    .map(|s| {
+        s.with_run(run_id)
+            .with_task(&format!("Coding: {}", msg.title))
+    });
     if let Some(s) = &skills {
         tools.extend(s.tools());
         full_system.push_str(&s.prompt_section());

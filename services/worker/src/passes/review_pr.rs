@@ -360,7 +360,12 @@ pub async fn run(
             super::skills::Reader::Reviewer,
             format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
         )
-        .await;
+        .await
+        .map(|s| {
+            s.with_task(&format!(
+                "Answering a question on the pull request: {question}"
+            ))
+        });
         let system = match &skills {
             Some(s) => format!("{system}{}", s.prompt_section()),
             None => system,
@@ -642,7 +647,8 @@ pub async fn run(
         super::skills::Reader::Reviewer,
         format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
     )
-    .await;
+    .await
+    .map(|s| s.with_task(&format!("Reviewing: {title}")));
 
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(

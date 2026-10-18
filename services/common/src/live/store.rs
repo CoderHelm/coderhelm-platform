@@ -367,6 +367,14 @@ impl Activity {
     }
 }
 
+/// The run and the work a lookup was made during, for a link from the log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunRef {
+    pub run_id: String,
+    /// e.g. "owner/name#12", or "owner/name · TICKET-1" before a PR exists.
+    pub origin: String,
+}
+
 /// Records a lookup. A failure to record is returned so callers can decide;
 /// the reviewer withholds the result of a lookup it could not record.
 pub async fn log_activity(
@@ -374,6 +382,17 @@ pub async fn log_activity(
     table: &str,
     team_id: &str,
     a: &Activity,
+) -> Result<(), String> {
+    log_activity_in(dynamo, table, team_id, a, &RunRef::default()).await
+}
+
+/// [`log_activity`], also keeping the run and work it was made during.
+pub async fn log_activity_in(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    a: &Activity,
+    run: &RunRef,
 ) -> Result<(), String> {
     let now = chrono::Utc::now();
     let at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -401,6 +420,11 @@ pub async fn log_activity(
         req = req
             .item("repo", av_s(&a.repo))
             .item("pr", AttributeValue::N(a.pr.to_string()));
+    }
+    for (k, v) in [("run_id", &run.run_id), ("origin", &run.origin)] {
+        if !v.is_empty() {
+            req = req.item(k, av_s(crate::truncate_str(v, 300)));
+        }
     }
     req.send()
         .await
@@ -459,9 +483,51 @@ pub async fn list_activity(
                 ev["repo"] = json!(repo);
                 ev["pr"] = json!(i.get("pr").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0));
             }
+            for k in ["run_id", "origin"] {
+                let v = s(i, k);
+                if !v.is_empty() {
+                    ev[k] = json!(v);
+                }
+            }
             ev
         })
         .collect())
+}
+
+/// Lookups since `since` (RFC 3339) by outcome: `(ok, refused, failed)`.
+pub async fn count_activity(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    since: &str,
+) -> Result<(i64, i64, i64), String> {
+    let (mut ok, mut refused, mut failed) = (0, 0, 0);
+    let mut start = None;
+    loop {
+        let out = dynamo
+            .query()
+            .table_name(table)
+            .key_condition_expression("pk = :pk AND sk BETWEEN :lo AND :hi")
+            .expression_attribute_values(":pk", av_s(team_id))
+            .expression_attribute_values(":lo", av_s(&format!("{LOG_PREFIX}{since}")))
+            .expression_attribute_values(":hi", av_s(&format!("{LOG_PREFIX}~")))
+            .projection_expression("outcome")
+            .set_exclusive_start_key(start)
+            .send()
+            .await
+            .map_err(|e| format!("count lookups: {e}"))?;
+        for i in out.items() {
+            match s(i, "outcome").as_str() {
+                "ok" => ok += 1,
+                "refused" => refused += 1,
+                _ => failed += 1,
+            }
+        }
+        start = out.last_evaluated_key().cloned();
+        if start.is_none() {
+            return Ok((ok, refused, failed));
+        }
+    }
 }
 
 #[cfg(test)]
