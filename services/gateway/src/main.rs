@@ -447,6 +447,10 @@ async fn main() -> Result<(), Error> {
             "/skills/item",
             get(routes::skills::item).put(routes::skills::set_enabled),
         )
+        .route(
+            "/skills/asks",
+            get(routes::skills::asks).post(routes::skills::try_agent),
+        )
         .route("/data-sources", get(routes::data_sources::list))
         .route(
             "/data-sources/activity",

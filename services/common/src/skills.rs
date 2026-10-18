@@ -16,7 +16,9 @@
 //!
 //! - `SKILLREPO#{owner/name}`: a connected repository and its last sync;
 //! - `SKILL#{owner/name}#{path}`: one item, its text and its switch;
-//! - `SKILLFILE#{owner/name}#{path}`: one text file next to a skill.
+//! - `SKILLFILE#{owner/name}#{path}`: one text file next to a skill;
+//! - `SKILLASK#{owner/name}#{path}#{ulid}`: one question put to an agent and
+//!   its answer, kept for [`ASK_DAYS`] days.
 //!
 //! And one row per connected repository under the `SKILLREPO_INDEX`
 //! partition (`{team}|{owner/name}`), for the periodic check.
@@ -32,6 +34,7 @@ type Item = HashMap<String, AttributeValue>;
 const REPO: &str = "SKILLREPO#";
 const SKILL: &str = "SKILL#";
 const FILE: &str = "SKILLFILE#";
+const ASK: &str = "SKILLASK#";
 /// One partition listing every team's connected repositories, so the periodic
 /// check reads a few rows instead of scanning the table.
 const INDEX_PK: &str = "SKILLREPO_INDEX";
@@ -50,6 +53,11 @@ pub const MAX_REPO_BYTES: usize = 2_000_000;
 pub const MAX_REPOS: usize = 5;
 /// How much of a description goes into an agent's list.
 pub const DESCRIPTION_CHARS: usize = 240;
+/// How long a question put to an agent, and its answer, is kept.
+pub const ASK_DAYS: i64 = 30;
+/// How much of a question and of an answer is kept for the history.
+pub const ASK_KEEP_QUESTION_CHARS: usize = 4_000;
+pub const ASK_KEEP_ANSWER_CHARS: usize = 12_000;
 
 /// Files next to a skill are kept only when they are text an agent can read.
 const TEXT_EXTENSIONS: &[&str] = &[
@@ -66,6 +74,19 @@ pub struct SkillSyncMessage {
     pub repo: String,
     #[serde(default)]
     pub force: bool,
+}
+
+/// Asks the worker to put an admin's question to a team agent from the
+/// Skills page. The answer is written to the ask record `id` names.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SkillAskMessage {
+    pub team_id: String,
+    pub repo: String,
+    pub path: String,
+    pub id: String,
+    pub question: String,
+    #[serde(default)]
+    pub context: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -542,6 +563,67 @@ impl SkillMeta {
     }
 }
 
+/// One question put to a team agent, and how it went. The context the asker
+/// sent (code, a diff) is not kept, only its size.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentAsk {
+    pub id: String,
+    pub repo: String,
+    pub path: String,
+    /// Who asked: "reviewer", "coder", "planner", or "<email> (try)".
+    pub by: String,
+    /// The work it was asked during, e.g. "owner/name#12". Empty for a try.
+    pub origin: String,
+    pub question: String,
+    pub context_chars: i64,
+    /// "pending", "answered", "failed" or "timed_out".
+    pub outcome: String,
+    pub answer: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub ms: i64,
+    pub at: String,
+}
+
+impl AgentAsk {
+    fn from_item(i: &Item) -> Option<Self> {
+        let sk = s(i, "sk");
+        let id = sk.strip_prefix(ASK)?.rsplit('#').next()?.to_string();
+        Some(Self {
+            id,
+            repo: s(i, "repo"),
+            path: s(i, "path"),
+            by: s(i, "by"),
+            origin: s(i, "origin"),
+            question: s(i, "question"),
+            context_chars: n(i, "context_chars"),
+            outcome: s(i, "outcome"),
+            answer: s(i, "answer"),
+            model: s(i, "model"),
+            input_tokens: n(i, "input_tokens"),
+            output_tokens: n(i, "output_tokens"),
+            ms: n(i, "ms"),
+            at: s(i, "at"),
+        })
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "id": self.id, "by": self.by, "origin": self.origin,
+            "question": self.question, "context_chars": self.context_chars,
+            "outcome": self.outcome, "answer": self.answer, "model": self.model,
+            "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
+            "ms": self.ms, "at": self.at,
+        })
+    }
+}
+
+/// A new ask id. ULIDs sort by time, so the newest asks come first.
+pub fn new_ask_id() -> String {
+    ulid::Ulid::new().to_string()
+}
+
 /// The name agents ask for: `kind:name`, with the repository added when two
 /// connected repositories share one.
 pub fn handles(items: &[SkillMeta]) -> Vec<String> {
@@ -790,6 +872,75 @@ impl SkillStore<'_> {
             .await
             .map(|_| ())
             .map_err(|e| format!("skill store use: {e}"))
+    }
+
+    fn ask_key(repo: &str, path: &str, id: &str) -> String {
+        format!("{ASK}{repo}#{path}#{id}")
+    }
+
+    /// Writes one ask, new or finished. The question and answer are kept
+    /// clipped, and the record expires after [`ASK_DAYS`] days.
+    pub async fn put_ask(&self, a: &AgentAsk) -> Result<(), String> {
+        let ttl = chrono::Utc::now().timestamp() + ASK_DAYS * 86_400;
+        let num = |v: i64| AttributeValue::N(v.to_string());
+        self.dynamo
+            .put_item()
+            .table_name(self.table)
+            .item("pk", av(self.team))
+            .item("sk", av(&Self::ask_key(&a.repo, &a.path, &a.id)))
+            .item("repo", av(&a.repo))
+            .item("path", av(&a.path))
+            .item("by", av(&a.by))
+            .item("origin", av(&a.origin))
+            .item(
+                "question",
+                av(crate::truncate_str(&a.question, ASK_KEEP_QUESTION_CHARS)),
+            )
+            .item("context_chars", num(a.context_chars))
+            .item("outcome", av(&a.outcome))
+            .item(
+                "answer",
+                av(crate::truncate_str(&a.answer, ASK_KEEP_ANSWER_CHARS)),
+            )
+            .item("model", av(&a.model))
+            .item("input_tokens", num(a.input_tokens))
+            .item("output_tokens", num(a.output_tokens))
+            .item("ms", num(a.ms))
+            .item(
+                "at",
+                av(if a.at.is_empty() { now() } else { a.at.clone() }.as_str()),
+            )
+            .item("ttl", num(ttl))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("skill store ask: {e}"))
+    }
+
+    /// One ask, for the Skills page to wait on a try.
+    pub async fn ask(&self, repo: &str, path: &str, id: &str) -> Result<Option<AgentAsk>, String> {
+        Ok(self
+            .get(&Self::ask_key(repo, path, id))
+            .await?
+            .as_ref()
+            .and_then(AgentAsk::from_item))
+    }
+
+    /// An agent's most recent asks, newest first.
+    pub async fn asks(&self, repo: &str, path: &str, limit: i32) -> Result<Vec<AgentAsk>, String> {
+        let r = self
+            .dynamo
+            .query()
+            .table_name(self.table)
+            .key_condition_expression("pk = :p AND begins_with(sk, :s)")
+            .expression_attribute_values(":p", av(self.team))
+            .expression_attribute_values(":s", av(&format!("{ASK}{repo}#{path}#")))
+            .scan_index_forward(false)
+            .limit(limit.clamp(1, 50))
+            .send()
+            .await
+            .map_err(|e| format!("skill store asks: {e}"))?;
+        Ok(r.items().iter().filter_map(AgentAsk::from_item).collect())
     }
 
     /// Records a failed sync without touching what was read before.

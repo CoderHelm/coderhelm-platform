@@ -415,8 +415,13 @@ Rules:
         full_system.push_str(&l.prompt_section());
     }
     // The team's own written skills, read-only guidance.
-    let skills =
-        super::skills::TeamSkills::load(state, &msg.team_id, super::skills::Reader::Coder).await;
+    let skills = super::skills::TeamSkills::load(
+        state,
+        &msg.team_id,
+        super::skills::Reader::Coder,
+        format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
+    )
+    .await;
     if let Some(s) = &skills {
         tools.extend(s.tools());
         full_system.push_str(&s.prompt_section());

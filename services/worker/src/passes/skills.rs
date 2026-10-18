@@ -14,8 +14,8 @@
 //! no tool or permission it didn't already have.
 
 use common::skills::{
-    self, file_in_skill, handles, parse_item, select, usable, within_budget, Kind, SkillMeta,
-    SkillStore, SkillSyncMessage,
+    self, file_in_skill, handles, parse_item, select, usable, within_budget, AgentAsk, Kind,
+    SkillAskMessage, SkillMeta, SkillStore, SkillSyncMessage,
 };
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -201,6 +201,8 @@ impl Reader {
 pub struct TeamSkills {
     team_id: String,
     reader: Reader,
+    /// The work this run is on, e.g. "owner/name#12", for the ask history.
+    origin: String,
     items: Vec<(String, SkillMeta)>,
     reads: std::sync::atomic::AtomicUsize,
     asks: std::sync::atomic::AtomicUsize,
@@ -211,7 +213,12 @@ pub struct TeamSkills {
 impl TeamSkills {
     /// The team's switched-on items, or `None` when there are none (or they
     /// can't be read: work goes on without them).
-    pub async fn load(state: &WorkerState, team_id: &str, reader: Reader) -> Option<TeamSkills> {
+    pub async fn load(
+        state: &WorkerState,
+        team_id: &str,
+        reader: Reader,
+        origin: String,
+    ) -> Option<TeamSkills> {
         let st = SkillStore {
             dynamo: &state.dynamo,
             table: &state.config.settings_table_name,
@@ -232,7 +239,7 @@ impl TeamSkills {
                 return None;
             }
         };
-        Self::from_items(team_id, reader, items)
+        Self::from_items(team_id, reader, items).map(|s| TeamSkills { origin, ..s })
     }
 
     fn from_items(team_id: &str, reader: Reader, items: Vec<SkillMeta>) -> Option<TeamSkills> {
@@ -243,6 +250,7 @@ impl TeamSkills {
         Some(TeamSkills {
             team_id: team_id.to_string(),
             reader,
+            origin: String::new(),
             items: names.into_iter().zip(items).collect(),
             reads: std::sync::atomic::AtomicUsize::new(0),
             asks: std::sync::atomic::AtomicUsize::new(0),
@@ -410,69 +418,36 @@ impl TeamSkills {
                 return "The agent couldn't be reached right now. Continue without it.".into();
             }
         };
-        let provider = match crate::agent::provider::ModelProvider::load_for_team(
-            &state.dynamo,
-            &state.config.settings_table_name,
-            &self.team_id,
-        )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %e, "No model for a team agent");
-                return "The agent couldn't be reached right now. Continue without it.".into();
-            }
-        };
-        let (hint, system) = agent_system_prompt(&body, self.reader);
-        let model = pick_model(hint.as_deref(), &provider).to_string();
         let context = input["context"].as_str().unwrap_or("");
-        let user = format!(
-            "{}{}",
-            common::truncate_str(question, ASK_QUESTION_CHARS),
-            if context.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n\n## Context\n{}",
-                    common::truncate_str(context, ASK_CONTEXT_CHARS)
-                )
-            }
-        );
-        let mut messages = vec![(
-            "user".to_string(),
-            vec![json!({"type": "text", "text": user})],
-        )];
-        let mut usage = crate::models::TokenUsage::default();
-        let call = crate::agent::provider::converse(
-            state,
-            &provider,
-            &model,
-            &system,
-            &mut messages,
-            // No tools at all, whatever the brief's own `tools:` line says.
-            &[],
-            &NoTools,
-            &mut usage,
-            crate::agent::llm::ConverseOptions {
-                max_turns: 1,
-                max_tokens: ASK_MAX_TOKENS,
-                deadline: None,
-                effort: Some("medium"),
-            },
-            None,
-            None,
-        );
-        let answer = match tokio::time::timeout(ASK_TIMEOUT, call).await {
-            Ok(Ok(a)) => a,
-            Ok(Err(e)) => {
-                warn!(error = %e, agent = %asked, "Team agent call failed");
-                return "The agent didn't answer. Continue without it.".into();
-            }
-            Err(_) => {
-                warn!(agent = %asked, "Team agent call timed out");
-                return "The agent took too long to answer. Continue without it.".into();
-            }
+        let mut record = AgentAsk {
+            id: skills::new_ask_id(),
+            repo: m.repo.clone(),
+            path: m.path.clone(),
+            by: self.reader.label().to_string(),
+            origin: self.origin.clone(),
+            question: question.to_string(),
+            context_chars: context.len() as i64,
+            ..Default::default()
         };
+        let reply = answer_as_agent(
+            state,
+            &self.team_id,
+            &body,
+            self.reader.label(),
+            question,
+            context,
+        )
+        .await;
+        record.outcome = reply.outcome.to_string();
+        record.model = reply.model.clone();
+        record.input_tokens = reply.usage.input_tokens as i64;
+        record.output_tokens = reply.usage.output_tokens as i64;
+        record.ms = reply.ms;
+        record.answer = reply.answer.clone().unwrap_or_default();
+        if let Err(e) = st.put_ask(&record).await {
+            warn!(error = %e, "Could not keep a team agent ask");
+        }
+        let usage = reply.usage;
         if let Ok(mut u) = self.usage.lock() {
             u.add(
                 usage.input_tokens,
@@ -481,11 +456,17 @@ impl TeamSkills {
                 usage.cache_write_tokens,
             );
         }
+        let Some(answer) = reply.answer else {
+            return match reply.outcome {
+                "timed_out" => "The agent took too long to answer. Continue without it.".into(),
+                _ => "The agent didn't answer. Continue without it.".into(),
+            };
+        };
+        let model = reply.model;
         let by = format!("{} (asked)", self.reader.label());
         if let Err(e) = st.record_use(&m.repo, &m.path, &by).await {
             warn!(error = %e, "Could not count a team agent ask");
         }
-        let (answer, _) = common::live::redact::redact_text(&answer);
         info!(
             team_id = %self.team_id,
             agent = %asked,
@@ -624,6 +605,168 @@ impl TeamSkills {
     }
 }
 
+/// Where a ticket run's asks came from: "owner/name#12" for a GitHub issue,
+/// otherwise "owner/name · TICKET-1".
+pub fn ticket_origin(owner: &str, name: &str, ticket_id: &str, issue_number: u64) -> String {
+    if issue_number > 0 {
+        format!("{owner}/{name}#{issue_number}")
+    } else {
+        format!("{owner}/{name} · {ticket_id}")
+    }
+}
+
+/// How one question to a team agent went.
+struct AgentReply {
+    /// "answered", "failed" or "timed_out".
+    outcome: &'static str,
+    /// Redacted. `None` unless answered.
+    answer: Option<String>,
+    model: String,
+    usage: crate::models::TokenUsage,
+    ms: i64,
+}
+
+/// Puts one question to a team agent: its brief as instructions, the team's
+/// own model, no tools, one turn, capped in length and time. Used by a run's
+/// `ask_team_agent` and by an admin's try on the Skills page alike, so both
+/// get exactly the same agent.
+async fn answer_as_agent(
+    state: &WorkerState,
+    team_id: &str,
+    brief: &str,
+    asker: &str,
+    question: &str,
+    context: &str,
+) -> AgentReply {
+    let started = std::time::Instant::now();
+    let mut reply = AgentReply {
+        outcome: "failed",
+        answer: None,
+        model: String::new(),
+        usage: Default::default(),
+        ms: 0,
+    };
+    let provider = match crate::agent::provider::ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "No model for a team agent");
+            return reply;
+        }
+    };
+    let (hint, system) = agent_system_prompt(brief, asker);
+    reply.model = pick_model(hint.as_deref(), &provider).to_string();
+    let user = format!(
+        "{}{}",
+        common::truncate_str(question, ASK_QUESTION_CHARS),
+        if context.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n## Context\n{}",
+                common::truncate_str(context, ASK_CONTEXT_CHARS)
+            )
+        }
+    );
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![json!({"type": "text", "text": user})],
+    )];
+    let call = crate::agent::provider::converse(
+        state,
+        &provider,
+        &reply.model,
+        &system,
+        &mut messages,
+        // No tools at all, whatever the brief's own `tools:` line says.
+        &[],
+        &NoTools,
+        &mut reply.usage,
+        crate::agent::llm::ConverseOptions {
+            max_turns: 1,
+            max_tokens: ASK_MAX_TOKENS,
+            deadline: None,
+            effort: Some("medium"),
+        },
+        None,
+        None,
+    );
+    match tokio::time::timeout(ASK_TIMEOUT, call).await {
+        Ok(Ok(a)) => {
+            reply.outcome = "answered";
+            reply.answer = Some(common::live::redact::redact_text(&a).0);
+        }
+        Ok(Err(e)) => warn!(error = %e, "Team agent call failed"),
+        Err(_) => {
+            warn!("Team agent call timed out");
+            reply.outcome = "timed_out";
+        }
+    }
+    reply.ms = started.elapsed().as_millis() as i64;
+    reply
+}
+
+/// An admin's question to a team agent from the Skills page. The page waits
+/// on the ask record the gateway wrote as pending; this fills it in.
+pub async fn try_ask(
+    state: &WorkerState,
+    msg: SkillAskMessage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let st = SkillStore {
+        dynamo: &state.dynamo,
+        table: &state.config.settings_table_name,
+        team: &msg.team_id,
+    };
+    let Some(mut record) = st.ask(&msg.repo, &msg.path, &msg.id).await? else {
+        warn!(id = %msg.id, "Try ask record is gone");
+        return Ok(());
+    };
+    if record.outcome != "pending" {
+        // A redelivered message: it was answered already.
+        return Ok(());
+    }
+    let reply = match st.item(&msg.repo, &msg.path).await? {
+        Some((m, body)) if m.enabled && m.kind == skills::Kind::Agent => {
+            answer_as_agent(
+                state,
+                &msg.team_id,
+                &body,
+                "admin, trying you out",
+                &msg.question,
+                &msg.context,
+            )
+            .await
+        }
+        _ => {
+            record.outcome = "failed".into();
+            record.answer = "This agent was switched off or removed.".into();
+            st.put_ask(&record).await?;
+            return Ok(());
+        }
+    };
+    record.outcome = reply.outcome.to_string();
+    record.answer = reply.answer.unwrap_or_default();
+    record.model = reply.model;
+    record.input_tokens = reply.usage.input_tokens as i64;
+    record.output_tokens = reply.usage.output_tokens as i64;
+    record.ms = reply.ms;
+    st.put_ask(&record).await?;
+    info!(
+        team_id = %msg.team_id,
+        agent = %msg.path,
+        outcome = %record.outcome,
+        input_tokens = record.input_tokens,
+        output_tokens = record.output_tokens,
+        "Admin tried a team agent"
+    );
+    Ok(())
+}
+
 /// A team agent gets no tools: anything it asks for is refused.
 struct NoTools;
 
@@ -643,7 +786,7 @@ impl crate::agent::llm::ToolExecutor for NoTools {
 /// A team agent's instructions from its brief, and its `model:` hint. Only
 /// the text after the front matter is used: the brief's `tools:`, `model:`
 /// and any other settings never reach the model as instructions.
-fn agent_system_prompt(brief: &str, reader: Reader) -> (Option<String>, String) {
+fn agent_system_prompt(brief: &str, asker: &str) -> (Option<String>, String) {
     let (_, _, body) = skills::parse_front_matter(brief);
     let hint = front_matter_field(brief, "model");
     let system = format!(
@@ -652,7 +795,7 @@ fn agent_system_prompt(brief: &str, reader: Reader) -> (Option<String>, String) 
          can't read files, run commands or look anything up, so if you'd need something you \
          weren't given, say what. Keep the answer focused, under about 600 words.\n\n\
          ## Your brief\n{}",
-        reader.label(),
+        asker,
         common::truncate_str(&body, READ_CHARS)
     );
     (hint, system)
@@ -721,6 +864,12 @@ mod tests {
             last_used_by: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    #[test]
+    fn asks_say_which_work_they_came_from() {
+        assert_eq!(ticket_origin("acme", "web", "ABC-1", 12), "acme/web#12");
+        assert_eq!(ticket_origin("acme", "web", "ABC-1", 0), "acme/web · ABC-1");
     }
 
     #[test]
@@ -834,7 +983,7 @@ mod tests {
     #[test]
     fn a_briefs_tools_and_settings_never_reach_the_model() {
         let brief = "---\nname: reviewer-bot\ndescription: Reviews specs\ntools: Bash, Write, WebFetch\nmodel: opus\n---\nYou review requirements.\n";
-        let (hint, system) = agent_system_prompt(brief, Reader::Reviewer);
+        let (hint, system) = agent_system_prompt(brief, "reviewer");
         assert_eq!(hint.as_deref(), Some("opus"));
         assert!(system.contains("You review requirements."));
         assert!(!system.contains("Bash"), "{system}");
@@ -850,7 +999,7 @@ mod tests {
         assert_eq!(pick_model(Some("sonnet"), &p), "team-primary");
         assert_eq!(pick_model(Some("gpt-9"), &p), "team-primary");
         assert_eq!(pick_model(None, &p), "team-primary");
-        let (hint, _) = agent_system_prompt("no front matter", Reader::Coder);
+        let (hint, _) = agent_system_prompt("no front matter", "coder");
         assert_eq!(hint, None);
     }
 
