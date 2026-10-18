@@ -451,6 +451,7 @@ async fn main() -> Result<(), Error> {
             "/skills/asks",
             get(routes::skills::asks).post(routes::skills::try_agent),
         )
+        .route("/skills/stats", get(routes::skills::stats))
         .route("/data-sources", get(routes::data_sources::list))
         .route(
             "/data-sources/activity",

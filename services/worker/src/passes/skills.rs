@@ -625,6 +625,9 @@ impl TeamSkills {
         if let Err(e) = st.record_use(&m.repo, &m.path, self.reader.label()).await {
             warn!(error = %e, "Could not count a skill read");
         }
+        if let Err(e) = st.count_read(&m.repo, &m.path, self.reader.label()).await {
+            warn!(error = %e, "Could not count today's skill read");
+        }
         info!(
             team_id = %self.team_id,
             skill = %asked,

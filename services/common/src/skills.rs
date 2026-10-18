@@ -18,7 +18,9 @@
 //! - `SKILL#{owner/name}#{path}`: one item, its text and its switch;
 //! - `SKILLFILE#{owner/name}#{path}`: one text file next to a skill;
 //! - `SKILLASK#{owner/name}#{path}#{ulid}`: one question put to an agent and
-//!   its answer, kept for [`ASK_DAYS`] days.
+//!   its answer, kept for [`ASK_DAYS`] days;
+//! - `SKILLDAY#{yyyy-mm-dd}#{owner/name}#{path}`: how many times each agent
+//!   read one item that day, kept for [`STAT_KEEP_DAYS`] days.
 //!
 //! And one row per connected repository under the `SKILLREPO_INDEX`
 //! partition (`{team}|{owner/name}`), for the periodic check.
@@ -35,6 +37,7 @@ const REPO: &str = "SKILLREPO#";
 const SKILL: &str = "SKILL#";
 const FILE: &str = "SKILLFILE#";
 const ASK: &str = "SKILLASK#";
+const DAY: &str = "SKILLDAY#";
 /// One partition listing every team's connected repositories, so the periodic
 /// check reads a few rows instead of scanning the table.
 const INDEX_PK: &str = "SKILLREPO_INDEX";
@@ -58,6 +61,12 @@ pub const ASK_DAYS: i64 = 30;
 /// How much of a question and of an answer is kept for the history.
 pub const ASK_KEEP_QUESTION_CHARS: usize = 4_000;
 pub const ASK_KEEP_ANSWER_CHARS: usize = 12_000;
+/// Days the usage stats cover.
+pub const STAT_DAYS: i64 = 30;
+/// Days a day's read counts are kept, a little past what the stats show.
+pub const STAT_KEEP_DAYS: i64 = 35;
+/// The agents whose reads are counted.
+pub const READERS: [&str; 3] = ["planner", "coder", "reviewer"];
 
 /// Files next to a skill are kept only when they are text an agent can read.
 const TEXT_EXTENSIONS: &[&str] = &[
@@ -959,6 +968,90 @@ impl SkillStore<'_> {
             .map_err(|e| format!("skill store use: {e}"))
     }
 
+    /// Counts one read of an item by one of [`READERS`] on today's row.
+    pub async fn count_read(&self, repo: &str, path: &str, reader: &str) -> Result<(), String> {
+        if !READERS.contains(&reader) {
+            return Err(format!("skill store read count: unknown reader {reader}"));
+        }
+        let today = chrono::Utc::now().format("%Y-%m-%d");
+        let ttl = chrono::Utc::now().timestamp() + STAT_KEEP_DAYS * 86_400;
+        self.dynamo
+            .update_item()
+            .table_name(self.table)
+            .key("pk", av(self.team))
+            .key("sk", av(&format!("{DAY}{today}#{repo}#{path}")))
+            .update_expression("ADD #r :one SET repo = :repo, #p = :path, #t = :ttl")
+            .expression_attribute_names("#r", reader)
+            .expression_attribute_names("#p", "path")
+            .expression_attribute_names("#t", "ttl")
+            .expression_attribute_values(":one", AttributeValue::N("1".into()))
+            .expression_attribute_values(":repo", av(repo))
+            .expression_attribute_values(":path", av(path))
+            .expression_attribute_values(":ttl", AttributeValue::N(ttl.to_string()))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("skill store read count: {e}"))
+    }
+
+    /// Every day's read counts from `since` (yyyy-mm-dd) on.
+    pub async fn read_days(&self, since: &str) -> Result<Vec<ReadDay>, String> {
+        let mut out = Vec::new();
+        let mut start = None;
+        loop {
+            let r = self
+                .dynamo
+                .query()
+                .table_name(self.table)
+                .key_condition_expression("pk = :p AND sk BETWEEN :a AND :b")
+                .expression_attribute_values(":p", av(self.team))
+                .expression_attribute_values(":a", av(&format!("{DAY}{since}")))
+                // '$' sorts after '#' and every digit, closing the range.
+                .expression_attribute_values(":b", av(&format!("{DAY}$")))
+                .set_exclusive_start_key(start)
+                .send()
+                .await
+                .map_err(|e| format!("skill store read days: {e}"))?;
+            out.extend(r.items().iter().filter_map(ReadDay::from_item));
+            start = r.last_evaluated_key().cloned();
+            if start.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every ask still kept (the last [`ASK_DAYS`] days), for the stats.
+    pub async fn recent_asks(&self) -> Result<Vec<AgentAsk>, String> {
+        let mut out = Vec::new();
+        let mut start = None;
+        loop {
+            let r = self
+                .dynamo
+                .query()
+                .table_name(self.table)
+                .key_condition_expression("pk = :p AND begins_with(sk, :s)")
+                .expression_attribute_values(":p", av(self.team))
+                .expression_attribute_values(":s", av(ASK))
+                .projection_expression(
+                    "sk, repo, #p, #b, outcome, input_tokens, output_tokens, ms, #a",
+                )
+                .expression_attribute_names("#p", "path")
+                .expression_attribute_names("#b", "by")
+                .expression_attribute_names("#a", "at")
+                .set_exclusive_start_key(start)
+                .send()
+                .await
+                .map_err(|e| format!("skill store recent asks: {e}"))?;
+            out.extend(r.items().iter().filter_map(AgentAsk::from_item));
+            start = r.last_evaluated_key().cloned();
+            if start.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     fn ask_key(repo: &str, path: &str, id: &str) -> String {
         format!("{ASK}{repo}#{path}#{id}")
     }
@@ -1229,9 +1322,226 @@ pub async fn all_repos(
     Ok(out)
 }
 
+/// One item's reads on one day, by each of [`READERS`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReadDay {
+    pub date: String,
+    pub repo: String,
+    pub path: String,
+    pub planner: i64,
+    pub coder: i64,
+    pub reviewer: i64,
+}
+
+impl ReadDay {
+    fn from_item(i: &Item) -> Option<Self> {
+        let sk = s(i, "sk");
+        let date = sk.strip_prefix(DAY)?.split('#').next()?.to_string();
+        Some(Self {
+            date,
+            repo: s(i, "repo"),
+            path: s(i, "path"),
+            planner: n(i, "planner"),
+            coder: n(i, "coder"),
+            reviewer: n(i, "reviewer"),
+        })
+    }
+
+    fn total(&self) -> i64 {
+        self.planner + self.coder + self.reviewer
+    }
+
+    fn by(&self, reader: &str) -> i64 {
+        match reader {
+            "planner" => self.planner,
+            "coder" => self.coder,
+            "reviewer" => self.reviewer,
+            _ => 0,
+        }
+    }
+}
+
+/// How a team's skills and agents were used over the last [`STAT_DAYS`] days
+/// up to `today`: per day, per agent reading, and per item. Only items still
+/// kept count, so a removed item's leftover rows drop out. An admin's tries
+/// are counted apart from the asks Coderhelm's agents made.
+pub fn usage_stats(
+    items: &[SkillMeta],
+    reads: &[ReadDay],
+    asks: &[AgentAsk],
+    today: chrono::NaiveDate,
+) -> Value {
+    let first = today - chrono::Duration::days(STAT_DAYS - 1);
+    let in_window = |date: &str| {
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .map(|d| d >= first && d <= today)
+            .unwrap_or(false)
+    };
+    let known: HashMap<(&str, &str), &SkillMeta> = items
+        .iter()
+        .map(|m| ((m.repo.as_str(), m.path.as_str()), m))
+        .collect();
+    let reads: Vec<&ReadDay> = reads
+        .iter()
+        .filter(|r| in_window(&r.date) && known.contains_key(&(r.repo.as_str(), r.path.as_str())))
+        .collect();
+    let ask_day = |a: &AgentAsk| a.at.get(..10).unwrap_or("").to_string();
+    let (tries, asks): (Vec<&AgentAsk>, Vec<&AgentAsk>) = asks
+        .iter()
+        .filter(|a| {
+            in_window(&ask_day(a)) && known.contains_key(&(a.repo.as_str(), a.path.as_str()))
+        })
+        .partition(|a| a.by.ends_with("(try)"));
+    let answered = |a: &AgentAsk| a.outcome == "answered";
+    let finished = |a: &AgentAsk| a.outcome != "pending";
+
+    let days: Vec<Value> = (0..STAT_DAYS)
+        .map(|i| {
+            let d = (first + chrono::Duration::days(i))
+                .format("%Y-%m-%d")
+                .to_string();
+            let on = |a: &&&AgentAsk| ask_day(a) == d;
+            json!({
+                "date": d,
+                "reads": reads.iter().filter(|r| r.date == d).map(|r| r.total()).sum::<i64>(),
+                "asks": asks.iter().filter(on).count(),
+                "answered": asks.iter().filter(on).filter(|a| answered(a)).count(),
+            })
+        })
+        .collect();
+    let by_reader: Vec<Value> = READERS
+        .iter()
+        .map(|who| {
+            json!({
+                "reader": who,
+                "reads": reads.iter().map(|r| r.by(who)).sum::<i64>(),
+                "asks": asks.iter().filter(|a| a.by == *who).count(),
+            })
+        })
+        .collect();
+
+    let mut per: HashMap<(&str, &str), (i64, usize, usize)> = HashMap::new();
+    for r in &reads {
+        per.entry((r.repo.as_str(), r.path.as_str())).or_default().0 += r.total();
+    }
+    for a in &asks {
+        let e = per.entry((a.repo.as_str(), a.path.as_str())).or_default();
+        e.1 += 1;
+        e.2 += usize::from(answered(a));
+    }
+    let mut top: Vec<(&SkillMeta, (i64, usize, usize))> = per
+        .iter()
+        .filter_map(|(k, v)| known.get(k).map(|m| (*m, *v)))
+        .collect();
+    top.sort_by(|(am, a), (bm, b)| {
+        (b.0 + b.1 as i64)
+            .cmp(&(a.0 + a.1 as i64))
+            .then_with(|| am.name.cmp(&bm.name))
+    });
+    let unused: Vec<&SkillMeta> = items
+        .iter()
+        .filter(|m| m.enabled && !per.contains_key(&(m.repo.as_str(), m.path.as_str())))
+        .collect();
+    let brief = |m: &SkillMeta| json!({ "repo": m.repo, "path": m.path, "name": m.name, "kind": m.kind.as_str() });
+    let mut ms: Vec<i64> = asks.iter().filter(|a| answered(a)).map(|a| a.ms).collect();
+    ms.sort_unstable();
+
+    json!({
+        "days_covered": STAT_DAYS,
+        "since": first.format("%Y-%m-%d").to_string(),
+        "reads": reads.iter().map(|r| r.total()).sum::<i64>(),
+        "asks": asks.len(),
+        "answered": asks.iter().filter(|a| answered(a)).count(),
+        "no_answer": asks.iter().filter(|a| finished(a) && !answered(a)).count(),
+        "tries": tries.len(),
+        "input_tokens": asks.iter().map(|a| a.input_tokens).sum::<i64>(),
+        "output_tokens": asks.iter().map(|a| a.output_tokens).sum::<i64>(),
+        "median_answer_ms": ms.get(ms.len() / 2).copied(),
+        "days": days,
+        "by_reader": by_reader,
+        "top": top.iter().take(8).map(|(m, (reads, asks, answered))| {
+            let mut v = brief(m);
+            v["reads"] = json!(reads);
+            v["asks"] = json!(asks);
+            v["answered"] = json!(answered);
+            v
+        }).collect::<Vec<_>>(),
+        "unused_count": unused.len(),
+        "unused": unused.iter().take(12).map(|m| brief(m)).collect::<Vec<_>>(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_stats_count_reads_and_asks_in_the_window_only() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
+        let items = vec![
+            meta("acme/playbook", Kind::Skill, "api-conventions", true),
+            meta("acme/playbook", Kind::Agent, "spec-checker", true),
+            meta("acme/playbook", Kind::Agent, "copy-tone", true),
+        ];
+        let read = |date: &str, path: &str, coder: i64, reviewer: i64| ReadDay {
+            date: date.into(),
+            repo: "acme/playbook".into(),
+            path: path.into(),
+            coder,
+            reviewer,
+            ..Default::default()
+        };
+        let reads = vec![
+            read("2026-03-31", "skills/api-conventions.md", 2, 1),
+            read("2026-03-02", "skills/api-conventions.md", 1, 0),
+            // Before the 30 days, and for an item since removed: both left out.
+            read("2026-03-01", "skills/api-conventions.md", 9, 0),
+            read("2026-03-31", "skills/gone.md", 5, 0),
+        ];
+        let ask = |by: &str, outcome: &str, ms: i64| AgentAsk {
+            repo: "acme/playbook".into(),
+            path: "agents/spec-checker.md".into(),
+            by: by.into(),
+            outcome: outcome.into(),
+            ms,
+            at: "2026-03-30T10:00:00Z".into(),
+            ..Default::default()
+        };
+        let asks = vec![
+            ask("reviewer", "answered", 3000),
+            ask("planner", "answered", 5000),
+            ask("coder", "timed_out", 0),
+            ask("admin@example.com (try)", "answered", 1000),
+        ];
+        let v = usage_stats(&items, &reads, &asks, today);
+        assert_eq!(v["since"], "2026-03-02");
+        assert_eq!(v["days"].as_array().unwrap().len(), 30);
+        assert_eq!(v["reads"], 4);
+        assert_eq!(v["asks"], 3);
+        assert_eq!(v["answered"], 2);
+        assert_eq!(v["no_answer"], 1);
+        assert_eq!(v["tries"], 1);
+        assert_eq!(v["median_answer_ms"], 5000);
+        assert_eq!(
+            v["days"][29],
+            json!({"date": "2026-03-31", "reads": 3, "asks": 0, "answered": 0})
+        );
+        assert_eq!(v["days"][28]["asks"], 3);
+        let coder = &v["by_reader"][1];
+        assert_eq!(
+            (
+                coder["reader"].as_str(),
+                coder["reads"].as_i64(),
+                coder["asks"].as_i64()
+            ),
+            (Some("coder"), Some(3), Some(1))
+        );
+        assert_eq!(v["top"][0]["name"], "api-conventions");
+        assert_eq!(v["top"][1]["name"], "spec-checker");
+        assert_eq!(v["top"][1]["answered"], 2);
+        assert_eq!(v["unused_count"], 1);
+        assert_eq!(v["unused"][0]["name"], "copy-tone");
+    }
 
     #[test]
     fn repo_names_are_owner_slash_name() {
