@@ -766,7 +766,8 @@ pub async fn run(
             held_since_approval = held;
         }
     }
-    let postable = review_agent::to_postable(&findings, &changed);
+    let hunks = review_agent::right_line_hunks(&compare);
+    let postable = review_agent::to_postable(&findings, &changed, &hunks);
 
     // 4) Optional sandbox verification ("receipts"): actually run the affected
     // tests/build. A hard failure forces REQUEST_CHANGES.
@@ -965,13 +966,15 @@ pub async fn run(
             .await;
         if let Err(e) = posted {
             warn!(pr = msg.pr_number, error = %e, "Inline review post failed — retrying body-only");
+            // Fold the inline findings into the body so none are lost.
+            let body_only = review_agent::fold_inline_into_body(&full_body, &postable.inline);
             github
                 .create_pr_review(
                     &msg.repo_owner,
                     &msg.repo_name,
                     msg.pr_number,
                     effective_event,
-                    &full_body,
+                    &body_only,
                 )
                 .await?;
         }
