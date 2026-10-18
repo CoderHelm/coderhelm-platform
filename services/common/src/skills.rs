@@ -185,28 +185,32 @@ fn is_text_path(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The front matter's name and description, and the text after it.
-pub fn parse_front_matter(text: &str) -> (Option<String>, Option<String>, String) {
+/// A file's front matter (the text between the `---` lines) and the text
+/// after it. `None` when the file has no front matter.
+fn split_front_matter(text: &str) -> Option<(&str, String)> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let Some(after) = text
+    let after = text
         .strip_prefix("---\n")
-        .or_else(|| text.strip_prefix("---\r\n"))
-    else {
-        return (None, None, text.to_string());
-    };
-    let Some(end) = after
+        .or_else(|| text.strip_prefix("---\r\n"))?;
+    let end = after
         .find("\n---\n")
         .or_else(|| after.find("\n---\r\n"))
-        .or_else(|| after.strip_suffix("\n---").map(|s| s.len()))
-    else {
-        return (None, None, text.to_string());
-    };
+        .or_else(|| after.strip_suffix("\n---").map(|s| s.len()))?;
     let head = &after[..end];
     let body = after[end..]
         .trim_start_matches('\n')
         .trim_start_matches("---")
         .trim_start_matches(['\r', '\n'])
         .to_string();
+    Some((head, body))
+}
+
+/// The front matter's name and description, and the text after it.
+pub fn parse_front_matter(text: &str) -> (Option<String>, Option<String>, String) {
+    let Some((head, body)) = split_front_matter(text) else {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        return (None, None, text.to_string());
+    };
     let field = |k: &str| -> Option<String> {
         if let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(head) {
             if let Some(s) = v.get(k).and_then(|x| x.as_str()) {
@@ -228,6 +232,135 @@ pub fn parse_front_matter(text: &str) -> (Option<String>, Option<String>, String
         })
     };
     (field("name"), field("description"), body)
+}
+
+/// The tools an item asks for in its front matter, from `tools:` and
+/// `allowed-tools:`. Either may be a YAML list or one string of names split by
+/// commas or spaces. A pattern such as `Bash(git status:*)` counts as its base
+/// name (`Bash`); an MCP tool (`mcp__server__tool`) keeps its full name. Each
+/// name appears once, in the order first asked for.
+pub fn front_matter_tools(text: &str) -> Vec<String> {
+    let Some((head, _)) = split_front_matter(text) else {
+        return Vec::new();
+    };
+    let mut raw: Vec<String> = Vec::new();
+    match serde_yaml::from_str::<serde_yaml::Value>(head) {
+        Ok(v) if v.is_mapping() => {
+            for key in ["tools", "allowed-tools"] {
+                match v.get(key) {
+                    Some(serde_yaml::Value::Sequence(list)) => {
+                        for x in list {
+                            if let Some(s) = x.as_str() {
+                                raw.extend(split_tool_list(s));
+                            }
+                        }
+                    }
+                    Some(serde_yaml::Value::String(s)) => raw.extend(split_tool_list(s)),
+                    _ => {}
+                }
+            }
+        }
+        // Front matter that isn't valid YAML: `key: a, b` lines, or a key
+        // followed by `- name` lines.
+        _ => {
+            let lines: Vec<&str> = head.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                let Some((key, value)) = l.split_once(':') else {
+                    continue;
+                };
+                if l.starts_with([' ', '\t']) || !matches!(key.trim(), "tools" | "allowed-tools") {
+                    continue;
+                }
+                let value = value.trim();
+                if !value.is_empty() {
+                    let value = value.trim_start_matches('[').trim_end_matches(']');
+                    raw.extend(split_tool_list(value));
+                    continue;
+                }
+                for next in &lines[i + 1..] {
+                    let Some(item) = next.trim_start().strip_prefix("- ") else {
+                        break;
+                    };
+                    raw.extend(split_tool_list(item));
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    raw.into_iter()
+        .filter_map(|t| tool_base_name(&t))
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
+}
+
+/// Splits `Read, Grep Bash(git status:*)` into its names: commas and spaces
+/// separate them, except inside a pattern's parentheses.
+fn split_tool_list(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            ',' | ' ' | '\t' if depth == 0 => {
+                if !cur.trim().is_empty() {
+                    out.push(cur.trim().to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// `Bash(git status:*)` gives `Bash`. Quotes are dropped; `*` (any tool) and
+/// empty names are no tool.
+fn tool_base_name(t: &str) -> Option<String> {
+    let t = t.trim().trim_matches(['"', '\'']).trim();
+    let base = t.split('(').next().unwrap_or("").trim();
+    (!base.is_empty() && base != "*").then(|| base.to_string())
+}
+
+/// Claude Code's tool names, and the Coderhelm tools that do the same job.
+/// Only real equivalents are listed: Coderhelm's agents read, search, edit
+/// and write a repository's files. A test in the worker checks that every
+/// Coderhelm name here is a tool its coding agent is given.
+pub const TOOL_EQUIVALENTS: &[(&str, &[&str])] = &[
+    ("Read", &["read_file", "read_file_lines"]),
+    ("Edit", &["edit_file"]),
+    ("MultiEdit", &["edit_file"]),
+    ("Write", &["write_file", "batch_write"]),
+    ("Grep", &["search_code"]),
+    ("Glob", &["read_tree", "list_directory"]),
+    ("LS", &["list_directory"]),
+];
+
+/// The tools an item asks for that Coderhelm's agents don't have. A Claude
+/// Code name counts as had when [`TOOL_EQUIVALENTS`] lists an equivalent, and
+/// Coderhelm's own tool names count as they are. Everything else (a shell,
+/// the web, sub agents, notebooks, MCP tools) is missing: Coderhelm runs the
+/// item without it.
+pub fn missing_tools(asked: &[String]) -> Vec<String> {
+    asked
+        .iter()
+        .filter(|t| {
+            !TOOL_EQUIVALENTS
+                .iter()
+                .any(|(name, ours)| name == t || ours.contains(&t.as_str()))
+        })
+        .cloned()
+        .collect()
 }
 
 /// When there's no description, the first line of text that isn't a heading.
@@ -351,6 +484,20 @@ pub struct Parsed {
     pub hash: String,
     /// Files kept next to a skill (paths in the repository).
     pub files: Vec<String>,
+    /// Tools its front matter asks for that Coderhelm's agents don't have.
+    pub missing_tools: Vec<String>,
+}
+
+/// The tools an item asks for that it won't get. A team agent answers with
+/// no tools at all (see [`agent_system_prompt`]), so every tool it lists is
+/// missing; a skill or command is read by Coderhelm's agents, who have the
+/// tools [`missing_tools`] knows.
+pub fn item_missing_tools(kind: Kind, text: &str) -> Vec<String> {
+    let asked = front_matter_tools(text);
+    match kind {
+        Kind::Agent => asked,
+        Kind::Skill | Kind::Command => missing_tools(&asked),
+    }
 }
 
 /// Turns an item's text into what's kept. `None` when the path isn't an item.
@@ -375,6 +522,7 @@ pub fn parse_item(path: &str, text: &str) -> Option<Parsed> {
         hash: content_hash(text),
         body: text.to_string(),
         files: Vec::new(),
+        missing_tools: item_missing_tools(kind, text),
     })
 }
 
@@ -524,6 +672,8 @@ pub struct SkillMeta {
     pub hash: String,
     pub enabled: bool,
     pub files: Vec<String>,
+    /// Tools its front matter asks for that Coderhelm's agents don't have.
+    pub missing_tools: Vec<String>,
     pub uses: i64,
     pub last_used_at: String,
     pub last_used_by: String,
@@ -559,6 +709,11 @@ impl SkillMeta {
                 .and_then(|v| v.as_l().ok())
                 .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
                 .unwrap_or_default(),
+            missing_tools: i
+                .get("missing_tools")
+                .and_then(|v| v.as_l().ok())
+                .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
+                .unwrap_or_default(),
             uses: n(i, "uses"),
             last_used_at: s(i, "last_used_at"),
             last_used_by: s(i, "last_used_by"),
@@ -576,6 +731,7 @@ impl SkillMeta {
             "repo": self.repo, "path": self.path, "kind": self.kind.as_str(),
             "name": self.name, "description": self.description, "sha": self.sha,
             "hash": self.hash, "enabled": self.enabled, "files": self.files,
+            "missing_tools": self.missing_tools,
             "uses": self.uses, "last_used_at": self.last_used_at,
             "last_used_by": self.last_used_by, "updated_at": self.updated_at,
             "asks": self.asks, "last_asked_at": self.last_asked_at,
@@ -1187,18 +1343,51 @@ impl SkillStore<'_> {
             return Ok(());
         }
         let at = now();
-        let existing: HashMap<String, String> = self
-            .query(&format!("{SKILL}{repo}#"), Some("sk, #h, sha"))
+        // Each kept item's text and commit, and the tools it was last found
+        // to be missing (`None` for an item kept before that was worked out).
+        let existing: HashMap<String, (String, Option<Vec<String>>)> = self
+            .query(
+                &format!("{SKILL}{repo}#"),
+                Some("sk, #h, sha, missing_tools"),
+            )
             .await?
             .iter()
-            .map(|i| (s(i, "sk"), format!("{}|{}", s(i, "hash"), s(i, "sha"))))
+            .map(|i| {
+                let missing = i.get("missing_tools").and_then(|v| v.as_l().ok()).map(|l| {
+                    l.iter()
+                        .filter_map(|x| x.as_s().ok().cloned())
+                        .collect::<Vec<_>>()
+                });
+                (
+                    s(i, "sk"),
+                    (format!("{}|{}", s(i, "hash"), s(i, "sha")), missing),
+                )
+            })
             .collect();
         let mut keep: HashSet<String> = HashSet::new();
         for it in items {
             let sk = format!("{SKILL}{repo}#{}", it.path);
             keep.insert(sk.clone());
-            if existing.get(&sk) == Some(&format!("{}|{sha}", it.hash)) {
-                continue;
+            let missing_av = AttributeValue::L(it.missing_tools.iter().map(|t| av(t)).collect());
+            if let Some((same, missing)) = existing.get(&sk) {
+                if *same == format!("{}|{sha}", it.hash) {
+                    if missing.as_ref() != Some(&it.missing_tools) {
+                        // Same text, but its missing tools were never kept or
+                        // Coderhelm's tools changed: only those are written.
+                        self.dynamo
+                            .update_item()
+                            .table_name(self.table)
+                            .key("pk", av(self.team))
+                            .key("sk", av(&sk))
+                            .update_expression("SET missing_tools = :m")
+                            .condition_expression("attribute_exists(sk)")
+                            .expression_attribute_values(":m", missing_av)
+                            .send()
+                            .await
+                            .map_err(|e| format!("skill store write: {e}"))?;
+                    }
+                    continue;
+                }
             }
             let files_av = AttributeValue::L(it.files.iter().map(|f| av(f)).collect());
             self.dynamo
@@ -1208,7 +1397,7 @@ impl SkillStore<'_> {
                 .key("sk", av(&sk))
                 .update_expression(
                     "SET repo = :r, #p = :p, kind = :k, #n = :n, description = :d, body = :b, \
-                     sha = :sha, #h = :h, files = :f, updated_at = :at",
+                     sha = :sha, #h = :h, files = :f, missing_tools = :m, updated_at = :at",
                 )
                 .expression_attribute_names("#h", "hash")
                 .expression_attribute_names("#p", "path")
@@ -1222,6 +1411,7 @@ impl SkillStore<'_> {
                 .expression_attribute_values(":sha", av(sha))
                 .expression_attribute_values(":h", av(&it.hash))
                 .expression_attribute_values(":f", files_av)
+                .expression_attribute_values(":m", missing_av)
                 .expression_attribute_values(":at", av(&at))
                 .send()
                 .await
@@ -1622,6 +1812,134 @@ mod tests {
         assert_eq!(name, None);
     }
 
+    fn tools(front: &str) -> Vec<String> {
+        front_matter_tools(&format!("---\n{front}\n---\nbody"))
+    }
+
+    #[test]
+    fn front_matter_tools_reads_lists_and_strings() {
+        // A YAML list.
+        assert_eq!(
+            tools("name: a\ntools:\n  - Read\n  - Grep\n  - WebFetch"),
+            ["Read", "Grep", "WebFetch"]
+        );
+        // A flow list.
+        assert_eq!(tools("tools: [Read, Bash]"), ["Read", "Bash"]);
+        // One string, split by commas or spaces.
+        assert_eq!(tools("tools: Read, Grep,Glob"), ["Read", "Grep", "Glob"]);
+        assert_eq!(tools("allowed-tools: Read Write"), ["Read", "Write"]);
+        // Both keys, each name once.
+        assert_eq!(
+            tools("tools: Read, Grep\nallowed-tools: [Grep, Edit]"),
+            ["Read", "Grep", "Edit"]
+        );
+    }
+
+    #[test]
+    fn front_matter_tools_reduces_patterns_and_keeps_mcp_names() {
+        assert_eq!(
+            tools("allowed-tools: Bash(git status:*), Bash(git diff:*), Read"),
+            ["Bash", "Read"]
+        );
+        assert_eq!(
+            tools("allowed-tools:\n  - \"Bash(npm run test:*)\"\n  - mcp__tracker__get_issue"),
+            ["Bash", "mcp__tracker__get_issue"]
+        );
+        assert_eq!(
+            tools("tools: mcp__docs__search mcp__docs__fetch"),
+            ["mcp__docs__search", "mcp__docs__fetch"]
+        );
+    }
+
+    #[test]
+    fn front_matter_tools_when_there_are_none() {
+        assert!(tools("name: a\ndescription: b").is_empty());
+        assert!(tools("tools:").is_empty());
+        assert!(tools("tools: \"*\"").is_empty());
+        assert!(front_matter_tools("# No front matter\ntools: Bash").is_empty());
+        assert!(front_matter_tools("---\ntools: Bash\nno end").is_empty());
+    }
+
+    #[test]
+    fn front_matter_tools_reads_front_matter_that_isnt_yaml() {
+        // An unquoted `: ` in the description makes this invalid YAML.
+        assert_eq!(
+            tools("description: Use when: tests fail\ntools: Read, Bash(git log:*)"),
+            ["Read", "Bash"]
+        );
+        assert_eq!(
+            tools("description: Use when: tests fail\nallowed-tools:\n  - Grep\n  - WebSearch\nmodel: x"),
+            ["Grep", "WebSearch"]
+        );
+        assert_eq!(
+            tools("description: a: b\ntools: [Read, Task]"),
+            ["Read", "Task"]
+        );
+    }
+
+    #[test]
+    fn missing_tools_are_the_ones_without_an_equivalent() {
+        let asked: Vec<String> = [
+            "Read",
+            "Edit",
+            "MultiEdit",
+            "Write",
+            "Grep",
+            "Glob",
+            "LS",
+            "read_file",
+            "Bash",
+            "WebFetch",
+            "WebSearch",
+            "Task",
+            "Agent",
+            "NotebookEdit",
+            "TodoWrite",
+            "mcp__tracker__get_issue",
+            "read",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            missing_tools(&asked),
+            [
+                "Bash",
+                "WebFetch",
+                "WebSearch",
+                "Task",
+                "Agent",
+                "NotebookEdit",
+                "TodoWrite",
+                "mcp__tracker__get_issue",
+                "read",
+            ]
+        );
+        assert!(missing_tools(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_parsed_item_keeps_its_missing_tools() {
+        let text =
+            "---\nname: fix\nallowed-tools: Read, Edit, Bash(cargo test:*), WebFetch\n---\nSteps";
+        let p = parse_item("commands/fix.md", text).unwrap();
+        assert_eq!(p.missing_tools, ["Bash", "WebFetch"]);
+        let p = parse_item("skills/fix/SKILL.md", text).unwrap();
+        assert_eq!(p.missing_tools, ["Bash", "WebFetch"]);
+        // A team agent answers with no tools, so all of them are missing.
+        let p = parse_item("agents/fix.md", text).unwrap();
+        assert_eq!(p.missing_tools, ["Read", "Edit", "Bash", "WebFetch"]);
+        let p = parse_item("agents/plain.md", "---\nname: plain\n---\nAnswer.").unwrap();
+        assert!(p.missing_tools.is_empty());
+    }
+
+    #[test]
+    fn missing_tools_reach_the_api() {
+        let mut m = meta("acme/playbook", Kind::Command, "fix", true);
+        m.missing_tools = vec!["Bash".into()];
+        assert_eq!(m.json()["missing_tools"], json!(["Bash"]));
+    }
+
     #[test]
     fn an_item_without_front_matter_uses_its_path_and_first_line() {
         let p = parse_item(
@@ -1748,6 +2066,7 @@ mod tests {
             hash: "h".into(),
             enabled,
             files: vec![],
+            missing_tools: vec![],
             uses: 0,
             last_used_at: String::new(),
             last_used_by: String::new(),
