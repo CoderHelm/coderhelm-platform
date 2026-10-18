@@ -338,12 +338,30 @@ pub async fn rename_team(
     Ok(Json(json!({ "status": "renamed", "name": new_name })))
 }
 
-/// GET /api/allowlist — list allowed emails (owner only).
+/// The signup allowlist is platform-wide (one `ALLOWLIST` partition for
+/// every team), so only the platform admin may read or change it. A team
+/// owner role is not enough: anyone who signs up owns their own team.
+fn is_platform_admin(email: &str) -> bool {
+    let admins = std::env::var("PLATFORM_ADMIN_EMAILS")
+        .unwrap_or_else(|_| "admin@coderhelm.com".to_string());
+    platform_admin_listed(&admins, email)
+}
+
+fn platform_admin_listed(admins: &str, email: &str) -> bool {
+    let email = email.trim();
+    !email.is_empty()
+        && admins
+            .split(',')
+            .map(str::trim)
+            .any(|a| !a.is_empty() && a.eq_ignore_ascii_case(email))
+}
+
+/// GET /api/allowlist — list allowed emails (platform admin only).
 pub async fn list_allowlist(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    if claims.role != "owner" {
+    if !is_platform_admin(&claims.email) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -370,13 +388,13 @@ pub async fn list_allowlist(
     Ok(Json(json!({ "emails": emails })))
 }
 
-/// POST /api/allowlist — add an email to the allowlist (owner only).
+/// POST /api/allowlist — add an email to the allowlist (platform admin only).
 pub async fn add_to_allowlist(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    if claims.role != "owner" {
+    if !is_platform_admin(&claims.email) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -408,13 +426,13 @@ pub async fn add_to_allowlist(
     Ok(Json(json!({ "status": "added", "email": email })))
 }
 
-/// DELETE /api/allowlist — remove an email from the allowlist (owner only).
+/// DELETE /api/allowlist — remove an email from the allowlist (platform admin only).
 pub async fn remove_from_allowlist(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    if claims.role != "owner" {
+    if !is_platform_admin(&claims.email) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1112,10 +1130,22 @@ async fn github_reset_branch(
     }
 }
 
+/// Whether a run may be started over. A run still in flight would have its
+/// branch deleted out from under the worker and race a duplicate run (cancel
+/// it first); a merged run shipped, and starting over would rebuild the same
+/// work as a second PR. Same rules as `trigger_gate`.
+fn reset_allowed(status: &str) -> bool {
+    !matches!(
+        status,
+        "pending" | "queued" | "running" | "awaiting_ci" | "merged"
+    )
+}
+
 /// POST /api/runs/:run_id/reset — close the PR, delete the branch, and start
-/// a brand-new run from scratch. Unlike retry, works on ANY run status —
-/// the "start over cleanly" control for a run whose branch is corrupted or
-/// whose work should be thrown away.
+/// a brand-new run from scratch. Unlike retry, works on finished runs of any
+/// outcome (not in-flight or merged ones, see `reset_allowed`) — the "start
+/// over cleanly" control for a run whose branch is corrupted or whose work
+/// should be thrown away.
 pub async fn reset_and_rerun(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -1142,6 +1172,15 @@ pub async fn reset_and_rerun(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
+
+    let status = item
+        .get("status")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    if !reset_allowed(status) {
+        return Err(StatusCode::CONFLICT);
+    }
 
     let repo = item
         .get("repo")
@@ -3871,6 +3910,61 @@ pub async fn delete_model_provider(
     Ok(StatusCode::OK)
 }
 
+type RunItem = std::collections::HashMap<String, AttributeValue>;
+
+fn item_s<'a>(item: &'a RunItem, key: &str) -> Option<&'a str> {
+    item.get(key)
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+}
+
+/// Runs whose status is `status` and that pass `keep`, newest first, at most
+/// `max`. Reads the `status-index` GSI (`status_run_id` = `<status>#<run_id>`)
+/// page by page. The health checks used to query the whole team partition
+/// with `Limit` 20/50 before the status filter, so they only ever looked at
+/// the oldest 20 or 50 runs and missed nearly every stuck or failed run.
+async fn runs_with_status(
+    state: &AppState,
+    team_id: &str,
+    status: &str,
+    keep: impl Fn(&RunItem) -> bool,
+    max: usize,
+) -> Result<Vec<RunItem>, ()> {
+    let mut out: Vec<RunItem> = Vec::new();
+    let mut start: Option<RunItem> = None;
+    // A hard stop, so one team's long history cannot make this page slow.
+    for _ in 0..20 {
+        let result = state
+            .dynamo
+            .query()
+            .table_name(&state.config.runs_table_name)
+            .index_name("status-index")
+            .key_condition_expression("team_id = :tid AND begins_with(status_run_id, :p)")
+            .expression_attribute_values(":tid", attr_s(team_id))
+            .expression_attribute_values(":p", attr_s(&format!("{status}#")))
+            .scan_index_forward(false)
+            .limit(100)
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| error!("health: status-index query failed: {e}"))?;
+        for item in result.items() {
+            // The index can lag the table; trust the item's own status.
+            if item_s(item, "status") == Some(status) && keep(item) {
+                out.push(item.clone());
+                if out.len() >= max {
+                    return Ok(out);
+                }
+            }
+        }
+        match result.last_evaluated_key() {
+            Some(key) => start = Some(key.clone()),
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
 /// GET /api/health — system health check (stale runs, DLQ depth, queue depths).
 pub async fn health(
     State(state): State<Arc<AppState>>,
@@ -3883,22 +3977,16 @@ pub async fn health(
 
     // 1. Crashed runs — "running" with no update for over 20 minutes (worker likely died or timed out)
     let crash_cutoff = (now - chrono::Duration::minutes(20)).to_rfc3339();
-    if let Ok(result) = state
-        .dynamo
-        .query()
-        .table_name(&state.config.runs_table_name)
-        .key_condition_expression("team_id = :tid")
-        .filter_expression("#s = :running AND updated_at < :cutoff")
-        .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":tid", attr_s(&claims.team_id))
-        .expression_attribute_values(":running", attr_s("running"))
-        .expression_attribute_values(":cutoff", attr_s(&crash_cutoff))
-        .limit(20)
-        .send()
-        .await
+    if let Ok(items) = runs_with_status(
+        &state,
+        &claims.team_id,
+        "running",
+        |item| item_s(item, "updated_at").is_some_and(|t| t < crash_cutoff.as_str()),
+        20,
+    )
+    .await
     {
-        let crashed: Vec<Value> = result
-            .items()
+        let crashed: Vec<Value> = items
             .iter()
             .map(|item| {
                 let run_id = item.get("run_id").and_then(|v| v.as_s().ok()).cloned().unwrap_or_default();
@@ -3947,22 +4035,16 @@ pub async fn health(
 
     // 2. Stale queued — sitting in queue for over 30 minutes
     let stale_cutoff = (now - chrono::Duration::minutes(30)).to_rfc3339();
-    if let Ok(result) = state
-        .dynamo
-        .query()
-        .table_name(&state.config.runs_table_name)
-        .key_condition_expression("team_id = :tid")
-        .filter_expression("#s = :queued AND created_at < :cutoff")
-        .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":tid", attr_s(&claims.team_id))
-        .expression_attribute_values(":queued", attr_s("queued"))
-        .expression_attribute_values(":cutoff", attr_s(&stale_cutoff))
-        .limit(20)
-        .send()
-        .await
+    if let Ok(items) = runs_with_status(
+        &state,
+        &claims.team_id,
+        "queued",
+        |item| item_s(item, "created_at").is_some_and(|t| t < stale_cutoff.as_str()),
+        20,
+    )
+    .await
     {
-        let stale_runs: Vec<Value> = result
-            .items()
+        let stale_runs: Vec<Value> = items
             .iter()
             .map(|item| {
                 json!({
@@ -4060,28 +4142,22 @@ pub async fn health(
 
     // 5. Recent failed runs (last 24h)
     let error_cutoff = (now - chrono::Duration::hours(24)).to_rfc3339();
-    if let Ok(result) = state
-        .dynamo
-        .query()
-        .table_name(&state.config.runs_table_name)
-        .key_condition_expression("team_id = :tid")
-        .filter_expression("#s = :failed AND created_at > :cutoff")
-        .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":tid", attr_s(&claims.team_id))
-        .expression_attribute_values(":failed", attr_s("failed"))
-        .expression_attribute_values(":cutoff", attr_s(&error_cutoff))
-        .limit(50)
-        .send()
-        .await
+    if let Ok(items) = runs_with_status(
+        &state,
+        &claims.team_id,
+        "failed",
+        |item| item_s(item, "created_at").is_some_and(|t| t > error_cutoff.as_str()),
+        50,
+    )
+    .await
     {
-        let failed_runs: Vec<Value> = result
-            .items()
+        let failed_runs: Vec<Value> = items
             .iter()
             .map(|item| {
                 json!({
                     "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
                     "title": item.get("title").and_then(|v| v.as_s().ok()),
-                    "error": item.get("error").and_then(|v| v.as_s().ok()),
+                    "error": item_s(item, "error_message").or_else(|| item_s(item, "error")),
                     "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
                 })
             })
@@ -4500,4 +4576,37 @@ pub async fn purge_dlq(
 
     warn!(team_id = %claims.team_id, deleted, "DLQ purged (team-scoped)");
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{platform_admin_listed, reset_allowed};
+
+    #[test]
+    fn only_listed_emails_are_platform_admins() {
+        let admins = "admin@coderhelm.com, ops@coderhelm.com";
+        assert!(platform_admin_listed(admins, "admin@coderhelm.com"));
+        assert!(platform_admin_listed(admins, "Ops@CoderHelm.com"));
+        assert!(!platform_admin_listed(admins, "owner@example.com"));
+        assert!(!platform_admin_listed(admins, ""));
+        assert!(!platform_admin_listed("", "admin@coderhelm.com"));
+        assert!(!platform_admin_listed(" , ", ""));
+    }
+
+    #[test]
+    fn start_over_refuses_runs_in_flight_and_merged_runs() {
+        for status in ["pending", "queued", "running", "awaiting_ci", "merged"] {
+            assert!(!reset_allowed(status), "{status} must not be started over");
+        }
+        for status in [
+            "completed",
+            "failed",
+            "needs_input",
+            "cancelled",
+            "retried",
+            "success",
+        ] {
+            assert!(reset_allowed(status), "{status} may be started over");
+        }
+    }
 }

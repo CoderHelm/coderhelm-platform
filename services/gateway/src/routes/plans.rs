@@ -26,55 +26,76 @@ pub async fn list_plans(
         .unwrap_or(20)
         .min(100);
 
-    let mut query = state
-        .dynamo
-        .query()
-        .table_name(&state.config.plans_table_name)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", attr_s(&claims.team_id))
-        .expression_attribute_values(":prefix", attr_s("PLAN#"))
-        .filter_expression("attribute_exists(plan_id)")
-        .scan_index_forward(false)
-        .limit(limit);
-
-    // Resume from cursor
-    if let Some(cursor) = params.get("cursor").filter(|c| !c.is_empty()) {
-        let lek = std::collections::HashMap::from([
-            ("pk".to_string(), attr_s(&claims.team_id)),
-            ("sk".to_string(), attr_s(cursor)),
-        ]);
-        query = query.set_exclusive_start_key(Some(lek));
-    }
-
-    let result = query.send().await.map_err(|e| {
-        error!("Failed to query plans: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let plans: Vec<Value> = result
-        .items()
-        .iter()
-        .filter(|item| {
+    // Plan rows (`PLAN#<id>`) share the partition with their task rows
+    // (`PLAN#<id>#TASK#…`), and DynamoDB applies `Limit` before any filter.
+    // A single limited query therefore counted task rows against the page:
+    // a page could hold a couple of plans, or none, plus a cursor. Read
+    // query pages until `limit` plans are collected, and hand back the sort
+    // key of the last plan returned as the cursor.
+    type Key = std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>;
+    let mut start: Option<Key> = params
+        .get("cursor")
+        .filter(|c| !c.is_empty())
+        .map(|cursor| {
+            Key::from([
+                ("pk".to_string(), attr_s(&claims.team_id)),
+                ("sk".to_string(), attr_s(cursor)),
+            ])
+        });
+    let mut plans: Vec<Value> = Vec::new();
+    let mut next_cursor: Option<String> = None;
+    'pages: loop {
+        let result = state
+            .dynamo
+            .query()
+            .table_name(&state.config.plans_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":pk", attr_s(&claims.team_id))
+            .expression_attribute_values(":prefix", attr_s("PLAN#"))
+            .scan_index_forward(false)
+            .limit(100)
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to query plans: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        for item in result.items() {
             let sk = item
                 .get("sk")
                 .and_then(|v| v.as_s().ok())
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            !sk.contains("#TASK#")
-        })
-        .map(plan_from_item)
-        .collect();
-
-    let next_cursor = result
-        .last_evaluated_key()
-        .and_then(|k| k.get("sk"))
-        .and_then(|v| v.as_s().ok())
-        .map(|s| s.to_string());
+            if !is_plan_row(sk) {
+                continue;
+            }
+            if plans.len() >= limit as usize {
+                // One more plan exists past this page: keep the cursor.
+                break 'pages;
+            }
+            next_cursor = Some(sk.to_string());
+            plans.push(plan_from_item(item));
+        }
+        match result.last_evaluated_key() {
+            Some(key) => start = Some(key.clone()),
+            None => {
+                // Read to the end: nothing after the last plan.
+                next_cursor = None;
+                break;
+            }
+        }
+    }
 
     Ok(Json(json!({
         "plans": plans,
         "next_cursor": next_cursor,
     })))
+}
+
+/// A plan's own row, as opposed to one of its task rows.
+fn is_plan_row(sk: &str) -> bool {
+    sk.starts_with("PLAN#") && !sk.contains("#TASK#")
 }
 
 /// POST /api/plans — create a new plan.
@@ -3762,6 +3783,19 @@ fn accumulate_delta(block: &mut Value, delta: &Value, partial_json: &mut String)
             partial_json.push_str(delta["partial_json"].as_str().unwrap_or(""));
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::is_plan_row;
+
+    #[test]
+    fn task_rows_do_not_count_as_plans() {
+        assert!(is_plan_row("PLAN#01PLAN"));
+        assert!(!is_plan_row("PLAN#01PLAN#TASK#01TASK"));
+        assert!(!is_plan_row("TEMPLATE#01T"));
+        assert!(!is_plan_row(""));
     }
 }
 

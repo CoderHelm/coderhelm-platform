@@ -388,16 +388,6 @@ pub const CAPABILITIES: &[Capability] = &[
         handlers: &["api::delete_jira_integration", "api::delete_model_provider"],
     },
     Capability {
-        key: "allowlist",
-        label: "Manage the sign-up allowlist",
-        min_role: "owner",
-        handlers: &[
-            "api::list_allowlist",
-            "api::add_to_allowlist",
-            "api::remove_from_allowlist",
-        ],
-    },
-    Capability {
         key: "reset",
         label: "Reset account data",
         min_role: "owner",
