@@ -28,6 +28,7 @@ pub async fn run(
     voice: &str,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
+    run_id: &str,
 ) -> Result<PrResult, Box<dyn std::error::Error + Send + Sync>> {
     // Get diff for body summary
     let diff = github
@@ -158,6 +159,11 @@ Return ONLY the markdown body text."#,
             format!("Source ticket: {}\n\n{clean_body}", msg.ticket_id)
         }
     };
+    // Which team agents the planner and coder asked, where reviewers look.
+    let full_body = format!(
+        "{full_body}{}",
+        super::skills::run_consulted(state, &msg.team_id, run_id).await
+    );
 
     // Create PR title
     let mut title = match msg.source {
@@ -363,11 +369,7 @@ async fn notify_alert_pr(
     else {
         return;
     };
-    let base = if state.config.stage == "prod" {
-        "https://app.coderhelm.com"
-    } else {
-        "http://localhost:3000"
-    };
+    let base = super::skills::app_url(&state.config.stage);
     let alert_id = s("alert_id");
     let alert_url = if alert_id.is_empty() {
         String::new()

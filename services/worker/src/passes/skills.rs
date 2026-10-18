@@ -210,6 +210,8 @@ pub struct TeamSkills {
     asks: std::sync::atomic::AtomicUsize,
     /// Tokens spent asking team agents, added to the run's own count.
     usage: std::sync::Mutex<crate::models::TokenUsage>,
+    /// The asks made here, for the "Consulted" line on what Coderhelm writes.
+    asked: std::sync::Mutex<Vec<AgentAsk>>,
 }
 
 impl TeamSkills {
@@ -258,6 +260,7 @@ impl TeamSkills {
             reads: std::sync::atomic::AtomicUsize::new(0),
             asks: std::sync::atomic::AtomicUsize::new(0),
             usage: std::sync::Mutex::new(Default::default()),
+            asked: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -278,6 +281,20 @@ impl TeamSkills {
                 spent.cache_write_tokens,
             );
         }
+    }
+
+    /// The "Consulted" line for what this reader writes on a PR, or nothing
+    /// when it asked no team agent.
+    pub fn consulted_markdown(&self, base: &str) -> String {
+        let asked = self.asked.lock().map(|a| a.clone()).unwrap_or_default();
+        consulted_markdown(&consulted(&asked, |r, p| self.name_of(r, p)), base)
+    }
+
+    fn name_of(&self, repo: &str, path: &str) -> Option<String> {
+        self.items
+            .iter()
+            .find(|(_, m)| m.repo == repo && m.path == path)
+            .map(|(_, m)| m.name.clone())
     }
 
     fn has_agents(&self) -> bool {
@@ -457,6 +474,9 @@ impl TeamSkills {
         record.answer = reply.answer.clone().unwrap_or_default();
         if let Err(e) = st.put_ask(&record).await {
             warn!(error = %e, "Could not keep a team agent ask");
+        }
+        if let Ok(mut a) = self.asked.lock() {
+            a.push(record);
         }
         if let Err(e) = st.count_ask(&m.repo, &m.path).await {
             warn!(error = %e, "Could not count a team agent ask");
@@ -823,9 +843,164 @@ fn clip(text: &str) -> String {
     }
 }
 
+/// Where links to the dashboard point.
+pub fn app_url(stage: &str) -> &'static str {
+    if stage == "prod" {
+        "https://app.coderhelm.com"
+    } else {
+        "http://localhost:3000"
+    }
+}
+
+/// One team agent asked during a piece of work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Consulted {
+    pub name: String,
+    pub repo: String,
+    pub path: String,
+    pub asked: usize,
+    pub answered: usize,
+}
+
+/// Asks grouped by agent, in the order each was first asked. `name_of` gives
+/// an agent's name; without one the file name stands in.
+pub fn consulted(
+    asks: &[AgentAsk],
+    name_of: impl Fn(&str, &str) -> Option<String>,
+) -> Vec<Consulted> {
+    let mut out: Vec<Consulted> = Vec::new();
+    for a in asks {
+        let answered = usize::from(a.outcome == "answered");
+        if let Some(c) = out
+            .iter_mut()
+            .find(|c| c.repo == a.repo && c.path == a.path)
+        {
+            c.asked += 1;
+            c.answered += answered;
+            continue;
+        }
+        let name = name_of(&a.repo, &a.path).unwrap_or_else(|| {
+            let file = a.path.rsplit('/').next().unwrap_or(&a.path);
+            file.strip_suffix(".md").unwrap_or(file).to_string()
+        });
+        out.push(Consulted {
+            name,
+            repo: a.repo.clone(),
+            path: a.path.clone(),
+            asked: 1,
+            answered,
+        });
+    }
+    out
+}
+
+/// The line Coderhelm adds to a PR body, review or reply when it asked team
+/// agents, each linked to its page. Empty when it asked none.
+pub fn consulted_markdown(list: &[Consulted], base: &str) -> String {
+    if list.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = list
+        .iter()
+        .map(|c| {
+            let note = match (c.asked, c.answered) {
+                (_, 0) => " (no answer)".to_string(),
+                (1, _) => String::new(),
+                (n, a) if a == n => format!(" (asked {n} times)"),
+                (n, a) => format!(" ({a} of {n} answered)"),
+            };
+            format!(
+                "[{}]({base}/skills/agent/?repo={}&path={}){note}",
+                c.name.replace(['[', ']'], ""),
+                urlencoding::encode(&c.repo),
+                urlencoding::encode(&c.path),
+            )
+        })
+        .collect();
+    format!(
+        "\n\n<sub>Consulted team agents: {}</sub>",
+        parts.join(" · ")
+    )
+}
+
+/// The "Consulted" line for everything a run asked, across its passes.
+pub async fn run_consulted(state: &WorkerState, team_id: &str, run_id: &str) -> String {
+    if run_id.is_empty() {
+        return String::new();
+    }
+    let st = SkillStore {
+        dynamo: &state.dynamo,
+        table: &state.config.settings_table_name,
+        team: team_id,
+    };
+    let asks = match st.asks_for_run(run_id).await {
+        Ok(a) if !a.is_empty() => a,
+        Ok(_) => return String::new(),
+        Err(e) => {
+            warn!(error = %e, "Could not read the run's team agent asks");
+            return String::new();
+        }
+    };
+    let items = st.items().await.unwrap_or_default();
+    let name_of = |repo: &str, path: &str| {
+        items
+            .iter()
+            .find(|m| m.repo == repo && m.path == path)
+            .map(|m| m.name.clone())
+    };
+    consulted_markdown(&consulted(&asks, name_of), app_url(&state.config.stage))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ask(path: &str, outcome: &str) -> AgentAsk {
+        AgentAsk {
+            repo: "acme/playbook".into(),
+            path: path.into(),
+            outcome: outcome.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_consulted_line_names_each_agent_once_with_its_page() {
+        let asks = [
+            ask("agents/spec-checker.md", "answered"),
+            ask("agents/copy-tone.md", "timed_out"),
+            ask("agents/spec-checker.md", "answered"),
+        ];
+        let named =
+            |_: &str, p: &str| (p == "agents/spec-checker.md").then(|| "Spec checker".to_string());
+        let list = consulted(&asks, named);
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].asked, list[0].answered), (2, 2));
+        // Without a known name, the file name stands in.
+        assert_eq!(list[1].name, "copy-tone");
+        let md = consulted_markdown(&list, "https://app.example.com");
+        assert_eq!(
+            md,
+            "\n\n<sub>Consulted team agents: \
+             [Spec checker](https://app.example.com/skills/agent/?repo=acme%2Fplaybook&path=agents%2Fspec-checker.md) (asked 2 times) · \
+             [copy-tone](https://app.example.com/skills/agent/?repo=acme%2Fplaybook&path=agents%2Fcopy-tone.md) (no answer)</sub>"
+        );
+    }
+
+    #[test]
+    fn nothing_is_added_when_no_agent_was_asked() {
+        assert_eq!(consulted_markdown(&consulted(&[], |_, _| None), "x"), "");
+    }
+
+    #[test]
+    fn a_partly_answered_agent_says_how_many() {
+        let asks = [ask("a.md", "answered"), ask("a.md", "failed")];
+        let md = consulted_markdown(&consulted(&asks, |_, _| None), "b");
+        assert!(
+            md.contains("[a](b/skills/agent/?repo=acme%2Fplaybook&path=a.md) (1 of 2 answered)"),
+            "{md}"
+        );
+    }
 
     fn meta(name: &str, kind: Kind, files: &[&str]) -> SkillMeta {
         SkillMeta {
