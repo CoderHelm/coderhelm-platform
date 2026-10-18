@@ -166,6 +166,8 @@ pub fn severity(kind: &str, title: &str) -> Severity {
             "OK" => Severity::Resolved,
             _ => Severity::Info,
         }
+    } else if kind == "recovery" {
+        Severity::Resolved
     } else {
         Severity::Warning
     }
@@ -299,7 +301,10 @@ pub fn alert_card(a: &AlertCard) -> Value {
         .unwrap_or(a.title);
     let (style, color, label) = match sev {
         Severity::Alarm => ("attention", "Attention", format!("🔴 {name}")),
-        Severity::Resolved => ("good", "Good", format!("✅ Resolved · {name}")),
+        Severity::Resolved if a.kind == "cloudwatch_alarm" => {
+            ("good", "Good", format!("✅ Resolved · {name}"))
+        }
+        Severity::Resolved => ("good", "Good", format!("✅ {name}")),
         Severity::Info => ("emphasis", "Default", format!("⚪ {}", a.title)),
         Severity::Warning => ("warning", "Warning", format!("🟠 {name}")),
     };
@@ -437,9 +442,14 @@ pub fn cloudwatch_console_url(region: &str, alarm_name: &str) -> Option<String> 
 }
 
 /// Log-and-continue wrapper: a notification never fails the caller.
-pub async fn send(http: &reqwest::Client, url: &str, card: &Value, what: &str) {
-    if let Err(e) = post(http, url, card).await {
-        warn!(what, error = %e, "Teams alert notification failed");
+/// Post a card, logging a failure. True when Teams accepted it.
+pub async fn send(http: &reqwest::Client, url: &str, card: &Value, what: &str) -> bool {
+    match post(http, url, card).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(what, error = %e, "Teams alert notification failed");
+            false
+        }
     }
 }
 
