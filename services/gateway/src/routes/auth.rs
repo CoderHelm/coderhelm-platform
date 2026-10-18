@@ -964,6 +964,17 @@ pub async fn github_callback(
 
         // Link GitHub installations to the user's team in both tables
         for (inst_id, org) in &all_installations {
+            let owner = super::github_webhook::resolve_team_by_installation(&state, *inst_id).await;
+            if !may_link_installation(owner.as_deref(), &claims.team_id) {
+                warn!(
+                    installation_id = inst_id,
+                    org,
+                    team_id = %claims.team_id,
+                    owner = owner.as_deref().unwrap_or(""),
+                    "Installation already belongs to another team — not linking it here"
+                );
+                continue;
+            }
             let _ = state
                 .dynamo
                 .update_item()
@@ -971,7 +982,8 @@ pub async fn github_callback(
                 .key("team_id", attr_s(&claims.team_id))
                 .key("sk", attr_s("META"))
                 .update_expression(
-                    "SET github_installation_id = :iid, github_org = :org, updated_at = :now",
+                    "SET github_installation_id = :iid, github_org = :org, updated_at = :now, \
+                     installation_linked_at = if_not_exists(installation_linked_at, :now)",
                 )
                 .expression_attribute_values(
                     ":iid",
@@ -1127,6 +1139,33 @@ pub async fn github_callback(
         return Ok(Redirect::temporary(&redirect).into_response());
     }
 
+    // A first-time sign-in with no invite, from an org whose installation a
+    // team already owns: do NOT mint a new team that also claims the
+    // installation (each such team split the org and stole its webhooks).
+    // The person needs an invite from that team; an invited person already
+    // has a record and never reaches this branch.
+    if !has_existing_record {
+        for (inst_id, org) in &all_installations {
+            if let Some(owner) =
+                super::github_webhook::resolve_team_by_installation(&state, *inst_id).await
+            {
+                info!(
+                    github_login,
+                    installation_id = inst_id,
+                    org = org.as_str(),
+                    owner_team = %owner,
+                    "First GitHub sign-in for an installation another team owns — asking for an invite"
+                );
+                let dash = if state.config.stage == "prod" {
+                    "https://app.coderhelm.com"
+                } else {
+                    "http://localhost:3000"
+                };
+                return Ok(Redirect::temporary(&ask_for_invite_url(dash, org)).into_response());
+            }
+        }
+    }
+
     let (team_id, user_id, role) = if let Some(ref item) = existing_user {
         // Existing user — extract team_id, user_id, role
         let tid = item
@@ -1208,8 +1247,27 @@ pub async fn github_callback(
         send_welcome_email(&state, email).await;
     }
 
-    // Link GitHub installations to the team in the teams table
-    if !all_installations.is_empty() {
+    // Link GitHub installations to the team in the teams table — only when no
+    // OTHER team owns the installation already.
+    let link_target = match all_installations.first() {
+        Some(&(inst_id, _)) => {
+            let owner = super::github_webhook::resolve_team_by_installation(&state, inst_id).await;
+            if may_link_installation(owner.as_deref(), &team_id) {
+                Some(inst_id)
+            } else {
+                warn!(
+                    github_login,
+                    installation_id = inst_id,
+                    team_id = %team_id,
+                    owner = owner.as_deref().unwrap_or(""),
+                    "Installation already belongs to another team — not linking it here"
+                );
+                None
+            }
+        }
+        None => None,
+    };
+    if link_target.is_some() {
         let (inst_id, ref org) = all_installations[0];
         let _ = state
             .dynamo
@@ -1218,7 +1276,8 @@ pub async fn github_callback(
             .key("team_id", attr_s(&team_id))
             .key("sk", attr_s("META"))
             .update_expression(
-                "SET github_installation_id = :iid, github_org = :org, updated_at = :now",
+                "SET github_installation_id = :iid, github_org = :org, updated_at = :now, \
+                 installation_linked_at = if_not_exists(installation_linked_at, :now)",
             )
             .expression_attribute_values(
                 ":iid",
@@ -1313,6 +1372,21 @@ pub async fn github_callback(
         StatusCode::FOUND,
     )
         .into_response())
+}
+
+/// A team may link an installation only when no other team owns it.
+fn may_link_installation(owner: Option<&str>, team_id: &str) -> bool {
+    owner.is_none_or(|o| o == team_id)
+}
+
+/// Where a first-time sign-in lands when their org's installation already
+/// belongs to a team: the dashboard tells them to ask that team's admin for an
+/// invite.
+fn ask_for_invite_url(dash: &str, org: &str) -> String {
+    format!(
+        "{dash}?error=ask_admin_invite&org={}",
+        urlencoding::encode(org)
+    )
 }
 
 // ── Logout ───────────────────────────────────────────────────────────
@@ -1754,5 +1828,25 @@ mod team_select_tests {
     #[test]
     fn no_team_yet_returns_none() {
         assert!(select_session_team(&[], "abc").is_none());
+    }
+}
+
+#[cfg(test)]
+mod installation_link_tests {
+    use super::*;
+
+    #[test]
+    fn link_only_unowned_or_own_installations() {
+        assert!(may_link_installation(None, "TEAM#a"));
+        assert!(may_link_installation(Some("TEAM#a"), "TEAM#a"));
+        assert!(!may_link_installation(Some("TEAM#b"), "TEAM#a"));
+    }
+
+    #[test]
+    fn invite_url_names_the_org_safely() {
+        assert_eq!(
+            ask_for_invite_url("https://app.example.com", "acme co"),
+            "https://app.example.com?error=ask_admin_invite&org=acme%20co"
+        );
     }
 }
