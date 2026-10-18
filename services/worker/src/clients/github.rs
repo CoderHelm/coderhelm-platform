@@ -46,6 +46,36 @@ pub struct InlineComment {
     pub body: String,
 }
 
+/// Turn a non-2xx response into an error that CARRIES GitHub's response body.
+/// `error_for_status()` discarded it, so a 422 surfaced only as "422
+/// Unprocessable Entity" with no hint of which field GitHub rejected.
+/// The message keeps the status line, so existing status checks still match.
+async fn ok_or_body(
+    resp: reqwest::Response,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let url = resp.url().clone();
+    let body = resp.text().await.unwrap_or_default();
+    Err(status_error_message(status, url.as_str(), &body).into())
+}
+
+fn status_error_message(status: reqwest::StatusCode, url: &str, body: &str) -> String {
+    let kind = if status.is_client_error() {
+        "client"
+    } else {
+        "server"
+    };
+    let body = common::truncate_str(body.trim(), 2000);
+    if body.is_empty() {
+        format!("HTTP status {kind} error ({status}) for url ({url})")
+    } else {
+        format!("HTTP status {kind} error ({status}) for url ({url}): {body}")
+    }
+}
+
 /// GitHub REST API client using installation token auth.
 pub struct GitHubClient {
     app_id: String,
@@ -196,7 +226,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await?.error_for_status()?;
+        let resp = ok_or_body(req.send().await?).await?;
         Ok(resp.json().await?)
     }
 
@@ -210,7 +240,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await?.error_for_status()?;
+        let resp = ok_or_body(req.send().await?).await?;
         Ok(resp.json().await?)
     }
 
@@ -224,7 +254,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await?.error_for_status()?;
+        let resp = ok_or_body(req.send().await?).await?;
         Ok(resp.json().await?)
     }
 
@@ -1065,6 +1095,10 @@ impl GitHubClient {
                     .await
                     .unwrap_or_else(|_| vec![path.to_string()]);
                 if foreign.iter().any(|p| p == path) {
+                    // Drop the stale snapshot so the re-read this error asks
+                    // for returns LIVE content; keeping it re-served the old
+                    // body and the write was refused again, forever.
+                    self.invalidate_snapshot(owner, repo, branch).await;
                     return Err(format!(
                         "branch advanced upstream: '{path}' was changed by a commit this pass has not read. \
                          Re-read the file and reapply the change on top of its current content."
@@ -1127,6 +1161,9 @@ impl GitHubClient {
                         continue;
                     }
                     _ => {
+                        // The snapshot may hold our own mirrored body; drop it
+                        // so the re-read sees what is actually on the branch.
+                        self.invalidate_snapshot(owner, repo, branch).await;
                         return Err(format!(
                             "write_file conflict: '{path}' changed concurrently on '{branch}'. \
                              Re-read the file and reapply the change on top of its current content."
@@ -1230,6 +1267,8 @@ impl GitHubClient {
                         .filter(|p| write_paths.contains(&p.as_str()))
                         .collect();
                     if !conflicts.is_empty() {
+                        // Same as write_file: the re-read must see live content.
+                        self.invalidate_snapshot(owner, repo, branch).await;
                         return Err(format!(
                             "branch advanced upstream: {} commit(s) landed after this pass read the repo, touching file(s) this write would overwrite: {}. \
                              Re-read the current content of these files and reapply the change on top of it.",
@@ -2410,7 +2449,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        req.send().await?.error_for_status()?;
+        ok_or_body(req.send().await?).await?;
         Ok(())
     }
 
@@ -2493,7 +2532,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        req.send().await?.error_for_status()?;
+        ok_or_body(req.send().await?).await?;
         Ok(())
     }
 
@@ -2683,5 +2722,28 @@ mod token_format_tests {
         assert!(token.len() >= 520);
         let v: reqwest::header::HeaderValue = format!("token {token}").parse().unwrap();
         assert_eq!(v.to_str().unwrap(), format!("token {token}"));
+    }
+}
+
+#[cfg(test)]
+mod status_error_tests {
+    use super::*;
+
+    #[test]
+    fn error_carries_status_and_github_body() {
+        let m = status_error_message(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "https://api.github.com/repos/o/r/pulls/1/reviews",
+            r#"{"message":"Unprocessable Entity","errors":["Line could not be resolved"]}"#,
+        );
+        assert!(m.contains("422"));
+        assert!(m.contains("client error"));
+        assert!(m.contains("Line could not be resolved"));
+    }
+
+    #[test]
+    fn empty_body_keeps_the_status_line() {
+        let m = status_error_message(reqwest::StatusCode::BAD_GATEWAY, "u", "  ");
+        assert_eq!(m, "HTTP status server error (502 Bad Gateway) for url (u)");
     }
 }
