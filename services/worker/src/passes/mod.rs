@@ -1318,6 +1318,7 @@ async fn run_passes(
                 &repo_instructions,
                 &provider,
                 usage,
+                run_id,
             )
             .await?
         }
@@ -1330,6 +1331,7 @@ async fn run_passes(
             &repo_instructions,
             &provider,
             usage,
+            run_id,
         )
         .await?
     };
@@ -2916,6 +2918,7 @@ async fn run_passes(
         &voice,
         &provider,
         usage,
+        run_id,
     )
     .await?;
     write_pass_trace(
@@ -3388,6 +3391,7 @@ async fn run_repo_pipeline(
         voice,
         provider,
         usage,
+        run_id,
     )
     .await?;
     write_pass_trace(

@@ -409,7 +409,11 @@ pub async fn run(
         if let Some(s) = &skills {
             s.drain_usage_into(&mut usage);
         }
-        let body = format!("{answer}{RATING_FOOTER}");
+        let consulted = skills
+            .as_ref()
+            .map(|s| s.consulted_markdown(super::skills::app_url(&state.config.stage)))
+            .unwrap_or_default();
+        let body = format!("{answer}{consulted}{RATING_FOOTER}");
         // Asked inside an inline review thread → answer in that thread.
         match msg.reply_to_comment_id {
             Some(comment_id) => {
@@ -881,6 +885,9 @@ pub async fn run(
             fixed_threads.len(),
             still_open
         ));
+    }
+    if let Some(s) = &skills {
+        full_body.push_str(&s.consulted_markdown(super::skills::app_url(&state.config.stage)));
     }
     full_body.push_str(RATING_FOOTER);
 

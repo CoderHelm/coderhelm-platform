@@ -27,6 +27,7 @@ pub struct RepoTasks {
     pub tasks: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     state: &WorkerState,
     msg: &TicketMessage,
@@ -35,6 +36,7 @@ pub async fn run(
     repo_instructions: &str,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
+    run_id: &str,
 ) -> Result<PlanResult, Box<dyn std::error::Error + Send + Sync>> {
     // Fetch all enabled repos for this team so the planner can explore cross-repo
     let team_repos = fetch_team_repos(state, &msg.team_id).await;
@@ -323,7 +325,8 @@ After researching, output the four files using this exact format:
             msg.issue_number,
         ),
     )
-    .await;
+    .await
+    .map(|s| s.with_run(Some(run_id)));
     if let Some(s) = &skills {
         tools.extend(s.tools());
         full_system.push_str(&s.prompt_section());

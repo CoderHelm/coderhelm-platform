@@ -484,6 +484,12 @@ Rules:
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Which team agents were asked goes once, on the last reply.
+    let consulted = skills
+        .as_ref()
+        .map(|s| s.consulted_markdown(super::skills::app_url(&state.config.stage)))
+        .unwrap_or_default();
+
     // Only match against actionable (non-context) comments for reply posting
     let actionable_comments: Vec<&ReviewComment> = comments
         .iter()
@@ -495,12 +501,16 @@ Rules:
         info!(run_id = %msg.run_id, "CI-only feedback — skipping PR comment (commit is the communication)");
     } else if sections.len() == actionable_comments.len() {
         // Matched — post each section to its corresponding comment thread
-        for (section, comment) in sections.iter().zip(actionable_comments.iter()) {
-            let reply = if section.len() > 65000 {
+        let last = sections.len() - 1;
+        for (i, (section, comment)) in sections.iter().zip(actionable_comments.iter()).enumerate() {
+            let mut reply = if section.len() > 65000 {
                 format!("{}\n\n*(truncated)*", common::truncate_str(section, 65000))
             } else {
                 section.to_string()
             };
+            if i == last {
+                reply.push_str(&consulted);
+            }
             github
                 .reply_to_review_comment(
                     &msg.repo_owner,
@@ -522,6 +532,7 @@ Rules:
         } else {
             reply_text
         };
+        let reply = format!("{reply}{consulted}");
         if let Some(comment_id) = actionable_comments.first().and_then(|c| c.comment_id) {
             github
                 .reply_to_review_comment(
