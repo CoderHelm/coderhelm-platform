@@ -1020,6 +1020,7 @@ mod tests {
             hash: "h".into(),
             enabled: true,
             files: files.iter().map(|f| f.to_string()).collect(),
+            missing_tools: vec![],
             uses: 0,
             last_used_at: String::new(),
             last_used_by: String::new(),

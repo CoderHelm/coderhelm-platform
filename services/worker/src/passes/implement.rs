@@ -2040,3 +2040,23 @@ mod generated_guard_tests {
         let _ = is_generated_file(&s); // just must not panic
     }
 }
+
+#[cfg(test)]
+mod tool_equivalents_tests {
+    use super::all_tools;
+
+    /// The Skills page says a repository item asking for `Read` or `Edit`
+    /// gets Coderhelm's own tool for it. Each one named must be real.
+    #[test]
+    fn every_equivalent_is_a_tool_the_coder_is_given() {
+        let names: Vec<String> = all_tools().into_iter().map(|t| t.name).collect();
+        for (claude, ours) in common::skills::TOOL_EQUIVALENTS {
+            for t in *ours {
+                assert!(
+                    names.iter().any(|n| n == t),
+                    "{claude} maps to {t}, which the coder doesn't have"
+                );
+            }
+        }
+    }
+}
