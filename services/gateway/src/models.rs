@@ -391,6 +391,9 @@ pub struct NotificationPrefs {
     pub email_run_complete: bool,
     pub email_run_failed: bool,
     pub email_weekly_summary: bool,
+    /// Token usage emails at 80% and 100% of the monthly limit. The worker reads
+    /// this exact field name before sending them.
+    pub email_token_warning: bool,
 }
 
 impl Default for NotificationPrefs {
@@ -399,6 +402,41 @@ impl Default for NotificationPrefs {
             email_run_complete: true,
             email_run_failed: true,
             email_weekly_summary: true,
+            email_token_warning: true,
+        }
+    }
+}
+
+impl NotificationPrefs {
+    /// Read stored preferences. A missing field means the email is on, which is
+    /// also what the worker assumes when it decides whether to send.
+    pub fn from_item(
+        item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+    ) -> Self {
+        let flag = |key: &str| {
+            item.get(key)
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(true)
+        };
+        Self {
+            email_run_complete: flag("email_run_complete"),
+            email_run_failed: flag("email_run_failed"),
+            email_weekly_summary: flag("email_weekly_summary"),
+            email_token_warning: flag("email_token_warning"),
+        }
+    }
+
+    /// Apply a request body on top of the stored preferences: a field the body
+    /// leaves out keeps its stored value, so a client that does not know about
+    /// a setting cannot change it by accident.
+    pub fn merged_with(&self, body: &serde_json::Value) -> Self {
+        let pick = |key: &str, current: bool| body[key].as_bool().unwrap_or(current);
+        Self {
+            email_run_complete: pick("email_run_complete", self.email_run_complete),
+            email_run_failed: pick("email_run_failed", self.email_run_failed),
+            email_weekly_summary: pick("email_weekly_summary", self.email_weekly_summary),
+            email_token_warning: pick("email_token_warning", self.email_token_warning),
         }
     }
 }
@@ -472,6 +510,37 @@ mod tests {
         let s: Secrets = serde_json::from_str(json).unwrap();
         assert_eq!(s.github_app_id, "1");
         assert!(s.jira_webhook_secret.is_none());
+    }
+
+    #[test]
+    fn notification_prefs_default_on_when_missing() {
+        let prefs = NotificationPrefs::from_item(&std::collections::HashMap::new());
+        assert!(prefs.email_token_warning);
+        assert!(prefs.email_weekly_summary);
+    }
+
+    #[test]
+    fn notification_prefs_keep_token_warning() {
+        use aws_sdk_dynamodb::types::AttributeValue;
+        let mut item = std::collections::HashMap::new();
+        item.insert(
+            "email_token_warning".to_string(),
+            AttributeValue::Bool(false),
+        );
+        let stored = NotificationPrefs::from_item(&item);
+        assert!(!stored.email_token_warning);
+
+        // A body without the field keeps what was stored.
+        let kept = stored.merged_with(&serde_json::json!({ "email_weekly_summary": false }));
+        assert!(!kept.email_token_warning);
+        assert!(!kept.email_weekly_summary);
+        assert!(kept.email_run_complete);
+
+        // A body with the field changes it, and the response carries it.
+        let on = stored.merged_with(&serde_json::json!({ "email_token_warning": true }));
+        assert!(on.email_token_warning);
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json["email_token_warning"], serde_json::json!(true));
     }
 
     #[test]
