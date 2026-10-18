@@ -743,6 +743,7 @@ pub async fn google_callback(
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or_else(|| "member".to_string());
+        touch_last_login(&state, &tid, &uid).await;
         (tid, uid, r)
     } else {
         // New user — create personal team
@@ -1207,28 +1208,44 @@ pub async fn github_callback(
         (new_team_id, uid, "owner".to_string())
     };
 
-    // Upsert user record
-    let _ = state
+    // Upsert the member record. An UPDATE that only sets the GitHub fields:
+    // a put here used to replace the whole record, wiping a linked member's
+    // email (GitHub's is often empty), status, name, invited_by and email
+    // index keys.
+    let upsert = github_signin_update(
+        existing_user.as_ref(),
+        &GithubProfile {
+            id: github_id,
+            login: github_login,
+            email,
+            avatar_url: user["avatar_url"].as_str().unwrap_or(""),
+            name: user["name"].as_str().unwrap_or(""),
+        },
+        &team_id,
+        &role,
+        &now,
+    );
+    if let Err(e) = state
         .dynamo
-        .put_item()
+        .update_item()
         .table_name(&state.config.users_table_name)
-        .item("pk", attr_s(&team_id))
-        .item("sk", attr_s(&user_id))
-        .item("github_id", attr_n(github_id))
-        .item("github_login", attr_s(github_login))
-        .item("email", attr_s(email))
-        .item(
-            "avatar_url",
-            attr_s(user["avatar_url"].as_str().unwrap_or("")),
-        )
-        .item("role", attr_s(&role))
-        .item("updated_at", attr_s(&now))
-        .item("gsi1pk", attr_s(&format!("GHUSER#{github_id}")))
-        .item("gsi1sk", attr_s(&team_id))
-        .item("gsi2pk", attr_s(&format!("EMAIL#{normalized_email}")))
-        .item("gsi2sk", attr_s(&team_id))
+        .key("pk", attr_s(&team_id))
+        .key("sk", attr_s(&user_id))
+        .update_expression(upsert.expression)
+        .set_expression_attribute_names(upsert.names)
+        .set_expression_attribute_values(Some(upsert.values))
         .send()
-        .await;
+        .await
+    {
+        error!(github_login, team_id = %team_id, "Failed to upsert GitHub user record: {e}");
+    }
+    // The session carries the member's own email when GitHub has none.
+    let email = existing_user
+        .as_ref()
+        .and_then(|item| item.get("email"))
+        .and_then(|v| v.as_s().ok())
+        .filter(|e| !e.is_empty())
+        .map_or(email, |e| e.as_str());
 
     // Ensure teams table record exists (for new users without an existing record)
     if !has_existing_record {
@@ -1372,6 +1389,105 @@ pub async fn github_callback(
         StatusCode::FOUND,
     )
         .into_response())
+}
+
+/// Record when a member last signed in (shown on the team page). Only that one
+/// attribute is written, and only on a record that exists.
+async fn touch_last_login(state: &AppState, team_id: &str, user_id: &str) {
+    if team_id.is_empty() || user_id.is_empty() {
+        return;
+    }
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(user_id))
+        .update_expression("SET last_login_at = :now")
+        .condition_expression("attribute_exists(pk)")
+        .expression_attribute_values(":now", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await;
+}
+
+/// The GitHub profile fields a sign-in may write.
+struct GithubProfile<'a> {
+    id: u64,
+    login: &'a str,
+    email: &'a str,
+    avatar_url: &'a str,
+    name: &'a str,
+}
+
+/// An `UpdateItem` expression and its values.
+#[derive(Debug)]
+struct RecordUpdate {
+    expression: String,
+    names: Option<HashMap<String, String>>,
+    values: HashMap<String, AttributeValue>,
+}
+
+/// The write a GitHub sign-in makes to a member record. It always refreshes the
+/// GitHub id/login, GSI1 keys, avatar and timestamps. On an existing record it
+/// never touches role, status, invited_by, or an email/name already set: it
+/// fills email (and the GSI2 email keys) or name only when the record has none.
+/// A brand-new record also gets its role, status and creation time.
+fn github_signin_update(
+    existing: Option<&HashMap<String, AttributeValue>>,
+    gh: &GithubProfile<'_>,
+    team_id: &str,
+    role: &str,
+    now: &str,
+) -> RecordUpdate {
+    let field = |k: &str| {
+        existing
+            .and_then(|i| i.get(k))
+            .and_then(|v| v.as_s().ok())
+            .map_or("", |v| v.as_str())
+    };
+    let mut sets = vec![
+        "github_id = :gid",
+        "github_login = :gl",
+        "gsi1pk = :g1pk",
+        "gsi1sk = :team",
+        "updated_at = :now",
+        "last_login_at = :now",
+    ];
+    let mut values = HashMap::from([
+        (":gid".to_string(), attr_n(gh.id)),
+        (":gl".to_string(), attr_s(gh.login)),
+        (":g1pk".to_string(), attr_s(&format!("GHUSER#{}", gh.id))),
+        (":team".to_string(), attr_s(team_id)),
+        (":now".to_string(), attr_s(now)),
+    ]);
+    let mut names = HashMap::new();
+    if !gh.avatar_url.is_empty() {
+        sets.push("avatar_url = :avatar");
+        values.insert(":avatar".to_string(), attr_s(gh.avatar_url));
+    }
+    let normalized = normalize_email(gh.email);
+    if field("email").is_empty() && !normalized.is_empty() {
+        sets.extend(["email = :email", "gsi2pk = :g2pk", "gsi2sk = :team"]);
+        values.insert(":email".to_string(), attr_s(gh.email));
+        values.insert(":g2pk".to_string(), attr_s(&format!("EMAIL#{normalized}")));
+    }
+    if field("name").is_empty() && !gh.name.is_empty() {
+        sets.push("#n = :name");
+        names.insert("#n".to_string(), "name".to_string());
+        values.insert(":name".to_string(), attr_s(gh.name));
+    }
+    if existing.is_none() {
+        sets.extend(["#r = :role", "#st = :active", "created_at = :now"]);
+        names.insert("#r".to_string(), "role".to_string());
+        names.insert("#st".to_string(), "status".to_string());
+        values.insert(":role".to_string(), attr_s(role));
+        values.insert(":active".to_string(), attr_s("active"));
+    }
+    RecordUpdate {
+        expression: format!("SET {}", sets.join(", ")),
+        names: (!names.is_empty()).then_some(names),
+        values,
+    }
 }
 
 /// A team may link an installation only when no other team owns it.
@@ -1552,6 +1668,18 @@ async fn issue_session_from_cognito(
                 attr_s(&format!("EMAIL#{}", normalize_email(email))),
             )
             .item("gsi2sk", attr_s(&invite_tid))
+            .item("status", attr_s("active"))
+            .item(
+                "invited_by",
+                attr_s(
+                    item.get("invited_by")
+                        .and_then(|v| v.as_s().ok())
+                        .map_or("", |v| v),
+                ),
+            )
+            // Already a member of that team (e.g. linked to GitHub): keep their
+            // record as it is and just drop the invite.
+            .condition_expression("attribute_not_exists(pk)")
             .send()
             .await;
 
@@ -1568,6 +1696,8 @@ async fn issue_session_from_cognito(
             info!(email = %email, team_id = %invite_tid, role = %invite_role, "Processed pending invite on login");
         }
     }
+
+    touch_last_login(state, &team_id, &user_id).await;
 
     let token = jwt::create_token(
         &user_id,
@@ -1604,7 +1734,7 @@ fn extract_cookie<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Normalize an email: lowercase + strip plus-alias (user+tag@domain.com → user@domain.com)
-fn normalize_email(email: &str) -> String {
+pub(crate) fn normalize_email(email: &str) -> String {
     let email = email.trim().to_lowercase();
     if let Some((local, domain)) = email.split_once('@') {
         let base = local.split('+').next().unwrap_or(local);
@@ -1848,5 +1978,147 @@ mod installation_link_tests {
             ask_for_invite_url("https://app.example.com", "acme co"),
             "https://app.example.com?error=ask_admin_invite&org=acme%20co"
         );
+    }
+}
+
+#[cfg(test)]
+mod github_signin_update_tests {
+    use super::*;
+
+    fn profile<'a>(email: &'a str) -> GithubProfile<'a> {
+        GithubProfile {
+            id: 4242,
+            login: "sam-dev",
+            email,
+            avatar_url: "https://avatars.example.com/u/4242",
+            name: "Sam Dev",
+        }
+    }
+
+    fn sets(u: &RecordUpdate) -> Vec<String> {
+        u.expression
+            .trim_start_matches("SET ")
+            .split(", ")
+            .map(|s| s.split(" = ").next().unwrap().to_string())
+            .collect()
+    }
+
+    fn existing(pairs: &[(&str, &str)]) -> HashMap<String, AttributeValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), attr_s(v)))
+            .collect()
+    }
+
+    #[test]
+    fn linked_member_keeps_email_status_name_role_and_invited_by() {
+        let rec = existing(&[
+            ("email", "sam@example.com"),
+            ("status", "active"),
+            ("name", "Sam"),
+            ("role", "admin"),
+            ("invited_by", "USER#someone"),
+            ("gsi2pk", "EMAIL#sam@example.com"),
+        ]);
+        let u = github_signin_update(Some(&rec), &profile(""), "TEAM#t1", "member", "now");
+        let fields = sets(&u);
+        for kept in ["email", "gsi2pk", "gsi2sk", "#n", "#r", "#st", "invited_by"] {
+            assert!(
+                !fields.contains(&kept.to_string()),
+                "{kept} must not be written: {fields:?}"
+            );
+        }
+        for set in [
+            "github_id",
+            "github_login",
+            "gsi1pk",
+            "gsi1sk",
+            "avatar_url",
+            "updated_at",
+            "last_login_at",
+        ] {
+            assert!(
+                fields.contains(&set.to_string()),
+                "{set} missing: {fields:?}"
+            );
+        }
+        assert_eq!(u.values[":g1pk"], attr_s("GHUSER#4242"));
+        assert_eq!(u.values[":gid"], AttributeValue::N("4242".into()));
+        assert!(u.names.is_none());
+
+        // Even when GitHub has a (different) email, the member's stays.
+        let u = github_signin_update(
+            Some(&rec),
+            &profile("other@example.com"),
+            "TEAM#t1",
+            "member",
+            "now",
+        );
+        assert!(!sets(&u).contains(&"email".to_string()));
+    }
+
+    #[test]
+    fn github_only_record_gains_email_when_github_shares_one() {
+        let rec = existing(&[("email", ""), ("github_login", "sam-dev")]);
+        let u = github_signin_update(
+            Some(&rec),
+            &profile("Sam+x@Example.com"),
+            "TEAM#t1",
+            "member",
+            "now",
+        );
+        let fields = sets(&u);
+        assert!(fields.contains(&"email".to_string()));
+        assert_eq!(u.values[":g2pk"], attr_s("EMAIL#sam@example.com"));
+        assert!(
+            fields.contains(&"#n".to_string()),
+            "name filled when missing"
+        );
+        assert!(
+            !fields.contains(&"#r".to_string()),
+            "role untouched on existing"
+        );
+    }
+
+    #[test]
+    fn empty_github_email_never_writes_an_empty_email_index_key() {
+        let u = github_signin_update(None, &profile(""), "TEAM#t1", "owner", "now");
+        let fields = sets(&u);
+        assert!(!fields.contains(&"gsi2pk".to_string()));
+        assert!(!fields.contains(&"email".to_string()));
+        // A new record gets its role and status.
+        assert!(fields.contains(&"#r".to_string()) && fields.contains(&"#st".to_string()));
+        assert_eq!(u.values[":role"], attr_s("owner"));
+        assert_eq!(u.values[":active"], attr_s("active"));
+    }
+
+    #[test]
+    fn expression_placeholders_all_have_values() {
+        for (rec, email) in [
+            (None, "a@example.com"),
+            (Some(existing(&[("email", "")])), ""),
+        ] {
+            let u = github_signin_update(rec.as_ref(), &profile(email), "TEAM#t1", "member", "now");
+            for token in u
+                .expression
+                .split(|c: char| !(c.is_alphanumeric() || c == ':' || c == '#' || c == '_'))
+            {
+                if token.starts_with(':') {
+                    assert!(u.values.contains_key(token), "{token} has no value");
+                }
+                if token.starts_with('#') {
+                    assert!(
+                        u.names.as_ref().is_some_and(|n| n.contains_key(token)),
+                        "{token} has no name"
+                    );
+                }
+            }
+            for key in u.values.keys() {
+                assert!(
+                    u.expression.contains(key.as_str()),
+                    "{key} unused (DynamoDB rejects it)"
+                );
+            }
+        }
     }
 }

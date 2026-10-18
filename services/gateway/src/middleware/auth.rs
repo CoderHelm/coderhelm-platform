@@ -40,12 +40,21 @@ pub async fn require_auth(
     req.extensions_mut().insert(claims.clone());
     let mut response = next.run(req).await;
 
-    if needs_refresh {
+    // The refreshed token carries the member's CURRENT role, and a removed
+    // member gets no refresh (their session runs out), so role changes and
+    // removals on the team page reach existing sessions.
+    let current_role = if needs_refresh {
+        current_role(&state, &claims).await
+    } else {
+        None
+    };
+
+    if let Some(role) = current_role {
         if let Ok(new_token) = jwt::create_token(
             &claims.sub,
             &claims.team_id,
             &claims.email,
-            &claims.role,
+            &role,
             claims.github_login.as_deref(),
             &state.secrets.jwt_secret,
             SESSION_TTL_SECS,
@@ -60,6 +69,41 @@ pub async fn require_auth(
     }
 
     Ok(response)
+}
+
+/// The member's role on their record now; `None` when they are no longer on
+/// the team (or the lookup failed, in which case the old token simply runs on).
+async fn current_role(state: &AppState, claims: &crate::models::Claims) -> Option<String> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table_name)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(claims.team_id.clone()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S(claims.sub.clone()),
+        )
+        .send()
+        .await
+        .ok()?
+        .item?;
+    if item
+        .get("status")
+        .and_then(|v| v.as_s().ok())
+        .map(String::as_str)
+        == Some("invited")
+    {
+        return None;
+    }
+    Some(
+        item.get("role")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_else(|| "member".to_string()),
+    )
 }
 
 fn extract_cookie<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
