@@ -17,8 +17,8 @@ use axum::{
     Extension, Json,
 };
 use common::skills::{
-    new_ask_id, valid_repo, AgentAsk, Kind, SkillAskMessage, SkillStore, SkillSyncMessage,
-    MAX_REPOS,
+    new_ask_id, usage_stats, valid_repo, AgentAsk, Kind, SkillAskMessage, SkillStore,
+    SkillSyncMessage, MAX_REPOS, STAT_DAYS,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -89,6 +89,22 @@ pub async fn list(
         "items": items.iter().map(|i| i.json()).collect::<Vec<_>>(),
         "can_manage": matches!(claims.role.as_str(), "admin" | "owner"),
     })))
+}
+
+/// GET /api/skills/stats — how the team's skills and agents were used over
+/// the last 30 days: reads, asks, who made them, and what went unused.
+pub async fn stats(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    let st = store(&state, &claims);
+    let today = chrono::Utc::now().date_naive();
+    let since = (today - chrono::Duration::days(STAT_DAYS - 1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let (items, reads, asks) = tokio::try_join!(st.items(), st.read_days(&since), st.recent_asks())
+        .map_err(|e| internal("skill stats", e))?;
+    Ok(Json(usage_stats(&items, &reads, &asks, today)))
 }
 
 /// Whether the team's GitHub App covers `repo` (it has a repository record,
