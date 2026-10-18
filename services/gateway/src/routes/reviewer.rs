@@ -556,6 +556,7 @@ pub async fn rate_review(
     Extension(claims): Extension<Claims>,
     Json(body): Json<RateBody>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(1)?; // member+ (viewers are read-only)
     if !body.sk.starts_with("REVIEW#") || body.sk.len() > 400 {
         return Err(StatusCode::BAD_REQUEST);
     }

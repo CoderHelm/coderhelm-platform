@@ -357,13 +357,7 @@ impl Claims {
 
     /// Numeric role level: owner=4, admin=3, billing=2, member=1, viewer=0.
     pub fn role_level(&self) -> u8 {
-        match self.role.as_str() {
-            "owner" => 4,
-            "admin" => 3,
-            "billing" => 2,
-            "member" => 1,
-            _ => 0,
-        }
+        crate::permissions::role_level(&self.role)
     }
 
     /// Require minimum role level, return 403 if insufficient.

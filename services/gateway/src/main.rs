@@ -13,6 +13,7 @@ mod auth;
 mod clients;
 mod middleware;
 mod models;
+mod permissions;
 mod routes;
 
 pub struct AppState {
@@ -281,9 +282,14 @@ async fn main() -> Result<(), Error> {
         .route("/account/reset", post(routes::api::reset_account))
         // User management
         .route("/users", get(routes::users::list_users))
+        .route("/users/permissions", get(routes::users::get_permissions))
         .route("/users/invite", post(routes::users::invite_user))
         .route("/users/:user_id/role", put(routes::users::update_role))
         .route("/users/:user_id/resend", post(routes::users::resend_invite))
+        .route(
+            "/users/:user_id/link-github",
+            post(routes::users::link_github),
+        )
         .route("/users/:user_id", delete(routes::users::remove_user))
         .route("/users/password", put(routes::users::change_password))
         .route("/users/mfa/setup", post(routes::users::mfa_setup))

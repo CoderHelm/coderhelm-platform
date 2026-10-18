@@ -172,6 +172,9 @@ pub async fn list_teams(
                     .item("updated_at", attr_s(&now))
                     .item("gsi2pk", attr_s(&format!("EMAIL#{}", claims.email)))
                     .item("gsi2sk", attr_s(&invite_tid))
+                    .item("status", attr_s("active"))
+                    // Never overwrite an existing member record.
+                    .condition_expression("attribute_not_exists(pk)")
                     .send()
                     .await;
 

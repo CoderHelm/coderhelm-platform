@@ -434,6 +434,7 @@ pub async fn add_task(
     axum::extract::Path(plan_id): axum::extract::Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+ (viewers are read-only)
     validate_plan_id(&plan_id)?;
 
     let title = body["title"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
@@ -509,6 +510,7 @@ pub async fn update_task(
     axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(1)?; // member+ (viewers are read-only)
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
 
@@ -596,6 +598,7 @@ pub async fn delete_task(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(1)?; // member+ (viewers are read-only)
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
 
@@ -720,6 +723,7 @@ pub async fn reject_task(
     Extension(claims): Extension<Claims>,
     axum::extract::Path((plan_id, task_id)): axum::extract::Path<(String, String)>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(1)?; // member+ (viewers are read-only)
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
 
@@ -1197,6 +1201,7 @@ pub async fn generate_plan_openspec(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+ (viewers are read-only)
     validate_plan_id(&plan_id)?;
 
     // Fetch plan + tasks (same query as get_plan)
@@ -1525,6 +1530,7 @@ pub async fn create_template(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+ (viewers are read-only)
     let title = body["title"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
     if title.is_empty() || title.len() > 200 {
         return Err(StatusCode::BAD_REQUEST);
@@ -1583,6 +1589,7 @@ pub async fn create_template_from_plan(
     axum::extract::Path(plan_id): axum::extract::Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+ (viewers are read-only)
     validate_plan_id(&plan_id)?;
 
     // Fetch the plan + tasks
@@ -1728,6 +1735,7 @@ pub async fn delete_template(
     Extension(claims): Extension<Claims>,
     axum::extract::Path(template_id): axum::extract::Path<String>,
 ) -> Result<StatusCode, StatusCode> {
+    claims.require_role(1)?; // member+ (viewers are read-only)
     validate_template_id(&template_id)?;
 
     state
@@ -1753,6 +1761,7 @@ pub async fn use_template(
     axum::extract::Path(template_id): axum::extract::Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+ (viewers are read-only)
     validate_template_id(&template_id)?;
 
     // Fetch the template
@@ -1936,7 +1945,8 @@ pub async fn stream_token(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Mint a short-lived token (5 minutes) scoped for streaming
+    claims.require_role(1)?; // member+ (viewers are read-only)
+                             // Mint a short-lived token (5 minutes) scoped for streaming
     let token = crate::auth::jwt::create_token(
         &claims.sub,
         &claims.team_id,
@@ -2348,6 +2358,7 @@ pub async fn plan_chat(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?; // member+ (viewers are read-only)
     let messages_input = body["messages"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
 
     if messages_input.is_empty() || messages_input.len() > 20 {
