@@ -1352,6 +1352,7 @@ async fn start_fix_ticket(
         continuation: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
+        ticket_update_note: None,
     };
     match enqueue(state, crate::models::WorkerMessage::Ticket(ticket)).await {
         Ok(()) => {
@@ -1547,6 +1548,7 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
                 continuation: 0,
                 continuation_run_id: None,
                 first_attempt_ms: 0,
+                ticket_update_note: None,
             };
             enqueue(state, crate::models::WorkerMessage::Ticket(ticket)).await?;
             rec.status = "generating".into();

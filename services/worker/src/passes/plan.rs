@@ -436,6 +436,17 @@ After researching, output the four files using this exact format:
         .content_type("text/plain")
         .send()
         .await;
+    // And the ticket text itself, so a later edit can show the agent exactly
+    // what changed (old → new) instead of only the new text.
+    let _ = state
+        .s3
+        .put_object()
+        .bucket(&state.config.bucket_name)
+        .key(format!("{prefix}/{TICKET_TEXT_FILE}"))
+        .body(ticket_text(&msg.title, &msg.body).into_bytes().into())
+        .content_type("text/markdown")
+        .send()
+        .await;
 
     Ok(files)
 }
@@ -807,6 +818,14 @@ impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
         // Fall through to read-only tools
         self.read_only.execute(name, input).await
     }
+}
+
+/// S3 file (next to the openspec) holding the ticket text a plan was built from.
+pub const TICKET_TEXT_FILE: &str = "ticket.md";
+
+/// The ticket text as stored next to its plan and compared on an update.
+pub fn ticket_text(title: &str, body: &str) -> String {
+    format!("# {title}\n\n{body}")
 }
 
 /// Compute a hash of ticket content (title + body + image attachment keys)
