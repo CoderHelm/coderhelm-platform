@@ -2213,7 +2213,7 @@ async fn run_passes(
 
         // --- Plan Validation (deterministic, no LLM) ---
         let team_repos = plan::fetch_team_repos(state, &msg.team_id).await;
-        let plan_warnings = validate_plan(
+        let mut plan_warnings = validate_plan(
             &plan_result,
             &github,
             &msg.repo_owner,
@@ -2226,6 +2226,105 @@ async fn run_passes(
             usage,
         )
         .await;
+        // Over the file cap: ask the planner ONCE to narrow the scope before
+        // failing the run — most oversized plans pad the change set.
+        if let Some((planned, cap)) = plan_warnings.over_cap {
+            info!(
+                run_id,
+                planned, cap, "Plan over the file cap — re-planning once with a narrower scope"
+            );
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Plan changed {planned} files (cap {cap}) — re-planning with a narrower scope"
+                ),
+            )
+            .await;
+            let mut narrowed = msg.clone();
+            narrowed.body.push_str(&narrow_scope_note(planned, cap));
+            match plan::run(
+                state,
+                &narrowed,
+                &github,
+                &triage_result,
+                &repo_instructions,
+                &provider,
+                usage,
+                run_id,
+            )
+            .await
+            {
+                Ok(p) => {
+                    plan_result = p;
+                    // The planner stored a hash of the NARROWED ticket; put the
+                    // real ticket's hash back so the next run reuses this plan.
+                    let prefix = openspec_prefix(
+                        &msg.team_id,
+                        &msg.ticket_id,
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                    );
+                    let _ = state
+                        .s3
+                        .put_object()
+                        .bucket(&state.config.bucket_name)
+                        .key(format!("{prefix}/context_hash.txt"))
+                        .body(context_hash.as_bytes().to_vec().into())
+                        .content_type("text/plain")
+                        .send()
+                        .await;
+                    // Keep the branch's openspec in step with the plan in use.
+                    if commit_openspec {
+                        let ticket_slug = msg.ticket_id.to_lowercase();
+                        let spec_files: Vec<crate::clients::github::FileOp> = [
+                            ("proposal.md", &plan_result.proposal),
+                            ("design.md", &plan_result.design),
+                            ("tasks.md", &plan_result.tasks),
+                            ("spec.md", &plan_result.spec),
+                        ]
+                        .iter()
+                        .filter(|(_, content)| !content.is_empty())
+                        .map(|(name, content)| crate::clients::github::FileOp::Write {
+                            path: format!("openspec/specs/{ticket_slug}/{name}"),
+                            content: content.to_string(),
+                        })
+                        .collect();
+                        if !spec_files.is_empty() {
+                            if let Err(e) = github
+                                .batch_write(
+                                    &msg.repo_owner,
+                                    &msg.repo_name,
+                                    &branch_name,
+                                    &format!("Narrow openspec for {}", msg.ticket_id),
+                                    &spec_files,
+                                )
+                                .await
+                            {
+                                warn!(run_id, error = %e, "Failed to commit the narrowed openspec");
+                            }
+                        }
+                    }
+                    plan_warnings = validate_plan(
+                        &plan_result,
+                        &github,
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        &msg.base_branch,
+                        state,
+                        &msg.team_id,
+                        &team_repos,
+                        &provider,
+                        usage,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(run_id, error = %e, "Narrowed re-plan failed — keeping the first plan's verdict")
+                }
+            }
+        }
 
         // Complexity upgrade valve: triage classifies with zero codebase
         // knowledge, and a wrong "simple" verdict silently strips the
@@ -5190,9 +5289,69 @@ struct PlanValidation {
     switch_repo: Option<String>,
     /// Human-readable reason for the switch, shown in the run's progress notes.
     switch_reason: String,
-    /// How many distinct files the plan text references — used to upgrade a
-    /// misclassified "simple" ticket before implement.
+    /// How many distinct files the plan changes (its task checklist; the
+    /// plan text when it has no checklist) — used to upgrade a misclassified
+    /// "simple" ticket before implement.
     mentioned_file_count: usize,
+    /// `(files the plan changes, hard cap)` when the plan is over the cap.
+    over_cap: Option<(usize, usize)>,
+}
+
+/// A file one plan task changes, read from the `- [ ] <path>: <description>`
+/// checklist the planner is required to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanTaskFile {
+    path: String,
+    /// The task creates the file — it legitimately doesn't exist yet.
+    is_new: bool,
+}
+
+/// Files the plan's task checklist actually changes, deduped, in order.
+/// Empty when the tasks don't follow the checklist format.
+fn plan_task_files(tasks: &str) -> Vec<PlanTaskFile> {
+    let mut out: Vec<PlanTaskFile> = Vec::new();
+    for line in tasks.lines() {
+        let l = line.trim_start();
+        let Some(rest) = l
+            .strip_prefix("- [ ]")
+            .or_else(|| l.strip_prefix("- [x]"))
+            .or_else(|| l.strip_prefix("- [X]"))
+        else {
+            continue;
+        };
+        let Some((head, desc)) = rest.split_once(':') else {
+            continue;
+        };
+        let path = head.trim().trim_matches(|c| c == '`' || c == '*').trim();
+        let looks_like_path = !path.is_empty()
+            && path.len() < 300
+            && !path.chars().any(char::is_whitespace)
+            && (path.contains('/') || path.contains('.'));
+        if !looks_like_path {
+            continue;
+        }
+        let path = path.trim_start_matches("./").to_string();
+        let d = desc.to_lowercase();
+        let is_new = d.contains("create")
+            || d.contains("new file")
+            || d.contains("(new)")
+            || d.trim_start().starts_with("new ")
+            || d.trim_start().starts_with("add new");
+        match out.iter_mut().find(|f| f.path == path) {
+            Some(f) => f.is_new |= is_new,
+            None => out.push(PlanTaskFile { path, is_new }),
+        }
+    }
+    out
+}
+
+/// Appended to the ticket for the one narrowed re-plan.
+fn narrow_scope_note(planned: usize, cap: usize) -> String {
+    format!(
+        "\n\n---\nNOTE FROM CODERHELM: the previous plan for this ticket changed {planned} files, \
+         over the limit of {cap}. Plan again and change at most {cap} files: only the files this \
+         ticket strictly requires. Leave out refactors, renames, cleanups and optional follow-ups."
+    )
 }
 
 /// Plan validation — catches bad plans before the expensive Implement pass.
@@ -5239,23 +5398,41 @@ async fn validate_plan(
     mentioned_files.sort();
     mentioned_files.dedup();
 
+    // The files the plan CHANGES are its checklist's task files. Every path
+    // the text merely mentions ("follow the pattern in X", "see Y") used to
+    // count toward the cap and failed reasonable plans; the regex mentions
+    // remain the fallback for a plan without the checklist format.
+    let task_files = plan_task_files(&plan.tasks);
+    let new_files: std::collections::HashSet<&str> = task_files
+        .iter()
+        .filter(|f| f.is_new)
+        .map(|f| f.path.as_str())
+        .collect();
+    let changed_files: Vec<String> = if task_files.is_empty() {
+        mentioned_files.clone()
+    } else {
+        task_files.iter().map(|f| f.path.clone()).collect()
+    };
+
     // 1. Scope check
     let max_plan_files = load_workflow_setting_num(state, team_id, "max_plan_files")
         .await
         .unwrap_or(15)
         .min(30) as usize;
 
-    if mentioned_files.len() > max_plan_files + 10 {
+    let mut over_cap = None;
+    if changed_files.len() > max_plan_files + 10 {
         warnings.push(format!(
             "This plan modifies {} files — exceeds the hard cap of {}. Please break into smaller tickets.",
-            mentioned_files.len(),
+            changed_files.len(),
             max_plan_files + 10,
         ));
         blocked = true;
-    } else if mentioned_files.len() > max_plan_files {
+        over_cap = Some((changed_files.len(), max_plan_files + 10));
+    } else if changed_files.len() > max_plan_files {
         warnings.push(format!(
             "This plan modifies {} files (limit: {}). Consider breaking into smaller tickets.",
-            mentioned_files.len(),
+            changed_files.len(),
             max_plan_files,
         ));
     }
@@ -5265,8 +5442,13 @@ async fn validate_plan(
     // current repo at base_branch while candidates get HEAD meant a repo
     // whose default branch isn't the message's base_branch had ALL its
     // files "missing", which then triggered a bogus repo switch.
-    if !mentioned_files.is_empty() {
-        let sample: Vec<&String> = mentioned_files.iter().take(10).collect();
+    // Files a task CREATES don't exist yet by design — never "hallucinated".
+    let existing_expected: Vec<&String> = changed_files
+        .iter()
+        .filter(|p| !new_files.contains(p.as_str()))
+        .collect();
+    if !existing_expected.is_empty() {
+        let sample: Vec<&String> = existing_expected.iter().take(10).copied().collect();
         let mut missing = Vec::new();
         for path in &sample {
             match github.read_file(repo_owner, repo_name, path, "HEAD").await {
@@ -5577,7 +5759,8 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
         blocked,
         switch_repo,
         switch_reason,
-        mentioned_file_count: mentioned_files.len(),
+        mentioned_file_count: changed_files.len(),
+        over_cap,
     }
 }
 
@@ -6405,5 +6588,45 @@ mod ticket_update_tests {
         let n = ticket_update_note(7, None, "# T", "");
         assert!(n.contains("previous ticket text was not saved"));
         assert!(n.contains("could not be loaded"));
+    }
+}
+
+#[cfg(test)]
+mod plan_cap_tests {
+    use super::*;
+
+    #[test]
+    fn counts_only_checklist_task_files() {
+        let tasks = "- [ ] src/a.ts: Change the handler (see src/ref.ts for the pattern)\n\
+                     - [x] `src/b.ts`: Update import\n\
+                     - [ ] src/a.ts: Also add the export\n\
+                     Some prose mentioning docs/guide.md\n\
+                     - [ ] Verify: nothing";
+        let files = plan_task_files(tasks);
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/a.ts", "src/b.ts"]);
+    }
+
+    #[test]
+    fn created_files_are_marked_new() {
+        let tasks = "- [ ] src/new_widget.tsx: Create the widget component\n\
+                     - [ ] src/index.ts: Export the widget\n\
+                     - [ ] test/widget.test.tsx: New test for the widget";
+        let files = plan_task_files(tasks);
+        assert!(files[0].is_new);
+        assert!(!files[1].is_new);
+        assert!(files[2].is_new);
+    }
+
+    #[test]
+    fn plans_without_a_checklist_fall_back() {
+        assert!(plan_task_files("Update the handler in src/a.ts and src/b.ts").is_empty());
+        assert!(plan_task_files("NO_CHANGES_NEEDED: already done").is_empty());
+    }
+
+    #[test]
+    fn narrow_note_names_the_cap() {
+        let n = narrow_scope_note(31, 25);
+        assert!(n.contains("31 files") && n.contains("at most 25 files"));
     }
 }
