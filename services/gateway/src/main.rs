@@ -458,6 +458,8 @@ async fn main() -> Result<(), Error> {
             get(routes::skills::asks).post(routes::skills::try_agent),
         )
         .route("/skills/stats", get(routes::skills::stats))
+        .route("/skills/activity", get(routes::skills::activity))
+        .route("/activity/summary", get(routes::activity::summary))
         .route("/data-sources", get(routes::data_sources::list))
         .route(
             "/data-sources/activity",

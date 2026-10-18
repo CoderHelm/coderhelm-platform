@@ -38,6 +38,8 @@ const SKILL: &str = "SKILL#";
 const FILE: &str = "SKILLFILE#";
 const ASK: &str = "SKILLASK#";
 const DAY: &str = "SKILLDAY#";
+/// One read or ask, for the access log: `SKILLUSE#<ulid>`.
+const USE: &str = "SKILLUSE#";
 /// One partition listing every team's connected repositories, so the periodic
 /// check reads a few rows instead of scanning the table.
 const INDEX_PK: &str = "SKILLREPO_INDEX";
@@ -804,6 +806,194 @@ impl AgentAsk {
     }
 }
 
+/// One time an item was read or asked: who, during which work, why, and how
+/// it went. Never what was read or answered; only names, ids and the reason.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SkillAccess {
+    /// A ULID: sorts by time, newest last.
+    pub id: String,
+    pub at: String,
+    pub repo: String,
+    pub path: String,
+    /// "skill", "agent" or "command".
+    pub kind: String,
+    pub name: String,
+    /// "read" (the item), "read_file" (a file kept with a skill) or "ask".
+    pub action: String,
+    /// For `read_file`: which file, by path.
+    pub file: String,
+    /// "planner", "coder", "reviewer", or "<email> (try)".
+    pub by: String,
+    /// The work it happened during, e.g. "owner/name#12". Empty for a try.
+    pub origin: String,
+    /// The run it happened during, for a link. Empty for a review or a try.
+    pub run_id: String,
+    /// Why, in the reader's words: the reason it gave, its question, or the
+    /// task's title. Clipped and redacted.
+    pub why: String,
+    /// For reads: "ok", "off" (switched off or removed), "limit" (the pass
+    /// used all its reads) or "failed". For asks: "answered", "failed",
+    /// "timed_out", "limit" or "off".
+    pub outcome: String,
+    /// For an ask: its id, to open the question and answer.
+    pub ask_id: String,
+    pub ms: i64,
+}
+
+/// How long access records are kept.
+pub const ACCESS_DAYS: i64 = 180;
+/// Longest reason kept on an access record.
+pub const ACCESS_WHY_CHARS: usize = 300;
+/// Records looked at for one page of a filtered list, so a filter that
+/// matches little can't read the whole log in one request.
+pub const ACCESS_SCAN_CAP: usize = 3_000;
+
+/// Whether an outcome means it went wrong.
+pub fn access_problem(outcome: &str) -> bool {
+    !matches!(outcome, "ok" | "answered" | "pending")
+}
+
+/// What to show of the access log. Empty fields match everything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessFilter {
+    pub repo: String,
+    pub path: String,
+    /// "planner", "coder", "reviewer", or "people" for anyone else.
+    pub by: String,
+    /// "read" (either kind of read) or "ask".
+    pub action: String,
+    /// An outcome, or "problems" for any that went wrong.
+    pub outcome: String,
+    /// Words to find in the name, reason, work, run or file.
+    pub q: String,
+    /// RFC 3339 bounds, inclusive.
+    pub since: String,
+    pub until: String,
+}
+
+impl AccessFilter {
+    pub fn matches(&self, a: &SkillAccess) -> bool {
+        if !self.repo.is_empty() && a.repo != self.repo {
+            return false;
+        }
+        if !self.path.is_empty() && a.path != self.path {
+            return false;
+        }
+        match self.by.as_str() {
+            "" => {}
+            "people" if READERS.contains(&a.by.as_str()) => return false,
+            "people" => {}
+            who if a.by != who => return false,
+            _ => {}
+        }
+        match self.action.as_str() {
+            "" => {}
+            "read" if !a.action.starts_with("read") => return false,
+            "ask" if a.action != "ask" => return false,
+            _ => {}
+        }
+        match self.outcome.as_str() {
+            "" => {}
+            "problems" if !access_problem(&a.outcome) => return false,
+            "problems" => {}
+            o if a.outcome != o => return false,
+            _ => {}
+        }
+        let q = self.q.trim().to_lowercase();
+        if !q.is_empty() {
+            let hay = format!(
+                "{} {}:{} {} {} {} {} {}",
+                a.name, a.kind, a.name, a.path, a.why, a.origin, a.run_id, a.file
+            )
+            .to_lowercase();
+            if !q.split_whitespace().all(|w| hay.contains(w)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The sort key range the time bounds cover, as `(low, high)`.
+    fn key_range(&self) -> (String, String) {
+        let ms = |t: &str| {
+            chrono::DateTime::parse_from_rfc3339(t)
+                .ok()
+                .map(|d| d.timestamp_millis().max(0) as u64)
+        };
+        let low = ms(&self.since)
+            .map(|m| format!("{USE}{}", ulid::Ulid::from_parts(m, 0)))
+            .unwrap_or_else(|| USE.to_string());
+        let high = ms(&self.until)
+            .map(|m| format!("{USE}{}", ulid::Ulid::from_parts(m, u128::MAX)))
+            .unwrap_or_else(|| format!("{USE}~"));
+        (low, high)
+    }
+}
+
+impl SkillAccess {
+    fn from_item(i: &Item) -> Option<Self> {
+        let id = s(i, "sk").strip_prefix(USE)?.to_string();
+        Some(Self {
+            id,
+            at: s(i, "at"),
+            repo: s(i, "repo"),
+            path: s(i, "path"),
+            kind: s(i, "kind"),
+            name: s(i, "name"),
+            action: s(i, "action"),
+            file: s(i, "file"),
+            by: s(i, "by"),
+            origin: s(i, "origin"),
+            run_id: s(i, "run_id"),
+            why: s(i, "why"),
+            outcome: s(i, "outcome"),
+            ask_id: s(i, "ask_id"),
+            ms: n(i, "ms"),
+        })
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "id": self.id, "at": self.at, "repo": self.repo, "path": self.path,
+            "kind": self.kind, "name": self.name, "action": self.action,
+            "file": self.file, "by": self.by, "origin": self.origin,
+            "run_id": self.run_id, "why": self.why, "outcome": self.outcome,
+            "ask_id": self.ask_id, "ms": self.ms, "cursor": format!("{USE}{}", self.id),
+        })
+    }
+}
+
+/// The reason kept on an access record: whitespace folded, secrets taken
+/// out, clipped.
+pub fn access_why(text: &str) -> String {
+    let folded = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (clean, _) = crate::live::redact::redact_text(&folded);
+    crate::truncate_str(&clean, ACCESS_WHY_CHARS).to_string()
+}
+
+/// Counts of the access log over a window, for the summary at the top of
+/// the activity pages.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessCounts {
+    pub reads: i64,
+    pub asks: i64,
+    pub read_problems: i64,
+    pub ask_problems: i64,
+}
+
+impl AccessCounts {
+    pub fn add(&mut self, action: &str, outcome: &str) {
+        let problem = access_problem(outcome);
+        if action == "ask" {
+            self.asks += 1;
+            self.ask_problems += i64::from(problem);
+        } else {
+            self.reads += 1;
+            self.read_problems += i64::from(problem);
+        }
+    }
+}
+
 /// How much of an agent's file it is given as instructions.
 pub const AGENT_BRIEF_CHARS: usize = 24_000;
 
@@ -1308,6 +1498,140 @@ impl SkillStore<'_> {
         Ok(out)
     }
 
+    /// Records one read or ask on the access log, kept [`ACCESS_DAYS`] days.
+    /// The reason is clipped and redacted here, whoever calls.
+    pub async fn put_access(&self, a: &SkillAccess) -> Result<(), String> {
+        let id = if a.id.is_empty() {
+            new_ask_id()
+        } else {
+            a.id.clone()
+        };
+        let ttl = chrono::Utc::now().timestamp() + ACCESS_DAYS * 86_400;
+        let mut req = self
+            .dynamo
+            .put_item()
+            .table_name(self.table)
+            .item("pk", av(self.team))
+            .item("sk", av(&format!("{USE}{id}")))
+            .item(
+                "at",
+                av(if a.at.is_empty() { now() } else { a.at.clone() }.as_str()),
+            )
+            .item("repo", av(&a.repo))
+            .item("path", av(&a.path))
+            .item("kind", av(&a.kind))
+            .item("name", av(&a.name))
+            .item("action", av(&a.action))
+            .item("by", av(&a.by))
+            .item("outcome", av(&a.outcome))
+            .item("why", av(&access_why(&a.why)))
+            .item("ms", AttributeValue::N(a.ms.to_string()))
+            .item("ttl", AttributeValue::N(ttl.to_string()));
+        for (k, v) in [
+            ("file", &a.file),
+            ("origin", &a.origin),
+            ("run_id", &a.run_id),
+            ("ask_id", &a.ask_id),
+        ] {
+            if !v.is_empty() {
+                req = req.item(k, av(crate::truncate_str(v, 300)));
+            }
+        }
+        req.send()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("skill store access: {e}"))
+    }
+
+    /// One page of the access log, newest first, matching `f`. `before` is
+    /// the `cursor` of the last record already shown. Returns the page and
+    /// the cursor to read further back, or `None` at the end. A page can come
+    /// back short with a cursor when a filter matched little of what was
+    /// looked at ([`ACCESS_SCAN_CAP`]).
+    pub async fn access_page(
+        &self,
+        f: &AccessFilter,
+        limit: usize,
+        before: Option<&str>,
+    ) -> Result<(Vec<SkillAccess>, Option<String>), String> {
+        let limit = limit.clamp(1, 200);
+        let (low, high) = f.key_range();
+        let mut start: Option<String> = before
+            .filter(|b| b.starts_with(USE) && *b <= high.as_str())
+            .map(str::to_string);
+        let mut out = Vec::new();
+        let mut looked = 0usize;
+        loop {
+            let mut q = self
+                .dynamo
+                .query()
+                .table_name(self.table)
+                .key_condition_expression("pk = :p AND sk BETWEEN :lo AND :hi")
+                .expression_attribute_values(":p", av(self.team))
+                .expression_attribute_values(":lo", av(&low))
+                .expression_attribute_values(":hi", av(&high))
+                .scan_index_forward(false)
+                .limit(200);
+            if let Some(sk) = &start {
+                q = q
+                    .exclusive_start_key("pk", av(self.team))
+                    .exclusive_start_key("sk", av(sk));
+            }
+            let r = q
+                .send()
+                .await
+                .map_err(|e| format!("skill store access log: {e}"))?;
+            for i in r.items() {
+                looked += 1;
+                let sk = s(i, "sk");
+                if let Some(a) = SkillAccess::from_item(i).filter(|a| f.matches(a)) {
+                    out.push(a);
+                }
+                if out.len() >= limit || looked >= ACCESS_SCAN_CAP {
+                    return Ok((out, Some(sk)));
+                }
+            }
+            match r.last_evaluated_key().and_then(|k| k.get("sk")) {
+                Some(AttributeValue::S(sk)) => start = Some(sk.clone()),
+                _ => return Ok((out, None)),
+            }
+        }
+    }
+
+    /// Counts of reads and asks since `since` (RFC 3339).
+    pub async fn access_counts(&self, since: &str) -> Result<AccessCounts, String> {
+        let (low, high) = AccessFilter {
+            since: since.to_string(),
+            ..Default::default()
+        }
+        .key_range();
+        let mut counts = AccessCounts::default();
+        let mut start = None;
+        loop {
+            let r = self
+                .dynamo
+                .query()
+                .table_name(self.table)
+                .key_condition_expression("pk = :p AND sk BETWEEN :lo AND :hi")
+                .expression_attribute_values(":p", av(self.team))
+                .expression_attribute_values(":lo", av(&low))
+                .expression_attribute_values(":hi", av(&high))
+                .projection_expression("#a, outcome")
+                .expression_attribute_names("#a", "action")
+                .set_exclusive_start_key(start)
+                .send()
+                .await
+                .map_err(|e| format!("skill store access counts: {e}"))?;
+            for i in r.items() {
+                counts.add(&s(i, "action"), &s(i, "outcome"));
+            }
+            start = r.last_evaluated_key().cloned();
+            if start.is_none() {
+                return Ok(counts);
+            }
+        }
+    }
+
     /// Records a failed sync without touching what was read before.
     pub async fn sync_failed(&self, repo: &str, error: &str) -> Result<(), String> {
         self.dynamo
@@ -1664,6 +1988,128 @@ pub fn usage_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn access(by: &str, action: &str, outcome: &str) -> SkillAccess {
+        SkillAccess {
+            repo: "acme/playbook".into(),
+            path: "skills/debug/SKILL.md".into(),
+            kind: "skill".into(),
+            name: "debug".into(),
+            action: action.into(),
+            by: by.into(),
+            origin: "acme/web#12".into(),
+            why: "The flaky checkout test".into(),
+            outcome: outcome.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_access_filter_matches_reader_action_outcome_and_words() {
+        let read = access("coder", "read", "ok");
+        let file = access("planner", "read_file", "off");
+        let ask = access("a@b.co (try)", "ask", "timed_out");
+        let all = AccessFilter::default();
+        assert!(all.matches(&read) && all.matches(&file) && all.matches(&ask));
+
+        let by = |b: &str| AccessFilter {
+            by: b.into(),
+            ..Default::default()
+        };
+        assert!(by("coder").matches(&read));
+        assert!(!by("coder").matches(&file));
+        assert!(
+            by("people").matches(&ask),
+            "a person is anyone but an agent"
+        );
+        assert!(!by("people").matches(&read));
+
+        let action = |x: &str| AccessFilter {
+            action: x.into(),
+            ..Default::default()
+        };
+        assert!(action("read").matches(&file), "a file read is a read");
+        assert!(!action("read").matches(&ask));
+        assert!(action("ask").matches(&ask));
+
+        let problems = AccessFilter {
+            outcome: "problems".into(),
+            ..Default::default()
+        };
+        assert!(!problems.matches(&read));
+        assert!(problems.matches(&file) && problems.matches(&ask));
+
+        let words = |q: &str| AccessFilter {
+            q: q.into(),
+            ..Default::default()
+        };
+        assert!(words("FLAKY checkout").matches(&read));
+        assert!(words("skill:debug").matches(&read));
+        assert!(words("web#12").matches(&read));
+        assert!(
+            !words("flaky deploy").matches(&read),
+            "every word must be found"
+        );
+
+        let other = AccessFilter {
+            repo: "acme/playbook".into(),
+            path: "agents/other.md".into(),
+            ..Default::default()
+        };
+        assert!(!other.matches(&read));
+    }
+
+    #[test]
+    fn the_access_key_range_follows_the_time_bounds() {
+        let (lo, hi) = AccessFilter::default().key_range();
+        assert_eq!((lo.as_str(), hi.as_str()), ("SKILLUSE#", "SKILLUSE#~"));
+        let f = AccessFilter {
+            since: "2026-10-01T00:00:00Z".into(),
+            until: "2026-10-02T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let (lo, hi) = f.key_range();
+        let at = |t: &str| {
+            let ms = chrono::DateTime::parse_from_rfc3339(t)
+                .unwrap()
+                .timestamp_millis() as u64;
+            format!("SKILLUSE#{}", ulid::Ulid::from_parts(ms, 12345))
+        };
+        let inside = at("2026-10-01T12:00:00Z");
+        assert!(lo < inside && inside < hi);
+        assert!(at("2026-09-30T23:59:59Z") < lo);
+        assert!(at("2026-10-02T00:00:01Z") > hi);
+    }
+
+    #[test]
+    fn a_reason_is_folded_clipped_and_counts_add_up() {
+        let long = format!("Why:\n  {}", "word ".repeat(200));
+        let w = access_why(&long);
+        assert!(w.len() <= ACCESS_WHY_CHARS);
+        assert!(w.starts_with("Why: word word"));
+        assert!(!w.contains('\n'));
+
+        let mut c = AccessCounts::default();
+        c.add("read", "ok");
+        c.add("read_file", "limit");
+        c.add("ask", "answered");
+        c.add("ask", "failed");
+        c.add("ask", "pending");
+        assert_eq!(
+            c,
+            AccessCounts {
+                reads: 2,
+                asks: 3,
+                read_problems: 1,
+                ask_problems: 1
+            }
+        );
+        let a = SkillAccess {
+            id: "01J".into(),
+            ..access("coder", "read", "ok")
+        };
+        assert_eq!(a.json()["cursor"], "SKILLUSE#01J");
+    }
 
     #[test]
     fn usage_stats_count_reads_and_asks_in_the_window_only() {

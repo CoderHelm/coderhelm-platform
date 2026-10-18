@@ -17,8 +17,8 @@ use axum::{
     Extension, Json,
 };
 use common::skills::{
-    new_ask_id, usage_stats, valid_repo, AgentAsk, Kind, SkillAskMessage, SkillStore,
-    SkillSyncMessage, MAX_REPOS, STAT_DAYS,
+    new_ask_id, usage_stats, valid_repo, AccessFilter, AgentAsk, Kind, SkillAskMessage, SkillStore,
+    SkillSyncMessage, ACCESS_DAYS, MAX_REPOS, STAT_DAYS,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -105,6 +105,47 @@ pub async fn stats(
     let (items, reads, asks) = tokio::try_join!(st.items(), st.read_days(&since), st.recent_asks())
         .map_err(|e| internal("skill stats", e))?;
     Ok(Json(usage_stats(&items, &reads, &asks, today)))
+}
+
+/// The access log filter a request's query asks for. Unknown values are
+/// kept as given and simply match nothing.
+fn access_filter(q: &HashMap<String, String>) -> AccessFilter {
+    let get = |k: &str| q.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+    AccessFilter {
+        repo: get("repo"),
+        path: get("path"),
+        by: get("by"),
+        action: get("action"),
+        outcome: get("outcome"),
+        q: common::truncate_str(&get("q"), 200).to_string(),
+        since: get("since"),
+        until: get("until"),
+    }
+}
+
+/// GET /api/skills/activity?[repo=&path=][&by=][&action=][&outcome=][&q=]
+/// [&since=&until=][&limit=][&before=] — every read and ask, newest first:
+/// what was read or asked, by whom, during which work, why, and how it went.
+/// `next` is the cursor for the page after, or null at the end.
+pub async fn activity(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Reply {
+    let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50);
+    let before = q
+        .get("before")
+        .map(String::as_str)
+        .filter(|b| !b.is_empty());
+    let (list, next) = store(&state, &claims)
+        .access_page(&access_filter(&q), limit, before)
+        .await
+        .map_err(|e| internal("skill access log", e))?;
+    Ok(Json(json!({
+        "events": list.iter().map(|a| a.json()).collect::<Vec<_>>(),
+        "next": next,
+        "kept_days": ACCESS_DAYS,
+    })))
 }
 
 /// Whether the team's GitHub App covers `repo` (it has a repository record,

@@ -151,6 +151,8 @@ pub struct LiveSources {
     verified: Mutex<std::collections::HashSet<String>>,
     /// The team's own approved, switched-on tools on these sources.
     tools: Vec<LoadedTool>,
+    /// The run and work this is, kept on each lookup for a link back.
+    run: store::RunRef,
 }
 
 /// One approved tool and the loaded source it reads.
@@ -249,7 +251,17 @@ impl LiveSources {
             evidence: Mutex::new(Vec::new()),
             verified: Mutex::new(Default::default()),
             tools: own_tools,
+            run: store::RunRef::default(),
         })
+    }
+
+    /// Ties each lookup to the run and the work it was made during.
+    pub fn with_run(mut self, run_id: &str, origin: String) -> Self {
+        self.run = store::RunRef {
+            run_id: run_id.to_string(),
+            origin,
+        };
+        self
     }
 
     fn names(&self, kind: Option<Kind>) -> Vec<&str> {
@@ -728,7 +740,7 @@ impl LiveSources {
             Err(e) if e.is_refusal() => ("refused", e.message.clone(), 0),
             Err(e) => ("failed", e.message.clone(), 0),
         };
-        let logged = store::log_activity(
+        let logged = store::log_activity_in(
             &state.dynamo,
             &state.config.settings_table_name,
             &self.team_id,
@@ -743,6 +755,7 @@ impl LiveSources {
                 detail,
                 ms,
             },
+            &self.run,
         )
         .await;
         if let Err(e) = logged {
@@ -949,7 +962,7 @@ impl LiveSources {
             Err(e) if e.is_refusal() => ("refused", e.message.clone(), 0),
             Err(e) => ("failed", e.message.clone(), 0),
         };
-        let logged = store::log_activity(
+        let logged = store::log_activity_in(
             &state.dynamo,
             &state.config.settings_table_name,
             &self.team_id,
@@ -964,6 +977,7 @@ impl LiveSources {
                 detail,
                 ms,
             },
+            &self.run,
         )
         .await;
         // A lookup the team cannot see in its activity log is not used.
@@ -1238,6 +1252,7 @@ mod tests {
             evidence: Mutex::new(Vec::new()),
             verified: Mutex::new(Default::default()),
             tools: Vec::new(),
+            run: store::RunRef::default(),
         }
     }
 

@@ -150,19 +150,165 @@ pub async fn list(
     Ok(Json(json!({ "sources": sources })))
 }
 
-/// GET /api/data-sources/activity?limit=50&before=<cursor>
+/// What to show of the lookup log. Empty fields match everything.
+#[derive(Debug, Default)]
+struct LookupFilter {
+    source: String,
+    /// `ok`, `refused`, `failed`, or `problems` for either of the last two.
+    outcome: String,
+    /// An agent (`reviewer`, `planner`, `coder`), or `people` for anyone else.
+    who: String,
+    /// Words to find in what was asked, the reason, the source or the work.
+    q: String,
+    /// RFC 3339; lookups before it are left out.
+    since: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
+
+const AGENT_ACTORS: [&str; 3] = ["reviewer", "planner", "coder"];
+/// Lookups looked at for one filtered page, so a filter that matches little
+/// can't read the whole log in one request.
+const LOOKUP_SCAN_CAP: usize = 3_000;
+
+impl LookupFilter {
+    fn from_query(q: &std::collections::HashMap<String, String>) -> Self {
+        let get = |k: &str| q.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+        LookupFilter {
+            source: get("source"),
+            outcome: get("outcome"),
+            who: get("who"),
+            q: common::truncate_str(&get("q"), 200).to_lowercase(),
+            since: chrono::DateTime::parse_from_rfc3339(&get("since")).ok(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.source.is_empty()
+            && self.outcome.is_empty()
+            && self.who.is_empty()
+            && self.q.is_empty()
+            && self.since.is_none()
+    }
+
+    fn matches(&self, ev: &Value) -> bool {
+        let field = |k: &str| ev[k].as_str().unwrap_or("");
+        if !self.source.is_empty() && field("source_id") != self.source {
+            return false;
+        }
+        let outcome = field("outcome");
+        match self.outcome.as_str() {
+            "" => {}
+            "problems" if outcome == "ok" => return false,
+            "problems" => {}
+            o if outcome != o => return false,
+            _ => {}
+        }
+        let actor = field("actor");
+        match self.who.as_str() {
+            "" => {}
+            "people" if AGENT_ACTORS.contains(&actor) => return false,
+            "people" => {}
+            w if actor != w => return false,
+            _ => {}
+        }
+        if !self.q.is_empty() {
+            let hay = format!(
+                "{} {} {} {} {} {}",
+                field("query"),
+                field("summary"),
+                field("detail"),
+                field("source_name"),
+                field("repo"),
+                field("origin")
+            )
+            .to_lowercase();
+            if !self.q.split_whitespace().all(|w| hay.contains(w)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether `ev` is older than the window, so nothing after it can match.
+    fn past(&self, ev: &Value) -> bool {
+        let at = chrono::DateTime::parse_from_rfc3339(ev["at"].as_str().unwrap_or(""));
+        matches!((self.since, at), (Some(since), Ok(at)) if at < since)
+    }
+}
+
+/// GET /api/data-sources/activity?limit=50&before=<cursor>[&source=][&outcome=]
+/// [&who=][&q=][&since=][&until=] — lookups newest first. With a filter, a
+/// page holds only matching lookups and `next` says where to read on from
+/// (null at the end); a page can be short when little matched.
 pub async fn activity(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Reply {
     admin(&claims)?;
-    let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50);
-    let before = q.get("before").map(String::as_str);
-    let events = store::list_activity(&state.dynamo, table(&state), &claims.team_id, limit, before)
+    let limit: usize = q
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let filter = LookupFilter::from_query(&q);
+    // `until` starts the read just after the last lookup at that time.
+    let until = q
+        .get("until")
+        .filter(|u| chrono::DateTime::parse_from_rfc3339(u).is_ok())
+        .map(|u| format!("DSLOG#{u}~"));
+    let mut before = q.get("before").filter(|b| !b.is_empty()).cloned().or(until);
+    if filter.is_empty() {
+        let events = store::list_activity(
+            &state.dynamo,
+            table(&state),
+            &claims.team_id,
+            limit as i32,
+            before.as_deref(),
+        )
         .await
         .map_err(|e| internal("list lookups", e))?;
-    Ok(Json(json!({ "events": events })))
+        let next = (events.len() == limit)
+            .then(|| {
+                events
+                    .last()
+                    .and_then(|e| e["cursor"].as_str())
+                    .map(String::from)
+            })
+            .flatten();
+        return Ok(Json(json!({ "events": events, "next": next })));
+    }
+    let mut out: Vec<Value> = Vec::new();
+    let mut looked = 0usize;
+    loop {
+        let page = store::list_activity(
+            &state.dynamo,
+            table(&state),
+            &claims.team_id,
+            200,
+            before.as_deref(),
+        )
+        .await
+        .map_err(|e| internal("list lookups", e))?;
+        let full = page.len() == 200;
+        for ev in page {
+            looked += 1;
+            if filter.past(&ev) {
+                return Ok(Json(json!({ "events": out, "next": null })));
+            }
+            let cursor = ev["cursor"].as_str().unwrap_or("").to_string();
+            if filter.matches(&ev) {
+                out.push(ev);
+            }
+            if out.len() >= limit || looked >= LOOKUP_SCAN_CAP {
+                let next = (!cursor.is_empty()).then_some(cursor);
+                return Ok(Json(json!({ "events": out, "next": next })));
+            }
+            before = Some(cursor);
+        }
+        if !full || before.as_deref().unwrap_or("").is_empty() {
+            return Ok(Json(json!({ "events": out, "next": null })));
+        }
+    }
 }
 
 /// POST /api/data-sources/api/probe  { url }
@@ -1248,6 +1394,43 @@ async fn create_warehouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lookup_filter_matches_source_outcome_who_words_and_time() {
+        let ev = |actor: &str, outcome: &str, at: &str| {
+            json!({
+                "at": at, "source_id": "ds_1", "source_name": "orders-db database",
+                "actor": actor, "query": "SELECT status FROM orders", "summary": "SELECT status FROM orders",
+                "detail": "Timed out", "outcome": outcome, "repo": "acme/web", "origin": "acme/web#12",
+            })
+        };
+        let f = |pairs: &[(&str, &str)]| {
+            LookupFilter::from_query(
+                &pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        let ok = ev("reviewer", "ok", "2026-10-10T12:00:00.000Z");
+        let refused = ev("a@b.co", "refused", "2026-10-10T12:00:00.000Z");
+        assert!(f(&[]).is_empty());
+        assert!(f(&[("source", "ds_1")]).matches(&ok));
+        assert!(!f(&[("source", "ds_2")]).matches(&ok));
+        assert!(f(&[("outcome", "problems")]).matches(&refused));
+        assert!(!f(&[("outcome", "problems")]).matches(&ok));
+        assert!(!f(&[("outcome", "failed")]).matches(&refused));
+        assert!(f(&[("who", "people")]).matches(&refused));
+        assert!(!f(&[("who", "people")]).matches(&ok));
+        assert!(f(&[("who", "reviewer")]).matches(&ok));
+        assert!(f(&[("q", "ORDERS status")]).matches(&ok));
+        assert!(f(&[("q", "web#12")]).matches(&ok));
+        assert!(!f(&[("q", "orders deploy")]).matches(&ok));
+        let week = f(&[("since", "2026-10-11T00:00:00Z")]);
+        assert!(!week.is_empty());
+        assert!(week.past(&ok), "older than the window");
+        assert!(!week.past(&ev("coder", "ok", "2026-10-12T00:00:00.000Z")));
+    }
 
     #[test]
     fn warehouse_samples_keep_their_database() {

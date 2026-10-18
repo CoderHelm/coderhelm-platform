@@ -15,7 +15,7 @@
 
 use common::skills::{
     self, file_in_skill, handles, parse_item, select, usable, within_budget, AgentAsk, Kind,
-    SkillAskMessage, SkillMeta, SkillStore, SkillSyncMessage,
+    SkillAccess, SkillAskMessage, SkillMeta, SkillStore, SkillSyncMessage,
 };
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -39,6 +39,9 @@ const ASK_CONTEXT_CHARS: usize = 16_000;
 const ASK_MAX_TOKENS: i32 = 4_096;
 /// How long one ask may take before the asking agent goes on without it.
 const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// What a read tool asks the agent to say about why it reads.
+const REASON_HINT: &str =
+    "In a few words, why this fits the work. The team sees it in its activity log.";
 
 pub async fn sync(
     state: &WorkerState,
@@ -205,6 +208,9 @@ pub struct TeamSkills {
     origin: String,
     /// The run's id, for a link from an ask to its run. Empty if none.
     run_id: String,
+    /// What the work is, e.g. the ticket's title: the reason kept for a read
+    /// when the reader gave none.
+    task: String,
     items: Vec<(String, SkillMeta)>,
     reads: std::sync::atomic::AtomicUsize,
     asks: std::sync::atomic::AtomicUsize,
@@ -256,6 +262,7 @@ impl TeamSkills {
             reader,
             origin: String::new(),
             run_id: String::new(),
+            task: String::new(),
             items: names.into_iter().zip(items).collect(),
             reads: std::sync::atomic::AtomicUsize::new(0),
             asks: std::sync::atomic::AtomicUsize::new(0),
@@ -268,6 +275,39 @@ impl TeamSkills {
     pub fn with_run(mut self, run_id: Option<&str>) -> Self {
         self.run_id = run_id.unwrap_or_default().to_string();
         self
+    }
+
+    /// What the work is about, kept as the reason for a read the reader
+    /// gave no reason for.
+    pub fn with_task(mut self, task: &str) -> Self {
+        self.task = task.trim().to_string();
+        self
+    }
+
+    /// Why a read happened: the reader's own reason, else the task.
+    fn why(&self, input: &Value) -> String {
+        match input["reason"].as_str().map(str::trim) {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => self.task.clone(),
+        }
+    }
+
+    /// Keeps one read or ask on the team's access log. Work goes on if it
+    /// can't be kept.
+    async fn note(&self, st: &SkillStore<'_>, m: &SkillMeta, access: SkillAccess) {
+        let record = SkillAccess {
+            repo: m.repo.clone(),
+            path: m.path.clone(),
+            kind: m.kind.as_str().to_string(),
+            name: m.name.clone(),
+            by: self.reader.label().to_string(),
+            origin: self.origin.clone(),
+            run_id: self.run_id.clone(),
+            ..access
+        };
+        if let Err(e) = st.put_access(&record).await {
+            warn!(error = %e, "Could not keep a skill access record");
+        }
     }
 
     /// Adds what asking team agents cost to the run's usage, once.
@@ -310,8 +350,11 @@ impl TeamSkills {
                 .to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": { "name": { "type": "string", "description": "As listed, e.g. skill:debug" } },
-                "required": ["name"]
+                "properties": {
+                    "name": { "type": "string", "description": "As listed, e.g. skill:debug" },
+                    "reason": { "type": "string", "description": REASON_HINT }
+                },
+                "required": ["name", "reason"]
             }),
         }];
         if self.items.iter().any(|(_, m)| !m.files.is_empty()) {
@@ -325,9 +368,10 @@ impl TeamSkills {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string", "description": "The skill, e.g. skill:debug" },
-                        "path": { "type": "string", "description": "The file, as listed" }
+                        "path": { "type": "string", "description": "The file, as listed" },
+                        "reason": { "type": "string", "description": REASON_HINT }
                     },
-                    "required": ["name", "path"]
+                    "required": ["name", "path", "reason"]
                 }),
             });
         }
@@ -425,22 +469,33 @@ impl TeamSkills {
         if question.is_empty() {
             return "Give the agent a question.".to_string();
         }
-        if !self.take_ask() {
-            return format!(
-                "All {MAX_ASKS} team agent asks are used. Continue with what you have."
-            );
-        }
         let st = SkillStore {
             dynamo: &state.dynamo,
             table: &state.config.settings_table_name,
             team: &self.team_id,
         };
+        let asking = |outcome: &str| SkillAccess {
+            action: "ask".into(),
+            why: question.to_string(),
+            outcome: outcome.into(),
+            ..Default::default()
+        };
+        if !self.take_ask() {
+            self.note(&st, m, asking("limit")).await;
+            return format!(
+                "All {MAX_ASKS} team agent asks are used. Continue with what you have."
+            );
+        }
         // Read again: an admin may have switched it off since the run began.
         let body = match st.item(&m.repo, &m.path).await {
             Ok(Some((now, body))) if now.enabled => body,
-            Ok(_) => return format!("'{asked}' was switched off or removed. Continue without it."),
+            Ok(_) => {
+                self.note(&st, m, asking("off")).await;
+                return format!("'{asked}' was switched off or removed. Continue without it.");
+            }
             Err(e) => {
                 warn!(error = %e, "Could not read a team agent");
+                self.note(&st, m, asking("failed")).await;
                 return "The agent couldn't be reached right now. Continue without it.".into();
             }
         };
@@ -475,6 +530,16 @@ impl TeamSkills {
         if let Err(e) = st.put_ask(&record).await {
             warn!(error = %e, "Could not keep a team agent ask");
         }
+        self.note(
+            &st,
+            m,
+            SkillAccess {
+                ask_id: record.id.clone(),
+                ms: record.ms,
+                ..asking(&record.outcome)
+            },
+        )
+        .await;
         if let Ok(mut a) = self.asked.lock() {
             a.push(record);
         }
@@ -556,16 +621,35 @@ impl TeamSkills {
                 "There's no switched-on team skill called '{asked}'. Use a name from the list under 'Team skills'."
             ));
         };
-        if !self.take_read() {
-            return Some(format!(
-                "All {MAX_READS} skill reads are used. Continue with what you have."
-            ));
-        }
         let st = SkillStore {
             dynamo: &state.dynamo,
             table: &state.config.settings_table_name,
             team: &self.team_id,
         };
+        let file = if name == "read_skill_file" {
+            file_in_skill(&m.path, input["path"].as_str().unwrap_or(""))
+                .filter(|p| m.files.contains(p))
+        } else {
+            None
+        };
+        let reading = |outcome: &str| SkillAccess {
+            action: if name == "read_skill" {
+                "read"
+            } else {
+                "read_file"
+            }
+            .to_string(),
+            file: file.clone().unwrap_or_default(),
+            why: self.why(input),
+            outcome: outcome.into(),
+            ..Default::default()
+        };
+        if !self.take_read() {
+            self.note(&st, m, reading("limit")).await;
+            return Some(format!(
+                "All {MAX_READS} skill reads are used. Continue with what you have."
+            ));
+        }
         let source = format!(
             "{}@{} ({})",
             m.repo,
@@ -592,6 +676,7 @@ impl TeamSkills {
                 Ok(_) => None,
                 Err(e) => {
                     warn!(error = %e, "Could not read a skill");
+                    self.note(&st, m, reading("failed")).await;
                     return Some(
                         "The skill couldn't be read right now. Continue without it.".into(),
                     );
@@ -599,7 +684,7 @@ impl TeamSkills {
             }
         } else {
             let req = input["path"].as_str().unwrap_or("");
-            let Some(path) = file_in_skill(&m.path, req).filter(|p| m.files.contains(p)) else {
+            let Some(path) = file.clone() else {
                 return Some(format!(
                     "'{req}' isn't one of the files kept with {asked}. Files: {}",
                     m.files.join(", ")
@@ -610,6 +695,7 @@ impl TeamSkills {
                 Ok(None) => None,
                 Err(e) => {
                     warn!(error = %e, "Could not read a skill file");
+                    self.note(&st, m, reading("failed")).await;
                     return Some(
                         "The file couldn't be read right now. Continue without it.".into(),
                     );
@@ -617,6 +703,7 @@ impl TeamSkills {
             }
         };
         let Some(text) = text else {
+            self.note(&st, m, reading("off")).await;
             return Some(format!(
                 "'{asked}' was switched off or removed. Continue without it."
             ));
@@ -628,6 +715,7 @@ impl TeamSkills {
         if let Err(e) = st.count_read(&m.repo, &m.path, self.reader.label()).await {
             warn!(error = %e, "Could not count today's skill read");
         }
+        self.note(&st, m, reading("ok")).await;
         info!(
             team_id = %self.team_id,
             skill = %asked,
@@ -794,6 +882,24 @@ pub async fn try_ask(
     record.output_tokens = reply.usage.output_tokens as i64;
     record.ms = reply.ms;
     st.put_ask(&record).await?;
+    if let Ok(Some((m, _))) = st.item(&msg.repo, &msg.path).await {
+        let access = SkillAccess {
+            repo: m.repo,
+            path: m.path,
+            kind: m.kind.as_str().to_string(),
+            name: m.name,
+            action: "ask".into(),
+            by: record.by.clone(),
+            why: msg.question.clone(),
+            outcome: record.outcome.clone(),
+            ask_id: record.id.clone(),
+            ms: record.ms,
+            ..Default::default()
+        };
+        if let Err(e) = st.put_access(&access).await {
+            warn!(error = %e, "Could not keep a skill access record");
+        }
+    }
     info!(
         team_id = %msg.team_id,
         agent = %msg.path,
@@ -1088,6 +1194,40 @@ mod tests {
         assert!(s.find("debug").is_none(), "ambiguous bare name");
         assert!(s.find("skill:missing").is_none());
         assert!(s.find("").is_none());
+    }
+
+    #[test]
+    fn a_read_keeps_the_readers_reason_or_else_the_task() {
+        let s = TeamSkills::from_items(
+            "t",
+            Reader::Coder,
+            vec![meta("a", Kind::Skill, &["skills/a/x.md"])],
+        )
+        .unwrap()
+        .with_task("  Coding: Fix the login redirect ");
+        assert_eq!(
+            s.why(&json!({"name": "skill:a", "reason": " It covers redirects "})),
+            "It covers redirects"
+        );
+        assert_eq!(
+            s.why(&json!({"name": "skill:a", "reason": "  "})),
+            "Coding: Fix the login redirect"
+        );
+        assert_eq!(
+            s.why(&json!({"name": "skill:a"})),
+            "Coding: Fix the login redirect"
+        );
+        for t in s.tools() {
+            let required: Vec<&str> = t.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            if t.name.starts_with("read_skill") {
+                assert!(required.contains(&"reason"), "{} asks why", t.name);
+            }
+        }
     }
 
     #[test]
