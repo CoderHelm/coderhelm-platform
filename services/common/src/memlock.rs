@@ -1,3 +1,6 @@
+use aws_sdk_dynamodb::error::DisplayErrorContext;
+use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
+use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client as DynamoClient;
 use tracing::{info, warn};
@@ -47,8 +50,9 @@ pub async fn acquire_lock(
             Ok(Some(token))
         }
         Err(e) => {
-            let err_str = format!("{e}");
-            if err_str.contains("ConditionalCheckFailed") {
+            // The SDK's Display for a service error is just "service error",
+            // so classify on the typed error, never on the message text.
+            if put_is_contention(e.as_service_error()) {
                 warn!(
                     team_id,
                     repo = %format!("{repo_owner}/{repo_name}"),
@@ -56,6 +60,12 @@ pub async fn acquire_lock(
                 );
                 Ok(None)
             } else {
+                warn!(
+                    team_id,
+                    repo = %format!("{repo_owner}/{repo_name}"),
+                    error = %DisplayErrorContext(&e),
+                    "Failed to acquire memory lock"
+                );
                 Err(e.into())
             }
         }
@@ -95,12 +105,61 @@ pub async fn release_lock(
             );
     }
     if let Err(e) = req.send().await {
-        warn!(error = %e, "Failed to release memory lock (will auto-expire)");
+        if delete_is_contention(e.as_service_error()) {
+            // The condition failed: the lock now belongs to someone else
+            // (or is still live for a tokenless cleanup). Leaving it is right.
+            info!(
+                team_id,
+                repo = %format!("{repo_owner}/{repo_name}"),
+                "Memory lock no longer ours, left in place"
+            );
+        } else {
+            warn!(
+                error = %DisplayErrorContext(&e),
+                "Failed to release memory lock (will auto-expire)"
+            );
+        }
     } else {
         info!(
             team_id,
             repo = %format!("{repo_owner}/{repo_name}"),
             "Released memory lock"
         );
+    }
+}
+
+/// True when an acquire failed only because another invocation holds the lock.
+fn put_is_contention(err: Option<&PutItemError>) -> bool {
+    err.is_some_and(|e| e.is_conditional_check_failed_exception())
+}
+
+/// True when a release failed only because the lock is not ours to delete.
+fn delete_is_contention(err: Option<&DeleteItemError>) -> bool {
+    err.is_some_and(|e| e.is_conditional_check_failed_exception())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_dynamodb::types::error::ConditionalCheckFailedException;
+
+    #[test]
+    fn conditional_check_failure_is_contention_even_though_display_hides_it() {
+        let e = PutItemError::ConditionalCheckFailedException(
+            ConditionalCheckFailedException::builder().build(),
+        );
+        assert!(put_is_contention(Some(&e)));
+        let d = DeleteItemError::ConditionalCheckFailedException(
+            ConditionalCheckFailedException::builder().build(),
+        );
+        assert!(delete_is_contention(Some(&d)));
+    }
+
+    #[test]
+    fn other_errors_are_not_contention() {
+        assert!(!put_is_contention(None));
+        assert!(!delete_is_contention(None));
+        let e = PutItemError::unhandled("boom");
+        assert!(!put_is_contention(Some(&e)));
     }
 }
