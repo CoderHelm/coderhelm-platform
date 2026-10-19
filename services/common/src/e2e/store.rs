@@ -7,7 +7,8 @@
 //! | `T#{team}` | `REPO#{repo}` | a repo with results: default branch, installation |
 //! | `REPO#{repo}` | `TEAM#{team}` | reverse lookup for CI calls signed by GitHub |
 //! | `T#{team}#RUNS#{repo}` | `{started_at}#{run_key}` | a run (expires) |
-//! | `T#{team}#RUNKEY` | `{run_key}` | which repo a run belongs to; claims ingestion once |
+//! | `T#{team}#RUNKEY` | `{run_key}` | which repo a run belongs to; claims ingestion once; what reading it found |
+//! | `T#{team}#QNOTE` | `{repo}#{pr}` | the PR comment that says only quarantined tests failed |
 //! | `T#{team}#TESTS` | `{test id}` | a test's summary (the dashboard's list) |
 //! | `T#{team}#TEST#{id}` | `RECORD` | a test's full record: history, events |
 //! | `T#{team}#SIGS` | `{repo}#{signature}` | a failure group |
@@ -24,7 +25,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::model::{Recommendation, Run, Settings, TestRecord};
+use super::model::{IngestOutcome, Recommendation, Run, Settings, TestRecord};
 
 /// Runs, run keys and PR triage expire after this.
 pub const RETENTION_DAYS: i64 = 120;
@@ -94,6 +95,25 @@ pub fn upload_key(team: &str, repo: &str, name: &str) -> String {
 
 fn sanitize(team: &str) -> String {
     team.replace('#', "_")
+}
+
+/// The outcome of the newest attempt among a run's claim items (`{run_id}-{attempt}`).
+/// A claim without a result is still being read.
+fn newest_outcome(items: &[Item], run_id: u64) -> Option<IngestOutcome> {
+    let prefix = format!("{run_id}-");
+    items
+        .iter()
+        .filter_map(|i| {
+            let sk = i.get("sk")?.as_s().ok()?;
+            let attempt: u32 = sk.strip_prefix(&prefix)?.parse().ok()?;
+            Some((attempt, i))
+        })
+        .max_by_key(|(a, _)| *a)
+        .map(|(_, i)| {
+            data::<Value>(i)
+                .and_then(|v| serde_json::from_value(v["result"].clone()).ok())
+                .unwrap_or(IngestOutcome::Reading)
+        })
 }
 
 /// One failure, for its failure group.
@@ -316,6 +336,70 @@ impl<'a> Store<'a> {
                     v["started_at"].as_str().unwrap_or("").to_string(),
                 ))
             }))
+    }
+
+    /// Records what reading a claimed run found, next to its claim.
+    pub async fn finish_run(
+        &self,
+        team: &str,
+        run_key: &str,
+        repo: &str,
+        started_at: &str,
+        outcome: &IngestOutcome,
+    ) -> Result<(), String> {
+        let v = json!({ "repo": repo, "started_at": started_at, "result": outcome });
+        self.put(
+            &format!("T#{team}#RUNKEY"),
+            run_key,
+            &v,
+            vec![("ttl", ttl(RETENTION_DAYS))],
+        )
+        .await
+    }
+
+    /// What reading the newest attempt of a workflow run found. `None` when
+    /// no attempt of it has been claimed yet.
+    pub async fn latest_outcome(
+        &self,
+        team: &str,
+        run_id: u64,
+    ) -> Result<Option<IngestOutcome>, String> {
+        let out = self
+            .dynamo
+            .query()
+            .table_name(self.table)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :run)")
+            .expression_attribute_values(":pk", s(&format!("T#{team}#RUNKEY")))
+            .expression_attribute_values(":run", s(&format!("{run_id}-")))
+            .send()
+            .await
+            .map_err(|e| format!("e2e run outcome: {e}"))?;
+        Ok(newest_outcome(out.items(), run_id))
+    }
+
+    /// The comment id of a PR's "only quarantined tests failed" note.
+    pub async fn pr_note(&self, team: &str, repo: &str, pr: u64) -> Result<Option<u64>, String> {
+        Ok(self
+            .get(&format!("T#{team}#QNOTE"), &format!("{repo}#{pr}"))
+            .await?
+            .and_then(|i| data::<Value>(&i))
+            .and_then(|v| v["comment_id"].as_u64()))
+    }
+
+    pub async fn put_pr_note(
+        &self,
+        team: &str,
+        repo: &str,
+        pr: u64,
+        comment_id: u64,
+    ) -> Result<(), String> {
+        self.put(
+            &format!("T#{team}#QNOTE"),
+            &format!("{repo}#{pr}"),
+            &json!({ "comment_id": comment_id }),
+            vec![("ttl", ttl(RETENTION_DAYS))],
+        )
+        .await
     }
 
     pub async fn put_run(&self, team: &str, run: &Run) -> Result<(), String> {
@@ -604,5 +688,47 @@ mod tests {
             "e2e/TEAM_1/acme/web/raw/9-1/.._x_y.json"
         );
         assert_eq!(day_minus("2026-03-01", 1), "2026-02-28");
+    }
+
+    fn claim(sk: &str, data: Option<Value>) -> Item {
+        let mut i = HashMap::from([("sk".to_string(), s(sk))]);
+        if let Some(d) = data {
+            i.insert("data".into(), s(&d.to_string()));
+        }
+        i
+    }
+
+    #[test]
+    fn the_newest_attempt_decides_and_a_bare_claim_is_still_reading() {
+        let read = |rescued: bool| json!({ "repo": "acme/web", "result": { "outcome": "read", "failed": 1, "rescued": rescued, "quarantined": ["a"] } });
+        let items = vec![
+            claim("77-1", Some(read(false))),
+            claim("77-10", Some(read(true))),
+            claim("77-2", Some(read(false))),
+            claim("770-1", Some(read(false))),
+        ];
+        assert_eq!(
+            newest_outcome(&items, 77),
+            Some(IngestOutcome::Read {
+                failed: 1,
+                rescued: true,
+                quarantined: vec!["a".into()]
+            })
+        );
+        assert_eq!(
+            newest_outcome(&[claim("5-1", Some(json!({ "repo": "acme/web" })))], 5),
+            Some(IngestOutcome::Reading)
+        );
+        assert_eq!(
+            newest_outcome(
+                &[claim(
+                    "5-1",
+                    Some(json!({ "result": { "outcome": "no_tests" } }))
+                )],
+                5
+            ),
+            Some(IngestOutcome::NoTests)
+        );
+        assert_eq!(newest_outcome(&[], 5), None);
     }
 }
