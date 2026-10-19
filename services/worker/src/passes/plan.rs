@@ -754,6 +754,21 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
 
 /// Fetch enabled repos for a team from DynamoDB.
 pub async fn fetch_team_repos(state: &WorkerState, team_id: &str) -> Vec<String> {
+    fetch_team_repo_list(state, team_id)
+        .await
+        .into_iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.full_name)
+        .collect()
+}
+
+/// Every repo connected to the team (a REPO# row), enabled for runs or not.
+/// Jira repo selection needs the disabled ones too, so a ticket that names a
+/// connected-but-disabled repo stops out loud instead of being re-routed.
+pub async fn fetch_team_repo_list(
+    state: &WorkerState,
+    team_id: &str,
+) -> Vec<super::repo_pick::TeamRepo> {
     let result = state
         .dynamo
         .query()
@@ -774,13 +789,15 @@ pub async fn fetch_team_repos(state: &WorkerState, team_id: &str) -> Vec<String>
         Ok(output) => output
             .items()
             .iter()
-            .filter(|item| {
-                item.get("enabled")
+            .filter_map(|item| {
+                let full_name = item.get("repo_name").and_then(|v| v.as_s().ok())?.clone();
+                let enabled = item
+                    .get("enabled")
                     .and_then(|v| v.as_bool().ok())
                     .copied()
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                Some(super::repo_pick::TeamRepo { full_name, enabled })
             })
-            .filter_map(|item| item.get("repo_name").and_then(|v| v.as_s().ok()).cloned())
             .collect(),
         Err(e) => {
             tracing::warn!(error = %e, "Failed to fetch team repos for planner");

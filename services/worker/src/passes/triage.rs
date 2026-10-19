@@ -5,6 +5,7 @@ use crate::agent::provider::ModelProvider;
 use crate::agent::{llm, provider};
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
+use crate::passes::repo_pick::{self, RepoPick};
 use crate::WorkerState;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -245,10 +246,11 @@ pub async fn select_repo(
     state: &WorkerState,
     msg: &TicketMessage,
     repos: &[String],
+    disabled: &[String],
     github: &GitHubClient,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<RepoPick, Box<dyn std::error::Error + Send + Sync>> {
     let system = "You are a repo-selection agent. Given a Jira ticket and a list of repositories \
                   with descriptions, pick the single best repository for implementation. \
                   Rules: \
@@ -257,6 +259,7 @@ pub async fn select_repo(
                   3. If the ticket mentions specific services, APIs, SDKs, or integrations (e.g. a payments provider, a member-management API, billing), pick the repo that implements or calls those services — typically an API/backend repo, not a data repo. \
                   4. Terraform/infrastructure repos are ONLY for infra changes (IAM, networking, deployment config). \
                   5. When unsure, prefer application/API repos over data or infrastructure repos. \
+                  6. If the ticket says its work belongs in a repo listed as NOT turned on for runs, never substitute another repo — answer NOT_ENABLED: owner/name. \
                   Think step by step: (1) what is this ticket about, (2) which repo owns that area, (3) return ONLY the repo in owner/name format.";
 
     // Enrich repo list with language, description, and top-level directory from GitHub
@@ -310,6 +313,11 @@ pub async fn select_repo(
     let mut repo_scores: Vec<(String, usize, usize)> = Vec::new();
     let mut searches_attempted = 0usize;
     let mut searches_failed = 0usize;
+    // A ticket that may name a connected-but-disabled repo must reach the
+    // model: code evidence in an ENABLED repo would otherwise short-circuit to
+    // exactly the silent re-route this check exists to prevent.
+    let ticket_text = format!("{}\n{}", msg.title, msg.body);
+    let may_name_disabled = repo_pick::mentions_disabled_repo(&ticket_text, disabled);
     // Bound the fan-out: only probe when we have terms and a sane repo count.
     if !probe_terms.is_empty() && repos.len() <= 10 {
         for r in repos {
@@ -368,7 +376,7 @@ pub async fn select_repo(
         // mis-route we're preventing) — that case falls through to the LLM with
         // the evidence in hand.
         let max_terms = repo_scores.iter().map(|(_, m, _)| *m).max().unwrap_or(0);
-        if max_terms >= 2 {
+        if max_terms >= 2 && !may_name_disabled {
             let leaders: Vec<&(String, usize, usize)> = repo_scores
                 .iter()
                 .filter(|(_, m, _)| *m == max_terms)
@@ -382,7 +390,11 @@ pub async fn select_repo(
                     files = leaders[0].2,
                     "Repo selected by code evidence (unique strong match)"
                 );
-                return Ok(repo);
+                let why = format!(
+                    "its code is the only one that contains the ticket's identifiers ({}).",
+                    probe_terms.join(", ")
+                );
+                return Ok(RepoPick::Repo { repo, why });
             }
         }
     }
@@ -424,6 +436,19 @@ pub async fn select_repo(
         }
     };
 
+    let disabled_section = if disabled.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = disabled.iter().take(25).map(|r| format!("- {r}")).collect();
+        format!(
+            "\n## Connected repos that are NOT turned on for runs\n{}\n\
+             You cannot pick these. If the ticket says its work belongs in one of them (names it \
+             as the repo to change), do NOT pick a different repo: put `NOT_ENABLED: owner/name` \
+             on the last line instead. A passing mention that isn't where the change goes doesn't count.\n",
+            list.join("\n")
+        )
+    };
+
     let global_agents = super::load_content(state, &msg.team_id, "AGENTS#GLOBAL").await;
 
     let context_section = if global_agents.is_empty() {
@@ -444,13 +469,13 @@ Description:
 {context_section}
 ## Available repositories
 {repo_list}
-{evidence_section}{roles_section}
+{evidence_section}{roles_section}{disabled_section}
 Think step by step:
 1. What is this ticket about, and what DOMAIN is it — web/frontend, backend/API, mobile, cms, infra, or data? (one sentence)
 2. If a repo has a ROLE matching that domain (see Repo roles), pick it — roles are authoritative and override descriptions. Otherwise weigh the CODE EVIDENCE (which repo actually contains the ticket's identifiers) ABOVE the repo descriptions.
 3. Why is it NOT any of the other repos?
 
-Then on the LAST line, return ONLY the repository in `owner/name` format."#,
+Then on the LAST line, return ONLY the repository in `owner/name` format (or `NOT_ENABLED: owner/name` when the ticket belongs in a repo that isn't turned on)."#,
         ticket_id = msg.ticket_id,
         title = msg.title,
         body = msg.body,
@@ -497,15 +522,44 @@ Then on the LAST line, return ONLY the repository in `owner/name` format."#,
 
     info!(response = %response.trim(), "Triage repo selection reasoning");
 
+    if let Some(named) = repo_pick::parse_not_enabled_answer(&response, disabled) {
+        info!(repo = %named, "Ticket belongs in a repo that isn't turned on for runs");
+        return Ok(RepoPick::NotEnabled(named));
+    }
+
     if let Some(repo) = extract_repo_choice(&response, repos) {
         info!(repo = %repo, "Repo selected for Jira ticket");
-        return Ok(repo);
+        let why = pick_reason(&response);
+        return Ok(RepoPick::Repo { repo, why });
     }
 
     // Fall back to first repo — should now be rare (truncation fixed and the
     // parser scans every line); the progress notes make it visible upstream.
     info!(fallback = %repos[0], "LLM pick not in list, falling back");
-    Ok(repos[0].clone())
+    Ok(RepoPick::Repo {
+        repo: repos[0].clone(),
+        why: "the repo picker gave no usable answer, so the first enabled repo was used."
+            .to_string(),
+    })
+}
+
+/// The model's reasoning minus its final answer line, flattened and capped,
+/// so a no-changes comment can say why this repo was chosen.
+fn pick_reason(response: &str) -> String {
+    let mut lines: Vec<&str> = response
+        .trim()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.pop();
+    let joined = lines.join(" ");
+    let capped = common::truncate_str(&joined, 400);
+    if capped.len() < joined.len() {
+        format!("{capped}…")
+    } else {
+        capped.to_string()
+    }
 }
 
 /// Scan the response from the LAST line upward for a line that names one of
@@ -543,7 +597,15 @@ fn extract_repo_choice(response: &str, repos: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_repo_choice, extract_ticket_search_terms};
+    use super::{extract_repo_choice, extract_ticket_search_terms, pick_reason};
+
+    #[test]
+    fn pick_reason_drops_the_answer_line() {
+        let r = "1. Billing endpoint change.\n2. Acme/api owns billing.\n\nAcme/api";
+        let why = pick_reason(r);
+        assert!(why.contains("owns billing"), "{why}");
+        assert!(!why.ends_with("Acme/api"), "{why}");
+    }
 
     #[test]
     fn extracts_distinctive_identifiers() {
