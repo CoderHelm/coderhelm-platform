@@ -17,6 +17,8 @@ pub mod alert_notify;
 /// the dashboard's test path and the reviewer's tool path enforce the same rules.
 pub mod e2e;
 pub mod live;
+/// Sealed credentials for a team's MCP servers (KMS, bound to team and server).
+pub mod mcp_credentials;
 pub mod memory_meta;
 /// Paginated DynamoDB lookups (follow LastEvaluatedKey to a match).
 pub mod paged;

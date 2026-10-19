@@ -9,6 +9,7 @@ import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as kms from "aws-cdk-lib/aws-kms";
 import * as logs from "aws-cdk-lib/aws-logs";
 import { Construct } from "constructs";
 
@@ -21,6 +22,7 @@ interface StreamingStackProps extends cdk.StackProps {
   mcpConfigsTable: dynamodb.TableV2;
   bucket: s3.Bucket;
   mcpProxyFunction: lambda.Function;
+  secretsKey: kms.Key;
 }
 
 export class StreamingStack extends cdk.Stack {
@@ -115,6 +117,9 @@ export class StreamingStack extends cdk.Stack {
     props.reposTable.grantReadData(this.streamingFunction);
     props.settingsTable.grantReadData(this.streamingFunction);
     props.mcpConfigsTable.grantReadData(this.streamingFunction);
+    // Plan chat opens a team's sealed MCP credentials for a tool call; it
+    // never seals (the gateway does), so decrypt only.
+    props.secretsKey.grantDecrypt(this.streamingFunction);
     props.bucket.grantRead(this.streamingFunction);
     secrets.grantRead(this.streamingFunction);
 

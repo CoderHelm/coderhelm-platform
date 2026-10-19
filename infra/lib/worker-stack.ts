@@ -142,7 +142,8 @@ export class WorkerStack extends cdk.Stack {
     props.reposTable.grantReadWriteData(this.workerFunction);
     props.settingsTable.grantReadWriteData(this.workerFunction);
     props.testsTable.grantReadWriteData(this.workerFunction);
-    // Data-source keys: the worker reads them to run lookups, never writes them.
+    // Data-source keys and MCP server credentials: the worker opens them to
+    // run lookups and tool calls, never seals or writes them.
     props.secretsKey.grantDecrypt(this.workerFunction);
 
     // Data sources in a team's own AWS account (logs, a database): the agents
