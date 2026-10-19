@@ -306,13 +306,7 @@ pub async fn item(
         .ok()
         .filter(|v| v.is_object())
     {
-        let mut c = meta.compat_json();
-        if let (Some(obj), Some(full)) = (c.as_object_mut(), full.as_object()) {
-            for (k, v) in full {
-                obj.entry(k.clone()).or_insert(v.clone());
-            }
-        }
-        out["compat"] = c;
+        out["compat"] = full_compat(meta.compat_json(), &full);
     }
     out["translated"] = json!(translated);
     if meta.kind == Kind::Agent {
@@ -323,6 +317,23 @@ pub async fn item(
     }
     out["body"] = json!(body);
     Ok(Json(out))
+}
+
+/// The short check with the full one's steps, counts and cost added, and
+/// its list of what to connect as `needs_detail` (the short `needs` stays a
+/// list of names).
+fn full_compat(short: Value, full: &Value) -> Value {
+    let mut c = short;
+    if let (Some(obj), Some(full)) = (c.as_object_mut(), full.as_object()) {
+        for (k, v) in full {
+            if k == "needs" {
+                obj.insert("needs_detail".into(), v.clone());
+            } else {
+                obj.entry(k.clone()).or_insert(v.clone());
+            }
+        }
+    }
+    c
 }
 
 /// PUT /api/skills/item `{repo, path, enabled}` — switches an item on or off
@@ -665,6 +676,22 @@ mod tests {
             at: (chrono::Utc::now() - chrono::Duration::hours(hours_ago)).to_rfc3339(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn an_items_page_gets_the_full_check_with_names_kept_short() {
+        let short = json!({ "status": "needs_tools", "needs": ["Monitoring"], "current": true });
+        let full = json!({
+            "status": "ignored", "steps": [{ "title": "a" }],
+            "needs": [{ "name": "Monitoring", "fix": "Connect it" }], "cost_usd": 0.02
+        });
+        let c = full_compat(short, &full);
+        assert_eq!(c["status"], "needs_tools", "the short form leads");
+        assert_eq!(c["needs"], json!(["Monitoring"]));
+        assert_eq!(c["needs_detail"][0]["fix"], "Connect it");
+        assert_eq!(c["steps"][0]["title"], "a");
+        assert_eq!(c["cost_usd"], 0.02);
+        assert_eq!(c["current"], true);
     }
 
     #[test]
