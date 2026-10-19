@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 
 use super::api::Check;
 use super::aws::{rdsdata_client, AwsTarget, Session};
-use super::redact::{hidden_terms, redact_all};
+use super::redact::redact_all;
 use super::sql::{check_read_only_sql, CheckedSql};
 use super::tools::{BoundParam, ParamValue};
 use super::StepError;
@@ -286,7 +286,7 @@ pub async fn run_sql(
     let count = value.as_array().map(|a| a.len()).unwrap_or(0);
     // Columns returned by `*` carry their real names; free text can still hold
     // an email or a token. Both are hidden here.
-    let hidden_count = redact_all(&mut value, &hidden_terms(hidden));
+    let hidden_count = redact_all(&mut value, &checked.hidden_terms);
     let pretty = serde_json::to_string_pretty(&value).unwrap_or_default();
     Ok(DbLookup {
         statement: checked.statement,
@@ -314,7 +314,7 @@ pub async fn run_tool_sql(
     let ms = started.elapsed().as_millis();
     let count = rows.len();
     let mut value = Value::Array(rows.into_iter().map(Value::Object).collect());
-    let hidden_count = redact_all(&mut value, &hidden_terms(hidden));
+    let hidden_count = redact_all(&mut value, &super::sql::statement_terms(text, hidden));
     let pretty = serde_json::to_string_pretty(&value).unwrap_or_default();
     Ok((
         count,
@@ -366,6 +366,11 @@ pub fn schema_text(rows: &[Row]) -> (String, usize) {
             tables += 1;
         }
         out.push_str(&format!("  {}: {}\n", get("c"), get("d")));
+    }
+    if rows.len() >= MAX_SCHEMA_COLUMNS {
+        // Read when checking names: a table missing from a cut-short list
+        // may still exist.
+        out.push_str(&format!("\n{}\n", super::catalog::INCOMPLETE_MARK));
     }
     (out, tables)
 }

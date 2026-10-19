@@ -17,8 +17,20 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::graphql::IMPLEMENTED_BY;
-use super::redact::{hidden_terms, is_hidden};
+use super::redact::{hidden_terms, hidden_terms_for, is_hidden, TableRef};
 use super::sql::table_aliases;
+
+/// Written under a description that was cut short (more columns than one
+/// read returns), so a name missing from it is not taken as proof that the
+/// source lacks it.
+pub const INCOMPLETE_MARK: &str = "# (more columns than were read; this list is incomplete)";
+/// A GraphQL description stops growing at this size (see
+/// `graphql::schema_from_introspection`); one near it may be missing types.
+const API_DESCRIPTION_FULL_BYTES: usize = 290_000;
+/// Columns read per database before a description is cut short: Redshift
+/// reads 3,000 per database, PostgreSQL 10,000 in all.
+const WAREHOUSE_COLUMNS_READ: usize = 3_000;
+const DATABASE_COLUMNS_READ: usize = 10_000;
 
 /// Most close names offered for one wrong name.
 const MAX_SUGGESTIONS: usize = 5;
@@ -67,9 +79,33 @@ pub struct Entry {
     pub members: Vec<String>,
     /// The block exactly as saved.
     pub block: String,
+    /// For a warehouse table, the database it is in (`table public.orders
+    /// (database dev)`).
+    pub database: Option<String>,
 }
 
 impl Entry {
+    /// The table or type this entry is, for matching table-scoped hidden
+    /// entries: a database table without a schema is in `public`.
+    pub fn table_ref(&self) -> TableRef {
+        let mut r = TableRef::parse(&self.name);
+        if self.kind == EntryKind::Table && r.schema.is_none() {
+            r.schema = Some("public".into());
+        }
+        r
+    }
+
+    /// The hidden terms for this entry's own fields. A table gets the
+    /// entries scoped to it; an API type gets every entry by field name
+    /// (an API's answers don't say which type a field came from).
+    pub fn hidden_terms(&self, hidden: &[String]) -> Vec<String> {
+        if self.kind == EntryKind::Table {
+            hidden_terms_for(hidden, &[self.table_ref()])
+        } else {
+            hidden_terms(hidden)
+        }
+    }
+
     /// The last part of a dotted name: `invoices` for `billing.invoices`.
     fn short(&self) -> &str {
         self.name.rsplit('.').next().unwrap_or(&self.name)
@@ -86,6 +122,12 @@ impl Entry {
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     pub entries: Vec<Entry>,
+    /// The description may be missing tables or types (it was cut short), so
+    /// a name missing from it doesn't prove anything.
+    pub incomplete: bool,
+    /// Which databases' lists were cut short ("" for a database described
+    /// without one).
+    pub cut: std::collections::HashSet<String>,
 }
 
 fn unquote(s: &str) -> String {
@@ -97,9 +139,19 @@ impl Catalog {
     /// `db::schema_text` or `redshift::schema_text`. Blocks it doesn't
     /// recognise are skipped.
     pub fn parse(text: &str) -> Catalog {
-        let mut entries = Vec::new();
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut cut: std::collections::HashSet<String> = Default::default();
         for block in text.split("\n\n") {
             let block = block.trim_matches('\n');
+            if block.trim() == INCOMPLETE_MARK {
+                // Written after the list it belongs to.
+                let db = entries
+                    .last()
+                    .and_then(|e| e.database.clone())
+                    .unwrap_or_default();
+                cut.insert(db);
+                continue;
+            }
             let mut lines = block.lines();
             let Some(head) = lines.next() else { continue };
             let head = head.trim_end();
@@ -168,6 +220,12 @@ impl Catalog {
                     });
                 }
             }
+            let database = (kind == EntryKind::Table)
+                .then(|| {
+                    head.split_once(" (database ")
+                        .map(|(_, d)| d.trim_end_matches(')').trim().to_string())
+                })
+                .flatten();
             if !name.is_empty() {
                 entries.push(Entry {
                     kind,
@@ -175,10 +233,48 @@ impl Catalog {
                     fields,
                     members,
                     block: block.to_string(),
+                    database,
                 });
             }
         }
-        Catalog { entries }
+        cut.extend(cut_short(text, &entries));
+        Catalog {
+            incomplete: !cut.is_empty(),
+            entries,
+            cut,
+        }
+    }
+
+    /// Only the tables of one warehouse database, when the description says
+    /// which database each table is in; otherwise the whole description.
+    /// Cut short when that database's list was, or when it lists nothing.
+    pub fn in_database(&self, database: Option<&str>) -> Catalog {
+        let Some(db) = database.filter(|_| self.entries.iter().any(|e| e.database.is_some()))
+        else {
+            return self.clone();
+        };
+        let entries: Vec<Entry> = self
+            .entries
+            .iter()
+            .filter(|e| e.database.as_deref() == Some(db))
+            .cloned()
+            .collect();
+        let cut: std::collections::HashSet<String> = self
+            .cut
+            .iter()
+            .filter(|c| c.as_str() == db)
+            .cloned()
+            .collect();
+        Catalog {
+            incomplete: !cut.is_empty() || entries.is_empty(),
+            entries,
+            cut,
+        }
+    }
+
+    /// Whether this describes database tables (rather than an API's types).
+    pub fn has_tables(&self) -> bool {
+        self.is_tables()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -234,8 +330,7 @@ impl Catalog {
     /// interface is followed by its members' blocks, while they fit.
     pub fn describe(&self, name: &str, hidden: &[String], max_bytes: usize) -> Option<String> {
         let e = self.find(name)?;
-        let terms = hidden_terms(hidden);
-        let mut out = mark_hidden(&e.block, &terms);
+        let mut out = mark_hidden(&e.block, &e.hidden_terms(hidden));
         match e.kind {
             EntryKind::Union => out.push_str(&format!(
                 "\n({} has no fields of its own. Select from it with inline fragments: \
@@ -252,7 +347,7 @@ impl Catalog {
         }
         for m in &e.members {
             let Some(member) = self.find(m) else { continue };
-            let b = mark_hidden(&member.block, &terms);
+            let b = mark_hidden(&member.block, &member.hidden_terms(hidden));
             if out.len() + b.len() + 2 > max_bytes {
                 out.push_str("\n(more members left out; look each one up by name)\n");
                 break;
@@ -296,13 +391,12 @@ impl Catalog {
     /// closest names instead of nothing.
     pub fn search(&self, term: &str, hidden: &[String], max_bytes: usize) -> String {
         let term = term.trim().to_lowercase();
-        let terms = hidden_terms(hidden);
         let mut out = String::new();
         for e in &self.entries {
             if !e.block.to_lowercase().contains(&term) {
                 continue;
             }
-            let b = mark_hidden(&e.block, &terms);
+            let b = mark_hidden(&e.block, &e.hidden_terms(hidden));
             if out.len() + b.len() + 2 > max_bytes {
                 out.push_str("\n(more matches left out; search for something narrower)\n");
                 break;
@@ -404,9 +498,32 @@ fn distance(wanted: &str, candidate: &str) -> f64 {
         if shortest >= 3 && (c.contains(&w) || w.contains(&c)) {
             d = d.min(0.3);
         }
+        // The same with plurals taken off: `shipments` is close to
+        // `order_shipment`, `people` isn't helped but `orders` is.
+        let (ws, cs) = (singular(&w), singular(&c));
+        if ws.chars().count().min(cs.chars().count()) >= 4 && (c.contains(&ws) || w.contains(&cs)) {
+            d = d.min(0.35);
+        }
         best = best.min(d);
     }
     best
+}
+
+/// A word without a plural ending: `boxes` → `box`, `entries` →
+/// `entry`, `orders` → `order`.
+fn singular(w: &str) -> String {
+    if let Some(s) = w.strip_suffix("ies") {
+        return format!("{s}y");
+    }
+    for end in ["sses", "shes", "ches", "xes"] {
+        if w.ends_with(end) {
+            return w[..w.len() - 2].to_string();
+        }
+    }
+    match w.strip_suffix('s') {
+        Some(s) if !s.ends_with('s') => s.to_string(),
+        _ => w.to_string(),
+    }
 }
 
 /// Up to `n` of `candidates` closest to `wanted`, closest first. Names too
@@ -612,7 +729,6 @@ pub fn is_name_error(error: &str) -> bool {
 /// `error` is the database's message; `sql` is the lookup that failed, used
 /// to tell which table an alias stands for.
 pub fn sql_hints(catalog: &Catalog, error: &str, sql: &str, hidden: &[String]) -> Vec<String> {
-    let terms = hidden_terms(hidden);
     let mut out: Vec<String> = Vec::new();
     for c in SQL_RELATION.captures_iter(error) {
         let wanted = &c[1];
@@ -651,6 +767,7 @@ pub fn sql_hints(catalog: &Catalog, error: &str, sql: &str, hidden: &[String]) -
             continue;
         }
         for e in tables {
+            let terms = e.hidden_terms(hidden);
             let names: Vec<&str> = visible(e, &terms).collect();
             let near = closest(column, names.iter().copied(), MAX_SUGGESTIONS);
             let mut s = format!("{} has no column {column}.", e.name);
@@ -663,6 +780,542 @@ pub fn sql_hints(catalog: &Catalog, error: &str, sql: &str, hidden: &[String]) -
     }
     out.dedup();
     out
+}
+
+/// Whether a description saved before [`INCOMPLETE_MARK`] existed was cut
+/// short: as many columns as one read returns, or an API description at its
+/// size limit.
+fn cut_short(text: &str, entries: &[Entry]) -> Vec<String> {
+    if !entries.iter().any(|e| e.kind == EntryKind::Table) {
+        let full = !entries.is_empty() && text.len() >= API_DESCRIPTION_FULL_BYTES;
+        return if full {
+            vec![String::new()]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut per_db: std::collections::HashMap<&str, usize> = Default::default();
+    for e in entries.iter().filter(|e| e.kind == EntryKind::Table) {
+        *per_db
+            .entry(e.database.as_deref().unwrap_or(""))
+            .or_default() += e.fields.len();
+    }
+    per_db
+        .into_iter()
+        .filter(|(db, n)| {
+            if db.is_empty() {
+                *n >= DATABASE_COLUMNS_READ
+            } else {
+                // Warehouses read this many per database before 10,000.
+                *n == WAREHOUSE_COLUMNS_READ || *n >= DATABASE_COLUMNS_READ
+            }
+        })
+        .map(|(db, _)| db.to_string())
+        .collect()
+}
+
+/// Schemas and name prefixes of a database's own system tables. They are
+/// never in a source's description, so they are never called unknown.
+fn is_system_table(r: &TableRef) -> bool {
+    const SCHEMAS: &[&str] = &[
+        "pg_catalog",
+        "information_schema",
+        "pg_internal",
+        "pg_toast",
+    ];
+    const PREFIXES: &[&str] = &["pg_", "stl_", "stv_", "svl_", "svv_", "sys_"];
+    r.schema.as_deref().is_some_and(|s| SCHEMAS.contains(&s))
+        || (r.schema.is_none() && PREFIXES.iter().any(|p| r.table.starts_with(p)))
+}
+
+/// Words a database reads as a value where a column could go, so a bare one
+/// is never called an unknown column.
+const PSEUDO_COLUMNS: &[&str] = &[
+    "sysdate",
+    "getdate",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "current_role",
+    "current_schema",
+    "current_catalog",
+    "current_database",
+    "session_user",
+    "user",
+    "localtime",
+    "localtimestamp",
+    "true",
+    "false",
+    "null",
+    "oid",
+    "ctid",
+    "xmin",
+    "xmax",
+    "cmin",
+    "cmax",
+    "tableoid",
+];
+
+/// What a SQL lookup names, read from its parsed form.
+#[derive(Default)]
+struct SqlNames {
+    /// Names WITH gives a query; reading one is not reading a table.
+    ctes: std::collections::HashSet<String>,
+    /// Every table read: the reference, and what the lookup calls it.
+    tables: Vec<(TableRef, String)>,
+    /// Names that stand for something other than a described table: a
+    /// subquery's alias, a function's, a system table's.
+    opaque: std::collections::HashSet<String>,
+    /// Every `x.y` used in an expression.
+    qualified: Vec<(String, String)>,
+    /// Every bare name used in an expression.
+    bare: Vec<String>,
+    /// Names a SELECT gives its own output columns.
+    output: std::collections::HashSet<String>,
+    /// A factor that isn't a plain table (subquery, function, VALUES).
+    has_other_factor: bool,
+}
+
+fn ident_name(i: &sqlparser::ast::Ident) -> String {
+    i.value.to_lowercase()
+}
+
+fn output_names(body: &sqlparser::ast::SetExpr, out: &mut std::collections::HashSet<String>) {
+    use sqlparser::ast::{SelectItem, SetExpr};
+    match body {
+        SetExpr::Select(sel) => {
+            for item in &sel.projection {
+                if let SelectItem::ExprWithAlias { alias, .. } = item {
+                    out.insert(ident_name(alias));
+                }
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            output_names(left, out);
+            output_names(right, out);
+        }
+        _ => {}
+    }
+}
+
+impl sqlparser::ast::Visitor for SqlNames {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        if let Some(with) = &q.with {
+            for cte in &with.cte_tables {
+                self.ctes.insert(ident_name(&cte.alias.name));
+            }
+        }
+        output_names(&q.body, &mut self.output);
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(
+        &mut self,
+        t: &sqlparser::ast::TableFactor,
+    ) -> std::ops::ControlFlow<()> {
+        use sqlparser::ast::TableFactor;
+        match t {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
+                let full = name
+                    .0
+                    .iter()
+                    .filter_map(|p| p.as_ident())
+                    .map(|i| i.value.clone())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let r = TableRef::parse(&full);
+                let called = alias
+                    .as_ref()
+                    .map(|a| ident_name(&a.name))
+                    .unwrap_or_else(|| r.table.clone());
+                if args.is_some() {
+                    // `FROM generate_series(1, 3) AS g`: a function, not a table.
+                    self.has_other_factor = true;
+                    self.opaque.insert(called);
+                } else {
+                    self.tables.push((r, called));
+                }
+            }
+            TableFactor::NestedJoin { alias, .. } => {
+                if let Some(a) = alias {
+                    self.opaque.insert(ident_name(&a.name));
+                }
+            }
+            other => {
+                self.has_other_factor = true;
+                let alias = match other {
+                    TableFactor::Derived { alias, .. }
+                    | TableFactor::TableFunction { alias, .. }
+                    | TableFactor::Function { alias, .. }
+                    | TableFactor::UNNEST { alias, .. } => alias.as_ref(),
+                    _ => None,
+                };
+                if let Some(a) = alias {
+                    self.opaque.insert(ident_name(&a.name));
+                }
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &sqlparser::ast::Expr) -> std::ops::ControlFlow<()> {
+        use sqlparser::ast::Expr;
+        match e {
+            Expr::Identifier(i) if i.quote_style.is_none() || i.quote_style == Some('"') => {
+                self.bare.push(ident_name(i))
+            }
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => self
+                .qualified
+                .push((ident_name(&parts[0]), ident_name(&parts[1]))),
+            _ => {}
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+impl Catalog {
+    /// The described tables a reference could be: by schema and name when
+    /// it names a schema, by name in any schema when it doesn't (the
+    /// database's search path decides which).
+    fn tables_for(&self, r: &TableRef) -> Vec<&Entry> {
+        self.entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Table)
+            .filter(|e| {
+                let er = e.table_ref();
+                er.table == r.table
+                    && match &r.schema {
+                        Some(s) => er.schema.as_deref() == Some(s.as_str()),
+                        None => true,
+                    }
+            })
+            .collect()
+    }
+
+    /// Up to five described table names closest to `wanted`, by name.
+    fn closest_tables(&self, wanted: &str) -> Vec<&str> {
+        closest(
+            wanted,
+            self.entries
+                .iter()
+                .filter(|e| e.kind == EntryKind::Table)
+                .map(|e| e.name.as_str()),
+            MAX_SUGGESTIONS,
+        )
+    }
+}
+
+/// Checks a SQL lookup's tables and columns against the source's
+/// description before anything is sent. Returns one line per name the
+/// source doesn't have, with the closest real names; empty when every name
+/// is known, or when the description can't settle it (none saved, cut
+/// short, or SQL that doesn't parse: the read-only check refuses that).
+///
+/// Columns are checked when it is certain which table they belong to: a
+/// `t.column` whose `t` is a described table or its alias, or a bare column
+/// in a lookup that reads exactly one table and nothing else. Names WITH
+/// gives a query and subquery aliases are never taken for tables.
+/// [`unknown_sql_names`] for a lookup run in one warehouse database: only
+/// that database's tables count.
+pub fn unknown_sql_names_in(
+    catalog: &Catalog,
+    database: Option<&str>,
+    sql: &str,
+    hidden: &[String],
+) -> Vec<String> {
+    unknown_sql_names(&catalog.in_database(database), sql, hidden)
+}
+
+pub fn unknown_sql_names(catalog: &Catalog, sql: &str, hidden: &[String]) -> Vec<String> {
+    use sqlparser::ast::Visit;
+    if catalog.incomplete || !catalog.is_tables() {
+        return Vec::new();
+    }
+    let Ok(statements) =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+    else {
+        return Vec::new();
+    };
+    let mut names = SqlNames::default();
+    for st in &statements {
+        let _ = st.visit(&mut names);
+    }
+    let mut out: Vec<String> = Vec::new();
+    // What each name a lookup calls a table stands for: `Some(entry)` when it
+    // is one described table, `None` when it can't be checked.
+    let mut called: std::collections::HashMap<String, Option<&Entry>> = Default::default();
+    let mut real_tables = 0usize;
+    for (r, call) in &names.tables {
+        if r.schema.is_none() && names.ctes.contains(&r.table) {
+            called.insert(call.clone(), None);
+            continue;
+        }
+        if is_system_table(r) {
+            called.insert(call.clone(), None);
+            names.has_other_factor = true;
+            continue;
+        }
+        real_tables += 1;
+        let found = catalog.tables_for(r);
+        match found.as_slice() {
+            [] => {
+                let wanted = match &r.schema {
+                    Some(s) => format!("{s}.{}", r.table),
+                    None => r.table.clone(),
+                };
+                let near = catalog.closest_tables(&wanted);
+                out.push(if near.is_empty() {
+                    format!(
+                        "No table named {wanted}. Call live_describe with an empty search to list the tables."
+                    )
+                } else {
+                    format!("No table named {wanted}. Closest: {}.", near.join(", "))
+                });
+                called.insert(call.clone(), None);
+            }
+            [one] => {
+                // Two tables under one name make it unclear; never guess.
+                let entry = match called.get(call) {
+                    Some(Some(prev)) if prev.name != one.name => None,
+                    Some(None) => None,
+                    _ => Some(*one),
+                };
+                called.insert(call.clone(), entry);
+            }
+            _ => {
+                called.insert(call.clone(), None);
+            }
+        }
+    }
+    for o in &names.opaque {
+        called.insert(o.clone(), None);
+    }
+    let column_line = |e: &Entry, column: &str| -> String {
+        let terms = e.hidden_terms(hidden);
+        let visible_names: Vec<&str> = visible(e, &terms).collect();
+        let near = closest(column, visible_names.iter().copied(), MAX_SUGGESTIONS);
+        let mut s = format!("{} has no column {column}.", e.name);
+        if !near.is_empty() {
+            s.push_str(&format!(" Closest: {}.", near.join(", ")));
+        }
+        s.push_str(&format!(" Its columns: {}.", listing(visible_names)));
+        s
+    };
+    for (q, column) in &names.qualified {
+        if let Some(Some(e)) = called.get(q) {
+            if e.field(column).is_none() {
+                out.push(column_line(e, column));
+            }
+        }
+    }
+    // A bare column is only checked when one described table is all the
+    // lookup reads.
+    let only: Vec<&Entry> = called.values().filter_map(|e| *e).collect();
+    if real_tables == 1
+        && names.ctes.is_empty()
+        && !names.has_other_factor
+        && names.tables.len() == 1
+        && only.len() == 1
+    {
+        let e = only[0];
+        for column in &names.bare {
+            if names.output.contains(column)
+                || PSEUDO_COLUMNS.contains(&column.as_str())
+                || called.contains_key(column)
+            {
+                continue;
+            }
+            if e.field(column).is_none() {
+                out.push(column_line(e, column));
+            }
+        }
+    }
+    out.dedup();
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|l| seen.insert(l.clone()));
+    out
+}
+
+/// The named type a field returns: `Order` for `(first: Int): [Order!]!`.
+fn returned_type(rest: &str) -> String {
+    let after = if rest.starts_with('(') {
+        rest.rsplit_once("):").map(|(_, t)| t).unwrap_or("")
+    } else {
+        rest.trim_start_matches(':')
+    };
+    after
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']' || c == '!')
+        .to_string()
+}
+
+/// The argument names a field takes: `["first", "status"]`.
+fn argument_names(rest: &str) -> Vec<String> {
+    if !rest.starts_with('(') {
+        return Vec::new();
+    }
+    let inside = rest[1..].split("):").next().unwrap_or("");
+    inside
+        .split(',')
+        .filter_map(|a| a.split(':').next())
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect()
+}
+
+/// Checks a GraphQL lookup's fields, arguments and fragment types against
+/// the API's description before anything is sent: one line per name the API
+/// doesn't have, with the real ones. Empty when everything is known or the
+/// description can't settle it.
+pub fn unknown_graphql_names(catalog: &Catalog, query: &str, hidden: &[String]) -> Vec<String> {
+    use graphql_parser::query::{
+        parse_query, Definition, FragmentDefinition, OperationDefinition, Selection, SelectionSet,
+        TypeCondition,
+    };
+    let Some(root) = catalog
+        .entries
+        .first()
+        .filter(|e| e.kind == EntryKind::Type)
+    else {
+        return Vec::new();
+    };
+    let Ok(doc) = parse_query::<String>(query.trim()) else {
+        return Vec::new();
+    };
+    let terms = hidden_terms(hidden);
+    let mut fragments: std::collections::HashMap<&str, &FragmentDefinition<String>> =
+        Default::default();
+    let mut operation: Option<&SelectionSet<String>> = None;
+    for d in &doc.definitions {
+        match d {
+            Definition::Fragment(f) => {
+                fragments.insert(f.name.as_str(), f);
+            }
+            Definition::Operation(OperationDefinition::SelectionSet(s)) => operation = Some(s),
+            Definition::Operation(OperationDefinition::Query(q)) => {
+                operation = Some(&q.selection_set)
+            }
+            _ => return Vec::new(),
+        }
+    }
+    let Some(operation) = operation else {
+        return Vec::new();
+    };
+
+    struct Walk<'a> {
+        catalog: &'a Catalog,
+        fragments: &'a std::collections::HashMap<&'a str, &'a FragmentDefinition<'a, String>>,
+        terms: &'a [String],
+        out: Vec<String>,
+    }
+    impl<'a> Walk<'a> {
+        fn type_named(&mut self, name: &str) -> Option<&'a Entry> {
+            let found = self.catalog.find(name);
+            if found.is_none() && !self.catalog.incomplete {
+                self.out.push(not_described_type(self.catalog, name));
+            }
+            found
+        }
+
+        fn set(&mut self, set: &'a SelectionSet<'a, String>, on: &'a Entry, depth: usize) {
+            if depth > 12 {
+                return;
+            }
+            for item in &set.items {
+                match item {
+                    Selection::Field(f) => {
+                        if f.name.starts_with("__") {
+                            continue;
+                        }
+                        let field = on
+                            .field(&f.name)
+                            .filter(|_| !matches!(on.kind, EntryKind::Union | EntryKind::Enum));
+                        let Some(field) = field else {
+                            self.out
+                                .push(field_hint(self.catalog, on, &f.name, self.terms));
+                            continue;
+                        };
+                        let takes = argument_names(&field.rest);
+                        for (arg, _) in &f.arguments {
+                            if !takes.iter().any(|t| t == arg) {
+                                self.out.push(if takes.is_empty() {
+                                    format!("{} takes no arguments.", f.name)
+                                } else {
+                                    format!(
+                                        "{} takes no argument {arg}. Its arguments: {}.",
+                                        f.name,
+                                        takes.join(", ")
+                                    )
+                                });
+                            }
+                        }
+                        if !f.selection_set.items.is_empty() {
+                            if let Some(next) = self.catalog.find(&returned_type(&field.rest)) {
+                                self.set(&f.selection_set, next, depth + 1);
+                            }
+                        }
+                    }
+                    Selection::InlineFragment(fr) => {
+                        let next = match &fr.type_condition {
+                            Some(TypeCondition::On(t)) => self.type_named(t),
+                            None => Some(on),
+                        };
+                        if let Some(next) = next {
+                            self.set(&fr.selection_set, next, depth + 1);
+                        }
+                    }
+                    Selection::FragmentSpread(sp) => {
+                        let Some(fr) = self.fragments.get(sp.fragment_name.as_str()) else {
+                            continue;
+                        };
+                        let TypeCondition::On(t) = &fr.type_condition;
+                        if let Some(next) = self.type_named(t) {
+                            self.set(&fr.selection_set, next, depth + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut w = Walk {
+        catalog,
+        fragments: &fragments,
+        terms: &terms,
+        out: Vec::new(),
+    };
+    w.set(operation, root, 1);
+    let mut seen = std::collections::HashSet::new();
+    w.out.retain(|l| seen.insert(l.clone()));
+    w.out
+}
+
+fn not_described_type(catalog: &Catalog, name: &str) -> String {
+    let near = catalog.closest(name);
+    if near.is_empty() {
+        format!("No type named {name}.")
+    } else {
+        format!("No type named {name}. Closest: {}.", near.join(", "))
+    }
+}
+
+/// What an agent is told when a lookup names something the source doesn't
+/// have: nothing was sent, the real names, and to look the shape up first.
+pub fn unknown_names_message(source: &str, lines: &[String]) -> String {
+    let mut s =
+        format!("Not sent to {source}: the lookup names something this source doesn't have.");
+    for l in lines {
+        s.push_str("\n- ");
+        s.push_str(l);
+    }
+    s.push_str(
+        "\nDescribe the table or type with live_describe (`name`) before querying, then use only the names it lists.",
+    );
+    s
 }
 
 #[cfg(test)]
@@ -986,5 +1639,209 @@ mod tests {
         assert!(d
             .search("zzzzzz", &[], 1000)
             .contains("Leave the search empty"));
+    }
+    const SHOP: &str = "table public.orders (database dev)\n  id: integer\n  status: text\n  member_id: integer\n\n\
+        table public.order_shipment (database dev)\n  id: integer\n  title: text\n\n\
+        table public.members (database dev)\n  id: integer\n  name: text\n  contact_email: text\n\n\
+        table billing.invoices (database dev)\n  id: integer\n  order_id: integer\n";
+
+    fn shop() -> Catalog {
+        Catalog::parse(SHOP)
+    }
+
+    fn unknown(sql: &str) -> Vec<String> {
+        unknown_sql_names(&shop(), sql, &["email".to_string()])
+    }
+
+    #[test]
+    fn an_unknown_table_is_caught_before_it_is_sent() {
+        let u = unknown("select c.id from shipments c where c.id = 1");
+        assert_eq!(u.len(), 1, "{u:?}");
+        assert!(
+            u[0].starts_with("No table named shipments. Closest: "),
+            "{}",
+            u[0]
+        );
+        assert!(u[0].contains("public.order_shipment"), "{}", u[0]);
+        let msg = unknown_names_message("Production", &u);
+        assert!(msg.starts_with("Not sent to Production"), "{msg}");
+        assert!(msg.contains("live_describe"), "{msg}");
+        // Known tables pass, with or without their schema.
+        for ok in [
+            "select id, status from orders",
+            "select o.id from public.orders o",
+            "select id from dev.public.orders",
+            "select i.id from billing.invoices i join orders o on o.id = i.order_id",
+            "select table_name from information_schema.columns",
+            "select * from pg_catalog.pg_tables",
+            "select count(*) from svv_table_info",
+        ] {
+            assert!(unknown(ok).is_empty(), "{ok}: {:?}", unknown(ok));
+        }
+    }
+
+    #[test]
+    fn a_schema_must_match_when_one_is_named() {
+        let u = unknown("select id from billing.orders");
+        assert_eq!(u.len(), 1, "{u:?}");
+        assert!(
+            u[0].starts_with("No table named billing.orders."),
+            "{}",
+            u[0]
+        );
+        // Unqualified, any schema's table of that name will do.
+        assert!(unknown("select id from invoices").is_empty());
+    }
+
+    #[test]
+    fn columns_are_checked_through_aliases() {
+        let u = unknown("select o.id, o.state from orders o join members m on m.id = o.member_id");
+        assert_eq!(u.len(), 1, "{u:?}");
+        assert!(
+            u[0].starts_with("public.orders has no column state. Closest: status."),
+            "{}",
+            u[0]
+        );
+        // The table's own name works as a qualifier too.
+        assert_eq!(unknown("select orders.nope from orders").len(), 1);
+        // A bare column in a one-table lookup is checked...
+        let u = unknown("select id, titel from order_shipment where id > 3");
+        assert_eq!(u.len(), 1, "{u:?}");
+        assert!(u[0].contains("Closest: title."), "{}", u[0]);
+        // ...but not output names, functions or a database's own words.
+        assert!(unknown(
+            "select id as n, title from order_shipment where current_date > sysdate order by n"
+        )
+        .is_empty());
+        // In a join, a bare column could be either table's: not checked.
+        assert!(
+            unknown("select title, nope from order_shipment c join orders o on o.id = c.id")
+                .is_empty()
+        );
+        // Hidden columns are never offered as the fix.
+        let u = unknown("select m.contact from members m");
+        assert!(!u[0].contains("contact_email"), "{}", u[0]);
+    }
+
+    #[test]
+    fn ctes_and_subqueries_are_not_tables() {
+        for ok in [
+            "with recent as (select id, status from orders) select r.id, r.whatever from recent r",
+            "with recent as (select id from orders) select id from recent",
+            "select x.n from (select count(*) as n from orders) x",
+            "select s.id from (select id from orders) as s where s.id in (select order_id from billing.invoices)",
+            "select g from generate_series(1, 3) as g",
+            "select o.id from orders o where exists (select 1 from members m where m.id = o.member_id)",
+        ] {
+            assert!(unknown(ok).is_empty(), "{ok}: {:?}", unknown(ok));
+        }
+        // A real unknown table inside a CTE or subquery is still caught.
+        assert_eq!(
+            unknown("with r as (select id from shipments) select id from r").len(),
+            1
+        );
+        assert_eq!(
+            unknown("select id from orders where id in (select id from shipments)").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_cut_short_description_settles_nothing() {
+        let mut text = SHOP.to_string();
+        text.push_str(&format!("\n{INCOMPLETE_MARK}\n"));
+        let c = Catalog::parse(&text);
+        assert!(c.incomplete);
+        assert!(unknown_sql_names(&c, "select id from shipments", &[]).is_empty());
+        // A description saved before the mark, at the read limit, is cut short too.
+        let mut big = String::from("table public.wide (database dev)\n");
+        for i in 0..WAREHOUSE_COLUMNS_READ {
+            big.push_str(&format!("  c{i}: text\n"));
+        }
+        assert!(Catalog::parse(&big).incomplete);
+        assert!(!shop().incomplete);
+        // An API description has no tables to check against.
+        assert!(unknown_sql_names(&api(), "select 1 from x", &[]).is_empty());
+    }
+
+    #[test]
+    fn graphql_names_are_checked_before_sending() {
+        let c = api();
+        assert!(unknown_graphql_names(&c, "{ orders(first: 2) { id placedAt } }", &[]).is_empty());
+        assert!(unknown_graphql_names(
+            &c,
+            "query { search(term: \"a\") { __typename ... on Order { id } ... on Refund { amountCents } } }",
+            &[]
+        )
+        .is_empty());
+        let u = unknown_graphql_names(&c, "{ orders { id total } }", &[]);
+        assert_eq!(u.len(), 1, "{u:?}");
+        assert!(u[0].starts_with("Order has no field total."), "{}", u[0]);
+        let u = unknown_graphql_names(&c, "{ orders(limit: 2) { id } }", &[]);
+        assert_eq!(
+            u,
+            vec!["orders takes no argument limit. Its arguments: first, status."]
+        );
+        let u = unknown_graphql_names(&c, "{ search(term: \"a\") { placedAt } }", &[]);
+        assert!(u[0].contains("SearchResult is a union"), "{}", u[0]);
+        let u = unknown_graphql_names(&c, "{ search(term: \"a\") { ... on Refnd { id } } }", &[]);
+        assert!(
+            u[0].starts_with("No type named Refnd. Closest: Refund"),
+            "{}",
+            u[0]
+        );
+        let u = unknown_graphql_names(&c, "{ order { id } }", &[]);
+        assert!(
+            u[0].starts_with("Query has no field order. Closest: orders."),
+            "{}",
+            u[0]
+        );
+        // Fragments are followed.
+        let u = unknown_graphql_names(
+            &c,
+            "query { orders { ...F } } fragment F on Order { id nope }",
+            &[],
+        );
+        assert!(u[0].starts_with("Order has no field nope."), "{}", u[0]);
+    }
+
+    #[test]
+    fn hidden_columns_are_marked_per_table() {
+        let c = shop();
+        let hidden = vec!["public.members.name".to_string()];
+        let m = c.describe("members", &hidden, 10_000).unwrap();
+        assert!(m.contains("name: text  (hidden: refused)"), "{m}");
+        let o = c
+            .describe("order_shipment", &["order_shipment.title".into()], 10_000)
+            .unwrap();
+        assert!(o.contains("title: text  (hidden: refused)"), "{o}");
+        let o = c.describe("order_shipment", &hidden, 10_000).unwrap();
+        assert!(!o.contains("hidden"), "{o}");
+    }
+    #[test]
+    fn a_warehouse_is_checked_one_database_at_a_time() {
+        let mut text =
+            String::from("table public.course (database sales)\n  id: integer\n  name: text\n\n");
+        text.push_str("table public.wide (database big)\n  c: text\n\n");
+        text.push_str(INCOMPLETE_MARK);
+        text.push('\n');
+        let c = Catalog::parse(&text);
+        assert!(c.incomplete);
+        assert_eq!(c.cut.iter().collect::<Vec<_>>(), vec!["big"]);
+        // The whole warehouse can't settle a name; one complete database can.
+        assert!(unknown_sql_names(&c, "select id from shipments", &[]).is_empty());
+        assert_eq!(
+            unknown_sql_names_in(&c, Some("sales"), "select id from shipments", &[]).len(),
+            1
+        );
+        assert!(
+            unknown_sql_names_in(&c, Some("sales"), "select id, name from public.course", &[])
+                .is_empty()
+        );
+        assert!(unknown_sql_names_in(&c, Some("big"), "select id from shipments", &[]).is_empty());
+        // A database with nothing described settles nothing either.
+        assert!(
+            unknown_sql_names_in(&c, Some("other"), "select id from shipments", &[]).is_empty()
+        );
     }
 }

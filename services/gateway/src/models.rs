@@ -136,6 +136,8 @@ pub enum WorkerMessage {
     Ticket(TicketMessage),
     #[serde(rename = "tool_proposals")]
     ToolProposals(ToolProposalsMessage),
+    #[serde(rename = "hidden_suggest")]
+    HiddenSuggest(HiddenSuggestMessage),
     #[serde(rename = "feedback")]
     Feedback(FeedbackMessage),
     #[serde(rename = "onboard")]
@@ -582,6 +584,16 @@ pub struct ReleaseNotesMessage {
     /// notes when the tag's commit is on the repo's release branch.
     #[serde(default)]
     pub check_branch: bool,
+}
+
+/// Work out suggested hidden fields for one database source from its table
+/// and column names. `force` asks again even when the names haven't changed.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HiddenSuggestMessage {
+    pub team_id: String,
+    pub source_id: String,
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Tool definitions changed in a repo's default branch: each becomes a

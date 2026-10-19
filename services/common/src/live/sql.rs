@@ -18,7 +18,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
-use super::redact::{hidden_terms, is_hidden};
+use super::redact::{hidden_terms, hidden_terms_for, is_hidden, TableRef};
 use super::StepError;
 
 /// Longest lookup accepted.
@@ -135,6 +135,10 @@ pub struct CheckedSql {
     pub statement: String,
     /// Tables read, by their own name.
     pub tables: Vec<String>,
+    /// The hidden-column terms that apply to this statement: every global
+    /// term, and each table-scoped one whose table it reads. Results are
+    /// redacted with these.
+    pub hidden_terms: Vec<String>,
 }
 
 const WHOLE_ROW: &str = "That lookup uses a whole row as one value. Name the columns you need.";
@@ -153,6 +157,16 @@ fn refused(message: impl Into<String>) -> StepError {
     )
 }
 
+/// A dotted name as written, without quotes: `public.orders`.
+fn object_name(name: &ObjectName) -> String {
+    name.0
+        .iter()
+        .filter_map(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn last_name(name: &ObjectName) -> String {
     name.0
         .last()
@@ -167,6 +181,8 @@ struct Scan {
     problem: Option<String>,
     statements: usize,
     tables: Vec<String>,
+    /// Every table read, with its schema when the statement names one.
+    refs: Vec<TableRef>,
     /// Names that can stand for a whole row: tables and their aliases.
     row_names: HashSet<String>,
     /// Every identifier used in an expression, each part separately.
@@ -223,6 +239,7 @@ impl Visitor for Scan {
             return ControlFlow::Break(());
         }
         self.row_names.insert(name.clone());
+        self.refs.push(TableRef::parse(&object_name(r)));
         self.tables.push(name);
         ControlFlow::Continue(())
     }
@@ -338,7 +355,10 @@ pub fn check_read_only_sql(sql: &str, hidden: &[String]) -> Result<CheckedSql, S
 
     // A hidden column is refused wherever it appears (selected, filtered on,
     // sorted by), so neither its value nor a guess at it comes back.
-    let terms = hidden_terms(hidden);
+    // A column hidden in one table only (`person.name`) counts when the
+    // lookup reads that table, wherever the column name appears in it: the
+    // rows that come back carry column names, not tables.
+    let terms = hidden_terms_for(hidden, &scan.refs);
     if let Some(col) = scan.idents.iter().find(|i| is_hidden(i, &terms)) {
         return Err(StepError::new(
             "read_only",
@@ -373,7 +393,33 @@ pub fn check_read_only_sql(sql: &str, hidden: &[String]) -> Result<CheckedSql, S
         text: format!("SELECT * FROM ({statement}) AS coderhelm_lookup LIMIT {MAX_ROWS}"),
         statement,
         tables,
+        hidden_terms: terms,
     })
+}
+
+/// The hidden-column terms for already-checked SQL (a reviewed tool's text,
+/// with `:name` parameters): the statement's tables decide which scoped
+/// entries apply. Text that doesn't parse gets every entry.
+pub fn statement_terms(sql: &str, hidden: &[String]) -> Vec<String> {
+    #[derive(Default)]
+    struct Refs(Vec<TableRef>);
+    impl Visitor for Refs {
+        type Break = ();
+        fn pre_visit_relation(&mut self, r: &ObjectName) -> ControlFlow<()> {
+            self.0.push(TableRef::parse(&object_name(r)));
+            ControlFlow::Continue(())
+        }
+    }
+    match Parser::parse_sql(&PostgreSqlDialect {}, sql) {
+        Ok(statements) => {
+            let mut refs = Refs::default();
+            for s in &statements {
+                let _ = s.visit(&mut refs);
+            }
+            hidden_terms_for(hidden, &refs.0)
+        }
+        Err(_) => hidden_terms(hidden),
+    }
 }
 
 /// The Data API reads `:` followed by a word as a parameter, and the parser
@@ -802,5 +848,36 @@ mod tests {
         no("");
         no("this is not sql");
         no(&format!("SELECT '{}'", "a".repeat(MAX_SQL_BYTES)));
+    }
+    #[test]
+    fn a_column_hidden_in_one_table_is_refused_only_where_that_table_is_read() {
+        let hidden = vec!["email".to_string(), "person.name".to_string()];
+        let c = check_read_only_sql("SELECT id, name FROM public.course LIMIT 1", &hidden).unwrap();
+        assert!(!is_hidden("name", &c.hidden_terms));
+        assert!(is_hidden("email", &c.hidden_terms));
+        for sql in [
+            "SELECT name FROM person",
+            "SELECT p.name FROM public.person p",
+            "SELECT s.name FROM course s JOIN person p ON p.id = s.owner_id",
+        ] {
+            let e = check_read_only_sql(sql, &hidden).unwrap_err();
+            assert!(
+                e.message.contains("hidden column (name)"),
+                "{sql}: {}",
+                e.message
+            );
+        }
+        // `*` from that table still comes back with the column hidden.
+        let c = check_read_only_sql("SELECT * FROM person", &hidden).unwrap();
+        assert!(is_hidden("name", &c.hidden_terms));
+        // A reviewed tool's text gets the same terms.
+        assert!(is_hidden(
+            "name",
+            &statement_terms("SELECT id FROM person WHERE id = :id", &hidden)
+        ));
+        assert!(!is_hidden(
+            "name",
+            &statement_terms("SELECT id FROM course WHERE id = :id", &hidden)
+        ));
     }
 }

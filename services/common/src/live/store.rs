@@ -343,6 +343,85 @@ pub async fn external_id(
         .ok_or_else(|| "external id was not saved".to_string())
 }
 
+/// Hidden-field suggestions for one source, kept beside it so an admin can
+/// accept or dismiss each. Dismissed entries are never suggested again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HiddenSuggestions {
+    #[serde(default)]
+    pub suggestions: Vec<super::hidden_suggest::Suggestion>,
+    #[serde(default)]
+    pub dismissed: Vec<String>,
+    /// The table and column names they were worked out from.
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub at: String,
+}
+
+fn suggestions_sk(source_id: &str) -> String {
+    format!("DATA_SOURCE_HIDDEN#{source_id}")
+}
+
+pub async fn get_hidden_suggestions(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    source_id: &str,
+) -> Result<HiddenSuggestions, String> {
+    let out = dynamo
+        .get_item()
+        .table_name(table)
+        .key("pk", av_s(team_id))
+        .key("sk", av_s(&suggestions_sk(source_id)))
+        .send()
+        .await
+        .map_err(|e| format!("get hidden suggestions: {e}"))?;
+    Ok(out
+        .item()
+        .map(|i| serde_json::from_str(&s(i, "data")).unwrap_or_default())
+        .unwrap_or_default())
+}
+
+pub async fn put_hidden_suggestions(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    source_id: &str,
+    h: &HiddenSuggestions,
+) -> Result<(), String> {
+    dynamo
+        .put_item()
+        .table_name(table)
+        .item("pk", av_s(team_id))
+        .item("sk", av_s(&suggestions_sk(source_id)))
+        .item("record_type", av_s("data_source_hidden_suggestions"))
+        .item(
+            "data",
+            av_s(&serde_json::to_string(h).unwrap_or_else(|_| "{}".into())),
+        )
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("put hidden suggestions: {e}"))
+}
+
+pub async fn delete_hidden_suggestions(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    source_id: &str,
+) -> Result<(), String> {
+    dynamo
+        .delete_item()
+        .table_name(table)
+        .key("pk", av_s(team_id))
+        .key("sk", av_s(&suggestions_sk(source_id)))
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("delete hidden suggestions: {e}"))
+}
+
 /// One lookup, as recorded. Written for every attempt, including refused ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Activity {
@@ -354,7 +433,8 @@ pub struct Activity {
     pub pr: u64,
     /// The lookup text, shortened.
     pub query: String,
-    /// `ok` | `refused` | `failed`
+    /// `ok` | `refused` | `failed` | `unknown_name` (the lookup named a table,
+    /// column, type or field the source doesn't have, so it wasn't sent)
     pub outcome: &'static str,
     pub detail: String,
     pub ms: u128,
@@ -579,7 +659,8 @@ pub async fn count_activity(
         for i in out.items() {
             match s(i, "outcome").as_str() {
                 "ok" => ok += 1,
-                "refused" => refused += 1,
+                // Nothing was sent either way.
+                "refused" | "unknown_name" => refused += 1,
                 _ => failed += 1,
             }
         }

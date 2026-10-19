@@ -31,6 +31,7 @@ pub mod confluence;
 pub mod connectors;
 pub mod db;
 pub mod graphql;
+pub mod hidden_suggest;
 pub mod http;
 pub mod identity;
 pub mod logs;

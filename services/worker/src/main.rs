@@ -275,6 +275,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Tool proposals failed: {e:?}");
             }
         }
+        models::WorkerMessage::HiddenSuggest(msg) => {
+            info!(team_id = %msg.team_id, source = %msg.source_id, "Hidden-field suggestions");
+            if let Err(e) = passes::hidden_suggest::run(&state, msg).await {
+                error!("Hidden-field suggestions failed: {e:?}");
+            }
+        }
         models::WorkerMessage::TagSweep(msg) => {
             info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), remaining_secs = msg.delay_remaining_secs, "Batched release-tag sweep");
             if let Err(e) = passes::review_actions::run_tag_sweep(&state, msg).await {
