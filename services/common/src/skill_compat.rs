@@ -1738,6 +1738,7 @@ mod tests {
             connection: String::new(),
             action: String::new(),
             basis: String::new(),
+            link: Default::default(),
         };
         let merged = merge_same(vec![
             r("`git log`", "missing", &[]),
