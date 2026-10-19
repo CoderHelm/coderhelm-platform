@@ -392,8 +392,22 @@ pub async fn converse_json(
     };
     apply_model_family(&mut request, Some(effort), false);
     request.output_config = Some(json_output_config(request.output_config.take(), schema));
+    // A decline is an error to see, not an answer from another model.
+    request.fallbacks = None;
     let resp = send_request(client, &request).await?;
     account(client, model_id, &resp.usage, usage).await;
+    let kinds: Vec<&str> = resp
+        .content
+        .iter()
+        .filter_map(|b| b.get("type").and_then(|t| t.as_str()))
+        .collect();
+    info!(
+        model = model_id,
+        stop_reason = resp.stop_reason.as_deref().unwrap_or(""),
+        blocks = ?kinds,
+        output_tokens = resp.usage.output_tokens,
+        "Structured answer received"
+    );
     if let Some(refusal) = resp.refusal() {
         return Err(refusal.into());
     }

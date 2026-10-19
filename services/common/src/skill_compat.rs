@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Bumped when the analysis format changes, so every item is checked again.
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 /// Longest translated text kept.
 pub const MAX_TRANSLATED_CHARS: usize = 64_000;
 const MAX_STEPS: usize = 40;

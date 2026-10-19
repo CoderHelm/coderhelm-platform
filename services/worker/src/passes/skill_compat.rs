@@ -24,6 +24,8 @@ const PARALLEL: usize = 4;
 /// worker's 15 minutes; what's left is checked on the next sweep.
 const BUDGET: Duration = Duration::from_secs(11 * 60);
 const EFFORT: &str = "medium";
+/// After a stub answer, the one more try thinks harder.
+const RETRY_EFFORT: &str = "high";
 const MAX_TOKENS: i32 = 32_000;
 
 /// Coderhelm's own tools, as an item can rely on them. A test checks each
@@ -135,11 +137,14 @@ const NEVER: &[&str] = &[
 #[async_trait::async_trait]
 pub trait Checker: Send + Sync {
     fn model(&self) -> &str;
+    /// `effort` is the model's effort: the usual one first, a higher one
+    /// for the one more try after a stub answer.
     async fn check(
         &self,
         system: &str,
         user: &str,
         schema: &Value,
+        effort: &str,
     ) -> (Result<Value, String>, TokenUsage);
 }
 
@@ -160,6 +165,7 @@ impl Checker for TeamModel<'_> {
         system: &str,
         user: &str,
         schema: &Value,
+        effort: &str,
     ) -> (Result<Value, String>, TokenUsage) {
         let mut usage = TokenUsage::default();
         let client = self.provider.client();
@@ -169,7 +175,7 @@ impl Checker for TeamModel<'_> {
             system,
             user,
             schema,
-            EFFORT,
+            effort,
             MAX_TOKENS,
             &mut usage,
         )
@@ -198,12 +204,15 @@ pub async fn check_item(
     // A stub or malformed answer is asked again once; both calls count.
     let mut usage = TokenUsage::default();
     let mut result = Err(String::new());
-    for _ in 0..2 {
-        let (raw, spent) = checker.check(skill_compat::SYSTEM, &user, &schema).await;
+    for effort in [EFFORT, RETRY_EFFORT] {
+        let (raw, spent) = checker
+            .check(skill_compat::SYSTEM, &user, &schema, effort)
+            .await;
         usage.merge(&spent);
         result = raw.and_then(|v| skill_compat::finish(&v, inv, source_chars));
-        if result.is_ok() {
-            break;
+        match &result {
+            Ok(_) => break,
+            Err(e) => warn!(path = %m.path, effort, error = %e, "Skill check answer refused"),
         }
     }
     let (mut a, translated) = result?;
@@ -239,9 +248,15 @@ pub fn to_check<'a>(
         .collect()
 }
 
-/// One item's path and checked text hash, and its check (`None` when the
-/// run's time was up before it started).
-type Outcome = (String, String, Option<Result<(Analysis, String), String>>);
+/// One item's path, checked text hash, whether its last check was of other
+/// text or another inventory, and its check (`None` when the run's time
+/// was up before it started).
+type Outcome = (
+    String,
+    String,
+    bool,
+    Option<Result<(Analysis, String), String>>,
+);
 
 /// Checks `repo`'s items that need it and keeps each result on its item.
 /// `only` is one path, or empty for every item; `force` checks even
@@ -293,12 +308,13 @@ async fn run_inner(state: &WorkerState, team_id: &str, repo: &str, only: &str, f
     let results: Vec<Outcome> = futures::stream::iter(todo)
         .map(|(m, body)| {
             let (checker, inv) = (&checker, &inv);
+            let outdated = m.compat.hash != m.hash || m.compat.fingerprint != fp;
             async move {
                 if started.elapsed() > BUDGET {
-                    return (m.path.clone(), m.hash.clone(), None);
+                    return (m.path.clone(), m.hash.clone(), outdated, None);
                 }
                 let r = check_item(checker, inv, m, body).await;
-                (m.path.clone(), m.hash.clone(), Some(r))
+                (m.path.clone(), m.hash.clone(), outdated, Some(r))
             }
         })
         .buffer_unordered(PARALLEL)
@@ -306,7 +322,7 @@ async fn run_inner(state: &WorkerState, team_id: &str, repo: &str, only: &str, f
         .await;
     let mut done = 0usize;
     let mut cost = 0.0f64;
-    for (path, hash, r) in results {
+    for (path, hash, outdated, r) in results {
         let Some(r) = r else { continue };
         let kept = match &r {
             Ok((a, translated)) => {
@@ -321,7 +337,7 @@ async fn run_inner(state: &WorkerState, team_id: &str, repo: &str, only: &str, f
             }
             Err(e) => {
                 warn!(team_id, repo, path = %path, error = %e, "Skill check failed");
-                st.put_compat(repo, &path, &hash, &fp, Err(e.as_str()))
+                st.put_compat(repo, &path, &hash, &fp, Err((e.as_str(), outdated)))
                     .await
             }
         };
@@ -564,7 +580,9 @@ mod tests {
             system: &str,
             user: &str,
             schema: &Value,
+            effort: &str,
         ) -> (Result<Value, String>, TokenUsage) {
+            assert!([EFFORT, RETRY_EFFORT].contains(&effort));
             assert!(system.contains("Read the WHOLE text"));
             assert!(user.contains("## Coderhelm inventory"));
             assert!(user.contains("skill `triage`"));
@@ -672,8 +690,15 @@ mod tests {
         fn model(&self) -> &str {
             "fake-light"
         }
-        async fn check(&self, _: &str, _: &str, _: &Value) -> (Result<Value, String>, TokenUsage) {
+        async fn check(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Value,
+            effort: &str,
+        ) -> (Result<Value, String>, TokenUsage) {
             let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(effort, if n == 0 { EFFORT } else { RETRY_EFFORT });
             let usage = TokenUsage {
                 input_tokens: 100,
                 output_tokens: 10,
