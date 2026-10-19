@@ -24,14 +24,15 @@ const PARALLEL: usize = 4;
 /// worker's 15 minutes; what's left is checked on the next sweep.
 const BUDGET: Duration = Duration::from_secs(11 * 60);
 const EFFORT: &str = "medium";
-/// After a stub answer, the one more try thinks harder and isn't held to
-/// the schema by the API (the stubs came from constrained answers): the
-/// schema is in its instructions and its answer is checked the same way.
+/// After an unusable answer, the one more try thinks harder.
 const RETRY_EFFORT: &str = "high";
 
 /// How each try asks: its effort, and whether the API holds the answer to
-/// the schema.
-pub const TRIES: [(&str, bool); 2] = [(EFFORT, true), (RETRY_EFFORT, false)];
+/// the schema. Neither is: on real items about a quarter of the answers
+/// held to the schema came back as placeholders (one step titled "x" or
+/// "placeholder", no translation), while unconstrained answers were full.
+/// The schema is in the instructions, and `finish` checks the answer.
+pub const TRIES: [(&str, bool); 2] = [(EFFORT, false), (RETRY_EFFORT, false)];
 const MAX_TOKENS: i32 = 32_000;
 
 /// Tools Coderhelm's agents have beside the coding agent's own list (which
