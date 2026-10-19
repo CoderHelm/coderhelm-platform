@@ -1,4 +1,5 @@
-//! The weekly summary email: what Coderhelm did for a team in the last 7 days.
+//! The weekly summary email: what Coderhelm did for a team in the seven whole
+//! UTC days before the send (Monday to Sunday for the Monday send).
 //!
 //! A schedule drops `{"type":"weekly_summary"}` on the ticket queue every
 //! Monday; it sends nothing unless `WEEKLY_SUMMARY_ENABLED=true`. Each active
@@ -21,7 +22,7 @@ use std::fmt::Write as _;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message, MessageHeader};
-use chrono::{DateTime, Datelike, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, Duration, SecondsFormat, TimeZone, Utc};
 use common::unsubscribe;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -98,27 +99,32 @@ impl Tokens {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunStats {
+    /// Runs created in the week.
     pub started: u64,
-    /// Runs started this week that finished their work.
+    /// Of the runs created in the week, the ones that finished their work.
     pub completed: u64,
+    /// PRs merged in the week (one per PR), whenever their run started.
     pub merged: u64,
-    pub open: u64,
-    pub failed: u64,
     pub top_merged: Vec<MergedPr>,
-    /// Commits CoderHelm pushed to fix CI, and on how many runs.
+    /// CI fixes Coderhelm pushed in the week, and on how many PRs.
     pub ci_fix_pushes: u64,
-    pub ci_fix_runs: u64,
-    /// PRs whose CI Coderhelm could not get green, left for a person.
+    pub ci_fix_prs: u64,
+    /// PRs Coderhelm handed to a person in the week because it could not get
+    /// CI green.
     pub ci_handed_off: u64,
     /// Waiting on a person, most recent first, at most `TOP_ATTENTION`.
     pub attention: Vec<Attention>,
     pub attention_total: u64,
-    pub tokens: Tokens,
+    /// Of `attention_total`: PRs ready for review.
+    pub waiting_review: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReviewStats {
-    pub total: u64,
+    /// Reviews posted on PRs (answers to questions are not reviews).
+    pub posted: u64,
+    /// Distinct PRs those reviews were on.
+    pub prs: u64,
     pub approve: u64,
     pub request_changes: u64,
     pub comment: u64,
@@ -142,9 +148,28 @@ pub struct LookupStats {
 pub struct Usage {
     /// "October 2026"
     pub month: String,
+    /// The month's counters as of the send.
     pub month_tokens: Tokens,
-    /// 0 = no limit. Counts all four kinds of tokens.
+    /// The week's days from the same counters; `None` when part of the week
+    /// is from before every model call was counted per day.
+    pub week_tokens: Option<Tokens>,
+    /// 0 = no limit.
     pub limit_tokens: u64,
+    /// Whether the limit counts cache tokens (otherwise new input + output).
+    pub limit_counts_cache: bool,
+}
+
+impl Usage {
+    /// What the limit compares with `limit_tokens`, by the same rule the
+    /// limit is enforced with.
+    pub fn counted(&self) -> u64 {
+        let t = &self.month_tokens;
+        if self.limit_counts_cache {
+            t.total()
+        } else {
+            t.input + t.output
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -208,6 +233,14 @@ fn b(i: &Item, k: &str) -> Option<bool> {
     i.get(k).and_then(|v| v.as_bool().ok()).copied()
 }
 
+/// The string entries of a list attribute.
+fn strings(i: &Item, k: &str) -> Vec<String> {
+    i.get(k)
+        .and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect())
+        .unwrap_or_default()
+}
+
 fn within(ts: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
     DateTime::parse_from_rfc3339(ts)
         .map(|t| {
@@ -217,101 +250,190 @@ fn within(ts: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
         .unwrap_or(false)
 }
 
-/// Runs from the last 30 days → the week's numbers. Started, completed, open,
-/// failed, CI fixes and tokens count runs started in the week; merged counts
-/// PRs merged in the week, whenever their run started; waiting on a person
-/// counts every run in the 30 days that still is.
+/// The summary's week: the seven whole UTC days before the day it is sent.
+pub fn week_before(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let end = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .map(|t| t.and_utc())
+        .unwrap_or(now);
+    (end - Duration::days(7), end)
+}
+
+/// One PR across every run that worked on it.
+struct PrRuns<'a> {
+    runs: Vec<&'a Item>,
+}
+
+impl PrRuns<'_> {
+    fn merged_run(&self) -> Option<&Item> {
+        self.runs
+            .iter()
+            .copied()
+            .filter(|r| s(r, "status") == "merged" || s(r, "pr_outcome") == "merged")
+            .max_by_key(|r| s(r, "merged_at"))
+    }
+    fn closed(&self) -> bool {
+        self.runs.iter().any(|r| s(r, "pr_outcome") == "closed")
+    }
+    fn latest(&self) -> &Item {
+        self.runs
+            .iter()
+            .copied()
+            .max_by_key(|r| s(r, "created_at"))
+            .expect("a PR has at least one run")
+    }
+}
+
+/// The key a PR is counted under: its link, or the run when there is none.
+fn pr_key(r: &Item) -> String {
+    let url = s(r, "pr_url");
+    if url.is_empty() {
+        format!("run:{}", s(r, "run_id"))
+    } else {
+        url
+    }
+}
+
+/// Runs from the last 30 days → the week's numbers.
+///
+/// * started / completed: runs created in the week, and those of them that
+///   finished their work (completed or merged);
+/// * merged: PRs (one per link, however many runs worked on it) whose merge
+///   time is in the week; a merge recorded without a time counts when its run
+///   was created in the week;
+/// * waiting on a person, as of the send: a run that asked a question and is
+///   still its ticket's latest run, and a PR whose latest run finished, that no
+///   run recorded as merged or closed (one entry per PR);
+/// * CI: fixes pushed in the week (`ci_fixes_at`), the PRs they were on, and
+///   PRs handed to a person in the week (`handed_off_at`).
 pub fn run_stats(rows: &[Item], start: DateTime<Utc>, end: DateTime<Utc>) -> RunStats {
     let mut out = RunStats::default();
-    let mut merged: Vec<(String, MergedPr)> = Vec::new();
-    let mut waiting: Vec<(String, Attention)> = Vec::new();
+    let mut prs: HashMap<String, PrRuns> = HashMap::new();
+    let mut latest_of_ticket: HashMap<(String, String), String> = HashMap::new();
     for r in rows {
         let created = s(r, "created_at");
-        let in_week = within(&created, start, end);
-        let status = s(r, "status");
-        let outcome = s(r, "pr_outcome");
-        let is_merged = status == "merged" || outcome == "merged";
-        let merged_at = s(r, "merged_at");
-        let has_pr = n(r, "pr_number") > 0.0;
-        let pr_url = s(r, "pr_url");
-        if is_merged && (within(&merged_at, start, end) || (merged_at.is_empty() && in_week)) {
-            out.merged += 1;
-            if !pr_url.is_empty() {
-                let when = if merged_at.is_empty() {
-                    created.clone()
-                } else {
-                    merged_at.clone()
-                };
-                merged.push((
-                    when,
-                    MergedPr {
-                        title: s(r, "title"),
-                        url: pr_url.clone(),
-                        repo: s(r, "repo"),
+        if n(r, "pr_number") > 0.0 || !s(r, "pr_url").is_empty() {
+            prs.entry(pr_key(r))
+                .or_insert_with(|| PrRuns { runs: Vec::new() })
+                .runs
+                .push(r);
+        }
+        let ticket = s(r, "ticket_id");
+        if !ticket.is_empty() {
+            let e = latest_of_ticket.entry((s(r, "repo"), ticket)).or_default();
+            if created > *e {
+                *e = created.clone();
+            }
+        }
+        if within(&created, start, end) {
+            out.started += 1;
+            if matches!(s(r, "status").as_str(), "completed" | "merged") {
+                out.completed += 1;
+            }
+        }
+    }
+
+    let mut merged: Vec<(String, MergedPr)> = Vec::new();
+    let mut waiting: Vec<(String, Attention)> = Vec::new();
+    let mut fix_prs = std::collections::HashSet::new();
+    let mut handed = std::collections::HashSet::new();
+    for (key, pr) in &prs {
+        if let Some(m) = pr.merged_run() {
+            let merged_at = s(m, "merged_at");
+            let created = s(m, "created_at");
+            let in_week = if merged_at.is_empty() {
+                within(&created, start, end)
+            } else {
+                within(&merged_at, start, end)
+            };
+            if in_week {
+                out.merged += 1;
+                let url = s(m, "pr_url");
+                if !url.is_empty() {
+                    let when = if merged_at.is_empty() {
+                        created
+                    } else {
+                        merged_at
+                    };
+                    merged.push((
+                        when,
+                        MergedPr {
+                            title: s(m, "title"),
+                            url,
+                            repo: s(m, "repo"),
+                        },
+                    ));
+                }
+            }
+        } else if !pr.closed() {
+            let last = pr.latest();
+            if s(last, "status") == "completed" && n(last, "pr_number") > 0.0 {
+                out.waiting_review += 1;
+                waiting.push((
+                    s(last, "created_at"),
+                    Attention {
+                        title: s(last, "title"),
+                        repo: s(last, "repo"),
+                        url: s(last, "pr_url"),
+                        why: Waiting::Review,
                     },
                 ));
             }
         }
-        let why = if status == "needs_input" {
-            Some(Waiting::Input)
-        } else if status == "completed" && has_pr && !is_merged && outcome != "closed" {
-            Some(Waiting::Review)
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            let url = if pr_url.is_empty() {
-                format!("{APP}/runs/detail/?id={}", s(r, "run_id"))
-            } else {
-                pr_url.clone()
-            };
-            waiting.push((
-                created.clone(),
-                Attention {
-                    title: s(r, "title"),
-                    repo: s(r, "repo"),
-                    url,
-                    why,
-                },
-            ));
+        for r in &pr.runs {
+            let fixes = strings(r, "ci_fixes_at")
+                .iter()
+                .filter(|t| within(t, start, end))
+                .count() as u64;
+            if fixes > 0 {
+                out.ci_fix_pushes += fixes;
+                fix_prs.insert(key.clone());
+            }
+            if within(&s(r, "handed_off_at"), start, end) {
+                handed.insert(key.clone());
+            }
         }
-        if !in_week {
+    }
+    out.ci_fix_prs = fix_prs.len() as u64;
+    out.ci_handed_off = handed.len() as u64;
+
+    for r in rows {
+        if s(r, "status") != "needs_input" {
             continue;
         }
-        out.started += 1;
-        if matches!(status.as_str(), "completed" | "merged") {
-            out.completed += 1;
+        let created = s(r, "created_at");
+        let ticket = s(r, "ticket_id");
+        let superseded = !ticket.is_empty()
+            && latest_of_ticket
+                .get(&(s(r, "repo"), ticket))
+                .is_some_and(|latest| *latest > created);
+        if superseded {
+            continue;
         }
-        if status == "failed" {
-            out.failed += 1;
-        } else if has_pr && !is_merged && outcome != "closed" && status != "cancelled" {
-            out.open += 1;
-        }
-        let fixes = n(r, "ci_fix_commits") as u64;
-        if fixes > 0 {
-            out.ci_fix_pushes += fixes;
-            out.ci_fix_runs += 1;
-        }
-        // Coderhelm said on the PR that a person has it now, or it tried and
-        // CI was still red when the run ended.
-        let finished = matches!(status.as_str(), "completed" | "failed" | "merged");
-        let still_red = finished && n(r, "ci_fix_attempts") > 0.0 && s(r, "ci_last") == "failed";
-        if has_pr && (b(r, "handoff_notified") == Some(true) || still_red) {
-            out.ci_handed_off += 1;
-        }
-        out.tokens.input += n(r, "tokens_in") as u64;
-        out.tokens.cache_read += n(r, "cache_read_tokens") as u64;
-        out.tokens.cache_write += n(r, "cache_write_tokens") as u64;
-        out.tokens.output += n(r, "tokens_out") as u64;
+        let url = match s(r, "pr_url") {
+            u if u.is_empty() => format!("{APP}/runs/detail/?id={}", s(r, "run_id")),
+            u => u,
+        };
+        waiting.push((
+            created,
+            Attention {
+                title: s(r, "title"),
+                repo: s(r, "repo"),
+                url,
+                why: Waiting::Input,
+            },
+        ));
     }
-    // Most recent first.
-    merged.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Most recent first; ties by link so the order never depends on the map.
+    merged.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.url.cmp(&b.1.url)));
     out.top_merged = merged
         .into_iter()
         .take(TOP_MERGED)
         .map(|(_, p)| p)
         .collect();
-    waiting.sort_by(|a, b| b.0.cmp(&a.0));
+    waiting.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.url.cmp(&b.1.url)));
     out.attention_total = waiting.len() as u64;
     out.attention = waiting
         .into_iter()
@@ -321,16 +443,19 @@ pub fn run_stats(rows: &[Item], start: DateTime<Utc>, end: DateTime<Utc>) -> Run
     out
 }
 
-/// Review stats records (`RSTAT#`) → verdict split. Questions answered and
-/// re-reviews that posted nothing are not reviews.
+/// Review stats records (`RSTAT#`) → reviews posted, the PRs they were on,
+/// and the verdict split. Answers to questions and re-reviews that posted
+/// nothing are not reviews.
 pub fn review_stats(rows: &[Item]) -> ReviewStats {
     let mut out = ReviewStats::default();
+    let mut prs = std::collections::HashSet::new();
     for r in rows {
         let verdict = s(r, "verdict");
         if !b(r, "posted").unwrap_or(true) || verdict == "QUESTION" {
             continue;
         }
-        out.total += 1;
+        out.posted += 1;
+        prs.insert((s(r, "repo"), n(r, "pr_number") as u64));
         match verdict.as_str() {
             "APPROVE" => out.approve += 1,
             "REQUEST_CHANGES" => out.request_changes += 1,
@@ -338,7 +463,33 @@ pub fn review_stats(rows: &[Item]) -> ReviewStats {
             _ => {}
         }
     }
+    out.prs = prs.len() as u64;
     out
+}
+
+/// Review records (`REVIEW#`) from before every review also wrote a stats
+/// record, in the week, that have no stats record → stats rows for them.
+/// Those reviews did not record whether they were posted: counted as posted.
+pub fn reviews_missing_stats(
+    reviews: &[Item],
+    stats: &[Item],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Vec<Item> {
+    let have: std::collections::HashSet<String> = stats.iter().map(|i| s(i, "sk")).collect();
+    reviews
+        .iter()
+        .filter(|r| within(&s(r, "created_at"), start, end))
+        .filter(|r| {
+            common::review_stats::stat_sk_from_review_sk(&s(r, "sk"))
+                .is_some_and(|sk| !have.contains(&sk))
+        })
+        .map(|r| {
+            let mut row = r.clone();
+            row.insert("posted".into(), AttributeValue::Bool(true));
+            row
+        })
+        .collect()
 }
 
 /// Alert records (`ALERT_EVENT#`) → received, recovered and runs started.
@@ -543,31 +694,26 @@ fn cards(sm: &Summary, access: Access) -> Vec<Card> {
     let r = &sm.runs;
     let v = &sm.reviews;
     let a = &sm.alerts;
-    let waiting_review = r
-        .attention
-        .iter()
-        .filter(|x| x.why == Waiting::Review)
-        .count() as u64;
     let mut out = Vec::new();
     if r.merged > 0 {
         let note =
-            (waiting_review > 0).then(|| format!("{} waiting on review", num(waiting_review)));
+            (r.waiting_review > 0).then(|| format!("{} waiting on review", num(r.waiting_review)));
         out.push(card(r.merged, "PR merged", "PRs merged", note));
     }
     if r.completed > 0 {
         let note = (r.started > r.completed).then(|| format!("of {} started", num(r.started)));
         out.push(card(r.completed, "run completed", "runs completed", note));
     }
-    if v.total > 0 {
-        let note = (v.approve > 0).then(|| format!("{} approved", num(v.approve)));
-        out.push(card(v.total, "PR reviewed", "PRs reviewed", note));
+    if v.prs > 0 {
+        let note = Some(plural(v.posted, "review posted", "reviews posted"));
+        out.push(card(v.prs, "PR reviewed", "PRs reviewed", note));
     }
     if access >= Access::Member && a.received > 0 {
         let note = (a.recovered > 0).then(|| format!("{} recovered", num(a.recovered)));
-        out.push(card(a.received, "alert handled", "alerts handled", note));
+        out.push(card(a.received, "alert received", "alerts received", note));
     }
     if r.ci_fix_pushes > 0 {
-        let note = Some(format!("on {}", plural(r.ci_fix_runs, "PR", "PRs")));
+        let note = Some(format!("on {}", plural(r.ci_fix_prs, "PR", "PRs")));
         out.push(card(
             r.ci_fix_pushes,
             "CI fix pushed",
@@ -582,9 +728,10 @@ fn cards(sm: &Summary, access: Access) -> Vec<Card> {
         out.push(card(sm.lookups.total, "data lookup", "data lookups", None));
     }
     // Tokens have their own section; a card only when nothing else happened.
-    if out.is_empty() && r.tokens.total() > 0 {
+    let week = sm.usage.week_tokens.unwrap_or_default();
+    if out.is_empty() && week.total() > 0 {
         out.push(Card {
-            value: tokens(r.tokens.total()),
+            value: tokens(week.total()),
             label: "tokens used".into(),
             note: None,
         });
@@ -608,19 +755,36 @@ fn token_split(t: &Tokens) -> String {
 /// The token split as a small table: this week and the month so far, in
 /// the same order as everywhere else (total, new input, read from cache,
 /// written to cache, output).
-fn token_table(week: &Tokens, month: &Tokens, month_name: &str) -> String {
-    let head = format!(
-        r#"<tr><th scope="col" align="left" class="t3" style="padding:0 0 8px;font-size:13px;line-height:18px;font-weight:600;color:{t3}">Tokens</th><th scope="col" align="right" class="t3" style="padding:0 0 8px 12px;font-size:13px;line-height:18px;font-weight:600;color:{t3};white-space:nowrap">This week</th><th scope="col" align="right" class="t3" style="padding:0 0 8px 12px;font-size:13px;line-height:18px;font-weight:600;color:{t3};white-space:nowrap">{} so far</th></tr>"#,
-        esc(month_name),
-        t3 = c::T3
+fn token_table(week: Option<&Tokens>, month: &Tokens, month_name: &str) -> String {
+    let th = |text: &str, first: bool| {
+        let (align, pad) = if first {
+            ("left", "0 0 8px")
+        } else {
+            ("right", "0 0 8px 12px")
+        };
+        format!(
+            r#"<th scope="col" align="{align}" class="t3" style="padding:{pad};font-size:13px;line-height:18px;font-weight:600;color:{t3};white-space:nowrap">{}</th>"#,
+            esc(text),
+            t3 = c::T3
+        )
+    };
+    let mut rows = format!(
+        "<tr>{}{}{}</tr>",
+        th("Tokens", true),
+        if week.is_some() {
+            th("This week", false)
+        } else {
+            String::new()
+        },
+        th(&format!("{month_name} so far"), false)
     );
-    let mut rows = head;
-    for (i, (name, w, m)) in [
-        ("Total", week.total(), month.total()),
-        ("New input", week.input, month.input),
-        ("Read from cache", week.cache_read, month.cache_read),
-        ("Written to cache", week.cache_write, month.cache_write),
-        ("Output", week.output, month.output),
+    let w = week.copied().unwrap_or_default();
+    for (i, (name, wv, m)) in [
+        ("Total", w.total(), month.total()),
+        ("New input", w.input, month.input),
+        ("Read from cache", w.cache_read, month.cache_read),
+        ("Written to cache", w.cache_write, month.cache_write),
+        ("Output", w.output, month.output),
     ]
     .into_iter()
     .enumerate()
@@ -642,7 +806,11 @@ fn token_table(week: &Tokens, month: &Tokens, month_name: &str) -> String {
             rows,
             "<tr>{}{}{}</tr>",
             cell(esc(name), true),
-            cell(tokens(w), false),
+            if week.is_some() {
+                cell(tokens(wv), false)
+            } else {
+                String::new()
+            },
             cell(tokens(m), false)
         );
     }
@@ -717,7 +885,7 @@ fn meter(pct: u64, color: &str) -> String {
 fn details(sm: &Summary, access: Access) -> Vec<Detail> {
     let mut out = Vec::new();
     let v = &sm.reviews;
-    if v.total > 0 {
+    if v.posted > 0 {
         let mut legend = Vec::new();
         for (n, word, color, class) in [
             (v.approve, "approved", c::GREEN, "t1"),
@@ -739,7 +907,11 @@ fn details(sm: &Summary, access: Access) -> Vec<Detail> {
         ]);
         out.push(Detail {
             name: "Reviews",
-            line: format!("{} posted", plural(v.total, "review", "reviews")),
+            line: format!(
+                "{} on {}",
+                plural(v.posted, "review posted", "reviews posted"),
+                plural(v.prs, "PR", "PRs")
+            ),
             extra: format!(
                 r#"<div style="margin:12px 0 8px">{bar}</div><div class="t2" style="font-size:14px;line-height:22px;color:{t2}">{}</div>"#,
                 legend.join(""),
@@ -756,7 +928,7 @@ fn details(sm: &Summary, access: Access) -> Vec<Detail> {
             parts.push(format!(
                 "{} on {}",
                 plural(r.ci_fix_pushes, "fix pushed", "fixes pushed"),
-                plural(r.ci_fix_runs, "PR", "PRs")
+                plural(r.ci_fix_prs, "PR", "PRs")
             ));
         }
         if r.ci_handed_off > 0 {
@@ -981,7 +1153,7 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
     let cs = cards(sm, access);
     let ds = details(sm, access);
     let month_total = u.month_tokens.total();
-    let has_usage = r.tokens.total() > 0 || month_total > 0;
+    let has_usage = u.week_tokens.is_some_and(|w| w.total() > 0) || month_total > 0;
     let has_data = !cs.is_empty() || !r.attention.is_empty() || !ds.is_empty() || has_usage;
     let when = period(sm.start, sm.end);
     let team = if sm.team_name.trim().is_empty() {
@@ -1025,14 +1197,22 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
 
     // Usage lines, shared by both parts.
     let month = &u.month;
+    // The limit is shown by the rule it is enforced with: all four kinds of
+    // tokens, or new input + output only.
+    let counted = u.counted();
+    let limit_rule = if u.limit_counts_cache {
+        ""
+    } else {
+        " (the limit counts new input and output, not cache)"
+    };
     let usage_head;
     let mut usage_pct = None;
     if u.limit_tokens > 0 {
-        let pct = (month_total as f64 / u.limit_tokens as f64 * 100.0).round() as u64;
+        let pct = (counted as f64 / u.limit_tokens as f64 * 100.0).round() as u64;
         usage_pct = Some(pct);
         usage_head = format!(
-            "{} of {} tokens · {pct}%",
-            tokens(month_total),
+            "{} of the {} token limit used · {pct}%{limit_rule}",
+            tokens(counted),
             tokens(u.limit_tokens)
         );
     } else {
@@ -1043,11 +1223,16 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
         tokens(month_total),
         token_split(&u.month_tokens)
     );
-    let week_line = format!(
-        "{} tokens this week · {}",
-        tokens(r.tokens.total()),
-        token_split(&r.tokens)
-    );
+    let week_line = u
+        .week_tokens
+        .map(|w| {
+            format!(
+                "\n{} tokens this week · {}",
+                tokens(w.total()),
+                token_split(&w)
+            )
+        })
+        .unwrap_or_default();
 
     // ── Plain text ──
     let mut text = format!("{headline}\n{team} · {when}\n");
@@ -1065,7 +1250,7 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
         }
     }
     if !r.attention.is_empty() {
-        text.push_str("\nNEEDS YOUR ATTENTION\n");
+        text.push_str("\nNEEDS YOUR ATTENTION · LAST 30 DAYS\n");
         for a in &r.attention {
             let meta = pr_meta(&a.repo, &a.url);
             let _ = writeln!(
@@ -1127,7 +1312,7 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
     if has_usage {
         let _ = writeln!(
             text,
-            "\nTOKEN USAGE\n{usage_head}\n{month_line}\n{week_line}\nToken limit: {APP}/settings/budget/"
+            "\nTOKEN USAGE\n{usage_head}\n{month_line}{week_line}\nToken limit: {APP}/settings/budget/"
         );
     }
     let _ = write!(
@@ -1199,7 +1384,7 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
         };
         rows.push_str(&block(&format!(
             "{}{}{tail}",
-            h2("Needs your attention"),
+            h2("Needs your attention · last 30 days"),
             list(&items)
         )));
     }
@@ -1263,8 +1448,12 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
                 "tokens · no monthly limit set".to_string(),
             ),
             limit => (
-                tokens(month_total),
-                format!("of {} tokens · {}%", tokens(limit), usage_pct.unwrap_or(0)),
+                tokens(counted),
+                format!(
+                    "of the {} token limit used · {}%{limit_rule}",
+                    tokens(limit),
+                    usage_pct.unwrap_or(0)
+                ),
             ),
         };
         let bar = usage_pct
@@ -1285,7 +1474,7 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
             h = h2("Token usage"),
             big = esc(&big),
             small = esc(&small),
-            split = token_table(&r.tokens, &u.month_tokens, month),
+            split = token_table(u.week_tokens.as_ref(), &u.month_tokens, month),
             more = more_link("Token limit", &format!("{APP}/settings/budget/")),
             t1 = c::T1,
             t2 = c::T2,
@@ -1370,8 +1559,29 @@ fn ulid_at(t: DateTime<Utc>, high: bool) -> String {
     ulid::Ulid::from_parts(t.timestamp_millis().max(0) as u64, random).to_string()
 }
 
+/// Where a summary is read from: the tables, and a client allowed to read
+/// them. Built from the worker's state, or from a plain client in the
+/// read-only live check.
+pub struct Source<'a> {
+    pub dynamo: &'a aws_sdk_dynamodb::Client,
+    pub settings_table: &'a str,
+    pub runs_table: &'a str,
+    pub analytics_table: &'a str,
+}
+
+impl<'a> Source<'a> {
+    pub fn of(state: &'a WorkerState) -> Self {
+        Source {
+            dynamo: &state.dynamo,
+            settings_table: &state.config.settings_table_name,
+            runs_table: &state.config.runs_table_name,
+            analytics_table: &state.config.analytics_table_name,
+        }
+    }
+}
+
 async fn settings_range(
-    state: &WorkerState,
+    src: &Source<'_>,
     team: &str,
     lo: &str,
     hi: &str,
@@ -1380,18 +1590,21 @@ async fn settings_range(
     let mut out = Vec::new();
     let mut start: Option<Item> = None;
     for _ in 0..MAX_PAGES {
-        let resp = state
+        let mut req = src
             .dynamo
             .query()
-            .table_name(&state.config.settings_table_name)
+            .table_name(src.settings_table)
             .key_condition_expression("pk = :pk AND sk BETWEEN :lo AND :hi")
             .expression_attribute_values(":pk", av(team))
             .expression_attribute_values(":lo", av(lo))
             .expression_attribute_values(":hi", av(hi))
             .projection_expression(projection)
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await?;
+            .set_exclusive_start_key(start.take());
+        // `action` is a reserved word.
+        if projection.contains("#a") {
+            req = req.expression_attribute_names("#a", "action");
+        }
+        let resp = req.send().await?;
         out.extend(resp.items().iter().cloned());
         match resp.last_evaluated_key() {
             Some(k) => start = Some(k.clone()),
@@ -1401,28 +1614,23 @@ async fn settings_range(
     Ok(out)
 }
 
-async fn load_runs(
-    state: &WorkerState,
-    team: &str,
-    end: DateTime<Utc>,
-) -> Result<Vec<Item>, BoxErr> {
+async fn load_runs(src: &Source<'_>, team: &str, end: DateTime<Utc>) -> Result<Vec<Item>, BoxErr> {
     let lo = ulid_at(end - Duration::days(RUN_LOOKBACK_DAYS), false);
-    let hi = ulid_at(end, true);
+    let hi = ulid_at(end - Duration::milliseconds(1), true);
     let mut out = Vec::new();
     let mut start: Option<Item> = None;
     for _ in 0..MAX_PAGES {
-        let resp = state
+        let resp = src
             .dynamo
             .query()
-            .table_name(&state.config.runs_table_name)
+            .table_name(src.runs_table)
             .key_condition_expression("team_id = :t AND run_id BETWEEN :lo AND :hi")
             .expression_attribute_values(":t", av(team))
             .expression_attribute_values(":lo", av(&lo))
             .expression_attribute_values(":hi", av(&hi))
             .projection_expression(
-                "run_id, created_at, #s, repo, title, tokens_in, tokens_out, \
-                 cache_read_tokens, cache_write_tokens, pr_number, pr_url, ci_fix_commits, \
-                 ci_fix_attempts, ci_last, handoff_notified, pr_outcome, merged_at",
+                "run_id, created_at, #s, repo, title, ticket_id, pr_number, pr_url, \
+                 pr_outcome, merged_at, ci_fixes_at, handed_off_at",
             )
             .expression_attribute_names("#s", "status")
             .set_exclusive_start_key(start.take())
@@ -1437,86 +1645,216 @@ async fn load_runs(
     Ok(out)
 }
 
-async fn load_usage(state: &WorkerState, team: &str, end: DateTime<Utc>) -> Result<Usage, BoxErr> {
-    let period = end.format("%Y-%m").to_string();
-    let (month, limit) = tokio::join!(
-        state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.analytics_table_name)
-            .key("team_id", av(team))
-            .key("period", av(&period))
-            .send(),
-        state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", av(team))
-            .key("sk", av("SETTINGS#TOKEN_LIMIT"))
-            .send()
-    );
-    let month = month?;
-    let limit = limit?;
-    let m = month.item();
+/// The first whole UTC day every model call was counted per day
+/// (`DAY#` analytics items, from the deploy of per-call accounting on
+/// 2026-10-19). A week that starts earlier has no complete week count.
+fn per_day_counting_from() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 20, 0, 0, 0)
+        .single()
+        .unwrap_or_else(Utc::now)
+}
+
+/// From this time on every review also writes its stats record. Earlier
+/// reviews got theirs from a one-time copy that dropped some writes, so a
+/// week that starts earlier also reads the review records themselves.
+fn review_stats_complete_from() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 17, 4, 0, 0)
+        .single()
+        .unwrap_or_else(Utc::now)
+}
+
+fn tokens_of(item: Option<&Item>) -> Tokens {
+    let t = common::usage::UsageTotals::from_item(item);
+    Tokens {
+        input: t.tokens_in_uncached,
+        cache_read: t.cache_read,
+        cache_write: t.cache_write,
+        output: t.tokens_out,
+    }
+}
+
+async fn analytics_item(
+    src: &Source<'_>,
+    team: &str,
+    period: &str,
+) -> Result<Option<Item>, BoxErr> {
+    Ok(src
+        .dynamo
+        .get_item()
+        .table_name(src.analytics_table)
+        .key("team_id", av(team))
+        .key("period", av(period))
+        .send()
+        .await?
+        .item()
+        .cloned())
+}
+
+/// The month so far (as of `now`), the week's days, and the limit, all from
+/// the same counters the limit is enforced with.
+async fn load_usage(
+    src: &Source<'_>,
+    team: &str,
+    start: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<Usage, BoxErr> {
+    let month = analytics_item(src, team, &now.format("%Y-%m").to_string()).await?;
+    let limit = src
+        .dynamo
+        .get_item()
+        .table_name(src.settings_table)
+        .key("pk", av(team))
+        .key("sk", av("SETTINGS#TOKEN_LIMIT"))
+        .send()
+        .await?;
+    let week_tokens = if start >= per_day_counting_from() {
+        let mut w = Tokens::default();
+        for d in 0..7 {
+            let day = (start + Duration::days(d)).format("%Y-%m-%d");
+            let t = tokens_of(
+                analytics_item(src, team, &format!("DAY#{day}"))
+                    .await?
+                    .as_ref(),
+            );
+            w.input += t.input;
+            w.cache_read += t.cache_read;
+            w.cache_write += t.cache_write;
+            w.output += t.output;
+        }
+        Some(w)
+    } else {
+        None
+    };
+    let limit = limit.item();
+    let team_counts_cache = limit
+        .and_then(|i| i.get("counts_cache"))
+        .and_then(|v| v.as_bool().ok())
+        .copied();
     Ok(Usage {
-        month: end.format("%B %Y").to_string(),
-        month_tokens: m
-            .map(|i| Tokens {
-                input: n(i, "total_tokens_in") as u64,
-                cache_read: n(i, "cache_read_tokens") as u64,
-                cache_write: n(i, "cache_write_tokens") as u64,
-                output: n(i, "total_tokens_out") as u64,
-            })
-            .unwrap_or_default(),
-        limit_tokens: limit.item().map(|i| n(i, "max_tokens") as u64).unwrap_or(0),
+        month: now.format("%B %Y").to_string(),
+        month_tokens: tokens_of(month.as_ref()),
+        week_tokens,
+        limit_tokens: limit.map(|i| n(i, "max_tokens") as u64).unwrap_or(0),
+        limit_counts_cache: common::usage::counts_cache_enabled(
+            team_counts_cache,
+            std::env::var("TOKEN_LIMIT_COUNTS_CACHE").ok().as_deref(),
+        ),
     })
 }
 
-/// Everything in a team's summary for the 7 days before `end`.
+/// Review records, keys and the fields a stats row needs (bodies are not
+/// projected away by DynamoDB's read cost, but they are not kept).
+async fn load_review_records(src: &Source<'_>, team: &str) -> Result<Vec<Item>, BoxErr> {
+    let mut out = Vec::new();
+    let mut start: Option<Item> = None;
+    loop {
+        let resp = src
+            .dynamo
+            .query()
+            .table_name(src.settings_table)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .expression_attribute_values(":pk", av(team))
+            .expression_attribute_values(":p", av("REVIEW#"))
+            .projection_expression("sk, created_at, verdict, repo, pr_number")
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await?;
+        out.extend(resp.items().iter().cloned());
+        match resp.last_evaluated_key() {
+            Some(k) => start = Some(k.clone()),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// Everything in a team's summary for the week before the day of `now`.
 pub async fn load(
     state: &WorkerState,
     team_id: &str,
     team_name: &str,
-    end: DateTime<Utc>,
+    now: DateTime<Utc>,
 ) -> Result<Summary, BoxErr> {
-    let start = end - Duration::days(7);
+    load_from(&Source::of(state), team_id, team_name, now).await
+}
+
+pub async fn load_from(
+    src: &Source<'_>,
+    team_id: &str,
+    team_name: &str,
+    now: DateTime<Utc>,
+) -> Result<Summary, BoxErr> {
+    let (start, end) = week_before(now);
     let iso = |t: DateTime<Utc>| t.to_rfc3339_opts(SecondsFormat::Millis, true);
-    let table = state.config.settings_table_name.as_str();
-    let skills = common::skills::SkillStore {
-        dynamo: &state.dynamo,
-        table,
-        team: team_id,
-    };
-    let since = iso(start);
+    let last = end - Duration::milliseconds(1);
+    // Stats keys hold the review's own timestamp (nanoseconds), so the range
+    // ends just before the first key of `end`.
     let rstat_lo = format!("{}{}", common::review_stats::PREFIX, iso(start));
-    let rstat_hi = format!("{}{}~", common::review_stats::PREFIX, iso(end));
+    let rstat_hi = format!("{}{}", common::review_stats::PREFIX, iso(end));
     let alert_lo = format!("ALERT_EVENT#{}", ulid_at(start, false));
-    let alert_hi = format!("ALERT_EVENT#{}", ulid_at(end, true));
+    let alert_hi = format!("ALERT_EVENT#{}", ulid_at(last, true));
+    let use_lo = format!("SKILLUSE#{}", ulid_at(start, false));
+    let use_hi = format!("SKILLUSE#{}", ulid_at(last, true));
+    let log_lo = format!("DSLOG#{}", iso(start));
+    let log_hi = format!("DSLOG#{}", iso(end));
     let (runs, reviews, alerts, access, lookups, usage) = tokio::join!(
-        load_runs(state, team_id, end),
-        settings_range(state, team_id, &rstat_lo, &rstat_hi, "verdict, posted"),
-        settings_range(state, team_id, &alert_lo, &alert_hi, "kind, outcome"),
-        skills.access_counts(&since),
-        common::live::store::count_activity(&state.dynamo, table, team_id, &since),
-        load_usage(state, team_id, end),
+        load_runs(src, team_id, end),
+        settings_range(
+            src,
+            team_id,
+            &rstat_lo,
+            &rstat_hi,
+            "sk, verdict, posted, repo, pr_number"
+        ),
+        settings_range(src, team_id, &alert_lo, &alert_hi, "kind, outcome"),
+        settings_range(src, team_id, &use_lo, &use_hi, "#a, outcome"),
+        settings_range(src, team_id, &log_lo, &log_hi, "outcome"),
+        load_usage(src, team_id, start, now),
     );
-    let runs = runs?;
-    let access = access.map_err(|e| format!("skill activity: {e}"))?;
-    let (ok, refused, failed) = lookups.map_err(|e| format!("lookups: {e}"))?;
+    let mut reviews = reviews?;
+    // `rstat_hi` is exclusive in effect: a key at exactly `end` sorts after it
+    // only when it has more digits; drop anything at or after `end`.
+    reviews.retain(|r| {
+        r.get("sk").and_then(|v| v.as_s().ok()).is_some_and(|sk| {
+            within(
+                sk.trim_start_matches(common::review_stats::PREFIX)
+                    .split('#')
+                    .next()
+                    .unwrap_or(""),
+                start,
+                end,
+            )
+        })
+    });
+    let complete_from = review_stats_complete_from();
+    if start < complete_from {
+        let records = load_review_records(src, team_id).await?;
+        let gap_end = end.min(complete_from);
+        let missing = reviews_missing_stats(&records, &reviews, start, gap_end);
+        reviews.extend(missing);
+    }
+    let mut skills = common::skills::AccessCounts::default();
+    for i in access? {
+        skills.add(&s(&i, "action"), &s(&i, "outcome"));
+    }
+    let mut looked = LookupStats::default();
+    for i in lookups? {
+        looked.total += 1;
+        match s(&i, "outcome").as_str() {
+            "ok" => {}
+            "refused" => looked.refused += 1,
+            _ => looked.failed += 1,
+        }
+    }
     Ok(Summary {
         team_name: team_name.to_string(),
         start,
         end,
-        runs: run_stats(&runs, start, end),
-        reviews: review_stats(&reviews?),
+        runs: run_stats(&runs?, start, end),
+        reviews: review_stats(&reviews),
         alerts: alert_stats(&alerts?),
-        skill_reads: access.reads.max(0) as u64,
-        agent_asks: access.asks.max(0) as u64,
-        lookups: LookupStats {
-            total: (ok + refused + failed).max(0) as u64,
-            failed: failed.max(0) as u64,
-            refused: refused.max(0) as u64,
-        },
+        skill_reads: skills.reads.max(0) as u64,
+        agent_asks: skills.asks.max(0) as u64,
+        lookups: looked,
         usage: usage?,
     })
 }
@@ -1870,7 +2208,7 @@ mod tests {
     }
 
     fn week() -> (DateTime<Utc>, DateTime<Utc>) {
-        let end = Utc.with_ymd_and_hms(2026, 10, 19, 13, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 10, 19, 0, 0, 0).unwrap();
         (end - Duration::days(7), end)
     }
 
@@ -1892,8 +2230,6 @@ mod tests {
                 started: 16,
                 completed: 12,
                 merged: 14,
-                open: 3,
-                failed: 2,
                 top_merged: vec![
                     pr("Add retry to the webhook sender", "example/api", 41),
                     pr("Fix <script> escaping & quotes", "example/web", 9),
@@ -1906,7 +2242,7 @@ mod tests {
                     ),
                 ],
                 ci_fix_pushes: 4,
-                ci_fix_runs: 3,
+                ci_fix_prs: 3,
                 ci_handed_off: 1,
                 attention: vec![
                     Attention {
@@ -1923,15 +2259,11 @@ mod tests {
                     },
                 ],
                 attention_total: 2,
-                tokens: Tokens {
-                    input: 1_100_000,
-                    cache_read: 61_400_000,
-                    cache_write: 8_800_000,
-                    output: 1_000_000,
-                },
+                waiting_review: 1,
             },
             reviews: ReviewStats {
-                total: 9,
+                posted: 9,
+                prs: 6,
                 approve: 5,
                 request_changes: 3,
                 comment: 1,
@@ -1956,7 +2288,14 @@ mod tests {
                     cache_write: 14_000_000,
                     output: 2_000_000,
                 },
+                week_tokens: Some(Tokens {
+                    input: 1_100_000,
+                    cache_read: 61_400_000,
+                    cache_write: 8_800_000,
+                    output: 1_000_000,
+                }),
                 limit_tokens: 200_000_000,
+                limit_counts_cache: true,
             },
         }
     }
@@ -1973,12 +2312,6 @@ mod tests {
                 completed: 1,
                 merged: 1,
                 top_merged: vec![pr("Fix a typo in the README", "example/docs", 3)],
-                tokens: Tokens {
-                    input: 40_000,
-                    cache_read: 300_000,
-                    cache_write: 50_000,
-                    output: 10_000,
-                },
                 ..Default::default()
             },
             reviews: ReviewStats::default(),
@@ -1994,7 +2327,9 @@ mod tests {
                     cache_write: 50_000,
                     output: 10_000,
                 },
+                week_tokens: None,
                 limit_tokens: 0,
+                limit_counts_cache: false,
             },
         }
     }
@@ -2002,7 +2337,18 @@ mod tests {
     const LINK: &str = "https://api.coderhelm.com/email/unsubscribe?t=abc.def";
 
     #[test]
-    fn runs_count_the_week_and_merges_count_when_they_merged() {
+    fn the_week_is_the_seven_whole_days_before_the_send_and_labelled_so() {
+        let sent = Utc.with_ymd_and_hms(2026, 10, 19, 13, 0, 0).unwrap();
+        let (start, end) = week_before(sent);
+        assert_eq!(start, Utc.with_ymd_and_hms(2026, 10, 12, 0, 0, 0).unwrap());
+        assert_eq!(end, Utc.with_ymd_and_hms(2026, 10, 19, 0, 0, 0).unwrap());
+        // Monday to Sunday: the label names exactly the days counted.
+        assert_eq!(period(start, end), "Oct 12 – 18, 2026");
+        assert_eq!(week_before(end), (end - Duration::days(7), end));
+    }
+
+    #[test]
+    fn merges_count_once_per_pr_when_they_merged() {
         let (start, end) = week();
         let rows = vec![
             // Started this week, merged this week.
@@ -2014,13 +2360,14 @@ mod tests {
                 ("pr_url", "https://github.com/x/y/pull/5"),
                 ("title", "Newer"),
                 ("merged_at", "2026-10-16T10:00:00Z"),
-                ("tokens_in", "#1000"),
-                ("tokens_out", "#500"),
-                ("cache_read_tokens", "#7000"),
-                ("cache_write_tokens", "#300"),
-                ("ci_fix_commits", "#2"),
-                ("ci_fix_attempts", "#2"),
-                ("ci_last", "passed"),
+            ]),
+            // An earlier run on the same PR: the PR counts once.
+            item(&[
+                ("run_id", "r0"),
+                ("created_at", "2026-10-13T10:00:00Z"),
+                ("status", "completed"),
+                ("pr_number", "#5"),
+                ("pr_url", "https://github.com/x/y/pull/5"),
             ]),
             // Started weeks ago, merged this week.
             item(&[
@@ -2031,60 +2378,100 @@ mod tests {
                 ("pr_url", "https://github.com/x/y/pull/4"),
                 ("title", "Older"),
                 ("merged_at", "2026-10-13T10:00:00Z"),
-                ("tokens_in", "#99999"),
-            ]),
-            // Open PR this week, waiting on review; CI was left red.
-            item(&[
-                ("created_at", "2026-10-15T10:00:00Z"),
-                ("status", "completed"),
-                ("pr_number", "#6"),
-                ("pr_url", "https://github.com/x/y/pull/6"),
-                ("title", "Waiting"),
-                ("ci_fix_attempts", "#3"),
-                ("ci_last", "failed"),
-            ]),
-            // Closed without merging: neither open nor merged.
-            item(&[
-                ("created_at", "2026-10-15T11:00:00Z"),
-                ("status", "completed"),
-                ("pr_outcome", "closed"),
-                ("pr_number", "#7"),
-            ]),
-            item(&[("created_at", "2026-10-17T10:00:00Z"), ("status", "failed")]),
-            // Asked a question two weeks ago and still waiting.
-            item(&[
-                ("run_id", "r9"),
-                ("created_at", "2026-10-03T10:00:00Z"),
-                ("status", "needs_input"),
-                ("title", "Asks"),
             ]),
             // Merged last week: not this week's.
             item(&[
                 ("created_at", "2026-10-01T10:00:00Z"),
                 ("status", "merged"),
                 ("pr_number", "#3"),
+                ("pr_url", "https://github.com/x/y/pull/3"),
                 ("merged_at", "2026-10-05T10:00:00Z"),
+            ]),
+            item(&[("created_at", "2026-10-17T10:00:00Z"), ("status", "failed")]),
+            item(&[
+                ("created_at", "2026-10-17T11:00:00Z"),
+                ("status", "retried"),
             ]),
         ];
         let r = run_stats(&rows, start, end);
-        assert_eq!(
-            (r.started, r.completed, r.merged, r.open, r.failed),
-            (4, 3, 2, 1, 1)
-        );
+        assert_eq!(r.merged, 2);
         assert_eq!(r.top_merged.len(), 2);
         assert_eq!(r.top_merged[0].title, "Newer");
-        assert_eq!((r.ci_fix_pushes, r.ci_fix_runs, r.ci_handed_off), (2, 1, 1));
-        assert_eq!(
-            r.tokens,
-            Tokens {
-                input: 1000,
-                cache_read: 7000,
-                cache_write: 300,
-                output: 500
-            }
-        );
-        assert_eq!(r.tokens.total(), 8800);
-        assert_eq!(r.attention_total, 2);
+        assert_eq!(r.top_merged[1].title, "Older");
+        // Created this week: r1, r0, the failed and the retried run.
+        assert_eq!((r.started, r.completed), (4, 2));
+    }
+
+    #[test]
+    fn waiting_on_a_person_is_one_entry_per_pr_and_only_the_latest_question() {
+        let (start, end) = week();
+        let rows = vec![
+            // Two runs on one open PR: one entry, from the latest run.
+            item(&[
+                ("run_id", "a1"),
+                ("created_at", "2026-10-14T10:00:00Z"),
+                ("status", "completed"),
+                ("pr_number", "#6"),
+                ("pr_url", "https://github.com/x/y/pull/6"),
+                ("title", "First try"),
+            ]),
+            item(&[
+                ("run_id", "a2"),
+                ("created_at", "2026-10-15T10:00:00Z"),
+                ("status", "completed"),
+                ("pr_number", "#6"),
+                ("pr_url", "https://github.com/x/y/pull/6"),
+                ("title", "Waiting"),
+            ]),
+            // A PR another run merged is not waiting, whatever this run says.
+            item(&[
+                ("created_at", "2026-10-14T09:00:00Z"),
+                ("status", "completed"),
+                ("pr_number", "#8"),
+                ("pr_url", "https://github.com/x/y/pull/8"),
+            ]),
+            item(&[
+                ("created_at", "2026-10-14T12:00:00Z"),
+                ("status", "merged"),
+                ("pr_number", "#8"),
+                ("pr_url", "https://github.com/x/y/pull/8"),
+                ("merged_at", "2026-10-01T00:00:00Z"),
+            ]),
+            // Closed without merging: not waiting.
+            item(&[
+                ("created_at", "2026-10-15T11:00:00Z"),
+                ("status", "completed"),
+                ("pr_outcome", "closed"),
+                ("pr_number", "#7"),
+                ("pr_url", "https://github.com/x/y/pull/7"),
+            ]),
+            // A question two weeks ago, still the ticket's latest run.
+            item(&[
+                ("run_id", "r9"),
+                ("created_at", "2026-10-03T10:00:00Z"),
+                ("status", "needs_input"),
+                ("ticket_id", "T-1"),
+                ("repo", "x/y"),
+                ("title", "Asks"),
+            ]),
+            // A question a later run of the same ticket replaced.
+            item(&[
+                ("run_id", "q1"),
+                ("created_at", "2026-10-04T10:00:00Z"),
+                ("status", "needs_input"),
+                ("ticket_id", "T-2"),
+                ("repo", "x/y"),
+            ]),
+            item(&[
+                ("run_id", "q2"),
+                ("created_at", "2026-10-05T10:00:00Z"),
+                ("status", "cancelled"),
+                ("ticket_id", "T-2"),
+                ("repo", "x/y"),
+            ]),
+        ];
+        let r = run_stats(&rows, start, end);
+        assert_eq!((r.attention_total, r.waiting_review), (2, 1));
         assert_eq!(r.attention[0].title, "Waiting");
         assert_eq!(r.attention[0].why, Waiting::Review);
         assert_eq!(r.attention[0].url, "https://github.com/x/y/pull/6");
@@ -2096,38 +2483,211 @@ mod tests {
     }
 
     #[test]
-    fn reviews_and_alerts_are_split_the_way_the_pages_show_them() {
+    fn ci_fixes_and_hand_offs_count_when_they_happened() {
+        let (start, end) = week();
+        let list = |v: &[&str]| {
+            AttributeValue::L(v.iter().map(|s| AttributeValue::S(s.to_string())).collect())
+        };
+        let mut old_run = item(&[
+            ("created_at", "2026-09-30T10:00:00Z"),
+            ("status", "completed"),
+            ("pr_number", "#4"),
+            ("pr_url", "https://github.com/x/y/pull/4"),
+            ("handed_off_at", "2026-10-15T00:00:00Z"),
+        ]);
+        // Two fixes this week, one before it.
+        old_run.insert(
+            "ci_fixes_at".into(),
+            list(&[
+                "2026-10-01T00:00:00Z",
+                "2026-10-13T00:00:00Z",
+                "2026-10-14T00:00:00Z",
+            ]),
+        );
+        let mut new_run = item(&[
+            ("created_at", "2026-10-14T10:00:00Z"),
+            ("status", "completed"),
+            ("pr_number", "#5"),
+            ("pr_url", "https://github.com/x/y/pull/5"),
+            ("handed_off_at", "2026-10-21T00:00:00Z"),
+            // The old counters carry no time and are not counted.
+            ("ci_fix_commits", "#9"),
+            ("ci_last", "failed"),
+            ("ci_fix_attempts", "#3"),
+        ]);
+        new_run.insert("ci_fixes_at".into(), list(&["2026-10-15T00:00:00Z"]));
+        let r = run_stats(&[old_run, new_run], start, end);
+        assert_eq!((r.ci_fix_pushes, r.ci_fix_prs, r.ci_handed_off), (3, 2, 1));
+    }
+
+    #[test]
+    fn reviews_count_posted_reviews_and_the_prs_they_were_on() {
         let reviews = vec![
-            item(&[("verdict", "APPROVE"), ("posted", "true")]),
-            item(&[("verdict", "REQUEST_CHANGES")]),
-            item(&[("verdict", "COMMENT"), ("posted", "true")]),
-            item(&[("verdict", "APPROVE"), ("posted", "false")]),
-            item(&[("verdict", "QUESTION"), ("posted", "true")]),
+            item(&[
+                ("verdict", "APPROVE"),
+                ("posted", "true"),
+                ("repo", "a/b"),
+                ("pr_number", "#1"),
+            ]),
+            item(&[
+                ("verdict", "REQUEST_CHANGES"),
+                ("repo", "a/b"),
+                ("pr_number", "#1"),
+            ]),
+            item(&[
+                ("verdict", "COMMENT"),
+                ("posted", "true"),
+                ("repo", "a/c"),
+                ("pr_number", "#1"),
+            ]),
+            item(&[
+                ("verdict", "APPROVE"),
+                ("posted", "false"),
+                ("repo", "a/d"),
+                ("pr_number", "#9"),
+            ]),
+            item(&[
+                ("verdict", "QUESTION"),
+                ("posted", "true"),
+                ("repo", "a/e"),
+                ("pr_number", "#9"),
+            ]),
         ];
         assert_eq!(
             review_stats(&reviews),
             ReviewStats {
-                total: 3,
+                posted: 3,
+                prs: 2,
                 approve: 1,
                 request_changes: 1,
                 comment: 1
             }
         );
+    }
+
+    #[test]
+    fn reviews_without_a_stats_record_are_filled_in_from_the_review_records() {
+        let (start, end) = week();
+        let review = |sk: &str, created: &str| {
+            item(&[
+                ("sk", sk),
+                ("created_at", created),
+                ("verdict", "APPROVE"),
+                ("repo", "a/b"),
+                ("pr_number", "#7"),
+            ])
+        };
+        let records = vec![
+            review(
+                "REVIEW#a/b#000007#2026-10-14T00:00:00Z",
+                "2026-10-14T00:00:00Z",
+            ),
+            review(
+                "REVIEW#a/b#000007#2026-10-15T00:00:00Z",
+                "2026-10-15T00:00:00Z",
+            ),
+            // Outside the week.
+            review(
+                "REVIEW#a/b#000007#2026-10-01T00:00:00Z",
+                "2026-10-01T00:00:00Z",
+            ),
+        ];
+        let stats = vec![item(&[
+            ("sk", "RSTAT#2026-10-14T00:00:00Z#a/b#000007"),
+            ("verdict", "APPROVE"),
+            ("posted", "false"),
+        ])];
+        let missing = reviews_missing_stats(&records, &stats, start, end);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(
+            missing[0]["created_at"],
+            AttributeValue::S("2026-10-15T00:00:00Z".into())
+        );
+        assert_eq!(missing[0]["posted"], AttributeValue::Bool(true));
+        // The one with a stats record keeps its own posted flag.
+        let mut all = stats.clone();
+        all.extend(missing);
+        assert_eq!(review_stats(&all).posted, 1);
+    }
+
+    #[test]
+    fn alerts_received_leave_out_recoveries_and_non_alarms() {
         let alerts = vec![
             item(&[("kind", "cloudwatch_alarm"), ("outcome", "run_started")]),
-            item(&[("kind", "cloudwatch_alarm"), ("outcome", "notified")]),
-            item(&[("kind", "cloudwatch_alarm"), ("outcome", "recovered")]),
+            item(&[("kind", "message"), ("outcome", "notified")]),
+            item(&[
+                ("kind", "cloudwatch_alarm"),
+                ("outcome", "recovered"),
+                ("backfilled", "true"),
+            ]),
+            item(&[("kind", "recovery"), ("outcome", "recovered")]),
             item(&[("kind", "recovery"), ("outcome", "no_open_alert")]),
-            item(&[("kind", "eventbridge"), ("outcome", "not_alarm")]),
+            item(&[("kind", "cloudwatch_alarm"), ("outcome", "not_alarm")]),
         ];
         assert_eq!(
             alert_stats(&alerts),
             AlertStats {
                 received: 2,
-                recovered: 2,
+                recovered: 3,
                 runs_started: 1
             }
         );
+    }
+
+    #[test]
+    fn the_limit_is_shown_by_the_rule_it_is_enforced_with() {
+        let mut sm = sample();
+        // Without cache: 2M new input + 2M output of 200M.
+        sm.usage.limit_counts_cache = false;
+        let e = render(&sm, Access::Admin, LINK);
+        assert!(
+            e.text.contains(
+                "4M of the 200M token limit used · 2% (the limit counts new input and output, not cache)"
+            ),
+            "{}",
+            e.text
+        );
+        // The month still shows all four kinds.
+        assert!(e.text.contains("118M tokens in October so far"));
+        sm.usage.limit_counts_cache = true;
+        let e = render(&sm, Access::Admin, LINK);
+        assert!(e.text.contains("118M of the 200M token limit used · 59%\n"));
+    }
+
+    #[test]
+    fn a_week_without_complete_day_counts_shows_the_month_only() {
+        let mut sm = sample();
+        sm.usage.week_tokens = None;
+        let e = render(&sm, Access::Admin, LINK);
+        assert!(!e.text.contains("tokens this week"));
+        assert!(!e.html.contains("This week"));
+        assert!(e.html.contains("October so far"));
+        sm.usage.week_tokens = Some(Tokens::default());
+        let e = render(&sm, Access::Admin, LINK);
+        assert!(e.html.contains("This week"));
+    }
+
+    #[test]
+    fn cards_say_what_they_count() {
+        let e = render(&sample(), Access::Admin, LINK);
+        // Distinct PRs on the card, reviews posted in its note.
+        assert!(
+            e.text.contains("  6 PRs reviewed (9 reviews posted)"),
+            "{}",
+            e.text
+        );
+        assert!(e.text.contains("Reviews: 9 reviews posted on 6 PRs"));
+        // Waiting on review counts every waiting PR, not the listed ones.
+        assert!(e.text.contains("14 PRs merged (1 waiting on review)"));
+        let member = render(&sample(), Access::Member, LINK);
+        assert!(
+            member.text.contains("6 alerts received (4 recovered)"),
+            "{}",
+            member.text
+        );
+        assert!(e
+            .text
+            .contains("CI: 4 fixes pushed on 3 PRs · 1 PR handed to a person"));
     }
 
     #[test]
@@ -2167,9 +2727,9 @@ mod tests {
             assert!(!e.to_lowercase().contains("lookup"), "{e}");
         }
         assert!(member.html.contains(">Alerts<"));
-        assert!(member.html.contains("alerts handled"));
+        assert!(member.html.contains("alerts received"));
         assert!(!viewer.html.contains(">Alerts<"));
-        assert!(!viewer.html.contains("alerts handled"));
+        assert!(!viewer.html.contains("alerts received"));
         assert!(viewer.html.contains("Merged this week"));
     }
 
@@ -2182,7 +2742,8 @@ mod tests {
             end,
             runs: RunStats::default(),
             reviews: ReviewStats {
-                total: 1,
+                posted: 1,
+                prs: 1,
                 approve: 1,
                 ..Default::default()
             },
@@ -2245,7 +2806,7 @@ mod tests {
         assert!(e
             .html
             .contains("Your week on Coderhelm: 14&nbsp;PRs&nbsp;merged"));
-        assert!(e.html.contains("Oct 12 – 19, 2026"));
+        assert!(e.html.contains("Oct 12 – 18, 2026"));
         // Five merged PRs by name, the rest counted.
         assert!(e.html.contains("and 9 more"));
         assert!(e.html.contains("example/api · #41"));
@@ -2253,8 +2814,8 @@ mod tests {
         assert!(e.html.contains("Fix &lt;script&gt; escaping &amp; quotes"));
         assert!(!e.html.contains("<script>"));
         // Tokens against the limit, split the same way everywhere.
-        assert!(e.text.contains("118M of 200M tokens · 59%"));
-        assert!(e.html.contains("of 200M tokens · 59%"));
+        assert!(e.text.contains("118M of the 200M token limit used · 59%"));
+        assert!(e.html.contains("of the 200M token limit used · 59%"));
         let split = "72.3M tokens this week · 1.1M new input · 61.4M read from cache · \
                      8.8M written to cache · 1M output";
         assert!(e.text.contains(split), "{}", e.text);
@@ -2401,10 +2962,10 @@ mod tests {
             None
         );
         let (start, end) = week();
-        assert_eq!(period(start, end), "Oct 12 – 19, 2026");
+        assert_eq!(period(start, end), "Oct 12 – 18, 2026");
         assert_eq!(
             period(start - Duration::days(14), end - Duration::days(14)),
-            "Sep 28 – Oct 5, 2026"
+            "Sep 28 – Oct 4, 2026"
         );
         assert_eq!(week_key(week().1), "2026-W43");
         assert_eq!(Access::from_role("owner"), Access::Admin);
@@ -2431,5 +2992,53 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// Renders one real team's summary from live tables, read only, as an
+    /// admin would get it (nothing is sent):
+    /// `WEEKLY_SUMMARY_LIVE_TEAM=TEAM#.. WEEKLY_SUMMARY_LIVE_OUT=/dir
+    /// [WEEKLY_SUMMARY_LIVE_AT=2026-10-19T13:00:00Z] [WEEKLY_SUMMARY_LIVE_STAGE=prod]
+    /// cargo test -p worker weekly_summary_live -- --ignored`.
+    /// Writes `email.txt`, `email.html` and `summary.txt` for an independent
+    /// check of every figure against the raw records.
+    #[test]
+    #[ignore]
+    fn weekly_summary_live() {
+        let team = std::env::var("WEEKLY_SUMMARY_LIVE_TEAM").expect("WEEKLY_SUMMARY_LIVE_TEAM");
+        let dir = std::env::var("WEEKLY_SUMMARY_LIVE_OUT").expect("WEEKLY_SUMMARY_LIVE_OUT dir");
+        let stage = std::env::var("WEEKLY_SUMMARY_LIVE_STAGE").unwrap_or_else(|_| "prod".into());
+        let at = std::env::var("WEEKLY_SUMMARY_LIVE_AT")
+            .ok()
+            .map(|v| {
+                DateTime::parse_from_rfc3339(&v)
+                    .expect("WEEKLY_SUMMARY_LIVE_AT is RFC 3339")
+                    .with_timezone(&Utc)
+            })
+            .unwrap_or_else(Utc::now);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let dynamo = aws_sdk_dynamodb::Client::new(&cfg);
+            let (settings, runs, analytics) = (
+                format!("coderhelm-{stage}-settings"),
+                format!("coderhelm-{stage}-runs"),
+                format!("coderhelm-{stage}-analytics"),
+            );
+            let src = Source {
+                dynamo: &dynamo,
+                settings_table: &settings,
+                runs_table: &runs,
+                analytics_table: &analytics,
+            };
+            let sm = load_from(&src, &team, "a team", at).await.unwrap();
+            let e = render(&sm, Access::Admin, LINK);
+            std::fs::write(format!("{dir}/email.html"), &e.html).unwrap();
+            std::fs::write(
+                format!("{dir}/email.txt"),
+                format!("Subject: {}\n\n{}", e.subject, e.text),
+            )
+            .unwrap();
+            std::fs::write(format!("{dir}/summary.txt"), format!("{sm:#?}")).unwrap();
+        });
     }
 }

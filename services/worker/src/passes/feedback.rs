@@ -629,7 +629,18 @@ Rules:
     // If feedback committed code changes — OR the pre-feedback conflict
     // resolution pushed a merge commit — set awaiting_ci so the CI result
     // has a consumer.
-    let code_pushed = *executor.files_modified.lock().unwrap() || conflicts_pushed;
+    let fix_pushed = *executor.files_modified.lock().unwrap();
+    let code_pushed = fix_pushed || conflicts_pushed;
+    // A push that carried CI failures to fix is a CI fix, counted with its time.
+    if fix_pushed && has_ci_failures {
+        super::record_ci_outcome(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            super::CiOutcome::FixCommitted,
+        )
+        .await;
+    }
     let final_status = if code_pushed {
         "awaiting_ci"
     } else {
@@ -1990,6 +2001,14 @@ async fn hand_off_to_human(state: &WorkerState, github: &GitHubClient, msg: &Fee
         .expression_attribute_values(":cancelled", AttributeValue::S("cancelled".to_string()))
         .send()
         .await;
+    // When it was handed off (the first time only), for the weekly summary.
+    super::record_ci_outcome(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        super::CiOutcome::HandedOff,
+    )
+    .await;
 
     // (3) Explain ONCE. The marker write wins for exactly one invocation; a
     // redelivered/concurrent event sees the marker and skips (no PR spam). Done

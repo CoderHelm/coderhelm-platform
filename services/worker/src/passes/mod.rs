@@ -3816,18 +3816,25 @@ pub(crate) async fn update_pass(
 pub(crate) enum CiOutcome {
     /// CI was red and Coderhelm started a fix cycle.
     FixAttempt,
-    /// A fix cycle changed code and pushed it.
+    /// A fix cycle changed code and pushed it. Also keeps when, so a week's
+    /// fixes can be counted whenever the run started.
     FixCommitted,
     /// CI came back green.
     Passed,
+    /// Coderhelm could not get CI green and left the PR to a person; the
+    /// first hand-off's time is kept.
+    HandedOff,
 }
 
 impl CiOutcome {
     fn update_expression(self) -> &'static str {
         match self {
             CiOutcome::FixAttempt => "ADD ci_fix_attempts :one SET ci_last = :failed",
-            CiOutcome::FixCommitted => "ADD ci_fix_commits :one",
+            CiOutcome::FixCommitted => {
+                "ADD ci_fix_commits :one SET ci_fixes_at = list_append(if_not_exists(ci_fixes_at, :empty), :at)"
+            }
             CiOutcome::Passed => "SET ci_last = :passed",
+            CiOutcome::HandedOff => "SET handed_off_at = if_not_exists(handed_off_at, :now)",
         }
     }
 }
@@ -3851,8 +3858,22 @@ pub(crate) async fn record_ci_outcome(
         CiOutcome::FixAttempt => req
             .expression_attribute_values(":one", attr_n(1))
             .expression_attribute_values(":failed", attr_s("failed")),
-        CiOutcome::FixCommitted => req.expression_attribute_values(":one", attr_n(1)),
+        CiOutcome::FixCommitted => {
+            let now = chrono::Utc::now().to_rfc3339();
+            req.expression_attribute_values(":one", attr_n(1))
+                .expression_attribute_values(
+                    ":at",
+                    aws_sdk_dynamodb::types::AttributeValue::L(vec![attr_s(&now)]),
+                )
+                .expression_attribute_values(
+                    ":empty",
+                    aws_sdk_dynamodb::types::AttributeValue::L(vec![]),
+                )
+        }
         CiOutcome::Passed => req.expression_attribute_values(":passed", attr_s("passed")),
+        CiOutcome::HandedOff => {
+            req.expression_attribute_values(":now", attr_s(&chrono::Utc::now().to_rfc3339()))
+        }
     };
     if let Err(e) = req.send().await {
         warn!(run_id, error = %e, "Failed to record CI outcome (non-fatal)");
@@ -6468,11 +6489,15 @@ mod ci_outcome_tests {
         );
         assert_eq!(
             CiOutcome::FixCommitted.update_expression(),
-            "ADD ci_fix_commits :one"
+            "ADD ci_fix_commits :one SET ci_fixes_at = list_append(if_not_exists(ci_fixes_at, :empty), :at)"
         );
         assert_eq!(
             CiOutcome::Passed.update_expression(),
             "SET ci_last = :passed"
+        );
+        assert_eq!(
+            CiOutcome::HandedOff.update_expression(),
+            "SET handed_off_at = if_not_exists(handed_off_at, :now)"
         );
     }
 }

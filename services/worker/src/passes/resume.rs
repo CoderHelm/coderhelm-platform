@@ -1073,6 +1073,13 @@ pub async fn run(
                 run_id = msg.run_id,
                 cycle, "Fix budget reached — completing for human review"
             );
+            super::record_ci_outcome(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                super::CiOutcome::HandedOff,
+            )
+            .await;
             // Every terminal path consumes its events; left unprocessed, the
             // next resume (e.g. after a re-review) replayed these failures.
             mark_events_processed(state, &msg.run_id, &events).await;
