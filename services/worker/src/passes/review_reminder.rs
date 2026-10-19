@@ -163,7 +163,7 @@ async fn load_reminder_configs(state: &WorkerState) -> Vec<RepoReminder> {
 }
 
 /// A team's GitHub installation id, from the teams table META record.
-async fn team_installation_id(state: &WorkerState, team_id: &str) -> Option<u64> {
+pub(crate) async fn team_installation_id(state: &WorkerState, team_id: &str) -> Option<u64> {
     let item = state
         .dynamo
         .get_item()

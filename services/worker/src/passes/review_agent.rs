@@ -101,6 +101,15 @@ pub fn thread_holds_merge(body: &str) -> bool {
     !first.trim_end().ends_with("(question)")
 }
 
+/// Whether an earlier CoderHelm comment is a question for a person (its first
+/// line, as posted, ends with "(question)"). An open, unanswered question
+/// keeps the review from approving; an open note or unverified concern
+/// doesn't.
+pub fn thread_is_question(body: &str) -> bool {
+    let first = body.lines().next().unwrap_or("");
+    first.trim_end().ends_with("(question)")
+}
+
 /// The model's structured review output.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ReviewOutput {
@@ -120,26 +129,24 @@ pub struct ReviewOutput {
     /// none are needed (only when the repo turned label picking on).
     #[serde(default)]
     pub tests_note: String,
-    /// The review did not finish (the model errored or its output couldn't be
-    /// read), so it must not approve.
-    #[serde(skip)]
-    pub incomplete: bool,
 }
 
 /// The model's judgment of one earlier CoderHelm thread at the new head.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PriorStatus {
     pub index: usize,
-    /// "fixed" | "answered" | "open"
+    /// "fixed" | "answered" | "accepted" | "open"
     #[serde(default)]
     pub status: String,
 }
 
 impl PriorStatus {
-    /// Nothing is left to do on the thread: the code fixed it, or a person's
-    /// reply answered it.
+    /// Nothing is left to do on the thread: the code fixed it, a person's
+    /// reply answered it, or the author accepted or decided on a suggestion.
     pub fn is_settled(&self) -> bool {
-        self.status.eq_ignore_ascii_case("fixed") || self.status.eq_ignore_ascii_case("answered")
+        ["fixed", "answered", "accepted"]
+            .iter()
+            .any(|s| self.status.eq_ignore_ascii_case(s))
     }
 }
 
@@ -271,8 +278,10 @@ pub fn format_prior_threads(prior: &[&BotReviewThread]) -> String {
          replies under it. Report every index in `prior`: \"fixed\" ONLY if you verified the \
          problem is gone at this head; \"answered\" if a person's reply settles it (it gives the \
          fact you asked for, or it points at code at this head that already handles the case and \
-         you read that code and agree); otherwise \"open\". Do NOT repeat an open one as a new \
-         finding; it is still visible.\n",
+         you read that code and agree); \"accepted\" if it was a suggestion or a non-blocking \
+         note and the author accepted it, declined it with a reason, or said it will be done \
+         separately (their call to make); otherwise \"open\". Do NOT repeat an open one as a \
+         new finding; it is still visible.\n",
     );
     for (i, t) in prior.iter().enumerate() {
         s.push_str(&format!("{i}: {}", thread_line(t)));
@@ -356,32 +365,30 @@ impl Finding {
     }
 }
 
-/// The review's verdict.
+/// The verdict of a review that finished. (A review that didn't finish has
+/// no verdict: it is retried, and never posted as a block.)
 ///
-/// `APPROVE` exactly when nothing is left: no finding, no earlier comment
-/// still open, verification passed, the review finished. `REQUEST_CHANGES`
-/// only for something that holds the merge: a verified defect (or a policy
-/// like required tests), an earlier requested change still open, a failed
-/// verification, or a review that didn't finish. Otherwise — only questions
-/// or concerns the reviewer couldn't verify are left — `COMMENT`: said, not
-/// approved, not blocking.
+/// `REQUEST_CHANGES` only for something that holds the merge: a verified
+/// defect (or a policy like required tests), an earlier requested change
+/// still open, or a failed verification. `COMMENT` when a question for a
+/// person is still unanswered, new or from an earlier review. Otherwise
+/// `APPROVE`: notes, suggestions and concerns the reviewer couldn't verify
+/// are posted with the approval, and questions or suggestions the author
+/// answered or accepted are settled, so none of them hold it back.
 pub fn decide_verdict(
     findings: &[Finding],
     prior_open_holding: usize,
-    prior_open_other: usize,
+    prior_open_questions: usize,
     verify_failed: bool,
-    incomplete: bool,
 ) -> &'static str {
-    if incomplete
-        || verify_failed
-        || prior_open_holding > 0
-        || findings.iter().any(Finding::holds_merge)
-    {
+    if verify_failed || prior_open_holding > 0 || findings.iter().any(Finding::holds_merge) {
         "REQUEST_CHANGES"
-    } else if findings.is_empty() && prior_open_other == 0 {
-        "APPROVE"
-    } else {
+    } else if prior_open_questions > 0
+        || findings.iter().any(|f| f.evidence() == Evidence::Question)
+    {
         "COMMENT"
+    } else {
+        "APPROVE"
     }
 }
 
@@ -923,8 +930,10 @@ pub fn format_diff(compare: &serde_json::Value, cap: usize) -> String {
     common::head_tail_str(&diff, cap)
 }
 
-/// Generation pass: agentic, high-recall. Returns the parsed output (fail-closed
-/// to REQUEST_CHANGES/HIGH with the raw text as summary if JSON can't be parsed).
+/// Generation pass: agentic, high-recall. Returns the parsed output, or why
+/// the review didn't finish (the model call failed, or its answer couldn't be
+/// read). A review that didn't finish has no verdict: the caller retries it
+/// and never posts it as a block.
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_review(
     state: &WorkerState,
@@ -946,7 +955,7 @@ pub async fn generate_review(
     skills: Option<&super::skills::TeamSkills>,
     web: Option<&super::web_check::WebCheck>,
     usage: &mut TokenUsage,
-) -> ReviewOutput {
+) -> Result<ReviewOutput, String> {
     let graph_note = if graph.is_some() {
         "\nThis repo has a CODE GRAPH: prefer graph_definition/graph_callers/graph_impact for \
          exact structural lookups (where is X defined, who calls X, what a change reaches); use \
@@ -1011,9 +1020,11 @@ pub async fn generate_review(
          that in-place replacement: the full new text of every anchored line, nothing outside them. A fix that \
          moves code, or changes more than one place, gets NO suggestion; describe it in the body instead.\n\
          Use \"blocking\" ONLY for real bugs/risks that should stop the merge. The PR is approved \
-         when there are no findings and none of your earlier comments is still open, so every \
-         reason to hold the merge MUST be a verified-defect finding: a concern written only in \
-         the summary holds nothing. If you are unsure whether something is a real problem, read more code until you \
+         unless a verified defect, a required test, a failed check or an unanswered question is \
+         left; notes and suggestions are posted with the approval. So every reason to hold the \
+         merge MUST be a verified-defect finding: a concern written only in the summary holds \
+         nothing. Give every remaining item now, in this review: do not hold back non-blocking \
+         notes (wording of the PR description, counts in it) for a later round. If you are unsure whether something is a real problem, read more code until you \
          know.{graph_note}"
     );
     let live_context = format!(
@@ -1090,25 +1101,20 @@ pub async fn generate_review(
     }
 
     match reply {
-        Ok(text) => extract_json(&text).unwrap_or(ReviewOutput {
-            verdict: "REQUEST_CHANGES".to_string(),
-            summary: common::head_tail_str(&text, 4000),
-            findings: vec![],
-            prior: vec![],
-            labels: vec![],
-            tests_note: String::new(),
-            incomplete: true,
-        }),
-        Err(e) => ReviewOutput {
-            verdict: "REQUEST_CHANGES".to_string(),
-            summary: format!("Automated review could not complete ({e}). Requesting a human look."),
-            findings: vec![],
-            prior: vec![],
-            labels: vec![],
-            tests_note: String::new(),
-            incomplete: true,
-        },
+        Ok(text) => parse_review(&text),
+        Err(e) => Err(format!("the model call failed: {e}")),
     }
+}
+
+/// The review in the model's final answer, or why there is none. An answer
+/// without a readable review is a failed review, not a verdict.
+pub fn parse_review(text: &str) -> Result<ReviewOutput, String> {
+    extract_json(text).ok_or_else(|| {
+        format!(
+            "the model's answer had no readable review ({} chars)",
+            text.len()
+        )
+    })
 }
 
 #[derive(Deserialize)]
@@ -1497,6 +1503,127 @@ pub async fn verify_in_sandbox(
     }
 }
 
+/// How a reply's conclusion bears on CoderHelm's formal verdict on the PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictChange {
+    /// The reply doesn't conclude anything about merge readiness.
+    None,
+    /// The reply concludes nothing in the code at this head needs changing.
+    Clear,
+    /// The reply identifies a verified defect that must be fixed first.
+    Block,
+}
+
+/// The model's reading of a reply CoderHelm is about to post.
+#[derive(Debug, Clone)]
+pub struct ReplyConclusion {
+    pub verdict_change: VerdictChange,
+    pub reason: String,
+    /// The reply raises non-blocking items that no earlier CoderHelm reply
+    /// mentioned, after an earlier reply already said the code was fine.
+    pub new_nonblocking_items: bool,
+    /// The reply without those new items (only meaningful when set).
+    pub revised_reply: String,
+}
+
+/// What the reply-conclusion check is told.
+pub const REPLY_CONCLUSION_SYSTEM: &str =
+    "You read a reply CoderHelm, a code reviewer, is about to \
+     post on a pull request, together with its earlier replies on the same PR, and report what the \
+     reply concludes. verdict_change: \"clear\" when the reply concludes that nothing in the code \
+     at the current head needs changing before merge (anything it still lists is non-blocking: \
+     description wording, optional suggestions, items the author accepted, tests the author \
+     reported running); \"block\" when it states a defect in the code at the current head that it \
+     verified and that must be fixed before merge; \"none\" when it only answers a question \
+     without a conclusion about merging. reason: one sentence saying why. \
+     new_nonblocking_items: true only when an earlier CoderHelm reply already said the code looks \
+     fine or ready to merge, and this reply brings up non-blocking items (description wording or \
+     counts, a file the description doesn't mention, style) that no earlier reply mentioned. \
+     revised_reply: when new_nonblocking_items is true, the reply with exactly those new items \
+     removed and nothing else changed; otherwise an empty string.";
+
+/// The JSON schema of the reply-conclusion answer.
+pub fn reply_conclusion_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "verdict_change": {"type": "string", "enum": ["none", "clear", "block"]},
+            "reason": {"type": "string"},
+            "new_nonblocking_items": {"type": "boolean"},
+            "revised_reply": {"type": "string"}
+        },
+        "required": ["verdict_change", "reason", "new_nonblocking_items", "revised_reply"],
+        "additionalProperties": false
+    })
+}
+
+/// The user message for the reply-conclusion check.
+pub fn reply_conclusion_prompt(earlier_replies: &[String], question: &str, reply: &str) -> String {
+    let mut s = String::new();
+    if earlier_replies.is_empty() {
+        s.push_str("## CoderHelm's earlier replies on this PR\n(none)\n");
+    } else {
+        s.push_str("## CoderHelm's earlier replies on this PR (oldest first)\n");
+        for (i, r) in earlier_replies.iter().enumerate() {
+            s.push_str(&format!(
+                "### Reply {}\n{}\n\n",
+                i + 1,
+                common::truncate_str(r.trim(), 3000)
+            ));
+        }
+    }
+    s.push_str(&format!(
+        "\n## What the person asked\n{}\n\n## The reply about to be posted\n{}\n",
+        common::truncate_str(question.trim(), 2000),
+        common::truncate_str(reply.trim(), 8000)
+    ));
+    s
+}
+
+/// The structured answer, read leniently: anything unreadable concludes
+/// nothing (no verdict change, no rewrite).
+pub fn parse_reply_conclusion(v: &serde_json::Value) -> ReplyConclusion {
+    let verdict_change = match v["verdict_change"].as_str().unwrap_or("") {
+        "clear" => VerdictChange::Clear,
+        "block" => VerdictChange::Block,
+        _ => VerdictChange::None,
+    };
+    let revised_reply = v["revised_reply"].as_str().unwrap_or("").trim().to_string();
+    ReplyConclusion {
+        verdict_change,
+        reason: v["reason"].as_str().unwrap_or("").trim().to_string(),
+        new_nonblocking_items: v["new_nonblocking_items"].as_bool().unwrap_or(false)
+            && !revised_reply.is_empty(),
+        revised_reply,
+    }
+}
+
+/// CoderHelm's formal review standing on a PR (its newest review that set a
+/// GitHub review state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandingReview {
+    /// "APPROVE" | "REQUEST_CHANGES"
+    pub verdict: String,
+    /// A review that didn't finish (an old error review).
+    pub failed: bool,
+    pub head_sha: String,
+}
+
+/// Whether a reply's conclusion needs a fresh formal review so the verdict
+/// on GitHub matches what CoderHelm just said: a reply that finds nothing
+/// blocking while a request for changes (or an error review) stands, or a
+/// reply that finds a verified blocker while an approval stands.
+pub fn needs_reconcile(change: VerdictChange, standing: Option<&StandingReview>) -> bool {
+    let Some(st) = standing else {
+        return false;
+    };
+    match change {
+        VerdictChange::Clear => st.failed || st.verdict == "REQUEST_CHANGES",
+        VerdictChange::Block => st.verdict == "APPROVE" && !st.failed,
+        VerdictChange::None => st.failed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1522,6 +1649,16 @@ mod tests {
         let out = extract_json(reply).unwrap();
         assert_eq!(out.verdict, "APPROVE");
         assert_eq!(out.summary, "ok");
+    }
+
+    /// An answer with no readable review is a failed review (retried), never
+    /// a verdict.
+    #[test]
+    fn an_unreadable_answer_is_a_failure_not_a_verdict() {
+        assert!(parse_review("I looked at the diff and it seems fine.").is_err());
+        assert!(parse_review("```json\n{\"verdict\": \"APPROVE\", \"findings\": [ \n```").is_err());
+        let ok = parse_review("```json\n{\"verdict\":\"APPROVE\",\"findings\":[]}\n```").unwrap();
+        assert_eq!(ok.verdict, "APPROVE");
     }
 
     #[test]
@@ -1703,10 +1840,7 @@ mod required_tests_tests {
         assert!(v[0].is_blocking());
         assert!(v[0].holds_merge(), "a kept override is a verified defect");
         assert_eq!(v[1].severity, "medium");
-        assert_eq!(
-            decide_verdict(&v[..1], 0, 0, false, false),
-            "REQUEST_CHANGES"
-        );
+        assert_eq!(decide_verdict(&v[..1], 0, 0, false), "REQUEST_CHANGES");
     }
 
     #[test]

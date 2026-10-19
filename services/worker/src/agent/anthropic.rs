@@ -618,7 +618,7 @@ pub async fn converse_tool_loop(
         };
         apply_model_family(&mut request, effort, true);
 
-        let response = send_with_retry(client, &request, model_id).await?;
+        let response = send_request(client, &request).await?;
 
         // Track usage
         account(client, model_id, &response.usage, usage).await;
@@ -798,23 +798,38 @@ fn truncate_input_summary(input: &Value) -> String {
     summary
 }
 
+/// Sends one Messages request. Transient failures (any 5xx including the
+/// Cloudflare 520-524 errors, 408, 429, 529 overloaded, and requests that got
+/// no response) are retried with backoff by status, not by error text; the
+/// error returned after that is final for this call.
 async fn send_request(
     client: &AnthropicClient,
     request: &MessagesRequest,
 ) -> Result<MessagesResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let resp = client
-        .http
-        .post(ANTHROPIC_API_URL)
-        .header("x-api-key", &client.api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("anthropic-beta", beta_header(request))
-        .json(request)
-        .send()
-        .await?;
+    let reply = common::model_retry::send(
+        || {
+            client
+                .http
+                .post(ANTHROPIC_API_URL)
+                .header("x-api-key", &client.api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("anthropic-beta", beta_header(request))
+                .json(request)
+        },
+        &common::model_retry::WORKER_BACKOFF_SECS,
+        &request.model,
+    )
+    .await?;
+    api_result(reply)
+}
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+/// A final response read as the API's answer or its error.
+fn api_result(
+    reply: common::model_retry::Reply,
+) -> Result<MessagesResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let status = reply.status;
+    if !reply.is_success() {
+        let body = reply.text();
         if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
             return Err(format!(
                 "Anthropic API error {status} ({}): {}",
@@ -824,46 +839,7 @@ async fn send_request(
         }
         return Err(format!("Anthropic API error ({status}): {body}").into());
     }
-
-    Ok(resp.json().await?)
-}
-
-async fn send_with_retry(
-    client: &AnthropicClient,
-    request: &MessagesRequest,
-    model_id: &str,
-) -> Result<MessagesResponse, Box<dyn std::error::Error + Send + Sync>> {
-    for attempt in 0..3u32 {
-        match send_request(client, request).await {
-            Ok(resp) => return Ok(resp),
-            Err(e) => {
-                let err_str = format!("{e}");
-                let transient = err_str.contains("overloaded")
-                    || err_str.contains("rate_limit")
-                    || err_str.contains("529")
-                    || err_str.contains("500")
-                    || err_str.contains("502")
-                    || err_str.contains("503")
-                    || err_str.contains("504")
-                    || err_str.contains("api_error")
-                    || err_str.contains("timed out")
-                    || err_str.contains("connection")
-                    || err_str.contains("error sending request");
-                if attempt < 2 && transient {
-                    let delay_secs = 2u64.pow(attempt + 1);
-                    warn!(
-                        model_id,
-                        attempt = attempt + 1,
-                        "Anthropic transient error, retrying in {delay_secs}s: {err_str}"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                    continue;
-                }
-                return Err(e);
-            }
-        }
-    }
-    unreachable!()
+    Ok(serde_json::from_slice(&reply.body)?)
 }
 
 fn extract_text(

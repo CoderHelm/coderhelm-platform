@@ -1774,6 +1774,31 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// Dismiss a review on a PR (CoderHelm dismisses only its own stale
+    /// "changes requested" reviews). A repo may restrict who can dismiss.
+    pub async fn dismiss_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        review_id: u64,
+        message: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews/{review_id}/dismissals"
+        );
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.put(&url).json(&serde_json::json!({
+            "message": message,
+            "event": "DISMISS",
+        }));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        ok_or_body(req.send().await?).await?;
+        Ok(())
+    }
+
     /// List tags on a repo (used to compute the next semver release tag).
     pub async fn list_tags(
         &self,

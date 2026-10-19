@@ -263,6 +263,21 @@ export class ApiStack extends cdk.Stack {
       ],
     });
 
+    // Stuck-review sweep: every 30 min, re-run the review of open PRs whose
+    // standing CoderHelm review didn't finish (a service error), once per head.
+    new events.Rule(this, "ReviewSweepSchedule", {
+      ruleName: `${prefix}-review-sweep`,
+      description: "Re-run reviews stuck on a review that didn't finish",
+      schedule: events.Schedule.rate(cdk.Duration.minutes(30)),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "review_sweep",
+          }),
+        }),
+      ],
+    });
+
     // Weekly summary email: Mondays 13:00 UTC, one constant message on the
     // ticket queue; the worker sends each team's summary to members who have
     // it on. Ships disabled (see flags.ts) until a test email is approved.

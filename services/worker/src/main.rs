@@ -239,6 +239,19 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Review failed: {e:?}");
             }
         }
+        models::WorkerMessage::ReviewSweep => {
+            info!("Running stuck-review sweep");
+            match passes::review_sweep::run(&state).await {
+                Ok(report) => info!(
+                    repos = report.repos,
+                    open_prs = report.open_prs,
+                    requeued = report.requeued.len(),
+                    prs = ?report.requeued,
+                    "Stuck-review sweep done"
+                ),
+                Err(e) => error!("Stuck-review sweep failed: {e:?}"),
+            }
+        }
         models::WorkerMessage::ReviewReminder => {
             info!("Running review-reminder sweep");
             if let Err(e) = passes::review_reminder::run(&state).await {

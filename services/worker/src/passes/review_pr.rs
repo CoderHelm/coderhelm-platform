@@ -5,7 +5,10 @@
 //! or COMMENT when GitHub forbids a self-review), persists a review record for
 //! the dashboard, and — only when the repo opts in — runs post-approval actions.
 //!
-//! Fail-closed everywhere: any error becomes REQUEST_CHANGES, never an APPROVE.
+//! Never approves on an error. A review that didn't finish (a model API
+//! failure, an unreadable answer, a GitHub error) has no verdict: it is never
+//! posted as a block. It is sent again with a delay, and once every retry has
+//! failed the PR gets a short note while the previous verdict stands.
 //! Auto-merge/tag/deploy + the health guard live in `review_actions` and ship
 //! OFF by default; this pass only ever *reviews* unless a repo turns them on.
 
@@ -186,9 +189,217 @@ latest commit, or **@coderhelm <question>** to ask._";
 /// (a comment id) are unaffected by the length; head-based keys get this window.
 const REVIEW_JOB_DEDUP_TTL_SECS: u64 = 6 * 3600;
 
+/// Waits (seconds) before each retry of a review that didn't finish: 2, 10
+/// and 30 minutes. After the last one fails the PR is told, and the stuck-
+/// review sweep tries the head once more later.
+pub(crate) const REVIEW_RETRY_DELAYS_SECS: [u64; 3] = [120, 600, 1800];
+
+/// The longest delay one SQS message can carry.
+const SQS_MAX_DELAY_SECS: u64 = 900;
+
+/// What to do after a review didn't finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailurePlan {
+    /// Send the job again after this many seconds.
+    Retry { delay_secs: u64 },
+    /// Every retry failed: tell the PR, keep the previous verdict.
+    GiveUp,
+}
+
+/// The plan for a review that failed on run `attempt` (0 = the first run).
+pub(crate) fn failure_plan(attempt: u32) -> FailurePlan {
+    match REVIEW_RETRY_DELAYS_SECS.get(attempt as usize) {
+        Some(&delay_secs) => FailurePlan::Retry { delay_secs },
+        None => FailurePlan::GiveUp,
+    }
+}
+
+/// The job that retries `msg` after `delay_secs`, and the delay of its first
+/// SQS hop (the rest rides in `wait_secs`). A verdict review is pinned to the
+/// head it was reviewing, so a newer commit's own review supersedes it; a
+/// question keeps resolving the latest head. Each retry has its own dedup key.
+pub(crate) fn retry_message(
+    msg: &ReviewMessage,
+    reviewed_head: &str,
+    delay_secs: u64,
+) -> (ReviewMessage, u64) {
+    let mut next = msg.clone();
+    next.attempt = msg.attempt + 1;
+    if next.question.is_none() && !reviewed_head.is_empty() {
+        next.head_sha = reviewed_head.to_string();
+    }
+    // The original trigger's key, without an earlier retry's prefix.
+    let base = match msg.dedup_key.strip_prefix("retry#") {
+        Some(rest) => rest
+            .split_once('#')
+            .map(|(_, k)| k)
+            .unwrap_or(rest)
+            .to_string(),
+        None if msg.dedup_key.is_empty() => format!("head#{reviewed_head}"),
+        None => msg.dedup_key.clone(),
+    };
+    next.dedup_key = format!("retry#{}#{base}", next.attempt);
+    let hop = delay_secs.min(SQS_MAX_DELAY_SECS);
+    next.wait_secs = delay_secs - hop;
+    (next, hop)
+}
+
+/// The note on the PR once every retry failed. It is a plain comment, not a
+/// review: it neither blocks nor clears, and the previous verdict stands.
+pub(crate) fn gave_up_note(msg: &ReviewMessage, head: &str) -> String {
+    let short = &head[..head.len().min(7)];
+    if msg.question.is_some() {
+        "I couldn't answer this because of a service error on my side. Ask again          (mention **@coderhelm**) and I'll pick it up."
+            .to_string()
+    } else if short.is_empty() {
+        "CoderHelm's review didn't finish because of a service error, so there's no new          verdict and the previous one is unchanged. It runs again on the next push, or comment          **@coderhelm re-review** to run it now."
+            .to_string()
+    } else {
+        format!(
+            "CoderHelm's review of `{short}` didn't finish because of a service error, so              there's no new verdict and the previous one is unchanged. It runs again on the next              push, or comment **@coderhelm re-review** to run it now."
+        )
+    }
+}
+
+/// Sends a review job to the worker queue with an SQS delay (at most 900s).
+pub(crate) async fn enqueue_review(
+    state: &WorkerState,
+    msg: &ReviewMessage,
+    delay_secs: u64,
+) -> bool {
+    if state.config.ticket_queue_url.is_empty() {
+        warn!(
+            pr = msg.pr_number,
+            "TICKET_QUEUE_URL not set; can't send a review job"
+        );
+        return false;
+    }
+    match state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(super::review_sweep::review_job_body(msg))
+        .delay_seconds(delay_secs.min(SQS_MAX_DELAY_SECS) as i32)
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %aws_sdk_sqs::error::DisplayErrorContext(&e), "Could not send the review job");
+            false
+        }
+    }
+}
+
+/// Runs one review job. A job that fails is retried or, after the last
+/// retry, reported on the PR; it never posts a verdict for a failure.
 pub async fn run(
     state: &WorkerState,
     msg: ReviewMessage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // A retry that must wait longer than one SQS delay: send it on.
+    if msg.wait_secs > 0 {
+        let mut next = msg.clone();
+        let hop = msg.wait_secs.min(SQS_MAX_DELAY_SECS);
+        next.wait_secs = msg.wait_secs - hop;
+        if !enqueue_review(state, &next, hop).await {
+            return Err("could not send a waiting review retry on".into());
+        }
+        return Ok(());
+    }
+    let mut reviewed_head = msg.head_sha.clone();
+    match run_once(state, msg.clone(), &mut reviewed_head).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            review_failed(state, &msg, &reviewed_head, &e.to_string()).await;
+            Ok(())
+        }
+    }
+}
+
+/// A review didn't finish: log it (for the failed-review metric), then send
+/// it again or, once every retry failed, leave a note on the PR. Never a
+/// REQUEST_CHANGES, and never touches an earlier verdict.
+async fn review_failed(state: &WorkerState, msg: &ReviewMessage, head: &str, reason: &str) {
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    tracing::error!(
+        team_id = %msg.team_id,
+        repo = %repo,
+        pr = msg.pr_number,
+        head = %head,
+        attempt = msg.attempt,
+        trigger = %msg.trigger,
+        reason = %common::truncate_str(reason, 1000),
+        "review_failed: the review didn't finish"
+    );
+    let plan = failure_plan(msg.attempt);
+    if let FailurePlan::Retry { delay_secs } = plan {
+        let (next, hop) = retry_message(msg, head, delay_secs);
+        if enqueue_review(state, &next, hop).await {
+            super::review_sweep::note_failure(state, msg, head, reason, false).await;
+            info!(
+                pr = msg.pr_number,
+                attempt = next.attempt,
+                delay_secs,
+                "Review sent again after a failure"
+            );
+            return;
+        }
+    }
+    tracing::error!(
+        team_id = %msg.team_id,
+        repo = %repo,
+        pr = msg.pr_number,
+        head = %head,
+        attempts = msg.attempt + 1,
+        "review_gave_up: every retry of the review failed"
+    );
+    super::review_sweep::note_failure(state, msg, head, reason, msg.question.is_none()).await;
+    // Tell the PR once per head (or per question).
+    let once = format!(
+        "REVIEWFAILNOTE#{repo}#{:0>6}#{}",
+        msg.pr_number,
+        if msg.question.is_some() {
+            msg.dedup_key.as_str()
+        } else {
+            head
+        }
+    );
+    if !claim_once(state, &msg.team_id, &once).await {
+        return;
+    }
+    let github = match GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "Could not tell the PR the review failed");
+            return;
+        }
+    };
+    let note = gave_up_note(msg, head);
+    let posted = match (msg.question.is_some(), msg.reply_to_comment_id) {
+        (true, Some(cid)) => github
+            .reply_to_review_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, cid, &note)
+            .await
+            .map(|_| ()),
+        _ => github
+            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &note)
+            .await
+            .map(|_| ()),
+    };
+    if let Err(e) = posted {
+        warn!(pr = msg.pr_number, error = %e, "Could not tell the PR the review failed");
+    }
+}
+
+async fn run_once(
+    state: &WorkerState,
+    msg: ReviewMessage,
+    reviewed_head: &mut String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let job_started = chrono::Utc::now().to_rfc3339();
     let cfg = load_config(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
@@ -265,6 +476,7 @@ pub async fn run(
     } else {
         msg.head_sha.clone()
     };
+    *reviewed_head = head_sha.clone();
 
     // A reply asking for a re-review and the author's push of the same commit
     // arrive together and used to give two reviews of one commit, sometimes
@@ -307,12 +519,21 @@ pub async fn run(
         format!("\n\n## Org-wide review standards (apply to every repo)\n{org_instructions}")
     };
 
-    let provider = ModelProvider::load_for_team(
+    // No model key set up is the team's setup, not a service error: there
+    // is nothing to retry.
+    let provider = match ModelProvider::load_for_team(
         &state.dynamo,
         &state.config.settings_table_name,
         &msg.team_id,
     )
-    .await?;
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(team_id = %msg.team_id, pr = msg.pr_number, error = %e, "Review skipped: no usable model provider");
+            return Ok(());
+        }
+    };
     let mut usage = TokenUsage::default();
 
     // ── Reply-with-a-question mode: answer, don't vote. ──
@@ -327,7 +548,12 @@ pub async fn run(
              Answer what was asked and nothing more, in at most five short sentences or bullets, \
              with no headings and no tables. This is a reply, not a review: do not add new \
              concerns or re-raise earlier ones. When the \
-             person confirms a fact or a decision, accept it and say so in one line. {}{}{}{}{}",
+             person confirms a fact or a decision, accept it and say so in one line. \
+             If you say what is left before merge, give every remaining item in this one reply. \
+             Once you or an earlier reply of yours has said the code looks fine, don't bring up \
+             new non-blocking items (description wording or counts, files the description \
+             doesn't mention, style); raise something new only if it is a real defect in the \
+             code. {}{}{}{}{}",
             msg.repo_owner,
             msg.repo_name,
             review_agent::COPY_RULE,
@@ -336,8 +562,32 @@ pub async fn run(
             org_block,
             extra,
         );
+        // What CoderHelm already said on this PR, so the answer builds on it
+        // instead of drip-feeding new items each round.
+        let earlier_replies = match github
+            .list_issue_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+            .await
+        {
+            Ok(c) => own_comments(&c, 3),
+            Err(e) => {
+                warn!(pr = msg.pr_number, error = %e, "Could not list earlier replies");
+                Vec::new()
+            }
+        };
+        let earlier_section = if earlier_replies.is_empty() {
+            String::new()
+        } else {
+            let mut s = String::from("\n\n## Your earlier replies on this PR (oldest first)\n");
+            for r in &earlier_replies {
+                s.push_str(&format!(
+                    "- {}\n",
+                    common::truncate_str(r.trim(), 1500).replace('\n', " ")
+                ));
+            }
+            s
+        };
         let prompt = format!(
-            "PR #{}: {title}\n\n{pr_body}\n\n## Question from a reviewer\n{question}\n\n## Diff (base...head)\n{diff}",
+            "PR #{}: {title}\n\n{pr_body}{earlier_section}\n\n## Question from a reviewer\n{question}\n\n## Diff (base...head)\n{diff}",
             msg.pr_number,
         );
         // The same read-only tools a review has, so an answer rests on the code
@@ -457,10 +707,56 @@ pub async fn run(
             None,
             None,
         )
-        .await
-        .unwrap_or_else(|e| format!("I couldn't answer that automatically ({e})."));
+        .await;
         if let Some(s) = &skills {
             s.drain_usage_into(&mut usage);
+        }
+        // A failed answer is retried (see `run`), never posted as an error.
+        let mut answer = match answer {
+            Ok(a) => a,
+            Err(e) => {
+                record_review_usage(state, &msg.team_id, None, &usage).await;
+                return Err(format!("the model call failed: {e}").into());
+            }
+        };
+        // What the answer concludes, judged by the model: whether CoderHelm's
+        // formal verdict must follow it, and whether it drip-feeds new
+        // non-blocking items after an earlier reply said the code was fine.
+        let conclusion =
+            reply_conclusion(&provider, &earlier_replies, question, &answer, &mut usage).await;
+        if let Some(c) = conclusion.as_ref().filter(|c| c.new_nonblocking_items) {
+            info!(
+                pr = msg.pr_number,
+                "Reply dropped new non-blocking items raised after the code was called fine"
+            );
+            answer = c.revised_reply.clone();
+        }
+        let repo_slug = format!("{}/{}", msg.repo_owner, msg.repo_name);
+        let records =
+            super::review_sweep::review_records(state, &msg.team_id, &repo_slug, msg.pr_number, 10)
+                .await;
+        let standing = super::review_sweep::standing_review(&records);
+        let self_authored = pr_author.contains("coderhelm");
+        let reconcile = !self_authored
+            && conclusion.as_ref().is_some_and(|c| {
+                review_agent::needs_reconcile(c.verdict_change, standing.as_ref())
+            });
+        if reconcile {
+            let c = conclusion.as_ref().expect("checked above");
+            let job = reconcile_message(&msg, &head_sha, &c.reason);
+            if enqueue_review(state, &job, 0).await {
+                info!(
+                    pr = msg.pr_number,
+                    head = %head_sha,
+                    change = ?c.verdict_change,
+                    standing = ?standing,
+                    "Reply conclusion differs from the standing verdict; formal review re-run"
+                );
+                answer.push_str(&format!(
+                    "\n\nI'm re-running the full review on `{}` so the formal verdict matches.",
+                    &head_sha[..head_sha.len().min(7)]
+                ));
+            }
         }
         let consulted = skills
             .as_ref()
@@ -685,7 +981,20 @@ pub async fn run(
     } else {
         ""
     };
-    let prior_context = format!("{prior_context}{label_context}{tests_context}");
+    let reconcile_context = msg
+        .reconcile_note
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| {
+            format!(
+                "\n## Your own reply on this PR concluded\n{}\nThe formal review on the PR \
+                 doesn't match it yet. Check it against the code at this head and give the \
+                 verdict the code supports.\n",
+                common::truncate_str(n.trim(), 1500)
+            )
+        })
+        .unwrap_or_default();
+    let prior_context = format!("{prior_context}{label_context}{tests_context}{reconcile_context}");
 
     // Repository history through the GitHub App: no setup.
     let history = super::github_history::GithubHistory::new(
@@ -766,6 +1075,15 @@ pub async fn run(
         &mut usage,
     )
     .await;
+    // A review that didn't finish has no verdict: the job is retried (see
+    // `run`), and nothing is posted for it. Its tokens still count.
+    let output = match output {
+        Ok(o) => o,
+        Err(reason) => {
+            record_review_usage(state, &msg.team_id, None, &usage).await;
+            return Err(reason.into());
+        }
+    };
     let fixed_threads: Vec<&crate::clients::github::BotReviewThread> =
         settled_prior_threads(&prior_threads, &output.prior);
     let still_open = prior_threads.len() - fixed_threads.len();
@@ -775,6 +1093,15 @@ pub async fn run(
         .iter()
         .filter(|t| !fixed_threads.iter().any(|f| f.id == t.id))
         .filter(|t| review_agent::thread_holds_merge(&t.body))
+        .count();
+    // Open questions nobody answered keep it from approving; an open note or
+    // unverified concern doesn't.
+    let still_open_questions = prior_threads
+        .iter()
+        .filter(|t| !fixed_threads.iter().any(|f| f.id == t.id))
+        .filter(|t| {
+            !review_agent::thread_holds_merge(&t.body) && review_agent::thread_is_question(&t.body)
+        })
         .count();
     // Label picking is live when there's something to pick: existing allowed
     // labels, or an allowed family whose labels may not exist yet.
@@ -918,9 +1245,8 @@ pub async fn run(
     let verdict: &'static str = review_agent::decide_verdict(
         &findings,
         still_open_holding,
-        still_open - still_open_holding,
+        still_open_questions,
         verify_failed,
-        output.incomplete,
     );
     // Computed, explainable risk (blast-radius-weighted) — overrides the model's
     // guess and drives the displayed level.
@@ -938,6 +1264,7 @@ pub async fn run(
     let self_authored = pr_author.contains("coderhelm");
     let effective_event = if self_authored { "COMMENT" } else { verdict };
     let verdict_line = match verdict {
+        "APPROVE" if !findings.is_empty() => "✅ **Approved**, with a few notes that don't block",
         "APPROVE" => "✅ **Approved**",
         "COMMENT" => "💬 **Questions, nothing blocking**",
         _ => "🔴 **Changes requested**",
@@ -1045,7 +1372,11 @@ pub async fn run(
     // button) always speaks, even if the verdict is unchanged — the person asked to
     // see it. Only webhook-driven re-reviews (a self-fix commit, a re-label) get
     // silenced when the verdict didn't change.
-    let explicit = msg.question.is_some() || msg.trigger == "reply" || msg.trigger == "rerequest";
+    let explicit = msg.question.is_some()
+        || matches!(
+            msg.trigger.as_str(),
+            "reply" | "rerequest" | "sweep" | "reconcile"
+        );
     // News = the verdict changed, OR there are new findings, OR earlier comments
     // got fixed. A same-verdict re-review that fixed one of three issues (and
     // found nothing new) used to be silently dropped here.
@@ -1096,6 +1427,13 @@ pub async fn run(
                     &body_only,
                 )
                 .await?;
+        }
+        // A COMMENT review doesn't change CoderHelm's review state on GitHub,
+        // so an earlier "changes requested" (a real one now settled, or an
+        // old error review) would keep holding the PR. This review found
+        // nothing that holds the merge: dismiss it.
+        if effective_event == "COMMENT" && !self_authored {
+            dismiss_stale_change_requests(&github, &msg, &head_sha).await;
         }
         // Resolve the earlier threads this head fixed (after the review is up, so
         // the "N fixed" note is visible when they collapse).
@@ -1332,7 +1670,12 @@ async fn claim_once(state: &WorkerState, team_id: &str, sk: &str) -> bool {
 /// `claim_once` with a caller-chosen TTL. Short TTLs suit dedup markers that
 /// should self-heal (a failed review can be re-driven once the marker expires);
 /// long TTLs suit one-shot handoffs. Fails OPEN on a transient error.
-async fn claim_once_ttl(state: &WorkerState, team_id: &str, sk: &str, ttl_secs: u64) -> bool {
+pub(crate) async fn claim_once_ttl(
+    state: &WorkerState,
+    team_id: &str,
+    sk: &str,
+    ttl_secs: u64,
+) -> bool {
     let ttl = chrono::Utc::now().timestamp() as u64 + ttl_secs;
     match state
         .dynamo
@@ -1351,6 +1694,58 @@ async fn claim_once_ttl(state: &WorkerState, team_id: &str, sk: &str, ttl_secs: 
             .map(|se| se.is_conditional_check_failed_exception())
             .unwrap_or(false),
     }
+}
+
+/// Dismisses CoderHelm's own "changes requested" reviews on the PR, after a
+/// finished review of `head` found nothing that holds the merge. Best-effort:
+/// a repo can restrict who dismisses reviews, so a failure is logged.
+async fn dismiss_stale_change_requests(github: &GitHubClient, msg: &ReviewMessage, head: &str) {
+    let reviews = match github
+        .list_pr_reviews(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "Could not list reviews to dismiss a stale request for changes");
+            return;
+        }
+    };
+    let short = &head[..head.len().min(7)];
+    for id in own_change_requests(&reviews) {
+        let note =
+            format!("Superseded by CoderHelm's review of `{short}`: nothing left holds the merge.");
+        match github
+            .dismiss_review(&msg.repo_owner, &msg.repo_name, msg.pr_number, id, &note)
+            .await
+        {
+            Ok(()) => info!(
+                pr = msg.pr_number,
+                review_id = id,
+                "Dismissed a stale request for changes"
+            ),
+            Err(e) => {
+                warn!(pr = msg.pr_number, review_id = id, error = %e, "Could not dismiss a stale request for changes")
+            }
+        }
+    }
+}
+
+/// Ids of CoderHelm's own reviews still in the "changes requested" state.
+fn own_change_requests(reviews: &serde_json::Value) -> Vec<u64> {
+    reviews
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter(|r| r["state"].as_str() == Some("CHANGES_REQUESTED"))
+        .filter(|r| {
+            r["user"]["type"].as_str() == Some("Bot")
+                && r["user"]["login"]
+                    .as_str()
+                    .is_some_and(|l| l.contains("coderhelm"))
+        })
+        .filter_map(|r| r["id"].as_u64())
+        .collect()
 }
 
 /// Route a self-review's requested changes into the originating run's feedback
@@ -1564,6 +1959,13 @@ async fn last_review(state: &WorkerState, msg: &ReviewMessage) -> Option<LastRev
     };
     resp.items().iter().find_map(|i| {
         let verdict = get(i, "verdict");
+        // An old error review is not a verdict on the code.
+        if get(i, "body")
+            .trim_start()
+            .starts_with(super::review_sweep::LEGACY_FAILED_PREFIX)
+        {
+            return None;
+        }
         (verdict == "APPROVE" || verdict == "REQUEST_CHANGES").then(|| LastReview {
             verdict,
             head_sha: get(i, "head_sha"),
@@ -1755,6 +2157,69 @@ async fn record_review_usage(
             .await
         {
             warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Failed to add review cost to team usage (non-fatal)");
+        }
+    }
+}
+
+/// The last `max` conversation comments CoderHelm wrote, oldest first.
+pub(crate) fn own_comments(comments: &[serde_json::Value], max: usize) -> Vec<String> {
+    let own: Vec<String> = comments
+        .iter()
+        .filter(|c| {
+            c["user"]["type"].as_str() == Some("Bot")
+                && c["user"]["login"]
+                    .as_str()
+                    .is_some_and(|l| l.contains("coderhelm"))
+        })
+        .filter_map(|c| c["body"].as_str().map(|b| b.trim().to_string()))
+        .filter(|b| !b.is_empty())
+        .collect();
+    let skip = own.len().saturating_sub(max);
+    own.into_iter().skip(skip).collect()
+}
+
+/// The job that re-runs the formal review of `head` after a reply concluded
+/// something the standing verdict doesn't match.
+pub(crate) fn reconcile_message(msg: &ReviewMessage, head: &str, reason: &str) -> ReviewMessage {
+    let mut job = msg.clone();
+    job.question = None;
+    job.reply_to_comment_id = None;
+    job.head_sha = head.to_string();
+    job.trigger = "reconcile".to_string();
+    job.dedup_key = format!("reconcile#{head}#{}", msg.dedup_key);
+    job.attempt = 0;
+    job.wait_secs = 0;
+    job.reconcile_note = Some(reason.to_string());
+    job
+}
+
+/// The model's reading of a reply about to be posted (see
+/// [`review_agent::ReplyConclusion`]). None when the check itself failed:
+/// the reply is posted as written and the verdict left as it is.
+async fn reply_conclusion(
+    provider: &ModelProvider,
+    earlier_replies: &[String],
+    question: &str,
+    answer: &str,
+    usage: &mut TokenUsage,
+) -> Option<review_agent::ReplyConclusion> {
+    match crate::agent::anthropic::converse_json(
+        &provider.client(),
+        provider.primary_model_id(),
+        review_agent::REPLY_CONCLUSION_SYSTEM,
+        &review_agent::reply_conclusion_prompt(earlier_replies, question, answer),
+        &review_agent::reply_conclusion_schema(),
+        true,
+        "low",
+        4096,
+        usage,
+    )
+    .await
+    {
+        Ok(v) => Some(review_agent::parse_reply_conclusion(&v)),
+        Err(e) => {
+            warn!(error = %e, "Could not check the reply's conclusion");
+            None
         }
     }
 }
@@ -2070,6 +2535,9 @@ mod superseded_tests {
             trigger: "synchronize".into(),
             dedup_key: String::new(),
             reply_to_comment_id: None,
+            attempt: 0,
+            wait_secs: 0,
+            reconcile_note: None,
         }
     }
 
@@ -2142,21 +2610,16 @@ mod verdict_tests {
 
     #[test]
     fn approves_only_with_nothing_left_to_change() {
-        assert_eq!(decide_verdict(&[], 0, 0, false, false), "APPROVE");
+        assert_eq!(decide_verdict(&[], 0, 0, false), "APPROVE");
         // A low + a nit, both shown in the code
         let defects = [
             finding("bug", Some("verified-defect"), "off by one"),
             finding("convention", None, "nit"),
         ];
-        assert_eq!(
-            decide_verdict(&defects, 0, 0, false, false),
-            "REQUEST_CHANGES"
-        );
+        assert_eq!(decide_verdict(&defects, 0, 0, false), "REQUEST_CHANGES");
         // an earlier requested change still open
-        assert_eq!(decide_verdict(&[], 1, 0, false, false), "REQUEST_CHANGES");
-        assert_eq!(decide_verdict(&[], 0, 0, true, false), "REQUEST_CHANGES");
-        // the review errored or its output couldn't be read
-        assert_eq!(decide_verdict(&[], 0, 0, false, true), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[], 1, 0, false), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[], 0, 0, true), "REQUEST_CHANGES");
     }
 
     /// The case that held a PR for three pushes: six 301 targets changed in a
@@ -2169,12 +2632,15 @@ mod verdict_tests {
         for f in [
             finding("question", None, ask),
             finding("question", Some("verified-defect"), ask),
-            finding("correctness", Some("unverified-concern"), ask),
             finding("correctness", Some("question"), ask),
         ] {
             assert!(!f.holds_merge(), "{:?}", f.evidence);
-            assert_eq!(decide_verdict(&[f], 0, 0, false, false), "COMMENT");
+            assert_eq!(decide_verdict(&[f], 0, 0, false), "COMMENT");
         }
+        // A concern the reviewer couldn't verify is said with the approval.
+        let concern = finding("correctness", Some("unverified-concern"), ask);
+        assert!(!concern.holds_merge());
+        assert_eq!(decide_verdict(&[concern], 0, 0, false), "APPROVE");
         // Its open thread from the earlier push doesn't hold the next one.
         let old_thread = "💬 **Confirm redirect targets** (question)\n\nPlease confirm …";
         assert!(!thread_holds_merge(old_thread));
@@ -2184,7 +2650,61 @@ mod verdict_tests {
         assert!(thread_holds_merge(
             "🔴 **Wrong target** (bug)\n\n/docs → 404"
         ));
-        assert_eq!(decide_verdict(&[], 0, 1, false, false), "COMMENT");
+        assert_eq!(decide_verdict(&[], 0, 1, false), "COMMENT");
+    }
+
+    /// Questions and suggestions the author answered or accepted are settled,
+    /// and non-blocking notes (a line count in the description) ride along
+    /// with the approval: only verified defects, required tests, failed
+    /// checks and unanswered questions hold it back.
+    #[test]
+    fn answered_or_accepted_items_and_notes_do_not_block_approval() {
+        use super::review_agent::{thread_is_question, PriorStatus};
+        for status in ["fixed", "answered", "accepted", "ACCEPTED"] {
+            let p = PriorStatus {
+                index: 0,
+                status: status.into(),
+            };
+            assert!(p.is_settled(), "{status}");
+        }
+        assert!(!PriorStatus {
+            index: 0,
+            status: "open".into()
+        }
+        .is_settled());
+        // Every earlier thread settled, a description nit left: approve.
+        let nit = Finding {
+            severity: "nit".into(),
+            category: "convention".into(),
+            evidence: Some("unverified-concern".into()),
+            title: "Description says +39 lines, diff shows +41".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_verdict(std::slice::from_ref(&nit), 0, 0, false),
+            "APPROVE"
+        );
+        // An open question nobody answered still keeps it a comment.
+        let q = "💬 **Which pods ship?** (question)\n\nbody";
+        assert!(thread_is_question(q));
+        assert!(!thread_is_question(
+            "💬 **X** (correctness, not verified)\n\nbody"
+        ));
+        assert_eq!(
+            decide_verdict(std::slice::from_ref(&nit), 0, 1, false),
+            "COMMENT"
+        );
+        // A required test or a failed check still blocks.
+        let mut tests = Finding {
+            category: "tests".into(),
+            ..Default::default()
+        };
+        super::review_agent::enforce_required_tests(std::slice::from_mut(&mut tests));
+        assert_eq!(
+            decide_verdict(&[nit, tests], 0, 0, false),
+            "REQUEST_CHANGES"
+        );
+        assert_eq!(decide_verdict(&[], 0, 0, true), "REQUEST_CHANGES");
     }
 
     /// check_url ran: all six targets returned 200 → nothing to ask, the
@@ -2201,7 +2721,7 @@ mod verdict_tests {
             let c = check(u, &gate, &fake).await.unwrap();
             assert_eq!(c.status(), Some(200), "{u}");
         }
-        assert_eq!(decide_verdict(&[], 0, 0, false, false), "APPROVE");
+        assert_eq!(decide_verdict(&[], 0, 0, false), "APPROVE");
     }
 
     /// check_url ran and a target is a 404: that is a verified defect with
@@ -2224,7 +2744,7 @@ mod verdict_tests {
         );
         assert!(f.holds_merge());
         assert!(f.body.contains("404"));
-        assert_eq!(decide_verdict(&[f], 0, 0, false, false), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[f], 0, 0, false), "REQUEST_CHANGES");
     }
 
     mod fixture {
@@ -2283,5 +2803,165 @@ mod head_author_tests {
             &json!({"commits": [{"sha": "c", "author": null}]}),
             "c"
         ));
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use review_agent::{needs_reconcile, parse_reply_conclusion, StandingReview, VerdictChange};
+
+    fn msg() -> ReviewMessage {
+        ReviewMessage {
+            team_id: "T".into(),
+            installation_id: 1,
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            head_sha: "a1b2c3d4".into(),
+            label: "ch-review".into(),
+            question: None,
+            trigger: "synchronize".into(),
+            dedup_key: "head#a1b2c3d4".into(),
+            reply_to_comment_id: None,
+            attempt: 0,
+            wait_secs: 0,
+            reconcile_note: None,
+        }
+    }
+
+    /// A review that fails (a 520 that outlasted the client's retries, an
+    /// unreadable answer) is sent again at 2, 10 and 30 minutes, then the
+    /// PR is told. Nothing on this path is a verdict.
+    #[test]
+    fn a_failed_review_is_requeued_then_reported_never_blocking() {
+        let mut m = msg();
+        let mut delays = vec![];
+        while let FailurePlan::Retry { delay_secs } = failure_plan(m.attempt) {
+            let (next, hop) = retry_message(&m, "a1b2c3d4", delay_secs);
+            assert!(hop <= SQS_MAX_DELAY_SECS);
+            assert_eq!(hop + next.wait_secs, delay_secs);
+            assert_eq!(next.head_sha, "a1b2c3d4", "pinned to the reviewed head");
+            assert_eq!(next.attempt, m.attempt + 1);
+            assert_eq!(
+                next.dedup_key,
+                format!("retry#{}#head#a1b2c3d4", next.attempt)
+            );
+            assert!(next.question.is_none());
+            delays.push(delay_secs);
+            m = next;
+        }
+        assert_eq!(failure_plan(m.attempt), FailurePlan::GiveUp);
+        assert_eq!(delays, vec![120, 600, 1800]);
+        assert_eq!(m.attempt, 3);
+        // The final word is a plain comment that keeps the previous verdict
+        // and says how to run it again.
+        let note = gave_up_note(&m, "a1b2c3d4");
+        assert!(note.contains("`a1b2c3d`"));
+        assert!(note.contains("service error"));
+        assert!(note.contains("@coderhelm re-review"));
+        assert!(note.contains("previous one is unchanged"));
+        assert!(!note.contains("Requesting"));
+        // A failed question keeps resolving the latest head.
+        let mut q = msg();
+        q.head_sha.clear();
+        q.question = Some("why?".into());
+        q.dedup_key = "reply#9".into();
+        let (next, _) = retry_message(&q, "a1b2c3d4", 120);
+        assert!(next.head_sha.is_empty());
+        assert_eq!(next.dedup_key, "retry#1#reply#9");
+        assert!(gave_up_note(&q, "").contains("Ask again"));
+    }
+
+    /// The incident: the reply says nothing in the diff needs changing while
+    /// CoderHelm's error review still requests changes → a fresh formal
+    /// review of the current head.
+    #[test]
+    fn a_nothing_blocking_reply_over_an_error_review_reruns_the_formal_review() {
+        let answer = serde_json::json!({
+            "verdict_change": "clear",
+            "reason": "The cold-start fix is in place; nothing in the diff needs changing.",
+            "new_nonblocking_items": false,
+            "revised_reply": ""
+        });
+        let c = parse_reply_conclusion(&answer);
+        assert_eq!(c.verdict_change, VerdictChange::Clear);
+        let error_review = StandingReview {
+            verdict: "REQUEST_CHANGES".into(),
+            failed: true,
+            head_sha: "a1b2c3d4".into(),
+        };
+        assert!(needs_reconcile(c.verdict_change, Some(&error_review)));
+        let real = StandingReview {
+            failed: false,
+            ..error_review.clone()
+        };
+        assert!(needs_reconcile(VerdictChange::Clear, Some(&real)));
+        let approved = StandingReview {
+            verdict: "APPROVE".into(),
+            failed: false,
+            head_sha: "a1b2c3d4".into(),
+        };
+        assert!(!needs_reconcile(VerdictChange::Clear, Some(&approved)));
+        assert!(needs_reconcile(VerdictChange::Block, Some(&approved)));
+        assert!(!needs_reconcile(VerdictChange::Block, Some(&real)));
+        assert!(!needs_reconcile(VerdictChange::None, Some(&real)));
+        assert!(!needs_reconcile(VerdictChange::Clear, None));
+
+        let mut q = msg();
+        q.question = Some("is this fine to merge?".into());
+        q.reply_to_comment_id = Some(9);
+        q.dedup_key = "reply#9".into();
+        let job = reconcile_message(&q, "a1b2c3d4", &c.reason);
+        assert!(job.question.is_none() && job.reply_to_comment_id.is_none());
+        assert_eq!(job.trigger, "reconcile");
+        assert_eq!(job.head_sha, "a1b2c3d4");
+        assert_eq!(job.dedup_key, "reconcile#a1b2c3d4#reply#9");
+        assert_eq!(job.reconcile_note.as_deref(), Some(c.reason.as_str()));
+    }
+
+    #[test]
+    fn a_reply_that_drip_feeds_new_nits_is_replaced_by_its_revision() {
+        let c = parse_reply_conclusion(&serde_json::json!({
+            "verdict_change": "clear",
+            "reason": "r",
+            "new_nonblocking_items": true,
+            "revised_reply": "Looks fine to merge."
+        }));
+        assert!(c.new_nonblocking_items);
+        assert_eq!(c.revised_reply, "Looks fine to merge.");
+        // Flagged without a revision: nothing to post instead, keep it.
+        let c = parse_reply_conclusion(&serde_json::json!({
+            "verdict_change": "none", "reason": "", "new_nonblocking_items": true, "revised_reply": " "
+        }));
+        assert!(!c.new_nonblocking_items);
+        assert_eq!(
+            parse_reply_conclusion(&serde_json::json!({})).verdict_change,
+            VerdictChange::None
+        );
+    }
+
+    #[test]
+    fn only_coderhelms_own_change_requests_are_dismissed() {
+        let reviews = serde_json::json!([
+            {"id": 1, "state": "CHANGES_REQUESTED", "user": {"login": "coderhelm[bot]", "type": "Bot"}},
+            {"id": 2, "state": "APPROVED", "user": {"login": "coderhelm[bot]", "type": "Bot"}},
+            {"id": 3, "state": "CHANGES_REQUESTED", "user": {"login": "dev", "type": "User"}},
+            {"id": 4, "state": "CHANGES_REQUESTED", "user": {"login": "other[bot]", "type": "Bot"}},
+            {"id": 5, "state": "DISMISSED", "user": {"login": "coderhelm[bot]", "type": "Bot"}}
+        ]);
+        assert_eq!(own_change_requests(&reviews), vec![1]);
+    }
+
+    #[test]
+    fn earlier_replies_are_coderhelms_latest_comments() {
+        let c = |login: &str, kind: &str, body: &str| serde_json::json!({"user": {"login": login, "type": kind}, "body": body});
+        let comments = vec![
+            c("coderhelm[bot]", "Bot", "first"),
+            c("dev", "User", "question"),
+            c("coderhelm[bot]", "Bot", "second"),
+            c("coderhelm[bot]", "Bot", "third"),
+        ];
+        assert_eq!(own_comments(&comments, 2), vec!["second", "third"]);
     }
 }

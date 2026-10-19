@@ -162,5 +162,44 @@ class UsageAccounting(unittest.TestCase):
         self.u.record_usage(Broken(), "t", "team1", "log_analysis", "claude-sonnet-5-5", {"input_tokens": 1})
 
 
+class ModelRetryTest(unittest.TestCase):
+    """Transient failures are retried by status; others fail at once."""
+
+    def _opener(self, codes):
+        import io
+        from urllib.error import HTTPError
+
+        calls = []
+
+        def opener(req, timeout=None):
+            code = codes[min(len(calls), len(codes) - 1)]
+            calls.append(code)
+            if code != 200:
+                raise HTTPError("u", code, "x", {}, io.BytesIO(b"error code: 520"))
+            return io.BytesIO(b'{"ok": true}')
+
+        return opener, calls
+
+    def test_a_520_is_retried(self):
+        opener, calls = self._opener([520, 529, 200])
+        body = h.send_with_retry(object(), backoff=(0, 0, 0), sleep=lambda s: None, opener=opener)
+        self.assertEqual(body, b'{"ok": true}')
+        self.assertEqual(calls, [520, 529, 200])
+
+    def test_a_client_error_is_not_retried(self):
+        from urllib.error import HTTPError
+
+        opener, calls = self._opener([400, 200])
+        with self.assertRaises(HTTPError):
+            h.send_with_retry(object(), backoff=(0, 0), sleep=lambda s: None, opener=opener)
+        self.assertEqual(calls, [400])
+
+    def test_statuses(self):
+        for c in (408, 429, 500, 502, 503, 504, 520, 524, 529):
+            self.assertTrue(h.is_transient_status(c), c)
+        for c in (200, 400, 401, 404, 413):
+            self.assertFalse(h.is_transient_status(c), c)
+
+
 if __name__ == "__main__":
     unittest.main()

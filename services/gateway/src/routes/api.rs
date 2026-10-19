@@ -3883,20 +3883,33 @@ pub async fn update_model_provider(
     // Validate the key (and its access to the chosen model) via the Models API
     // — no generation, so it works the same for thinking and non-thinking models.
     let client = reqwest::Client::new();
-    let test_resp = client
-        .get(format!(
-            "https://api.anthropic.com/v1/models/{primary_model}"
-        ))
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Anthropic validation request failed: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // A transient failure (5xx, 408, 429, 529) is retried and, if it lasts,
+    // reported as the service being unavailable, not as a bad key.
+    let models_url = format!("https://api.anthropic.com/v1/models/{primary_model}");
+    let test_resp = common::model_retry::send(
+        || {
+            client
+                .get(&models_url)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+        },
+        &common::model_retry::INTERACTIVE_BACKOFF_SECS,
+        "validate_key",
+    )
+    .await
+    .map_err(|e| {
+        error!("Anthropic validation request failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    if !test_resp.status().is_success() {
+    if common::model_retry::is_transient_status(test_resp.status) {
+        error!(
+            status = test_resp.status,
+            "Anthropic unavailable while validating a key"
+        );
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    if !test_resp.is_success() {
         return Ok(Json(json!({ "error": "Invalid API key" })));
     }
 

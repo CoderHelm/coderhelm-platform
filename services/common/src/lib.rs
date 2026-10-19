@@ -20,6 +20,8 @@ pub mod live;
 /// Sealed credentials for a team's MCP servers (KMS, bound to team and server).
 pub mod mcp_credentials;
 pub mod memory_meta;
+/// Retrying model API calls on transient failures, classified by status.
+pub mod model_retry;
 /// Paginated DynamoDB lookups (follow LastEvaluatedKey to a match).
 pub mod paged;
 /// What happened to a PR Coderhelm opened, read from GitHub.

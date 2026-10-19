@@ -5,6 +5,7 @@ import * as actions from "aws-cdk-lib/aws-cloudwatch-actions";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as sqs from "aws-cdk-lib/aws-sqs";
+import * as logs from "aws-cdk-lib/aws-logs";
 import { Construct } from "constructs";
 
 interface MonitoringStackProps extends cdk.StackProps {
@@ -65,6 +66,39 @@ export class MonitoringStack extends cdk.Stack {
     });
     dlqAlarm.addAlarmAction(new actions.SnsAction(alertTopic));
 
+    // Reviews that didn't finish (a model or GitHub service error). Every
+    // failed attempt is counted; an alarm fires when every retry of one failed
+    // and the PR was told (the stuck-review sweep tries it once more later).
+    const workerLogs = logs.LogGroup.fromLogGroupName(
+      this,
+      "WorkerLogs",
+      `/aws/lambda/${prefix}-worker`
+    );
+    const reviewFailedMetric = new logs.MetricFilter(this, "ReviewFailedFilter", {
+      logGroup: workerLogs,
+      filterPattern: logs.FilterPattern.literal('"review_failed"'),
+      metricNamespace: "CoderHelm/Reviewer",
+      metricName: "ReviewFailed",
+      metricValue: "1",
+    }).metric({ period: cdk.Duration.minutes(15), statistic: "Sum" });
+    const reviewGaveUpMetric = new logs.MetricFilter(this, "ReviewGaveUpFilter", {
+      logGroup: workerLogs,
+      filterPattern: logs.FilterPattern.literal('"review_gave_up"'),
+      metricNamespace: "CoderHelm/Reviewer",
+      metricName: "ReviewGaveUp",
+      metricValue: "1",
+    }).metric({ period: cdk.Duration.minutes(15), statistic: "Sum" });
+    const reviewGaveUpAlarm = new cloudwatch.Alarm(this, "ReviewGaveUpAlarm", {
+      alarmName: `${prefix}-review-gave-up`,
+      alarmDescription: "A PR review failed on every retry (service errors)",
+      metric: reviewGaveUpMetric,
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    reviewGaveUpAlarm.addAlarmAction(new actions.SnsAction(alertTopic));
+
     // Dashboard
     const dashboard = new cloudwatch.Dashboard(this, "Dashboard", {
       dashboardName: prefix,
@@ -95,6 +129,11 @@ export class MonitoringStack extends cdk.Stack {
       new cloudwatch.GraphWidget({
         title: "Worker Duration",
         left: [props.workerFunction.metricDuration()],
+        width: 12,
+      }),
+      new cloudwatch.GraphWidget({
+        title: "Reviews that didn't finish",
+        left: [reviewFailedMetric, reviewGaveUpMetric],
         width: 12,
       })
     );
