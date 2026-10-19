@@ -69,8 +69,8 @@ futures = "0.3"
 tokio-stream = "0.1"
 
 # MenteDB (agent memory browsing)
-mentedb = "=0.40.0"
-mentedb-core = "=0.40.0"
+mentedb = "=0.41.0"
+mentedb-core = "=0.41.0"
 flate2 = "1"
 tar = "0.4"
 

@@ -44,9 +44,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Agent memory
-mentedb = "=0.40.0"
-mentedb-core = "=0.40.0"
-mentedb-embedding = "=0.40.0"
+mentedb = "=0.41.0"
+mentedb-core = "=0.41.0"
+mentedb-embedding = "=0.41.0"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
 # e2e: GitHub Actions artifacts are zip files

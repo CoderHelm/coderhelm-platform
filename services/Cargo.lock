@@ -2592,9 +2592,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mentedb"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4289c61e8197a86ab126b372bc0d2dc4e454278bd88c9a36d880728817ebaadd"
+checksum = "fe320eca4387170651c88949af7ac779304c0edb5d4653fdf12c27a8b18dbd94"
 dependencies = [
  "crc32fast",
  "mentedb-cognitive",
@@ -2616,9 +2616,9 @@ dependencies = [
 
 [[package]]
 name = "mentedb-cognitive"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f0cdd705346af1bf6f1ce6c71e2795dea5f9d19cd8acdaee08c5211d251e579"
+checksum = "59d13c36d62a1deb505f6b4d5ae9cdffbbb833b06ad5d620882bca1b2f8c6013"
 dependencies = [
  "ahash",
  "crossbeam",
@@ -2633,9 +2633,9 @@ dependencies = [
 
 [[package]]
 name = "mentedb-consolidation"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06b6b100e728ee0206ab17a063a11fe766b2e8093f5a2c744e0b89c69ec10249"
+checksum = "28be87f9dc3c74fa4669a8a8c8952d16f82aedae5f4b648117d7509f7b0a3233"
 dependencies = [
  "ahash",
  "mentedb-core",
@@ -2646,9 +2646,9 @@ dependencies = [
 
 [[package]]
 name = "mentedb-context"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffd44fe7f7fb1e4a555b9d63392e320f2af6e48b0494426e88b77e09f817bcc1"
+checksum = "0390fa678d221e4b431fe39ec6880a24c222b755049fbedccfc48bd8d5aad1ca"
 dependencies = [
  "ahash",
  "mentedb-core",
@@ -2660,9 +2660,9 @@ dependencies = [
 
 [[package]]
 name = "mentedb-core"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "721bbb64e2d2d8fda4110143cf461ba74201762983be1ef1343acc3aebe8e0d5"
+checksum = "a0541e83d76a45566628ac2bcc380e6a4e3309723434db2c7532cce394212a85"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -2677,9 +2677,9 @@ dependencies = [
 
 [[package]]
 name = "mentedb-embedding"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1bd14b67d19270fa408ea4961929006f3037296b6f45d15f098fc002d5f5970"
+checksum = "b7f5e45c36159e62cf3fa2e44cd747e9e5d4f04f4dd9276719bc4ceb49c7c8c0"
 dependencies = [
  "mentedb-core",
  "serde",
@@ -2691,9 +2691,9 @@ dependencies = [
 
 [[package]]
 name = "mentedb-graph"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3be3492a0e330841acee3eecc5e5ecd365b803882da05d2b626e3e4f4bb2e3ee"
+checksum = "b9da4f3af1411ba55b4e154b352525ced1f76f7824fba459e575d1f56ed12861"
 dependencies = [
  "ahash",
  "bincode",
@@ -2708,9 +2708,9 @@ dependencies = [
 
 [[package]]
 name = "mentedb-index"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e292ae9e3da9d0b7126a2b86f1c3ec543d5d936ad69fd97c59f380a5afcee5d5"
+checksum = "18d07f344073789aec7ea87425d266284d6247176938c44b7094864d62514f2a"
 dependencies = [
  "ahash",
  "bincode",
@@ -2727,9 +2727,9 @@ dependencies = [
 
 [[package]]
 name = "mentedb-query"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6227892bef57c533beee05dd3c5fa96c4007dea1908f757c69967bd7f4b5d0ce"
+checksum = "f168e117e6bf0ff36de75cd8bffd626ccf1c54626dd27688aaa32a7c4efcc75f"
 dependencies = [
  "mentedb-core",
  "serde",
@@ -2740,9 +2740,9 @@ dependencies = [
 
 [[package]]
 name = "mentedb-storage"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39d4ed669e95aaaa6d579f269db708bc8717dd6f8e24a619924b50eb18246583"
+checksum = "c1035c7a2396e4a8c0e36860ca6276e9196ca25c864bf01876012d76dc548b4c"
 dependencies = [
  "ahash",
  "bincode",
