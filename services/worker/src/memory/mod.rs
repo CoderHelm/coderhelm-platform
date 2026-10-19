@@ -16,6 +16,9 @@ use self::embedder::embed_async;
 /// Most pinned memories handed to an agent on one ticket.
 const MAX_PINNED: usize = 10;
 
+/// Fused-score relevance floor for recalled learnings; see `recall_context`.
+const MIN_RELEVANCE: f32 = 0.02;
+
 pub struct AgentMemory {
     db: MenteDb,
     bedrock: aws_sdk_bedrockruntime::Client,
@@ -28,6 +31,53 @@ pub struct AgentMemory {
     /// Ids of the memories the last recall handed to an agent, pinned ones
     /// included, so the run can count their use.
     pub last_recalled: Vec<String>,
+}
+
+/// Open a repo's memory directory with the engine settings the worker uses.
+///
+/// Engine calibration stays off. On open it embeds a built-in probe set
+/// through the synchronous `EmbeddingProvider::embed`, which for Bedrock means
+/// `block_on` inside the worker's async runtime: a panic, which aborts the
+/// whole Lambda under the release profile's `panic = "abort"`. It also
+/// costs about forty Titan calls on every run whose snapshot lacks the cached
+/// result. Its only
+/// effect would be to lower the write-time duplicate threshold from 0.97 to
+/// the measured paraphrase band of the embedder, and that is the change we do
+/// not want: the engine's write-time duplicate check has no value-update
+/// guard, so a correction that swaps one word in a long learning (token
+/// overlap >= 0.85) would be skipped as a duplicate and the stale fact kept.
+/// With 0.97 only near-verbatim restatements are skipped, as before.
+/// Supersession of value updates does not depend on calibration: the engine
+/// default floor (0.3) was set from Titan and Cohere measurements.
+fn open_db(
+    dir: &std::path::Path,
+    embedder: Box<dyn mentedb_embedding::EmbeddingProvider>,
+) -> mentedb_core::error::MenteResult<MenteDb> {
+    let config = mentedb::CognitiveConfig {
+        calibration_enabled: false,
+        ..Default::default()
+    };
+    MenteDb::open_with_embedder_and_config(dir, embedder, config)
+}
+
+/// Pinned memories (id, content), at most [`MAX_PINNED`], found through the
+/// engine's tag index instead of loading every memory. The tag is checked
+/// again on the loaded memory in case the index lags a write.
+fn pinned_memories(db: &MenteDb) -> Vec<(String, String)> {
+    // Oldest first, so which ten reach the agent does not change run to run.
+    let mut pinned: Vec<(u64, String, String)> = db
+        .memory_ids_with_tag(common::memory_meta::PINNED)
+        .into_iter()
+        .filter_map(|id| db.get_memory(id).ok())
+        .filter(|n| n.tags.iter().any(|t| t == common::memory_meta::PINNED))
+        .map(|n| (n.created_at, n.id.to_string(), n.content))
+        .collect();
+    pinned.sort();
+    pinned
+        .into_iter()
+        .take(MAX_PINNED)
+        .map(|(_, id, content)| (id, content))
+        .collect()
 }
 
 /// Where a learning came from: the run and ticket it was learned on.
@@ -98,23 +148,8 @@ impl AgentMemory {
             }
         };
 
-        // NOTE on dedup: the engine default memory_dedup_threshold (0.97 cosine)
-        // is unreachable on Titan-v2-1024 (measured 7/24: paraphrase pairs
-        // 0.75-0.93, near-verbatim 0.94), so store-time dedup never fires and
-        // reworded re-extracted learnings accumulate. Left OFF deliberately: on
-        // this embedder the two-gate (cosine AND token-jaccard) design can't be
-        // made both safe and useful. The jaccard gate is length-dependent — a
-        // single-token VALUE UPDATE ("port 8000"->"8001") in a real 1-2 sentence
-        // learning scores jaccard >=0.89 and cosine ~0.94, so any threshold low
-        // enough to catch near-verbatim dupes also SWALLOWS corrections (the new
-        // value lost, supersession never fires). Reworded paraphrases score
-        // jaccard 0.33-0.41 and are never caught at any safe setting. Losing a
-        // correction is far worse than keeping a duplicate, so we don't dedup at
-        // store time. The real fix is the engine 0.26.0 self-calibrating
-        // thresholds + retroactive dedup sweep (a separate upgrade); until then
-        // the 0.02 recall floor + top-k bound the cost of accumulation.
         let bedrock_embedder = embedder::BedrockEmbedder::new(state.bedrock.clone());
-        match MenteDb::open_with_embedder(&local_dir, Box::new(bedrock_embedder)) {
+        match open_db(&local_dir, Box::new(bedrock_embedder)) {
             Ok(db) => {
                 info!(
                     memories = db.memory_count(),
@@ -186,7 +221,6 @@ impl AgentMemory {
         // (max ≈ 0.08 = 1/60·0.7 + salience·0.05 + recency·0.02), NOT cosine
         // similarity — a cosine-scale floor filtered out every result. This
         // floor only drops the deep tail of the ranked list.
-        const MIN_RELEVANCE: f32 = 0.02;
         let results: Vec<_> = results
             .into_iter()
             .filter(|(_, score)| *score >= MIN_RELEVANCE)
@@ -195,17 +229,7 @@ impl AgentMemory {
 
         // Pinned memories reach the agent on every ticket: a person decided
         // they always apply.
-        let mut pinned: Vec<(String, String)> = Vec::new();
-        for id in self.db.memory_ids() {
-            if pinned.len() >= MAX_PINNED {
-                break;
-            }
-            if let Ok(node) = self.db.get_memory(id) {
-                if node.tags.iter().any(|t| t == common::memory_meta::PINNED) {
-                    pinned.push((id.to_string(), node.content.clone()));
-                }
-            }
-        }
+        let pinned = pinned_memories(&self.db);
         if results.is_empty() && pinned.is_empty() {
             return String::new();
         }
@@ -266,10 +290,12 @@ impl AgentMemory {
         node.tags = tags;
         node.confidence = 0.9;
 
-        if let Err(e) = self.db.store(node) {
-            warn!(error = %e, "Failed to store memory");
-        } else {
-            self.dirty = true;
+        match self.db.store_with_outcome(node) {
+            Ok(mentedb::StoreOutcome::Stored) => self.dirty = true,
+            Ok(mentedb::StoreOutcome::Duplicate { of }) => {
+                info!(existing = %of, "Learning already remembered, not stored again");
+            }
+            Err(e) => warn!(error = %e, "Failed to store memory"),
         }
     }
 
@@ -510,5 +536,193 @@ impl AgentMemory {
         s3_sync::cleanup_local(&self.local_dir);
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mentedb_core::error::MenteResult;
+    use std::path::PathBuf;
+
+    /// A snapshot written by the engine this worker ran before 0.40.0
+    /// (git rev b4db444, release 0.24.4), in the exact tar.gz shape
+    /// `s3_sync::upload_memory` puts in S3. It holds 24 worker-shaped learnings
+    /// (`Fixture learning number {i}: ...`, embedding `fixture_vector(i)`, run
+    /// and topic tags, every 7th pinned), then number 5 deleted and number 6
+    /// edited and pinned through the dashboard's forget-then-store path.
+    const OLD_SNAPSHOT: &[u8] = include_bytes!("testdata/snapshot-mentedb-0.24.4.tar.gz");
+
+    /// The embedding the fixture gave learning `i`: four 0.5 entries.
+    fn fixture_vector(i: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; 1024];
+        for k in 0..4 {
+            v[(i * 37 + k * 251) % 1024] = 0.5;
+        }
+        v
+    }
+
+    /// The worker always embeds before it calls the engine, so the engine must
+    /// never call the embedder itself: for Bedrock that would be `block_on`
+    /// inside the async runtime.
+    struct MustNotEmbed;
+
+    impl mentedb_embedding::EmbeddingProvider for MustNotEmbed {
+        fn embed(&self, _text: &str) -> MenteResult<Vec<f32>> {
+            panic!("the engine called the embedder")
+        }
+        fn embed_batch(&self, _texts: &[&str]) -> MenteResult<Vec<Vec<f32>>> {
+            panic!("the engine called the embedder")
+        }
+        fn dimensions(&self) -> usize {
+            1024
+        }
+        fn model_name(&self) -> &str {
+            "amazon.titan-embed-text-v2:0"
+        }
+    }
+
+    fn unpack_old_snapshot() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mentedb-compat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tar::Archive::new(flate2::read::GzDecoder::new(OLD_SNAPSHOT))
+            .unpack(&dir)
+            .unwrap();
+        dir
+    }
+
+    fn find(db: &MenteDb, i: usize) -> Option<MemoryNode> {
+        let prefix = format!("Fixture learning number {i}:");
+        db.memory_ids()
+            .into_iter()
+            .filter_map(|id| db.get_memory(id).ok())
+            .find(|n| n.content.starts_with(&prefix))
+    }
+
+    fn recall(
+        db: &MenteDb,
+        embedding: &[f32],
+        text: &str,
+    ) -> Vec<(mentedb_core::types::MemoryId, f32)> {
+        db.recall_hybrid_at(embedding, Some(text), 5, now_micros(), None, None, None)
+            .unwrap()
+    }
+
+    fn now_micros() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    }
+
+    fn check_old_learnings(db: &MenteDb) {
+        for i in (0..24).filter(|i| *i != 5 && *i != 6) {
+            let node = find(db, i).unwrap_or_else(|| panic!("learning {i} lost"));
+            assert_eq!(node.embedding, fixture_vector(i), "learning {i} embedding");
+            assert!(
+                node.tags.iter().any(|t| t == "source:run"),
+                "learning {i} tags"
+            );
+            let hits = recall(db, &fixture_vector(i), &node.content);
+            assert_eq!(hits[0].0, node.id, "learning {i} is its own best match");
+            assert!(
+                hits[0].1 >= MIN_RELEVANCE,
+                "learning {i} clears the relevance floor, scored {}",
+                hits[0].1
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapshot_from_the_previous_engine_opens_and_recalls() {
+        let dir = unpack_old_snapshot();
+        let db = open_db(&dir, Box::new(MustNotEmbed)).unwrap();
+        assert!(db.calibration().is_none(), "calibration stays off");
+
+        assert_eq!(db.memory_count(), 23, "24 stored, one deleted");
+        assert!(find(&db, 5).is_none(), "the deleted learning stays deleted");
+        let edited = find(&db, 6).expect("the edited learning survives");
+        assert!(edited.content.ends_with("(edited)"));
+        check_old_learnings(&db);
+
+        // Pinned ones come from the tag index: 0, 7, 14, 21 and the edited 6.
+        let pinned = pinned_memories(&db);
+        assert_eq!(pinned.len(), 5);
+        assert!(pinned.iter().any(|(id, _)| *id == edited.id.to_string()));
+        assert!(pinned.iter().all(|(_, c)| [
+            "number 0:",
+            "number 6:",
+            "number 7:",
+            "number 14:",
+            "number 21:"
+        ]
+        .iter()
+        .any(|n| c.contains(n))));
+
+        // A run on the new engine adds a learning and uploads; the next run
+        // opens that snapshot and finds old and new learnings alike.
+        let mut node = MemoryNode::new(
+            AgentId::nil(),
+            MemoryType::Procedural,
+            "Run the service tests from the services directory.".into(),
+            fixture_vector(500),
+        );
+        node.tags = vec!["topic:procedure".into(), "source:run".into()];
+        let new_id = node.id;
+        assert!(matches!(
+            db.store_with_outcome(node).unwrap(),
+            mentedb::StoreOutcome::Stored
+        ));
+        db.flush().unwrap();
+        db.close().unwrap();
+        drop(db);
+
+        let db = open_db(&dir, Box::new(MustNotEmbed)).unwrap();
+        assert_eq!(db.memory_count(), 24);
+        check_old_learnings(&db);
+        let hits = recall(
+            &db,
+            &fixture_vector(500),
+            "Run the service tests from the services directory.",
+        );
+        assert_eq!(hits[0].0, new_id);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_verbatim_repeat_is_not_stored_twice_but_a_one_word_change_is() {
+        let dir = unpack_old_snapshot();
+        let db = open_db(&dir, Box::new(MustNotEmbed)).unwrap();
+        let existing = find(&db, 3).unwrap();
+
+        let repeat = MemoryNode::new(
+            AgentId::nil(),
+            existing.memory_type,
+            existing.content.clone(),
+            existing.embedding.clone(),
+        );
+        assert!(matches!(
+            db.store_with_outcome(repeat).unwrap(),
+            mentedb::StoreOutcome::Duplicate { of } if of == existing.id
+        ));
+
+        // One word swapped in a long learning keeps token overlap above the
+        // engine's 0.85 gate; at the 0.97 cosine threshold it is still stored,
+        // so a correction is never dropped as a duplicate.
+        let mut near = existing.embedding.clone();
+        near[1] = 0.3;
+        let correction = MemoryNode::new(
+            AgentId::nil(),
+            existing.memory_type,
+            existing.content.replace("handlers", "routes"),
+            near,
+        );
+        assert!(matches!(
+            db.store_with_outcome(correction).unwrap(),
+            mentedb::StoreOutcome::Stored
+        ));
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

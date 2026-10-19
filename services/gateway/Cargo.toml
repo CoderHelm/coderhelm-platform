@@ -69,8 +69,8 @@ futures = "0.3"
 tokio-stream = "0.1"
 
 # MenteDB (agent memory browsing)
-mentedb = { git = "https://github.com/nambok/mentedb.git", rev = "b4db4447d62384cf3b30153787295a70dae4a6a5" }
-mentedb-core = { git = "https://github.com/nambok/mentedb.git", rev = "b4db4447d62384cf3b30153787295a70dae4a6a5" }
+mentedb = "=0.40.0"
+mentedb-core = "=0.40.0"
 flate2 = "1"
 tar = "0.4"
 
