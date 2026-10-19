@@ -2158,6 +2158,30 @@ async fn mark_ready(
                     );
                     return;
                 }
+                // A person put this PR back into draft: that is their call, and
+                // a later CI pass or run completion must not undo it. Only a
+                // draft CoderHelm opened (or marked ready itself) is its to mark
+                // ready. When the timeline can't be read, the draft is left alone
+                // this time (fail closed: a draft stays a draft).
+                if pr.get("draft").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    match github
+                        .list_issue_timeline(repo_owner, repo_name, pr_number)
+                        .await
+                    {
+                        Ok(timeline) => {
+                            if let Some(who) =
+                                crate::clients::github::human_converted_to_draft(&timeline)
+                            {
+                                info!(pr_number, converted_by = %who, "PR was put back into draft by a person — not marking ready");
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(pr_number, error = %e, "Could not read the PR timeline — leaving the draft as is");
+                            return;
+                        }
+                    }
+                }
                 // A PR reaching ready (CI + review passed) is no longer
                 // "partial" — drop the salvage marker from the title.
                 if let Some(title) = pr.get("title").and_then(|v| v.as_str()) {

@@ -1,0 +1,25 @@
+{
+  "name": "merge gate: a dismissed CoderHelm approval disarms the gate until it reviews again",
+  "description": "CoderHelm approved and CI is green. A maintainer dismissed CoderHelm's approval, then a person approved: the gate must not merge on the withdrawn key. After `@coderhelm re-review` CoderHelm approves the same head again and the gate merges.",
+  "auto_merge": {"require_human": true},
+  "steps": [
+    {"push": "h1"},
+    {"ci": {"name": "Build", "status": "completed", "conclusion": "success", "suite_completed": true}},
+    {"review": {"head": "h1", "model_output": {
+      "verdict": "APPROVE", "summary": "Moves the cache TTL into config.", "findings": []
+    }}},
+    {"dismiss": {"who": "coderhelm"}},
+    {"gate_is": {"state": "waiting_approval", "merged": false}},
+    {"approve": {"by": "alice"}},
+    {"gate_is": {"state": "waiting_approval", "merged": false}},
+    {"comment": {"id": 501, "text": "@coderhelm re-review", "ask_kind": "re_review",
+      "review": {"head": "h1", "model_output": {
+        "verdict": "APPROVE", "summary": "Re-checked: the TTL change is covered by tests.", "findings": []
+      }}
+    }}
+  ],
+  "expect": {
+    "final_formal": {"head": "h1", "event": "APPROVE"},
+    "gate": {"state": "merged", "merged": true}
+  }
+}

@@ -5,6 +5,12 @@ name: Reviewer evals (live)
 # model, and each must land in its case's outcome class. The deterministic
 # layer runs on every PR in CI; this one costs model calls, so it runs
 # nightly. A failure opens an issue.
+#
+# Model access: no model key is stored in GitHub. The job exchanges GitHub's
+# OIDC token for short-lived AWS credentials of the `coderhelm-prod-reviewer-evals`
+# role (infra/lib/worker-stack.ts). That role trusts only this repository's
+# main branch and may only invoke the one eval model on Amazon Bedrock; the
+# evals send the same Messages requests the worker sends to Anthropic.
 
 on:
   schedule:
@@ -14,9 +20,11 @@ on:
 permissions:
   contents: read
   issues: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
+  AWS_REGION: us-east-1
 
 jobs:
   live:
@@ -31,10 +39,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: services
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-reviewer-evals
+          role-session-name: reviewer-evals-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
       - name: Run the live evals
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.REVIEWER_EVAL_ANTHROPIC_API_KEY }}
-          EVAL_MODEL: claude-haiku-4-5
+          EVAL_PROVIDER: bedrock
+          EVAL_MODEL: us.anthropic.claude-haiku-4-5-20251001-v1:0
         run: cargo test -p worker review_eval -- --ignored --nocapture 2>&1 | tee eval.log
         shell: bash -o pipefail {0}
       - name: Open an issue on failure
@@ -48,7 +61,11 @@ jobs:
             echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo
             echo '```'
-            grep -A40 "eval failures" eval.log | head -60 || tail -40 eval.log
+            if [ -f eval.log ]; then
+              grep -A40 "eval failures" eval.log | head -60 || tail -40 eval.log
+            else
+              echo "The evals did not run (setup failed before them)."
+            fi
             echo '```'
           } > issue.md
           gh issue create --repo "$GITHUB_REPOSITORY" --title "Reviewer evals failed ($(date -u +%F))" --body-file issue.md

@@ -1717,10 +1717,11 @@ impl GitHubClient {
     }
 
     /// Merge a PR, but ONLY if its head still equals `sha` (a blast-radius guard:
-    /// a commit pushed after the review moves the head, GitHub returns 409, and
-    /// we return Ok(false) rather than merging unreviewed code). Ok(false) also
-    /// covers "not mergeable" (405, e.g. failing required checks). Any other
-    /// status is a hard error so the caller never treats a failure as a merge.
+    /// a commit pushed after the review moves the head and GitHub returns 409, so
+    /// unreviewed code is never merged). A 405 means GitHub refused the merge
+    /// (branch protection, required reviews or checks, a conflict); its message
+    /// is kept so the caller can show the actual reason. Any other status is a
+    /// hard error so the caller never treats a failure as a merge.
     /// `merge_method` is "squash" | "merge" | "rebase".
     pub async fn merge_pull_request(
         &self,
@@ -1729,7 +1730,7 @@ impl GitHubClient {
         pr_number: u64,
         sha: &str,
         merge_method: &str,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<MergeOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/merge");
         let headers = self.auth_headers().await?;
         let mut req = self.http.put(&url).json(&serde_json::json!({
@@ -1740,13 +1741,19 @@ impl GitHubClient {
             req = req.header(k, v);
         }
         let resp = req.send().await?;
-        match resp.status().as_u16() {
-            200 => Ok(true),
-            405 | 409 => Ok(false),
-            status => {
-                let text = resp.text().await.unwrap_or_default();
-                Err(format!("merge failed ({status}): {text}").into())
-            }
+        let status = resp.status().as_u16();
+        if status == 200 {
+            return Ok(MergeOutcome::Merged);
+        }
+        let text = resp.text().await.unwrap_or_default();
+        let reason = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v["message"].as_str().map(str::to_string))
+            .unwrap_or_else(|| text.clone());
+        match status {
+            405 => Ok(MergeOutcome::NotMergeable(reason)),
+            409 => Ok(MergeOutcome::HeadMoved(reason)),
+            _ => Err(format!("merge failed ({status}): {text}").into()),
         }
     }
 
@@ -1762,16 +1769,60 @@ impl GitHubClient {
         self.get(&url).await
     }
 
-    /// List submitted reviews on a PR (used by the two-key auto-merge gate to
-    /// confirm a human approval exists alongside the bot's).
+    /// Every submitted review on a PR, oldest first (the two-key auto-merge
+    /// gate reads approvals and dismissals from it). All pages: GitHub lists
+    /// reviews chronologically, so on a busy PR the newest ones sit past the
+    /// first page.
     pub async fn list_pr_reviews(
         &self,
         owner: &str,
         repo: &str,
         pr_number: u64,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews?per_page=100");
-        self.get(&url).await
+        self.get_pages(
+            &format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews"),
+            10,
+        )
+        .await
+    }
+
+    /// The issue/PR timeline (labels, draft changes, reviews, ...), oldest first.
+    pub async fn list_issue_timeline(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_pages(
+            &format!("{API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/timeline"),
+            10,
+        )
+        .await
+    }
+
+    /// GET a list endpoint page by page (100 per page) and concatenate the
+    /// arrays, up to `max_pages`. Stops at the first short page.
+    async fn get_pages(
+        &self,
+        base_url: &str,
+        max_pages: u32,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        for page in 1..=max_pages {
+            let batch = match self
+                .get(&format!("{base_url}?per_page=100&page={page}"))
+                .await?
+            {
+                serde_json::Value::Array(b) => b,
+                other => return Err(format!("expected a JSON array, got {other}").into()),
+            };
+            let done = batch.len() < 100;
+            items.extend(batch);
+            if done {
+                break;
+            }
+        }
+        Ok(serde_json::Value::Array(items))
     }
 
     /// Dismiss a review on a PR (CoderHelm dismisses only its own stale
@@ -2706,6 +2757,79 @@ pub enum FileOp {
 }
 
 /// Code search result.
+/// Result of a SHA-guarded merge attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Merged,
+    /// GitHub refused the merge (405); carries GitHub's message.
+    NotMergeable(String),
+    /// The head moved past the reviewed SHA (409); carries GitHub's message.
+    HeadMoved(String),
+}
+
+/// Did a person (not a bot) convert this PR back to draft after it was last
+/// marked ready? Returns their login. `timeline` is the issue timeline,
+/// oldest first. A PR opened as a draft has no conversion event at all.
+pub fn human_converted_to_draft(timeline: &serde_json::Value) -> Option<String> {
+    let events = timeline.as_array()?;
+    let last = events.iter().rev().find(|e| {
+        matches!(
+            e["event"].as_str(),
+            Some("convert_to_draft") | Some("ready_for_review")
+        )
+    })?;
+    if last["event"].as_str() != Some("convert_to_draft") {
+        return None;
+    }
+    let actor = &last["actor"];
+    let login = actor["login"].as_str().unwrap_or("");
+    let is_bot = actor["type"].as_str() == Some("Bot")
+        || login.ends_with("[bot]")
+        || login.to_ascii_lowercase().contains("coderhelm");
+    (!is_bot && !login.is_empty()).then(|| login.to_string())
+}
+
+#[cfg(test)]
+mod human_draft_tests {
+    use super::human_converted_to_draft;
+    use serde_json::json;
+
+    fn ev(event: &str, login: &str, kind: &str) -> serde_json::Value {
+        json!({"event": event, "actor": {"login": login, "type": kind}})
+    }
+
+    #[test]
+    fn a_person_s_draft_after_coderhelm_marked_ready_is_respected() {
+        let tl = json!([
+            ev("ready_for_review", "coderhelm[bot]", "Bot"),
+            ev("labeled", "someone", "User"),
+            ev("convert_to_draft", "alice", "User"),
+        ]);
+        assert_eq!(human_converted_to_draft(&tl).as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn ready_after_the_person_s_draft_clears_it() {
+        let tl = json!([
+            ev("convert_to_draft", "alice", "User"),
+            ev("ready_for_review", "alice", "User"),
+        ]);
+        assert_eq!(human_converted_to_draft(&tl), None);
+    }
+
+    #[test]
+    fn a_bot_conversion_or_none_is_not_a_person_s_draft() {
+        assert_eq!(
+            human_converted_to_draft(&json!([ev("convert_to_draft", "coderhelm[bot]", "Bot")])),
+            None
+        );
+        assert_eq!(
+            human_converted_to_draft(&json!([ev("labeled", "a", "User")])),
+            None
+        );
+    }
+}
+
 pub struct SearchResult {
     pub path: String,
     pub matches: Vec<String>,

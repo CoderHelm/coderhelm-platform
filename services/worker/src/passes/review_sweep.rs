@@ -402,6 +402,7 @@ fn sweep_message(
         trigger: "sweep".to_string(),
         dedup_key: format!("sweep#{head}"),
         reply_to_comment_id: None,
+        requested_by: String::new(),
         attempt: 0,
         wait_secs: 0,
         reconcile_note: None,

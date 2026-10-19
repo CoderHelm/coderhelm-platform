@@ -795,6 +795,7 @@ async fn own_pr_failures(
             review_id: 0,
             review_body: body,
             comments: Vec::new(),
+            trigger_author: String::new(),
             defer_count: 0,
             model_retries: 0,
         };
