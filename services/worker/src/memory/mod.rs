@@ -616,6 +616,19 @@ mod tests {
     }
 
     fn check_old_learnings(db: &MenteDb) {
+        // The old engine stored the edited learning (6) by deleting it and
+        // storing it again under the same id, which left its vector out of
+        // the index. The engine heals that on open, so it is its own best
+        // match like every other learning.
+        let edited = find(db, 6).expect("the edited learning survives");
+        let hits = recall(db, &edited.embedding, &edited.content);
+        assert_eq!(hits[0].0, edited.id, "the edited learning is recalled");
+        assert!(
+            hits[0].1 >= MIN_RELEVANCE,
+            "the edited learning clears the relevance floor, scored {}",
+            hits[0].1
+        );
+
         for i in (0..24).filter(|i| *i != 5 && *i != 6) {
             let node = find(db, i).unwrap_or_else(|| panic!("learning {i} lost"));
             assert_eq!(node.embedding, fixture_vector(i), "learning {i} embedding");
