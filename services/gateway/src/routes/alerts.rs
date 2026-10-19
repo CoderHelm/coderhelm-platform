@@ -883,12 +883,12 @@ async fn close_open_alert(state: &AppState, team_id: &str, fingerprint: &str) ->
     })
 }
 
-struct TeamNotify {
-    url: String,
-    enabled: bool,
+pub(crate) struct TeamNotify {
+    pub(crate) url: String,
+    pub(crate) enabled: bool,
 }
 
-async fn team_notify_settings(state: &AppState, team_id: &str) -> TeamNotify {
+pub(crate) async fn team_notify_settings(state: &AppState, team_id: &str) -> TeamNotify {
     let item = state
         .dynamo
         .get_item()

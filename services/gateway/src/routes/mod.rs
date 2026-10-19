@@ -11,6 +11,7 @@ pub mod github;
 pub mod github_webhook;
 pub mod graph;
 pub mod infrastructure;
+pub mod integrations;
 pub mod jira_webhook;
 pub mod log_analyzer;
 pub mod memory;

@@ -1,8 +1,15 @@
 //! Agents' tools for the monitoring, docs and pipeline systems a team turned
-//! on (see `common::live::connectors`): New Relic, Confluence, CloudWatch
-//! metrics and Airflow (MWAA), plus `aws_identity`, which says which AWS
-//! account, role and region Coderhelm uses for the team and whether each
+//! on: New Relic and Confluence (see `common::live::connectors`), CloudWatch
+//! metrics and Airflow (MWAA), which are abilities of a connected AWS account
+//! (see `common::live::aws_account`), plus `aws_identity`, which says which
+//! AWS account, role and region Coderhelm uses for the team and whether each
 //! works.
+//!
+//! Metrics and Airflow use the AWS account's own record: the role it
+//! connected with, what a check found the role can do, and the Airflow
+//! environments it found. Older separate `CONNECTOR#metrics` and
+//! `CONNECTOR#airflow` records are still honoured until the Integrations page
+//! folds them into the account, and only when no account gives that ability.
 //!
 //! Every call goes through `common::live`, which allows reads only (GET-only
 //! for Airflow, one read-only GraphQL query for New Relic, two read calls for
@@ -15,6 +22,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::live::aws::{assume, AwsTarget};
+use common::live::aws_account::{self, AwsAccount};
 use common::live::confluence::Confluence;
 use common::live::connectors::{self, ConnKind, Connector, MAX_CALLS_PER_RUN, MAX_WRITES_PER_RUN};
 use common::live::http::Https;
@@ -41,16 +49,193 @@ struct AwsRole {
     used_for: Vec<String>,
 }
 
+/// CloudWatch metrics or Airflow through one AWS account's role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwsAbility {
+    pub target: AwsTarget,
+    /// Airflow: the environments agents may read there.
+    pub environments: Vec<String>,
+}
+
+impl AwsAbility {
+    fn account(&self) -> &str {
+        self.target.account()
+    }
+}
+
+/// What the team's AWS accounts give agents: the accounts, and where
+/// metrics and Airflow can be read.
+#[derive(Debug, Clone, Default)]
+pub struct AwsAbilities {
+    pub accounts: Vec<AwsAccount>,
+    pub metrics: Vec<AwsAbility>,
+    pub airflow: Vec<AwsAbility>,
+}
+
+impl AwsAbilities {
+    /// From the accounts, then any older separate connection for an ability
+    /// no account gives yet (until it is folded in).
+    pub fn from_parts(accounts: Vec<AwsAccount>, legacy: &[Connector]) -> AwsAbilities {
+        let mut metrics: Vec<AwsAbility> = accounts
+            .iter()
+            .filter(|a| a.metrics_on())
+            .map(|a| AwsAbility {
+                target: a.target(),
+                environments: Vec::new(),
+            })
+            .collect();
+        let mut airflow: Vec<AwsAbility> = accounts
+            .iter()
+            .filter(|a| a.airflow_on())
+            .map(|a| AwsAbility {
+                target: a.target(),
+                environments: a.airflow_environments(),
+            })
+            .collect();
+        for c in legacy {
+            let Some(t) = &c.aws else { continue };
+            match c.kind() {
+                ConnKind::Metrics if metrics.is_empty() => metrics.push(AwsAbility {
+                    target: t.clone(),
+                    environments: Vec::new(),
+                }),
+                ConnKind::Airflow if airflow.is_empty() && !c.environments.is_empty() => airflow
+                    .push(AwsAbility {
+                        target: t.clone(),
+                        environments: c.environments.clone(),
+                    }),
+                _ => {}
+            }
+        }
+        AwsAbilities {
+            accounts,
+            metrics,
+            airflow,
+        }
+    }
+
+    /// Reads the team's accounts. An account never checked yet is checked
+    /// here (read-only, not saved) so its abilities work before anyone opens
+    /// the Integrations page. `legacy` are the older connections usable for
+    /// this work.
+    pub async fn load(
+        state: &WorkerState,
+        team_id: &str,
+        actor: &str,
+        legacy: &[Connector],
+    ) -> AwsAbilities {
+        let table = &state.config.aws_insights_table_name;
+        let mut accounts = if table.is_empty() {
+            Vec::new()
+        } else {
+            match aws_account::list(&state.dynamo, table, team_id).await {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(error = %e, "Could not read AWS accounts; continuing without them");
+                    Vec::new()
+                }
+            }
+        };
+        for a in accounts
+            .iter_mut()
+            .filter(|a| a.abilities.checked_at.is_empty())
+        {
+            let c = identity::check(&state.sts, &a.target(), Vec::new(), actor, true).await;
+            a.apply_check(&c, &chrono::Utc::now().to_rfc3339());
+        }
+        AwsAbilities::from_parts(accounts, legacy)
+    }
+
+    /// All Airflow environments agents may read, across accounts.
+    pub fn environments(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .airflow
+            .iter()
+            .flat_map(|a| a.environments.iter().cloned())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The account that has `environment`.
+    pub fn airflow_for(&self, environment: &str) -> Option<&AwsAbility> {
+        self.airflow
+            .iter()
+            .find(|a| a.environments.iter().any(|e| e == environment))
+    }
+
+    /// The account to read metrics in: the one asked for, or the only one.
+    pub fn metrics_for(&self, account: Option<&str>) -> Result<&AwsAbility, StepError> {
+        match account.map(str::trim).filter(|a| !a.is_empty()) {
+            Some(a) => self
+                .metrics
+                .iter()
+                .find(|m| m.account() == a)
+                .ok_or_else(|| {
+                    StepError::new(
+                        "read_only",
+                        format!("Metrics can't be read in account {a}."),
+                        format!(
+                            "Accounts with metrics on: {}.",
+                            self.metric_accounts().join(", ")
+                        ),
+                    )
+                }),
+            None => match self.metrics.as_slice() {
+                [one] => Ok(one),
+                [] => Err(StepError::new(
+                    "read_only",
+                    "CloudWatch metrics aren't on for any AWS account.",
+                    "Ask an admin to turn them on in Settings → Integrations.",
+                )),
+                _ => Err(StepError::new(
+                    "read_only",
+                    "Say which AWS account to read metrics in.",
+                    format!("Accounts: {}.", self.metric_accounts().join(", ")),
+                )),
+            },
+        }
+    }
+
+    fn metric_accounts(&self) -> Vec<String> {
+        self.metrics
+            .iter()
+            .map(|m| m.account().to_string())
+            .collect()
+    }
+}
+
 pub struct OpsTools {
     team_id: String,
     repo: String,
     actor: String,
     pr: u64,
     run: RunRef,
+    /// New Relic and Confluence.
     loaded: Vec<Loaded>,
+    aws: AwsAbilities,
     roles: Vec<AwsRole>,
     calls: AtomicUsize,
     writes: AtomicUsize,
+}
+
+/// The production environment among several: the only one whose name starts
+/// with `prod` (or else contains it).
+pub fn preferred_environment(envs: &[String]) -> Option<&str> {
+    if envs.len() == 1 {
+        return envs.first().map(String::as_str);
+    }
+    let pick = |f: &dyn Fn(&str) -> bool| {
+        let m: Vec<&String> = envs.iter().filter(|e| f(&e.to_lowercase())).collect();
+        (m.len() == 1).then(|| m[0].as_str())
+    };
+    pick(&|e| e.starts_with("prod")).or_else(|| pick(&|e| e.contains("prod")))
+}
+
+/// A trimmed, non-empty text field of a tool call.
+fn s_in<'a>(input: &'a Value, k: &str) -> Option<&'a str> {
+    input[k].as_str().map(str::trim).filter(|v| !v.is_empty())
 }
 
 fn tool(name: &str, description: &str, schema: Value) -> ToolDefinition {
@@ -120,6 +305,27 @@ pub fn describe(c: &Connector) -> String {
     }
 }
 
+/// What the AWS accounts' metrics give, in a line.
+fn describe_metrics(aws: &AwsAbilities) -> String {
+    let where_: Vec<String> = aws
+        .metrics
+        .iter()
+        .map(|m| format!("account {} ({})", m.account(), m.target.region))
+        .collect();
+    format!(
+        "CloudWatch metrics in {}: ECS, RDS, Lambda, CloudFront, load balancers, SQS, DynamoDB",
+        where_.join(", ")
+    )
+}
+
+/// What the AWS accounts' Airflow gives, in a line.
+fn describe_airflow(aws: &AwsAbilities) -> String {
+    format!(
+        "Airflow on MWAA ({}): DAGs, DAG runs, task instances, task logs, import errors",
+        aws.environments().join(", ")
+    )
+}
+
 impl OpsTools {
     /// What work on `repo` (`owner/name`) may use, or `None` when nothing is
     /// connected.
@@ -132,21 +338,19 @@ impl OpsTools {
     ) -> Option<OpsTools> {
         let table = &state.config.settings_table_name;
         let mut loaded = Vec::new();
+        let mut legacy = Vec::new();
         match connectors::list(&state.dynamo, table, team_id).await {
             Ok(list) => {
                 for conn in list.into_iter().filter(|c| c.usable_for(repo)) {
-                    let key = if conn.kind().uses_aws() {
-                        if conn.aws.is_none() {
+                    if conn.kind().uses_aws() {
+                        legacy.push(conn);
+                        continue;
+                    }
+                    let key = match secret::open(&state.kms, team_id, &conn.key_sealed).await {
+                        Ok(k) => k,
+                        Err(e) => {
+                            warn!(kind = conn.kind().as_str(), error = %e, "Could not open a connection key; skipping it");
                             continue;
-                        }
-                        String::new()
-                    } else {
-                        match secret::open(&state.kms, team_id, &conn.key_sealed).await {
-                            Ok(k) => k,
-                            Err(e) => {
-                                warn!(kind = conn.kind().as_str(), error = %e, "Could not open a connection key; skipping it");
-                                continue;
-                            }
                         }
                     };
                     loaded.push(Loaded { conn, key });
@@ -154,6 +358,7 @@ impl OpsTools {
             }
             Err(e) => warn!(error = %e, "Could not list connections; continuing without them"),
         }
+        let aws = AwsAbilities::load(state, team_id, &format!("{actor}-pr{pr}"), &legacy).await;
         let mut roles: Vec<AwsRole> = Vec::new();
         let mut add = |t: &AwsTarget, what: String| match roles
             .iter_mut()
@@ -165,10 +370,14 @@ impl OpsTools {
                 used_for: vec![what],
             }),
         };
-        for l in &loaded {
-            if let Some(a) = &l.conn.aws {
-                add(a, l.conn.kind().label().to_string());
-            }
+        for m in &aws.metrics {
+            add(&m.target, "CloudWatch metrics".to_string());
+        }
+        for a in &aws.airflow {
+            add(&a.target, "Airflow".to_string());
+        }
+        for a in &aws.accounts {
+            add(&a.target(), "Log alerts".to_string());
         }
         if let Ok(sources) = store::list_sources(&state.dynamo, table, team_id).await {
             for s in sources.iter().filter(|s| s.usable_for(repo)) {
@@ -183,6 +392,8 @@ impl OpsTools {
         info!(
             connections = loaded.len(),
             aws_roles = roles.len(),
+            metrics_accounts = aws.metrics.len(),
+            airflow_environments = aws.environments().len(),
             "Agent has monitoring and docs connections"
         );
         Some(OpsTools {
@@ -192,6 +403,7 @@ impl OpsTools {
             pr,
             run: RunRef::default(),
             loaded,
+            aws,
             roles,
             calls: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
@@ -276,28 +488,39 @@ impl OpsTools {
                 ));
             }
         }
-        if self.get(ConnKind::Metrics).is_some() {
+        if !self.aws.metrics.is_empty() {
             let ns: Vec<String> = metrics::NAMESPACES
                 .iter()
                 .map(|(n, w)| format!("{n} ({w})"))
                 .collect();
+            let mut list_props = json!({ "namespace": { "type": "string" }, "metric": { "type": "string" }, "dimensions": { "type": "object" } });
+            let mut query_props = json!({
+                "metrics": { "type": "array", "items": { "type": "object", "properties": {
+                    "namespace": { "type": "string" }, "metric": { "type": "string" }, "dimensions": { "type": "object" }, "stat": { "type": "string" } }, "required": ["namespace", "metric"] } },
+                "period": { "type": "integer", "description": "seconds per point, a multiple of 60" },
+                "since": since, "until": until });
+            if self.aws.metrics.len() > 1 {
+                let account = json!({ "type": "string", "description": format!("AWS account: {}", self.aws.metric_accounts().join(", ")) });
+                list_props["account"] = account.clone();
+                query_props["account"] = account;
+            }
             out.push(tool(
                 "metrics_list",
                 &format!("List CloudWatch metrics that exist in a namespace, with their dimension values (find the ClusterName, ServiceName, DBInstanceIdentifier, FunctionName, DistributionId to query). Namespaces: {}", ns.join("; ")),
-                json!({ "type": "object", "properties": { "namespace": { "type": "string" }, "metric": { "type": "string" }, "dimensions": { "type": "object" } }, "required": ["namespace"] }),
+                json!({ "type": "object", "properties": list_props, "required": ["namespace"] }),
             ));
             out.push(tool(
                 "metrics_query",
                 "Read up to 5 CloudWatch metrics over a window (at most 14 days): e.g. ECS CPUUtilization/MemoryUtilization, RDS DatabaseConnections, Lambda Duration/Throttles, CloudFront CacheHitRate, ALB TargetResponseTime. Each metric is {namespace, metric, dimensions, stat} with stat Average, Sum, Minimum, Maximum, SampleCount, p50, p90, p95 or p99.",
-                json!({ "type": "object", "properties": {
-                    "metrics": { "type": "array", "items": { "type": "object", "properties": {
-                        "namespace": { "type": "string" }, "metric": { "type": "string" }, "dimensions": { "type": "object" }, "stat": { "type": "string" } }, "required": ["namespace", "metric"] } },
-                    "period": { "type": "integer", "description": "seconds per point, a multiple of 60" },
-                    "since": since, "until": until }, "required": ["metrics"] }),
+                json!({ "type": "object", "properties": query_props, "required": ["metrics"] }),
             ));
         }
-        if let Some(l) = self.get(ConnKind::Airflow) {
-            let env = json!({ "type": "string", "description": format!("MWAA environment: {}", l.conn.environments.join(", ")) });
+        if !self.aws.airflow.is_empty() {
+            let envs = self.aws.environments();
+            let env = json!({ "type": "string", "description": match preferred_environment(&envs) {
+                Some(p) if envs.len() > 1 => format!("MWAA environment: {} (default {p}, production)", envs.join(", ")),
+                _ => format!("MWAA environment: {}", envs.join(", ")),
+            } });
             out.push(tool("airflow_dags", "List Airflow DAGs (or one by `dag_id`) with paused state, schedule and next run.", json!({ "type": "object", "properties": { "environment": env, "dag_id": { "type": "string" }, "search": { "type": "string" }, "limit": { "type": "integer" } } })));
             out.push(tool("airflow_dag_runs", "List DAG runs, newest first, for one DAG (`dag_id`) or all; filter by `state` (queued, running, success, failed) and `since`.", json!({ "type": "object", "properties": { "environment": env, "dag_id": { "type": "string" }, "state": { "type": "string" }, "since": { "type": "string" }, "limit": { "type": "integer" } } })));
             out.push(tool("airflow_task_instances", "List the task instances of one DAG run with their state, tries and duration.", json!({ "type": "object", "properties": { "environment": env, "dag_id": { "type": "string" }, "run_id": { "type": "string" }, "state": { "type": "string" } }, "required": ["dag_id", "run_id"] })));
@@ -325,6 +548,12 @@ impl OpsTools {
         }
         for l in &self.loaded {
             s.push_str(&format!("- {}\n", describe(&l.conn)));
+        }
+        if !self.aws.metrics.is_empty() {
+            s.push_str(&format!("- {}\n", describe_metrics(&self.aws)));
+        }
+        if !self.aws.airflow.is_empty() {
+            s.push_str(&format!("- {}\n", describe_airflow(&self.aws)));
         }
         s.push_str(&format!(
             "At most {MAX_CALLS_PER_RUN} lookups across these.\n"
@@ -406,6 +635,65 @@ impl OpsTools {
         let now = chrono::Utc::now().timestamp();
         let actor = format!("{}-pr{}", self.actor, self.pr);
         let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
+        if kind == Some(ConnKind::Metrics) {
+            let target = &self.aws.metrics_for(s_in(input, "account"))?.target;
+            return match name {
+                "metrics_list" => {
+                    let q = metrics::check_list(
+                        s_in(input, "namespace").unwrap_or(""),
+                        s_in(input, "metric"),
+                        &input["dimensions"],
+                    )?;
+                    let session = assume(&state.sts, target, &actor).await?;
+                    let list =
+                        metrics::MetricsApi::list(&metrics::Aws { session: &session }, &q).await?;
+                    Ok((metrics::format_list(&list), format!("list {}", q.namespace)))
+                }
+                _ => {
+                    let empty = Vec::new();
+                    let q = metrics::check_query(
+                        input["metrics"].as_array().unwrap_or(&empty),
+                        input["period"].as_i64(),
+                        s_in(input, "since"),
+                        s_in(input, "until"),
+                        now,
+                    )?;
+                    let session = assume(&state.sts, target, &actor).await?;
+                    let series =
+                        metrics::MetricsApi::get(&metrics::Aws { session: &session }, &q).await?;
+                    Ok((metrics::format_series(&q, &series), q.describe()))
+                }
+            };
+        }
+        if kind == Some(ConnKind::Airflow) {
+            let what = name.trim_start_matches("airflow_");
+            let envs = self.aws.environments();
+            // With several environments and none named, read production.
+            let mut input = input.clone();
+            if s_in(&input, "environment").is_none() {
+                if let Some(p) = preferred_environment(&envs) {
+                    input["environment"] = json!(p);
+                }
+            }
+            let get = airflow::build(what, &input, &envs)?;
+            let target = &self
+                .aws
+                .airflow_for(&get.environment)
+                .ok_or_else(|| {
+                    StepError::new(
+                        "read_only",
+                        format!(
+                            "{} isn't an Airflow environment agents may read.",
+                            get.environment
+                        ),
+                        "Ask an admin to pick it in Settings → Integrations.",
+                    )
+                })?
+                .target;
+            let session = assume(&state.sts, target, &actor).await?;
+            let (text, _hidden) = airflow::read(&airflow::Mwaa { session: &session }, &get).await?;
+            return Ok((text, get.describe()));
+        }
         let Some(kind) = kind else {
             let mut lines = Vec::new();
             for r in &self.roles {
@@ -420,7 +708,7 @@ impl OpsTools {
             StepError::new(
                 "read_only",
                 "That connection isn't on.",
-                "Ask an admin to turn it on in Data sources.",
+                "Ask an admin to turn it on in Settings → Integrations.",
             )
         })?;
         let s = |k: &str| input[k].as_str().map(str::trim).filter(|v| !v.is_empty());
@@ -498,67 +786,43 @@ impl OpsTools {
                 };
                 Ok((a.text, a.asked))
             }
-            ConnKind::Metrics => {
-                let target = l.conn.aws.as_ref().expect("checked on load");
-                match name {
-                    "metrics_list" => {
-                        let q = metrics::check_list(
-                            s("namespace").unwrap_or(""),
-                            s("metric"),
-                            &input["dimensions"],
-                        )?;
-                        let session = assume(&state.sts, target, &actor).await?;
-                        let list =
-                            metrics::MetricsApi::list(&metrics::Aws { session: &session }, &q)
-                                .await?;
-                        Ok((metrics::format_list(&list), format!("list {}", q.namespace)))
-                    }
-                    _ => {
-                        let empty = Vec::new();
-                        let q = metrics::check_query(
-                            input["metrics"].as_array().unwrap_or(&empty),
-                            input["period"].as_i64(),
-                            s("since"),
-                            s("until"),
-                            now,
-                        )?;
-                        let session = assume(&state.sts, target, &actor).await?;
-                        let series =
-                            metrics::MetricsApi::get(&metrics::Aws { session: &session }, &q)
-                                .await?;
-                        Ok((metrics::format_series(&q, &series), q.describe()))
-                    }
-                }
-            }
-            ConnKind::Airflow => {
-                let target = l.conn.aws.as_ref().expect("checked on load");
-                let what = name.trim_start_matches("airflow_");
-                let get = airflow::build(what, input, &l.conn.environments)?;
-                let session = assume(&state.sts, target, &actor).await?;
-                let (text, _hidden) =
-                    airflow::read(&airflow::Mwaa { session: &session }, &get).await?;
-                Ok((text, get.describe()))
-            }
+            // Handled above, through the AWS accounts.
+            ConnKind::Metrics | ConnKind::Airflow => Err(StepError::new(
+                "read_only",
+                "That connection isn't on.",
+                "Ask an admin to turn it on in Settings → Integrations.",
+            )),
         }
     }
 }
 
-/// The connections the team can set up in Data sources but hasn't turned on
-/// and made ready, for the skill check (`id: what it reads`).
+/// The connections the team can set up in Settings → Integrations but
+/// hasn't turned on and made ready, for the skill check (`id: what it
+/// reads`).
 pub async fn connectable(state: &WorkerState, team_id: &str) -> Vec<String> {
-    let ready: Vec<ConnKind> =
-        connectors::list(&state.dynamo, &state.config.settings_table_name, team_id)
-            .await
-            .map(|l| {
-                l.into_iter()
-                    .filter(|c| c.enabled && c.status == "ready")
-                    .map(|c| c.kind())
-                    .collect()
-            })
-            .unwrap_or_default();
+    let conns = connectors::list(&state.dynamo, &state.config.settings_table_name, team_id)
+        .await
+        .unwrap_or_default();
+    let legacy: Vec<Connector> = conns
+        .iter()
+        .filter(|c| c.kind().uses_aws() && c.enabled && c.status == "ready")
+        .cloned()
+        .collect();
+    let aws = AwsAbilities::load(state, team_id, "skill-check", &legacy).await;
+    connectable_from(&conns, &aws)
+}
+
+/// Pure: what isn't on yet, by `id: what it would give`.
+pub fn connectable_from(conns: &[Connector], aws: &AwsAbilities) -> Vec<String> {
     ConnKind::ALL
         .into_iter()
-        .filter(|k| !ready.contains(k))
+        .filter(|k| match k {
+            ConnKind::Metrics => aws.metrics.is_empty(),
+            ConnKind::Airflow => aws.airflow.is_empty(),
+            _ => !conns
+                .iter()
+                .any(|c| c.kind() == *k && c.enabled && c.status == "ready"),
+        })
         .map(|k| format!("{}: {}", k.as_str(), connectable_line(k)))
         .collect()
 }
@@ -568,51 +832,88 @@ pub fn connectable_line(k: ConnKind) -> &'static str {
     match k {
         ConnKind::NewRelic => "New Relic: NRQL, entities, change events and deployment markers, deployment impact, response time, error rate and throughput",
         ConnKind::Confluence => "Confluence: search and read pages; optionally append to listed pages",
-        ConnKind::Metrics => "CloudWatch metrics: ECS, RDS, Lambda, CloudFront, load balancers, SQS, DynamoDB",
-        ConnKind::Airflow => "Airflow on MWAA: DAGs, DAG runs, task instances, task logs, import errors",
+        ConnKind::Metrics => "CloudWatch metrics (an ability of a connected AWS account): ECS, RDS, Lambda, CloudFront, load balancers, SQS, DynamoDB",
+        ConnKind::Airflow => "Airflow on MWAA (an ability of a connected AWS account): DAGs, DAG runs, task instances, task logs, import errors",
     }
 }
 
 /// The team's connections as the skill check sees them: one source per
-/// connection that's on and ready, and one for `aws_identity` when Coderhelm
-/// uses any AWS role for the team.
+/// connection that's on and ready, one each for metrics and Airflow when an
+/// AWS account gives them, and one for `aws_identity` when Coderhelm uses any
+/// AWS role for the team.
 pub async fn inventory_sources(
     state: &WorkerState,
     team_id: &str,
 ) -> Vec<common::skill_compat::Source> {
     let table = &state.config.settings_table_name;
+    let conns = connectors::list(&state.dynamo, table, team_id)
+        .await
+        .unwrap_or_default();
+    let legacy: Vec<Connector> = conns
+        .iter()
+        .filter(|c| c.kind().uses_aws() && c.enabled && c.status == "ready")
+        .cloned()
+        .collect();
+    let aws = AwsAbilities::load(state, team_id, "skill-check", &legacy).await;
+    let other_aws = store::list_sources(&state.dynamo, table, team_id)
+        .await
+        .map(|l| {
+            l.iter()
+                .any(|s| s.enabled && s.status == "ready" && s.aws.is_some())
+        })
+        .unwrap_or(false);
+    inventory_from(&conns, &aws, other_aws)
+}
+
+/// Pure: the skill check's sources from what is connected.
+pub fn inventory_from(
+    conns: &[Connector],
+    aws: &AwsAbilities,
+    other_aws_sources: bool,
+) -> Vec<common::skill_compat::Source> {
     let mut out = Vec::new();
-    let mut aws = false;
-    if let Ok(list) = connectors::list(&state.dynamo, table, team_id).await {
-        for c in list
-            .into_iter()
-            .filter(|c| c.enabled && c.status == "ready")
-        {
-            aws |= c.aws.is_some();
-            let tools = tool_names(c.kind(), &c);
-            out.push(common::skill_compat::Source {
-                kind: c.kind().as_str().to_string(),
-                name: c.kind().label().to_string(),
-                detail: describe(&c),
-                writes: tools
-                    .iter()
-                    .filter(|t| *t == "confluence_append")
-                    .cloned()
-                    .collect(),
-                tools,
-            });
-        }
+    for c in conns
+        .iter()
+        .filter(|c| !c.kind().uses_aws() && c.enabled && c.status == "ready")
+    {
+        let tools = tool_names(c.kind(), c);
+        out.push(common::skill_compat::Source {
+            kind: c.kind().as_str().to_string(),
+            name: c.kind().label().to_string(),
+            detail: describe(c),
+            writes: tools
+                .iter()
+                .filter(|t| *t == "confluence_append")
+                .cloned()
+                .collect(),
+            tools,
+        });
     }
-    if !aws {
-        aws = store::list_sources(&state.dynamo, table, team_id)
-            .await
-            .map(|l| {
-                l.iter()
-                    .any(|s| s.enabled && s.status == "ready" && s.aws.is_some())
-            })
-            .unwrap_or(false);
+    if !aws.metrics.is_empty() {
+        let k = ConnKind::Metrics;
+        out.push(common::skill_compat::Source {
+            kind: k.as_str().into(),
+            name: k.label().into(),
+            detail: describe_metrics(aws),
+            tools: tool_names(k, &Connector::new(k)),
+            writes: Vec::new(),
+        });
     }
-    if aws {
+    if !aws.airflow.is_empty() {
+        let k = ConnKind::Airflow;
+        out.push(common::skill_compat::Source {
+            kind: k.as_str().into(),
+            name: k.label().into(),
+            detail: describe_airflow(aws),
+            tools: tool_names(k, &Connector::new(k)),
+            writes: Vec::new(),
+        });
+    }
+    if !aws.accounts.is_empty()
+        || !aws.metrics.is_empty()
+        || !aws.airflow.is_empty()
+        || other_aws_sources
+    {
         out.push(common::skill_compat::Source {
             kind: "aws".into(),
             name: "AWS account".into(),
@@ -653,15 +954,203 @@ mod tests {
                     key: "k".into(),
                 })
                 .collect(),
+            aws: AwsAbilities::default(),
             roles: Vec::new(),
             calls: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
         }
     }
 
+    fn checked_account(id: &str, metrics: bool, envs: &[&str]) -> AwsAccount {
+        let mut a = AwsAccount {
+            account: id.into(),
+            role_arn: format!("arn:aws:iam::{id}:role/CoderHelmLogReader"),
+            external_id: "x".into(),
+            region: "us-east-1".into(),
+            status: "active".into(),
+            ..Default::default()
+        };
+        a.apply_check(
+            &identity::RoleCheck {
+                works: true,
+                can_read_logs: Some(true),
+                can_read_metrics: Some(metrics),
+                can_read_airflow: Some(!envs.is_empty()),
+                airflow_environments: envs.iter().map(|e| e.to_string()).collect(),
+                ..Default::default()
+            },
+            "t",
+        );
+        a
+    }
+
+    fn with_aws(aws: AwsAbilities) -> OpsTools {
+        OpsTools { aws, ..ops(vec![]) }
+    }
+
+    fn names(o: &OpsTools) -> Vec<String> {
+        o.tools().into_iter().map(|t| t.name).collect()
+    }
+
+    #[test]
+    fn metrics_and_airflow_tools_come_from_the_aws_account() {
+        let a = checked_account(
+            "123456789012",
+            true,
+            &["prod-bi-airflow", "staging-bi-airflow"],
+        );
+        let o = with_aws(AwsAbilities::from_parts(vec![a], &[]));
+        let n = names(&o);
+        assert!(n.contains(&"metrics_query".to_string()));
+        assert!(n.contains(&"airflow_dag_runs".to_string()));
+        assert_eq!(
+            o.aws.environments(),
+            vec!["prod-bi-airflow", "staging-bi-airflow"]
+        );
+        assert_eq!(
+            o.aws
+                .airflow_for("prod-bi-airflow")
+                .unwrap()
+                .target
+                .account(),
+            "123456789012"
+        );
+        assert_eq!(
+            o.aws.metrics_for(None).unwrap().target.account(),
+            "123456789012"
+        );
+        let p = o.prompt_section();
+        assert!(
+            p.contains("CloudWatch metrics in account 123456789012"),
+            "{p}"
+        );
+        assert!(p.contains("prod-bi-airflow"), "{p}");
+    }
+
+    #[test]
+    fn an_account_without_the_abilities_gives_no_tools() {
+        let a = checked_account("123456789012", false, &[]);
+        let o = with_aws(AwsAbilities::from_parts(vec![a.clone()], &[]));
+        let n = names(&o);
+        assert!(!n
+            .iter()
+            .any(|x| x.starts_with("metrics_") || x.starts_with("airflow_")));
+        // Switched off by an admin: same.
+        let mut off = checked_account("123456789012", true, &["prod"]);
+        off.abilities.metrics_off = true;
+        off.abilities.airflow_off = true;
+        let o = with_aws(AwsAbilities::from_parts(vec![off], &[]));
+        assert!(o.aws.metrics.is_empty() && o.aws.airflow.is_empty());
+    }
+
+    #[test]
+    fn airflow_reads_production_unless_told_otherwise() {
+        let v = |l: &[&str]| l.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            preferred_environment(&v(&["prod-bi-airflow", "staging-bi-airflow"])),
+            Some("prod-bi-airflow")
+        );
+        assert_eq!(
+            preferred_environment(&v(&["bi-prod", "bi-dev"])),
+            Some("bi-prod")
+        );
+        assert_eq!(preferred_environment(&v(&["a", "b"])), None);
+        assert_eq!(preferred_environment(&v(&["prod-a", "prod-b"])), None);
+        assert_eq!(preferred_environment(&v(&["only"])), Some("only"));
+        let o = with_aws(AwsAbilities::from_parts(
+            vec![checked_account(
+                "123456789012",
+                false,
+                &["prod-bi-airflow", "staging-bi-airflow"],
+            )],
+            &[],
+        ));
+        let t = o
+            .tools()
+            .into_iter()
+            .find(|t| t.name == "airflow_dags")
+            .unwrap();
+        assert!(t.input_schema["properties"]["environment"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("default prod-bi-airflow"));
+    }
+
+    #[test]
+    fn several_accounts_need_an_account_for_metrics() {
+        let o = with_aws(AwsAbilities::from_parts(
+            vec![
+                checked_account("111111111111", true, &[]),
+                checked_account("222222222222", true, &[]),
+            ],
+            &[],
+        ));
+        let t = o
+            .tools()
+            .into_iter()
+            .find(|t| t.name == "metrics_query")
+            .unwrap();
+        assert!(t.input_schema["properties"]["account"].is_object());
+        assert!(o.aws.metrics_for(None).is_err());
+        assert_eq!(
+            o.aws
+                .metrics_for(Some("222222222222"))
+                .unwrap()
+                .target
+                .account(),
+            "222222222222"
+        );
+        assert!(o.aws.metrics_for(Some("333333333333")).is_err());
+    }
+
+    #[test]
+    fn old_connections_are_used_only_until_the_account_gives_the_ability() {
+        let mut m = conn(ConnKind::Metrics);
+        m.aws = Some(AwsTarget {
+            role_arn: "arn:aws:iam::999999999999:role/CoderHelmLogReader".into(),
+            region: "us-west-2".into(),
+            ..Default::default()
+        });
+        let mut af = conn(ConnKind::Airflow);
+        af.aws = m.aws.clone();
+        let legacy = vec![m, af];
+        // No account gives them yet: the old connections work.
+        let aws =
+            AwsAbilities::from_parts(vec![checked_account("123456789012", false, &[])], &legacy);
+        assert_eq!(aws.metrics[0].target.account(), "999999999999");
+        assert_eq!(aws.environments(), vec!["prod"]);
+        // The account gives them: the account wins.
+        let aws = AwsAbilities::from_parts(
+            vec![checked_account("123456789012", true, &["new"])],
+            &legacy,
+        );
+        assert_eq!(aws.metrics.len(), 1);
+        assert_eq!(aws.metrics[0].target.account(), "123456789012");
+        assert_eq!(aws.environments(), vec!["new"]);
+    }
+
+    #[test]
+    fn the_skill_check_sees_account_abilities() {
+        let aws =
+            AwsAbilities::from_parts(vec![checked_account("123456789012", true, &["prod"])], &[]);
+        let nr = conn(ConnKind::NewRelic);
+        let src = inventory_from(std::slice::from_ref(&nr), &aws, false);
+        let kinds: Vec<&str> = src.iter().map(|s| s.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["newrelic", "metrics", "airflow", "aws"]);
+        let open = connectable_from(&[nr], &aws);
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert!(open[0].starts_with("confluence:"));
+        let none = connectable_from(&[], &AwsAbilities::default());
+        assert!(none
+            .iter()
+            .any(|l| l.starts_with("metrics:") && l.contains("AWS account")));
+    }
+
     #[test]
     fn tools_follow_what_is_connected() {
-        let o = ops(vec![conn(ConnKind::NewRelic), conn(ConnKind::Airflow)]);
+        let mut o = ops(vec![conn(ConnKind::NewRelic)]);
+        o.aws =
+            AwsAbilities::from_parts(vec![checked_account("123456789012", false, &["prod"])], &[]);
         let names: Vec<String> = o.tools().into_iter().map(|t| t.name).collect();
         assert!(names.contains(&"newrelic_nrql".to_string()));
         assert!(names.contains(&"airflow_dag_runs".to_string()));
@@ -705,9 +1194,9 @@ mod tests {
 
     #[test]
     fn the_prompt_names_each_connection() {
-        let mut m = conn(ConnKind::Metrics);
-        m.region = "us-east-1".into();
-        let p = ops(vec![conn(ConnKind::NewRelic), m]).prompt_section();
+        let mut o = ops(vec![conn(ConnKind::NewRelic)]);
+        o.aws = AwsAbilities::from_parts(vec![checked_account("123456789012", true, &[])], &[]);
+        let p = o.prompt_section();
         assert!(p.contains("New Relic"));
         assert!(p.contains("CloudWatch metrics"));
         assert!(p.contains("information only"));
