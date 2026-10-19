@@ -23,6 +23,8 @@ from urllib.error import HTTPError
 import boto3
 from botocore.exceptions import ClientError
 
+import usage
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -34,8 +36,11 @@ LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://app.coderhelm.com")
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+# Team usage counters (empty: usage isn't counted).
+ANALYTICS_TABLE = os.environ.get("ANALYTICS_TABLE_NAME", "")
 
 dynamodb = boto3.resource("dynamodb")
+dynamodb_client = boto3.client("dynamodb")
 aws_insights_table = dynamodb.Table(AWS_INSIGHTS_TABLE)
 settings_table = dynamodb.Table(SETTINGS_TABLE)
 sts_client = boto3.client("sts")
@@ -373,7 +378,7 @@ def analyze_connection(conn):
             new_recs.append(advisory_rec)
 
     # Send to Anthropic for analysis
-    recommendations = analyze_with_anthropic(all_results, account_id, api_key, existing)
+    recommendations = analyze_with_anthropic(all_results, account_id, api_key, existing, team_id=team_id)
 
     # None = the analysis failed: we can't tell "no issues" from "API error",
     # so nothing is resolved.
@@ -518,7 +523,7 @@ def parse_recommendations(output_text):
     return [r for r in recs if isinstance(r, dict)][:10]
 
 
-def analyze_with_anthropic(query_results, account_id, api_key, existing=None):
+def analyze_with_anthropic(query_results, account_id, api_key, existing=None, team_id=None):
     """Send log error summaries to Anthropic Claude for analysis."""
     # Scrub any secrets/tokens from the data before sending to AI
     scrubbed_results = scrub_query_results(query_results)
@@ -603,6 +608,12 @@ Return ONLY the JSON array, no surrounding text."""
 
         with urlopen(req, timeout=120) as resp:
             response_data = json.loads(resp.read().decode("utf-8"))
+
+        # Count the call once in the team's usage counters (tokens + cost).
+        usage.record_usage(
+            dynamodb_client, ANALYTICS_TABLE, team_id, usage.FEATURE_LOG_ANALYSIS,
+            MODEL_ID, response_data.get("usage"),
+        )
 
         recommendations = parse_recommendations(response_text(response_data))
         if recommendations is None:

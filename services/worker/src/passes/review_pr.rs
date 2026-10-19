@@ -1523,13 +1523,12 @@ fn review_cost_str(usage: &TokenUsage) -> String {
 
 /// True when the review used the model at all.
 fn has_usage(usage: &TokenUsage) -> bool {
-    usage.input_tokens + usage.output_tokens + usage.cache_read_tokens + usage.cache_write_tokens
-        > 0
+    usage.total_tokens() > 0
 }
 
-/// Persist what a review cost on its REVIEW# record, and add it to the team's
-/// usage counters — the same per-month analytics item runs add to and the token
-/// budget reads — so reviews are no longer free in the team's accounting.
+/// Persist what a review used on its REVIEW# record and count the review on the
+/// team's analytics item. Its tokens and cost reach the team's counters per
+/// model call (common::usage), so they are not added again here.
 async fn record_review_usage(
     state: &WorkerState,
     team_id: &str,
@@ -1572,16 +1571,9 @@ async fn record_review_usage(
             .table_name(&state.config.analytics_table_name)
             .key("team_id", attr_s(team_id))
             .key("period", attr_s(period))
-            .update_expression(
-                "ADD total_cost_usd :cost, total_tokens_in :ti, total_tokens_out :to, \
-                 cache_read_tokens :cr, cache_write_tokens :cw, \
-                 reviews :one, review_cost_usd :cost",
-            )
-            .expression_attribute_values(":cost", attr_n(&cost))
-            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-            .expression_attribute_values(":to", attr_n(usage.output_tokens))
-            .expression_attribute_values(":cr", attr_n(usage.cache_read_tokens))
-            .expression_attribute_values(":cw", attr_n(usage.cache_write_tokens))
+            // Tokens and cost are already counted per model call
+            // (common::usage, feature "review"); only the review count here.
+            .update_expression("ADD reviews :one")
             .expression_attribute_values(":one", attr_n(1))
             .send()
             .await
@@ -1638,12 +1630,18 @@ mod review_usage_tests {
 
     #[test]
     fn cost_matches_the_run_formula() {
-        let u = TokenUsage {
-            input_tokens: 100_000,
-            output_tokens: 10_000,
-            ..Default::default()
-        };
+        let mut u = TokenUsage::default();
+        u.add_call(
+            "claude-opus-5-5",
+            &common::usage::CallUsage {
+                uncached_input: 100_000,
+                output: 10_000,
+                ..Default::default()
+            },
+        );
         assert_eq!(review_cost_str(&u), format!("{:.4}", u.estimated_cost()));
+        // Opus 5.5: 0.1M × $4 + 0.01M × $20.
+        assert_eq!(review_cost_str(&u), "0.6000");
         assert!(review_cost_str(&u).parse::<f64>().unwrap() > 0.0);
     }
 }

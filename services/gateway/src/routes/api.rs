@@ -2913,6 +2913,7 @@ pub async fn get_stats(
             .and_then(|v| v.as_n().ok())
             .and_then(|n| n.parse().ok())
             .unwrap_or(0);
+        let t = common::usage::UsageTotals::from_item(item);
         json!({
             "total_runs": total,
             "completed": completed,
@@ -2921,6 +2922,10 @@ pub async fn get_stats(
             "total_cost_usd": cost,
             "total_tokens_in": tokens_in,
             "total_tokens_out": tokens_out,
+            "cache_read_tokens": t.cache_read,
+            "cache_write_tokens": t.cache_write,
+            "total_tokens": t.total(),
+            "cache_hit_rate": t.cache_hit_rate(),
             "merge_rate": if total > 0 { completed as f64 / total as f64 } else { 0.0 },
         })
     };
@@ -2982,6 +2987,9 @@ pub async fn get_stats_history(
             "total_cost_usd": get_f("total_cost_usd"),
             "total_tokens_in": get_n("total_tokens_in"),
             "total_tokens_out": get_n("total_tokens_out"),
+            "cache_read_tokens": get_n("cache_read_tokens"),
+            "cache_write_tokens": get_n("cache_write_tokens"),
+            "total_tokens": common::usage::UsageTotals::from_item(item).total(),
         }));
     }
 
@@ -3531,8 +3539,11 @@ pub async fn get_budget(
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0); // 0 = unlimited
+    let counts_cache = super::github_webhook::token_limit_counts_cache(result.item());
 
-    Ok(Json(json!({ "max_tokens": max_tokens })))
+    Ok(Json(
+        json!({ "max_tokens": max_tokens, "limit_counts_cache": counts_cache }),
+    ))
 }
 
 /// PUT /api/settings/budget — set monthly token limit.
@@ -3544,14 +3555,16 @@ pub async fn update_budget(
     claims.require_role(3)?; // admin or owner
     let max_tokens = body["max_tokens"].as_u64().unwrap_or(0);
 
+    // An update, not a put: keeps the item's other settings (counts_cache).
     state
         .dynamo
-        .put_item()
+        .update_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&claims.team_id))
-        .item("sk", attr_s("SETTINGS#TOKEN_LIMIT"))
-        .item(
-            "max_tokens",
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s("SETTINGS#TOKEN_LIMIT"))
+        .update_expression("SET max_tokens = :m")
+        .expression_attribute_values(
+            ":m",
             aws_sdk_dynamodb::types::AttributeValue::N(max_tokens.to_string()),
         )
         .send()
@@ -3597,40 +3610,61 @@ pub async fn get_usage(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let tokens_in: u64 = analytics
-        .item()
-        .and_then(|i| i.get("total_tokens_in"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
-    let tokens_out: u64 = analytics
-        .item()
-        .and_then(|i| i.get("total_tokens_out"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
-    let total_runs: u64 = analytics
-        .item()
-        .and_then(|i| i.get("total_runs"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
+    let counts_cache = super::github_webhook::token_limit_counts_cache(limit.item());
+    Ok(Json(usage_json(
+        &month,
+        analytics.item(),
+        limit.item(),
+        counts_cache,
+    )))
+}
 
-    let max_tokens: u64 = limit
-        .item()
-        .and_then(|i| i.get("max_tokens"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
-
-    Ok(Json(json!({
+/// The usage body: tokens only (no money). `total_tokens` is all four parts;
+/// `counted_tokens` is what the limit compares with `max_tokens` today.
+pub fn usage_json(
+    month: &str,
+    analytics: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
+    limit: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
+    counts_cache: bool,
+) -> Value {
+    let n = |item: Option<
+        &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+    >,
+             k: &str|
+     -> u64 {
+        item.and_then(|i| i.get(k))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    };
+    let t = common::usage::UsageTotals::from_item(analytics);
+    let features: Vec<Value> = common::usage::feature_totals(analytics)
+        .into_iter()
+        .map(|(f, ft)| {
+            json!({
+                "feature": f,
+                "total_tokens": ft.total(),
+                "tokens_in": ft.tokens_in_uncached,
+                "cache_read_tokens": ft.cache_read,
+                "cache_write_tokens": ft.cache_write,
+                "tokens_out": ft.tokens_out,
+            })
+        })
+        .collect();
+    json!({
         "month": month,
-        "total_tokens": tokens_in + tokens_out,
-        "tokens_in": tokens_in,
-        "tokens_out": tokens_out,
-        "total_runs": total_runs,
-        "max_tokens": max_tokens,
-    })))
+        "total_tokens": t.total(),
+        "tokens_in": t.tokens_in_uncached,
+        "cache_read_tokens": t.cache_read,
+        "cache_write_tokens": t.cache_write,
+        "tokens_out": t.tokens_out,
+        "cache_hit_rate": t.cache_hit_rate(),
+        "counted_tokens": t.counted(counts_cache),
+        "limit_counts_cache": counts_cache,
+        "features": features,
+        "total_runs": n(analytics, "total_runs"),
+        "max_tokens": n(limit, "max_tokens"),
+    })
 }
 
 /// GET /api/settings/workflow — get workflow preferences.
@@ -4573,7 +4607,54 @@ pub async fn purge_dlq(
 
 #[cfg(test)]
 mod tests {
-    use super::{platform_admin_listed, reset_allowed};
+    use super::{platform_admin_listed, reset_allowed, usage_json};
+
+    #[test]
+    fn usage_shows_all_four_parts_tokens_only() {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let call = common::usage::CallUsage {
+            uncached_input: 120_000,
+            cache_read: 61_400_000,
+            cache_write_5m: 8_800_000,
+            cache_write_1h: 0,
+            output: 1_000_000,
+        };
+        let (_, names, values) = common::usage::add_expression("run", "claude-opus-5-5", &call);
+        let mut analytics: std::collections::HashMap<String, A> = names
+            .iter()
+            .map(|(ph, a)| (a.clone(), values[&ph.replace("#a", ":v")].clone()))
+            .collect();
+        analytics.insert("total_runs".into(), A::N("3".into()));
+        let mut limit = std::collections::HashMap::new();
+        limit.insert("max_tokens".to_string(), A::N("200000000".into()));
+
+        let off = usage_json("2026-10", Some(&analytics), Some(&limit), false);
+        let parts = [
+            "tokens_in",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "tokens_out",
+        ];
+        let sum: u64 = parts.iter().map(|k| off[k].as_u64().unwrap()).sum();
+        assert_eq!(off["total_tokens"].as_u64().unwrap(), sum);
+        assert_eq!(sum, 71_320_000);
+        assert_eq!(
+            off["counted_tokens"], 1_120_000,
+            "old rule while the flag is off"
+        );
+        assert_eq!(off["limit_counts_cache"], false);
+        assert_eq!(off["max_tokens"], 200_000_000u64);
+        assert_eq!(off["features"][0]["feature"], "run");
+        assert_eq!(off["features"][0]["total_tokens"], 71_320_000u64);
+        let rate = off["cache_hit_rate"].as_f64().unwrap();
+        assert!((rate - 61_400_000.0 / 70_320_000.0).abs() < 1e-9);
+
+        let on = usage_json("2026-10", Some(&analytics), Some(&limit), true);
+        assert_eq!(on["counted_tokens"], on["total_tokens"]);
+        // No money on the usage view.
+        let text = on.to_string();
+        assert!(!text.contains("cost") && !text.contains("usd"), "{text}");
+    }
 
     #[test]
     fn only_listed_emails_are_platform_admins() {

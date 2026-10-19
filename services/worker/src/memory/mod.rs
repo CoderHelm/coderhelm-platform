@@ -292,10 +292,11 @@ impl AgentMemory {
     pub async fn extract_learnings_from_conversation(
         &mut self,
         conversation_json: &[serde_json::Value],
-        api_key: &str,
-        model_id: &str,
+        provider: &crate::agent::provider::ModelProvider,
         origin: &LearningOrigin,
     ) {
+        let api_key = provider.api_key();
+        let model_id = provider.primary_model_id();
         if conversation_json.is_empty() || api_key.is_empty() {
             return;
         }
@@ -385,6 +386,13 @@ impl AgentMemory {
                 return;
             }
         };
+        // Count the call (after the run: the team's counters, not the run's).
+        if let (Some(meter), Some(u)) = (&provider.meter, body.get("usage")) {
+            let call = common::usage::CallUsage::from_api(u, common::usage::CacheTtl::FiveMinutes);
+            meter
+                .record_as(common::usage::feature::MEMORY, model_id, &call)
+                .await;
+        }
 
         // First TEXT block — thinking models lead with a `thinking` block.
         let text = body["content"]

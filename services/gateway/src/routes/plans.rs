@@ -2425,10 +2425,6 @@ pub async fn plan_chat(
 
     // Agentic loop — up to 5 tool-use turns for plan chat (gateway has 30s timeout)
     let max_turns = 5;
-    let mut total_input_tokens: u64 = 0;
-    let mut total_output_tokens: u64 = 0;
-    let mut cache_read_tokens: u64 = 0;
-    let mut cache_write_tokens: u64 = 0;
     let mut mcp_servers_used: std::collections::HashSet<String> = std::collections::HashSet::new();
     let http = reqwest::Client::new();
 
@@ -2458,19 +2454,6 @@ pub async fn plan_chat(
             .await
             .map_err(|e| {
                 error!("Anthropic request failed: {e}");
-                let s = state.clone();
-                let t = claims.team_id.clone();
-                tokio::spawn(async move {
-                    track_chat_tokens(
-                        &s,
-                        &t,
-                        total_input_tokens,
-                        total_output_tokens,
-                        cache_read_tokens,
-                        cache_write_tokens,
-                    )
-                    .await;
-                });
                 StatusCode::BAD_GATEWAY
             })?;
 
@@ -2478,46 +2461,17 @@ pub async fn plan_chat(
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             error!("Anthropic API error ({status}): {body}");
-            let s = state.clone();
-            let t = claims.team_id.clone();
-            tokio::spawn(async move {
-                track_chat_tokens(
-                    &s,
-                    &t,
-                    total_input_tokens,
-                    total_output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                )
-                .await;
-            });
             return Err(StatusCode::BAD_GATEWAY);
         }
 
         let response: Value = resp.json().await.map_err(|e| {
             error!("Failed to parse Anthropic response: {e}");
-            let s = state.clone();
-            let t = claims.team_id.clone();
-            tokio::spawn(async move {
-                track_chat_tokens(
-                    &s,
-                    &t,
-                    total_input_tokens,
-                    total_output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                )
-                .await;
-            });
             StatusCode::BAD_GATEWAY
         })?;
 
-        // Track token usage
+        // Count this call, once, as it happens.
         if let Some(usage) = response.get("usage") {
-            total_input_tokens += usage["input_tokens"].as_u64().unwrap_or(0);
-            total_output_tokens += usage["output_tokens"].as_u64().unwrap_or(0);
-            cache_read_tokens += usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-            cache_write_tokens += usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            count_chat_call(&state, &claims.team_id, &model_id, usage).await;
         }
 
         let content = response["content"].as_array().cloned().unwrap_or_default();
@@ -2547,21 +2501,6 @@ pub async fn plan_chat(
                 .collect::<Vec<_>>()
                 .join("");
 
-            {
-                let state_clone = state.clone();
-                let team_id_clone = claims.team_id.clone();
-                tokio::spawn(async move {
-                    track_chat_tokens(
-                        &state_clone,
-                        &team_id_clone,
-                        total_input_tokens,
-                        total_output_tokens,
-                        cache_read_tokens,
-                        cache_write_tokens,
-                    )
-                    .await;
-                });
-            }
             let servers: Vec<&str> = mcp_servers_used.iter().map(|s| s.as_str()).collect();
             return Ok(Json(json!({ "content": text, "mcp_servers": servers })));
         }
@@ -2639,21 +2578,6 @@ pub async fn plan_chat(
         })
         .unwrap_or_default();
 
-    {
-        let state_clone = state.clone();
-        let team_id_clone = claims.team_id.clone();
-        tokio::spawn(async move {
-            track_chat_tokens(
-                &state_clone,
-                &team_id_clone,
-                total_input_tokens,
-                total_output_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-            )
-            .await;
-        });
-    }
     let servers: Vec<&str> = mcp_servers_used.iter().map(|s| s.as_str()).collect();
     Ok(Json(json!({ "content": text, "mcp_servers": servers })))
 }
@@ -2693,8 +2617,6 @@ async fn run_anthropic_stream(
     let max_turns = 5;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
-    let mut cache_read_tokens: u64 = 0;
-    let mut cache_write_tokens: u64 = 0;
 
     info!(
         model = model_id,
@@ -2744,15 +2666,6 @@ async fn run_anthropic_stream(
                         json!({"message": format!("Anthropic API error: {status}")}),
                     ))
                     .await;
-                track_chat_tokens(
-                    state,
-                    team_id,
-                    total_input_tokens,
-                    total_output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                )
-                .await;
                 return;
             }
             Err(e) => {
@@ -2763,15 +2676,6 @@ async fn run_anthropic_stream(
                         json!({"message": format!("AI service error: {e}")}),
                     ))
                     .await;
-                track_chat_tokens(
-                    state,
-                    team_id,
-                    total_input_tokens,
-                    total_output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                )
-                .await;
                 return;
             }
         };
@@ -2790,6 +2694,8 @@ async fn run_anthropic_stream(
         let mut blocks: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
         let mut block_json: std::collections::HashMap<u64, String> =
             std::collections::HashMap::new();
+        // This turn's usage: message_start's, updated by message_delta.
+        let mut turn_usage = json!({});
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -2886,22 +2792,30 @@ async fn run_anthropic_stream(
                         if let Some(sr) = event["delta"]["stop_reason"].as_str() {
                             stop_reason = sr.to_string();
                         }
-                        if let Some(u) = event.get("usage") {
-                            total_output_tokens += u["output_tokens"].as_u64().unwrap_or(0);
+                        // Counts here are cumulative for the message: take
+                        // the latest value of each, never add them up.
+                        if let Some(u) = event.get("usage").and_then(|u| u.as_object()) {
+                            for (k, v) in u {
+                                if !v.is_null() {
+                                    turn_usage[k] = v.clone();
+                                }
+                            }
                         }
                     }
                     Some("message_start") => {
                         if let Some(u) = event.get("message").and_then(|m| m.get("usage")) {
-                            total_input_tokens += u["input_tokens"].as_u64().unwrap_or(0);
-                            cache_read_tokens += u["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                            cache_write_tokens +=
-                                u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                            turn_usage = u.clone();
                         }
                     }
                     _ => {}
                 }
             }
         }
+
+        // Count this call, once, even if the stream broke off.
+        total_input_tokens += turn_usage["input_tokens"].as_u64().unwrap_or(0);
+        total_output_tokens += turn_usage["output_tokens"].as_u64().unwrap_or(0);
+        count_chat_call(state, team_id, model_id, &turn_usage).await;
 
         // Assistant turn for conversation state: every block, in order, verbatim.
         let assistant_content: Vec<Value> = blocks.into_values().collect();
@@ -2937,19 +2851,6 @@ async fn run_anthropic_stream(
                 ))
                 .await;
             let _ = tx.send(sse_event("done", json!({}))).await;
-            let state_c = state.clone();
-            let tid = team_id.to_string();
-            tokio::spawn(async move {
-                track_chat_tokens(
-                    &state_c,
-                    &tid,
-                    total_input_tokens,
-                    total_output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                )
-                .await;
-            });
             return;
         }
 
@@ -3031,19 +2932,6 @@ async fn run_anthropic_stream(
         ))
         .await;
     let _ = tx.send(sse_event("done", json!({}))).await;
-    let state_c = state.clone();
-    let tid = team_id.to_string();
-    tokio::spawn(async move {
-        track_chat_tokens(
-            &state_c,
-            &tid,
-            total_input_tokens,
-            total_output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-        )
-        .await;
-    });
 }
 
 #[allow(clippy::collapsible_match)]
@@ -3229,31 +3117,22 @@ fn compact_tool_result_for_model(result: &Value) -> String {
     let truncated: String = s.chars().take(max_chars).collect();
     format!("{truncated}… [truncated]")
 }
-async fn track_chat_tokens(
-    state: &AppState,
-    team_id: &str,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-) {
-    let month = chrono::Utc::now().format("%Y-%m").to_string();
-    for period in &[month.as_str(), "ALL_TIME"] {
-        let _ = state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.analytics_table_name)
-            .key("team_id", attr_s(team_id))
-            .key("period", attr_s(period))
-            .update_expression(
-                "ADD total_tokens_in :tin, total_tokens_out :tout, cache_read_tokens :cr, cache_write_tokens :cw",
-            )
-            .expression_attribute_values(":tin", attr_n(input_tokens))
-            .expression_attribute_values(":tout", attr_n(output_tokens))
-            .expression_attribute_values(":cr", attr_n(cache_read_tokens))
-            .expression_attribute_values(":cw", attr_n(cache_write_tokens))
-            .send()
-            .await;
+
+/// Count one plan chat model call in the team's usage counters (all four
+/// token parts, priced per model). Never fails the chat.
+async fn count_chat_call(state: &AppState, team_id: &str, model_id: &str, usage: &Value) {
+    let call = common::usage::CallUsage::from_api(usage, common::usage::CacheTtl::FiveMinutes);
+    if let Err(e) = common::usage::record(
+        &state.dynamo,
+        &state.config.analytics_table_name,
+        team_id,
+        common::usage::feature::CHAT,
+        model_id,
+        &call,
+    )
+    .await
+    {
+        warn!(team_id, error = %e, "Couldn't record plan chat usage");
     }
 }
 

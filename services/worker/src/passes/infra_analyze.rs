@@ -1,7 +1,7 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{info, warn};
 
-use crate::agent::anthropic::{self, AnthropicClient};
+use crate::agent::anthropic;
 use crate::agent::provider::ModelProvider;
 use crate::models::{InfraAnalyzeMessage, TokenUsage};
 use crate::WorkerState;
@@ -832,7 +832,7 @@ async fn call_anthropic(
         "Analyze this infrastructure code and generate the diagram and findings:\n\n{code_context}"
     );
 
-    let client = AnthropicClient::new(provider.api_key().to_string());
+    let client = provider.client();
     anthropic::converse_simple(&client, provider.primary_model_id(), SYSTEM, &prompt, usage).await
 }
 
@@ -853,7 +853,7 @@ async fn call_anthropic_retry(
          Use junctions for 3+ edges from one port."
     );
 
-    let client = AnthropicClient::new(provider.api_key().to_string());
+    let client = provider.client();
     anthropic::converse_simple(&client, provider.primary_model_id(), SYSTEM, &prompt, usage).await
 }
 

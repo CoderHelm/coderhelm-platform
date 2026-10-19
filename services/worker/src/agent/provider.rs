@@ -15,6 +15,9 @@ pub struct ModelProvider {
     pub api_key: String,
     pub primary_model: String,
     pub heavy_model: String,
+    /// Counts this team's model calls (set by `load_for_team`).
+    #[serde(skip)]
+    pub meter: Option<common::usage::UsageMeter>,
 }
 
 impl ModelProvider {
@@ -66,10 +69,22 @@ impl ModelProvider {
             .unwrap_or_else(|| "claude-opus-5-5".to_string());
 
         info!(team_id, "Loaded Anthropic provider");
+        let analytics_table = std::env::var("ANALYTICS_TABLE_NAME").unwrap_or_default();
+        if analytics_table.is_empty() {
+            tracing::warn!(
+                team_id,
+                "ANALYTICS_TABLE_NAME unset: model usage won't be counted"
+            );
+        }
         Ok(Self {
             api_key,
             primary_model,
             heavy_model,
+            meter: Some(common::usage::UsageMeter::dynamo(
+                dynamo.clone(),
+                &analytics_table,
+                team_id,
+            )),
         })
     }
 
@@ -88,8 +103,13 @@ impl ModelProvider {
         &self.api_key
     }
 
-    fn client(&self) -> AnthropicClient {
-        AnthropicClient::new(self.api_key.clone())
+    /// A client whose every response is counted for this team.
+    pub fn client(&self) -> AnthropicClient {
+        let meter = self.meter.clone().unwrap_or_else(|| {
+            tracing::warn!("Model provider without a usage meter; usage stays uncounted");
+            common::usage::UsageMeter::memory("").0
+        });
+        AnthropicClient::new(self.api_key.clone(), meter)
     }
 }
 

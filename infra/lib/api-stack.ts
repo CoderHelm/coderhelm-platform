@@ -280,6 +280,23 @@ export class ApiStack extends cdk.Stack {
       ],
     });
 
+    // Usage reconciliation: daily 06:00 UTC, compares the previous day's
+    // recorded model usage with Anthropic's usage/cost report. The worker
+    // does nothing unless the coderhelm/<stage>/anthropic-admin-keys secret
+    // exists, so this is safe to run before that secret is added.
+    new events.Rule(this, "UsageReconcileSchedule", {
+      ruleName: `${prefix}-usage-reconcile`,
+      description: "Compare recorded model usage with Anthropic's report (daily)",
+      schedule: events.Schedule.cron({ minute: "0", hour: "6" }),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "usage_reconcile",
+          }),
+        }),
+      ],
+    });
+
     // --- Secrets ---
 
     const secrets = secretsmanager.Secret.fromSecretNameV2(
@@ -368,7 +385,9 @@ export class ApiStack extends cdk.Stack {
         resources: [`arn:aws:dynamodb:${this.region}:${this.account}:table/coderhelm-${props.stage}-runs/index/*`],
       })
     );
-    analyticsTable.grantReadData(this.gatewayFunction);
+    // Write: plan chat counts its model calls in the team's usage counters
+    // (read-only before, so those writes silently failed).
+    analyticsTable.grantReadWriteData(this.gatewayFunction);
     jiraEventsTable.grantReadWriteData(this.gatewayFunction);
     tracesTable.grantReadData(this.gatewayFunction);
 

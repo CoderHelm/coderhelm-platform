@@ -182,6 +182,47 @@ pub enum WorkerMessage {
     /// One test weekly summary for a team, to one address only.
     #[serde(rename = "weekly_summary_test")]
     WeeklySummaryTest(crate::passes::weekly_summary::WeeklySummaryTestMessage),
+    /// Daily (EventBridge → SQS): compare our recorded usage with Anthropic's
+    /// usage and cost report. Off unless the admin-key secret exists.
+    #[serde(rename = "usage_reconcile")]
+    UsageReconcile(UsageReconcileMessage),
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct UsageReconcileMessage {
+    /// `YYYY-MM-DD` (UTC) to compare; empty = yesterday.
+    #[serde(default)]
+    pub day: String,
+}
+
+impl WorkerMessage {
+    /// The usage feature every model call made while handling this message
+    /// is counted under (`common::usage::feature`).
+    pub fn usage_feature(&self) -> &'static str {
+        use common::usage::feature as f;
+        match self {
+            WorkerMessage::Ticket(t) if matches!(t.source, TicketSource::Alert) => f::ALERT,
+            WorkerMessage::Ticket(_) | WorkerMessage::Resume(_) | WorkerMessage::MarkReady(_) => {
+                f::RUN
+            }
+            WorkerMessage::Feedback(_) => f::FEEDBACK,
+            WorkerMessage::Onboard(_) => f::ONBOARD,
+            WorkerMessage::PlanExecute(_) | WorkerMessage::PlanTaskContinue(_) => f::PLAN,
+            WorkerMessage::InfraAnalyze(_) => f::INFRA,
+            WorkerMessage::Review(_) | WorkerMessage::ReviewReminder => f::REVIEW,
+            WorkerMessage::SkillSync(_) => f::SKILL_SYNC,
+            WorkerMessage::SkillAsk(_) => f::AGENT_ASK,
+            WorkerMessage::ReleaseNotes(_) | WorkerMessage::TagSweep(_) => f::RELEASE_NOTES,
+            WorkerMessage::TestIngest(_) | WorkerMessage::TestAction(_) => f::TESTS,
+            WorkerMessage::ToolProposals(_) => f::LIVE_SOURCES,
+            WorkerMessage::HealthCheck(_)
+            | WorkerMessage::AwaitMerge(_)
+            | WorkerMessage::GraphIndex(_)
+            | WorkerMessage::WeeklySummary
+            | WorkerMessage::WeeklySummaryTest(_)
+            | WorkerMessage::UsageReconcile(_) => f::OTHER,
+        }
+    }
 }
 
 /// A code-graph index job. `changed_files: None` ⇒ full index of the branch
@@ -437,23 +478,50 @@ pub struct ReviewComment {
     pub is_context: bool,
 }
 
-/// Token usage tracking with prompt cache metrics.
+/// One run's (or one job's) token usage with prompt cache metrics. Per-run
+/// totals only: the team's monthly counters are written per model call by
+/// `common::usage` (never from this struct), so nothing is counted twice.
 #[derive(Debug, Default, Clone)]
 pub struct TokenUsage {
+    /// Uncached input (Anthropic `input_tokens`).
     pub input_tokens: u64,
+    /// Output, thinking included.
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+    /// All cache writes (5-minute + 1-hour).
     pub cache_write_tokens: u64,
+    /// The 1-hour part of `cache_write_tokens`.
+    pub cache_write_1h_tokens: u64,
+    /// USD, each call priced at its own model's rates.
+    pub cost_usd: f64,
     pub tool_calls: u64,
     pub tool_names: Vec<String>,
 }
 
 impl TokenUsage {
-    pub fn add(&mut self, input: u64, output: u64, cache_read: u64, cache_write: u64) {
-        self.input_tokens += input;
-        self.output_tokens += output;
-        self.cache_read_tokens += cache_read;
-        self.cache_write_tokens += cache_write;
+    /// Add one model call's usage, priced at `model_id`'s rates.
+    pub fn add_call(&mut self, model_id: &str, call: &common::usage::CallUsage) {
+        self.input_tokens += call.uncached_input;
+        self.output_tokens += call.output;
+        self.cache_read_tokens += call.cache_read;
+        self.cache_write_tokens += call.cache_write();
+        self.cache_write_1h_tokens += call.cache_write_1h;
+        self.cost_usd += call.cost_usd(model_id);
+    }
+
+    /// Add another usage's tokens and cost (tool calls are not merged).
+    pub fn merge(&mut self, other: &TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+        self.cache_write_1h_tokens += other.cache_write_1h_tokens;
+        self.cost_usd += other.cost_usd;
+    }
+
+    /// All four parts.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
     }
 
     pub fn record_tool_call(&mut self, name: &str, duration_ms: u64) {
@@ -464,21 +532,34 @@ impl TokenUsage {
         let _ = duration_ms; // tracked for logging, not stored in cumulative
     }
 
-    /// Estimated cost using blended rates across Opus (implement) and Sonnet (other passes).
-    /// Actual Anthropic billing is model-specific; this is an approximation for display.
-    /// Blended: ~60% of input goes to Opus, ~40% to Sonnet (implement is the heaviest pass).
+    /// USD for this usage: the sum of each call at its own model's price.
     pub fn estimated_cost(&self) -> f64 {
-        // Blended input rate: weighted average of Opus ($15/M) and Sonnet ($3/M)
-        let input_rate = 10.0 / 1_000_000.0;
-        // Blended output rate: weighted average of Opus ($75/M) and Sonnet ($15/M)
-        let output_rate = 50.0 / 1_000_000.0;
+        self.cost_usd
+    }
 
-        let input_cost = self.input_tokens as f64 * input_rate;
-        let output_cost = self.output_tokens as f64 * output_rate;
-        let cache_read_cost = self.cache_read_tokens as f64 * input_rate * 0.1;
-        let cache_write_cost = self.cache_write_tokens as f64 * input_rate * 1.25;
-
-        input_cost + output_cost + cache_read_cost + cache_write_cost
+    /// Rebuild a saved usage. Old checkpoints carry no cost: their tokens are
+    /// priced at `model_id`'s rates.
+    pub fn restored(
+        model_id: &str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cost_usd: Option<f64>,
+    ) -> Self {
+        let call = common::usage::CallUsage {
+            uncached_input: input,
+            cache_read,
+            cache_write_5m: cache_write,
+            cache_write_1h: 0,
+            output,
+        };
+        let mut u = TokenUsage::default();
+        u.add_call(model_id, &call);
+        if let Some(c) = cost_usd {
+            u.cost_usd = c;
+        }
+        u
     }
 }
 
@@ -588,12 +669,36 @@ mod tests {
     #[test]
     fn token_usage_cost() {
         let mut usage = TokenUsage::default();
-        usage.add(1000, 500, 200, 100);
-        assert_eq!(usage.input_tokens, 1000);
-        assert_eq!(usage.output_tokens, 500);
-        assert_eq!(usage.cache_read_tokens, 200);
-        assert_eq!(usage.cache_write_tokens, 100);
-        assert!(usage.estimated_cost() > 0.0);
+        let call = common::usage::CallUsage {
+            uncached_input: 1000,
+            cache_read: 200,
+            cache_write_5m: 100,
+            cache_write_1h: 0,
+            output: 500,
+        };
+        usage.add_call("claude-opus-5-5", &call);
+        usage.add_call("claude-sonnet-5-5", &call);
+        assert_eq!(usage.input_tokens, 2000);
+        assert_eq!(usage.output_tokens, 1000);
+        assert_eq!(usage.cache_read_tokens, 400);
+        assert_eq!(usage.cache_write_tokens, 200);
+        assert_eq!(usage.total_tokens(), 3600);
+        // Each call at its own model's price, not one blended rate.
+        let want = call.cost_usd("claude-opus-5-5") + call.cost_usd("claude-sonnet-5-5");
+        assert!((usage.estimated_cost() - want).abs() < 1e-12);
+        let mut merged = TokenUsage::default();
+        merged.merge(&usage);
+        assert_eq!(merged.total_tokens(), usage.total_tokens());
+        assert!((merged.cost_usd - usage.cost_usd).abs() < 1e-12);
+    }
+
+    #[test]
+    fn restored_usage_keeps_a_saved_cost_or_prices_the_tokens() {
+        let r = TokenUsage::restored("claude-opus-5-5", 10, 20, 30, 40, Some(1.5));
+        assert_eq!(r.total_tokens(), 100);
+        assert_eq!(r.cost_usd, 1.5);
+        let r = TokenUsage::restored("claude-opus-5-5", 1_000_000, 0, 0, 0, None);
+        assert!((r.cost_usd - 4.0).abs() < 1e-9);
     }
 
     #[test]
