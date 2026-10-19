@@ -668,6 +668,8 @@ pub async fn get_run(
         "cost_usd": cost_usd,
         "files_modified": item.get("files_modified").and_then(|v| v.as_l().ok()).map(|list| list.iter().filter_map(|v| v.as_s().ok().map(|s| s.as_str())).collect::<Vec<_>>()),
         "mcp_servers": item.get("mcp_servers").and_then(|v| v.as_l().ok()).map(|list| list.iter().filter_map(|v| v.as_s().ok().map(|s| s.as_str())).collect::<Vec<_>>()),
+        // Team standards the run's passes were given in full ("always apply").
+        "applied_standards": item.get("applied_standards").and_then(|v| v.as_ss().ok()).map(|set| { let mut v: Vec<&str> = set.iter().map(String::as_str).collect(); v.sort_unstable(); v }).unwrap_or_default(),
         "duration_s": item.get("duration_s").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "error": item.get("error_message").and_then(|v| v.as_s().ok()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),

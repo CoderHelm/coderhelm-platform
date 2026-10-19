@@ -716,12 +716,30 @@ async fn run_locked(
             &msg.team_id,
         )
         .await?;
+        // The team's standards set to always apply to release notes (a
+        // writing guide, say), in full. Path-scoped ones need the work's
+        // files, which a release doesn't have, so they aren't given.
+        let standards = super::skills::TeamSkills::load(
+            state,
+            &msg.team_id,
+            super::skills::Reader::Writer,
+            format!("{owner}/{repo} · {tag}"),
+            super::skills::Work::new(format!("{owner}/{repo}"), &["release_notes"], Vec::new()),
+        )
+        .await;
+        let system = match &standards {
+            Some(s) => {
+                s.record_applied(state).await;
+                format!("{WRITER_SYSTEM}{}", s.standards_section())
+            }
+            None => WRITER_SYSTEM.to_string(),
+        };
         let mut usage = TokenUsage::default();
         let reply = provider::converse_simple(
             state,
             &provider,
             provider.heavy_model_id(),
-            WRITER_SYSTEM,
+            &system,
             &prompt,
             &mut usage,
         )

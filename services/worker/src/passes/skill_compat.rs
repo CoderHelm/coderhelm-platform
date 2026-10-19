@@ -680,6 +680,8 @@ mod tests {
                 fingerprint: kept_fp.into(),
                 ..Default::default()
             },
+            always: Default::default(),
+            suggestion: Default::default(),
         }
     }
 

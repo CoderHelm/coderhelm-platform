@@ -417,12 +417,14 @@ Rules:
     // Correct a stale stored base so the rest of the system stays consistent.
     heal_run_base_branch(state, &msg, &base).await;
     let ci_only = comments.is_empty() && msg.review_body.trim().is_empty();
+    // The PR's changed files: the scope of a CI-only cycle, and what the
+    // team's always-applied skills scoped to paths are matched against.
+    let pr_files = github
+        .compare_changed_files(&msg.repo_owner, &msg.repo_name, &base, &branch)
+        .await;
     let scope_guard = if ci_only {
-        match github
-            .compare_changed_files(&msg.repo_owner, &msg.repo_name, &base, &branch)
-            .await
-        {
-            Ok(files) => super::write_guard::ScopeGuard::scoped(files),
+        match &pr_files {
+            Ok(files) => super::write_guard::ScopeGuard::scoped(files.clone()),
             Err(e) => {
                 warn!(run_id = %msg.run_id, error = %e, "Could not list PR files — feedback cycle runs unscoped");
                 super::write_guard::ScopeGuard::unscoped()
@@ -474,6 +476,12 @@ Rules:
         &msg.team_id,
         super::skills::Reader::Coder,
         format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
+        super::skills::Work::new(
+            format!("{}/{}", msg.repo_owner, msg.repo_name),
+            // It fixes code and replies to the comments.
+            &["coder", "replies"],
+            pr_files.unwrap_or_default(),
+        ),
     )
     .await
     .map(|s| {
@@ -485,6 +493,7 @@ Rules:
     if let Some(s) = &skills {
         tools.extend(s.tools());
         full_system.push_str(&s.prompt_section());
+        s.record_applied(state).await;
     }
 
     let executor = FeedbackToolExecutor {

@@ -474,6 +474,12 @@ fn review_item_to_json(item: &HashMap<String, AttributeValue>, truncate_body: bo
         "thumbs_down": item_num(item, "thumbs_down", 0),
         "rating_comments": comments,
         "created_at": item_str(item, "created_at", ""),
+        // Team standards the review was given in full ("always apply").
+        "applied_standards": item
+            .get("applied_standards")
+            .and_then(|v| v.as_l().ok())
+            .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect::<Vec<_>>())
+            .unwrap_or_default(),
     })
 }
 

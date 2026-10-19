@@ -354,6 +354,13 @@ After researching, output the four files using this exact format:
             &msg.ticket_id,
             msg.issue_number,
         ),
+        // The files aren't known before the plan: an item scoped to paths
+        // is named for the planner to read if the plan touches them.
+        super::skills::Work::new(
+            format!("{}/{}", msg.repo_owner, msg.repo_name),
+            &["planner"],
+            Vec::new(),
+        ),
     )
     .await
     .map(|s| {
@@ -363,6 +370,7 @@ After researching, output the four files using this exact format:
     if let Some(s) = &skills {
         tools.extend(s.tools());
         full_system.push_str(&s.prompt_section());
+        s.record_applied(state).await;
     }
 
     let executor = CombinedToolExecutor {

@@ -428,6 +428,12 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             &msg.ticket_id,
             msg.issue_number,
         ),
+        // The files the plan names, for items scoped to paths.
+        super::skills::Work::new(
+            format!("{}/{}", msg.repo_owner, msg.repo_name),
+            &["coder"],
+            extract_file_paths(&plan.tasks),
+        ),
     )
     .await
     .map(|s| {
@@ -437,6 +443,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
     if let Some(s) = &skills {
         tools.extend(s.tools());
         full_system.push_str(&s.prompt_section());
+        s.record_applied(state).await;
     }
 
     // When the execution sandbox is available, tell the agent to actually use
