@@ -732,14 +732,21 @@ pub async fn create_memory(
         );
         node.tags = tags;
         node.confidence = 1.0;
-        let id = node.id.to_string();
-        db.store(node).map_err(|e| {
+        let new_id = node.id;
+        let outcome = db.store_with_outcome(node).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Save failed: {e}"),
             )
         })?;
-        Ok((db, id))
+        // A near-verbatim copy of an existing memory is not stored again;
+        // hand back the memory that already says it, since `new_id` does not
+        // exist.
+        let id = match outcome {
+            mentedb::StoreOutcome::Stored => new_id,
+            mentedb::StoreOutcome::Duplicate { of } => of,
+        };
+        Ok((db, id.to_string()))
     })
     .await?;
     info!(memory_id = %id, "Memory added via dashboard");
