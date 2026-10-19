@@ -394,6 +394,15 @@ async fn main() -> Result<(), Error> {
             "/aws-connections/:id/log-groups",
             get(routes::log_analyzer::discover_log_groups),
         )
+        .route(
+            "/aws-connections/:id/abilities",
+            put(routes::integrations::set_aws_abilities),
+        )
+        .route(
+            "/aws-connections/:id/abilities/check",
+            post(routes::integrations::check_aws),
+        )
+        .route("/integrations", get(routes::integrations::list))
         // Recommendations
         .route(
             "/recommendations",

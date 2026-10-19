@@ -11,6 +11,9 @@ pub struct Config {
     pub jira_config_table_name: String,
     pub repos_table_name: String,
     pub settings_table_name: String,
+    /// Connected AWS accounts and what each can do (logs, metrics, Airflow).
+    /// Empty: agents use only the older separate connections.
+    pub aws_insights_table_name: String,
     pub infra_table_name: String,
     pub mcp_configs_table_name: String,
     pub traces_table_name: String,
@@ -55,6 +58,7 @@ impl Config {
             repos_table_name: std::env::var("REPOS_TABLE_NAME").expect("REPOS_TABLE_NAME required"),
             settings_table_name: std::env::var("SETTINGS_TABLE_NAME")
                 .expect("SETTINGS_TABLE_NAME required"),
+            aws_insights_table_name: std::env::var("AWS_INSIGHTS_TABLE_NAME").unwrap_or_default(),
             infra_table_name: std::env::var("INFRA_TABLE_NAME").expect("INFRA_TABLE_NAME required"),
             mcp_configs_table_name: std::env::var("MCP_CONFIGS_TABLE_NAME").unwrap_or_default(),
             traces_table_name: std::env::var("TRACES_TABLE_NAME").unwrap_or_default(),

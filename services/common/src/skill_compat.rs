@@ -109,8 +109,9 @@ pub struct Inventory {
     /// Commands Coderhelm does another way (only those whose tools it has).
     #[serde(default)]
     pub translations: Vec<Translation>,
-    /// Monitoring, docs and pipeline connections the team can set up in Data
-    /// sources but hasn't, by `id: what it reads`.
+    /// Monitoring, docs and pipeline connections the team can set up in
+    /// Settings → Integrations but hasn't, by `id: what it reads` (metrics
+    /// and Airflow are abilities of a connected AWS account).
     #[serde(default)]
     pub connections: Vec<String>,
     pub never: Vec<String>,
@@ -228,6 +229,10 @@ pub struct Requirement {
     /// doesn't do this, or it can't run in Coderhelm).
     #[serde(default)]
     pub action: String,
+    /// Worked out here, never by the model: the dashboard page (with the
+    /// card's anchor) where it is connected, or empty. See [`integrations_link`].
+    #[serde(default)]
+    pub link: String,
     /// Worked out here, never by the model: "inventory" when the status
     /// follows from the inventory alone (and so is the same on every
     /// check), "model" when it is the model's judgment.
@@ -262,6 +267,9 @@ pub struct Need {
     /// As on [`Requirement::connection`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub connection: String,
+    /// As on [`Requirement::link`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub link: String,
     /// "missing", or "blocked" for a write no connected tool can make.
     pub status: String,
     /// Steps it holds up.
@@ -401,7 +409,7 @@ short name of what's missing (a product name like the monitoring tool's name, or
 that's done: plugins (MCP servers), data_sources (APIs, databases, logs), github, or none. For \
 plugins, `server` is the id of the MCP server it means from the inventory's servers or \
 connectable list, or empty when none fits. When it is one of the inventory's `connections` (New \
-Relic, Confluence, CloudWatch metrics, Airflow on MWAA: these are Coderhelm data sources, not MCP \
+Relic, Confluence, CloudWatch metrics, Airflow on MWAA: these are Coderhelm integrations, not MCP \
 servers), set `connect` to data_sources and `connection` to its id; otherwise `connection` is \
 empty. Only genuinely impossible things stay missing: running \
 arbitrary shell commands, a person's local files, systems not connected.
@@ -748,7 +756,37 @@ fn translated_by(asks: &str, inv: &Inventory) -> Option<Vec<String>> {
     Some(uses)
 }
 
+/// Where in the dashboard a gap is connected: the Integrations page card
+/// (`#integration-<id>`) for GitHub, MCP servers, New Relic, Confluence and
+/// the AWS account (whose abilities are CloudWatch metrics and Airflow), or
+/// the Data sources page for APIs, databases and logs. Empty when there is
+/// nothing to connect.
+pub fn integrations_link(q: &Requirement) -> String {
+    if q.action == "none" || q.action.is_empty() {
+        return String::new();
+    }
+    let card = |id: &str| format!("/settings/integrations#integration-{id}");
+    match crate::live::connectors::ConnKind::parse(&q.connection) {
+        Some(k) if k.uses_aws() => return card("aws"),
+        Some(k) => return card(k.as_str()),
+        None => {}
+    }
+    match q.connect.as_str() {
+        "plugins" if !q.server.is_empty() => card(&q.server),
+        "plugins" => "/settings/integrations#other-tools".into(),
+        "data_sources" => "/data-sources".into(),
+        "github" => card("github"),
+        _ => String::new(),
+    }
+}
+
 fn check(q: Requirement, inv: &Inventory) -> Requirement {
+    let mut q = check_inner(q, inv);
+    q.link = integrations_link(&q);
+    q
+}
+
+fn check_inner(q: Requirement, inv: &Inventory) -> Requirement {
     let mut q = Requirement {
         asks: clip(&q.asks, 200),
         needs: clip(&q.needs, 60),
@@ -819,19 +857,27 @@ fn check(q: Requirement, inv: &Inventory) -> Requirement {
         return q;
     }
     if let Some(kind) = crate::live::connectors::ConnKind::parse(&q.connection) {
-        // A monitoring, docs or pipeline connection: set up on the Data
-        // sources page, never an MCP server.
+        // A monitoring, docs or pipeline connection: set up on the
+        // Integrations page (metrics and Airflow as abilities of the AWS
+        // account), never an MCP server.
         let connected = inv.sources.iter().any(|s| s.kind == kind.as_str());
         q.connect = "data_sources".into();
         q.server.clear();
         q.action = "connect".into();
-        q.fix = match (connected, q.status.as_str()) {
-            (true, "blocked") => format!(
-                "Turn on {} writes and list the page in Data sources, or leave this step to a person.",
+        q.fix = match (connected, q.status.as_str(), kind.uses_aws()) {
+            (true, "blocked", _) => format!(
+                "Turn on {} writes and list the page in Settings → Integrations, or leave this step to a person.",
                 kind.label()
             ),
-            (true, _) => format!("{} is connected; check its settings in Data sources.", kind.label()),
-            (false, _) => format!("Connect {} in Data sources.", kind.label()),
+            (true, _, _) => format!(
+                "{} is connected; check its settings in Settings → Integrations.",
+                kind.label()
+            ),
+            (false, _, true) => format!(
+                "Turn on {} for your AWS account in Settings → Integrations.",
+                kind.label()
+            ),
+            (false, _, false) => format!("Connect {} in Settings → Integrations.", kind.label()),
         };
         return q;
     }
@@ -891,6 +937,7 @@ fn needs(steps: &[Step]) -> Vec<Need> {
                 connect: q.connect.clone(),
                 action: q.action.clone(),
                 connection: q.connection.clone(),
+                link: q.link.clone(),
                 status: q.status.clone(),
                 steps: 0,
             });
@@ -1215,12 +1262,43 @@ mod tests {
     }
 
     #[test]
+    fn gaps_link_to_the_right_integrations_card() {
+        let q = check(conn_req("missing", "metrics", "none"), &inv());
+        assert_eq!(q.link, "/settings/integrations#integration-aws");
+        assert_eq!(
+            q.fix,
+            "Turn on CloudWatch metrics for your AWS account in Settings → Integrations."
+        );
+        let q = check(conn_req("missing", "airflow", "none"), &inv());
+        assert_eq!(q.link, "/settings/integrations#integration-aws");
+        let q = check(conn_req("missing", "newrelic", "none"), &inv());
+        assert_eq!(q.link, "/settings/integrations#integration-newrelic");
+        let mut sentry = conn_req("missing", "", "none");
+        sentry.server = "sentry".into();
+        sentry.needs = "Sentry".into();
+        let q = check(sentry, &inv());
+        assert_eq!(q.link, "/settings/integrations#integration-sentry");
+        let q = check(conn_req("missing", "", "none"), &inv());
+        assert_eq!(q.link, "/settings/integrations#other-tools");
+        let mut api = conn_req("missing", "", "none");
+        api.connect = "data_sources".into();
+        assert_eq!(check(api, &inv()).link, "/data-sources");
+        let mut covered = conn_req("available", "", "none");
+        covered.uses = vec!["read_file".into()];
+        let q = check(covered, &inv());
+        if q.status == "available" {
+            assert_eq!(q.link, "");
+        }
+    }
+
+    #[test]
     fn a_monitoring_or_docs_connection_links_to_data_sources() {
         let q = check(conn_req("missing", "confluence", "none"), &inv());
         assert_eq!(q.connect, "data_sources");
         assert_eq!(q.connection, "confluence");
         assert_eq!(q.action, "connect");
-        assert_eq!(q.fix, "Connect Confluence in Data sources.");
+        assert_eq!(q.fix, "Connect Confluence in Settings → Integrations.");
+        assert_eq!(q.link, "/settings/integrations#integration-confluence");
         let mut connected = inv();
         connected.sources.push(Source {
             kind: "confluence".into(),

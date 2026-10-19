@@ -234,6 +234,21 @@ pub async fn create_connection(
         account_id, "AWS connection created"
     );
 
+    // Find what the role can do (logs, metrics, Airflow) right away, so the
+    // Integrations page shows the abilities without a second step.
+    if let Ok(accounts) = common::live::aws_account::list(
+        &state.dynamo,
+        &state.config.aws_insights_table_name,
+        &claims.team_id,
+    )
+    .await
+    {
+        if let Some(mut a) = accounts.into_iter().find(|a| a.account == account_id) {
+            super::integrations::check_and_save(&state, &claims.team_id, &mut a, &claims.email)
+                .await;
+        }
+    }
+
     Ok(Json(json!({
         "connection_id": account_id,
         "external_id": external_id,
@@ -283,7 +298,10 @@ pub async fn list_connections(
                 None
             };
 
+            let abilities = common::live::aws_account::AwsAccount::from_item(item)
+                .map(|a| a.public_json());
             Some(json!({
+                "abilities": abilities,
                 "connection_id": account_id,
                 "role_arn": item.get("role_arn")?.as_s().ok()?,
                 "external_id": external_id,

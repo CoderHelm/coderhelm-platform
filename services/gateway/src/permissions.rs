@@ -193,6 +193,12 @@ pub const CAPABILITIES: &[Capability] = &[
             "alerts::get_event",
         ],
     },
+    Capability {
+        key: "view_integrations",
+        label: "See integrations, what each can do and whether it works",
+        min_role: "member",
+        handlers: &["integrations::list"],
+    },
     // ── Admins ──────────────────────────────────────────────────────
     Capability {
         key: "people",
@@ -257,7 +263,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "integrations",
-        label: "Connect GitHub, Jira, AWS accounts and MCP servers",
+        label: "Connect GitHub, Jira, AWS accounts, monitoring and docs tools, Teams and MCP servers, and choose what each may do",
         min_role: "admin",
         handlers: &[
             "github::link_installation",
@@ -278,6 +284,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "plugins::update_credentials",
             "plugins::update_prompt",
             "plugins::test_connection",
+            "integrations::check_aws",
+            "integrations::set_aws_abilities",
         ],
     },
     Capability {

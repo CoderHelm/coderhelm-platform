@@ -511,13 +511,21 @@ pub async fn sync_catalog_to_s3(state: &AppState) {
 }
 
 /// Return the MCP configs table name, falling back to settings table for migration compat.
-fn mcp_table(state: &AppState) -> &str {
+pub(crate) fn mcp_table(state: &AppState) -> &str {
     let t = &state.config.mcp_configs_table_name;
     if t.is_empty() {
         &state.config.settings_table_name
     } else {
         t
     }
+}
+
+/// The catalog as the Integrations page shows it.
+pub(crate) fn catalog_json() -> Vec<Value> {
+    CATALOG
+        .iter()
+        .filter_map(|p| serde_json::to_value(p).ok())
+        .collect()
 }
 
 /// GET /api/plugins/catalog — return all available plugins.
@@ -834,6 +842,7 @@ pub async fn test_connection(
 
     if let Some(err) = response.get("error").and_then(|v| v.as_str()) {
         info!(team = %claims.team_id, plugin = %plugin_id, "Plugin test failed: {err}");
+        record_test(&state, &claims.team_id, &plugin_id, false, err).await;
         return Ok(Json(json!({ "status": "error", "message": err })));
     }
 
@@ -844,5 +853,28 @@ pub async fn test_connection(
         .unwrap_or(0);
 
     info!(team = %claims.team_id, plugin = %plugin_id, tools = tool_count, "Plugin test succeeded");
+    let note = format!(
+        "{tool_count} tool{} available",
+        if tool_count == 1 { "" } else { "s" }
+    );
+    record_test(&state, &claims.team_id, &plugin_id, true, &note).await;
     Ok(Json(json!({ "status": "ok", "tool_count": tool_count })))
+}
+
+/// Keeps the last test's result on the plugin's record, for the
+/// Integrations page's "last check". Only while the plugin is switched on.
+async fn record_test(state: &AppState, team_id: &str, plugin_id: &str, ok: bool, message: &str) {
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(mcp_table(state))
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
+        .update_expression("SET last_test_at = :t, last_test_ok = :ok, last_test_message = :m")
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .expression_attribute_values(":ok", AttributeValue::Bool(ok))
+        .expression_attribute_values(":m", attr_s(common::truncate_str(message, 300)))
+        .condition_expression("attribute_exists(pk)")
+        .send()
+        .await;
 }

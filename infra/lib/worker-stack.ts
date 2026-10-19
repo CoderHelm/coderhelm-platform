@@ -88,6 +88,8 @@ export class WorkerStack extends cdk.Stack {
         JIRA_CONFIG_TABLE_NAME: props.jiraConfigTable.tableName,
         REPOS_TABLE_NAME: props.reposTable.tableName,
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
+        // Connected AWS accounts and what each can do (logs, metrics, Airflow).
+        AWS_INSIGHTS_TABLE_NAME: `coderhelm-${props.stage}-aws-insights`,
         MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
         INFRA_TABLE_NAME: props.infraTable.tableName,
         BILLING_TABLE_NAME: props.billingTable.tableName, // Retained for CF migration
@@ -129,6 +131,10 @@ export class WorkerStack extends cdk.Stack {
       })
     );
     analyticsTable.grantReadWriteData(this.workerFunction);
+    // Agents read a connected AWS account's abilities (metrics, Airflow) from
+    // its record; they never change it.
+    const awsInsightsTable = dynamodb.TableV2.fromTableName(this, "AwsInsightsTableRef", `coderhelm-${props.stage}-aws-insights`);
+    awsInsightsTable.grantReadData(this.workerFunction);
 
     props.usersTable.grantReadData(this.workerFunction);
     props.plansTable.grantReadWriteData(this.workerFunction);
