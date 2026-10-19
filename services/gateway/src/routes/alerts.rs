@@ -1093,7 +1093,7 @@ async fn record_event(
         .unwrap_or(now)
         .to_rfc3339();
     let ttl = now.timestamp().max(0) as u64 + EVENT_RETENTION_SECS;
-    let written = state
+    let put = state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
@@ -1110,10 +1110,17 @@ async fn record_event(
             attr_s(common::truncate_str(&alert.body, MAX_ALERT_BODY)),
         )
         .item("outcome", attr_s(outcome.as_str()))
-        .item("ticket_id", attr_s(tid))
-        .item("ttl", AttributeValue::N(ttl.to_string()))
-        .send()
-        .await;
+        .item("ticket_id", attr_s(tid));
+    // A recovery names the ticket of the alert it resolves, so the dashboard
+    // can show the two together (a plain `Recovers:` message has a ticket of
+    // its own).
+    let written = match &alert.recovers {
+        Some(fp) => put.item("recovers_ticket", attr_s(&ticket_id(fp))),
+        None => put,
+    }
+    .item("ttl", AttributeValue::N(ttl.to_string()))
+    .send()
+    .await;
     if let Err(e) = written {
         warn!(topic = %msg.topic_arn, ticket = %tid, error = %e, "Could not record alert event");
     }
@@ -1839,6 +1846,7 @@ fn event_summary(it: &HashMap<String, AttributeValue>) -> Value {
         "title": s("title"),
         "outcome": s("outcome"),
         "ticket_id": s("ticket_id"),
+        "recovers_ticket": s("recovers_ticket"),
     })
 }
 
@@ -1862,7 +1870,9 @@ pub async fn list_events(
         .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
         .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":p", attr_s("ALERT_EVENT#"))
-        .projection_expression("id, received_at, topic_arn, repo, kind, title, outcome, ticket_id")
+        .projection_expression(
+            "id, received_at, topic_arn, repo, kind, title, outcome, ticket_id, recovers_ticket",
+        )
         .scan_index_forward(false)
         .limit(50);
     if let Some(after) = q.after.as_deref() {
@@ -2350,5 +2360,31 @@ mod tests {
             "b",
         );
         assert_eq!(bare, "Recovered. Resolves the alert posted earlier.");
+    }
+
+    #[test]
+    fn a_recovery_names_the_ticket_of_the_alert_it_resolves() {
+        let alert = plain(Some("nightly load failed"), "nightly load failed");
+        let recovery = plain(None, "All clear\nRecovers: nightly load failed");
+        assert_eq!(
+            recovery.recovers.as_deref().map(ticket_id),
+            Some(ticket_id(&alert.fingerprint))
+        );
+        assert_ne!(
+            ticket_id(&recovery.fingerprint),
+            ticket_id(&alert.fingerprint)
+        );
+
+        let mut item = HashMap::new();
+        item.insert("id".to_string(), attr_s("01J0000000000000000000000A"));
+        item.insert("outcome".to_string(), attr_s("recovered"));
+        item.insert(
+            "recovers_ticket".to_string(),
+            attr_s(&ticket_id(&alert.fingerprint)),
+        );
+        let v = event_summary(&item);
+        assert_eq!(v["recovers_ticket"], json!(ticket_id(&alert.fingerprint)));
+        assert_eq!(v["outcome"], "recovered");
+        assert!(event_summary(&HashMap::new())["recovers_ticket"].is_null());
     }
 }
