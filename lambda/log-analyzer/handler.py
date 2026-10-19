@@ -523,6 +523,41 @@ def parse_recommendations(output_text):
     return [r for r in recs if isinstance(r, dict)][:10]
 
 
+# Waits (seconds) before each retry of a model call that failed transiently.
+RETRY_BACKOFF_SECS = (2, 4, 8, 16, 32)
+
+
+def is_transient_status(code):
+    """True for statuses that may succeed when sent again: every 5xx
+    (Cloudflare's 520-524 included), 408, 429 and 529."""
+    return code in (408, 429) or 500 <= code <= 599
+
+
+def send_with_retry(req, backoff=RETRY_BACKOFF_SECS, sleep=time.sleep, opener=None):
+    """POST `req` and return the response body. Retries transient statuses
+    and network errors (classified by status / exception type, never by
+    message text) after each wait in `backoff`, with jitter; anything else,
+    or the last failure, is raised."""
+    import random
+    import urllib.error
+
+    opener = opener or urlopen
+    for attempt in range(len(backoff) + 1):
+        last = attempt == len(backoff)
+        try:
+            with opener(req, timeout=120) as resp:
+                return resp.read()
+        except HTTPError as e:
+            if last or not is_transient_status(e.code):
+                raise
+            logger.warning(f"Anthropic transient status {e.code}, retrying (attempt {attempt + 1})")
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if last:
+                raise
+            logger.warning(f"Anthropic request failed ({e}), retrying (attempt {attempt + 1})")
+        sleep(backoff[attempt] * random.uniform(0.75, 1.25))
+
+
 def analyze_with_anthropic(query_results, account_id, api_key, existing=None, team_id=None):
     """Send log error summaries to Anthropic Claude for analysis."""
     # Scrub any secrets/tokens from the data before sending to AI
@@ -606,8 +641,7 @@ Return ONLY the JSON array, no surrounding text."""
             method="POST",
         )
 
-        with urlopen(req, timeout=120) as resp:
-            response_data = json.loads(resp.read().decode("utf-8"))
+        response_data = json.loads(send_with_retry(req).decode("utf-8"))
 
         # Count the call once in the team's usage counters (tokens + cost).
         usage.record_usage(

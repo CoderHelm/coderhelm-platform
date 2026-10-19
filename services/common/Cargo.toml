@@ -43,5 +43,7 @@ serde_yaml = "0.9"
 quick-xml = "0.37"
 
 [dev-dependencies]
+# model_retry: a local fake server in the tests
+tokio = { version = "1", features = ["macros", "time", "net", "rt", "io-util"] }
 # live: the ignored tests against a real AWS account
 aws-config = { version = "1", features = ["behavior-version-latest"] }

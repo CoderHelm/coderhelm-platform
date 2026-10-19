@@ -146,6 +146,10 @@ pub enum WorkerMessage {
     /// review. Carries no fields — the sweep scans per-repo reviewer config.
     #[serde(rename = "review_reminder")]
     ReviewReminder,
+    /// Periodic sweep (EventBridge → SQS) that re-runs reviews stuck on a
+    /// review that didn't finish (a service error) for the PR's current head.
+    #[serde(rename = "review_sweep")]
+    ReviewSweep,
     /// Async post-merge health check (self-scheduled with SQS delay). Waits for
     /// the base-branch deploy checks to complete, then alerts only on failures
     /// that are NEW vs. the pre-merge baseline.
@@ -240,7 +244,9 @@ impl WorkerMessage {
             WorkerMessage::Onboard(_) => f::ONBOARD,
             WorkerMessage::PlanExecute(_) | WorkerMessage::PlanTaskContinue(_) => f::PLAN,
             WorkerMessage::InfraAnalyze(_) => f::INFRA,
-            WorkerMessage::Review(_) | WorkerMessage::ReviewReminder => f::REVIEW,
+            WorkerMessage::Review(_)
+            | WorkerMessage::ReviewReminder
+            | WorkerMessage::ReviewSweep => f::REVIEW,
             WorkerMessage::SkillSync(_) => f::SKILL_SYNC,
             WorkerMessage::SkillAsk(_) => f::AGENT_ASK,
             WorkerMessage::ReleaseNotes(_) | WorkerMessage::TagSweep(_) => f::RELEASE_NOTES,
@@ -383,6 +389,18 @@ pub struct ReviewMessage {
     /// answer is posted back into that thread instead of the conversation.
     #[serde(default)]
     pub reply_to_comment_id: Option<u64>,
+    /// How many times this review already failed for a service error and
+    /// was sent again (0 on the first run).
+    #[serde(default)]
+    pub attempt: u32,
+    /// Seconds still to wait before this job runs: a retry waits longer than
+    /// one SQS delay allows, so it is sent on in hops until this reaches 0.
+    #[serde(default)]
+    pub wait_secs: u64,
+    /// Set when CoderHelm's own reply on the PR concluded something the
+    /// standing formal verdict doesn't match; the review checks it.
+    #[serde(default)]
+    pub reconcile_note: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

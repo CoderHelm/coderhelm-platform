@@ -2479,27 +2479,31 @@ pub async fn plan_chat(
             body["tools"] = json!(ctx.tools);
         }
 
-        let resp = http
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "prompt-caching-2024-07-31")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Anthropic request failed: {e}");
-                StatusCode::BAD_GATEWAY
-            })?;
+        // Transient failures (5xx incl. 520-524, 408, 429, 529, no response)
+        // are retried by status; a person is waiting, so the waits are short.
+        let resp = common::model_retry::send(
+            || {
+                http.post("https://api.anthropic.com/v1/messages")
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("anthropic-beta", "prompt-caching-2024-07-31")
+                    .json(&body)
+            },
+            &common::model_retry::INTERACTIVE_BACKOFF_SECS,
+            "plan_chat",
+        )
+        .await
+        .map_err(|e| {
+            error!("Anthropic request failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            error!("Anthropic API error ({status}): {body}");
+        if !resp.is_success() {
+            error!("Anthropic API error ({}): {}", resp.status, resp.text());
             return Err(StatusCode::BAD_GATEWAY);
         }
 
-        let response: Value = resp.json().await.map_err(|e| {
+        let response: Value = serde_json::from_slice(&resp.body).map_err(|e| {
             error!("Failed to parse Anthropic response: {e}");
             StatusCode::BAD_GATEWAY
         })?;
@@ -2713,23 +2717,27 @@ async fn run_anthropic_stream(
             body["tools"] = json!(tools);
         }
 
-        let resp = match http
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "prompt-caching-2024-07-31")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
+        // Retried by status until a stream starts (5xx incl. 520-524, 408,
+        // 429, 529, no response); a stream already flowing is never resent.
+        let resp = match common::model_retry::send_streaming(
+            || {
+                http.post("https://api.anthropic.com/v1/messages")
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("anthropic-beta", "prompt-caching-2024-07-31")
+                    .header("content-type", "application/json")
+                    .json(&body)
+            },
+            &common::model_retry::INTERACTIVE_BACKOFF_SECS,
+            "plan_chat_stream",
+        )
+        .await
         {
-            Ok(r) if r.status().is_success() => {
+            Ok(r) => {
                 info!(turn = turn, "run_anthropic_stream: Anthropic returned 200");
                 r
             }
-            Ok(r) => {
-                let status = r.status();
-                let body = r.text().await.unwrap_or_default();
+            Err(common::model_retry::StreamFailure::Status(status, body)) => {
                 error!("Anthropic stream error ({status}): {body}");
                 let _ = tx
                     .send(sse_event(
@@ -2739,7 +2747,7 @@ async fn run_anthropic_stream(
                     .await;
                 return;
             }
-            Err(e) => {
+            Err(common::model_retry::StreamFailure::Network(e)) => {
                 error!("Anthropic stream request failed: {e}");
                 let _ = tx
                     .send(sse_event(

@@ -674,6 +674,7 @@ pub mod review_labels;
 pub mod review_pr;
 pub mod review_reminder;
 pub mod review_risk;
+pub mod review_sweep;
 mod security;
 pub mod skill_compat;
 pub mod skill_suggest;
