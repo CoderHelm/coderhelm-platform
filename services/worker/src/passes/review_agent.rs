@@ -36,6 +36,69 @@ pub struct Finding {
     /// Exact replacement text for the anchored line(s), if a concrete fix exists.
     #[serde(default)]
     pub suggestion: Option<String>,
+    /// What the finding rests on: `verified-defect` | `unverified-concern` |
+    /// `question` (see [`Evidence`]). Only a verified defect holds the merge.
+    #[serde(default)]
+    pub evidence: Option<String>,
+}
+
+/// What a finding rests on. The verdict depends on it: only a defect the
+/// reviewer established from the code, a check it ran, or CI holds the merge.
+/// A concern it could not verify, or a question for a person, is said as a
+/// comment and never by itself requests changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// Shown by the code, a tool result or CI; or a policy the repo set
+    /// (missing required tests).
+    VerifiedDefect,
+    /// Might be wrong, but the reviewer could not establish it.
+    UnverifiedConcern,
+    /// Something only a person can confirm.
+    Question,
+}
+
+impl Evidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Evidence::VerifiedDefect => "verified-defect",
+            Evidence::UnverifiedConcern => "unverified-concern",
+            Evidence::Question => "question",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Evidence> {
+        let s = s.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+        match s.as_str() {
+            "verified-defect" | "verified" | "defect" => Some(Evidence::VerifiedDefect),
+            "unverified-concern" | "unverified" | "concern" => Some(Evidence::UnverifiedConcern),
+            "question" => Some(Evidence::Question),
+            _ => None,
+        }
+    }
+
+    /// How strongly it holds: a check may weaken a finding, never strengthen it.
+    fn rank(self) -> u8 {
+        match self {
+            Evidence::VerifiedDefect => 2,
+            Evidence::UnverifiedConcern => 1,
+            Evidence::Question => 0,
+        }
+    }
+}
+
+/// Hidden in a posted comment that doesn't hold the merge, so a later review
+/// knows the open thread is a question, not a requested change.
+pub const NON_BLOCKING_MARK: &str = "<!-- coderhelm:evidence=non-blocking -->";
+
+/// Whether an earlier CoderHelm comment, still open, holds the merge. A
+/// question or an unverified concern doesn't (marked when posted; older
+/// comments by their `question` category).
+pub fn thread_holds_merge(body: &str) -> bool {
+    if body.contains(NON_BLOCKING_MARK) {
+        return false;
+    }
+    let first = body.lines().next().unwrap_or("");
+    !first.trim_end().ends_with("(question)")
 }
 
 /// The model's structured review output.
@@ -215,11 +278,13 @@ pub fn format_discussion(comments: &[(String, String)]) -> String {
     s
 }
 
-/// "Require tests": every `tests` finding is blocking.
+/// "Require tests": every `tests` finding is blocking, and holds the merge
+/// as a policy the repo set.
 pub fn enforce_required_tests(findings: &mut [Finding]) {
     for f in findings.iter_mut() {
         if f.category.eq_ignore_ascii_case("tests") {
             f.severity = "blocking".to_string();
+            f.evidence = Some(Evidence::VerifiedDefect.as_str().to_string());
         }
     }
 }
@@ -227,6 +292,60 @@ pub fn enforce_required_tests(findings: &mut [Finding]) {
 impl Finding {
     fn is_blocking(&self) -> bool {
         self.severity.eq_ignore_ascii_case("blocking")
+    }
+
+    /// What the finding rests on. A `question` finding is a question
+    /// whatever else it says; a finding that doesn't say is taken as a
+    /// defect (the reviewer is told to say).
+    pub fn evidence(&self) -> Evidence {
+        if self.category.eq_ignore_ascii_case("question") {
+            return Evidence::Question;
+        }
+        self.evidence
+            .as_deref()
+            .and_then(Evidence::parse)
+            .unwrap_or(Evidence::VerifiedDefect)
+    }
+
+    /// Only a verified defect (or a repo policy) requests changes.
+    pub fn holds_merge(&self) -> bool {
+        self.evidence() == Evidence::VerifiedDefect
+    }
+
+    /// Weakens the finding to `to` when that is weaker than what it has.
+    pub fn weaken_to(&mut self, to: Evidence) {
+        if to.rank() < self.evidence().rank() {
+            self.evidence = Some(to.as_str().to_string());
+        }
+    }
+}
+
+/// The review's verdict.
+///
+/// `APPROVE` exactly when nothing is left: no finding, no earlier comment
+/// still open, verification passed, the review finished. `REQUEST_CHANGES`
+/// only for something that holds the merge: a verified defect (or a policy
+/// like required tests), an earlier requested change still open, a failed
+/// verification, or a review that didn't finish. Otherwise — only questions
+/// or concerns the reviewer couldn't verify are left — `COMMENT`: said, not
+/// approved, not blocking.
+pub fn decide_verdict(
+    findings: &[Finding],
+    prior_open_holding: usize,
+    prior_open_other: usize,
+    verify_failed: bool,
+    incomplete: bool,
+) -> &'static str {
+    if incomplete
+        || verify_failed
+        || prior_open_holding > 0
+        || findings.iter().any(Finding::holds_merge)
+    {
+        "REQUEST_CHANGES"
+    } else if findings.is_empty() && prior_open_other == 0 {
+        "APPROVE"
+    } else {
+        "COMMENT"
     }
 }
 
@@ -407,6 +526,8 @@ pub struct PrReviewToolExecutor<'a> {
     pub live: Option<&'a super::live_sources::LiveSources>,
     /// The team's written skills, read-only.
     pub skills: Option<&'a super::skills::TeamSkills>,
+    /// `check_url` on the team's own public pages.
+    pub web: Option<&'a super::web_check::WebCheck>,
 }
 
 /// Structural lookup tools backed by the persistent code graph. Offered only
@@ -467,6 +588,11 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
         }
         if let Some(history) = self.history {
             if let Some(out) = history.handle(self.state, self.github, name, input).await {
+                return Ok(json!(out));
+            }
+        }
+        if let Some(web) = self.web {
+            if let Some(out) = web.handle(self.state, self.github, name, input).await {
                 return Ok(json!(out));
             }
         }
@@ -782,6 +908,7 @@ pub async fn generate_review(
     ops: Option<&super::ops_tools::OpsTools>,
     live: Option<&super::live_sources::LiveSources>,
     skills: Option<&super::skills::TeamSkills>,
+    web: Option<&super::web_check::WebCheck>,
     usage: &mut TokenUsage,
 ) -> ReviewOutput {
     let graph_note = if graph.is_some() {
@@ -814,6 +941,17 @@ pub async fn generate_review(
          finding, and do not raise it at all once a person has answered it. A search that finds \
          nothing in other repositories is not evidence that something is undeployed. When a \
          LIVE SOURCE listed below can settle it, look it up instead of asking. \
+         CHECK BEFORE YOU ASK: when a tool can settle a question (check_url for whether a page, \
+         link or redirect target on the team's sites loads; check_package for a version; a live \
+         source), use it first and report what came back — \"Checked: all six targets return \
+         200\" in the summary, or a finding citing the result when it shows a defect (a 404, a \
+         redirect to the wrong place). Never ask a person to confirm what you could check. \
+         EVIDENCE: every finding says what it rests on in `evidence`: \"verified-defect\" only \
+         when the code you read, a tool result or a CI check shows it is wrong (say which in the \
+         body); \"unverified-concern\" when it might be wrong but you could not establish it; \
+         \"question\" when only a person can confirm it. Only verified defects request changes; \
+         the others are posted as comments and don't hold the merge, so never dress a concern \
+         you couldn't verify as a defect. \
          {REPLIES_RULE}\
          {COPY_RULE}\
          {TONE_RULE}\
@@ -822,10 +960,11 @@ pub async fn generate_review(
          cite the check instead. A RED check is evidence for a finding; name it.\
          {instructions_block}\n\n\
          When done exploring, output ONLY a fenced ```json block, no prose after it, matching:\n\
-         {{\n  \"verdict\": \"APPROVE\" | \"REQUEST_CHANGES\",\n  \"risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n  \
+         {{\n  \"verdict\": \"APPROVE\" | \"COMMENT\" | \"REQUEST_CHANGES\",\n  \"risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n  \
          \"summary\": \"2-4 sentence overview\",\n  \"findings\": [{{\n    \"file\": \"path\", \"line\": <int, a line present on the RIGHT side of the diff>,\n    \
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
          \"category\": \"bug|security|correctness|perf|convention|scope|tests|question\", \"title\": \"short\",\n    \
+         \"evidence\": \"verified-defect|unverified-concern|question\",\n    \
          \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}],\n  \
          \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"answered\" | \"open\"}}]  (one per earlier unresolved comment listed, if any),\n  \
          \"labels\": [{{\"name\": \"label\", \"reason\": \"changed file(s) that need it\"}}]  (only if a PR-labels section is given),\n  \
@@ -836,8 +975,8 @@ pub async fn generate_review(
          moves code, or changes more than one place, gets NO suggestion; describe it in the body instead.\n\
          Use \"blocking\" ONLY for real bugs/risks that should stop the merge. The PR is approved \
          when there are no findings and none of your earlier comments is still open, so every \
-         reason to hold the merge MUST be a finding: a concern written only in the summary holds \
-         nothing. If you are unsure whether something is a real problem, read more code until you \
+         reason to hold the merge MUST be a verified-defect finding: a concern written only in \
+         the summary holds nothing. If you are unsure whether something is a real problem, read more code until you \
          know.{graph_note}"
     );
     let live_context = format!(
@@ -847,7 +986,8 @@ pub async fn generate_review(
             .unwrap_or_default(),
         live.map(|l| l.prompt_section()).unwrap_or_default()
     ) + &ops.map(|o| o.prompt_section()).unwrap_or_default();
-    let skills_context = skills.map(|s| s.prompt_section()).unwrap_or_default();
+    let skills_context = skills.map(|s| s.prompt_section()).unwrap_or_default()
+        + &web.map(|w| w.prompt_section()).unwrap_or_default();
     let prompt = format!(
         "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{graph_context}{prior_context}{live_context}{skills_context}\n\
          Explore with the tools as needed, then emit the JSON review."
@@ -867,8 +1007,12 @@ pub async fn generate_review(
         ops,
         live,
         skills,
+        web,
     };
     let mut tools = review_tools();
+    if web.is_some() {
+        tools.push(super::web_check::tool());
+    }
     if graph.is_some() {
         tools.extend(graph_tools());
     }
@@ -941,6 +1085,10 @@ struct CritVerdict {
     index: usize,
     #[serde(default)]
     keep: bool,
+    /// The critic's reading of what a kept finding rests on; it can only
+    /// weaken the reviewer's.
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 /// The critic's note when people have already answered or resolved concerns on
@@ -995,8 +1143,9 @@ pub async fn critique_findings(
         .enumerate()
         .map(|(i, f)| {
             format!(
-                "{i}: [{sev}] {file}:{line} — {title}: {body}",
+                "{i}: [{sev}, {ev}] {file}:{line} — {title}: {body}",
                 sev = f.severity,
+                ev = f.evidence().as_str(),
                 file = f.file,
                 line = f.line,
                 title = f.title,
@@ -1011,8 +1160,12 @@ pub async fn critique_findings(
                   nit dressed as a bug, not a false claim about code that isn't shown. Default to \
                   DROP when uncertain. A `question` finding asks a person to confirm something \
                   outside the repository: keep it when the diff really creates that dependency. \
+                  For each kept finding also judge its evidence: \"verified-defect\" only when the \
+                  diff, a quoted tool result or CI shows the defect; \"unverified-concern\" when it \
+                  only might be wrong; \"question\" when it asks a person to confirm something \
+                  (\"please confirm X works\") without evidence that X is broken. \
                   Output ONLY a fenced ```json block: \
-                  {\"verdicts\":[{\"index\":<int>,\"keep\":<bool>}]} for every index.";
+                  {\"verdicts\":[{\"index\":<int>,\"keep\":<bool>,\"evidence\":\"verified-defect|unverified-concern|question\"}]} for every index.";
     let mut system = base_system.to_string();
     if require_tests {
         system.push_str(REQUIRE_TESTS_CRITIC_NOTE);
@@ -1044,7 +1197,7 @@ pub async fn critique_findings(
     // (converse_simple takes user_message; messages var unused — keep call simple)
     let _ = &mut messages;
 
-    let keep: Option<HashSet<usize>> = reply.ok().and_then(|text| {
+    let keep: Option<HashMap<usize, Option<Evidence>>> = reply.ok().and_then(|text| {
         let block = if let Some(s) = text.rfind("```json") {
             let after = &text[s + 7..];
             after.find("```").map(|e| after[..e].trim().to_string())
@@ -1057,20 +1210,31 @@ pub async fn critique_findings(
                 v.verdicts
                     .into_iter()
                     .filter(|c| c.keep)
-                    .map(|c| c.index)
+                    .map(|c| (c.index, c.evidence.as_deref().and_then(Evidence::parse)))
                     .collect()
             })
     });
 
     match keep {
-        Some(set) => findings
-            .into_iter()
-            .enumerate()
-            .filter(|(i, _)| set.contains(i))
-            .map(|(_, f)| f)
-            .collect(),
+        Some(kept) => apply_critic(findings, &kept),
         None => findings, // fail-open
     }
+}
+
+/// Keeps the findings the critic kept, each weakened to the critic's reading
+/// of its evidence when that is weaker.
+fn apply_critic(findings: Vec<Finding>, kept: &HashMap<usize, Option<Evidence>>) -> Vec<Finding> {
+    findings
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, mut f)| {
+            let ev = kept.get(&i)?;
+            if let Some(ev) = ev {
+                f.weaken_to(*ev);
+            }
+            Some(f)
+        })
+        .collect()
 }
 
 /// Result of turning findings into a postable review.
@@ -1148,7 +1312,7 @@ pub fn to_postable(
     let mut blocking_count = 0;
 
     for f in findings {
-        if f.is_blocking() {
+        if f.is_blocking() && f.holds_merge() {
             blocking_count += 1;
         }
         let anchored = f.line > 0
@@ -1165,13 +1329,21 @@ pub fn to_postable(
                 )
         });
         let collapsed = anchored && f.end_line.is_some_and(|e| e > f.line) && range_end.is_none();
-        let mut body = format!(
-            "{} **{}** ({})\n\n{}",
-            sev_emoji(&f.severity),
-            f.title,
-            f.category,
-            f.body
-        );
+        let holds = f.holds_merge();
+        let emoji = if holds {
+            sev_emoji(&f.severity)
+        } else {
+            "💬"
+        };
+        let kind = match f.evidence() {
+            Evidence::VerifiedDefect => f.category.clone(),
+            Evidence::Question => "question".to_string(),
+            Evidence::UnverifiedConcern => format!("{}, not verified", f.category),
+        };
+        let mut body = format!("{emoji} **{}** ({kind})\n\n{}", f.title, f.body);
+        if !holds {
+            body.push_str(&format!("\n\n{NON_BLOCKING_MARK}"));
+        }
         if let Some(sugg) = &f.suggestion {
             if collapsed {
                 // A multi-line replacement on a single anchored line would
@@ -1204,10 +1376,15 @@ pub fn to_postable(
                 format!("`{}`", f.file)
             };
             unanchored.push_str(&format!(
-                "- {} {} — {}\n",
-                sev_emoji(&f.severity),
+                "- {} {} — {}{}\n",
+                emoji,
                 loc,
-                f.title
+                f.title,
+                if holds {
+                    ""
+                } else {
+                    " (question, not blocking)"
+                }
             ));
         }
     }
@@ -1328,6 +1505,7 @@ mod tests {
                 title: "null deref".into(),
                 body: "boom".into(),
                 suggestion: Some("let x = y?;".into()),
+                evidence: None,
             },
             Finding {
                 file: "a.rs".into(),
@@ -1338,6 +1516,7 @@ mod tests {
                 title: "style".into(),
                 body: "meh".into(),
                 suggestion: None,
+                evidence: None,
             },
         ];
         let mut changed = HashMap::new();
@@ -1366,6 +1545,7 @@ mod anchoring_tests {
             title: "t".into(),
             body: "b".into(),
             suggestion: suggestion.map(String::from),
+            evidence: None,
         }
     }
 
@@ -1473,6 +1653,7 @@ mod required_tests_tests {
             title: "t".into(),
             body: "b".into(),
             suggestion: None,
+            evidence: None,
         }
     }
 
@@ -1500,6 +1681,7 @@ mod required_tests_tests {
             title: "t".into(),
             body: "b".into(),
             suggestion: Some(s.into()),
+            evidence: None,
         }
     }
 
@@ -1553,5 +1735,70 @@ mod copy_rule_tests {
             assert!(TONE_RULE.contains(rule), "{rule}");
         }
         assert!(TONE_RULE.contains("worth checking before merge is a useful heads-up"));
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    fn f(category: &str, evidence: Option<&str>) -> Finding {
+        Finding {
+            file: "infra/redirects.tf".into(),
+            line: 3,
+            severity: "blocking".into(),
+            category: category.into(),
+            title: "t".into(),
+            body: "b".into(),
+            evidence: evidence.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_critic_can_weaken_evidence_never_strengthen_it() {
+        let findings = vec![
+            f("bug", Some("verified-defect")),
+            f("bug", Some("question")),
+            f("bug", Some("verified-defect")),
+        ];
+        let kept: HashMap<usize, Option<Evidence>> = [
+            (0, Some(Evidence::Question)),
+            (1, Some(Evidence::VerifiedDefect)),
+        ]
+        .into_iter()
+        .collect();
+        let out = apply_critic(findings, &kept);
+        assert_eq!(out.len(), 2, "index 2 was dropped");
+        assert_eq!(out[0].evidence(), Evidence::Question);
+        assert_eq!(out[1].evidence(), Evidence::Question);
+    }
+
+    #[test]
+    fn a_question_posts_as_a_marked_comment_and_blocks_nothing() {
+        let changed: HashMap<String, HashSet<u64>> = [(
+            "infra/redirects.tf".to_string(),
+            [3u64].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect();
+        let p = to_postable(&[f("question", None)], &changed, &HashMap::new());
+        assert_eq!(p.blocking_count, 0);
+        assert!(p.inline[0].body.contains(NON_BLOCKING_MARK));
+        assert!(!thread_holds_merge(&p.inline[0].body));
+        let p = to_postable(
+            &[f("bug", Some("verified-defect"))],
+            &changed,
+            &HashMap::new(),
+        );
+        assert_eq!(p.blocking_count, 1);
+        assert!(thread_holds_merge(&p.inline[0].body));
+    }
+
+    #[test]
+    fn required_tests_are_a_policy_that_holds_the_merge() {
+        let mut v = vec![f("tests", Some("question"))];
+        enforce_required_tests(&mut v);
+        assert!(v[0].holds_merge());
     }
 }

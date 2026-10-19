@@ -5177,6 +5177,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "ulid",
+ "url",
  "urlencoding",
  "uuid",
  "zip",

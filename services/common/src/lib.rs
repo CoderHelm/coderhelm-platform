@@ -33,6 +33,7 @@ pub mod skills;
 pub mod unsubscribe;
 /// Model usage accounting: every model call is counted here, once.
 pub mod usage;
+pub mod web_domains;
 pub mod work_usage;
 
 /// GitHub's per-request override for the installation-token format, sent on

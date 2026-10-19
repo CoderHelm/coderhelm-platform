@@ -65,6 +65,11 @@ const EXTRA_TOOLS: &[(&str, &str)] = &[
     ("read_skill_file", "Read a file kept next to a team skill"),
     ("ask_team_agent", "Ask one of the team's agents a question"),
     (
+        super::web_check::TOOL,
+        "Check that https pages on the team's own sites load: each redirect's status, the \
+         final URL, content type and page title, no page content (reviews, coding, planning)",
+    ),
+    (
         super::github_history::TOOL,
         "Read the repository's history on GitHub (git log, git blame, gh pr list, gh release): \
          commits, blame, pull requests, releases, tags, deployments and Actions runs",
@@ -109,6 +114,11 @@ const TRANSLATIONS: &[(&str, &[&str], &str)] = &[
         "npm view, npm info, pip index versions, cargo search",
         &["check_package"],
         "Looks the package up on its registry",
+    ),
+    (
+        "curl -I, curl -sL -o /dev/null -w '%{http_code}', wget --spider, opening a link to see that it loads",
+        &[super::web_check::TOOL],
+        "Checks the page with check_url: status of each redirect, final URL and title, on the team's own sites only",
     ),
 ];
 
@@ -216,7 +226,8 @@ const NEVER: &[&str] = &[
     "Read a person's computer or home folder (paths like ~/...)",
     "Write to outside systems (wikis, tickets, incidents, chat, dashboards) unless a ready MCP \
      server's tool can",
-    "Browse the web",
+    "Browse the web or read a web page's content (check_url only says whether a page on the \
+     team's own sites loads, where it redirects and its title)",
 ];
 
 /// Reads one item and answers in the check's JSON. The worker's is the
@@ -1006,6 +1017,15 @@ mod tests {
     #[test]
     fn the_inventory_reads_the_real_tool_list() {
         let tools = builtin_tools();
+        // check_url is offered, and turns "curl the page" steps into a check.
+        let check = tools
+            .iter()
+            .find(|t| t.name == super::super::web_check::TOOL)
+            .expect("check_url in the inventory");
+        assert!(!check.writes_repo);
+        assert!(translations(&tools)
+            .iter()
+            .any(|t| t.uses == vec![super::super::web_check::TOOL.to_string()]));
         for name in super::super::implement::tool_names() {
             assert!(tools.iter().any(|t| t.name == name), "{name} is missing");
         }
@@ -1052,7 +1072,10 @@ mod tests {
         let a = inventory_for(&base, &m, body);
         let mut names: Vec<String> = a.tool_names().into_iter().collect();
         names.sort();
-        assert_eq!(names, ["read_file", "read_file_lines", "search_code"]);
+        assert_eq!(
+            names,
+            ["check_url", "read_file", "read_file_lines", "search_code"]
+        );
         assert!(a.elsewhere.iter().any(|t| t == "run_checks"));
         assert!(a.elsewhere.iter().any(|t| t == "logs_search"));
         assert_ne!(a.fingerprint(), base.fingerprint());

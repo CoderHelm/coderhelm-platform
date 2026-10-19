@@ -348,6 +348,27 @@ After researching, output the four files using this exact format:
     );
     tools.push(super::github_history::tool());
     full_system.push_str(super::github_history::prompt_line());
+    // `check_url` on the team's own public pages.
+    let web = super::web_check::WebCheck::load(
+        state,
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        "planner",
+        0,
+        &format!("{}\n{}", msg.title, msg.body),
+    )
+    .await
+    .with_run(
+        run_id,
+        super::skills::ticket_origin(
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.ticket_id,
+            msg.issue_number,
+        ),
+    );
+    tools.push(super::web_check::tool());
+    full_system.push_str(&web.prompt_section());
     let ops = super::ops_tools::OpsTools::load(
         state,
         &msg.team_id,
@@ -417,6 +438,7 @@ After researching, output the four files using this exact format:
         ops: ops.as_ref(),
         live: live.as_ref(),
         skills: skills.as_ref(),
+        web: Some(&web),
         state,
     };
 
@@ -869,6 +891,8 @@ struct CombinedToolExecutor<'a> {
     ops: Option<&'a super::ops_tools::OpsTools>,
     /// The team's connected live systems, read-only.
     live: Option<&'a super::live_sources::LiveSources>,
+    /// `check_url` on the team's own public pages.
+    web: Option<&'a super::web_check::WebCheck>,
     /// The team's written skills, read-only.
     skills: Option<&'a super::skills::TeamSkills>,
     state: &'a WorkerState,
@@ -883,6 +907,14 @@ impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(history) = self.history {
             if let Some(out) = history
+                .handle(self.state, self.read_only.github, name, input)
+                .await
+            {
+                return Ok(serde_json::json!(out));
+            }
+        }
+        if let Some(web) = self.web {
+            if let Some(out) = web
                 .handle(self.state, self.read_only.github, name, input)
                 .await
             {

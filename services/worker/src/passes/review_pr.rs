@@ -399,6 +399,16 @@ pub async fn run(
             }
             None => system,
         };
+        let web = super::web_check::WebCheck::load(
+            state,
+            &msg.team_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            "reviewer",
+            msg.pr_number,
+            &format!("{pr_body}\n{question}"),
+        )
+        .await;
+        let system = format!("{system}{}", web.prompt_section());
         let executor = review_agent::PrReviewToolExecutor {
             github: &github,
             owner: &msg.repo_owner,
@@ -410,9 +420,11 @@ pub async fn run(
             ops: ops.as_ref(),
             live: live.as_ref(),
             skills: skills.as_ref(),
+            web: Some(&web),
         };
         let mut tools = review_agent::review_tools();
         tools.push(super::github_history::tool());
+        tools.push(super::web_check::tool());
         if let Some(o) = &ops {
             tools.extend(o.tools());
         }
@@ -714,6 +726,19 @@ pub async fn run(
         s.record_applied(state).await;
     }
 
+    // Checking the team's own public pages (a redirect target, a docs link):
+    // hosts in the diff's URLs, the team's listed domains and hosts its
+    // repositories use.
+    let web = super::web_check::WebCheck::load(
+        state,
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        "reviewer",
+        msg.pr_number,
+        &format!("{pr_body}\n{diff}"),
+    )
+    .await;
+
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(
         state,
@@ -733,12 +758,20 @@ pub async fn run(
         ops.as_ref(),
         live.as_ref(),
         skills.as_ref(),
+        Some(&web),
         &mut usage,
     )
     .await;
     let fixed_threads: Vec<&crate::clients::github::BotReviewThread> =
         settled_prior_threads(&prior_threads, &output.prior);
     let still_open = prior_threads.len() - fixed_threads.len();
+    // Of those, the ones that hold the merge: a question or an unverified
+    // concern left open is still shown, but doesn't request changes.
+    let still_open_holding = prior_threads
+        .iter()
+        .filter(|t| !fixed_threads.iter().any(|f| f.id == t.id))
+        .filter(|t| review_agent::thread_holds_merge(&t.body))
+        .count();
     // Label picking is live when there's something to pick: existing allowed
     // labels, or an allowed family whose labels may not exist yet.
     let labels_live = !label_candidates.is_empty() || !label_rules.families().is_empty();
@@ -767,7 +800,7 @@ pub async fn run(
     }
 
     // 2) Critic pass drops weak/false findings.
-    let live_evidence = live.as_ref().map(|l| l.evidence()).unwrap_or_default();
+    let live_evidence = live.as_ref().map(|l| l.evidence()).unwrap_or_default() + &web.evidence();
     let mut findings = review_agent::critique_findings(
         state,
         &provider,
@@ -871,13 +904,18 @@ pub async fn run(
     }
 
     // Verdict: CoderHelm approves exactly when it has nothing left to ask for.
-    // Any surviving finding (any severity), an earlier CoderHelm comment still
-    // open, a failed verification, or a review that didn't finish →
-    // REQUEST_CHANGES. An approval is what arms auto-merge, so "approve with
-    // notes" would merge a PR with changes still requested; and changes
-    // requested with no finding would leave the author nothing to answer.
-    let verdict: &'static str =
-        final_verdict(findings.len(), still_open, verify_failed, output.incomplete);
+    // Changes are requested only for what holds the merge: a verified defect
+    // (or a policy like required tests), an earlier requested change still
+    // open, a failed verification, or a review that didn't finish. Questions
+    // and concerns it couldn't verify are posted as a COMMENT review: not an
+    // approval (which would arm auto-merge), not a block.
+    let verdict: &'static str = review_agent::decide_verdict(
+        &findings,
+        still_open_holding,
+        still_open - still_open_holding,
+        verify_failed,
+        output.incomplete,
+    );
     // Computed, explainable risk (blast-radius-weighted) — overrides the model's
     // guess and drives the displayed level.
     let risk_report = review_risk::assess(
@@ -893,10 +931,10 @@ pub async fn run(
     // GitHub forbids APPROVE / REQUEST_CHANGES on your OWN PR → downgrade to COMMENT.
     let self_authored = pr_author.contains("coderhelm");
     let effective_event = if self_authored { "COMMENT" } else { verdict };
-    let verdict_line = if verdict == "APPROVE" {
-        "✅ **Approved**"
-    } else {
-        "🔴 **Changes requested**"
+    let verdict_line = match verdict {
+        "APPROVE" => "✅ **Approved**",
+        "COMMENT" => "💬 **Questions, nothing blocking**",
+        _ => "🔴 **Changes requested**",
     };
     let summary = if output.summary.trim().is_empty() {
         "Automated review complete.".to_string()
@@ -907,7 +945,7 @@ pub async fn run(
     // "Approve with notes" no longer exists: say plainly why changes are
     // requested when nothing on its own is blocking.
     if verdict == "REQUEST_CHANGES" && postable.blocking_count == 0 && !verify_failed {
-        let open = findings.len() + still_open;
+        let open = findings.iter().filter(|f| f.holds_merge()).count() + still_open_holding;
         if open > 0 {
             full_body.push_str(&format!(
                 "\n\n> Nothing here is blocking on its own, but {open} requested change(s) are still open — \
@@ -1181,7 +1219,7 @@ pub async fn run(
                 warn!(pr = msg.pr_number, error = %e, "Failed to attach action summary (non-fatal)");
             }
         }
-    } else if self_authored {
+    } else if self_authored && verdict == "REQUEST_CHANGES" {
         // CoderHelm reviewed its OWN PR and wants changes → hand the findings to the
         // run's feedback loop so it applies the fixes. Two guards keep this review↔fix
         // loop from running away (it once flip-flopped a verdict into 67 commits / 44
@@ -1975,24 +2013,6 @@ fn superseded(msg: &ReviewMessage, current_head: &str) -> bool {
         && current_head != msg.head_sha
 }
 
-/// The review verdict. APPROVE exactly when nothing is left to change: no
-/// findings of any severity, none of CoderHelm's earlier comments still open,
-/// verification not failed, and the review finished. Every reason to hold a
-/// merge is a finding or an open thread, so the author always has something to
-/// answer or resolve.
-fn final_verdict(
-    findings: usize,
-    prior_still_open: usize,
-    verify_failed: bool,
-    incomplete: bool,
-) -> &'static str {
-    if findings == 0 && prior_still_open == 0 && !verify_failed && !incomplete {
-        "APPROVE"
-    } else {
-        "REQUEST_CHANGES"
-    }
-}
-
 #[cfg(test)]
 mod superseded_tests {
     use super::{moved_on, superseded};
@@ -2066,18 +2086,143 @@ mod superseded_tests {
 
 #[cfg(test)]
 mod verdict_tests {
-    use super::final_verdict;
+    use super::review_agent::{decide_verdict, thread_holds_merge, Finding, NON_BLOCKING_MARK};
+
+    fn finding(category: &str, evidence: Option<&str>, body: &str) -> Finding {
+        Finding {
+            file: "infra/redirects.tf".into(),
+            line: 12,
+            severity: "medium".into(),
+            category: category.into(),
+            title: "Redirect targets".into(),
+            body: body.into(),
+            evidence: evidence.map(String::from),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn approves_only_with_nothing_left_to_change() {
-        assert_eq!(final_verdict(0, 0, false, false), "APPROVE");
-        // A low + a nit
-        assert_eq!(final_verdict(2, 0, false, false), "REQUEST_CHANGES");
-        // an earlier CoderHelm comment still open
-        assert_eq!(final_verdict(0, 1, false, false), "REQUEST_CHANGES");
-        assert_eq!(final_verdict(0, 0, true, false), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[], 0, 0, false, false), "APPROVE");
+        // A low + a nit, both shown in the code
+        let defects = [
+            finding("bug", Some("verified-defect"), "off by one"),
+            finding("convention", None, "nit"),
+        ];
+        assert_eq!(
+            decide_verdict(&defects, 0, 0, false, false),
+            "REQUEST_CHANGES"
+        );
+        // an earlier requested change still open
+        assert_eq!(decide_verdict(&[], 1, 0, false, false), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[], 0, 0, true, false), "REQUEST_CHANGES");
         // the review errored or its output couldn't be read
-        assert_eq!(final_verdict(0, 0, false, true), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[], 0, 0, false, true), "REQUEST_CHANGES");
+    }
+
+    /// The case that held a PR for three pushes: six 301 targets changed in a
+    /// redirects map, and the only finding asked a person to confirm they
+    /// work because the reviewer couldn't open a page.
+    #[test]
+    fn a_please_confirm_finding_never_requests_changes() {
+        let ask = "Please confirm the six new 301 targets work on the live site before merge; \
+                   I couldn't check this myself.";
+        for f in [
+            finding("question", None, ask),
+            finding("question", Some("verified-defect"), ask),
+            finding("correctness", Some("unverified-concern"), ask),
+            finding("correctness", Some("question"), ask),
+        ] {
+            assert!(!f.holds_merge(), "{:?}", f.evidence);
+            assert_eq!(decide_verdict(&[f], 0, 0, false, false), "COMMENT");
+        }
+        // Its open thread from the earlier push doesn't hold the next one.
+        let old_thread = "💬 **Confirm redirect targets** (question)\n\nPlease confirm …";
+        assert!(!thread_holds_merge(old_thread));
+        assert!(!thread_holds_merge(&format!(
+            "💬 **X** (correctness, not verified)\n\nbody\n\n{NON_BLOCKING_MARK}"
+        )));
+        assert!(thread_holds_merge(
+            "🔴 **Wrong target** (bug)\n\n/docs → 404"
+        ));
+        assert_eq!(decide_verdict(&[], 0, 1, false, false), "COMMENT");
+    }
+
+    /// check_url ran: all six targets returned 200 → nothing to ask, the
+    /// reviewer reports the check in its summary and has no finding.
+    #[tokio::test]
+    async fn checked_targets_that_load_approve() {
+        use super::super::web_check::{check, HostPolicy};
+        let fake = fixture::six_targets(200);
+        let gate = HostPolicy {
+            domains: vec!["example.com".into()],
+            ..Default::default()
+        };
+        for u in fixture::TARGETS {
+            let c = check(u, &gate, &fake).await.unwrap();
+            assert_eq!(c.status(), Some(200), "{u}");
+        }
+        assert_eq!(decide_verdict(&[], 0, 0, false, false), "APPROVE");
+    }
+
+    /// check_url ran and a target is a 404: that is a verified defect with
+    /// the check as its evidence, and it requests changes.
+    #[tokio::test]
+    async fn a_checked_target_that_404s_requests_changes_with_the_evidence() {
+        use super::super::web_check::{check, HostPolicy};
+        let fake = fixture::six_targets(404);
+        let gate = HostPolicy {
+            domains: vec!["example.com".into()],
+            ..Default::default()
+        };
+        let c = check(fixture::TARGETS[2], &gate, &fake).await.unwrap();
+        assert_eq!(c.status(), Some(404));
+        let evidence = format!("check_url: {}", c.line());
+        let f = finding(
+            "bug",
+            Some("verified-defect"),
+            &format!("The new 301 target is missing. {evidence}"),
+        );
+        assert!(f.holds_merge());
+        assert!(f.body.contains("404"));
+        assert_eq!(decide_verdict(&[f], 0, 0, false, false), "REQUEST_CHANGES");
+    }
+
+    mod fixture {
+        use super::super::super::web_check::{Method, Resp, Transport};
+        use reqwest::Url;
+        use std::net::{IpAddr, SocketAddr};
+
+        pub const TARGETS: [&str; 6] = [
+            "https://www.example.com/pricing",
+            "https://www.example.com/docs/start",
+            "https://www.example.com/blog/launch",
+            "https://www.example.com/careers",
+            "https://www.example.com/legal/terms",
+            "https://www.example.com/contact",
+        ];
+
+        /// Every target answers `status`; the site resolves publicly.
+        pub struct Site(pub u16);
+
+        pub fn six_targets(status: u16) -> Site {
+            Site(status)
+        }
+
+        #[async_trait::async_trait]
+        impl Transport for Site {
+            async fn resolve(&self, _host: &str) -> Result<Vec<IpAddr>, String> {
+                Ok(vec!["93.184.215.14".parse().unwrap()])
+            }
+            async fn send(&self, _m: Method, url: &Url, _a: SocketAddr) -> Result<Resp, String> {
+                assert!(TARGETS.contains(&url.as_str()), "{url}");
+                Ok(Resp {
+                    status: self.0,
+                    content_type: "text/plain".into(),
+                    ..Default::default()
+                })
+            }
+        }
     }
 }
 
