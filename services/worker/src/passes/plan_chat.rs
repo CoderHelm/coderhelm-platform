@@ -155,9 +155,11 @@ pub fn used(kind: &str, label: &str, href: &str) -> Value {
     json!({ "kind": kind, "label": label, "href": href })
 }
 
+/// The dashboard page of an item: an agent's own page, else the item page.
 fn item_href(kind: &str, repo: &str, path: &str) -> String {
     format!(
-        "/skills/{kind}/?repo={}&path={}",
+        "/skills/{}?repo={}&path={}",
+        if kind == "agent" { "agent/" } else { "item" },
         urlencoding::encode(repo),
         urlencoding::encode(path)
     )
@@ -258,7 +260,7 @@ async fn call(state: &WorkerState, req: &Request, l: &Loaded) -> Value {
         .map(str::to_string)
         .or_else(|| input["source"].as_str().map(str::to_string))
         .unwrap_or_else(|| "a data source".into());
-    json!({ "text": text, "used": used("source", &label, "/data-sources/?tab=activity") })
+    json!({ "text": text, "used": used("source", &label, "/data-sources/activity") })
 }
 
 async fn github_for(state: &WorkerState, team_id: &str) -> Option<GitHubClient> {
@@ -315,6 +317,10 @@ mod tests {
         assert_eq!(
             item_href("agent", "acme/playbook", "agents/x.md"),
             "/skills/agent/?repo=acme%2Fplaybook&path=agents%2Fx.md"
+        );
+        assert_eq!(
+            item_href("skill", "acme/playbook", "skills/d/SKILL.md"),
+            "/skills/item?repo=acme%2Fplaybook&path=skills%2Fd%2FSKILL.md"
         );
     }
 }
