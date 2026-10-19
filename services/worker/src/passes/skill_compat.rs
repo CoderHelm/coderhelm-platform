@@ -60,6 +60,11 @@ const EXTRA_TOOLS: &[(&str, &str)] = &[
     ),
     ("read_skill_file", "Read a file kept next to a team skill"),
     ("ask_team_agent", "Ask one of the team's agents a question"),
+    (
+        super::github_history::TOOL,
+        "Read the repository's history on GitHub (git log, git blame, gh pr list, gh release): \
+         commits, blame, pull requests, releases, tags, deployments and Actions runs",
+    ),
 ];
 
 /// Tools that change the repository (in the pull request).
@@ -155,7 +160,8 @@ const GITHUB: &[&str] = &[
     "Compare the working branch with the pull request's base branch (get_diff)",
     "Open and update a pull request with its changes",
     "Answer review comments on its own pull requests",
-    "It has no tool for commit history, blame, releases, deploy history or CI logs",
+    "Read the repository's history (github_history): commits, blame, pull requests, releases, \
+     tags, deployments and Actions runs",
 ];
 
 const NEVER: &[&str] = &[
@@ -829,8 +835,8 @@ mod tests {
         assert!(commands.iter().any(|c| c.starts_with("grep")));
         assert!(commands.iter().any(|c| c.starts_with("git diff")));
         assert!(commands.iter().any(|c| c.starts_with("npm view")));
-        // The history tool isn't in this inventory, so git log isn't offered yet.
-        assert!(!commands.iter().any(|c| c.starts_with("git log")));
+        // The history tool is a built-in, so git log is offered as translated.
+        assert!(commands.iter().any(|c| c.starts_with("git log")));
         let mut with_history = builtin_tools();
         with_history.push(Tool {
             name: "github_history".into(),

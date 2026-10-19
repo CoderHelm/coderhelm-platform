@@ -399,6 +399,8 @@ pub struct PrReviewToolExecutor<'a> {
     /// definition/caller/impact tools. None ⇒ those tools aren't offered.
     pub state: &'a WorkerState,
     pub graph: Option<&'a super::code_graph::Graph>,
+    /// Repository history (commits, blame, pull requests, releases, deploys).
+    pub history: Option<&'a super::github_history::GithubHistory>,
     /// The team's connected live systems this review may read from, if any.
     pub live: Option<&'a super::live_sources::LiveSources>,
     /// The team's written skills, read-only.
@@ -460,6 +462,11 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
         if let Some(out) = super::code_graph::handle_tool(self.state, self.graph, name, input).await
         {
             return Ok(json!(common::head_tail_str(&out, 8_000)));
+        }
+        if let Some(history) = self.history {
+            if let Some(out) = history.handle(self.state, self.github, name, input).await {
+                return Ok(json!(out));
+            }
         }
         if let Some(live) = self.live {
             if let Some(out) = live.handle(self.state, name, input).await {
@@ -747,6 +754,7 @@ pub async fn generate_review(
     graph: Option<&super::code_graph::Graph>,
     graph_context: &str,
     prior_context: &str,
+    history: Option<&super::github_history::GithubHistory>,
     live: Option<&super::live_sources::LiveSources>,
     skills: Option<&super::skills::TeamSkills>,
     usage: &mut TokenUsage,
@@ -807,7 +815,13 @@ pub async fn generate_review(
          nothing. If you are unsure whether something is a real problem, read more code until you \
          know.{graph_note}"
     );
-    let live_context = live.map(|l| l.prompt_section()).unwrap_or_default();
+    let live_context = format!(
+        "{}{}",
+        history
+            .map(|_| super::github_history::prompt_line())
+            .unwrap_or_default(),
+        live.map(|l| l.prompt_section()).unwrap_or_default()
+    );
     let skills_context = skills.map(|s| s.prompt_section()).unwrap_or_default();
     let prompt = format!(
         "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{graph_context}{prior_context}{live_context}{skills_context}\n\
@@ -824,12 +838,16 @@ pub async fn generate_review(
         head_sha,
         state,
         graph,
+        history,
         live,
         skills,
     };
     let mut tools = review_tools();
     if graph.is_some() {
         tools.extend(graph_tools());
+    }
+    if history.is_some() {
+        tools.push(super::github_history::tool());
     }
     if let Some(live) = live {
         tools.extend(live.tools());

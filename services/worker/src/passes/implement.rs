@@ -398,6 +398,25 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         tools.extend(l.tools());
         full_system.push_str(&l.prompt_section());
     }
+    // Repository history through the GitHub App: no setup.
+    let history = super::github_history::GithubHistory::new(
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        super::plan::fetch_team_repos(state, &msg.team_id).await,
+        "coder",
+        0,
+    )
+    .with_run(
+        run_id.unwrap_or_default(),
+        super::skills::ticket_origin(
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.ticket_id,
+            msg.issue_number,
+        ),
+    );
+    tools.push(super::github_history::tool());
+    full_system.push_str(super::github_history::prompt_line());
     // The team's own written skills, read-only guidance.
     let skills = super::skills::TeamSkills::load(
         state,
@@ -479,6 +498,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         mcp_plugins: &loaded_mcp_plugins,
         lambda: &state.lambda,
         mcp_proxy_function_name: &state.config.mcp_proxy_function_name,
+        history: Some(&history),
         live: live.as_ref(),
         skills: skills.as_ref(),
         state,
@@ -1817,6 +1837,8 @@ struct CombinedWriteToolExecutor<'a> {
     mcp_plugins: &'a [mcp::McpPlugin],
     lambda: &'a aws_sdk_lambda::Client,
     mcp_proxy_function_name: &'a str,
+    /// Repository history (commits, blame, pull requests, releases, deploys).
+    history: Option<&'a super::github_history::GithubHistory>,
     /// The team's connected live systems, read-only.
     live: Option<&'a super::live_sources::LiveSources>,
     /// The team's written skills, read-only.
@@ -1831,6 +1853,14 @@ impl<'a> ToolExecutor for CombinedWriteToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(history) = self.history {
+            if let Some(out) = history
+                .handle(self.state, self.write_executor.github, name, input)
+                .await
+            {
+                return Ok(serde_json::json!(out));
+            }
+        }
         if let Some(live) = self.live {
             if let Some(out) = live.handle(self.state, name, input).await {
                 return Ok(serde_json::json!(out));

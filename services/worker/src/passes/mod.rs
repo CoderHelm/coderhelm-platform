@@ -646,6 +646,7 @@ pub mod code_graph;
 pub mod e2e;
 pub mod feedback;
 pub mod formatter;
+pub mod github_history;
 pub mod health_check;
 mod implement;
 pub mod infra_analyze;
