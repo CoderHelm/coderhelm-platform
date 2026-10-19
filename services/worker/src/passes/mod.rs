@@ -646,12 +646,14 @@ pub mod await_merge;
 pub mod code_graph;
 pub mod e2e;
 pub mod feedback;
+pub mod fix_location;
 pub mod formatter;
 pub mod github_history;
 pub mod health_check;
 pub mod hidden_suggest;
 mod implement;
 pub mod infra_analyze;
+pub mod lessons;
 pub mod live_sources;
 pub mod onboard;
 pub mod ops_tools;
@@ -1544,8 +1546,14 @@ async fn run_passes(
     // parse_openspec_files returns empty strings for any fence the model
     // omitted; an empty task list used to flow straight into implement and
     // produce a guaranteed zero-change run.
+    // Where the fix belongs, as the planner decided it from what it looked up.
+    let fix_route = fix_location::route_for_plan(plan_result.fix.as_ref(), &plan_result.tasks);
     let plan_is_directive = plan_result.tasks.starts_with("NO_CHANGES_NEEDED:")
-        || plan_result.tasks.starts_with("CLARIFICATION_NEEDED:");
+        || plan_result.tasks.starts_with("CLARIFICATION_NEEDED:")
+        || matches!(
+            fix_route,
+            fix_location::Route::OutsideOnly | fix_location::Route::Ask
+        );
     if !plan_is_directive
         && (plan_result.tasks.trim().is_empty() || plan_result.design.trim().is_empty())
     {
@@ -1559,6 +1567,72 @@ async fn run_passes(
              This is usually a transient model formatting issue — retry the run."
                 .into(),
         );
+    }
+
+    // --- Check: is the fix outside the code? ---
+    // The code works as designed and the outcome comes from data or settings
+    // in another system: report the change to make there, open no PR. Not
+    // sure which: report what was found and ask, rather than code around it.
+    if !plan_result.tasks.starts_with("NO_CHANGES_NEEDED:")
+        && !plan_result.tasks.starts_with("CLARIFICATION_NEEDED:")
+        && matches!(
+            fix_route,
+            fix_location::Route::OutsideOnly | fix_location::Route::Ask
+        )
+    {
+        let mut decision = plan_result.fix.clone().unwrap_or_default();
+        if decision.cause.trim().is_empty() {
+            // A plan that codes nothing but wrote no decision: its one line
+            // is what it found.
+            decision.cause = plan_result
+                .tasks
+                .trim_start()
+                .strip_prefix(fix_location::NO_CODE_CHANGE)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+        }
+        finish_without_code(
+            state,
+            msg,
+            run_id,
+            &github,
+            &decision,
+            fix_route,
+            usage,
+            start,
+            &used_mcp_ids,
+        )
+        .await;
+        close_memory(state, agent_memory.take()).await;
+        return Ok(());
+    }
+
+    // A code change AND a change outside the code: the ticket hears about the
+    // outside part now (the PR body carries it too), so a person can make it
+    // while the code is written.
+    if fix_route == fix_location::Route::CodeAndOutside {
+        if let Some(decision) = plan_result.fix.as_ref() {
+            report_also_outside(state, msg, run_id, &github, decision).await;
+        }
+    } else if fix_route == fix_location::Route::Code {
+        // The reviewer reads what the planner found when it judges the PR.
+        if let Some(decision) = plan_result.fix.as_ref() {
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key("team_id", attr_s(&msg.team_id))
+                .key("run_id", attr_s(run_id))
+                .update_expression("SET fix_location = :fl, fix_decision = :fd")
+                .expression_attribute_values(":fl", attr_s(decision.effective_location().as_str()))
+                .expression_attribute_values(
+                    ":fd",
+                    attr_s(&serde_json::to_string(decision).unwrap_or_default()),
+                )
+                .send()
+                .await;
+        }
     }
 
     // --- Check: already done? ---
@@ -3028,6 +3102,7 @@ async fn run_passes(
                 spec: String::new(),
                 design: String::new(),
                 repo_tasks: vec![],
+                fix: None,
             };
             let fix_cache = FileCache::default();
             // Fixer gets the same rules/conventions as the original implement
@@ -3418,6 +3493,7 @@ async fn run_repo_pipeline(
         tasks: repo_tasks.to_string(),
         spec: plan_result.spec.clone(),
         repo_tasks: vec![],
+        fix: plan_result.fix.clone(),
     };
 
     // --- Implement ---
@@ -3548,6 +3624,7 @@ async fn run_repo_pipeline(
                 spec: String::new(),
                 design: String::new(),
                 repo_tasks: vec![],
+                fix: None,
             };
             let fix_cache = FileCache::default();
             // Same rules/conventions as the original implement (see the
@@ -3938,6 +4015,198 @@ pub(crate) async fn record_ci_outcome(
     if let Err(e) = req.send().await {
         warn!(run_id, error = %e, "Failed to record CI outcome (non-fatal)");
     }
+}
+
+/// Ends a run whose fix is not (or not yet known to be) in the code: posts
+/// the findings on the ticket the run came from and records them on the run,
+/// with no branch and no pull request. A change outside the code ends the run
+/// as `needs_outside_change`; not knowing where the fix belongs ends it as
+/// `needs_input`, so a reply picks it up again.
+#[allow(clippy::too_many_arguments)]
+async fn finish_without_code(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    decision: &fix_location::FixDecision,
+    route: fix_location::Route,
+    usage: &TokenUsage,
+    start: &std::time::Instant,
+    mcp_ids: &[String],
+) {
+    let outside = route == fix_location::Route::OutsideOnly;
+    let (report, jira_title, jira_type) = if outside {
+        (
+            fix_location::outside_report(decision, false),
+            "Needs a change outside the code",
+            "clarification",
+        )
+    } else {
+        (
+            fix_location::unknown_report(decision, false),
+            "Not sure yet where the fix belongs",
+            "clarification",
+        )
+    };
+    let heading = format!("**{jira_title}**\n\n");
+    info!(
+        run_id,
+        fix_location = decision.effective_location().as_str(),
+        "Fix is not in the code — reporting instead of opening a PR"
+    );
+    add_progress_note(state, &msg.team_id, run_id, jira_title).await;
+
+    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+        if let Err(e) = github
+            .create_issue_comment(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                &format!("{heading}{report}"),
+            )
+            .await
+        {
+            warn!(run_id, error = %e, "Could not post the outside-the-code report on the issue");
+        }
+    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+        if let Err(e) = post_jira_comment(
+            state,
+            &msg.team_id,
+            &msg.ticket_id,
+            &fix_location::jira_text(&report),
+            jira_type,
+            jira_title,
+        )
+        .await
+        {
+            warn!(run_id, error = %e, "Could not post the outside-the-code report on the ticket");
+        }
+    }
+
+    if !outside {
+        mark_run_needs_input(state, msg, run_id, usage, start, mcp_ids).await;
+    }
+    let status = if outside {
+        fix_location::STATUS_OUTSIDE
+    } else {
+        "needs_input"
+    };
+    let duration = start.elapsed().as_secs();
+    let now = chrono::Utc::now().to_rfc3339();
+    let decision_json = serde_json::to_string(decision).unwrap_or_default();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET #status = :s, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, \
+             cache_write_tokens = :cwt, cost_usd = :c, duration_s = :d, updated_at = :t, \
+             current_pass = :cp, status_run_id = :sri, mcp_servers = :mcp, \
+             fix_location = :fl, fix_decision = :fd, outside_change_report = :rep",
+        )
+        .expression_attribute_names("#status", "status")
+        .expression_attribute_values(":s", attr_s(status))
+        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+        .expression_attribute_values(":to", attr_n(usage.output_tokens))
+        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+        .expression_attribute_values(":c", attr_n(format!("{:.4}", usage.estimated_cost())))
+        .expression_attribute_values(":d", attr_n(duration))
+        .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":cp", attr_s("done"))
+        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
+        .expression_attribute_values(
+            ":mcp",
+            AttributeValue::L(mcp_ids.iter().map(|s| attr_s(s)).collect()),
+        )
+        .expression_attribute_values(":fl", attr_s(decision.effective_location().as_str()))
+        .expression_attribute_values(":fd", attr_s(&decision_json))
+        .expression_attribute_values(":rep", attr_s(&format!("{heading}{report}")))
+        .send()
+        .await;
+
+    if outside {
+        let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
+        for period in &[analytics_month.as_str(), "ALL_TIME"] {
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.analytics_table_name)
+                .key("team_id", attr_s(&msg.team_id))
+                .key("period", attr_s(period))
+                .update_expression("ADD completed :one, outside_code :one")
+                .expression_attribute_values(":one", attr_n(1))
+                .send()
+                .await;
+        }
+    }
+}
+
+/// Tells the ticket about the part of the fix that has to be made outside the
+/// code when the run also changes code, and records it on the run.
+async fn report_also_outside(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    decision: &fix_location::FixDecision,
+) {
+    let section = fix_location::also_outside_section(Some(decision));
+    if section.is_empty() {
+        return;
+    }
+    let report = section
+        .trim()
+        .replacen("## Also needed outside the code", "", 1)
+        .trim()
+        .replace(
+            "This pull request does not make that change",
+            "The pull request for this ticket does not make that change",
+        );
+    let title = "Also needed outside the code";
+    add_progress_note(state, &msg.team_id, run_id, title).await;
+    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+        let _ = github
+            .create_issue_comment(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                &format!("**{title}**\n\n{report}"),
+            )
+            .await;
+    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+        if let Err(e) = post_jira_comment(
+            state,
+            &msg.team_id,
+            &msg.ticket_id,
+            &fix_location::jira_text(&report),
+            "clarification",
+            title,
+        )
+        .await
+        {
+            warn!(run_id, error = %e, "Could not post the outside part of the fix on the ticket");
+        }
+    }
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET fix_location = :fl, fix_decision = :fd, outside_change_report = :rep",
+        )
+        .expression_attribute_values(":fl", attr_s(decision.effective_location().as_str()))
+        .expression_attribute_values(
+            ":fd",
+            attr_s(&serde_json::to_string(decision).unwrap_or_default()),
+        )
+        .expression_attribute_values(":rep", attr_s(&format!("**{title}**\n\n{report}")))
+        .send()
+        .await;
 }
 
 /// Mark a run `needs_input` (a comment or re-run can pick it up again) and
@@ -6491,6 +6760,9 @@ async fn load_cached_plan_files(state: &WorkerState, prefix: &str) -> Option<pla
         tasks: files.remove("tasks.md").unwrap_or_default(),
         spec: files.remove("spec.md").unwrap_or_default(),
         repo_tasks: vec![],
+        fix: read_s3_text(state, &format!("{prefix}/{}", fix_location::FILE))
+            .await
+            .and_then(|t| serde_json::from_str(&t).ok()),
     })
 }
 

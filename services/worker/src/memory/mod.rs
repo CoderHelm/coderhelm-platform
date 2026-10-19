@@ -80,6 +80,135 @@ fn pinned_memories(db: &MenteDb) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Tag on a lesson about where a fix belonged (see [`AgentMemory::store_lesson`]).
+pub const LESSON_TAG: &str = "fix-location-lesson";
+
+/// Most lessons handed to the planner on one ticket.
+const MAX_LESSONS: usize = 3;
+
+/// Tags for a lesson: learned on a run, a correction, about this repo.
+pub fn lesson_tags(origin: &LearningOrigin, repo_owner: &str, repo_name: &str) -> Vec<String> {
+    let mut tags = common::memory_meta::run_tags(
+        "correction",
+        &origin.run_id,
+        &origin.ticket_id,
+        &origin.title,
+    );
+    tags.push(LESSON_TAG.to_string());
+    tags.push(format!("repo:{repo_owner}/{repo_name}"));
+    tags
+}
+
+/// The memory context for a ticket: pinned memories, the team's lessons on
+/// where similar fixes belonged, then other relevant learnings. Returns the
+/// context and the ids it handed over.
+fn recall_with(
+    db: &MenteDb,
+    embedding: &[f32],
+    query: &str,
+    k: usize,
+    now_micros: u64,
+) -> (String, Vec<String>) {
+    // Hybrid (vector + BM25 via RRF): tickets name exact code identifiers
+    // (function names, crate names, file paths) that pure vector recall
+    // ranks poorly — the keyword arm catches them. Same fused-score scale
+    // as recall_similar, so the floor below still applies.
+    //
+    // Relevance floor: top-k on a small store returns SOMETHING no matter
+    // how unrelated — injecting off-topic memories into every ticket
+    // steers the agent wrong. mentedb returns RRF-fused rank scores
+    // (max ≈ 0.08 = 1/60·0.7 + salience·0.05 + recency·0.02), NOT cosine
+    // similarity — a cosine-scale floor filtered out every result. This
+    // floor only drops the deep tail of the ranked list.
+    let recall = |k: usize, tags: Option<&[&str]>| -> Vec<(mentedb_core::types::MemoryId, f32)> {
+        match db.recall_hybrid_at(embedding, Some(query), k, now_micros, tags, None, None) {
+            Ok(r) => r
+                .into_iter()
+                .filter(|(_, score)| *score >= MIN_RELEVANCE)
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "Failed to recall memories");
+                Vec::new()
+            }
+        }
+    };
+    // Lessons are recalled on their own, so other learnings can't crowd out
+    // what the team said about where this kind of fix belongs.
+    let lessons = recall(MAX_LESSONS, Some(&[LESSON_TAG]));
+    let results = recall(k, None);
+    let mut recalled: Vec<String> = Vec::new();
+
+    // Pinned memories reach the agent on every ticket: a person decided
+    // they always apply.
+    let pinned = pinned_memories(db);
+    if results.is_empty() && pinned.is_empty() && lessons.is_empty() {
+        return (String::new(), recalled);
+    }
+
+    let mut context = String::from("## Agent Memory\n");
+    if !pinned.is_empty() {
+        context.push_str("Always follow these; your team pinned them for this repository:\n\n");
+        for (id, content) in &pinned {
+            context.push_str(&format!("- {content}\n"));
+            recalled.push(id.clone());
+        }
+        context.push('\n');
+    }
+    let mut lesson_lines = Vec::new();
+    for (id, _) in &lessons {
+        let Ok(node) = db.get_memory(*id) else {
+            continue;
+        };
+        let id = id.to_string();
+        if node.tags.iter().any(|t| t == common::memory_meta::PINNED) || recalled.contains(&id) {
+            continue;
+        }
+        lesson_lines.push(format!("- {}\n", node.content));
+        recalled.push(id);
+    }
+    if !lesson_lines.is_empty() {
+        context.push_str(
+            "Where similar fixes belonged before (your team's lessons for this repository; \
+             check these first, before planning code):\n\n",
+        );
+        for l in &lesson_lines {
+            context.push_str(l);
+        }
+        context.push('\n');
+    }
+    if results.is_empty() {
+        return (context, recalled);
+    }
+    let mut learned = String::new();
+    for (id, score) in &results {
+        if let Ok(node) = db.get_memory(*id) {
+            let type_label = match node.memory_type {
+                MemoryType::AntiPattern => "⚠️ Anti-pattern",
+                MemoryType::Semantic => "📋 Finding",
+                MemoryType::Procedural => "🔧 Procedure",
+                MemoryType::Correction => "✏️ Correction",
+                MemoryType::Episodic => "📝 Note",
+                MemoryType::Reasoning => "💡 Reasoning",
+            };
+            let sid = id.to_string();
+            if node.tags.iter().any(|t| t == common::memory_meta::PINNED) || recalled.contains(&sid)
+            {
+                continue;
+            }
+            learned.push_str(&format!(
+                "- **{type_label}** (relevance: {score:.2}): {}\n",
+                node.content
+            ));
+            recalled.push(sid);
+        }
+    }
+    if !learned.is_empty() {
+        context.push_str("Relevant learnings from past runs on this repository:\n\n");
+        context.push_str(&learned);
+    }
+    (context, recalled)
+}
+
 /// Where a learning came from: the run and ticket it was learned on.
 #[derive(Debug, Clone, Default)]
 pub struct LearningOrigin {
@@ -193,81 +322,22 @@ impl AgentMemory {
                 return String::new();
             }
         };
-
-        // Hybrid (vector + BM25 via RRF): tickets name exact code identifiers
-        // (function names, crate names, file paths) that pure vector recall
-        // ranks poorly — the keyword arm catches them. Same fused-score scale
-        // as recall_similar, so the floor below still applies.
         let now_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        let results =
-            match self
-                .db
-                .recall_hybrid_at(&embedding, Some(query), k, now_micros, None, None, None)
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(error = %e, "Failed to recall memories");
-                    return String::new();
-                }
-            };
-
-        // Relevance floor: top-k on a small store returns SOMETHING no matter
-        // how unrelated — injecting off-topic memories into every ticket
-        // steers the agent wrong. Cosine similarity below the floor is noise.
-        // mentedb's recall_similar returns RRF-fused rank scores
-        // (max ≈ 0.08 = 1/60·0.7 + salience·0.05 + recency·0.02), NOT cosine
-        // similarity — a cosine-scale floor filtered out every result. This
-        // floor only drops the deep tail of the ranked list.
-        let results: Vec<_> = results
-            .into_iter()
-            .filter(|(_, score)| *score >= MIN_RELEVANCE)
-            .collect();
-        self.last_recalled.clear();
-
-        // Pinned memories reach the agent on every ticket: a person decided
-        // they always apply.
-        let pinned = pinned_memories(&self.db);
-        if results.is_empty() && pinned.is_empty() {
-            return String::new();
-        }
-
-        let mut context = String::from("## Agent Memory\n");
-        if !pinned.is_empty() {
-            context.push_str("Always follow these; your team pinned them for this repository:\n\n");
-            for (id, content) in &pinned {
-                context.push_str(&format!("- {content}\n"));
-                self.last_recalled.push(id.clone());
-            }
-            context.push('\n');
-        }
-        if results.is_empty() {
-            return context;
-        }
-        context.push_str("Relevant learnings from past runs on this repository:\n\n");
-        for (id, score) in &results {
-            if let Ok(node) = self.db.get_memory(*id) {
-                let type_label = match node.memory_type {
-                    MemoryType::AntiPattern => "⚠️ Anti-pattern",
-                    MemoryType::Semantic => "📋 Finding",
-                    MemoryType::Procedural => "🔧 Procedure",
-                    MemoryType::Correction => "✏️ Correction",
-                    MemoryType::Episodic => "📝 Note",
-                    MemoryType::Reasoning => "💡 Reasoning",
-                };
-                if node.tags.iter().any(|t| t == common::memory_meta::PINNED) {
-                    continue;
-                }
-                context.push_str(&format!(
-                    "- **{type_label}** (relevance: {score:.2}): {}\n",
-                    node.content
-                ));
-                self.last_recalled.push(id.to_string());
-            }
-        }
+        let (context, recalled) = recall_with(&self.db, &embedding, query, k, now_micros);
+        self.last_recalled = recalled;
         context
+    }
+
+    /// Store a team lesson about where a fix belonged (learned when a person
+    /// said the fix was elsewhere, or closed CoderHelm's PR). It is recalled
+    /// on its own for similar tickets, ahead of the other learnings.
+    pub async fn store_lesson(&mut self, lesson: &str, origin: &LearningOrigin) {
+        let tags = lesson_tags(origin, &self.repo_owner, &self.repo_name);
+        self.store_learning(lesson, MemoryType::Correction, tags)
+            .await;
     }
 
     /// Store a new learning from this run.
@@ -699,6 +769,91 @@ mod tests {
             "Run the service tests from the services directory.",
         );
         assert_eq!(hits[0].0, new_id);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in for the embedder: words hashed into the vector, so texts
+    /// that share words point the same way.
+    fn words_vector(text: &str) -> Vec<f32> {
+        let mut v = vec![0.0f32; 1024];
+        for w in text
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2)
+        {
+            let h = w.bytes().fold(1469598103934665603u64, |h, b| {
+                (h ^ b as u64).wrapping_mul(1099511628211)
+            });
+            v[(h % 1024) as usize] += 1.0;
+        }
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        v.iter().map(|x| x / n).collect()
+    }
+
+    #[test]
+    fn a_lesson_from_a_closed_pr_is_recalled_first_for_a_similar_ticket() {
+        let dir = std::env::temp_dir().join(format!("mentedb-lesson-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = open_db(&dir, Box::new(MustNotEmbed)).unwrap();
+
+        // Ordinary learnings, enough to fill a recall on their own.
+        for i in 0..12 {
+            let text = format!(
+                "Sync job learning {i}: classes and programs are loaded by the nightly sync from the site tables."
+            );
+            let mut n = MemoryNode::new(
+                AgentId::nil(),
+                MemoryType::Semantic,
+                text.clone(),
+                words_vector(&text),
+            );
+            n.tags = common::memory_meta::run_tags("architecture", "run-0", "T-1", "older");
+            db.store_with_outcome(n).unwrap();
+        }
+        // The lesson stored when CoderHelm's PR was closed unmerged.
+        let lesson = "Classes missing from the site are often because their semester is not \
+                      available on web in the booking system; check that setting first.";
+        let origin = LearningOrigin {
+            run_id: "run-1".into(),
+            ticket_id: "T-2".into(),
+            title: "Saturday class missing".into(),
+        };
+        let mut n = MemoryNode::new(
+            AgentId::nil(),
+            MemoryType::Correction,
+            lesson.into(),
+            words_vector(lesson),
+        );
+        n.tags = lesson_tags(&origin, "acme", "data-sync");
+        assert!(n.tags.iter().any(|t| t == LESSON_TAG));
+        assert!(n.tags.iter().any(|t| t == "repo:acme/data-sync"));
+        assert!(n.tags.iter().any(|t| t == "correction"));
+        let lesson_id = n.id.to_string();
+        db.store_with_outcome(n).unwrap();
+        db.flush().unwrap();
+
+        // A later, similar ticket on the same repository.
+        let ticket = "Sunday class missing from the site: the Sunday class for program 555 \
+                      is not showing on the site";
+        let (context, recalled) = recall_with(&db, &words_vector(ticket), ticket, 5, now_micros());
+        assert!(recalled.contains(&lesson_id), "the lesson is recalled");
+        let lessons_at = context
+            .find("Where similar fixes belonged before")
+            .expect("lessons have their own section");
+        let lesson_at = context.find("Classes missing from the site").unwrap();
+        assert!(lesson_at > lessons_at, "the lesson is in that section");
+        if let Some(learned_at) = context.find("Relevant learnings from past runs") {
+            assert!(
+                lessons_at < learned_at,
+                "lessons come before other learnings"
+            );
+        }
+        assert_eq!(
+            context.matches("Classes missing from the site").count(),
+            1,
+            "never listed twice"
+        );
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

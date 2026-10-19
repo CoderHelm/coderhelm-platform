@@ -36,6 +36,15 @@ pub async fn run(
     // PRs per branch), otherwise reopen the original. Also strip the
     // "⚠️ Partial:" salvage marker — someone actively re-reviewing means the
     // work is being finished.
+    // A person saying the fix belongs outside the code (a setting in another
+    // system) is a lesson for the team, not a request to change this code.
+    // Checked first: it also holds when they closed the PR.
+    if super::lessons::check_comment(state, &provider, &github, &msg, &mut usage).await {
+        info!(run_id = %msg.run_id, "Feedback says the fix is outside the code — lesson recorded, no code change");
+        finish_without_change(state, &msg).await;
+        return Ok(());
+    }
+
     if !ensure_pr_open(state, &github, &mut msg).await {
         // A human closed the PR — respect it and stop.
         return Ok(());
@@ -1974,6 +1983,42 @@ async fn handle_wrong_repo(
     );
 
     Ok(())
+}
+
+/// Puts a run back to `completed` after a feedback cycle that changed nothing,
+/// unless it is still working (resume owns those states).
+async fn finish_without_change(state: &WorkerState, msg: &FeedbackMessage) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key(
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
+        )
+        .key(
+            "run_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
+        )
+        .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t")
+        .condition_expression("#s = :running")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(
+            ":s",
+            aws_sdk_dynamodb::types::AttributeValue::S("completed".to_string()),
+        )
+        .expression_attribute_values(
+            ":running",
+            aws_sdk_dynamodb::types::AttributeValue::S("running".to_string()),
+        )
+        .expression_attribute_values(
+            ":sri",
+            aws_sdk_dynamodb::types::AttributeValue::S(format!("completed#{}", msg.run_id)),
+        )
+        .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
+        .send()
+        .await;
 }
 
 /// While a run is awaiting CI or running, the resume flow owns CI fixing

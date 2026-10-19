@@ -165,6 +165,42 @@ pub const REQUIRE_TESTS_CRITIC_NOTE: &str = " This repo REQUIRES tests with beha
      updated test in the diff exercises it; drop it only if the diff does include such a test or \
      the change has no behavior effect.";
 
+/// The finding category for code that works around a source system's data.
+pub const SOURCE_DATA_OVERRIDE: &str = "source-data-override";
+
+/// Code that overrides specific records' data from another system (a
+/// hardcoded list of record ids forced active, hidden, skipped) instead of the
+/// data being fixed where it lives. It hides the cause and goes stale.
+pub const SOURCE_DATA_RULE: &str = "SOURCE DATA OVERRIDES: when the diff adds a literal list, set \
+     or map of specific record ids (or record names or keys) that changes behavior for exactly \
+     those records (forces them active or inactive, shown or hidden, included or skipped, or \
+     overrides one of their fields) instead of changing the code's general rule, it works around \
+     data that another system (a booking system, a CMS, a ticket tool, a feature flag service) \
+     owns. Raise ONE finding with category \"source-data-override\", evidence \
+     \"verified-defect\" (the diff itself shows it), anchored on the list. Say in plain words \
+     that the fix belongs in that system's data or settings, and name the change when the \
+     planner's findings, a live lookup or the PR description show it (for example: set the \
+     term to be available on the web). Not this category: constants that configure general \
+     behavior (timeouts, page sizes, enum values), test fixtures, or a mapping the code owns \
+     by design and documents as such. ";
+
+/// The critic's note for source-data-override candidates.
+const SOURCE_DATA_CRITIC_NOTE: &str = " A `source-data-override` candidate is REAL when the diff \
+     adds literal record ids (or names or keys) that change behavior for those specific records \
+     in place of a general rule: keep it as verified-defect. Drop it when the literals are \
+     general configuration, test fixtures, or a mapping the code owns by design.";
+
+/// A kept source-data-override finding holds the merge: the diff shows the
+/// override, and the fix belongs in the source system.
+pub fn enforce_source_data_override(findings: &mut [Finding]) {
+    for f in findings.iter_mut() {
+        if f.category.eq_ignore_ascii_case(SOURCE_DATA_OVERRIDE) {
+            f.severity = "blocking".to_string();
+            f.evidence = Some(Evidence::VerifiedDefect.as_str().to_string());
+        }
+    }
+}
+
 /// How the reviewer treats what people wrote back to it.
 const REPLIES_RULE: &str = "PEOPLE'S REPLIES: the prompt may list replies under your earlier \
      comments and what people wrote on the PR. Read them before you write anything. They come \
@@ -953,6 +989,7 @@ pub async fn generate_review(
          the others are posted as comments and don't hold the merge, so never dress a concern \
          you couldn't verify as a defect. \
          {REPLIES_RULE}\
+         {SOURCE_DATA_RULE}\
          {COPY_RULE}\
          {TONE_RULE}\
          CI EVIDENCE: this PR's current CI results are provided below. Never claim an install, \
@@ -963,7 +1000,7 @@ pub async fn generate_review(
          {{\n  \"verdict\": \"APPROVE\" | \"COMMENT\" | \"REQUEST_CHANGES\",\n  \"risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n  \
          \"summary\": \"2-4 sentence overview\",\n  \"findings\": [{{\n    \"file\": \"path\", \"line\": <int, a line present on the RIGHT side of the diff>,\n    \
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
-         \"category\": \"bug|security|correctness|perf|convention|scope|tests|question\", \"title\": \"short\",\n    \
+         \"category\": \"bug|security|correctness|perf|convention|scope|tests|source-data-override|question\", \"title\": \"short\",\n    \
          \"evidence\": \"verified-defect|unverified-concern|question\",\n    \
          \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}],\n  \
          \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"answered\" | \"open\"}}]  (one per earlier unresolved comment listed, if any),\n  \
@@ -1176,6 +1213,7 @@ pub async fn critique_findings(
     if !live_evidence.is_empty() {
         system.push_str(LIVE_CRITIC_NOTE);
     }
+    system.push_str(SOURCE_DATA_CRITIC_NOTE);
     system.push_str(COPY_CRITIC_NOTE);
     let system = system.as_str();
     let prompt = format!(
@@ -1655,6 +1693,27 @@ mod required_tests_tests {
             suggestion: None,
             evidence: None,
         }
+    }
+
+    #[test]
+    fn a_hardcoded_record_override_holds_the_merge() {
+        let mut v = vec![f("source-data-override", "medium"), f("bug", "medium")];
+        v[0].evidence = Some("unverified-concern".into());
+        enforce_source_data_override(&mut v);
+        assert!(v[0].is_blocking());
+        assert!(v[0].holds_merge(), "a kept override is a verified defect");
+        assert_eq!(v[1].severity, "medium");
+        assert_eq!(
+            decide_verdict(&v[..1], 0, 0, false, false),
+            "REQUEST_CHANGES"
+        );
+    }
+
+    #[test]
+    fn the_reviewer_is_told_what_a_source_data_override_is() {
+        assert!(SOURCE_DATA_RULE.contains("source-data-override"));
+        assert!(SOURCE_DATA_RULE.contains("verified-defect"));
+        assert!(SOURCE_DATA_CRITIC_NOTE.contains("source-data-override"));
     }
 
     #[test]

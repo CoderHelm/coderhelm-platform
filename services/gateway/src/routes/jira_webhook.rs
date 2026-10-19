@@ -859,8 +859,10 @@ async fn handle_jira_comment(
             .await;
             result
         }
-        // Completed run without PR — treat like needs_input, re-trigger
-        "completed" | "success" if pr_number == 0 => {
+        // Completed run without PR — treat like needs_input, re-trigger. A run
+        // that reported a change outside the code is the same: a reply ("done,
+        // still missing") runs it again with that context.
+        "completed" | "success" | "needs_outside_change" if pr_number == 0 => {
             let raw_description = issue
                 .get("fields")
                 .and_then(|f| f.get("description"))

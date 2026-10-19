@@ -126,7 +126,12 @@ pub async fn gate_ticket_trigger(
     // "success" is a legacy terminal status from an old resume path;
     // "merged" means the PR landed — rework only on real content change.
     let latest_status = status_of(latest);
-    if matches!(latest_status.as_str(), "completed" | "success" | "merged") {
+    // "needs_outside_change": the fix is a change in another system; the run
+    // is done until the ticket itself changes.
+    if matches!(
+        latest_status.as_str(),
+        "completed" | "success" | "merged" | "needs_outside_change"
+    ) {
         let stored_hash = latest.get("context_hash").and_then(|v| v.as_s().ok());
         match (new_context_hash, stored_hash) {
             _ if !rework_on_edit(&latest_status) => {

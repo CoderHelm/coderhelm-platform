@@ -672,6 +672,12 @@ pub async fn get_run(
         "applied_standards": item.get("applied_standards").and_then(|v| v.as_ss().ok()).map(|set| { let mut v: Vec<&str> = set.iter().map(String::as_str).collect(); v.sort_unstable(); v }).unwrap_or_default(),
         "duration_s": item.get("duration_s").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "error": item.get("error_message").and_then(|v| v.as_s().ok()),
+        // Where the fix belongs, and the report when (part of) it is a change
+        // outside the code.
+        "fix_location": item.get("fix_location").and_then(|v| v.as_s().ok()),
+        "outside_change_report": item.get("outside_change_report").and_then(|v| v.as_s().ok()),
+        // A lesson recorded for the repository when the fix was elsewhere.
+        "lesson": item.get("lesson").and_then(|v| v.as_s().ok()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
         "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
         "pass_history": item.get("pass_history").and_then(|v| v.as_l().ok()).map(|list| {
