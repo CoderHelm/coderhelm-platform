@@ -128,8 +128,8 @@ async fn run_inner(state: &WorkerState, team_id: &str, repo: &str) {
         table: &state.config.settings_table_name,
         team: team_id,
     };
-    let items = match st.compat_queue(repo).await {
-        Ok(i) => i,
+    let items: Vec<(SkillMeta, String)> = match st.compat_queue(repo).await {
+        Ok(i) => i.into_iter().map(|(m, body, _)| (m, body)).collect(),
         Err(e) => {
             warn!(error = %e, "Skill suggestions: couldn't read the items");
             return;

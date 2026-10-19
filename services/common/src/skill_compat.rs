@@ -11,13 +11,21 @@
 //! - `missing`: nothing in Coderhelm does it; `fix` says what to connect;
 //! - `blocked`: a write to an outside system no connected tool can make.
 //!
-//! The model reads the item and classifies; this module only checks its
-//! answer against the inventory (a tool it names must be one the team has,
-//! an outside write needs a connected tool that can write) and counts. It
+//! The model reads the item and lists what each step relies on. Then this
+//! module settles every requirement it can from the inventory alone, the
+//! same way every time ([`Requirement::basis`] says which were settled
+//! here): a Coderhelm tool named outright is available, a command in the
+//! inventory's translations is translated, talking to the person is always
+//! possible, a person's local path never is. Only what's left keeps the
+//! model's call, checked against the inventory (a tool it names must be one
+//! the team has, an outside write needs a connected tool that can write). It
 //! also keeps a translated version of the item that uses Coderhelm's names
 //! and marks each gap where it happens.
 //!
-//! One check per item, only when its text or the team's inventory changed.
+//! One check per item, only when its text or the team's inventory changed,
+//! or when an admin asks. A re-check of the same text against the same tools
+//! keeps each step's last result unless the inventory settles it otherwise
+//! ([`stabilize`]), so asking again never flips a step on the model's whim.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -124,10 +132,17 @@ impl Inventory {
         self
     }
 
-    /// Changes whenever anything an item can rely on changes.
+    /// Changes whenever anything an item can rely on changes, or the
+    /// analysis format does.
     pub fn fingerprint(&self) -> String {
+        self.fingerprint_at(FORMAT)
+    }
+
+    /// The fingerprint this inventory had under analysis format `format`:
+    /// equal to a kept fingerprint when only the format changed since.
+    pub fn fingerprint_at(&self, format: u32) -> String {
         let text = serde_json::to_string(self).unwrap_or_default();
-        crate::skills::content_hash(&format!("{FORMAT}|{text}"))
+        crate::skills::content_hash(&format!("{format}|{text}"))
     }
 
     /// Every tool name an agent can really call.
@@ -183,7 +198,9 @@ impl Inventory {
 pub struct Requirement {
     /// What the item asks for, in its words: a tool, a command, a system.
     pub asks: String,
-    /// "tool", "command", "data", "path" or "other".
+    /// "tool", "command", "data", "path", "person" (asking the person,
+    /// suggesting a commit message, instructions for someone to follow) or
+    /// "other".
     pub kind: String,
     /// "available", "translated", "missing" or "blocked".
     pub status: String,
@@ -211,6 +228,11 @@ pub struct Requirement {
     /// doesn't do this, or it can't run in Coderhelm).
     #[serde(default)]
     pub action: String,
+    /// Worked out here, never by the model: "inventory" when the status
+    /// follows from the inventory alone (and so is the same on every
+    /// check), "model" when it is the model's judgment.
+    #[serde(default)]
+    pub basis: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,7 +351,7 @@ pub fn output_schema() -> Value {
                                 "required": ["asks", "kind", "status", "uses", "write", "needs", "fix", "connect", "server", "connection"],
                                 "properties": {
                                     "asks": { "type": "string" },
-                                    "kind": enum_of(&["tool", "command", "data", "path", "other"]),
+                                    "kind": enum_of(&["tool", "command", "data", "path", "person", "other"]),
                                     "status": enum_of(&STATUSES),
                                     "uses": { "type": "array", "items": { "type": "string" } },
                                     "write": enum_of(&["none", "repo", "outside"]),
@@ -391,6 +413,22 @@ Coderhelm never runs a shell, never reads a person's machine or home folder, and
 outside systems unless a connected MCP server's tool writes. Steps that are only thinking or \
 writing a reply need nothing: give them no requirements. Mark `dropped` true for a step that only \
 makes sense on a person's own machine.
+
+Borderline cases, decided the same way every time:
+- Talking to the person always runs as written: asking the user a question or for a choice, \
+waiting for their answer, suggesting a commit message or a git commit for them to make, printing \
+instructions or a checklist for someone to follow. Give such a requirement `kind` person and \
+status available with empty `uses`, never missing, and never 'Shell access'.
+- Name a requirement by what the item literally asks for (the command, tool, path or system as \
+written, e.g. `git log --oneline` or `~/notes/todo.md`), not a category like 'shell' or 'local \
+files'.
+- A command listed in the inventory's `translations` is translated, whatever the item calls it. \
+Shell access or local files is missing only when the step can't be done any other way with the \
+inventory, its translations included: a build, an install, a script, a write outside the \
+repository, a file on someone's own computer.
+- A Coderhelm tool named outright is available, with that tool in `uses`.
+- When unsure between two statuses for the same request, pick the one the inventory supports \
+directly; don't change your mind between checks of the same text.
 
 Then write `translated`: the item rewritten for Coderhelm, in the same markdown style. Keep its \
 intent, structure, order and output format. Replace each tool or command with the Coderhelm tool \
@@ -470,12 +508,7 @@ pub fn finish(
             title = made_title(&does, &reqs);
             titled += 1;
         }
-        let status = reqs
-            .iter()
-            .map(|q| q.status.as_str())
-            .max_by_key(|st| rank(st))
-            .unwrap_or("available")
-            .to_string();
+        let status = step_status(&reqs);
         steps.push(Step {
             title,
             does,
@@ -513,6 +546,12 @@ pub fn finish(
         translated.clear();
         notes.push("The translated version came back nearly empty, so none is kept. Re-check to try again.".into());
     }
+    Ok((tally(steps, notes), translated))
+}
+
+/// An analysis of `steps`: counted, its needs listed, its status and
+/// summary worked out.
+fn tally(steps: Vec<Step>, notes: Vec<String>) -> Analysis {
     let counts = Counts {
         steps: steps.len(),
         as_written: steps.iter().filter(|s| s.status == "available").count(),
@@ -530,23 +569,30 @@ pub fn finish(
     }
     .to_string();
     let summary = summary(&counts, &needs);
-    Ok((
-        Analysis {
-            format: FORMAT,
-            steps,
-            counts,
-            needs,
-            status,
-            summary,
-            notes,
-            model: String::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            cost_usd: 0.0,
-            ms: 0,
-        },
-        translated,
-    ))
+    Analysis {
+        format: FORMAT,
+        steps,
+        counts,
+        needs,
+        status,
+        summary,
+        notes,
+        model: String::new(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd: 0.0,
+        ms: 0,
+    }
+}
+
+/// A step's status: the worst of its requirements, or "available" when it
+/// needs nothing.
+fn step_status(reqs: &[Requirement]) -> String {
+    reqs.iter()
+        .map(|q| q.status.as_str())
+        .max_by_key(|st| rank(st))
+        .unwrap_or("available")
+        .to_string()
 }
 
 /// What's kept when no answer listed a usable step, even after a second
@@ -611,6 +657,97 @@ fn made_title(does: &str, reqs: &[Requirement]) -> String {
     }
 }
 
+/// Paths on a person's own computer, as skills written for a laptop name
+/// them. Coderhelm never reads these.
+const LOCAL_PATHS: &[&str] = &["~/", "~\\", "$HOME", "${HOME}", "/Users/", "/home/", "C:\\"];
+
+/// What `needs` and `fix` say for a person's local path, the same every time.
+const LOCAL_NEEDS: &str = "Local files";
+const LOCAL_FIX: &str = "Coderhelm reads the repository, never a file on someone's own computer.";
+
+/// Settles a requirement from the inventory alone, when it can be: then the
+/// same request gets the same status on every check, whatever the model
+/// said. Returns whether it did; otherwise the model's call stands (and is
+/// checked by [`check`]).
+///
+/// - talking to the person (`kind` person) always runs as written;
+/// - a Coderhelm tool named outright is available;
+/// - commands that are all in the inventory's translations are translated,
+///   with the tools those translations name;
+/// - a path on a person's computer is missing.
+fn settle(q: &mut Requirement, inv: &Inventory) -> bool {
+    if q.kind == "person" {
+        q.status = "available".into();
+        q.uses.clear();
+        q.write = "none".into();
+        return true;
+    }
+    if q.write == "outside" {
+        return false;
+    }
+    let named = q.asks.trim().trim_matches('`').trim();
+    if matches!(q.kind.as_str(), "tool" | "command") {
+        if inv.has_tool(named) {
+            q.status = "available".into();
+            q.uses = vec![named.to_string()];
+            return true;
+        }
+        if let Some(uses) = translated_by(&q.asks, inv) {
+            q.status = "translated".into();
+            q.uses = uses;
+            return true;
+        }
+    }
+    if q.kind == "path" && LOCAL_PATHS.iter().any(|p| named.starts_with(p)) {
+        q.status = "missing".into();
+        q.uses.clear();
+        q.needs = LOCAL_NEEDS.into();
+        q.fix = LOCAL_FIX.into();
+        q.connect = "none".into();
+        q.server.clear();
+        q.connection.clear();
+        return true;
+    }
+    false
+}
+
+/// The tools that do `asks` when every command in it (split on commas) is
+/// one of the inventory's translations, given as written or with its
+/// arguments (`git log --oneline`). A chained or piped command is never
+/// one: it may do more than the read.
+fn translated_by(asks: &str, inv: &Inventory) -> Option<Vec<String>> {
+    let pieces: Vec<String> = asks
+        .split([',', ';'])
+        .map(|p| p.trim().trim_matches('`').trim().to_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if pieces.is_empty() {
+        return None;
+    }
+    let mut uses: Vec<String> = Vec::new();
+    for p in &pieces {
+        if ["&&", "||", "|", ">", "<", "$("]
+            .iter()
+            .any(|c| p.contains(c))
+        {
+            return None;
+        }
+        let t = inv.translations.iter().find(|t| {
+            t.commands
+                .split(',')
+                .map(|c| c.trim().trim_end_matches("(reads)").trim().to_lowercase())
+                .filter(|c| !c.is_empty())
+                .any(|c| *p == c || p.starts_with(&format!("{c} ")))
+        })?;
+        for u in &t.uses {
+            if !uses.contains(u) {
+                uses.push(u.clone());
+            }
+        }
+    }
+    Some(uses)
+}
+
 fn check(q: Requirement, inv: &Inventory) -> Requirement {
     let mut q = Requirement {
         asks: clip(&q.asks, 200),
@@ -627,8 +764,11 @@ fn check(q: Requirement, inv: &Inventory) -> Requirement {
     if !STATUSES.contains(&q.status.as_str()) {
         q.status = "missing".into();
     }
+    let settled = settle(&mut q, inv);
+    q.basis = if settled { "inventory" } else { "model" }.into();
+    let talks = settled && q.kind == "person";
     let covered = matches!(q.status.as_str(), "available" | "translated");
-    if covered && (q.uses.is_empty() || q.uses.iter().any(|u| !inv.has_tool(u))) {
+    if covered && !talks && (q.uses.is_empty() || q.uses.iter().any(|u| !inv.has_tool(u))) {
         let unknown: Vec<String> = q
             .uses
             .iter()
@@ -813,6 +953,194 @@ pub fn needs_check(
     force: bool,
 ) -> bool {
     force || hash != kept_hash || fingerprint != kept_fingerprint
+}
+
+/// What a new check is compared with: the item's last check, when it was of
+/// the same text.
+pub struct Last<'a> {
+    pub analysis: &'a Analysis,
+    pub translated: &'a str,
+    /// The team's tools changed since that check (more than the analysis
+    /// format did).
+    pub tools_changed: bool,
+}
+
+/// Whether the inventory an item was last checked against is `inv` (only
+/// the analysis format may have changed since): `kept_fingerprint` was
+/// taken under `kept_format`.
+pub fn same_tools(inv: &Inventory, kept_fingerprint: &str, kept_format: u32) -> bool {
+    kept_fingerprint == inv.fingerprint() || kept_fingerprint == inv.fingerprint_at(kept_format)
+}
+
+/// Where a step's status comes from: "inventory" when every requirement
+/// that makes it what it is was settled from the inventory, else "model"
+/// (including a step that needs nothing, which is the model's reading).
+fn step_basis(step: &Step) -> &'static str {
+    let deciding: Vec<&Requirement> = step
+        .requirements
+        .iter()
+        .filter(|q| q.status == step.status)
+        .collect();
+    if !deciding.is_empty() && deciding.iter().all(|q| q.basis == "inventory") {
+        "inventory"
+    } else {
+        "model"
+    }
+}
+
+/// A title as compared between checks: its letters and digits, lowercased.
+fn title_key(t: &str) -> String {
+    t.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Why a step now has `step`'s status, from what settled it.
+fn settled_reason(step: &Step) -> String {
+    let asks: Vec<String> = step
+        .requirements
+        .iter()
+        .filter(|q| q.status == step.status && q.basis == "inventory")
+        .map(|q| format!("`{}`", q.asks))
+        .collect();
+    let why = match step.status.as_str() {
+        "available" => "runs as written in Coderhelm",
+        "translated" => "is one of the commands Coderhelm does another way",
+        _ => "is never possible in Coderhelm",
+    };
+    if asks.is_empty() {
+        format!("worked out from the team's tools ({why})")
+    } else {
+        format!("{} {why}", asks.join(", "))
+    }
+}
+
+/// A new check of an item, held to its last check of the same text.
+///
+/// When the team's tools are the same as at the last check (only the format
+/// may have changed), each step keeps its last result, re-settled from the
+/// inventory, unless the new check settles that step from the inventory
+/// where the last one was the model's judgment. A step settled from the
+/// inventory never changes again while the text and tools stay the same,
+/// and the model's judgment never overrides one, so checking the same item
+/// again gives the same result. Every step that changes is noted with why;
+/// a step held to its last result is not a change.
+///
+/// When the tools changed, the new check stands and each step whose status
+/// changed is noted.
+pub fn stabilize(
+    new: Analysis,
+    new_translated: String,
+    last: &Last<'_>,
+    inv: &Inventory,
+) -> (Analysis, String) {
+    let prev = last.analysis;
+    let meta = |mut a: Analysis, from: &Analysis| {
+        a.model = from.model.clone();
+        a.input_tokens = from.input_tokens;
+        a.output_tokens = from.output_tokens;
+        a.cost_usd = from.cost_usd;
+        a.ms = from.ms;
+        a
+    };
+    if prev.status == "partial" || prev.steps.is_empty() {
+        return (new, new_translated);
+    }
+    let matching = |steps: &[Step], i: usize, title: &str| -> Option<usize> {
+        let key = title_key(title);
+        steps
+            .iter()
+            .position(|s| !key.is_empty() && title_key(&s.title) == key)
+            .or((steps.len() == prev.steps.len()).then_some(i))
+    };
+    if last.tools_changed {
+        let mut a = new;
+        let mut notes = Vec::new();
+        for (i, p) in prev.steps.iter().enumerate() {
+            if let Some(j) = matching(&a.steps, i, &p.title) {
+                let n = &a.steps[j];
+                if n.status != p.status {
+                    notes.push(format!(
+                        "Step \"{}\" changed from {} to {}: the team's tools changed since the last check.",
+                        n.title, p.status, n.status
+                    ));
+                }
+            }
+        }
+        a.notes.extend(notes);
+        return (a, new_translated);
+    }
+    if new.status == "partial" || new.steps.is_empty() {
+        // Nothing usable came back this time: the last check stands.
+        let kept = tally(resettle(&prev.steps, inv), prev.notes.clone());
+        return (meta(kept, &new), last.translated.to_string());
+    }
+    let mut notes = prev.notes.clone();
+    let mut changed = false;
+    let mut steps = Vec::with_capacity(prev.steps.len());
+    for (i, stored) in prev.steps.iter().enumerate() {
+        let p = resettle(std::slice::from_ref(stored), inv).remove(0);
+        if p.status != stored.status {
+            notes.push(format!(
+                "Step \"{}\" changed from {} to {}: {}.",
+                p.title,
+                stored.status,
+                p.status,
+                settled_reason(&p)
+            ));
+            changed = true;
+        }
+        let taken = matching(&new.steps, i, &p.title)
+            .map(|j| &new.steps[j])
+            .filter(|n| {
+                n.status != p.status && step_basis(n) == "inventory" && step_basis(&p) == "model"
+            });
+        match taken {
+            Some(n) => {
+                notes.push(format!(
+                    "Step \"{}\" changed from {} to {}: {}.",
+                    p.title,
+                    p.status,
+                    n.status,
+                    settled_reason(n)
+                ));
+                changed = true;
+                steps.push(Step {
+                    title: p.title.clone(),
+                    ..n.clone()
+                });
+            }
+            None => steps.push(p),
+        }
+    }
+    let translated = if changed && !new_translated.is_empty() {
+        new_translated
+    } else {
+        last.translated.to_string()
+    };
+    (meta(tally(steps, notes), &new), translated)
+}
+
+/// Steps kept from an earlier check, their requirements settled again from
+/// the inventory (an earlier check may predate a rule).
+fn resettle(steps: &[Step], inv: &Inventory) -> Vec<Step> {
+    steps
+        .iter()
+        .map(|s| {
+            let requirements: Vec<Requirement> = s
+                .requirements
+                .iter()
+                .cloned()
+                .map(|q| check(q, inv))
+                .collect();
+            Step {
+                status: step_status(&requirements),
+                requirements,
+                ..s.clone()
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1156,5 +1484,321 @@ mod tests {
             }
         }
         walk(&output_schema());
+    }
+
+    /// One requirement as the model might give it.
+    fn ask(asks: &str, kind: &str, status: &str, uses: &[&str], needs: &str) -> Value {
+        json!({
+            "asks": asks, "kind": kind, "status": status, "uses": uses, "write": "none",
+            "needs": needs, "fix": if needs.is_empty() { "" } else { "Coderhelm has no terminal." },
+            "connect": "none", "server": "", "connection": ""
+        })
+    }
+
+    fn one(q: Value) -> Requirement {
+        check(serde_json::from_value(q).unwrap(), &inv())
+    }
+
+    #[test]
+    fn talking_to_the_person_always_runs_as_written() {
+        for (asks, status, needs) in [
+            (
+                "ask the user which version to bump",
+                "missing",
+                "User input",
+            ),
+            ("suggest a git commit message", "missing", "Shell access"),
+            ("print the steps for a person to follow", "available", ""),
+        ] {
+            let q = one(ask(asks, "person", status, &[], needs));
+            assert_eq!(q.status, "available", "{asks}");
+            assert!(q.uses.is_empty() && q.needs.is_empty() && q.fix.is_empty());
+            assert_eq!((q.basis.as_str(), q.action.as_str()), ("inventory", "none"));
+        }
+    }
+
+    #[test]
+    fn a_translated_command_is_translated_whatever_the_model_said() {
+        for (status, uses) in [
+            ("missing", vec![]),
+            ("translated", vec!["read_file"]),
+            ("available", vec!["logs_search"]),
+        ] {
+            let q = one(ask(
+                "`grep -r TODO src`",
+                "command",
+                status,
+                &uses,
+                "Shell access",
+            ));
+            assert_eq!(q.status, "translated");
+            assert_eq!(q.uses, ["read_file"]);
+            assert_eq!(q.basis, "inventory");
+            assert!(q.needs.is_empty());
+        }
+        // A chained command may do more than the read: the model's call.
+        let q = one(ask(
+            "grep -r TODO src | wc -l",
+            "command",
+            "missing",
+            &[],
+            "Shell access",
+        ));
+        assert_eq!((q.status.as_str(), q.basis.as_str()), ("missing", "model"));
+    }
+
+    #[test]
+    fn a_tool_named_outright_is_available() {
+        let q = one(ask("read_file", "tool", "translated", &[], ""));
+        assert_eq!(q.status, "available");
+        assert_eq!(q.uses, ["read_file"]);
+        assert_eq!(q.basis, "inventory");
+    }
+
+    #[test]
+    fn a_path_on_someones_computer_is_never_possible() {
+        let a = one(ask(
+            "~/notes/todo.md",
+            "path",
+            "available",
+            &["read_file"],
+            "",
+        ));
+        let b = one(ask(
+            "~/notes/todo.md",
+            "path",
+            "missing",
+            &[],
+            "Laptop notes",
+        ));
+        assert_eq!(a, b, "the same path settles the same way every time");
+        assert_eq!(a.status, "missing");
+        assert_eq!(
+            (a.needs.as_str(), a.basis.as_str()),
+            (LOCAL_NEEDS, "inventory")
+        );
+        // A path in the repository is the model's call.
+        let q = one(ask(
+            "docs/notes.md",
+            "path",
+            "available",
+            &["read_file"],
+            "",
+        ));
+        assert_eq!(
+            (q.status.as_str(), q.basis.as_str()),
+            ("available", "model")
+        );
+    }
+
+    #[test]
+    fn a_vague_request_keeps_the_models_call() {
+        let q = one(ask("shell", "command", "missing", &[], "Shell access"));
+        assert_eq!((q.status.as_str(), q.basis.as_str()), ("missing", "model"));
+    }
+
+    #[test]
+    fn the_rubric_is_in_the_instructions() {
+        assert!(SYSTEM.contains("Talking to the person always runs as written"));
+        assert!(SYSTEM.contains("suggesting a commit message"));
+        assert!(SYSTEM.contains("can't be done any other way"));
+        assert_eq!(
+            output_schema()["properties"]["steps"]["items"]["properties"]["requirements"]["items"]
+                ["properties"]["kind"]["enum"][4],
+            "person"
+        );
+    }
+
+    fn analysis(steps: Vec<Value>) -> Analysis {
+        let raw =
+            json!({ "steps": steps, "translated": "The whole item, translated for Coderhelm." });
+        finish(&raw, &inv(), 10).unwrap().0
+    }
+
+    fn stp(title: &str, reqs: Vec<Value>) -> Value {
+        json!({ "title": title, "does": "Does it", "dropped": false, "requirements": reqs })
+    }
+
+    fn statuses(a: &Analysis) -> Vec<(&str, &str)> {
+        a.steps
+            .iter()
+            .map(|s| (s.title.as_str(), s.status.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_recheck_of_the_same_text_and_tools_keeps_each_steps_last_result() {
+        let prev = analysis(vec![
+            stp("Merge rate", vec![]),
+            stp("Ask", vec![]),
+            stp(
+                "Search",
+                vec![ask(
+                    "grep -r x",
+                    "command",
+                    "translated",
+                    &["read_file"],
+                    "",
+                )],
+            ),
+        ]);
+        // The model wavers on everything it judges.
+        let new = analysis(vec![
+            stp(
+                "Merge rate",
+                vec![ask("shell", "command", "missing", &[], "Shell access")],
+            ),
+            stp(
+                "Ask",
+                vec![ask("the user", "other", "missing", &[], "User input")],
+            ),
+            stp(
+                "Search",
+                vec![ask("grep -r x", "command", "missing", &[], "Shell access")],
+            ),
+        ]);
+        assert_eq!(new.status, "needs_tools");
+        let last = Last {
+            analysis: &prev,
+            translated: "kept",
+            tools_changed: false,
+        };
+        let (a, t) = stabilize(new, "new text".into(), &last, &inv());
+        assert_eq!(statuses(&a), statuses(&prev));
+        assert_eq!(a.status, "translated");
+        assert_eq!(a.summary, prev.summary);
+        assert_eq!(t, "kept", "nothing changed, so the translation stays too");
+        assert_eq!(
+            a.notes, prev.notes,
+            "a step held to its last result is no change"
+        );
+    }
+
+    #[test]
+    fn a_step_settled_from_the_inventory_replaces_the_models_judgment_once_and_says_why() {
+        // The last check judged asking the user a missing tool.
+        let prev = analysis(vec![
+            stp(
+                "Ask",
+                vec![ask("the user", "other", "missing", &[], "User input")],
+            ),
+            stp(
+                "Read",
+                vec![ask("the code", "data", "available", &["read_file"], "")],
+            ),
+        ]);
+        assert_eq!(prev.status, "needs_tools");
+        let new = analysis(vec![
+            stp(
+                "Ask",
+                vec![ask("ask the user", "person", "available", &[], "")],
+            ),
+            stp(
+                "Read",
+                vec![ask("the code", "data", "available", &["read_file"], "")],
+            ),
+        ]);
+        let last = Last {
+            analysis: &prev,
+            translated: "old",
+            tools_changed: false,
+        };
+        let (a, t) = stabilize(new, "new".into(), &last, &inv());
+        assert_eq!(a.status, "ready");
+        assert_eq!(t, "new");
+        assert_eq!(a.notes.len(), 1, "{:?}", a.notes);
+        assert!(
+            a.notes[0].starts_with(
+                "Step \"Ask\" changed from missing to available: `ask the user` runs as written"
+            ),
+            "{:?}",
+            a.notes
+        );
+        // And the model's judgment never takes it back.
+        let again = analysis(vec![
+            stp(
+                "Ask",
+                vec![ask("the user", "other", "missing", &[], "User input")],
+            ),
+            stp(
+                "Read",
+                vec![ask("the code", "data", "available", &["read_file"], "")],
+            ),
+        ]);
+        let last = Last {
+            analysis: &a,
+            translated: "new",
+            tools_changed: false,
+        };
+        let (b, _) = stabilize(again, "again".into(), &last, &inv());
+        assert_eq!(statuses(&b), statuses(&a));
+        assert_eq!(b.notes, a.notes);
+    }
+
+    #[test]
+    fn a_kept_step_is_resettled_by_the_current_rules() {
+        // A check from before a rule: `grep -r` judged missing.
+        let mut prev = analysis(vec![stp(
+            "Search",
+            vec![ask("shell", "command", "missing", &[], "Shell access")],
+        )]);
+        prev.steps[0].requirements[0].asks = "grep -r x".into();
+        let new = analysis(vec![stp(
+            "Search",
+            vec![ask("shell", "command", "missing", &[], "Shell access")],
+        )]);
+        let last = Last {
+            analysis: &prev,
+            translated: "old",
+            tools_changed: false,
+        };
+        let (a, _) = stabilize(new, "new".into(), &last, &inv());
+        assert_eq!(statuses(&a), [("Search", "translated")]);
+        assert!(
+            a.notes[0].contains("changed from missing to translated"),
+            "{:?}",
+            a.notes
+        );
+    }
+
+    #[test]
+    fn when_the_tools_changed_the_new_check_stands_and_each_flip_is_noted() {
+        let prev = analysis(vec![stp(
+            "Logs",
+            vec![ask("logs", "data", "available", &["logs_search"], "")],
+        )]);
+        let new = analysis(vec![stp(
+            "Logs",
+            vec![ask("logs", "data", "missing", &[], "Logs")],
+        )]);
+        let last = Last {
+            analysis: &prev,
+            translated: "old",
+            tools_changed: true,
+        };
+        let (a, t) = stabilize(new, "new".into(), &last, &inv());
+        assert_eq!(statuses(&a), [("Logs", "missing")]);
+        assert_eq!(t, "new");
+        assert!(
+            a.notes
+                .iter()
+                .any(|n| n.contains("the team's tools changed")),
+            "{:?}",
+            a.notes
+        );
+    }
+
+    #[test]
+    fn a_format_bump_alone_is_the_same_tools() {
+        let i = inv();
+        assert!(same_tools(&i, &i.fingerprint_at(FORMAT - 1), FORMAT - 1));
+        assert!(same_tools(&i, &i.fingerprint(), FORMAT));
+        let mut other = inv();
+        other.never.push("Something else".into());
+        assert!(!same_tools(
+            &i,
+            &other.fingerprint_at(FORMAT - 1),
+            FORMAT - 1
+        ));
     }
 }
