@@ -652,6 +652,7 @@ mod implement;
 pub mod infra_analyze;
 pub mod live_sources;
 pub mod onboard;
+pub mod ops_tools;
 mod plan;
 pub mod plan_execute;
 mod pr;

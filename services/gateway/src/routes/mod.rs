@@ -4,6 +4,7 @@ pub mod analytics;
 pub mod api;
 pub mod auth;
 pub mod banners;
+pub mod connectors;
 pub mod data_sources;
 pub mod email;
 pub mod github;

@@ -66,6 +66,10 @@ pub struct Source {
     pub detail: String,
     /// The tools that read it.
     pub tools: Vec<String>,
+    /// Its tools that write to the outside system (each refused unless an
+    /// admin turned writes on and listed what they may touch).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
 }
 
 /// A command a skill may name that Coderhelm does another way: no shell, but
@@ -152,6 +156,13 @@ impl Inventory {
     /// server's tools can (what each may do is set by the server's own
     /// token). Coderhelm's own tools write to the repository at most.
     pub fn writes_outside(&self, name: &str) -> bool {
+        if self
+            .sources
+            .iter()
+            .any(|s| s.writes.iter().any(|w| w == name))
+        {
+            return true;
+        }
         self.servers.iter().any(|s| {
             s.ready
                 && name
@@ -807,6 +818,7 @@ mod tests {
                 name: "Service logs".into(),
                 detail: "/svc/api".into(),
                 tools: vec!["live_describe".into(), "logs_search".into()],
+                writes: vec!["wiki_append".into()],
             }],
             team_tools: vec![],
             translations: vec![Translation {
@@ -844,6 +856,10 @@ mod tests {
             "the repository is not outside"
         );
         assert!(!i.writes_outside("logs_search"));
+        assert!(
+            i.writes_outside("wiki_append"),
+            "a source's listed write tool writes outside"
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Creates a read-only IAM role that allows Coderhelm to query your CloudWatch Logs.
+  Creates a read-only IAM role that allows Coderhelm to query your CloudWatch Logs and metrics
+  and read Airflow (MWAA) as a Viewer.
   This role uses an External ID to prevent confused deputy attacks.
 
 Parameters:
@@ -65,6 +66,27 @@ Resources:
                 Action:
                   - "sts:GetCallerIdentity"
                 Resource: "*"
+        - PolicyName: CloudWatchMetricsAndAirflowReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadMetrics
+                Effect: Allow
+                Action:
+                  - "cloudwatch:GetMetricData"
+                  - "cloudwatch:ListMetrics"
+                Resource: "*"
+              - Sid: ListAirflowEnvironments
+                Effect: Allow
+                Action:
+                  - "airflow:ListEnvironments"
+                  - "airflow:GetEnvironment"
+                Resource: "*"
+              - Sid: ReadAirflowAsViewer
+                Effect: Allow
+                Action:
+                  - "airflow:InvokeRestApi"
+                Resource: "arn:aws:airflow:*:*:role/*/Viewer"
 
 Outputs:
   RoleArn:

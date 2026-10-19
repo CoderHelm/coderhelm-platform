@@ -408,6 +408,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-mwaa"
+version = "1.103.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f6d651481971d531af0ff573ee0845d17fb030d99a5cd00b3ea7c0f2a16794f"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-rdsdata"
 version = "1.99.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1162,13 +1186,17 @@ dependencies = [
 name = "common"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "aws-config",
+ "aws-sdk-cloudwatch",
  "aws-sdk-cloudwatchlogs",
  "aws-sdk-dynamodb",
  "aws-sdk-kms",
+ "aws-sdk-mwaa",
  "aws-sdk-rdsdata",
  "aws-sdk-redshiftdata",
  "aws-sdk-sts",
+ "aws-smithy-types",
  "base64",
  "chrono",
  "graphql-parser",

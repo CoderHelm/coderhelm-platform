@@ -1,0 +1,40 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Adds read-only access to CloudWatch metrics and Airflow (MWAA) to the existing
+  CoderHelmLogReader role. Airflow is read through Airflow's Viewer role, which
+  can't trigger, clear or change anything. Delete this stack to take the access away.
+
+Parameters:
+  RoleName:
+    Type: String
+    Default: CoderHelmLogReader
+    Description: The Coderhelm role to extend (do not change this value).
+    AllowedPattern: "^CoderHelmLogReader$"
+
+Resources:
+  CoderHelmMetricsAndAirflowReadOnly:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CoderHelmMetricsAndAirflowReadOnly
+      Roles:
+        - !Ref RoleName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadMetrics
+            Effect: Allow
+            Action:
+              - "cloudwatch:GetMetricData"
+              - "cloudwatch:ListMetrics"
+            Resource: "*"
+          - Sid: ListAirflowEnvironments
+            Effect: Allow
+            Action:
+              - "airflow:ListEnvironments"
+              - "airflow:GetEnvironment"
+            Resource: "*"
+          - Sid: ReadAirflowAsViewer
+            Effect: Allow
+            Action:
+              - "airflow:InvokeRestApi"
+            Resource: "arn:aws:airflow:*:*:role/*/Viewer"

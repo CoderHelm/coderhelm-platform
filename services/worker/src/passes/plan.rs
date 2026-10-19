@@ -343,6 +343,29 @@ After researching, output the four files using this exact format:
     );
     tools.push(super::github_history::tool());
     full_system.push_str(super::github_history::prompt_line());
+    let ops = super::ops_tools::OpsTools::load(
+        state,
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        "planner",
+        0,
+    )
+    .await
+    .map(|o| {
+        o.with_run(
+            run_id,
+            super::skills::ticket_origin(
+                &msg.repo_owner,
+                &msg.repo_name,
+                &msg.ticket_id,
+                msg.issue_number,
+            ),
+        )
+    });
+    if let Some(o) = &ops {
+        tools.extend(o.tools());
+        full_system.push_str(&o.prompt_section());
+    }
     // The team's own written skills, read-only guidance.
     let skills = super::skills::TeamSkills::load(
         state,
@@ -385,6 +408,7 @@ After researching, output the four files using this exact format:
         lambda: &state.lambda,
         mcp_proxy_function_name: &state.config.mcp_proxy_function_name,
         history: Some(&history),
+        ops: ops.as_ref(),
         live: live.as_ref(),
         skills: skills.as_ref(),
         state,
@@ -817,6 +841,9 @@ struct CombinedToolExecutor<'a> {
     mcp_proxy_function_name: &'a str,
     /// Repository history (commits, blame, pull requests, releases, deploys).
     history: Option<&'a super::github_history::GithubHistory>,
+    /// Monitoring, docs and pipeline connections (New Relic, Confluence,
+    /// CloudWatch metrics, Airflow) and the AWS identity check.
+    ops: Option<&'a super::ops_tools::OpsTools>,
     /// The team's connected live systems, read-only.
     live: Option<&'a super::live_sources::LiveSources>,
     /// The team's written skills, read-only.
@@ -836,6 +863,11 @@ impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
                 .handle(self.state, self.read_only.github, name, input)
                 .await
             {
+                return Ok(serde_json::json!(out));
+            }
+        }
+        if let Some(ops) = self.ops {
+            if let Some(out) = ops.handle(self.state, name, input).await {
                 return Ok(serde_json::json!(out));
             }
         }
