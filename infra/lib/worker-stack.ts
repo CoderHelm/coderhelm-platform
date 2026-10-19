@@ -13,7 +13,7 @@ import * as eventsources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as codebuild from "aws-cdk-lib/aws-codebuild";
 import { Construct } from "constructs";
 import * as path from "path";
-import { WEEKLY_SUMMARY_ENABLED } from "./flags";
+import { WEEKLY_SUMMARY_ENABLED, WEEKLY_SUMMARY_LISTED_TEAMS_ONLY } from "./flags";
 
 interface WorkerStackProps extends cdk.StackProps {
   stage: string;
@@ -103,6 +103,8 @@ export class WorkerStack extends cdk.Stack {
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
         // The Monday weekly summary sends nothing unless this is "true".
         WEEKLY_SUMMARY_ENABLED: WEEKLY_SUMMARY_ENABLED ? "true" : "false",
+        // While "true", only teams with a rollout list get the summary.
+        WEEKLY_SUMMARY_LISTED_TEAMS_ONLY: WEEKLY_SUMMARY_LISTED_TEAMS_ONLY ? "true" : "false",
         CI_FIX_QUEUE_URL: props.ciFixQueue.queueUrl,
         TICKET_QUEUE_URL: props.ticketQueue.queueUrl,
         FEEDBACK_QUEUE_URL: props.feedbackQueue.queueUrl,

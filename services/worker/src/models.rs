@@ -35,6 +35,8 @@ pub struct Config {
     pub tests_table_name: String,
     /// The Monday weekly summary goes out only when this is true.
     pub weekly_summary_enabled: bool,
+    /// Send the scheduled summary only to teams that have a rollout list.
+    pub weekly_summary_listed_teams_only: bool,
 }
 
 impl Config {
@@ -78,6 +80,10 @@ impl Config {
             weekly_summary_enabled: std::env::var("WEEKLY_SUMMARY_ENABLED")
                 .map(|v| v.trim().eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            // Anything but an explicit "false" keeps the safe default.
+            weekly_summary_listed_teams_only: std::env::var("WEEKLY_SUMMARY_LISTED_TEAMS_ONLY")
+                .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
         }
     }
 }

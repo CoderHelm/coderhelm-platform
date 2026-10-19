@@ -1660,6 +1660,9 @@ async fn send_team(
     }
     // Read before anything is sent: if it can't be read, send nothing.
     let only = rollout(state, team_id).await?;
+    if !team_in_rollout(state.config.weekly_summary_listed_teams_only, only.as_ref()) {
+        return Ok(0);
+    }
     let name = team_name(state, team_id).await;
     let summary = load(state, team_id, &name, now).await?;
     let week = week_key(now);
@@ -1752,6 +1755,12 @@ async fn rollout(
         .send()
         .await?;
     Ok(rollout_from(item.item()))
+}
+
+/// Whether a team gets the scheduled summary at all: while the rollout is
+/// limited to listed teams, a team without a list gets nothing.
+fn team_in_rollout(listed_only: bool, only: Option<&std::collections::HashSet<String>>) -> bool {
+    !listed_only || only.is_some()
 }
 
 fn on_rollout(only: Option<&std::collections::HashSet<String>>, email: &str) -> bool {
@@ -2292,6 +2301,18 @@ mod tests {
             assert!(!e.text.contains("<td") && !e.text.contains("<a "));
             assert!(e.text.contains("https://app.coderhelm.com/"));
         }
+    }
+
+    #[test]
+    fn listed_teams_only_skips_teams_without_a_list() {
+        let list: std::collections::HashSet<String> =
+            ["person@example.com".to_string()].into_iter().collect();
+        // Limited rollout: only teams with a list get anything.
+        assert!(!team_in_rollout(true, None));
+        assert!(team_in_rollout(true, Some(&list)));
+        // Open rollout: every team, as before.
+        assert!(team_in_rollout(false, None));
+        assert!(team_in_rollout(false, Some(&list)));
     }
 
     #[test]
