@@ -17,6 +17,9 @@ pub struct PlanResult {
     pub spec: String,
     /// Per-repo task breakdown. Empty = single-repo (use msg.repo_owner/repo_name).
     pub repo_tasks: Vec<RepoTasks>,
+    /// Where the fix belongs, as the planner decided it. `None` for plans
+    /// written before the decision existed: those are code plans.
+    pub fix: Option<super::fix_location::FixDecision>,
 }
 
 /// Tasks scoped to a specific repo for multi-repo orchestration.
@@ -180,6 +183,8 @@ Do NOT include manual verification tasks, post-deploy checks, browser testing, o
    Only use multi-repo headers when changes span 2+ repos. For single-repo issues, omit headers.
 4. **spec.md** — Acceptance criteria as Given/When/Then scenarios
 
+{fix_guidance}
+
 After researching, output the four files using this exact format:
 
 ```proposal.md
@@ -196,7 +201,10 @@ After researching, output the four files using this exact format:
 
 ```spec.md
 (content)
-```"#,
+```
+
+Then the ```fix_location.json block described above."#,
+        fix_guidance = super::fix_location::PLANNER_GUIDANCE,
         title = msg.title,
         summary = triage.summary,
         body = msg.body,
@@ -516,6 +524,25 @@ After researching, output the four files using this exact format:
             .await?;
     }
 
+    // The decision on where the fix belongs, so a reused plan keeps it.
+    if let Some(fix) = &files.fix {
+        if let Ok(json) = serde_json::to_string(fix) {
+            let _ = state
+                .s3
+                .put_object()
+                .bucket(&state.config.bucket_name)
+                .key(format!("{prefix}/{}", super::fix_location::FILE))
+                .body(json.into_bytes().into())
+                .content_type("application/json")
+                .send()
+                .await;
+        }
+        info!(
+            fix_location = fix.effective_location().as_str(),
+            "Planner decided where the fix belongs"
+        );
+    }
+
     info!("Plan openspec written to S3");
 
     // Store context hash so we can detect when ticket content changes
@@ -575,6 +602,7 @@ fn parse_openspec_files(response: &str) -> PlanResult {
         tasks: contents.remove(0),
         spec: contents.remove(0),
         repo_tasks,
+        fix: super::fix_location::parse(response),
     }
 }
 

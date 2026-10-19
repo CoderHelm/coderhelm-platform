@@ -809,6 +809,21 @@ async fn handle_pull_request(
                 team_id,
                 run_id, pr_number, "PR closed without merging — outcome recorded"
             );
+            // Learn from it: the worker reads the ticket, the plan's findings
+            // and what people wrote, and records a lesson for the repository
+            // when the fix belonged outside the code.
+            let lesson = WorkerMessage::Lesson(crate::models::LessonMessage {
+                team_id: team_id.to_string(),
+                installation_id,
+                run_id: run_id.clone(),
+                repo_owner: owner.to_string(),
+                repo_name: name.to_string(),
+                pr_number,
+                trigger: "pr_closed".to_string(),
+            });
+            if let Err(e) = send_to_queue(state, &state.config.ticket_queue_url, &lesson).await {
+                warn!(team_id, run_id, pr_number, status = ?e, "Could not queue the closed PR's lesson");
+            }
             return Ok(StatusCode::OK);
         }
         if !run_id.is_empty() {

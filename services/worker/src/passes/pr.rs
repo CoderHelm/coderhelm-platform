@@ -195,8 +195,11 @@ Return ONLY the markdown body text."#,
         }
     };
     // Which team agents the planner and coder asked, where reviewers look.
+    // A change needed outside the code too: the PR says so, so the reviewer
+    // and whoever merges see the whole fix.
     let full_body = format!(
-        "{full_body}{}",
+        "{full_body}{}{}",
+        super::fix_location::also_outside_section(plan.fix.as_ref()),
         super::skills::run_consulted(state, &msg.team_id, run_id).await
     );
 

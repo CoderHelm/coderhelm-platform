@@ -159,6 +159,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                     .await;
             }
         }
+        models::WorkerMessage::Lesson(msg) => {
+            info!(team_id = %msg.team_id, run_id = %msg.run_id, trigger = %msg.trigger, "Lesson on where the fix belongs");
+            if let Err(e) = passes::lessons::run(&state, msg).await {
+                error!("Lesson failed: {e:?}");
+            }
+        }
         models::WorkerMessage::Onboard(msg) => {
             info!(team_id = %msg.team_id, repos = msg.repos.len(), "Processing onboard");
             let mut usage = models::TokenUsage::default();

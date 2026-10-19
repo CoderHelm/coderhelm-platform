@@ -172,6 +172,23 @@ pub enum WorkerMessage {
     #[serde(rename = "skill_sync")]
     SkillSync(common::skills::SkillSyncMessage),
     SkillAsk(common::skills::SkillAskMessage),
+    /// CoderHelm's PR was closed without merging: the worker reads what
+    /// happened and records a lesson when the fix belonged outside the code.
+    #[serde(rename = "lesson")]
+    Lesson(LessonMessage),
+}
+
+/// A lesson job (must match the worker's `LessonMessage`).
+#[derive(Serialize, Deserialize, Debug)]
+pub struct LessonMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub run_id: String,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    /// `pr_closed` or `comment`.
+    pub trigger: String,
 }
 
 /// A code-graph index job. `changed_files: None` ⇒ full index; `Some(paths)` ⇒

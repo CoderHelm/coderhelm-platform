@@ -592,7 +592,11 @@ pub async fn run(
             String::new()
         }
     };
-    let extra_context = format!("{graph_context}{ci_context}");
+    // For CoderHelm's own PR: what its planner looked up and found about
+    // where the fix belongs, so a diff that overrides source data can be
+    // judged against it.
+    let plan_context = plan_evidence_for_pr(state, &msg).await;
+    let extra_context = format!("{graph_context}{ci_context}{plan_context}");
 
     // CoderHelm's own threads from earlier reviews, with the replies under them.
     // Still-open ones: the re-review reports each as fixed or answered (→ resolved
@@ -800,7 +804,8 @@ pub async fn run(
     }
 
     // 2) Critic pass drops weak/false findings.
-    let live_evidence = live.as_ref().map(|l| l.evidence()).unwrap_or_default() + &web.evidence();
+    let live_evidence =
+        live.as_ref().map(|l| l.evidence()).unwrap_or_default() + &web.evidence() + &plan_context;
     let mut findings = review_agent::critique_findings(
         state,
         &provider,
@@ -845,6 +850,7 @@ pub async fn run(
     if cfg.require_tests {
         review_agent::enforce_required_tests(&mut findings);
     }
+    review_agent::enforce_source_data_override(&mut findings);
     // Verdict hysteresis. Once CoderHelm approved an earlier commit, a new
     // finding only holds the merge when it is in a file changed since that
     // approval; one about code that hasn't changed is still worth saying, but
@@ -1463,6 +1469,39 @@ async fn load_learning_context(
     )
 }
 
+/// What the planner of CoderHelm's run behind this PR found about where the
+/// fix belongs (empty for a person's PR or a plan without a decision).
+async fn plan_evidence_for_pr(state: &WorkerState, msg: &ReviewMessage) -> String {
+    let Some(run_id) = lookup_run_by_pr(
+        state,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+    )
+    .await
+    else {
+        return String::new();
+    };
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&run_id))
+        .projection_expression("fix_decision")
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item);
+    item.as_ref()
+        .and_then(|i| i.get("fix_decision"))
+        .and_then(|v| v.as_s().ok())
+        .and_then(|j| serde_json::from_str::<super::fix_location::FixDecision>(j).ok())
+        .map(|d| super::fix_location::reviewer_context(&d))
+        .unwrap_or_default()
+}
+
 /// Newest run for a PR, via the runs-table repo-index GSI. None if untracked.
 async fn lookup_run_by_pr(
     state: &WorkerState,
@@ -1722,7 +1761,7 @@ async fn record_review_usage(
 
 /// The last `max` conversation comments written by people, as `(author, body)`
 /// pairs, oldest first. Bot comments are left out.
-fn human_comments(comments: &[serde_json::Value], max: usize) -> Vec<(String, String)> {
+pub(crate) fn human_comments(comments: &[serde_json::Value], max: usize) -> Vec<(String, String)> {
     let human: Vec<(String, String)> = comments
         .iter()
         .filter(|c| c["user"]["type"].as_str() != Some("Bot"))

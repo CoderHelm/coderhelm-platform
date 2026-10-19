@@ -192,6 +192,30 @@ pub enum WorkerMessage {
     /// usage and cost report. Off unless the admin-key secret exists.
     #[serde(rename = "usage_reconcile")]
     UsageReconcile(UsageReconcileMessage),
+    /// A lesson on where a fix belonged: CoderHelm's PR was closed without
+    /// merging, or a person said the fix was outside the code.
+    #[serde(rename = "lesson")]
+    Lesson(LessonMessage),
+}
+
+/// A lesson job (gateway on a closed PR, or the feedback pass on a comment).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LessonMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub run_id: String,
+    pub repo_owner: String,
+    pub repo_name: String,
+    #[serde(default)]
+    pub pr_number: u64,
+    /// `pr_closed` or `comment`.
+    pub trigger: String,
+    /// The lesson, when it was already judged (a comment, or a retry).
+    #[serde(default)]
+    pub lesson: Option<String>,
+    /// Retries while another run held the repository's memory.
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -212,6 +236,7 @@ impl WorkerMessage {
                 f::RUN
             }
             WorkerMessage::Feedback(_) => f::FEEDBACK,
+            WorkerMessage::Lesson(_) => f::MEMORY,
             WorkerMessage::Onboard(_) => f::ONBOARD,
             WorkerMessage::PlanExecute(_) | WorkerMessage::PlanTaskContinue(_) => f::PLAN,
             WorkerMessage::InfraAnalyze(_) => f::INFRA,
