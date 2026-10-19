@@ -46,8 +46,43 @@ pub async fn run(
     } else {
         format!("\n\nIMPORTANT — Match the team's voice and tone as described below:\n{voice}")
     };
+    // The team's standards set to always apply to PR descriptions (a
+    // writing guide, say), in full; path-scoped ones match this diff.
+    let changed: Vec<String> = diff["files"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| f["filename"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let standards = super::skills::TeamSkills::load(
+        state,
+        &msg.team_id,
+        super::skills::Reader::Writer,
+        super::skills::ticket_origin(
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.ticket_id,
+            msg.issue_number,
+        ),
+        super::skills::Work::new(
+            format!("{}/{}", msg.repo_owner, msg.repo_name),
+            &["pr"],
+            changed,
+        ),
+    )
+    .await
+    .map(|s| s.with_run(Some(run_id)));
+    let standards_block = match &standards {
+        Some(s) => {
+            s.record_applied(state).await;
+            s.standards_section()
+        }
+        None => String::new(),
+    };
     let system = format!(
-        "You are writing a pull request description. Be concise and technical. Return only markdown.{voice_block}"
+        "You are writing a pull request description. Be concise and technical. Return only markdown.{voice_block}{standards_block}"
     );
 
     let ticket_ref = match msg.source {

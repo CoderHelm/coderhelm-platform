@@ -15,7 +15,8 @@
 //! Kept in the settings table, under the team:
 //!
 //! - `SKILLREPO#{owner/name}`: a connected repository and its last sync;
-//! - `SKILL#{owner/name}#{path}`: one item, its text and its switch;
+//! - `SKILL#{owner/name}#{path}`: one item, its text, its switch and its
+//!   "always apply" setting (see `skill_apply`), both kept across syncs;
 //! - `SKILLFILE#{owner/name}#{path}`: one text file next to a skill;
 //! - `SKILLASK#{owner/name}#{path}#{ulid}`: one question put to an agent and
 //!   its answer, kept for [`ASK_DAYS`] days;
@@ -30,6 +31,8 @@ use std::collections::{HashMap, HashSet};
 use aws_sdk_dynamodb::types::AttributeValue;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+use crate::skill_apply::{AlwaysApply, Suggestion};
 
 type Item = HashMap<String, AttributeValue>;
 
@@ -69,6 +72,10 @@ pub const STAT_DAYS: i64 = 30;
 pub const STAT_KEEP_DAYS: i64 = 35;
 /// The agents whose reads are counted.
 pub const READERS: [&str; 3] = ["planner", "coder", "reviewer"];
+/// Every Coderhelm agent that reads items: the [`READERS`] and the
+/// "writer" (PR descriptions and release notes, given always-applied items
+/// only). Anyone else on the access log is a person.
+pub const AGENTS: [&str; 4] = ["planner", "coder", "reviewer", "writer"];
 
 /// Files next to a skill are kept only when they are text an agent can read.
 const TEXT_EXTENSIONS: &[&str] = &[
@@ -620,6 +627,15 @@ fn n(i: &Item, k: &str) -> i64 {
 fn av(v: &str) -> AttributeValue {
     AttributeValue::S(v.to_string())
 }
+fn list(i: &Item, k: &str) -> Vec<String> {
+    i.get(k)
+        .and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
+        .unwrap_or_default()
+}
+fn av_list(v: &[String]) -> AttributeValue {
+    AttributeValue::L(v.iter().map(|x| av(x)).collect())
+}
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -695,6 +711,11 @@ pub struct SkillMeta {
     pub switched_at: String,
     /// How Coderhelm runs it, from its last check (see `skill_compat`).
     pub compat: CompatMeta,
+    /// Whether it's given in full to matching work (see `skill_apply`).
+    pub always: AlwaysApply,
+    /// A suggested "always apply" setting, worked out at sync. Never applied
+    /// by itself.
+    pub suggestion: Suggestion,
 }
 
 /// The short form of an item's last check, for lists. The full check and
@@ -798,6 +819,26 @@ impl SkillMeta {
             switched_by: s(i, "switched_by"),
             switched_at: s(i, "switched_at"),
             compat: CompatMeta::from_item(i),
+            always: AlwaysApply {
+                on: i
+                    .get("always_apply")
+                    .and_then(|v| v.as_bool().ok())
+                    .copied()
+                    .unwrap_or(false),
+                repos: list(i, "aa_repos"),
+                passes: list(i, "aa_passes"),
+                paths: list(i, "aa_paths"),
+                by: s(i, "aa_by"),
+                at: s(i, "aa_at"),
+            },
+            suggestion: Suggestion {
+                repos: list(i, "sugg_repos"),
+                passes: list(i, "sugg_passes"),
+                paths: list(i, "sugg_paths"),
+                reason: s(i, "sugg_reason"),
+                hash: s(i, "sugg_key"),
+                at: s(i, "sugg_at"),
+            },
         })
         .filter(|m| !rest.is_empty() && !m.repo.is_empty() && !m.path.is_empty())
     }
@@ -816,6 +857,8 @@ impl SkillMeta {
             "use_translated": self.compat.use_translated,
             "translated_by": self.compat.translated_by,
             "translated_at": self.compat.translated_at,
+            "always_apply": self.always.json(),
+            "suggestion": self.suggestion.json(),
         })
     }
 }
@@ -896,7 +939,8 @@ pub struct SkillAccess {
     /// "skill", "agent" or "command".
     pub kind: String,
     pub name: String,
-    /// "read" (the item), "read_file" (a file kept with a skill) or "ask".
+    /// "read" (the item), "read_file" (a file kept with a skill), "ask", or
+    /// "apply" (given in full by its "always apply" setting).
     pub action: String,
     /// For `read_file`: which file, by path.
     pub file: String,
@@ -936,9 +980,9 @@ pub fn access_problem(outcome: &str) -> bool {
 pub struct AccessFilter {
     pub repo: String,
     pub path: String,
-    /// "planner", "coder", "reviewer", or "people" for anyone else.
+    /// One of [`AGENTS`], or "people" for anyone else.
     pub by: String,
-    /// "read" (either kind of read) or "ask".
+    /// "read" (either kind of read), "ask" or "apply".
     pub action: String,
     /// An outcome, or "problems" for any that went wrong.
     pub outcome: String,
@@ -959,7 +1003,7 @@ impl AccessFilter {
         }
         match self.by.as_str() {
             "" => {}
-            "people" if READERS.contains(&a.by.as_str()) => return false,
+            "people" if AGENTS.contains(&a.by.as_str()) => return false,
             "people" => {}
             who if a.by != who => return false,
             _ => {}
@@ -968,6 +1012,7 @@ impl AccessFilter {
             "" => {}
             "read" if !a.action.starts_with("read") => return false,
             "ask" if a.action != "ask" => return false,
+            "apply" if a.action != "apply" => return false,
             _ => {}
         }
         match self.outcome.as_str() {
@@ -1055,6 +1100,8 @@ pub fn access_why(text: &str) -> String {
 pub struct AccessCounts {
     pub reads: i64,
     pub asks: i64,
+    /// Items given in full by their "always apply" setting.
+    pub applies: i64,
     pub read_problems: i64,
     pub ask_problems: i64,
 }
@@ -1065,6 +1112,8 @@ impl AccessCounts {
         if action == "ask" {
             self.asks += 1;
             self.ask_problems += i64::from(problem);
+        } else if action == "apply" {
+            self.applies += 1;
         } else {
             self.reads += 1;
             self.read_problems += i64::from(problem);
@@ -1294,7 +1343,9 @@ impl SkillStore<'_> {
                      last_used_at, last_used_by, updated_at, asks, last_asked_at, \
                      switched_by, switched_at, missing_tools, compat_status, compat_summary, \
                      compat_needs, compat_hash, compat_fp, compat_at, compat_error, \
-                     use_translated, translated_by, translated_at",
+                     use_translated, translated_by, translated_at, always_apply, aa_repos, \
+                     aa_passes, aa_paths, aa_by, aa_at, sugg_repos, sugg_passes, sugg_paths, \
+                     sugg_reason, sugg_key, sugg_at",
                 ),
             )
             .await?
@@ -1480,6 +1531,90 @@ impl SkillStore<'_> {
                 Ok(false)
             }
             Err(e) => Err(format!("skill store translated switch: {e}")),
+        }
+    }
+
+    /// An admin's "always apply" setting for an item. Kept across syncs.
+    /// Agents can't be always applied; the caller checks the kind.
+    pub async fn set_always_apply(
+        &self,
+        repo: &str,
+        path: &str,
+        a: &AlwaysApply,
+        by: &str,
+    ) -> Result<bool, String> {
+        let r = self
+            .dynamo
+            .update_item()
+            .table_name(self.table)
+            .key("pk", av(self.team))
+            .key("sk", av(&format!("{SKILL}{repo}#{path}")))
+            .update_expression(
+                "SET always_apply = :on, aa_repos = :r, aa_passes = :p, aa_paths = :g, \
+                 aa_by = :by, aa_at = :at",
+            )
+            .condition_expression("attribute_exists(sk)")
+            .expression_attribute_values(":on", AttributeValue::Bool(a.on))
+            .expression_attribute_values(":r", av_list(&a.repos))
+            .expression_attribute_values(":p", av_list(&a.passes))
+            .expression_attribute_values(":g", av_list(&a.paths))
+            .expression_attribute_values(":by", av(by))
+            .expression_attribute_values(":at", av(&now()))
+            .send()
+            .await;
+        match r {
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(format!("skill store always apply: {e}")),
+        }
+    }
+
+    /// Keeps a suggested setting worked out from the item's text `hash`,
+    /// only while the item still has that text. `key` is what it was worked
+    /// out from (see `skill_apply::suggestion_key`).
+    pub async fn put_suggestion(
+        &self,
+        repo: &str,
+        path: &str,
+        hash: &str,
+        key: &str,
+        sg: &Suggestion,
+    ) -> Result<bool, String> {
+        let r = self
+            .dynamo
+            .update_item()
+            .table_name(self.table)
+            .key("pk", av(self.team))
+            .key("sk", av(&format!("{SKILL}{repo}#{path}")))
+            .update_expression(
+                "SET sugg_repos = :r, sugg_passes = :p, sugg_paths = :g, sugg_reason = :why, \
+                 sugg_key = :k, sugg_at = :at",
+            )
+            .condition_expression("attribute_exists(sk) AND #h = :h")
+            .expression_attribute_names("#h", "hash")
+            .expression_attribute_values(":h", av(hash))
+            .expression_attribute_values(":r", av_list(&sg.repos))
+            .expression_attribute_values(":p", av_list(&sg.passes))
+            .expression_attribute_values(":g", av_list(&sg.paths))
+            .expression_attribute_values(":why", av(&sg.reason))
+            .expression_attribute_values(":k", av(key))
+            .expression_attribute_values(":at", av(&now()))
+            .send()
+            .await;
+        match r {
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(format!("skill store suggestion: {e}")),
         }
     }
 
@@ -1923,10 +2058,7 @@ impl SkillStore<'_> {
                 .table_name(self.table)
                 .key("pk", av(self.team))
                 .key("sk", av(&sk))
-                .update_expression(
-                    "SET repo = :r, #p = :p, kind = :k, #n = :n, description = :d, body = :b, \
-                     sha = :sha, #h = :h, files = :f, missing_tools = :m, updated_at = :at",
-                )
+                .update_expression(SYNC_WRITES)
                 .expression_attribute_names("#h", "hash")
                 .expression_attribute_names("#p", "path")
                 .expression_attribute_names("#n", "name")
@@ -1997,6 +2129,13 @@ impl SkillStore<'_> {
             .map_err(|e| format!("skill store sync result: {e}"))
     }
 }
+
+/// What a sync writes on an item whose text changed. Only what's read from
+/// the repository: an admin's switch, the "always apply" setting, the check
+/// and the counts are left as they are.
+const SYNC_WRITES: &str =
+    "SET repo = :r, #p = :p, kind = :k, #n = :n, description = :d, body = :b, sha = :sha, \
+     #h = :h, files = :f, missing_tools = :m, updated_at = :at";
 
 /// Every connected skill repository across teams, as `(team, repo)`. For the
 /// periodic check that a repository's default branch hasn't moved.
@@ -2305,7 +2444,8 @@ mod tests {
                 reads: 2,
                 asks: 3,
                 read_problems: 1,
-                ask_problems: 1
+                ask_problems: 1,
+                applies: 0,
             }
         );
         let a = SkillAccess {
@@ -2726,7 +2866,85 @@ mod tests {
             switched_by: String::new(),
             switched_at: String::new(),
             compat: Default::default(),
+            always: Default::default(),
+            suggestion: Default::default(),
         }
+    }
+
+    #[test]
+    fn an_items_always_apply_setting_and_suggestion_are_read_back() {
+        let l = |v: &[&str]| AttributeValue::L(v.iter().map(|x| av(x)).collect());
+        let mut i: Item = HashMap::new();
+        for (k, v) in [
+            ("sk", "SKILL#acme/playbook#skills/std/SKILL.md"),
+            ("repo", "acme/playbook"),
+            ("path", "skills/std/SKILL.md"),
+            ("kind", "skill"),
+            ("name", "std"),
+            ("aa_by", "a@b.co"),
+            ("sugg_reason", "Names the web app."),
+        ] {
+            i.insert(k.into(), av(v));
+        }
+        let m = SkillMeta::from_item(&i).unwrap();
+        assert!(!m.always.on, "off unless an admin turned it on");
+        assert!(!m.suggestion.some());
+        assert_eq!(m.json()["suggestion"], Value::Null);
+
+        i.insert("always_apply".into(), AttributeValue::Bool(true));
+        i.insert("aa_repos".into(), l(&["acme/web"]));
+        i.insert("aa_passes".into(), l(&["coder", "reviewer"]));
+        i.insert("aa_paths".into(), l(&["apps/web/**"]));
+        i.insert("sugg_repos".into(), l(&["acme/web"]));
+        i.insert("sugg_passes".into(), l(&["coder"]));
+        let m = SkillMeta::from_item(&i).unwrap();
+        assert!(m.always.on);
+        assert_eq!(m.always.repos, vec!["acme/web"]);
+        assert_eq!(m.always.passes, vec!["coder", "reviewer"]);
+        let j = m.json();
+        assert_eq!(j["always_apply"]["on"], true);
+        assert_eq!(j["always_apply"]["paths"][0], "apps/web/**");
+        assert_eq!(j["always_apply"]["by"], "a@b.co");
+        assert_eq!(j["suggestion"]["repos"][0], "acme/web");
+        assert_eq!(j["suggestion"]["reason"], "Names the web app.");
+    }
+
+    #[test]
+    fn a_sync_never_writes_the_admins_settings() {
+        // A sync writes only what it read from the repository; the switch,
+        // the always-apply setting, the suggestion and the check stay.
+        for kept in [
+            "enabled",
+            "always_apply",
+            "aa_",
+            "sugg_",
+            "compat",
+            "use_translated",
+            "uses",
+        ] {
+            assert!(!SYNC_WRITES.contains(kept), "a sync would overwrite {kept}");
+        }
+        assert!(
+            SYNC_WRITES.starts_with("SET "),
+            "a partial update, never a replace"
+        );
+    }
+
+    #[test]
+    fn applications_are_counted_apart_from_reads_and_found_by_filter() {
+        let mut c = AccessCounts::default();
+        c.add("apply", "ok");
+        c.add("read", "ok");
+        c.add("ask", "answered");
+        assert_eq!((c.applies, c.reads, c.asks), (1, 1, 1));
+        let applied = access("coder", "apply", "ok");
+        let only = |action: &str| AccessFilter {
+            action: action.into(),
+            ..Default::default()
+        };
+        assert!(only("apply").matches(&applied));
+        assert!(!only("read").matches(&applied));
+        assert!(!only("apply").matches(&access("coder", "read", "ok")));
     }
 
     #[test]

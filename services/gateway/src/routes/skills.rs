@@ -16,6 +16,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use common::skill_apply::AlwaysApply;
 use common::skills::{
     new_ask_id, usage_stats, valid_repo, AccessFilter, AgentAsk, Kind, SkillAskMessage, SkillStore,
     SkillSyncMessage, ACCESS_DAYS, MAX_REPOS, STAT_DAYS,
@@ -361,6 +362,113 @@ pub async fn set_enabled(
     }
     info!(team_id = %claims.team_id, repo, path, enabled = on, "Skill switched");
     Ok(Json(json!({ "ok": true, "enabled": on })))
+}
+
+/// The team's repositories (`owner/name`) its GitHub App covers and that
+/// are switched on, for an "always apply" scope.
+async fn team_repos(state: &AppState, team: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut start = None;
+    loop {
+        let r = state
+            .dynamo
+            .query()
+            .table_name(&state.config.repos_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .expression_attribute_values(
+                ":pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(team.to_string()),
+            )
+            .expression_attribute_values(
+                ":p",
+                aws_sdk_dynamodb::types::AttributeValue::S("REPO#".into()),
+            )
+            .set_exclusive_start_key(start)
+            .send()
+            .await
+            .map_err(|e| format!("team repos: {e}"))?;
+        out.extend(r.items().iter().filter_map(|i| {
+            let on = i
+                .get("enabled")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(false);
+            let name = i.get("repo_name").and_then(|v| v.as_s().ok())?;
+            on.then(|| name.clone())
+        }));
+        start = r.last_evaluated_key().cloned();
+        if start.is_none() {
+            return Ok(out);
+        }
+    }
+}
+
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// PUT /api/skills/always `{repo, path, on, repos, passes, paths}` — an
+/// admin's "always apply" setting for a skill or command: given in full to
+/// matching work instead of only listed. `repos` empty means every
+/// repository; `paths` empty means any change. Kept across syncs.
+pub async fn set_always_apply(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Reply {
+    admin(&claims)?;
+    let repo = body["repo"].as_str().unwrap_or("");
+    let path = body["path"].as_str().unwrap_or("");
+    let Some(on) = body["on"].as_bool() else {
+        return Err(fail(StatusCode::BAD_REQUEST, "Say on: true or false."));
+    };
+    if !valid_repo(repo) || path.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "Give a repo and a path."));
+    }
+    let st = store(&state, &claims);
+    match st
+        .item(repo, path)
+        .await
+        .map_err(|e| internal("get skill", e))?
+    {
+        None => return Err(fail(StatusCode::NOT_FOUND, "No such skill.")),
+        Some((m, _)) if m.kind == Kind::Agent => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "Agents are asked, not read, so they can't be always applied.",
+            ))
+        }
+        Some(_) => {}
+    }
+    let known = team_repos(&state, &claims.team_id)
+        .await
+        .map_err(|e| internal("list team repos", e))?;
+    let setting = AlwaysApply::validate(
+        on,
+        &strings(&body["repos"]),
+        &strings(&body["passes"]),
+        &strings(&body["paths"]),
+        &known,
+    )
+    .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
+    let found = st
+        .set_always_apply(repo, path, &setting, &claims.email)
+        .await
+        .map_err(|e| internal("set always apply", e))?;
+    if !found {
+        return Err(fail(StatusCode::NOT_FOUND, "No such skill."));
+    }
+    info!(team_id = %claims.team_id, repo, path, on, repos = setting.repos.len(), passes = ?setting.passes, paths = setting.paths.len(), "Skill always-apply set");
+    let mut out = setting.json();
+    out["by"] = json!(claims.email);
+    out["at"] = json!(chrono::Utc::now().to_rfc3339());
+    Ok(Json(json!({ "ok": true, "always_apply": out })))
 }
 
 /// POST /api/skills/recheck `{repo, path?}` — checks a repository's items

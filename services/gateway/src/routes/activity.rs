@@ -69,6 +69,7 @@ pub async fn summary(
             "asks": skills.asks,
             "read_problems": skills.read_problems,
             "ask_problems": skills.ask_problems,
+            "applies": skills.applies,
         },
         "lookups": lookups,
     })))

@@ -359,6 +359,12 @@ pub async fn run(
             &msg.team_id,
             super::skills::Reader::Reviewer,
             format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
+            super::skills::Work::new(
+                format!("{}/{}", msg.repo_owner, msg.repo_name),
+                // An answer to a question is a reply about the code.
+                &["reviewer", "replies"],
+                changed_files(&compare).into_iter().collect(),
+            ),
         )
         .await
         .map(|s| {
@@ -367,7 +373,10 @@ pub async fn run(
             ))
         });
         let system = match &skills {
-            Some(s) => format!("{system}{}", s.prompt_section()),
+            Some(s) => {
+                s.record_applied(state).await;
+                format!("{system}{}", s.prompt_section())
+            }
             None => system,
         };
         let executor = review_agent::PrReviewToolExecutor {
@@ -454,6 +463,9 @@ pub async fn run(
         )
         .await;
         record_review_usage(state, &msg.team_id, Some(&record_sk), &usage).await;
+        if let Some(s) = &skills {
+            note_review_standards(state, &msg.team_id, &record_sk, &s.applied_names()).await;
+        }
         info!(pr = msg.pr_number, "Reviewer answered a question");
         return Ok(());
     }
@@ -646,9 +658,18 @@ pub async fn run(
         &msg.team_id,
         super::skills::Reader::Reviewer,
         format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
+        super::skills::Work::new(
+            format!("{}/{}", msg.repo_owner, msg.repo_name),
+            // A review judges the code and writes the comments.
+            &["reviewer", "review_comments"],
+            changed_files(&compare).into_iter().collect(),
+        ),
     )
     .await
     .map(|s| s.with_task(&format!("Reviewing: {title}")));
+    if let Some(s) = &skills {
+        s.record_applied(state).await;
+    }
 
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(
@@ -1040,6 +1061,9 @@ pub async fn run(
     )
     .await;
     record_review_usage(state, &msg.team_id, Some(&record_sk), &usage).await;
+    if let Some(s) = &skills {
+        note_review_standards(state, &msg.team_id, &record_sk, &s.applied_names()).await;
+    }
     info!(
         pr = msg.pr_number,
         verdict = verdict,
@@ -1514,6 +1538,36 @@ async fn store_review_record(
         warn!(pr = msg.pr_number, error = %e, "Failed to persist review stats (non-fatal)");
     }
     sk
+}
+
+/// Names the team standards a review was given in full on its record, for
+/// its page. Nothing is written when there were none.
+async fn note_review_standards(
+    state: &WorkerState,
+    team_id: &str,
+    record_sk: &str,
+    names: &[String],
+) {
+    if names.is_empty() {
+        return;
+    }
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(record_sk))
+        .condition_expression("attribute_exists(sk)")
+        .update_expression("SET applied_standards = :n")
+        .expression_attribute_values(
+            ":n",
+            aws_sdk_dynamodb::types::AttributeValue::L(names.iter().map(|n| attr_s(n)).collect()),
+        )
+        .send()
+        .await
+    {
+        warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Failed to note the review's team standards (non-fatal)");
+    }
 }
 
 /// Cost of a review as stored (4 decimals, like run records).
