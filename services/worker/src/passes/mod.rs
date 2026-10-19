@@ -659,6 +659,7 @@ mod pr;
 pub mod pr_outcomes;
 pub mod quarantine;
 pub mod release_notes;
+pub(crate) mod repo_pick;
 mod resolve;
 pub mod resume;
 mod review;
@@ -1110,62 +1111,141 @@ async fn run_passes(
     }
 
     // --- Resolve repo for Jira tickets ---
-    // For Jira: project mapping > LLM select_repo > single repo fallback.
-    // validate_plan is the final safety net (tech-stack + plan-text checks).
+    // For Jira: explicit pin on the message > project mapping > LLM
+    // select_repo > single repo. A repo the ticket names (pinned, or plainly
+    // written in the ticket) that is connected but not turned on for runs is
+    // never swapped for another repo: the run stops as needs_input and says
+    // so. validate_plan is the final safety net (tech-stack + plan-text checks).
+    // Set when Coderhelm chose the repo itself (repo, why), so a no-changes
+    // result can say where it looked.
+    let mut auto_pick: Option<(String, String)> = None;
     if matches!(msg.source, TicketSource::Jira) {
-        let repos = plan::fetch_team_repos(state, &msg.team_id).await;
-        if repos.is_empty() {
-            return Err("No enabled repos found for team — cannot auto-pick repo".into());
-        }
+        let team_repos = plan::fetch_team_repo_list(state, &msg.team_id).await;
+        let repos: Vec<String> = team_repos
+            .iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.full_name.clone())
+            .collect();
+        let disabled: Vec<String> = team_repos
+            .iter()
+            .filter(|r| !r.enabled)
+            .map(|r| r.full_name.clone())
+            .collect();
 
-        // Check for explicit Jira project → repo mapping
-        let project_key = msg.ticket_id.split('-').next().unwrap_or("");
-        let mapped_repo = if !project_key.is_empty() {
-            lookup_jira_project_repo(state, &msg.team_id, project_key).await
-        } else {
-            None
-        };
+        let mut resolved: Option<String> = None;
+        let mut stop: Option<String> = None;
 
-        if let Some(ref repo) = mapped_repo {
-            if repos.iter().any(|r| r == repo) {
-                let (owner, name) = repo.split_once('/').unwrap_or(("", ""));
-                msg.repo_owner = owner.to_string();
-                msg.repo_name = name.to_string();
-                info!(run_id, repo = %repo, project_key, "Repo from Jira project mapping");
-            }
-        }
-
-        // If no mapping (or mapped repo not enabled), use LLM to pick the best repo
-        if msg.repo_owner.is_empty()
-            || !repos
-                .iter()
-                .any(|r| r == &format!("{}/{}", msg.repo_owner, msg.repo_name))
-        {
-            if repos.len() == 1 {
-                // Only one repo — no need for LLM
-                let (owner, name) = repos[0].split_once('/').unwrap_or(("", ""));
-                msg.repo_owner = owner.to_string();
-                msg.repo_name = name.to_string();
-                info!(run_id, repo = %repos[0], "Single repo available");
-            } else {
-                // Multiple repos — ask LLM to pick based on ticket content
-                match triage::select_repo(state, msg, &repos, &github, &provider, usage).await {
-                    Ok(selected) => {
-                        let (owner, name) = selected.split_once('/').unwrap_or(("", ""));
-                        msg.repo_owner = owner.to_string();
-                        msg.repo_name = name.to_string();
-                        info!(run_id, repo = %selected, "LLM selected repo for Jira ticket");
-                    }
-                    Err(e) => {
-                        // Fall back to first repo if LLM fails
-                        let (owner, name) = repos[0].split_once('/').unwrap_or(("", ""));
-                        msg.repo_owner = owner.to_string();
-                        msg.repo_name = name.to_string();
-                        warn!(run_id, error = %e, repo = %repos[0], "LLM repo selection failed, using first repo");
+        // A retry or an explicit pin names the repo outright.
+        if !msg.repo_owner.is_empty() && !msg.repo_name.is_empty() {
+            let pin = format!("{}/{}", msg.repo_owner, msg.repo_name);
+            match repo_pick::pin_state(&pin, &team_repos) {
+                repo_pick::PinState::Enabled(r) => {
+                    info!(run_id, repo = %r, "Repo pinned on the ticket message");
+                    resolved = Some(r);
+                }
+                repo_pick::PinState::Disabled(r) => {
+                    warn!(run_id, repo = %r, "Pinned repo is connected but not turned on for runs");
+                    stop = Some(repo_pick::not_enabled_message(&r));
+                }
+                repo_pick::PinState::NotListed => {
+                    match github.get_repo_info(&msg.repo_owner, &msg.repo_name).await {
+                        Ok(_) => {
+                            warn!(run_id, repo = %pin, "Pinned repo is visible to the app but not set up for runs");
+                            stop = Some(repo_pick::not_enabled_message(&pin));
+                        }
+                        Err(e) if e.to_string().contains("client error") => {
+                            warn!(run_id, repo = %pin, error = %e, "Pinned repo is not visible to the app");
+                            stop = Some(repo_pick::not_connected_message(&pin));
+                        }
+                        Err(e) => {
+                            return Err(format!(
+                                "Could not check whether {pin} is connected (GitHub error: {e}). Retry the run."
+                            )
+                            .into());
+                        }
                     }
                 }
             }
         }
+
+        if resolved.is_none() && stop.is_none() {
+            if repos.is_empty() {
+                // Nothing is turned on; say so plainly when the ticket names a
+                // connected repo, otherwise keep the existing failure.
+                let text = format!("{}\n{}", msg.title, msg.body);
+                match repo_pick::ticket_names_only_disabled(&text, &team_repos) {
+                    Some(r) => stop = Some(repo_pick::not_enabled_message(&r)),
+                    None => {
+                        return Err("No enabled repos found for team — cannot auto-pick repo".into())
+                    }
+                }
+            } else {
+                // Check for explicit Jira project → repo mapping
+                let project_key = msg.ticket_id.split('-').next().unwrap_or("");
+                let mapped_repo = if !project_key.is_empty() {
+                    lookup_jira_project_repo(state, &msg.team_id, project_key).await
+                } else {
+                    None
+                };
+                if let Some(repo) = mapped_repo.filter(|m| repos.iter().any(|r| r == m)) {
+                    info!(run_id, repo = %repo, project_key, "Repo from Jira project mapping");
+                    resolved = Some(repo);
+                }
+            }
+        }
+
+        if resolved.is_none() && stop.is_none() {
+            let text = format!("{}\n{}", msg.title, msg.body);
+            if let Some(r) = repo_pick::ticket_names_only_disabled(&text, &team_repos) {
+                // Deterministic: the ticket names exactly one connected repo,
+                // by its exact name, and it isn't turned on.
+                warn!(run_id, repo = %r, "Ticket names a repo that isn't turned on for runs");
+                stop = Some(repo_pick::not_enabled_message(&r));
+            } else if repos.len() == 1 && !repo_pick::mentions_disabled_repo(&text, &disabled) {
+                // Only one repo and nothing hints at another — no need for LLM
+                info!(run_id, repo = %repos[0], "Single repo available");
+                auto_pick = Some((
+                    repos[0].clone(),
+                    "it is the only repo turned on for runs.".to_string(),
+                ));
+                resolved = Some(repos[0].clone());
+            } else {
+                // Ask the LLM to pick based on ticket content; it also judges
+                // whether the ticket belongs in a repo that isn't turned on.
+                match triage::select_repo(state, msg, &repos, &disabled, &github, &provider, usage)
+                    .await
+                {
+                    Ok(repo_pick::RepoPick::Repo { repo, why }) => {
+                        info!(run_id, repo = %repo, "LLM selected repo for Jira ticket");
+                        auto_pick = Some((repo.clone(), why));
+                        resolved = Some(repo);
+                    }
+                    Ok(repo_pick::RepoPick::NotEnabled(r)) => {
+                        warn!(run_id, repo = %r, "Model judged the ticket belongs in a repo that isn't turned on");
+                        stop = Some(repo_pick::not_enabled_message(&r));
+                    }
+                    Err(e) => {
+                        // Fall back to first repo if LLM fails
+                        warn!(run_id, error = %e, repo = %repos[0], "LLM repo selection failed, using first repo");
+                        auto_pick = Some((
+                            repos[0].clone(),
+                            "the repo picker failed, so the first enabled repo was used."
+                                .to_string(),
+                        ));
+                        resolved = Some(repos[0].clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(message) = stop {
+            stop_run_repo_not_enabled(state, msg, run_id, usage, start, &message).await;
+            return Ok(());
+        }
+        let repo = resolved.ok_or("Could not resolve a repo for this Jira ticket")?;
+        let (owner, name) = repo.split_once('/').unwrap_or(("", ""));
+        msg.repo_owner = owner.to_string();
+        msg.repo_name = name.to_string();
     } else if msg.repo_owner.is_empty() || msg.repo_name.is_empty() {
         return Err("repo_owner and repo_name are required for GitHub tickets".into());
     }
@@ -1487,8 +1567,18 @@ async fn run_passes(
             formatter::format_with_voice(state, &voice, &raw_github, &provider, usage).await;
         let raw_jira =
             format!("{reason}\n\nThe codebase already satisfies what this issue asks for.");
-        let jira_comment =
+        let mut jira_comment =
             formatter::format_with_voice(state, &voice, &raw_jira, &provider, usage).await;
+        let mut github_comment = github_comment;
+        // When Coderhelm picked the repo itself, say which one it looked at and
+        // why, so a wrong-repo pick is visible instead of reading as "done".
+        // Appended after voice formatting so it can't be reworded away.
+        if let Some((repo, why)) = auto_pick.as_ref() {
+            let note = repo_pick::no_changes_repo_note(repo, why);
+            add_progress_note(state, &msg.team_id, run_id, &note).await;
+            github_comment = format!("{github_comment}\n\n{note}");
+            jira_comment = format!("{jira_comment}\n\n{note}");
+        }
 
         if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
             let _ = github
@@ -1608,52 +1698,7 @@ async fn run_passes(
         }
 
         // Mark the run as needs_input so a comment can re-trigger it
-        let duration = start.elapsed().as_secs();
-        let cost = usage.estimated_cost();
-        let now = chrono::Utc::now().to_rfc3339();
-        let _ = state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.runs_table_name)
-            .key("team_id", attr_s(&msg.team_id))
-            .key("run_id", attr_s(run_id))
-            .update_expression(
-                "SET #status = :s, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
-                 duration_s = :d, updated_at = :t, current_pass = :cp, \
-                 status_run_id = :sri, mcp_servers = :mcp",
-            )
-            .expression_attribute_names("#status", "status")
-            .expression_attribute_values(":s", attr_s("needs_input"))
-            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-            .expression_attribute_values(":to", attr_n(usage.output_tokens))
-            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-            .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
-            .expression_attribute_values(":d", attr_n(duration))
-            .expression_attribute_values(":t", attr_s(&now))
-            .expression_attribute_values(":cp", attr_s("done"))
-            .expression_attribute_values(":sri", attr_s(&format!("needs_input#{run_id}")))
-            .expression_attribute_values(
-                ":mcp",
-                AttributeValue::L(used_mcp_ids.iter().map(|s| attr_s(s)).collect()),
-            )
-            .send()
-            .await;
-
-        // Update analytics counters
-        let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
-        for period in &[analytics_month.as_str(), "ALL_TIME"] {
-            let _ = state
-                .dynamo
-                .update_item()
-                .table_name(&state.config.analytics_table_name)
-                .key("team_id", attr_s(&msg.team_id))
-                .key("period", attr_s(period))
-                .update_expression("ADD completed :one")
-                .expression_attribute_values(":one", attr_n(1))
-                .send()
-                .await;
-        }
+        mark_run_needs_input(state, msg, run_id, usage, start, &used_mcp_ids).await;
 
         close_memory(state, agent_memory.take()).await;
         return Ok(());
@@ -3883,6 +3928,97 @@ pub(crate) async fn record_ci_outcome(
     if let Err(e) = req.send().await {
         warn!(run_id, error = %e, "Failed to record CI outcome (non-fatal)");
     }
+}
+
+/// Mark a run `needs_input` (a comment or re-run can pick it up again) and
+/// count it in the analytics, the way every needs_input stop is recorded.
+async fn mark_run_needs_input(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    usage: &TokenUsage,
+    start: &std::time::Instant,
+    mcp_ids: &[String],
+) {
+    let duration = start.elapsed().as_secs();
+    let cost = usage.estimated_cost();
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET #status = :s, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
+             duration_s = :d, updated_at = :t, current_pass = :cp, \
+             status_run_id = :sri, mcp_servers = :mcp",
+        )
+        .expression_attribute_names("#status", "status")
+        .expression_attribute_values(":s", attr_s("needs_input"))
+        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+        .expression_attribute_values(":to", attr_n(usage.output_tokens))
+        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+        .expression_attribute_values(":d", attr_n(duration))
+        .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":cp", attr_s("done"))
+        .expression_attribute_values(":sri", attr_s(&format!("needs_input#{run_id}")))
+        .expression_attribute_values(
+            ":mcp",
+            AttributeValue::L(mcp_ids.iter().map(|s| attr_s(s)).collect()),
+        )
+        .send()
+        .await;
+
+    // Update analytics counters
+    let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
+    for period in &[analytics_month.as_str(), "ALL_TIME"] {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.analytics_table_name)
+            .key("team_id", attr_s(&msg.team_id))
+            .key("period", attr_s(period))
+            .update_expression("ADD completed :one")
+            .expression_attribute_values(":one", attr_n(1))
+            .send()
+            .await;
+    }
+}
+
+/// Stop a Jira run whose ticket belongs in a repo that isn't connected or
+/// isn't turned on for runs: tell the ticket (and the run notes) in plain
+/// words, and leave the run needs_input instead of re-routing it.
+async fn stop_run_repo_not_enabled(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    usage: &TokenUsage,
+    start: &std::time::Instant,
+    message: &str,
+) {
+    info!(
+        run_id,
+        message, "Run stopped: ticket's repo is not available for runs"
+    );
+    add_progress_note(state, &msg.team_id, run_id, message).await;
+    if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+        if let Err(e) = post_jira_comment(
+            state,
+            &msg.team_id,
+            &msg.ticket_id,
+            message,
+            "clarification",
+            "Repo not turned on",
+        )
+        .await
+        {
+            warn!(run_id, error = %e, "Could not post the repo-not-turned-on Jira comment");
+        }
+    }
+    mark_run_needs_input(state, msg, run_id, usage, start, &[]).await;
 }
 
 /// Append a timestamped progress note to the run record for live activity display.
