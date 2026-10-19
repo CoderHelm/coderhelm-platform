@@ -5,6 +5,8 @@
 //! member whose weekly summary preference is on (missing = on) gets one email,
 //! built for their role: data-source lookups only for admins and owners, alerts
 //! only for members and up, the same split as the dashboard's endpoints.
+//! A team can limit the scheduled send to a rollout list of addresses
+//! (`SETTINGS#WEEKLY_SUMMARY_ROLLOUT`, attribute `only_emails`).
 //!
 //! `{"type":"weekly_summary_test","team_id":..,"to":..}` renders the real
 //! summary for one team as an admin would see it and sends it to that one
@@ -361,64 +363,60 @@ pub fn alert_stats(rows: &[Item]) -> AlertStats {
 // ── Pure: numbers → email ─────────────────────────────────────────────────
 //
 // Built the way mail apps need it: tables for layout, every style inline
-// (the <style> blocks only add dark mode, Outlook.com's dark mode and phone
-// spacing on top), a 600px column that shrinks on phones, system fonts, no
-// images (the mark is text, so nothing breaks with images off), a VML
-// button for Outlook on Windows, and a hidden preview line. Colors are the
-// dashboard's zinc grays and blue, never pure white or black, so apps that
-// invert colors on their own still land on something readable.
+// (the <style> blocks only add phone spacing and guards on top), a 600px
+// column that shrinks on phones, system fonts, no images (the mark is text,
+// so nothing breaks with images off), a VML button for Outlook on Windows,
+// and a hidden preview line.
+//
+// Dark only, like the dashboard: every layer (body, page table, card, tiles)
+// carries its dark color both as a `bgcolor` attribute and inline, so it
+// stays dark where <style> is stripped, and the page says it is already dark
+// (`color-scheme: dark`) so apps don't invert it. Text colors pass AA
+// contrast on the card and tile colors.
 
-/// Light colors, inline. Dark ones live in `DARK_CSS` under the same names.
+/// The dashboard's dark zinc palette, used inline everywhere.
 mod c {
-    pub const PAGE: &str = "#f4f4f5";
-    pub const CARD: &str = "#fdfdfd";
-    pub const TILE: &str = "#f4f4f5";
-    pub const BORDER: &str = "#e4e4e7";
-    pub const T1: &str = "#18181b";
-    pub const T2: &str = "#52525b";
-    pub const T3: &str = "#71717a";
-    pub const LINK: &str = "#2563eb";
+    pub const PAGE: &str = "#09090b";
+    pub const CARD: &str = "#18181b";
+    pub const TILE: &str = "#202024";
+    pub const BORDER: &str = "#27272a";
+    pub const T1: &str = "#f4f4f5";
+    pub const T2: &str = "#a1a1aa";
+    pub const T3: &str = "#8f8f99";
+    pub const LINK: &str = "#60a5fa";
     pub const BLUE: &str = "#3b82f6";
     pub const BUTTON: &str = "#2563eb";
-    pub const TRACK: &str = "#e4e4e7";
-    pub const GREEN: &str = "#16a34a";
-    pub const AMBER: &str = "#d97706";
-    pub const RED: &str = "#dc2626";
-    pub const GRAY: &str = "#a1a1aa";
+    pub const TRACK: &str = "#2e2e33";
+    pub const GREEN: &str = "#22c55e";
+    pub const AMBER: &str = "#f59e0b";
+    pub const RED: &str = "#ef4444";
+    pub const GRAY: &str = "#71717a";
+    /// Status chips: (background, text).
+    pub const CHIP_REVIEW: (&str, &str) = ("#172554", "#bfdbfe");
+    pub const CHIP_INPUT: (&str, &str) = ("#422006", "#fde68a");
 }
 
 const FONT: &str = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
 const MONO: &str = "ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace";
 
-/// Dark mode for apps that support the media query (Apple Mail, iOS,
-/// Outlook for Mac). Gmail ignores it and inverts on its own.
-const DARK_CSS: &str = "@media (prefers-color-scheme: dark) {\
-.bg-page{background:#09090b !important}\
-.bg-card{background:#18181b !important;border-color:#27272a !important}\
-.bg-tile{background:#222226 !important;border-color:#2e2e33 !important}\
-.t1{color:#f4f4f5 !important}\
-.t2{color:#b4b4bc !important}\
-.t3{color:#8f8f99 !important}\
-.lk{color:#60a5fa !important}\
-.ln{border-color:#2a2a2e !important}\
-.trk{background:#2e2e33 !important}\
-.chip-r{background:#172554 !important;color:#bfdbfe !important}\
-.chip-i{background:#422006 !important;color:#fde68a !important}\
-}";
-
-/// Outlook.com marks its dark mode with these attributes instead.
-const OGSC_CSS: &str = "[data-ogsc] .t1{color:#f4f4f5 !important}\
-[data-ogsc] .t2{color:#b4b4bc !important}\
+/// Keeps the dark values where mail apps try to restyle: Gmail (reached
+/// through its `u + .body` wrapper) and Outlook.com's dark mode, which marks
+/// elements with `data-ogsc` (text) and `data-ogsb` (backgrounds).
+const GUARD_CSS: &str = "u + .body .bg-page{background:#09090b !important}\
+u + .body .bg-card{background:#18181b !important}\
+u + .body .bg-tile{background:#202024 !important}\
+[data-ogsc] .t1{color:#f4f4f5 !important}\
+[data-ogsc] .t2{color:#a1a1aa !important}\
 [data-ogsc] .t3{color:#8f8f99 !important}\
 [data-ogsc] .lk{color:#60a5fa !important}\
 [data-ogsb] .bg-page{background:#09090b !important}\
 [data-ogsb] .bg-card{background:#18181b !important}\
-[data-ogsb] .bg-tile{background:#222226 !important}";
+[data-ogsb] .bg-tile{background:#202024 !important}";
 
 /// Phones: tighter padding, a smaller headline. Resets for links that mail
 /// apps restyle on their own.
-const BASE_CSS: &str = ":root{color-scheme:light dark;supported-color-schemes:light dark}\
-body{margin:0;padding:0;-webkit-text-size-adjust:100%}\
+const BASE_CSS: &str = ":root{color-scheme:dark;supported-color-schemes:dark}\
+body{margin:0;padding:0;background:#09090b;-webkit-text-size-adjust:100%}\
 a[x-apple-data-detectors]{color:inherit !important;text-decoration:none !important;font:inherit !important}\
 u + .body a{color:inherit}\
 @media (max-width:620px){\
@@ -1171,8 +1169,18 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
             .enumerate()
             .map(|(i, a)| {
                 let chip = match a.why {
-                    Waiting::Input => ("Needs your answer", "#fef3c7", "#92400e", "chip-i"),
-                    Waiting::Review => ("Ready for review", "#dbeafe", "#1e40af", "chip-r"),
+                    Waiting::Input => (
+                        "Needs your answer",
+                        c::CHIP_INPUT.0,
+                        c::CHIP_INPUT.1,
+                        "chip-i",
+                    ),
+                    Waiting::Review => (
+                        "Ready for review",
+                        c::CHIP_REVIEW.0,
+                        c::CHIP_REVIEW.1,
+                        "chip-r",
+                    ),
                 };
                 list_row(
                     &title_or(&a.title, "Untitled run"),
@@ -1297,17 +1305,16 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="x-apple-disable-message-reformatting">
 <meta name="format-detection" content="telephone=no,date=no,address=no,email=no,url=no">
-<meta name="color-scheme" content="light dark">
-<meta name="supported-color-schemes" content="light dark">
+<meta name="color-scheme" content="dark">
+<meta name="supported-color-schemes" content="dark">
 <title>{title}</title>
 <!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><style>td,th,div,p,a,h1,h2{{font-family:Arial,sans-serif;mso-line-height-rule:exactly}}</style><![endif]-->
 <style>{base}</style>
-<style>{dark}</style>
-<style>{ogsc}</style>
+<style>{guard}</style>
 </head>
-<body class="body bg-page" xml:lang="en" style="margin:0;padding:0;background:{page};word-spacing:normal">
+<body class="body bg-page" bgcolor="{page}" xml:lang="en" style="color-scheme:dark;margin:0;padding:0;background:{page};word-spacing:normal">
 {pre}
-<div role="article" aria-roledescription="email" aria-label="{title}" lang="en" dir="ltr" style="font-family:{FONT};font-size:16px">
+<div role="article" aria-roledescription="email" aria-label="{title}" lang="en" dir="ltr" class="bg-page" style="background:{page};font-family:{FONT};font-size:16px">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="bg-page" bgcolor="{page}" style="width:100%;background:{page}"><tr><td align="center" style="padding:32px 16px 40px">
 <!--[if mso]><table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0" border="0"><tr><td><![endif]-->
 <div style="max-width:600px;margin:0 auto">
@@ -1331,8 +1338,7 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
 </html>"#,
         title = esc(&subject),
         base = BASE_CSS,
-        dark = DARK_CSS,
-        ogsc = OGSC_CSS,
+        guard = GUARD_CSS,
         pre = preheader(&preview),
         page = c::PAGE,
         card = c::CARD,
@@ -1652,12 +1658,21 @@ async fn send_team(
     if people.is_empty() {
         return Ok(0);
     }
+    // Read before anything is sent: if it can't be read, send nothing.
+    let only = rollout(state, team_id).await?;
     let name = team_name(state, team_id).await;
     let summary = load(state, team_id, &name, now).await?;
     let week = week_key(now);
     let mut sent = 0;
     for p in people {
-        if !wants_summary(state, team_id, &p.user_id).await? {
+        if !on_rollout(only.as_ref(), &p.email) {
+            continue;
+        }
+        if !should_send(
+            only.as_ref(),
+            &p.email,
+            wants_summary(state, team_id, &p.user_id).await?,
+        ) {
             continue;
         }
         let Some(link) = unsubscribe_link(state, team_id, &p.user_id) else {
@@ -1686,7 +1701,70 @@ async fn send_team(
             Err(e) => warn!(team_id, error = %e, "Weekly summary not sent to one member"),
         }
     }
+    info!(
+        team_id,
+        recipients = sent,
+        rollout_list = only.as_ref().map(|l| l.len()),
+        "Weekly summary sent for a team"
+    );
     Ok(sent)
+}
+
+/// Where a team's rollout list lives: `only_emails`, a string set (or a
+/// list of strings) of addresses. While it exists, the scheduled summary goes
+/// only to members on it; without it, to everyone as usual.
+const ROLLOUT_SK: &str = "SETTINGS#WEEKLY_SUMMARY_ROLLOUT";
+
+fn norm_email(v: &str) -> String {
+    v.trim().to_lowercase()
+}
+
+/// The `only_emails` addresses, normalized. `None` when the team has no list.
+fn rollout_from(item: Option<&Item>) -> Option<std::collections::HashSet<String>> {
+    let v = item?.get("only_emails")?;
+    let mut out = std::collections::HashSet::new();
+    if let Ok(ss) = v.as_ss() {
+        out.extend(ss.iter().map(|e| norm_email(e)));
+    } else if let Ok(l) = v.as_l() {
+        out.extend(
+            l.iter()
+                .filter_map(|e| e.as_s().ok())
+                .map(|e| norm_email(e)),
+        );
+    } else if let Ok(s) = v.as_s() {
+        out.extend(s.split(',').map(norm_email));
+    }
+    out.remove("");
+    // A list that is there but unreadable sends to nobody, never to everyone.
+    Some(out)
+}
+
+async fn rollout(
+    state: &WorkerState,
+    team_id: &str,
+) -> Result<Option<std::collections::HashSet<String>>, BoxErr> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", av(team_id))
+        .key("sk", av(ROLLOUT_SK))
+        .send()
+        .await?;
+    Ok(rollout_from(item.item()))
+}
+
+fn on_rollout(only: Option<&std::collections::HashSet<String>>, email: &str) -> bool {
+    only.is_none_or(|l| l.contains(&norm_email(email)))
+}
+
+/// Whether a member gets this week's scheduled summary.
+fn should_send(
+    only: Option<&std::collections::HashSet<String>>,
+    email: &str,
+    pref_on: bool,
+) -> bool {
+    pref_on && on_rollout(only, email)
 }
 
 /// The Monday schedule: every active team, if the summary is switched on.
@@ -2189,9 +2267,13 @@ mod tests {
             // Gmail clips messages over about 100KB.
             assert!(h.len() < 60_000, "{} bytes", h.len());
             assert!(h.contains(r#"<html lang="en""#));
-            assert!(h.contains(r#"name="color-scheme" content="light dark""#));
+            assert!(h.contains(r#"name="color-scheme" content="dark""#));
             assert!(h.contains(r#"name="supported-color-schemes""#));
-            assert!(h.contains("prefers-color-scheme: dark"));
+            assert!(h.contains("u + .body .bg-page"));
+            // Dark only, even where styles are stripped.
+            assert!(h.contains(r##"<body class="body bg-page" bgcolor="#09090b""##));
+            assert!(h.contains(r##"class="bg-card" bgcolor="#18181b""##));
+            assert!(!h.contains("light dark") && !h.contains("background:#f4f4f5"));
             assert!(h.contains("[data-ogsc]"));
             assert!(h.contains("v:roundrect"));
             assert!(h.contains(r#"aria-hidden="true""#));
@@ -2210,6 +2292,44 @@ mod tests {
             assert!(!e.text.contains("<td") && !e.text.contains("<a "));
             assert!(e.text.contains("https://app.coderhelm.com/"));
         }
+    }
+
+    #[test]
+    fn a_rollout_list_limits_who_gets_the_scheduled_summary() {
+        // No list: everyone whose preference is on.
+        let none = rollout_from(None);
+        assert!(should_send(none.as_ref(), "anyone@example.com", true));
+        assert!(!should_send(none.as_ref(), "anyone@example.com", false));
+        let no_field = item(&[("pk", "team-1")]);
+        assert_eq!(rollout_from(Some(&no_field)), None);
+
+        // A list: only the people on it, matched without case or spaces,
+        // and still only if their preference is on.
+        let mut listed = Item::new();
+        listed.insert(
+            "only_emails".into(),
+            AttributeValue::Ss(vec![" Owner@Example.com ".into()]),
+        );
+        let only = rollout_from(Some(&listed));
+        assert!(should_send(only.as_ref(), "owner@example.COM", true));
+        assert!(!should_send(only.as_ref(), "owner@example.com", false));
+        assert!(!should_send(only.as_ref(), "member@example.com", true));
+
+        // A list of strings works the same way.
+        let mut as_list = Item::new();
+        as_list.insert(
+            "only_emails".into(),
+            AttributeValue::L(vec![AttributeValue::S("owner@example.com".into())]),
+        );
+        let only = rollout_from(Some(&as_list));
+        assert!(should_send(only.as_ref(), "Owner@example.com", true));
+        assert!(!should_send(only.as_ref(), "member@example.com", true));
+
+        // A list that is there but unreadable sends to nobody.
+        let mut odd = Item::new();
+        odd.insert("only_emails".into(), AttributeValue::N("1".into()));
+        let only = rollout_from(Some(&odd));
+        assert!(!should_send(only.as_ref(), "owner@example.com", true));
     }
 
     #[test]

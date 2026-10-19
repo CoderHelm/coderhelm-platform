@@ -141,11 +141,9 @@ fn esc(v: &str) -> String {
 }
 
 /// Same look as the weekly summary email: zinc grays, the blue accent, the
-/// "///" mark as text, light by default and dark when the device is.
-const STYLE: &str = ":root{color-scheme:light dark;--page:#f4f4f5;--card:#fdfdfd;--border:#e4e4e7;\
---t1:#18181b;--t2:#52525b;--t3:#71717a;--blue:#3b82f6;--button:#2563eb;--link:#2563eb}\
-@media (prefers-color-scheme:dark){:root{--page:#09090b;--card:#18181b;--border:#27272a;\
---t1:#f4f4f5;--t2:#b4b4bc;--t3:#8f8f99;--link:#60a5fa}}\
+/// "///" mark as text, dark like the dashboard.
+const STYLE: &str = ":root{color-scheme:dark;--page:#09090b;--card:#18181b;--border:#27272a;\
+--t1:#f4f4f5;--t2:#a1a1aa;--t3:#8f8f99;--blue:#3b82f6;--button:#2563eb;--link:#60a5fa}\
 *{box-sizing:border-box}\
 body{margin:0;background:var(--page);color:var(--t2);\
 font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\
@@ -227,7 +225,7 @@ fn page(outcome: &Outcome) -> Response {
     let html = format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <meta name=\"color-scheme\" content=\"light dark\">\
+         <meta name=\"color-scheme\" content=\"dark\">\
          <meta name=\"referrer\" content=\"no-referrer\"><meta name=\"robots\" content=\"noindex\">\
          <title>{title} · Coderhelm</title><style>{STYLE}</style></head><body>\
          <div class=\"wrap\"><div class=\"mark\" aria-label=\"Coderhelm\"><i>/</i><b>/</b><i>/</i>&nbsp;Coderhelm</div>\
