@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use common::skill_compat::{self, Analysis, Inventory, Server, Source, Tool};
+use common::skill_compat::{self, Analysis, Inventory, Server, Source, Tool, Translation};
 use common::skills::{SkillMeta, SkillStore};
 use futures::StreamExt;
 use serde_json::Value;
@@ -34,91 +34,121 @@ const RETRY_EFFORT: &str = "high";
 pub const TRIES: [(&str, bool); 2] = [(EFFORT, true), (RETRY_EFFORT, false)];
 const MAX_TOKENS: i32 = 32_000;
 
-/// Coderhelm's own tools, as an item can rely on them. A test checks each
-/// one is a tool an agent is really given.
-pub const BUILTIN: &[(&str, &str, bool)] = &[
-    ("read_tree", "List every file in the repository", false),
-    ("list_directory", "List one folder of the repository", false),
-    ("read_file", "Read a file of the repository", false),
-    ("read_file_lines", "Read some lines of a file", false),
-    (
-        "search_code",
-        "Search the repository's code for text",
-        false,
-    ),
-    (
-        "write_file",
-        "Write a file in the repository (lands in the pull request)",
-        true,
-    ),
-    ("edit_file", "Edit part of a file in the repository", true),
-    (
-        "batch_write",
-        "Write several files in the repository at once",
-        true,
-    ),
-    (
-        "restore_file",
-        "Put a file back as it is on the base branch",
-        true,
-    ),
-    (
-        "get_diff",
-        "Compare the working branch with the pull request's base branch",
-        false,
-    ),
-    (
-        "run_checks",
-        "Run the repository's own build, type check, lint and tests in a sandbox (only the \
-         commands from its build config; no other commands)",
-        false,
-    ),
-    (
-        "run_codegen",
-        "Run the repository's own code generation in a sandbox",
-        true,
-    ),
+/// Tools Coderhelm's agents have beside the coding agent's own list (which
+/// is read live from the coder, so a tool added there shows up here).
+const EXTRA_TOOLS: &[(&str, &str)] = &[
     (
         "graph_definition",
         "Find where a symbol is defined (reviews)",
-        false,
     ),
-    (
-        "graph_callers",
-        "Find which files use a symbol (reviews)",
-        false,
-    ),
+    ("graph_callers", "Find which files use a symbol (reviews)"),
     (
         "graph_impact",
         "Find every file affected by a file's symbols (reviews)",
-        false,
     ),
     (
         "search_org",
         "Search the team's other repositories for a symbol (reviews)",
-        false,
     ),
     (
         "check_package",
         "Look a package version up on npm, crates.io or PyPI (reviews)",
-        false,
     ),
     (
         "read_skill",
         "Read one of the team's skills, commands or agents",
-        false,
+    ),
+    ("read_skill_file", "Read a file kept next to a team skill"),
+    ("ask_team_agent", "Ask one of the team's agents a question"),
+];
+
+/// Tools that change the repository (in the pull request).
+const WRITES_REPO: &[&str] = &[
+    "write_file",
+    "edit_file",
+    "batch_write",
+    "restore_file",
+    "run_codegen",
+];
+
+/// Commands a skill may name that Coderhelm does another way, and the tools
+/// that do it. Each is offered to the check only when the team's inventory
+/// has every tool it names, so a tool that ships later turns its commands
+/// into translated steps on the next check.
+const TRANSLATIONS: &[(&str, &[&str], &str)] = &[
+    (
+        "git clone, git checkout, cat, head, tail, ls, find, tree",
+        &["read_tree", "list_directory", "read_file"],
+        "Coderhelm already has the repository: it reads its files through the GitHub API, no clone needed",
     ),
     (
-        "read_skill_file",
-        "Read a file kept next to a team skill",
-        false,
+        "grep, grep -r, rg, git grep",
+        &["search_code"],
+        "Searches the repository's code with Coderhelm's code search",
     ),
     (
-        "ask_team_agent",
-        "Ask one of the team's agents a question",
-        false,
+        "git diff, gh pr diff, the files a pull request changes",
+        &["get_diff"],
+        "Compares the working branch with the pull request's base through GitHub",
+    ),
+    (
+        "git log, git blame, git show, git tag, gh pr list, gh pr view, gh release list, gh run list, gh api repos/... (reads)",
+        &["github_history"],
+        "Reads commits, blame, pull requests, releases, tags, deployments and workflow runs through the GitHub API",
+    ),
+    (
+        "npm view, npm info, pip index versions, cargo search",
+        &["check_package"],
+        "Looks the package up on its registry",
     ),
 ];
+
+/// The first sentence of a tool's description, for the inventory.
+fn first_sentence(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let end = flat
+        .find(". ")
+        .map(|i| i + 1)
+        .unwrap_or(flat.len())
+        .min(200);
+    common::truncate_str(&flat, end).to_string()
+}
+
+/// Coderhelm's own tools as an item can rely on them: the coding agent's
+/// real tool list, then the other agents' tools.
+pub fn builtin_tools() -> Vec<Tool> {
+    let mut out: Vec<Tool> = super::implement::coder_tools()
+        .into_iter()
+        .map(|t| Tool {
+            writes_repo: WRITES_REPO.contains(&t.name.as_str()),
+            what: first_sentence(&t.description),
+            name: t.name,
+        })
+        .collect();
+    for (name, what) in EXTRA_TOOLS {
+        if !out.iter().any(|t| t.name == *name) {
+            out.push(Tool {
+                name: name.to_string(),
+                what: what.to_string(),
+                writes_repo: false,
+            });
+        }
+    }
+    out
+}
+
+/// The translations whose tools are all in `tools`.
+pub fn translations(tools: &[Tool]) -> Vec<Translation> {
+    TRANSLATIONS
+        .iter()
+        .filter(|(_, uses, _)| uses.iter().all(|u| tools.iter().any(|t| t.name == *u)))
+        .map(|(commands, uses, note)| Translation {
+            commands: commands.to_string(),
+            uses: uses.iter().map(|u| u.to_string()).collect(),
+            note: note.to_string(),
+        })
+        .collect()
+}
 
 const GITHUB: &[&str] = &[
     "Read any file of the repository on the branch being worked on",
@@ -129,8 +159,8 @@ const GITHUB: &[&str] = &[
 ];
 
 const NEVER: &[&str] = &[
-    "Run shell commands or command line tools: there is no terminal (run_checks and run_codegen \
-     run only the repository's own configured commands)",
+    "Run arbitrary shell commands: there is no terminal (run_checks and run_codegen run only the \
+     repository's own configured commands; the reads listed under translations are done another way)",
     "Run git commands: it works through GitHub",
     "Read a person's computer or home folder (paths like ~/...)",
     "Write to outside systems (wikis, tickets, incidents, chat, dashboards) unless a ready MCP \
@@ -208,19 +238,39 @@ pub async fn check_item(
         .chars()
         .count();
     let schema = skill_compat::output_schema();
-    // A stub or malformed answer is asked again once; both calls count.
+    // An unusable answer is asked again once, told what was wrong; if that
+    // one is unusable too, a partial check is kept. Both calls count.
     let mut usage = TokenUsage::default();
-    let mut result = Err(String::new());
+    let mut result: Result<(Analysis, String), String> = Err(String::new());
+    let mut unusable = String::new();
     for (attempt, (effort, _)) in TRIES.iter().enumerate() {
+        let ask = if unusable.is_empty() {
+            user.clone()
+        } else {
+            format!("{user}{}", skill_compat::retry_note(&unusable))
+        };
         let (raw, spent) = checker
-            .check(skill_compat::SYSTEM, &user, &schema, attempt)
+            .check(skill_compat::SYSTEM, &ask, &schema, attempt)
             .await;
         usage.merge(&spent);
-        result = raw.and_then(|v| skill_compat::finish(&v, inv, source_chars));
+        result = match raw {
+            Ok(v) => skill_compat::finish(&v, inv, source_chars).inspect_err(|e| {
+                unusable = e.clone();
+            }),
+            Err(e) => Err(e),
+        };
         match &result {
-            Ok(_) => break,
-            Err(e) => warn!(path = %m.path, effort, error = %e, "Skill check answer refused"),
+            Ok((a, _)) => {
+                if !a.notes.is_empty() {
+                    info!(path = %m.path, notes = ?a.notes, "Skill check answer fixed up");
+                }
+                break;
+            }
+            Err(e) => warn!(path = %m.path, effort, error = %e, "Skill check answer unusable"),
         }
+    }
+    if result.is_err() && !unusable.is_empty() {
+        result = Ok((skill_compat::partial(&unusable), String::new()));
     }
     let (mut a, translated) = result?;
     a.model = checker.model().to_string();
@@ -369,14 +419,8 @@ async fn run_inner(state: &WorkerState, team_id: &str, repo: &str, only: &str, f
 /// Everything the team's items can rely on in Coderhelm right now.
 pub async fn inventory(state: &WorkerState, team_id: &str) -> Inventory {
     let table = &state.config.settings_table_name;
-    let builtin = BUILTIN
-        .iter()
-        .map(|(name, what, writes)| Tool {
-            name: name.to_string(),
-            what: what.to_string(),
-            writes_repo: *writes,
-        })
-        .collect();
+    let builtin = builtin_tools();
+    let translations = translations(&builtin);
 
     let mcp_table = if state.config.mcp_configs_table_name.is_empty() {
         table.as_str()
@@ -460,6 +504,7 @@ pub async fn inventory(state: &WorkerState, team_id: &str) -> Inventory {
         connectable,
         sources,
         team_tools,
+        translations,
         never: NEVER.iter().map(|s| s.to_string()).collect(),
     }
     .sorted()
@@ -634,14 +679,8 @@ mod tests {
 
     fn inv() -> Inventory {
         Inventory {
-            builtin: BUILTIN
-                .iter()
-                .map(|(n, w, r)| Tool {
-                    name: n.to_string(),
-                    what: w.to_string(),
-                    writes_repo: *r,
-                })
-                .collect(),
+            translations: translations(&builtin_tools()),
+            builtin: builtin_tools(),
             sources: vec![Source {
                 kind: "logs".into(),
                 name: "Service logs".into(),
@@ -681,16 +720,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_bad_answer_is_an_error_not_a_check() {
+    async fn an_answer_unusable_twice_is_kept_as_a_partial_check() {
         let m = meta("skills/triage/SKILL.md", "h1", "", "");
-        let err = check_item(&Fake(json!({"steps": "no"})), &inv(), &m, "body")
+        let (a, translated) = check_item(&Fake(json!({"steps": "no"})), &inv(), &m, "body")
             .await
-            .unwrap_err();
-        assert!(err.contains("expected shape"), "{err}");
+            .unwrap();
+        assert_eq!(a.status, "partial");
+        assert!(a.notes[0].contains("expected shape"), "{:?}", a.notes);
+        assert!(translated.is_empty());
+        assert_eq!(
+            (a.input_tokens, a.output_tokens),
+            (2000, 1000),
+            "both tries count"
+        );
     }
 
-    /// Answers a stub first, then a real check.
-    struct StubThenReal(std::sync::atomic::AtomicUsize, Value);
+    struct Down;
+
+    #[async_trait::async_trait]
+    impl Checker for Down {
+        fn model(&self) -> &str {
+            "fake-light"
+        }
+        async fn check(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Value,
+            _: usize,
+        ) -> (Result<Value, String>, TokenUsage) {
+            (
+                Err("Anthropic API error (500)".into()),
+                TokenUsage::default(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_that_cant_be_reached_is_an_error_not_a_check() {
+        let m = meta("skills/triage/SKILL.md", "h1", "", "");
+        let err = check_item(&Down, &inv(), &m, "body").await.unwrap_err();
+        assert!(err.contains("500"));
+    }
+
+    /// Answers a stub first, then a real check, keeping what it was asked.
+    struct StubThenReal(
+        std::sync::atomic::AtomicUsize,
+        Value,
+        std::sync::Mutex<Vec<String>>,
+    );
 
     #[async_trait::async_trait]
     impl Checker for StubThenReal {
@@ -700,10 +778,11 @@ mod tests {
         async fn check(
             &self,
             _: &str,
-            _: &str,
+            user: &str,
             _: &Value,
             attempt: usize,
         ) -> (Result<Value, String>, TokenUsage) {
+            self.2.lock().unwrap().push(user.to_string());
             let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(attempt, n);
             let usage = TokenUsage {
@@ -722,7 +801,7 @@ mod tests {
             "steps": [{ "title": "Read the rules", "does": "Read them", "dropped": false, "requirements": [] }],
             "translated": "Read the rules before changing the code, every time."
         });
-        let fake = StubThenReal(Default::default(), real);
+        let fake = StubThenReal(Default::default(), real, Default::default());
         let m = meta("skills/triage/SKILL.md", "h1", "", "");
         let (a, _) = check_item(&fake, &inv(), &m, "Read the rules first.")
             .await
@@ -730,6 +809,83 @@ mod tests {
         assert_eq!(a.status, "ready");
         assert_eq!((a.input_tokens, a.output_tokens), (200, 20));
         assert_eq!(fake.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let asked = fake.2.lock().unwrap();
+        assert!(!asked[0].contains("couldn't be used"));
+        assert!(
+            asked[1]
+                .contains("Your last answer couldn't be used: The answer listed no usable step."),
+            "the second try is told what was wrong"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_commands_are_translated_to_coderhelms_github_backed_tools() {
+        // A skill written for a laptop, with the read commands it relies on.
+        let body = "## Steps\n1. `git clone` the repo and `cat src/app.ts`.\n2. `grep -r TODO src`.\n\
+                    3. `git diff main`.\n4. `npm view react version`.\n5. `rm -rf build && make`.\n";
+        let i = inv();
+        let commands: Vec<&str> = i.translations.iter().map(|t| t.commands.as_str()).collect();
+        assert!(commands.iter().any(|c| c.contains("git clone")));
+        assert!(commands.iter().any(|c| c.starts_with("grep")));
+        assert!(commands.iter().any(|c| c.starts_with("git diff")));
+        assert!(commands.iter().any(|c| c.starts_with("npm view")));
+        // The history tool isn't in this inventory, so git log isn't offered yet.
+        assert!(!commands.iter().any(|c| c.starts_with("git log")));
+        let mut with_history = builtin_tools();
+        with_history.push(Tool {
+            name: "github_history".into(),
+            what: "Read the repository's history".into(),
+            writes_repo: false,
+        });
+        assert!(translations(&with_history)
+            .iter()
+            .any(|t| t.commands.starts_with("git log") && t.uses == ["github_history"]));
+
+        let req = |asks: &str, status: &str, uses: &[&str]| {
+            json!({ "asks": asks, "kind": "command", "status": status, "uses": uses, "write": "none",
+                    "needs": if status == "missing" { "Shell access" } else { "" },
+                    "fix": if status == "missing" { "Coderhelm has no terminal." } else { "" },
+                    "connect": "none", "server": "" })
+        };
+        let answer = json!({
+            "steps": [
+                { "title": "Read the code", "does": "Read the app file", "dropped": false,
+                  "requirements": [req("git clone, cat", "translated", &["read_file"])] },
+                { "title": "Find TODOs", "does": "Search for TODO", "dropped": false,
+                  "requirements": [req("grep -r", "translated", &["search_code"])] },
+                { "title": "See the change", "does": "Diff against main", "dropped": false,
+                  "requirements": [req("git diff", "translated", &["get_diff"])] },
+                { "title": "Check the version", "does": "Look up react", "dropped": false,
+                  "requirements": [req("npm view", "translated", &["check_package"])] },
+                { "title": "Rebuild", "does": "Clean and build locally", "dropped": true,
+                  "requirements": [req("rm -rf build && make", "missing", &[])] }
+            ],
+            "translated": "1. Read src/app.ts with `read_file` (uses the GitHub API instead of git clone).\n\
+                           2. Search for TODO with `search_code`.\n3. Compare with `get_diff`.\n\
+                           4. Look react up with `check_package`.\nGAP: Rebuild — clean and build — not possible in Coderhelm"
+        });
+        let m = meta("skills/triage/SKILL.md", "h1", "", "");
+        let (a, translated) = check_item(&Fake(answer), &i, &m, body).await.unwrap();
+        let st: Vec<&str> = a.steps.iter().map(|s| s.status.as_str()).collect();
+        assert_eq!(
+            st,
+            [
+                "translated",
+                "translated",
+                "translated",
+                "translated",
+                "missing"
+            ]
+        );
+        assert_eq!(
+            a.summary,
+            "0 of 5 steps run as written · 4 translated · 1 needs Shell access"
+        );
+        assert_eq!(
+            a.steps[4].requirements[0].action, "none",
+            "nothing to connect for a shell"
+        );
+        assert!(translated.contains("instead of git clone"));
     }
 
     #[test]
@@ -752,31 +908,46 @@ mod tests {
         assert!(to_check(&items, "fp", "a", false).is_empty());
     }
 
-    /// Every tool the inventory names is one an agent is really given.
+    /// The inventory reads the coder's real tools, and every translation
+    /// names tools the inventory knows about.
     #[test]
-    fn every_builtin_is_a_real_tool() {
-        let mut real: Vec<String> = super::super::implement::tool_names();
-        real.extend(
-            [
-                "run_checks",
-                "run_codegen",
-                "graph_definition",
-                "graph_callers",
-                "graph_impact",
-                "search_org",
-                "check_package",
-                "read_skill",
-                "read_skill_file",
-                "ask_team_agent",
-            ]
-            .map(String::from),
-        );
-        for (name, _, _) in BUILTIN {
-            assert!(
-                real.iter().any(|r| r == name),
-                "{name} isn't a tool any agent has"
-            );
+    fn the_inventory_reads_the_real_tool_list() {
+        let tools = builtin_tools();
+        for name in super::super::implement::tool_names() {
+            assert!(tools.iter().any(|t| t.name == name), "{name} is missing");
         }
+        assert!(tools.iter().any(|t| t.name == "run_checks"));
+        assert!(
+            tools
+                .iter()
+                .find(|t| t.name == "write_file")
+                .unwrap()
+                .writes_repo
+        );
+        assert!(
+            !tools
+                .iter()
+                .find(|t| t.name == "read_file")
+                .unwrap()
+                .writes_repo
+        );
+        assert!(tools
+            .iter()
+            .all(|t| !t.what.is_empty() && t.what.len() <= 200));
+        let known: Vec<&str> = tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .chain(["github_history"])
+            .collect();
+        for (_, uses, _) in TRANSLATIONS {
+            for u in *uses {
+                assert!(known.contains(u), "{u} isn't a tool");
+            }
+        }
+        assert_eq!(
+            first_sentence("Read a file. Large files are cut."),
+            "Read a file."
+        );
     }
 
     #[test]

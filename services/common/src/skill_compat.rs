@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Bumped when the analysis format changes, so every item is checked again.
-pub const FORMAT: u32 = 3;
+pub const FORMAT: u32 = 4;
 /// Longest translated text kept.
 pub const MAX_TRANSLATED_CHARS: usize = 64_000;
 const MAX_STEPS: usize = 40;
@@ -68,6 +68,18 @@ pub struct Source {
     pub tools: Vec<String>,
 }
 
+/// A command a skill may name that Coderhelm does another way: no shell, but
+/// a GitHub API backed tool does the same read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Translation {
+    /// The commands, as a skill writes them, e.g. "git log, git blame".
+    pub commands: String,
+    /// The Coderhelm tools that do it.
+    pub uses: Vec<String>,
+    /// One line on how, e.g. "Reads history through the GitHub API".
+    pub note: String,
+}
+
 /// Everything a team's items can rely on in Coderhelm, and what Coderhelm
 /// never does. Sorted, so equal inventories give equal fingerprints.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +94,9 @@ pub struct Inventory {
     pub sources: Vec<Source>,
     /// The team's own approved tools on its data sources.
     pub team_tools: Vec<Tool>,
+    /// Commands Coderhelm does another way (only those whose tools it has).
+    #[serde(default)]
+    pub translations: Vec<Translation>,
     pub never: Vec<String>,
 }
 
@@ -167,6 +182,15 @@ pub struct Requirement {
     pub fix: String,
     /// Where to fix it: "plugins", "data_sources", "github" or "none".
     pub connect: String,
+    /// For `plugins`: the MCP server it means, by inventory id, or empty.
+    #[serde(default)]
+    pub server: String,
+    /// Worked out here, never by the model: "connect" (offer a link to
+    /// connect it), "credentials" (switched on, its credentials missing) or
+    /// "none" (nothing to connect: the integration is already there and
+    /// doesn't do this, or it can't run in Coderhelm).
+    #[serde(default)]
+    pub action: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +214,9 @@ pub struct Need {
     pub name: String,
     pub fix: String,
     pub connect: String,
+    /// As on [`Requirement::action`].
+    #[serde(default)]
+    pub action: String,
     /// "missing", or "blocked" for a write no connected tool can make.
     pub status: String,
     /// Steps it holds up.
@@ -212,9 +239,13 @@ pub struct Analysis {
     pub steps: Vec<Step>,
     pub counts: Counts,
     pub needs: Vec<Need>,
-    /// "ready", "translated" or "needs_tools".
+    /// "ready", "translated", "needs_tools", or "partial" when the answer
+    /// listed no usable step.
     pub status: String,
     pub summary: String,
+    /// What was fixed up in the answer, in plain words, for the page.
+    #[serde(default)]
+    pub notes: Vec<String>,
     #[serde(default)]
     pub model: String,
     #[serde(default)]
@@ -272,7 +303,7 @@ pub fn output_schema() -> Value {
                             "items": {
                                 "type": "object",
                                 "additionalProperties": false,
-                                "required": ["asks", "kind", "status", "uses", "write", "needs", "fix", "connect"],
+                                "required": ["asks", "kind", "status", "uses", "write", "needs", "fix", "connect", "server"],
                                 "properties": {
                                     "asks": { "type": "string" },
                                     "kind": enum_of(&["tool", "command", "data", "path", "other"]),
@@ -281,7 +312,8 @@ pub fn output_schema() -> Value {
                                     "write": enum_of(&["none", "repo", "outside"]),
                                     "needs": { "type": "string" },
                                     "fix": { "type": "string" },
-                                    "connect": enum_of(&["plugins", "data_sources", "github", "none"])
+                                    "connect": enum_of(&["plugins", "data_sources", "github", "none"]),
+                                    "server": { "type": "string" }
                                 }
                             }
                         }
@@ -305,16 +337,25 @@ own headings or numbered steps; a short item may be one or two steps). For each 
 tool, command, system, data source, file path or outside write it relies on, and classify each \
 against the inventory:
 
+Every step needs a short `title` in plain words (what the step is) and a one sentence `does`.
+
 - available: the inventory has exactly that (put the Coderhelm tool names in `uses`).
 - translated: the inventory has a real equivalent. Put the exact Coderhelm tool names in `uses` \
 (for example a request for service logs maps to `logs_search` when a logs source covers them; a \
 SQL check maps to `db_query` on a named database source). Only name tools listed in the \
-inventory, never invent one, and only call it an equivalent when it really does the job.
+inventory, never invent one, and only call it an equivalent when it really does the job. The \
+inventory's `translations` list commands Coderhelm does another way (for example `git log` \
+through a GitHub history tool, `git clone` or `cat` through reading the repository it already \
+has, `grep -r` through `search_code`): those are translated, never missing, with the listed \
+tools in `uses`.
 - missing: nothing in the inventory does it (a shell command, a CLI, a local file or path, a \
 system that isn't connected, an MCP server that is switched on but not ready). `needs` is the \
 short name of what's missing (a product name like the monitoring tool's name, or 'Shell access'), \
 `fix` one plain line on what to connect in Coderhelm or why it can't run there, `connect` where \
-that's done: plugins (MCP servers), data_sources (APIs, databases, logs), github, or none.
+that's done: plugins (MCP servers), data_sources (APIs, databases, logs), github, or none. For \
+plugins, `server` is the id of the MCP server it means from the inventory's servers or \
+connectable list, or empty when none fits. Only genuinely impossible things stay missing: running \
+arbitrary shell commands, a person's local files, systems not connected.
 - blocked: the step writes to an outside system (a wiki page, a ticket, an incident, a message) \
 and no connected tool can write there. Set `write` to outside. Writing files in the repository \
 is `write: repo` and is fine.
@@ -326,7 +367,8 @@ makes sense on a person's own machine.
 
 Then write `translated`: the item rewritten for Coderhelm, in the same markdown style. Keep its \
 intent, structure, order and output format. Replace each tool or command with the Coderhelm tool \
-that does it, by its exact name and source. Where something is missing, keep the step and mark \
+that does it, by its exact name and source (for a translated command, say so briefly, e.g. \
+\"uses the GitHub API instead of git clone\"). Where something is missing, keep the step and mark \
 it inline as `GAP: <step> — <what it tried to do> — not connected in Coderhelm (<fix>)`, so a \
 run reports it instead of skipping it. Where a write is blocked, have the agent put what it \
 would have written in its own reply for a person to apply. Leave out steps that only make sense \
@@ -361,9 +403,13 @@ pub fn user_message(
 /// The model's answer, checked against the inventory and counted. A tool it
 /// names that the team doesn't have makes that requirement missing; an
 /// outside write with no tool that can write outside is blocked.
-/// `source_chars` is the length of the item's text after its front matter:
-/// a translation far shorter than it, or a step with no title, is a stub
-/// answer, not a check.
+///
+/// One malformed step never fails the whole check: a step without a title
+/// gets one made from what it does or what it relies on, a step with
+/// nothing in it is left out, and a translation far shorter than the item
+/// (`source_chars`, its text after the front matter) is not kept. Each fix
+/// is noted. It fails only when the answer isn't in the expected shape or
+/// no usable step is left.
 pub fn finish(
     raw: &Value,
     inv: &Inventory,
@@ -375,22 +421,27 @@ pub fn finish(
         translated: String,
     }
     let r: Raw = serde_json::from_value(raw.clone())
-        .map_err(|e| format!("The check's answer wasn't in the expected shape: {e}"))?;
-    if r.steps.is_empty() {
-        return Err("The check found no steps.".into());
-    }
-    if r.steps.iter().any(|s| s.title.trim().chars().count() < 2) {
-        return Err("The check left a step without a title.".into());
-    }
-    let shortest = (source_chars / 4).max(20);
-    if r.translated.trim().chars().count() < shortest {
-        return Err("The translated version came back nearly empty.".into());
-    }
+        .map_err(|e| format!("The answer wasn't in the expected shape: {e}"))?;
+    let mut notes: Vec<String> = Vec::new();
     let mut steps: Vec<Step> = Vec::new();
+    let (mut titled, mut empty) = (0usize, 0usize);
     for s in r.steps.into_iter().take(MAX_STEPS) {
-        let mut reqs = Vec::new();
-        for q in s.requirements.into_iter().take(MAX_REQUIREMENTS) {
-            reqs.push(check(q, inv));
+        let reqs: Vec<Requirement> = s
+            .requirements
+            .into_iter()
+            .take(MAX_REQUIREMENTS)
+            .filter(|q| !q.asks.trim().is_empty())
+            .map(|q| check(q, inv))
+            .collect();
+        let does = clip(&s.does, 400);
+        let mut title = clip(&s.title, 120);
+        if !has_words(&title) {
+            if !has_words(&does) && reqs.is_empty() {
+                empty += 1;
+                continue;
+            }
+            title = made_title(&does, &reqs);
+            titled += 1;
         }
         let status = reqs
             .iter()
@@ -399,12 +450,31 @@ pub fn finish(
             .unwrap_or("available")
             .to_string();
         steps.push(Step {
-            title: clip(&s.title, 120),
-            does: clip(&s.does, 400),
+            title,
+            does,
             requirements: reqs,
             dropped: s.dropped,
             status,
         });
+    }
+    if steps.is_empty() {
+        return Err("The answer listed no usable step.".into());
+    }
+    if titled > 0 {
+        notes.push(format!(
+            "{titled} step{} had no title; {} made from what {} does.",
+            plural(titled),
+            if titled == 1 { "it was" } else { "they were" },
+            if titled == 1 { "it" } else { "each" }
+        ));
+    }
+    if empty > 0 {
+        notes.push(format!("{empty} empty step{} left out.", plural(empty)));
+    }
+    let mut translated = crate::truncate_str(r.translated.trim(), MAX_TRANSLATED_CHARS).to_string();
+    if translated.chars().count() < (source_chars / 4).max(20) {
+        translated.clear();
+        notes.push("The translated version came back nearly empty, so none is kept. Re-check to try again.".into());
     }
     let counts = Counts {
         steps: steps.len(),
@@ -423,7 +493,6 @@ pub fn finish(
     }
     .to_string();
     let summary = summary(&counts, &needs);
-    let translated = crate::truncate_str(r.translated.trim(), MAX_TRANSLATED_CHARS).to_string();
     Ok((
         Analysis {
             format: FORMAT,
@@ -432,6 +501,7 @@ pub fn finish(
             needs,
             status,
             summary,
+            notes,
             model: String::new(),
             input_tokens: 0,
             output_tokens: 0,
@@ -440,6 +510,68 @@ pub fn finish(
         },
         translated,
     ))
+}
+
+/// What's kept when no answer listed a usable step, even after a second
+/// try: a partial check that says so, never a failure that hides the item.
+pub fn partial(why: &str) -> Analysis {
+    Analysis {
+        format: FORMAT,
+        steps: Vec::new(),
+        counts: Counts::default(),
+        needs: Vec::new(),
+        status: "partial".into(),
+        summary: "Coderhelm couldn't list this item's steps yet".into(),
+        notes: vec![format!(
+            "Two tries came back without usable steps ({}). The item is still read as written. \
+             Re-check to try again.",
+            why.trim_end_matches('.')
+        )],
+        model: String::new(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd: 0.0,
+        ms: 0,
+    }
+}
+
+/// What to tell the model on a second try after an unusable answer.
+pub fn retry_note(why: &str) -> String {
+    format!(
+        "\n\nYour last answer couldn't be used: {why} Answer again in full: every step with a \
+         short title and what it does, and the complete translated text."
+    )
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Whether a title or sentence has something to read: two letters or digits.
+fn has_words(s: &str) -> bool {
+    s.chars().filter(|c| c.is_alphanumeric()).count() >= 2
+}
+
+/// A short title for a step that came without one: the first words of what
+/// it does, else what it first relies on.
+fn made_title(does: &str, reqs: &[Requirement]) -> String {
+    if has_words(does) {
+        let words: Vec<&str> = does.split_whitespace().take(7).collect();
+        let mut t = words.join(" ");
+        t = t.trim_end_matches(['.', ',', ';', ':']).to_string();
+        if does.split_whitespace().count() > 7 {
+            t.push('…');
+        }
+        return t;
+    }
+    match reqs.first() {
+        Some(q) => clip(&format!("Use {}", q.asks), 60),
+        None => "A step".into(),
+    }
 }
 
 fn check(q: Requirement, inv: &Inventory) -> Requirement {
@@ -501,7 +633,41 @@ fn check(q: Requirement, inv: &Inventory) -> Requirement {
         q.needs.clear();
         q.fix.clear();
         q.connect = "none".into();
+        q.server.clear();
+        q.action = "none".into();
+        return q;
     }
+    let server = inv
+        .servers
+        .iter()
+        .find(|s| !q.server.is_empty() && s.id == q.server);
+    q.action = match q.connect.as_str() {
+        // Every team has GitHub connected: never send anyone to connect it.
+        "github" => {
+            q.fix = "Coderhelm's GitHub connection doesn't do this yet.".into();
+            "none"
+        }
+        "plugins" => match server {
+            Some(s) if s.ready => {
+                q.fix = format!(
+                    "{} is connected, but Coderhelm doesn't offer this from it yet.",
+                    s.name
+                );
+                "none"
+            }
+            Some(s) => {
+                q.fix = format!(
+                    "{} is switched on, but its credentials aren't saved, so agents don't get it.",
+                    s.name
+                );
+                "credentials"
+            }
+            None => "connect",
+        },
+        "data_sources" => "connect",
+        _ => "none",
+    }
+    .to_string();
     q
 }
 
@@ -525,6 +691,7 @@ fn needs(steps: &[Step]) -> Vec<Need> {
                 name: name.clone(),
                 fix: q.fix.clone(),
                 connect: q.connect.clone(),
+                action: q.action.clone(),
                 status: q.status.clone(),
                 steps: 0,
             });
@@ -632,6 +799,11 @@ mod tests {
                 tools: vec!["live_describe".into(), "logs_search".into()],
             }],
             team_tools: vec![],
+            translations: vec![Translation {
+                commands: "grep -r".into(),
+                uses: vec!["read_file".into()],
+                note: "Searches the repository through GitHub".into(),
+            }],
             never: vec!["Run a shell".into()],
         }
         .sorted()
@@ -751,27 +923,97 @@ mod tests {
         assert!(finish(&json!({"nope": 1}), &inv(), 0).is_err());
     }
 
+    fn step(title: &str, does: &str, reqs: Vec<Value>) -> Value {
+        json!({ "title": title, "does": does, "dropped": false, "requirements": reqs })
+    }
+
     #[test]
-    fn a_stub_answer_is_an_error_not_a_check() {
-        let stub = |title: &str, translated: &str| {
-            json!({ "steps": [{ "title": title, "does": "", "dropped": false, "requirements": [] }],
-                    "translated": translated })
-        };
+    fn a_step_without_a_title_gets_one_and_empty_steps_are_left_out() {
         let long = "A full translation of the item. ".repeat(10);
-        assert!(finish(&stub("Read it", &long), &inv(), 1000).is_ok());
-        assert!(finish(&stub("x", &long), &inv(), 1000)
-            .unwrap_err()
-            .contains("title"));
-        assert!(finish(&stub("", &long), &inv(), 1000).is_err());
-        assert!(finish(&stub("Read it", "x"), &inv(), 1000)
-            .unwrap_err()
-            .contains("nearly empty"));
-        assert!(
-            finish(&stub("Read it", &long), &inv(), 4000).is_err(),
-            "far shorter than the item"
+        let raw = json!({ "steps": [
+            step("Read the logs", "Search the logs.", vec![]),
+            step("", "Query the record in the database before anything else is changed.", vec![]),
+            step("x", "", vec![req("list_change_events", "missing", &[], "none", "Monitoring")]),
+            step(" ", "", vec![]),
+        ], "translated": long });
+        let (a, translated) = finish(&raw, &inv(), 100).unwrap();
+        let titles: Vec<&str> = a.steps.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Read the logs",
+                "Query the record in the database before…",
+                "Use list_change_events"
+            ]
         );
-        assert!(user_message(&inv(), "skill", "a", "Do this.", &[])
-            .contains("<item>\nDo this.\n</item>"));
+        assert_eq!(a.counts.steps, 3);
+        assert_eq!(
+            a.notes,
+            [
+                "2 steps had no title; they were made from what each does.",
+                "1 empty step left out."
+            ]
+        );
+        assert!(!translated.is_empty());
+    }
+
+    #[test]
+    fn a_short_translation_is_dropped_with_a_note_not_a_failure() {
+        let raw =
+            json!({ "steps": [step("Read it", "Read the file.", vec![])], "translated": "x" });
+        let (a, translated) = finish(&raw, &inv(), 1000).unwrap();
+        assert!(translated.is_empty());
+        assert_eq!(a.status, "ready");
+        assert!(a.notes[0].contains("nearly empty"));
+    }
+
+    #[test]
+    fn only_an_answer_with_no_usable_step_fails_and_then_is_kept_as_partial() {
+        let raw =
+            json!({ "steps": [step("x", "", vec![]), step("", " ", vec![])], "translated": "x" });
+        let err = finish(&raw, &inv(), 100).unwrap_err();
+        assert!(err.contains("no usable step"), "{err}");
+        assert!(finish(&json!({"steps": "no"}), &inv(), 0)
+            .unwrap_err()
+            .contains("expected shape"));
+        assert!(retry_note(&err).contains("Answer again in full"));
+        let p = partial(&err);
+        assert_eq!(p.status, "partial");
+        assert!(p.steps.is_empty());
+        assert!(p.notes[0].contains("no usable step"));
+        assert!(p.notes[0].contains("Re-check"));
+    }
+
+    #[test]
+    fn nobody_is_sent_to_connect_what_is_already_connected() {
+        let missing = |connect: &str, server: &str| {
+            let raw = json!({ "steps": [step("Do it", "Do the thing.", vec![json!({
+                "asks": "thing", "kind": "tool", "status": "missing", "uses": [], "write": "none",
+                "needs": "Thing", "fix": "Connect it.", "connect": connect, "server": server
+            })])], "translated": "Do the thing with Coderhelm's tools." });
+            let (a, _) = finish(&raw, &inv(), 0).unwrap();
+            a.steps[0].requirements[0].clone()
+        };
+        let gh = missing("github", "");
+        assert_eq!(gh.action, "none");
+        assert_eq!(gh.fix, "Coderhelm's GitHub connection doesn't do this yet.");
+        let ready = missing("plugins", "tracker");
+        assert_eq!(ready.action, "none");
+        assert!(ready.fix.starts_with("Tracker is connected"));
+        let not_ready = missing("plugins", "design");
+        assert_eq!(not_ready.action, "credentials");
+        assert!(not_ready.fix.contains("credentials aren't saved"));
+        assert_eq!(missing("plugins", "").action, "connect");
+        assert_eq!(missing("data_sources", "").action, "connect");
+        assert_eq!(missing("none", "").action, "none");
+    }
+
+    #[test]
+    fn the_item_is_fenced_and_translations_reach_the_model() {
+        let m = user_message(&inv(), "skill", "a", "Run `grep -r TODO .` first.", &[]);
+        assert!(m.contains("<item>\nRun `grep -r TODO .` first.\n</item>"));
+        assert!(m.contains("\"commands\": \"grep -r\""));
+        assert!(SYSTEM.contains("translations"));
     }
 
     #[test]
