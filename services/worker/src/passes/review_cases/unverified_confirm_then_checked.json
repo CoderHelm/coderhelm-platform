@@ -1,0 +1,25 @@
+{
+  "name": "please-confirm question, then the reviewer checks and approves",
+  "description": "A redirects map changes six 301 targets. The first review could not open the pages and asked a person to confirm them: a question, never a block. Re-reviewed with the URL check, all six return 200 and the question is answered.",
+  "steps": [
+    {"push": "h1"},
+    {"review": {"head": "h1", "model_output": {
+      "verdict": "REQUEST_CHANGES",
+      "summary": "Six redirect targets changed.",
+      "findings": [{"file": "infra/redirects.tf", "line": 12, "severity": "medium", "category": "question", "evidence": "question",
+        "title": "Confirm the six new targets load", "body": "Please confirm the new 301 targets work on the live site."}]
+    }}},
+    {"comment": {"id": 301, "text": "@coderhelm re-review", "ask_kind": "re_review",
+      "review": {"head": "h1", "model_output": {
+        "verdict": "APPROVE",
+        "summary": "Checked: all six targets return 200.",
+        "findings": [],
+        "prior": [{"index": 0, "status": "answered"}]
+      }}
+    }}
+  ],
+  "expect": {
+    "final_formal": {"head": "h1", "event": "APPROVE"},
+    "formal_events": [["h1", "COMMENT"], ["h1", "APPROVE"]]
+  }
+}

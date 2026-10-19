@@ -4,14 +4,14 @@
 //! be read) is retried a few times and then left with a note on the PR. Older
 //! code posted such a failure as a formal "request changes" review, which
 //! then held the PR until someone happened to ask for a re-review. This
-//! sweep (EventBridge → SQS, every 30 minutes) finds open PRs whose standing
+//! sweep (EventBridge → SQS, every 15 minutes) finds open PRs whose standing
 //! CoderHelm review is one that didn't finish, more than 30 minutes old and
 //! with nothing newer, and runs the review again for the PR's current head,
 //! once per head.
 
 use crate::clients::github::GitHubClient;
 use crate::models::{ReviewMessage, WorkerMessage};
-use crate::passes::review_agent::StandingReview;
+use crate::passes::review_verdict::StandingReview;
 use crate::passes::{attr_n, attr_s};
 use crate::WorkerState;
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -374,7 +374,7 @@ async fn sweep_repo(
         let msg = sweep_message(r, installation_id, owner, name, number, head);
         if super::review_pr::enqueue_review(state, &msg, 0).await {
             let line = format!("{}#{number}@{}: {why}", r.repo, &head[..head.len().min(7)]);
-            info!(team_id = %r.team_id, repo = %r.repo, pr = number, head, why, "Stuck review sent again");
+            info!(team_id = %r.team_id, repo = %r.repo, pr = number, head, why, "review_sweep_requeued: stuck review sent again");
             report.requeued.push(line);
         }
     }

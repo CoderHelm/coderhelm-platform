@@ -778,7 +778,8 @@ pub async fn re_review(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let cfg = super::github_webhook::load_review_config(&state, &claims.team_id, owner, name).await;
+    let cfg =
+        super::github_webhook::load_review_config(&state, &claims.team_id, owner, name).await?;
     if !cfg.enabled || cfg.killed {
         return Ok(Json(json!({
             "status": "skipped",

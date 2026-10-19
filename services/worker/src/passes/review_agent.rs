@@ -998,6 +998,7 @@ pub async fn generate_review(
          the others are posted as comments and don't hold the merge, so never dress a concern \
          you couldn't verify as a defect. \
          {REPLIES_RULE}\
+         {MANUAL_CHECK_RULE}\
          {SOURCE_DATA_RULE}\
          {COPY_RULE}\
          {TONE_RULE}\
@@ -1009,7 +1010,7 @@ pub async fn generate_review(
          {{\n  \"verdict\": \"APPROVE\" | \"COMMENT\" | \"REQUEST_CHANGES\",\n  \"risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n  \
          \"summary\": \"2-4 sentence overview\",\n  \"findings\": [{{\n    \"file\": \"path\", \"line\": <int, a line present on the RIGHT side of the diff>,\n    \
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
-         \"category\": \"bug|security|correctness|perf|convention|scope|tests|source-data-override|question\", \"title\": \"short\",\n    \
+         \"category\": \"bug|security|correctness|perf|convention|scope|tests|source-data-override|manual-check|question\", \"title\": \"short\",\n    \
          \"evidence\": \"verified-defect|unverified-concern|question\",\n    \
          \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}],\n  \
          \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"answered\" | \"open\"}}]  (one per earlier unresolved comment listed, if any),\n  \
@@ -1598,29 +1599,107 @@ pub fn parse_reply_conclusion(v: &serde_json::Value) -> ReplyConclusion {
     }
 }
 
-/// CoderHelm's formal review standing on a PR (its newest review that set a
-/// GitHub review state).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StandingReview {
-    /// "APPROVE" | "REQUEST_CHANGES"
-    pub verdict: String,
-    /// A review that didn't finish (an old error review).
-    pub failed: bool,
-    pub head_sha: String,
+/// What a person's `@coderhelm …` comment asks for, read by a model in the
+/// context of the PR (never by keywords).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskKind {
+    /// Review the latest code again.
+    ReReview,
+    /// The person thinks it's ready and asks for the approval ("can you
+    /// approve", "all addressed, take another look", "ready now?").
+    ApproveRequest,
+    /// A question about the code or the review.
+    Question,
+    /// Asks CoderHelm to change the code.
+    FixRequest,
+    /// Anything else (thanks, chatter).
+    Other,
 }
 
-/// Whether a reply's conclusion needs a fresh formal review so the verdict
-/// on GitHub matches what CoderHelm just said: a reply that finds nothing
-/// blocking while a request for changes (or an error review) stands, or a
-/// reply that finds a verified blocker while an approval stands.
-pub fn needs_reconcile(change: VerdictChange, standing: Option<&StandingReview>) -> bool {
-    let Some(st) = standing else {
-        return false;
-    };
-    match change {
-        VerdictChange::Clear => st.failed || st.verdict == "REQUEST_CHANGES",
-        VerdictChange::Block => st.verdict == "APPROVE" && !st.failed,
-        VerdictChange::None => st.failed,
+impl AskKind {
+    /// The ask is answered with a formal review of the head, not a reply.
+    pub fn wants_formal_review(self) -> bool {
+        matches!(self, AskKind::ReReview | AskKind::ApproveRequest)
+    }
+}
+
+/// What the ask classifier is told.
+pub const ASK_SYSTEM: &str = "You classify a comment a person wrote to CoderHelm, a code \
+     reviewer, on a pull request. kind: \"re_review\" when they ask for the latest code to be \
+     reviewed again; \"approve_request\" when they say the work is done or addressed and ask \
+     for the approval or for another look (\"can you approve\", \"ready now?\", \"all \
+     addressed, please take another look\"); \"question\" when they ask something about the \
+     code or the review; \"fix_request\" when they ask CoderHelm to change the code; \"other\" \
+     for anything else. Judge the meaning, in the context given.";
+
+/// The JSON schema of the ask classifier's answer.
+pub fn ask_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["re_review", "approve_request", "question", "fix_request", "other"]}
+        },
+        "required": ["kind"],
+        "additionalProperties": false
+    })
+}
+
+/// The user message for the ask classifier.
+pub fn ask_prompt(comment: &str, standing: &str, last_reply: Option<&str>) -> String {
+    let mut s = format!("## CoderHelm's formal review standing on the PR\n{standing}\n");
+    if let Some(r) = last_reply {
+        s.push_str(&format!(
+            "\n## CoderHelm's last reply on the PR\n{}\n",
+            common::truncate_str(r.trim(), 2000)
+        ));
+    }
+    s.push_str(&format!(
+        "\n## The comment\n{}\n",
+        common::truncate_str(comment.trim(), 3000)
+    ));
+    s
+}
+
+/// The classifier's answer; an unreadable one is a question (answered, the
+/// verdict untouched).
+pub fn parse_ask(v: &serde_json::Value) -> AskKind {
+    match v["kind"].as_str().unwrap_or("") {
+        "re_review" => AskKind::ReReview,
+        "approve_request" => AskKind::ApproveRequest,
+        "fix_request" => AskKind::FixRequest,
+        "other" => AskKind::Other,
+        _ => AskKind::Question,
+    }
+}
+
+/// What CoderHelm can and can't do on a PR, as it tells people.
+pub const CAPABILITIES_RULE: &str = "WHAT YOU CAN DO: you post the formal review on this PR, \
+     approve or request changes, and your formal verdict follows from the code. When nothing \
+     in the code needs changing, CoderHelm approves the PR; never tell a person you can't \
+     approve or that you only have read access. You don't merge by hand: a PR merges after \
+     approval only when the repo's auto-merge policy is turned on, and otherwise a person \
+     merges it. ";
+
+/// Asks to test something by hand (on a device, a staging build, before a
+/// store release) can't be met in CI and belong to the people shipping it.
+pub const MANUAL_CHECK_RULE: &str = "MANUAL CHECKS: a suggestion to test something by hand (on a \
+     device, a simulator, a staging build, before a store release) is a note, never a defect: \
+     raise it at most once, with category \"manual-check\" and evidence \"unverified-concern\", \
+     and not again once the author has acknowledged it or said it was done. ";
+
+/// The finding category for a by-hand test suggestion.
+pub const MANUAL_CHECK: &str = "manual-check";
+
+/// A by-hand test suggestion is a note: it never holds the merge, whatever
+/// the model rated it.
+pub fn enforce_manual_checks_are_notes(findings: &mut [Finding]) {
+    for f in findings.iter_mut() {
+        if f.category.eq_ignore_ascii_case(MANUAL_CHECK) {
+            f.weaken_to(Evidence::UnverifiedConcern);
+            if f.is_blocking() {
+                f.severity = "low".to_string();
+            }
+        }
     }
 }
 

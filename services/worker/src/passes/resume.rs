@@ -1108,6 +1108,7 @@ pub async fn run(
         continuation: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
+        model_retries: 0,
         ticket_update_note: None,
     };
 
@@ -1389,6 +1390,9 @@ pub async fn run(
                 }
             }
             Err(e) => {
+                if requeue_after_model_error(state, &msg, &*e).await {
+                    return Ok(());
+                }
                 error!(run_id = msg.run_id, error = %e, "CI fix implementation failed — completing with PR for human review");
                 mark_events_processed(state, &msg.run_id, &events).await;
                 complete_run_with_status(
@@ -1721,6 +1725,9 @@ pub async fn run(
                     }
                 }
                 Err(e) => {
+                    if requeue_after_model_error(state, &msg, &*e).await {
+                        return Ok(());
+                    }
                     error!(run_id = msg.run_id, error = %e, "Review fix implementation failed");
                     // Still mark PR ready, let human review
                     mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
@@ -2276,6 +2283,28 @@ async fn complete_run_with_status(
     // counted as it happens (common::usage).
     info!(run_id, status, "Run completed");
     Ok(())
+}
+
+/// A fix that failed on a transient model error is sent again later (the
+/// one requeue policy, [`common::model_retry::requeue_delay`]) instead of
+/// completing the run with the fix unapplied. False when the error isn't
+/// transient or the policy is spent.
+async fn requeue_after_model_error(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    e: &(dyn std::error::Error + 'static),
+) -> bool {
+    if !common::model_retry::is_transient_model_error(e) {
+        return false;
+    }
+    let Some(delay) = common::model_retry::requeue_delay(msg.model_retries) else {
+        return false;
+    };
+    let mut next = msg.clone();
+    next.model_retries = msg.model_retries + 1;
+    warn!(run_id = %msg.run_id, retry = next.model_retries, delay, "model_error_requeued: fix sent again after a transient model error");
+    send_delayed_resume(state, &next, delay as i32).await;
+    true
 }
 
 /// Send a delayed resume message to the CI fix queue.

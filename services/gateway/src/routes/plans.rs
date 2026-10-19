@@ -2499,7 +2499,8 @@ pub async fn plan_chat(
         })?;
 
         if !resp.is_success() {
-            error!("Anthropic API error ({}): {}", resp.status, resp.text());
+            let e = resp.into_error();
+            error!(status = ?e.status(), transient = e.is_transient(), "{e}");
             return Err(StatusCode::BAD_GATEWAY);
         }
 
@@ -2737,17 +2738,17 @@ async fn run_anthropic_stream(
                 info!(turn = turn, "run_anthropic_stream: Anthropic returned 200");
                 r
             }
-            Err(common::model_retry::StreamFailure::Status(status, body)) => {
-                error!("Anthropic stream error ({status}): {body}");
+            Err(e) if e.status().is_some() => {
+                error!(transient = e.is_transient(), "Anthropic stream error: {e}");
                 let _ = tx
                     .send(sse_event(
                         "error",
-                        json!({"message": format!("Anthropic API error: {status}")}),
+                        json!({"message": format!("Anthropic API error: {}", e.status().unwrap_or(0))}),
                     ))
                     .await;
                 return;
             }
-            Err(common::model_retry::StreamFailure::Network(e)) => {
+            Err(e) => {
                 error!("Anthropic stream request failed: {e}");
                 let _ = tx
                     .send(sse_event(

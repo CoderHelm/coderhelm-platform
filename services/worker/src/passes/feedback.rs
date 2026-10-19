@@ -176,6 +176,7 @@ pub async fn run(
                     continuation: 0,
                     continuation_run_id: None,
                     first_attempt_ms: 0,
+                    model_retries: 0,
                     ticket_update_note: None,
                 };
                 match super::pr::resolve_conflicts(
@@ -850,6 +851,21 @@ Rules:
     }
 
     Ok(())
+}
+
+/// Sends feedback again after a transient model error, per
+/// [`common::model_retry::requeue_delay`]. False once the policy is spent.
+pub(crate) async fn requeue_after_model_error(state: &WorkerState, msg: &FeedbackMessage) -> bool {
+    let Some(delay) = common::model_retry::requeue_delay(msg.model_retries) else {
+        return false;
+    };
+    let mut next = msg.clone();
+    next.model_retries = msg.model_retries + 1;
+    let sent = send_delayed_feedback(state, &next, delay as i32).await;
+    if sent {
+        warn!(run_id = %msg.run_id, retry = next.model_retries, delay, "model_error_requeued: feedback sent again after a transient model error");
+    }
+    sent
 }
 
 /// Re-enqueue a feedback message to the feedback queue with an SQS delay, so a
@@ -1923,6 +1939,7 @@ async fn handle_wrong_repo(
         continuation: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
+        model_retries: 0,
         ticket_update_note: None,
     });
 

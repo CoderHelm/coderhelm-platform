@@ -98,6 +98,34 @@ export class MonitoringStack extends cdk.Stack {
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
     reviewGaveUpAlarm.addAlarmAction(new actions.SnsAction(alertTopic));
+    // Many failed attempts in a short window: the model API (or GitHub) is
+    // failing for reviews broadly, even while retries are still running.
+    const reviewFailedAlarm = new cloudwatch.Alarm(this, "ReviewFailedAlarm", {
+      alarmName: `${prefix}-review-failed`,
+      alarmDescription: "Reviews failing repeatedly (5+ failed attempts in 15 minutes)",
+      metric: reviewFailedMetric,
+      threshold: 5,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    reviewFailedAlarm.addAlarmAction(new actions.SnsAction(alertTopic));
+    // Each PR the stuck-review sweep picks up, and each job any pass sent
+    // again after a transient model error.
+    const sweepRequeuedMetric = new logs.MetricFilter(this, "ReviewSweepRequeuedFilter", {
+      logGroup: workerLogs,
+      filterPattern: logs.FilterPattern.literal('"review_sweep_requeued"'),
+      metricNamespace: "CoderHelm/Reviewer",
+      metricName: "ReviewSweepRequeued",
+      metricValue: "1",
+    }).metric({ period: cdk.Duration.minutes(15), statistic: "Sum" });
+    const modelRequeuedMetric = new logs.MetricFilter(this, "ModelErrorRequeuedFilter", {
+      logGroup: workerLogs,
+      filterPattern: logs.FilterPattern.literal('"model_error_requeued"'),
+      metricNamespace: "CoderHelm/Worker",
+      metricName: "ModelErrorRequeued",
+      metricValue: "1",
+    }).metric({ period: cdk.Duration.minutes(15), statistic: "Sum" });
 
     // Dashboard
     const dashboard = new cloudwatch.Dashboard(this, "Dashboard", {
@@ -133,7 +161,7 @@ export class MonitoringStack extends cdk.Stack {
       }),
       new cloudwatch.GraphWidget({
         title: "Reviews that didn't finish",
-        left: [reviewFailedMetric, reviewGaveUpMetric],
+        left: [reviewFailedMetric, reviewGaveUpMetric, sweepRequeuedMetric, modelRequeuedMetric],
         width: 12,
       })
     );

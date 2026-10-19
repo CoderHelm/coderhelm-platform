@@ -1,0 +1,40 @@
+{
+  "name": "blocking finding, fix push hits a model outage, replies, approval ask",
+  "description": "A real defect blocks the first commit. The author pushes the fix; that review fails with a Cloudflare 520 from the model API. The old reviewer posted the failure as 'changes requested' and nothing replaced it; the author then asked questions over several days and finally for the approval. The PR must end with one formal approval of the fix commit, and no reply may say it's fine to merge while CoderHelm's own request for changes stands.",
+  "steps": [
+    {"push": "h1"},
+    {"review": {"head": "h1", "model_output": {
+      "verdict": "REQUEST_CHANGES",
+      "summary": "Adopting the scene life cycle moves app start into the scene delegate; cold-start deep links are dropped.",
+      "findings": [{"file": "ios/App/AppDelegate.swift", "line": 40, "severity": "blocking", "category": "bug", "evidence": "verified-defect",
+        "title": "Cold-start deep links are dropped", "body": "With a scene manifest, launch options no longer carry the URL; the link handler reads nothing on cold start."}]
+    }}},
+    {"push": "h2"},
+    {"legacy_error_review": {"head": "h2", "error": "Anthropic API error (520 <unknown status code>): error code: 520"}},
+    {"comment": {"id": 101, "text": "@coderhelm I moved React Native start into SceneDelegate and rebuild the launch options there. Does that cover cold start now?",
+      "ask_kind": "question",
+      "reply": "Yes: SceneDelegate rebuilds the launch options from the connection options, so a cold-start URL reaches the link handler where it reads it.",
+      "conclusion": {"verdict_change": "none", "reason": "Answers a question about the fix.", "new_nonblocking_items": false, "revised_reply": ""},
+      "review": {"head": "h2", "model_output": {
+        "verdict": "APPROVE",
+        "summary": "The fix starts React Native from the scene delegate and rebuilds launch options, so cold-start links reach the handler.",
+        "findings": [{"file": "ios/App/AppDelegate.swift", "line": 120, "severity": "low", "category": "manual-check", "evidence": "verified-defect",
+          "title": "Worth a device check before a store release", "body": "Try a cold-start universal link on a device."}],
+        "prior": [{"index": 0, "status": "fixed"}]
+      }}
+    }},
+    {"comment": {"id": 102, "text": "@coderhelm all addressed and tested on a device, can you approve?",
+      "ask_kind": "approve_request",
+      "review": {"head": "h2", "model_output": {
+        "verdict": "APPROVE",
+        "summary": "Nothing in the code needs changing.",
+        "findings": []
+      }}
+    }}
+  ],
+  "expect": {
+    "final_formal": {"head": "h2", "event": "APPROVE"},
+    "formal_events": [["h1", "REQUEST_CHANGES"], ["h2", "APPROVE"], ["h2", "APPROVE"]],
+    "first_approval_has_notes": true
+  }
+}

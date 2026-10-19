@@ -1,0 +1,54 @@
+name: Reviewer evals (live)
+
+# The model-in-the-loop layer of the reviewer evals: the recorded comments
+# and replies in services/worker/src/passes/review_cases are read by the real
+# model, and each must land in its case's outcome class. The deterministic
+# layer runs on every PR in CI; this one costs model calls, so it runs
+# nightly. A failure opens an issue.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live:
+    name: Reviewer evals (live model)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services
+      - name: Run the live evals
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.REVIEWER_EVAL_ANTHROPIC_API_KEY }}
+          EVAL_MODEL: claude-haiku-4-5
+        run: cargo test -p worker review_eval -- --ignored --nocapture 2>&1 | tee eval.log
+        shell: bash -o pipefail {0}
+      - name: Open an issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "The nightly reviewer evals failed on \`${GITHUB_SHA::7}\`."
+            echo
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo '```'
+            grep -A40 "eval failures" eval.log | head -60 || tail -40 eval.log
+            echo '```'
+          } > issue.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "Reviewer evals failed ($(date -u +%F))" --body-file issue.md

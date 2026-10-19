@@ -1,0 +1,16 @@
+{
+  "name": "a review fails twice, then succeeds; SQS delivers a job twice",
+  "description": "Every head gets exactly one formal review outcome: failures post nothing and retry, the successful retry posts once, and a redelivered copy of a job is dropped.",
+  "steps": [
+    {"push": "h1"},
+    {"review_fails": {"head": "h1", "times": 2}},
+    {"review": {"head": "h1", "deliveries": 2, "model_output": {"verdict": "APPROVE", "summary": "Looks right.", "findings": []}}},
+    {"push": "h2"},
+    {"review_fails": {"head": "h2", "times": 4}},
+    {"sweep": {"minutes_later": 45, "review": {"head": "h2", "model_output": {"verdict": "APPROVE", "summary": "Still right.", "findings": []}}}}
+  ],
+  "expect": {
+    "final_formal": {"head": "h2", "event": "APPROVE"},
+    "formal_events": [["h1", "APPROVE"], ["h2", "APPROVE"]]
+  }
+}

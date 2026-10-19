@@ -1,0 +1,17 @@
+{
+  "name": "hardcoded record ids override another system's data",
+  "description": "The diff forces three membership-term ids active instead of fixing the terms where they live. The reviewer rated it an unverified medium; the override rule makes it a verified defect that holds the merge.",
+  "steps": [
+    {"push": "h1"},
+    {"review": {"head": "h1", "model_output": {
+      "verdict": "COMMENT",
+      "summary": "Adds a list of term ids that are always shown.",
+      "findings": [{"file": "src/terms.ts", "line": 8, "severity": "medium", "category": "source-data-override", "evidence": "unverified-concern",
+        "title": "Term ids forced visible", "body": "ALWAYS_VISIBLE = ['T-101', 'T-102', 'T-103'] works around the booking system's data."}]
+    }}}
+  ],
+  "expect": {
+    "final_formal": {"head": "h1", "event": "REQUEST_CHANGES"},
+    "formal_events": [["h1", "REQUEST_CHANGES"]]
+  }
+}

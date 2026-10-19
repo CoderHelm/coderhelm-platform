@@ -442,15 +442,26 @@ pub async fn converse_json(
         output_tokens = resp.usage.output_tokens,
         "Structured answer received"
     );
+    use common::model_retry::{ModelCallError, ModelErrorKind};
     if let Some(refusal) = resp.refusal() {
-        return Err(refusal.into());
+        return Err(Box::new(ModelCallError::new(
+            ModelErrorKind::Refusal,
+            refusal,
+        )));
     }
     if resp.stop_reason.as_deref() == Some("max_tokens") {
-        return Err("The answer was cut off before it finished.".into());
+        return Err(Box::new(ModelCallError::new(
+            ModelErrorKind::Truncated,
+            "the answer was cut off before it finished",
+        )));
     }
     let text = extract_text(&resp.blocks())?;
-    serde_json::from_str(json_object(&text))
-        .map_err(|e| format!("The answer wasn't valid JSON: {e}").into())
+    serde_json::from_str(json_object(&text)).map_err(|e| {
+        Box::new(ModelCallError::new(
+            ModelErrorKind::BadOutput,
+            format!("the answer wasn't valid JSON: {e}"),
+        )) as Box<dyn std::error::Error + Send + Sync>
+    })
 }
 
 /// The JSON object in an answer: from its first `{` to its last `}`, so a
@@ -819,27 +830,36 @@ async fn send_request(
         &common::model_retry::WORKER_BACKOFF_SECS,
         &request.model,
     )
-    .await?;
+    .await
+    .map_err(Box::new)?;
     api_result(reply)
 }
 
 /// A final response read as the API's answer or its error.
+/// Every failure is a [`ModelCallError`], so callers decide what to do from
+/// its kind (`is_transient`), never from its text.
 fn api_result(
     reply: common::model_retry::Reply,
 ) -> Result<MessagesResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let status = reply.status;
+    use common::model_retry::{ModelCallError, ModelErrorKind};
     if !reply.is_success() {
+        let status = reply.status;
         let body = reply.text();
-        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
-            return Err(format!(
-                "Anthropic API error {status} ({}): {}",
-                api_err.error.r#type, api_err.error.message
-            )
-            .into());
-        }
-        return Err(format!("Anthropic API error ({status}): {body}").into());
+        let message = match serde_json::from_str::<ApiError>(&body) {
+            Ok(api_err) => format!("{}: {}", api_err.error.r#type, api_err.error.message),
+            Err(_) => body,
+        };
+        return Err(Box::new(ModelCallError::new(
+            ModelErrorKind::Status(status),
+            message,
+        )));
     }
-    Ok(serde_json::from_slice(&reply.body)?)
+    serde_json::from_slice(&reply.body).map_err(|e| {
+        Box::new(ModelCallError::new(
+            ModelErrorKind::Network,
+            format!("the response body couldn't be read: {e}"),
+        )) as Box<dyn std::error::Error + Send + Sync>
+    })
 }
 
 fn extract_text(
