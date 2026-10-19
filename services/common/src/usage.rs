@@ -49,6 +49,8 @@ pub mod feature {
     pub const TESTS: &str = "tests";
     /// Live source descriptions and tool proposals.
     pub const LIVE_SOURCES: &str = "live_sources";
+    /// Reading a connected data source's tables to suggest hidden fields.
+    pub const DATA_SOURCE: &str = "data_source";
     /// Learnings extracted into memory after a run.
     pub const MEMORY: &str = "memory";
     /// A call made outside any known scope (still counted in every total).

@@ -124,6 +124,8 @@ pub enum WorkerMessage {
     Ticket(TicketMessage),
     #[serde(rename = "tool_proposals")]
     ToolProposals(ToolProposalsMessage),
+    #[serde(rename = "hidden_suggest")]
+    HiddenSuggest(HiddenSuggestMessage),
     #[serde(rename = "feedback")]
     Feedback(FeedbackMessage),
     #[serde(rename = "onboard")]
@@ -219,6 +221,7 @@ impl WorkerMessage {
             WorkerMessage::ReleaseNotes(_) | WorkerMessage::TagSweep(_) => f::RELEASE_NOTES,
             WorkerMessage::TestIngest(_) | WorkerMessage::TestAction(_) => f::TESTS,
             WorkerMessage::ToolProposals(_) => f::LIVE_SOURCES,
+            WorkerMessage::HiddenSuggest(_) => f::DATA_SOURCE,
             WorkerMessage::HealthCheck(_)
             | WorkerMessage::AwaitMerge(_)
             | WorkerMessage::GraphIndex(_)
@@ -711,6 +714,16 @@ mod tests {
         let s: Secrets = serde_json::from_str(json).unwrap();
         assert_eq!(s.github_app_id, "1");
     }
+}
+
+/// Work out suggested hidden fields for one database source from its table
+/// and column names. `force` asks again even when the names haven't changed.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HiddenSuggestMessage {
+    pub team_id: String,
+    pub source_id: String,
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Tool definitions changed in a repo's default branch: each becomes a

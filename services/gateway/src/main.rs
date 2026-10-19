@@ -525,6 +525,11 @@ async fn main() -> Result<(), Error> {
             "/data-sources/:id/try",
             post(routes::data_sources::try_lookup),
         )
+        .route(
+            "/data-sources/:id/hidden-suggestions",
+            get(routes::data_sources::hidden_suggestions)
+                .post(routes::data_sources::decide_hidden_suggestions),
+        )
         // E2E test intelligence
         .route(
             "/tests/settings",

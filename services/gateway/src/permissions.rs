@@ -304,6 +304,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "data_sources::test",
             "data_sources::samples",
             "data_sources::try_lookup",
+            "data_sources::hidden_suggestions",
+            "data_sources::decide_hidden_suggestions",
             "data_sources::aws_setup",
             "data_sources::aws_connect",
             "data_sources::create_logs",

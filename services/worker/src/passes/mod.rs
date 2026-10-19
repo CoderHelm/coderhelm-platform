@@ -649,6 +649,7 @@ pub mod feedback;
 pub mod formatter;
 pub mod github_history;
 pub mod health_check;
+pub mod hidden_suggest;
 mod implement;
 pub mod infra_analyze;
 pub mod live_sources;

@@ -22,7 +22,7 @@ use serde_json::{Map, Number, Value};
 
 use super::api::Check;
 use super::aws::{AwsTarget, Session};
-use super::redact::{hidden_terms, redact_all};
+use super::redact::redact_all;
 use super::sql::{check_read_only_sql, CheckedSql};
 use super::tools::{BoundParam, ParamValue};
 use super::StepError;
@@ -33,7 +33,7 @@ const POLL: Duration = Duration::from_millis(300);
 /// How long the warehouse keeps a lookup's session open when idle.
 const SESSION_SECONDS: i32 = 60;
 /// Most columns kept per database in the description of the warehouse.
-const MAX_SCHEMA_COLUMNS: usize = 3_000;
+const MAX_SCHEMA_COLUMNS: usize = 10_000;
 
 type Row = Map<String, Value>;
 
@@ -358,7 +358,7 @@ pub async fn run_sql(
     let ms = started.elapsed().as_millis();
     let count = rows.len();
     let mut value = Value::Array(rows.into_iter().map(Value::Object).collect());
-    let hidden_count = redact_all(&mut value, &hidden_terms(hidden));
+    let hidden_count = redact_all(&mut value, &checked.hidden_terms);
     let pretty = serde_json::to_string_pretty(&value).unwrap_or_default();
     Ok(WarehouseLookup {
         statement: checked.statement,
@@ -388,7 +388,7 @@ pub async fn run_tool_sql(
     let ms = started.elapsed().as_millis();
     let count = rows.len();
     let mut value = Value::Array(rows.into_iter().map(Value::Object).collect());
-    let hidden_count = redact_all(&mut value, &hidden_terms(hidden));
+    let hidden_count = redact_all(&mut value, &super::sql::statement_terms(text, hidden));
     let pretty = serde_json::to_string_pretty(&value).unwrap_or_default();
     Ok((
         count,
@@ -414,7 +414,7 @@ const SCHEMA_READ: &str =
     "SELECT table_schema AS s, table_name AS t, column_name AS c, data_type AS d \
      FROM information_schema.columns \
      WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_internal') \
-     ORDER BY table_schema, table_name, ordinal_position LIMIT 3000";
+     ORDER BY table_schema, table_name, ordinal_position LIMIT 10000";
 
 /// Why the user could change something in `database`, or `None`.
 fn access_problem(access: &Row, database: &str) -> Option<StepError> {
@@ -519,6 +519,11 @@ pub fn schema_text(database: &str, rows: &[Row]) -> (String, usize) {
             tables += 1;
         }
         out.push_str(&format!("  {}: {}\n", get("c"), get("d")));
+    }
+    if rows.len() >= MAX_SCHEMA_COLUMNS {
+        // Read when checking names: a table missing from a cut-short list
+        // may still exist.
+        out.push_str(&format!("\n{}\n", super::catalog::INCOMPLETE_MARK));
     }
     (out, tables)
 }

@@ -419,6 +419,25 @@ fn string_list(v: &Value, max: usize) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The hidden list as saved: every entry a contains-term, an `=exact` name,
+/// or a scoped `table.column` / `schema.table.column`. Anything else is
+/// refused with what is wrong, so nothing is saved that hides less than the
+/// admin meant.
+fn checked_hidden(list: Vec<String>) -> Result<Vec<String>, (StatusCode, Json<Value>)> {
+    let problems: Vec<String> = list
+        .iter()
+        .filter_map(|e| common::live::redact::entry_problem(e))
+        .collect();
+    if let Some(p) = problems.first() {
+        return Err(fail(StatusCode::BAD_REQUEST, p));
+    }
+    let mut seen = std::collections::HashSet::new();
+    Ok(list
+        .into_iter()
+        .filter(|e| seen.insert(e.to_lowercase()))
+        .collect())
+}
+
 /// PUT /api/data-sources/:id  { enabled?, hidden_fields?, repos?, name? }
 pub async fn update(
     State(state): State<Arc<AppState>>,
@@ -435,7 +454,7 @@ pub async fn update(
         }
     }
     if let Some(hidden) = string_list(&body["hidden_fields"], MAX_HIDDEN_FIELDS) {
-        source.hidden_fields = hidden;
+        source.hidden_fields = checked_hidden(hidden)?;
     }
     if let Some(repos) = string_list(&body["repos"], MAX_REPOS) {
         source.repos = repos;
@@ -482,6 +501,8 @@ pub async fn remove(
         .key(Source::schema_s3_key(&claims.team_id, &id))
         .send()
         .await;
+    let _ =
+        store::delete_hidden_suggestions(&state.dynamo, table(&state), &claims.team_id, &id).await;
     info!(team = %claims.team_id, source = %id, "Data source removed");
     Ok(Json(json!({ "ok": true })))
 }
@@ -733,6 +754,57 @@ async fn record(
     }
 }
 
+/// The names a lookup uses that the source's saved description doesn't
+/// have, one line each with the closest real ones. Empty for logs, for a
+/// lookup the read-only check refuses (that answer says more), or when no
+/// description is saved.
+async fn unknown_names(
+    state: &AppState,
+    team_id: &str,
+    source: &Source,
+    query: &str,
+    database: Option<&str>,
+) -> Vec<String> {
+    use common::live::catalog;
+    let readable = match source.kind {
+        Kind::Database => {
+            common::live::sql::check_read_only_sql(query, &source.hidden_fields).is_ok()
+        }
+        Kind::Api => check_read_only(query).is_ok(),
+        Kind::Logs => false,
+    };
+    if !readable || !source.schema_available {
+        return Vec::new();
+    }
+    let Ok(out) = state
+        .s3
+        .get_object()
+        .bucket(&state.config.bucket_name)
+        .key(Source::schema_s3_key(team_id, &source.id))
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(bytes) = out.body.collect().await else {
+        return Vec::new();
+    };
+    let c = catalog::Catalog::parse(&String::from_utf8_lossy(&bytes.into_bytes()));
+    match source.kind {
+        Kind::Database => {
+            // A warehouse lookup runs in one database: only its tables count.
+            let db = source
+                .aws
+                .as_ref()
+                .filter(|a| a.engine == "redshift")
+                .and_then(|a| redshift::pick_database(a, database).ok());
+            catalog::unknown_sql_names_in(&c, db, query, &source.hidden_fields)
+        }
+        Kind::Api => catalog::unknown_graphql_names(&c, query, &source.hidden_fields),
+        Kind::Logs => Vec::new(),
+    }
+}
+
 fn aws_of(source: &Source) -> Result<&AwsTarget, (StatusCode, Json<Value>)> {
     source.aws.as_ref().ok_or_else(|| {
         fail(
@@ -755,6 +827,48 @@ pub async fn try_lookup(
     admin(&claims)?;
     let source = load(&state, &claims.team_id, &id).await?;
     let query = body["query"].as_str().unwrap_or("");
+
+    // Names are checked against the saved description first, the same as
+    // for the agents: a guessed table is never sent.
+    let unknown = unknown_names(
+        &state,
+        &claims.team_id,
+        &source,
+        query,
+        body["database"].as_str(),
+    )
+    .await;
+    if !unknown.is_empty() {
+        let logged = store::log_activity(
+            &state.dynamo,
+            table(&state),
+            &claims.team_id,
+            &Activity {
+                source_id: source.id.clone(),
+                source_name: source.name.clone(),
+                actor: claims.email.clone(),
+                repo: String::new(),
+                pr: 0,
+                query: query.to_string(),
+                outcome: "unknown_name",
+                detail: unknown.join(" "),
+                ms: 0,
+            },
+        )
+        .await;
+        if let Err(e) = logged {
+            warn!(error = %e, "Could not record a lookup");
+        }
+        return Ok(Json(json!({
+            "ok": false,
+            "query": query,
+            "fields": [],
+            "hidden_count": 0,
+            "ms": 0,
+            "unknown_name": true,
+            "refused": common::live::catalog::unknown_names_message(&source.name, &unknown),
+        })));
+    }
 
     let outcome: Result<Tried, StepError> = match source.kind {
         Kind::Api => {
@@ -1217,7 +1331,124 @@ async fn save_db_schema(state: &AppState, team_id: &str, id: &str, schema: &str)
         .await;
     if let Err(e) = put {
         warn!(error = %e, "Could not store the database's description; lookups still work");
+        return;
     }
+    queue_hidden_suggestions(state, team_id, id, false).await;
+}
+
+/// Asks the worker to suggest hidden fields from a database's table and
+/// column names (only when they changed, unless `force`).
+async fn queue_hidden_suggestions(state: &AppState, team_id: &str, id: &str, force: bool) {
+    let message =
+        crate::models::WorkerMessage::HiddenSuggest(crate::models::HiddenSuggestMessage {
+            team_id: team_id.to_string(),
+            source_id: id.to_string(),
+            force,
+        });
+    if super::github_webhook::send_to_queue(state, &state.config.ticket_queue_url, &message)
+        .await
+        .is_err()
+    {
+        warn!("Could not queue hidden-field suggestions");
+    }
+}
+
+/// GET /api/data-sources/:id/hidden-suggestions — columns the source's table
+/// and column names suggest hold a person's details, for an admin to accept
+/// or dismiss. Nothing is hidden until one is accepted.
+pub async fn hidden_suggestions(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Reply {
+    admin(&claims)?;
+    let source = load(&state, &claims.team_id, &id).await?;
+    let kept = store::get_hidden_suggestions(&state.dynamo, table(&state), &claims.team_id, &id)
+        .await
+        .map_err(|e| internal("read hidden suggestions", e))?;
+    // An entry hidden since (by hand) is no longer a suggestion.
+    let open: Vec<_> = kept
+        .suggestions
+        .iter()
+        .filter(|s| {
+            !source
+                .hidden_fields
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(&s.entry))
+        })
+        .collect();
+    Ok(Json(json!({
+        "suggestions": open,
+        "dismissed": kept.dismissed,
+        "checked_at": kept.at,
+    })))
+}
+
+/// POST /api/data-sources/:id/hidden-suggestions  { accept?: [entry], dismiss?: [entry], refresh?: bool }
+/// — accepted entries join the hidden list (the same list `PUT` saves);
+/// dismissed ones are never suggested again. `refresh` asks for suggestions
+/// to be worked out again.
+pub async fn decide_hidden_suggestions(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Reply {
+    admin(&claims)?;
+    let mut source = load(&state, &claims.team_id, &id).await?;
+    let mut kept =
+        store::get_hidden_suggestions(&state.dynamo, table(&state), &claims.team_id, &id)
+            .await
+            .map_err(|e| internal("read hidden suggestions", e))?;
+    let accept = string_list(&body["accept"], MAX_HIDDEN_FIELDS).unwrap_or_default();
+    let dismiss = string_list(&body["dismiss"], MAX_HIDDEN_FIELDS).unwrap_or_default();
+    let is_suggested = |e: &str| {
+        kept.suggestions
+            .iter()
+            .any(|s| s.entry.eq_ignore_ascii_case(e))
+    };
+    if let Some(e) = accept.iter().chain(&dismiss).find(|e| !is_suggested(e)) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            &format!("{e} isn't one of the suggestions. Reload the page."),
+        ));
+    }
+    if !accept.is_empty() {
+        let mut hidden = source.hidden_fields.clone();
+        hidden.extend(accept.iter().cloned());
+        if hidden.len() > MAX_HIDDEN_FIELDS {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                &format!("A source can hide at most {MAX_HIDDEN_FIELDS} names."),
+            ));
+        }
+        source.hidden_fields = checked_hidden(hidden)?;
+        save(&state, &claims.team_id, &source).await?;
+    }
+    let decided = |e: &str| {
+        accept
+            .iter()
+            .chain(&dismiss)
+            .any(|d| d.eq_ignore_ascii_case(e))
+    };
+    kept.suggestions.retain(|s| !decided(&s.entry));
+    for d in &dismiss {
+        if !kept.dismissed.iter().any(|x| x.eq_ignore_ascii_case(d)) {
+            kept.dismissed.push(d.to_lowercase());
+        }
+    }
+    store::put_hidden_suggestions(&state.dynamo, table(&state), &claims.team_id, &id, &kept)
+        .await
+        .map_err(|e| internal("save hidden suggestions", e))?;
+    if body["refresh"].as_bool() == Some(true) && source.kind == Kind::Database {
+        queue_hidden_suggestions(&state, &claims.team_id, &id, true).await;
+    }
+    info!(team = %claims.team_id, source = %id, accepted = accept.len(), dismissed = dismiss.len(), "Hidden-field suggestions decided");
+    Ok(Json(json!({
+        "source": source.public_json(),
+        "suggestions": kept.suggestions,
+        "dismissed": kept.dismissed,
+    })))
 }
 
 fn db_samples(schema: &str) -> Vec<(String, String)> {
