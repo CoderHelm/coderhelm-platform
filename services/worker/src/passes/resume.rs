@@ -1752,14 +1752,18 @@ async fn load_usage_from_checkpoint(
                         .and_then(|n| n.parse().ok())
                         .unwrap_or(0)
                 };
-                TokenUsage {
-                    input_tokens: get_n("tokens_in"),
-                    output_tokens: get_n("tokens_out"),
-                    cache_read_tokens: get_n("cache_read"),
-                    cache_write_tokens: get_n("cache_write"),
-                    tool_calls: 0,
-                    tool_names: vec![],
-                }
+                let cost = item
+                    .get("cost_usd")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<f64>().ok());
+                TokenUsage::restored(
+                    &state.config.model_id,
+                    get_n("tokens_in"),
+                    get_n("tokens_out"),
+                    get_n("cache_read"),
+                    get_n("cache_write"),
+                    cost,
+                )
             } else {
                 TokenUsage::default()
             }
@@ -2090,24 +2094,8 @@ async fn complete_run_with_status(
         Err(e) => return Err(e.into()),
     }
 
-    // Update analytics
-    let month = chrono::Utc::now().format("%Y-%m").to_string();
-    for period in &[month.as_str(), "ALL_TIME"] {
-        let _ = state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.analytics_table_name)
-            .key("team_id", attr_s(&msg.team_id))
-            .key("period", attr_s(period))
-            .update_expression("ADD total_tokens_in :ti, total_tokens_out :to, cache_read_tokens :crt, cache_write_tokens :cwt")
-            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-            .expression_attribute_values(":to", attr_n(usage.output_tokens))
-            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-            .send()
-            .await;
-    }
-
+    // The team's counters already have these tokens: each model call is
+    // counted as it happens (common::usage).
     info!(run_id, status, "Run completed");
     Ok(())
 }

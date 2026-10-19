@@ -156,6 +156,17 @@ export class WorkerStack extends cdk.Stack {
     props.eventsTable.grantReadWriteData(this.workerFunction);
     props.bucket.grantReadWrite(this.workerFunction);
     secrets.grantRead(this.workerFunction);
+    // Usage reconciliation reads Anthropic Admin API keys from this secret
+    // (optional: reconciliation is off until it exists). Secrets Manager adds
+    // a 6-character suffix to secret ARNs, hence the wildcard.
+    this.workerFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:coderhelm/${props.stage}/anthropic-admin-keys-??????`,
+        ],
+      })
+    );
 
     // Bedrock: converse + invoke model
     this.workerFunction.addToRolePolicy(

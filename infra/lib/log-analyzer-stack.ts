@@ -62,6 +62,8 @@ export class LogAnalyzerStack extends cdk.Stack {
       environment: {
         AWS_INSIGHTS_TABLE_NAME: props.awsInsightsTable.tableName,
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
+        // Team usage counters: every analysis call is counted (tokens + cost).
+        ANALYTICS_TABLE_NAME: `${prefix}-analytics`,
         MODEL_ID: "claude-sonnet-5-5",
         CODERHELM_ACCOUNT_ID: this.account,
         LOOKBACK_HOURS: "6",
@@ -72,6 +74,9 @@ export class LogAnalyzerStack extends cdk.Stack {
     // DynamoDB permissions
     props.awsInsightsTable.grantReadWriteData(analyzerFunction);
     props.settingsTable.grantReadData(analyzerFunction);
+    // Decoupled by name (like the worker) to avoid a cross-stack export.
+    dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `${prefix}-analytics`)
+      .grantWriteData(analyzerFunction);
 
     // STS AssumeRole — the analyzer needs to assume roles in customer accounts
     analyzerFunction.addToRolePolicy(

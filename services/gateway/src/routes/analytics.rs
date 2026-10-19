@@ -66,6 +66,8 @@ pub struct RunRow {
     pub cost_usd: f64,
     pub tokens_in: f64,
     pub tokens_out: f64,
+    pub cache_read_tokens: f64,
+    pub cache_write_tokens: f64,
     pub duration_s: f64,
     pub pr_number: u64,
     pub pr_url: String,
@@ -80,6 +82,11 @@ pub struct RunRow {
 }
 
 impl RunRow {
+    /// All four parts: new input, cache read, cache write, output.
+    fn tokens(&self) -> f64 {
+        self.tokens_in + self.cache_read_tokens + self.cache_write_tokens + self.tokens_out
+    }
+
     fn from_item(i: &Item) -> RunRow {
         RunRow {
             run_id: s(i, "run_id"),
@@ -92,6 +99,8 @@ impl RunRow {
             cost_usd: n(i, "cost_usd"),
             tokens_in: n(i, "tokens_in"),
             tokens_out: n(i, "tokens_out"),
+            cache_read_tokens: n(i, "cache_read_tokens"),
+            cache_write_tokens: n(i, "cache_write_tokens"),
             duration_s: n(i, "duration_s"),
             pr_number: n(i, "pr_number") as u64,
             pr_url: s(i, "pr_url"),
@@ -289,7 +298,7 @@ pub fn summary(runs: &[&RunRow], reviews: &[&ReviewRow]) -> Value {
     let closed = with_pr.iter().filter(|r| r.pr_outcome == "closed").count();
     let failed = runs.iter().filter(|r| r.status == "failed").count();
     let cost: f64 = runs.iter().map(|r| r.cost_usd).sum();
-    let tokens: f64 = runs.iter().map(|r| r.tokens_in + r.tokens_out).sum();
+    let tokens: f64 = runs.iter().map(|r| r.tokens()).sum();
     let hours: Vec<f64> = merged.iter().filter_map(|r| r.hours_to_merge()).collect();
     let edits_known: Vec<&&&RunRow> = merged
         .iter()
@@ -325,6 +334,8 @@ pub fn summary(runs: &[&RunRow], reviews: &[&ReviewRow]) -> Value {
         "tokens_per_merged_pr": ratio(tokens, merged.len() as f64).map(f64::round),
         "tokens_in": runs.iter().map(|r| r.tokens_in).sum::<f64>(),
         "tokens_out": runs.iter().map(|r| r.tokens_out).sum::<f64>(),
+        "cache_read_tokens": runs.iter().map(|r| r.cache_read_tokens).sum::<f64>(),
+        "cache_write_tokens": runs.iter().map(|r| r.cache_write_tokens).sum::<f64>(),
         "median_run_minutes": median(durations).map(round2),
         "median_hours_to_merge": median(hours.clone()).map(round2),
         "time_to_merge_known": hours.len(),
@@ -390,7 +401,7 @@ pub fn build(
                 e[3] += 1.0;
             }
             e[4] += r.cost_usd;
-            e[6] += r.tokens_in + r.tokens_out;
+            e[6] += r.tokens();
         }
     }
     // Merges land on the day they happened, when known.
@@ -444,7 +455,7 @@ pub fn build(
             e[3] += 1.0;
         }
         e[4] += r.cost_usd;
-        e[5] += r.tokens_in + r.tokens_out;
+        e[5] += r.tokens();
         let who = if r.sender.is_empty() {
             String::new()
         } else {
@@ -674,6 +685,7 @@ async fn load_runs(state: &AppState, team: &str, w: Window) -> Result<Vec<RunRow
             .expression_attribute_values(":hi", av(&hi))
             .projection_expression(
                 "run_id, created_at, #s, repo, ticket_source, sender, title, cost_usd, tokens_in, tokens_out, \
+                 cache_read_tokens, cache_write_tokens, \
                  duration_s, pr_number, pr_url, error_message, ci_fix_attempts, ci_fix_commits, ci_last, \
                  pr_outcome, merged_at, pr_opened_at, human_commits",
             )
@@ -972,6 +984,16 @@ mod tests {
 
     fn windows() -> (Window, Window) {
         Window::last_days(Utc::now(), 30)
+    }
+
+    #[test]
+    fn a_runs_tokens_are_all_four_parts() {
+        let mut r = run("1", 1, "completed");
+        r.tokens_in = 10.0;
+        r.cache_read_tokens = 1000.0;
+        r.cache_write_tokens = 200.0;
+        r.tokens_out = 50.0;
+        assert_eq!(r.tokens(), 1260.0);
     }
 
     #[test]

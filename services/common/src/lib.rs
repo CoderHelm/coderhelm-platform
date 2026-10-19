@@ -27,6 +27,8 @@ pub mod review_stats;
 pub mod skills;
 /// Signed links that turn off one email for one person, without signing in.
 pub mod unsubscribe;
+/// Model usage accounting: every model call is counted here, once.
+pub mod usage;
 
 /// GitHub's per-request override for the installation-token format, sent on
 /// `POST /app/installations/{id}/access_tokens`. GitHub is moving installation

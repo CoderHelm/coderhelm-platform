@@ -672,6 +672,7 @@ pub mod syntax_check;
 mod test;
 pub mod tool_proposals;
 mod triage;
+pub mod usage_reconcile;
 pub mod weekly_summary;
 pub mod write_guard;
 
@@ -850,23 +851,8 @@ pub async fn orchestrate_ticket(
                     .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
                     .send()
                     .await;
-                // Also update analytics for cancelled runs
-                let month = chrono::Utc::now().format("%Y-%m").to_string();
-                for period in &[month.as_str(), "ALL_TIME"] {
-                    let _ = state
-                        .dynamo
-                        .update_item()
-                        .table_name(&state.config.analytics_table_name)
-                        .key("team_id", attr_s(&msg.team_id))
-                        .key("period", attr_s(period))
-                        .update_expression("ADD total_tokens_in :ti, total_tokens_out :to, cache_read_tokens :crt, cache_write_tokens :cwt")
-                        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-                        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                        .send()
-                        .await;
-                }
+                // The team's counters already have these tokens: each model
+                // call is counted as it happens (common::usage).
             } else {
                 error!(run_id, error = %e, "Orchestration failed");
                 let checkpoint = load_checkpoint(state, &msg.team_id, &run_id).await;
@@ -1562,17 +1548,8 @@ async fn run_passes(
                 .table_name(&state.config.analytics_table_name)
                 .key("team_id", attr_s(&msg.team_id))
                 .key("period", attr_s(period))
-                .update_expression(
-                    "ADD completed :one, total_cost_usd :cost, \
-                     total_tokens_in :ti, total_tokens_out :to, \
-                     cache_read_tokens :cr, cache_write_tokens :cw",
-                )
+                .update_expression("ADD completed :one")
                 .expression_attribute_values(":one", attr_n(1))
-                .expression_attribute_values(":cost", attr_n(format!("{:.4}", cost)))
-                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                .expression_attribute_values(":cr", attr_n(usage.cache_read_tokens))
-                .expression_attribute_values(":cw", attr_n(usage.cache_write_tokens))
                 .send()
                 .await;
         }
@@ -1667,17 +1644,8 @@ async fn run_passes(
                 .table_name(&state.config.analytics_table_name)
                 .key("team_id", attr_s(&msg.team_id))
                 .key("period", attr_s(period))
-                .update_expression(
-                    "ADD completed :one, total_cost_usd :cost, \
-                     total_tokens_in :ti, total_tokens_out :to, \
-                     cache_read_tokens :cr, cache_write_tokens :cw",
-                )
+                .update_expression("ADD completed :one")
                 .expression_attribute_values(":one", attr_n(1))
-                .expression_attribute_values(":cost", attr_n(format!("{:.4}", cost)))
-                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                .expression_attribute_values(":cr", attr_n(usage.cache_read_tokens))
-                .expression_attribute_values(":cw", attr_n(usage.cache_write_tokens))
                 .send()
                 .await;
         }
@@ -3325,8 +3293,7 @@ async fn run_passes(
     if let Some(mut mem) = agent_memory {
         mem.extract_learnings_from_conversation(
             &impl_result.conversation_log,
-            provider.api_key(),
-            provider.primary_model_id(),
+            &provider,
             &crate::memory::LearningOrigin {
                 run_id: run_id.to_string(),
                 ticket_id: msg.ticket_id.clone(),
@@ -4068,17 +4035,8 @@ async fn complete_run(
             .table_name(&state.config.analytics_table_name)
             .key("team_id", attr_s(&msg.team_id))
             .key("period", attr_s(period))
-            .update_expression(
-                "ADD completed :one, total_cost_usd :cost, \
-                 total_tokens_in :ti, total_tokens_out :to, \
-                 cache_read_tokens :cr, cache_write_tokens :cw",
-            )
+            .update_expression("ADD completed :one")
             .expression_attribute_values(":one", attr_n(1))
-            .expression_attribute_values(":cost", attr_n(format!("{:.4}", cost)))
-            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-            .expression_attribute_values(":to", attr_n(usage.output_tokens))
-            .expression_attribute_values(":cr", attr_n(usage.cache_read_tokens))
-            .expression_attribute_values(":cw", attr_n(usage.cache_write_tokens))
             .send()
             .await?;
     }
@@ -4216,17 +4174,8 @@ async fn fail_run(
             .table_name(&state.config.analytics_table_name)
             .key("team_id", attr_s(&msg.team_id))
             .key("period", attr_s(period))
-            .update_expression(
-                "ADD failed :one, total_cost_usd :cost, \
-                 total_tokens_in :ti, total_tokens_out :to, \
-                 cache_read_tokens :cr, cache_write_tokens :cw",
-            )
+            .update_expression("ADD failed :one")
             .expression_attribute_values(":one", attr_n(1))
-            .expression_attribute_values(":cost", attr_n(format!("{:.4}", cost)))
-            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-            .expression_attribute_values(":to", attr_n(usage.output_tokens))
-            .expression_attribute_values(":cr", attr_n(usage.cache_read_tokens))
-            .expression_attribute_values(":cw", attr_n(usage.cache_write_tokens))
             .send()
             .await;
     }
@@ -5859,6 +5808,13 @@ pub(crate) async fn write_pass_trace(
         .item("output_tokens", attr_n(output_tokens))
         .item("cache_read_tokens", attr_n(cache_read))
         .item("cache_write_tokens", attr_n(cache_write))
+        .item(
+            "cost_usd",
+            attr_n(format!(
+                "{:.6}",
+                (usage_after.cost_usd - usage_before.cost_usd).max(0.0)
+            )),
+        )
         .item("tool_calls", attr_n(tool_calls))
         .item("timestamp", AttributeValue::S(now))
         .item(
@@ -6024,6 +5980,7 @@ pub(crate) async fn save_checkpoint(
         .item("tokens_out", attr_n(usage.output_tokens))
         .item("cache_read", attr_n(usage.cache_read_tokens))
         .item("cache_write", attr_n(usage.cache_write_tokens))
+        .item("cost_usd", attr_n(format!("{:.6}", usage.estimated_cost())))
         .item("updated_at", attr_n(now))
         .item("ttl", attr_n(ttl))
         .send()

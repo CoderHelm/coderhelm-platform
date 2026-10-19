@@ -1,7 +1,7 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{error, info, warn};
 
-use crate::agent::anthropic::{self, AnthropicClient};
+use crate::agent::anthropic;
 use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{OnboardMessage, TokenUsage};
@@ -261,7 +261,7 @@ async fn onboard_repo(
         ));
     }
 
-    let client = AnthropicClient::new(provider.api_key().to_string());
+    let client = provider.client();
     let agents_md = anthropic::converse_simple(
         &client,
         provider.primary_model_id(),
@@ -364,7 +364,7 @@ async fn generate_voice_md(
         samples = samples.join("\n\n")
     );
 
-    let client = AnthropicClient::new(provider.api_key().to_string());
+    let client = provider.client();
     let voice_md =
         anthropic::converse_simple(&client, provider.primary_model_id(), system, &prompt, usage)
             .await?;
@@ -416,7 +416,7 @@ async fn generate_global_context(
         repo_summaries.join("\n\n")
     );
 
-    let client = AnthropicClient::new(provider.api_key().to_string());
+    let client = provider.client();
     anthropic::converse_simple(&client, provider.primary_model_id(), system, &prompt, usage).await
 }
 

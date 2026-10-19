@@ -2540,6 +2540,21 @@ fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValu
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
 }
 
+/// Whether a team's token limit counts cache tokens: `counts_cache` on its
+/// `SETTINGS#TOKEN_LIMIT` item, else the `TOKEN_LIMIT_COUNTS_CACHE` env default.
+pub fn token_limit_counts_cache(
+    limit_item: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
+) -> bool {
+    let team = limit_item
+        .and_then(|i| i.get("counts_cache"))
+        .and_then(|v| v.as_bool().ok())
+        .copied();
+    common::usage::counts_cache_enabled(
+        team,
+        std::env::var("TOKEN_LIMIT_COUNTS_CACHE").ok().as_deref(),
+    )
+}
+
 /// Check whether this team has budget remaining. Returns Some(reason) if blocked.
 pub async fn check_run_budget(state: &AppState, team_id: &str) -> Option<String> {
     // 1. Read configured token limit from settings
@@ -2577,21 +2592,12 @@ pub async fn check_run_budget(state: &AppState, team_id: &str) -> Option<String>
         .await
         .ok()?;
 
-    let tokens_in: u64 = analytics
-        .item()
-        .and_then(|i| i.get("total_tokens_in"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
-
-    let tokens_out: u64 = analytics
-        .item()
-        .and_then(|i| i.get("total_tokens_out"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
-
-    let total_tokens = tokens_in + tokens_out;
+    // All four parts (new input, cache read, cache write, output) when the
+    // team's limit counts cache tokens; the old rule (new input + output)
+    // until then. See common::usage::counts_cache_enabled.
+    let counts_cache = token_limit_counts_cache(limit.item());
+    let totals = common::usage::UsageTotals::from_item(analytics.item());
+    let total_tokens = totals.counted(counts_cache);
 
     if total_tokens >= max_tokens {
         let limit_label = if max_tokens >= 1_000_000 {

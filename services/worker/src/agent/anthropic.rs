@@ -15,18 +15,35 @@ static ANTHROPIC_VERSION: &str = "2023-06-01";
 pub struct AnthropicClient {
     http: Client,
     api_key: String,
+    /// Counts every response into the team's analytics counters. Required:
+    /// a client can't be built without saying where its usage goes.
+    meter: common::usage::UsageMeter,
 }
 
 impl AnthropicClient {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String, meter: common::usage::UsageMeter) -> Self {
         Self {
             http: Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             api_key,
+            meter,
         }
     }
+}
+
+/// The one place a response's usage is counted: into the run's own totals
+/// (`usage`) and, once, into the team's analytics counters (the meter).
+async fn account(
+    client: &AnthropicClient,
+    model_id: &str,
+    api_usage: &ApiUsage,
+    usage: &mut TokenUsage,
+) {
+    let call = api_usage.call();
+    usage.add_call(model_id, &call);
+    client.meter.record(model_id, &call).await;
 }
 
 // --- Request/Response types ---
@@ -92,6 +109,29 @@ const BETA_THINKING_BINDING: &str = "thinking-binding-controls-2026-08-01";
 const BETA_CONTEXT_MANAGEMENT: &str = "context-management-2025-06-27";
 const BETA_FALLBACK_DEFAULT: &str = "server-side-fallback-2026-07-01";
 
+/// Tokens a server-side clear must remove before it happens at all. A clear
+/// rewrites the cached conversation from the first cleared tool result on, so
+/// with no minimum (the API default) every turn past the trigger cleared one
+/// old result near the START of the history and re-wrote nearly the whole
+/// context to the cache (1.25x input) instead of reading it (0.05x-0.1x).
+const CLEAR_AT_LEAST_TOKENS: u64 = 50_000;
+/// Input size at which old tool results start being cleared.
+const CLEAR_TRIGGER_TOKENS: u64 = 120_000;
+/// Most recent tool results always kept.
+const CLEAR_KEEP_TOOL_USES: u64 = 4;
+
+/// Legacy models trim history client-side; they do it once every this many turns.
+const LEGACY_COMPACT_EVERY_TURNS: usize = 6;
+
+fn clear_tool_uses_edit() -> Value {
+    json!({"edits": [{
+        "type": "clear_tool_uses_20250919",
+        "trigger": {"type": "input_tokens", "value": CLEAR_TRIGGER_TOKENS},
+        "keep": {"type": "tool_uses", "value": CLEAR_KEEP_TOOL_USES},
+        "clear_at_least": {"type": "input_tokens", "value": CLEAR_AT_LEAST_TOKENS}
+    }]})
+}
+
 /// Fill the model-family fields of a request. `effort` None → "high".
 fn apply_model_family(request: &mut MessagesRequest, effort: Option<&str>, tool_loop: bool) {
     if ModelFamily::of(&request.model) != ModelFamily::AlwaysThinking {
@@ -105,7 +145,7 @@ fn apply_model_family(request: &mut MessagesRequest, effort: Option<&str>, tool_
     }));
     request.output_config = Some(json!({"effort": effort.unwrap_or("high")}));
     if tool_loop {
-        request.context_management = Some(json!({"edits": [{"type": "clear_tool_uses_20250919"}]}));
+        request.context_management = Some(clear_tool_uses_edit());
     }
     if supports_default_fallback(&request.model) {
         request.fallbacks = Some(json!("default"));
@@ -228,12 +268,34 @@ impl MessagesResponse {
 
 #[derive(Deserialize, Debug)]
 struct ApiUsage {
+    /// Uncached input only.
     input_tokens: u64,
+    /// Thinking included (billed as output).
     output_tokens: u64,
     #[serde(default)]
     cache_creation_input_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: u64,
+    /// Cache writes by lifetime (`ephemeral_5m_input_tokens`,
+    /// `ephemeral_1h_input_tokens`), priced differently.
+    #[serde(default)]
+    cache_creation: Option<Value>,
+}
+
+impl ApiUsage {
+    fn call(&self) -> common::usage::CallUsage {
+        let mut v = json!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_creation_input_tokens": self.cache_creation_input_tokens,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+        });
+        if let Some(c) = &self.cache_creation {
+            v["cache_creation"] = c.clone();
+        }
+        // Every request this client sends caches with the 5-minute lifetime.
+        common::usage::CallUsage::from_api(&v, common::usage::CacheTtl::FiveMinutes)
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -287,12 +349,7 @@ pub async fn converse_simple(
     apply_model_family(&mut request, None, false);
 
     let resp = send_request(client, &request).await?;
-    usage.add(
-        resp.usage.input_tokens,
-        resp.usage.output_tokens,
-        resp.usage.cache_read_input_tokens,
-        resp.usage.cache_creation_input_tokens,
-    );
+    account(client, model_id, &resp.usage, usage).await;
     if let Some(refusal) = resp.refusal() {
         return Err(refusal.into());
     }
@@ -449,12 +506,7 @@ pub async fn converse_tool_loop(
         let response = send_with_retry(client, &request, model_id).await?;
 
         // Track usage
-        usage.add(
-            response.usage.input_tokens,
-            response.usage.output_tokens,
-            response.usage.cache_read_input_tokens,
-            response.usage.cache_creation_input_tokens,
-        );
+        account(client, model_id, &response.usage, usage).await;
 
         if let Some(refusal) = response.refusal() {
             return Err(refusal.into());
@@ -466,8 +518,11 @@ pub async fn converse_tool_loop(
         // Always-thinking models: history must stay append-only (an edit
         // invalidates every later thinking block), so the server clears old
         // tool results instead (`context_management` in apply_model_family).
+        // Batched: each compaction edits history and so re-writes the cache
+        // from the first edited block on. Compacting every turn re-wrote the
+        // last ~8 messages on every turn; every 6th turn writes them once.
         let keep_recent = 4; // keep last 4 turn-pairs (~8 messages)
-        if family == ModelFamily::Legacy {
+        if family == ModelFamily::Legacy && turns.is_multiple_of(LEGACY_COMPACT_EVERY_TURNS) {
             compact_messages(messages, keep_recent);
         }
 
@@ -812,10 +867,12 @@ mod tests {
             "drop_block"
         );
         assert_eq!(v["output_config"]["effort"], "high");
-        assert_eq!(
-            v["context_management"]["edits"][0]["type"],
-            "clear_tool_uses_20250919"
-        );
+        let edit = &v["context_management"]["edits"][0];
+        assert_eq!(edit["type"], "clear_tool_uses_20250919");
+        // Clears happen in large batches, so the cache isn't re-written every turn.
+        assert_eq!(edit["clear_at_least"]["type"], "input_tokens");
+        assert!(edit["clear_at_least"]["value"].as_u64().unwrap() >= 20_000);
+        assert!(edit["trigger"]["value"].as_u64().unwrap() >= 100_000);
         assert_eq!(v["fallbacks"], "default");
         assert!(v.get("temperature").is_none());
         let betas = beta_header(&r);
@@ -855,6 +912,35 @@ mod tests {
         assert!(matches!(blocks[1], ContentBlock::ToolUse { .. }));
         assert_eq!(extract_text(&blocks).unwrap(), "hi");
         assert!(resp.refusal().is_none());
+    }
+
+    #[tokio::test]
+    async fn each_response_reaches_the_run_and_the_team_counters_exactly_once() {
+        let (meter, calls) = common::usage::UsageMeter::memory("team-1");
+        let client = AnthropicClient::new("k".into(), meter);
+        let mut usage = TokenUsage::default();
+        let api: ApiUsage = serde_json::from_value(json!({
+            "input_tokens": 7, "output_tokens": 300,
+            "cache_read_input_tokens": 9000, "cache_creation_input_tokens": 1200,
+            "cache_creation": {"ephemeral_5m_input_tokens": 1000, "ephemeral_1h_input_tokens": 200}
+        }))
+        .unwrap();
+        common::usage::with_feature(common::usage::feature::RUN, async {
+            account(&client, "claude-opus-5-5", &api, &mut usage).await;
+            account(&client, "claude-sonnet-5-5", &api, &mut usage).await;
+        })
+        .await;
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "one team record per response");
+        let team_total: u64 = got.iter().map(|c| c.usage.total()).sum();
+        assert_eq!(team_total, usage.total_tokens());
+        assert_eq!(usage.total_tokens(), 2 * (7 + 300 + 9000 + 1200));
+        assert_eq!(usage.cache_write_1h_tokens, 400);
+        let team_cost: f64 = got.iter().map(|c| c.usage.cost_usd(&c.model)).sum();
+        assert!((team_cost - usage.cost_usd).abs() < 1e-12);
+        assert!(got
+            .iter()
+            .all(|c| c.feature == "run" && c.team_id == "team-1"));
     }
 
     #[test]

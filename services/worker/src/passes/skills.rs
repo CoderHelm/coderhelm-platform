@@ -314,12 +314,7 @@ impl TeamSkills {
     pub fn drain_usage_into(&self, usage: &mut crate::models::TokenUsage) {
         if let Ok(mut u) = self.usage.lock() {
             let spent = std::mem::take(&mut *u);
-            usage.add(
-                spent.input_tokens,
-                spent.output_tokens,
-                spent.cache_read_tokens,
-                spent.cache_write_tokens,
-            );
+            usage.merge(&spent);
         }
     }
 
@@ -548,12 +543,7 @@ impl TeamSkills {
         }
         let usage = reply.usage;
         if let Ok(mut u) = self.usage.lock() {
-            u.add(
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cache_read_tokens,
-                usage.cache_write_tokens,
-            );
+            u.merge(&usage);
         }
         let Some(answer) = reply.answer else {
             return match reply.outcome {
@@ -821,6 +811,7 @@ async fn answer_as_agent(
         None,
         None,
     );
+    let call = common::usage::with_feature(common::usage::feature::AGENT_ASK, call);
     match tokio::time::timeout(ASK_TIMEOUT, call).await {
         Ok(Ok(a)) => {
             reply.outcome = "answered";
@@ -1300,6 +1291,7 @@ mod tests {
             api_key: String::new(),
             primary_model: "team-primary".into(),
             heavy_model: "team-heavy".into(),
+            meter: None,
         };
         assert_eq!(pick_model(Some("opus"), &p), "team-heavy");
         assert_eq!(pick_model(Some("sonnet"), &p), "team-primary");

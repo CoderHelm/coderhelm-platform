@@ -668,6 +668,7 @@ Rules:
             "SET tokens_in = tokens_in + :ti, tokens_out = tokens_out + :to, \
              cache_read_tokens = if_not_exists(cache_read_tokens, :zero) + :crt, \
              cache_write_tokens = if_not_exists(cache_write_tokens, :zero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :zero) + :c, \
              updated_at = :t, #s = :s, current_pass = :p, status_run_id = :sri, \
              pass_history = list_append(if_not_exists(pass_history, :empty), :entry) \
              REMOVE error_message, #err",
@@ -698,6 +699,10 @@ Rules:
         .expression_attribute_values(
             ":zero",
             aws_sdk_dynamodb::types::AttributeValue::N("0".to_string()),
+        )
+        .expression_attribute_values(
+            ":c",
+            aws_sdk_dynamodb::types::AttributeValue::N(format!("{:.4}", usage.estimated_cost())),
         )
         .expression_attribute_values(
             ":t",
@@ -737,41 +742,8 @@ Rules:
         .send()
         .await?;
 
-    // Update analytics counters (current month + all-time)
-    let month = chrono::Utc::now().format("%Y-%m").to_string();
-    for period in &[month.as_str(), "ALL_TIME"] {
-        state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.analytics_table_name)
-            .key(
-                "team_id",
-                aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
-            )
-            .key(
-                "period",
-                aws_sdk_dynamodb::types::AttributeValue::S(period.to_string()),
-            )
-            .update_expression("ADD total_tokens_in :ti, total_tokens_out :to, cache_read_tokens :crt, cache_write_tokens :cwt")
-            .expression_attribute_values(
-                ":ti",
-                aws_sdk_dynamodb::types::AttributeValue::N(usage.input_tokens.to_string()),
-            )
-            .expression_attribute_values(
-                ":to",
-                aws_sdk_dynamodb::types::AttributeValue::N(usage.output_tokens.to_string()),
-            )
-            .expression_attribute_values(
-                ":crt",
-                aws_sdk_dynamodb::types::AttributeValue::N(usage.cache_read_tokens.to_string()),
-            )
-            .expression_attribute_values(
-                ":cwt",
-                aws_sdk_dynamodb::types::AttributeValue::N(usage.cache_write_tokens.to_string()),
-            )
-            .send()
-            .await?;
-    }
+    // The team's counters already have these tokens: each model call is
+    // counted as it happens (common::usage).
 
     // If code was pushed, schedule a delayed resume to watch for CI
     if code_pushed {

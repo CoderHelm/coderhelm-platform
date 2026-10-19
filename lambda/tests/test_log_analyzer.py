@@ -11,6 +11,7 @@ import types
 import unittest
 
 HANDLER = pathlib.Path(__file__).resolve().parents[1] / "log-analyzer" / "handler.py"
+sys.path.insert(0, str(HANDLER.parent))
 
 
 def load_handler(model_id):
@@ -106,6 +107,59 @@ class Teams(unittest.TestCase):
         self.assertIn("boom", c["body"][2]["items"][0]["text"])
         self.assertEqual(c["body"][-1]["text"], "+2 more")
         self.assertEqual(c["actions"][0]["url"], "https://app.example/settings/aws")
+
+
+class UsageAccounting(unittest.TestCase):
+    def setUp(self):
+        import usage
+        self.u = usage
+
+    def test_all_four_parts_priced_per_model(self):
+        u = self.u.call_usage({
+            "input_tokens": 1_000_000, "output_tokens": 1_000_000,
+            "cache_read_input_tokens": 2_000_000, "cache_creation_input_tokens": 2_000_000,
+            "cache_creation": {"ephemeral_5m_input_tokens": 1_000_000, "ephemeral_1h_input_tokens": 1_000_000},
+        })
+        self.assertEqual(self.u.total_tokens(u), 6_000_000)
+        # Same numbers as the Rust test: Sonnet 5.5 = 2 + 0.2 + 2.5 + 4 + 10.
+        self.assertAlmostEqual(self.u.call_cost("claude-sonnet-5-5", u), 18.7, places=9)
+        self.assertAlmostEqual(self.u.call_cost("claude-opus-5-5", u), 37.4, places=9)
+
+    def test_unknown_model_is_never_free(self):
+        u = self.u.call_usage({"input_tokens": 1000, "output_tokens": 1000})
+        unknown = self.u.call_cost("claude-imaginary-9", u)
+        self.assertGreater(unknown, 0)
+        for m in self.u.PRICES:
+            self.assertGreaterEqual(unknown, self.u.call_cost(m, u))
+
+    def test_one_call_one_transaction_with_every_counter(self):
+        calls = []
+
+        class Client:
+            def transact_write_items(self, **kw):
+                calls.append(kw)
+
+        self.u.record_usage(Client(), "t", "team1", "log_analysis", "claude-sonnet-5-5",
+                            {"input_tokens": 5, "output_tokens": 7, "cache_read_input_tokens": 11})
+        self.u.record_usage(Client(), "t", "team1", "log_analysis", "claude-sonnet-5-5", {})  # empty: skipped
+        self.assertEqual(len(calls), 1)
+        items = calls[0]["TransactItems"]
+        self.assertEqual(len(items), 3)  # month, all time, day
+        upd = items[0]["Update"]
+        attrs = {upd["ExpressionAttributeNames"][k]: upd["ExpressionAttributeValues"][k.replace("#a", ":v")]["N"]
+                 for k in upd["ExpressionAttributeNames"]}
+        self.assertEqual(attrs["total_tokens"], "23")
+        self.assertEqual(attrs["total_tokens_in"], "5")
+        self.assertEqual(attrs["cache_read_tokens"], "11")
+        self.assertEqual(attrs["feature#log_analysis#tokens_out"], "7")
+        self.assertEqual(attrs["model#claude-sonnet-5-5#calls"], "1")
+
+    def test_accounting_errors_never_raise(self):
+        class Broken:
+            def transact_write_items(self, **kw):
+                raise RuntimeError("down")
+
+        self.u.record_usage(Broken(), "t", "team1", "log_analysis", "claude-sonnet-5-5", {"input_tokens": 1})
 
 
 if __name__ == "__main__":

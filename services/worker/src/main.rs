@@ -81,222 +81,232 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
         info!("Processing SQS message");
 
         let message: models::WorkerMessage = serde_json::from_str(&body)?;
-
-        match message {
-            models::WorkerMessage::Ticket(msg) => {
-                info!(team_id = %msg.team_id, ticket_id = %msg.ticket_id, "Starting ticket run");
-                if let Err(e) = passes::orchestrate_ticket(&state, msg).await {
-                    error!("Ticket run failed: {e}");
-                }
-            }
-            models::WorkerMessage::Feedback(msg) => {
-                info!(team_id = %msg.team_id, run_id = %msg.run_id, "Processing feedback");
-                let team_id = msg.team_id.clone();
-                let run_id = msg.run_id.clone();
-                if let Err(e) = passes::feedback::run(&state, msg).await {
-                    error!("Feedback run failed: {e}");
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let _ = state
-                        .dynamo
-                        .update_item()
-                        .table_name(&state.config.runs_table_name)
-                        .key(
-                            "team_id",
-                            aws_sdk_dynamodb::types::AttributeValue::S(team_id),
-                        )
-                        .key(
-                            "run_id",
-                            aws_sdk_dynamodb::types::AttributeValue::S(run_id.clone()),
-                        )
-                        .update_expression(
-                            "SET #s = :s, #e = :e, status_run_id = :sri, updated_at = :t",
-                        )
-                        .expression_attribute_names("#s", "status")
-                        .expression_attribute_names("#e", "error")
-                        .expression_attribute_values(
-                            ":s",
-                            aws_sdk_dynamodb::types::AttributeValue::S("failed".to_string()),
-                        )
-                        .expression_attribute_values(
-                            ":e",
-                            aws_sdk_dynamodb::types::AttributeValue::S(format!("{e}")),
-                        )
-                        .expression_attribute_values(
-                            ":sri",
-                            aws_sdk_dynamodb::types::AttributeValue::S(format!("failed#{run_id}")),
-                        )
-                        .expression_attribute_values(
-                            ":t",
-                            aws_sdk_dynamodb::types::AttributeValue::S(now),
-                        )
-                        .send()
-                        .await;
-                }
-            }
-            models::WorkerMessage::Onboard(msg) => {
-                info!(team_id = %msg.team_id, repos = msg.repos.len(), "Processing onboard");
-                let mut usage = models::TokenUsage::default();
-                if let Err(e) = passes::onboard::run(&state, msg, &mut usage).await {
-                    error!("Onboard failed: {e}");
-                }
-            }
-            models::WorkerMessage::MarkReady(msg) => {
-                info!(team_id = %msg.team_id, pr_number = msg.pr_number, "Marking PR ready");
-                if let Err(e) = mark_pr_ready(&state, msg).await {
-                    error!("Mark PR ready failed: {e}");
-                }
-            }
-            models::WorkerMessage::PlanExecute(msg) => {
-                info!(team_id = %msg.team_id, plan_id = %msg.plan_id, "Executing plan");
-                if let Err(e) = passes::plan_execute::run(&state, msg).await {
-                    error!("Plan execute failed: {e}");
-                }
-            }
-            models::WorkerMessage::PlanTaskContinue(msg) => {
-                info!(team_id = %msg.team_id, plan_id = %msg.plan_id, tasks = msg.tasks.len(), "Continuing plan tasks");
-                if let Err(e) = passes::plan_execute::continue_tasks(&state, msg).await {
-                    error!("Plan task continue failed: {e}");
-                }
-            }
-            models::WorkerMessage::InfraAnalyze(msg) => {
-                info!(team_id = %msg.team_id, "Analyzing infrastructure");
-                let team_id = msg.team_id.clone();
-                let mut usage = models::TokenUsage::default();
-                if let Err(e) = passes::infra_analyze::run(&state, msg, &mut usage).await {
-                    error!("Infra analyze failed: {e}");
-                    // Store failed status so the dashboard can show the error
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let _ = state
-                        .dynamo
-                        .put_item()
-                        .table_name(&state.config.infra_table_name)
-                        .item("pk", aws_sdk_dynamodb::types::AttributeValue::S(team_id))
-                        .item(
-                            "sk",
-                            aws_sdk_dynamodb::types::AttributeValue::S(
-                                "INFRA#analysis".to_string(),
-                            ),
-                        )
-                        .item(
-                            "status",
-                            aws_sdk_dynamodb::types::AttributeValue::S("failed".to_string()),
-                        )
-                        .item(
-                            "has_infra",
-                            aws_sdk_dynamodb::types::AttributeValue::Bool(false),
-                        )
-                        .item(
-                            "error",
-                            aws_sdk_dynamodb::types::AttributeValue::S(e.to_string()),
-                        )
-                        .item(
-                            "updated_at",
-                            aws_sdk_dynamodb::types::AttributeValue::S(now),
-                        )
-                        .send()
-                        .await;
-                }
-            }
-            models::WorkerMessage::Resume(msg) => {
-                info!(team_id = %msg.team_id, run_id = %msg.run_id, "Resuming run from webhook event");
-                if let Err(e) = passes::resume::run(&state, msg).await {
-                    error!("Resume failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::Review(msg) => {
-                info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), pr = msg.pr_number, "Reviewing PR from label");
-                if let Err(e) = passes::review_pr::run(&state, msg).await {
-                    error!("Review failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::ReviewReminder => {
-                info!("Running review-reminder sweep");
-                if let Err(e) = passes::review_reminder::run(&state).await {
-                    error!("Review reminder sweep failed: {e:?}");
-                }
-                if let Err(e) = passes::pr_outcomes::backfill(&state).await {
-                    error!("Merged PR backfill failed: {e:?}");
-                }
-                if let Err(e) = passes::skills::sweep(&state).await {
-                    error!("Skill repository sweep failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::SkillSync(msg) => {
-                info!(team_id = %msg.team_id, repo = %msg.repo, force = msg.force, "Skill repository sync");
-                if let Err(e) = passes::skills::sync(&state, msg).await {
-                    error!("Skill sync failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::SkillAsk(msg) => {
-                info!(team_id = %msg.team_id, repo = %msg.repo, agent = %msg.path, "Admin trying a team agent");
-                if let Err(e) = passes::skills::try_ask(&state, msg).await {
-                    error!("Team agent try failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::HealthCheck(msg) => {
-                info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Post-merge health check");
-                if let Err(e) = passes::health_check::run(&state, msg).await {
-                    error!("Health check failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::AwaitMerge(msg) => {
-                info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Armed auto-merge check");
-                if let Err(e) = passes::await_merge::run(&state, msg).await {
-                    error!("Await-merge failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::ToolProposals(msg) => {
-                info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), files = msg.paths.len(), "Tool proposals from repo");
-                if let Err(e) = passes::tool_proposals::run(&state, msg).await {
-                    error!("Tool proposals failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::TagSweep(msg) => {
-                info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), remaining_secs = msg.delay_remaining_secs, "Batched release-tag sweep");
-                if let Err(e) = passes::review_actions::run_tag_sweep(&state, msg).await {
-                    error!("Tag sweep failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::ReleaseNotes(msg) => {
-                info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), tag = %msg.tag, resend = %msg.resend, "Release notes");
-                if let Err(e) = passes::release_notes::run(&state, msg).await {
-                    error!("Release notes failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::TestIngest(msg) => {
-                info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), run_id = msg.run_id, "Reading E2E results");
-                if let Err(e) = passes::e2e::ingest(&state, msg).await {
-                    error!("E2E ingest failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::TestAction(msg) => {
-                info!(team_id = %msg.team_id, repo = %msg.repo, action = %msg.action, "E2E action");
-                if let Err(e) = passes::e2e::act(&state, msg).await {
-                    error!("E2E action failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::WeeklySummary => {
-                info!("Weekly summary emails");
-                if let Err(e) = passes::weekly_summary::run(&state).await {
-                    error!("Weekly summary failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::WeeklySummaryTest(msg) => {
-                info!(team_id = %msg.team_id, "Weekly summary test email");
-                if let Err(e) = passes::weekly_summary::run_test(&state, msg).await {
-                    error!("Weekly summary test failed: {e:?}");
-                }
-            }
-            models::WorkerMessage::GraphIndex(msg) => {
-                info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), incremental = msg.changed_files.is_some(), "Code-graph index pass");
-                if let Err(e) = passes::code_graph::run(&state, msg).await {
-                    error!("Code-graph index failed: {e:?}");
-                }
-            }
-        }
+        // Every model call made while handling this message is counted under
+        // the message's feature (spawned tasks fall back to "other").
+        let feature = message.usage_feature();
+        common::usage::with_feature(feature, handle_message(Arc::clone(&state), message)).await;
     }
 
     Ok(())
+}
+
+async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage) {
+    match message {
+        models::WorkerMessage::Ticket(msg) => {
+            info!(team_id = %msg.team_id, ticket_id = %msg.ticket_id, "Starting ticket run");
+            if let Err(e) = passes::orchestrate_ticket(&state, msg).await {
+                error!("Ticket run failed: {e}");
+            }
+        }
+        models::WorkerMessage::Feedback(msg) => {
+            info!(team_id = %msg.team_id, run_id = %msg.run_id, "Processing feedback");
+            let team_id = msg.team_id.clone();
+            let run_id = msg.run_id.clone();
+            if let Err(e) = passes::feedback::run(&state, msg).await {
+                error!("Feedback run failed: {e}");
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = state
+                    .dynamo
+                    .update_item()
+                    .table_name(&state.config.runs_table_name)
+                    .key(
+                        "team_id",
+                        aws_sdk_dynamodb::types::AttributeValue::S(team_id),
+                    )
+                    .key(
+                        "run_id",
+                        aws_sdk_dynamodb::types::AttributeValue::S(run_id.clone()),
+                    )
+                    .update_expression(
+                        "SET #s = :s, #e = :e, status_run_id = :sri, updated_at = :t",
+                    )
+                    .expression_attribute_names("#s", "status")
+                    .expression_attribute_names("#e", "error")
+                    .expression_attribute_values(
+                        ":s",
+                        aws_sdk_dynamodb::types::AttributeValue::S("failed".to_string()),
+                    )
+                    .expression_attribute_values(
+                        ":e",
+                        aws_sdk_dynamodb::types::AttributeValue::S(format!("{e}")),
+                    )
+                    .expression_attribute_values(
+                        ":sri",
+                        aws_sdk_dynamodb::types::AttributeValue::S(format!("failed#{run_id}")),
+                    )
+                    .expression_attribute_values(
+                        ":t",
+                        aws_sdk_dynamodb::types::AttributeValue::S(now),
+                    )
+                    .send()
+                    .await;
+            }
+        }
+        models::WorkerMessage::Onboard(msg) => {
+            info!(team_id = %msg.team_id, repos = msg.repos.len(), "Processing onboard");
+            let mut usage = models::TokenUsage::default();
+            if let Err(e) = passes::onboard::run(&state, msg, &mut usage).await {
+                error!("Onboard failed: {e}");
+            }
+        }
+        models::WorkerMessage::MarkReady(msg) => {
+            info!(team_id = %msg.team_id, pr_number = msg.pr_number, "Marking PR ready");
+            if let Err(e) = mark_pr_ready(&state, msg).await {
+                error!("Mark PR ready failed: {e}");
+            }
+        }
+        models::WorkerMessage::PlanExecute(msg) => {
+            info!(team_id = %msg.team_id, plan_id = %msg.plan_id, "Executing plan");
+            if let Err(e) = passes::plan_execute::run(&state, msg).await {
+                error!("Plan execute failed: {e}");
+            }
+        }
+        models::WorkerMessage::PlanTaskContinue(msg) => {
+            info!(team_id = %msg.team_id, plan_id = %msg.plan_id, tasks = msg.tasks.len(), "Continuing plan tasks");
+            if let Err(e) = passes::plan_execute::continue_tasks(&state, msg).await {
+                error!("Plan task continue failed: {e}");
+            }
+        }
+        models::WorkerMessage::InfraAnalyze(msg) => {
+            info!(team_id = %msg.team_id, "Analyzing infrastructure");
+            let team_id = msg.team_id.clone();
+            let mut usage = models::TokenUsage::default();
+            if let Err(e) = passes::infra_analyze::run(&state, msg, &mut usage).await {
+                error!("Infra analyze failed: {e}");
+                // Store failed status so the dashboard can show the error
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = state
+                    .dynamo
+                    .put_item()
+                    .table_name(&state.config.infra_table_name)
+                    .item("pk", aws_sdk_dynamodb::types::AttributeValue::S(team_id))
+                    .item(
+                        "sk",
+                        aws_sdk_dynamodb::types::AttributeValue::S("INFRA#analysis".to_string()),
+                    )
+                    .item(
+                        "status",
+                        aws_sdk_dynamodb::types::AttributeValue::S("failed".to_string()),
+                    )
+                    .item(
+                        "has_infra",
+                        aws_sdk_dynamodb::types::AttributeValue::Bool(false),
+                    )
+                    .item(
+                        "error",
+                        aws_sdk_dynamodb::types::AttributeValue::S(e.to_string()),
+                    )
+                    .item(
+                        "updated_at",
+                        aws_sdk_dynamodb::types::AttributeValue::S(now),
+                    )
+                    .send()
+                    .await;
+            }
+        }
+        models::WorkerMessage::Resume(msg) => {
+            info!(team_id = %msg.team_id, run_id = %msg.run_id, "Resuming run from webhook event");
+            if let Err(e) = passes::resume::run(&state, msg).await {
+                error!("Resume failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::Review(msg) => {
+            info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), pr = msg.pr_number, "Reviewing PR from label");
+            if let Err(e) = passes::review_pr::run(&state, msg).await {
+                error!("Review failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::ReviewReminder => {
+            info!("Running review-reminder sweep");
+            if let Err(e) = passes::review_reminder::run(&state).await {
+                error!("Review reminder sweep failed: {e:?}");
+            }
+            if let Err(e) = passes::pr_outcomes::backfill(&state).await {
+                error!("Merged PR backfill failed: {e:?}");
+            }
+            if let Err(e) = passes::skills::sweep(&state).await {
+                error!("Skill repository sweep failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::SkillSync(msg) => {
+            info!(team_id = %msg.team_id, repo = %msg.repo, force = msg.force, "Skill repository sync");
+            if let Err(e) = passes::skills::sync(&state, msg).await {
+                error!("Skill sync failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::SkillAsk(msg) => {
+            info!(team_id = %msg.team_id, repo = %msg.repo, agent = %msg.path, "Admin trying a team agent");
+            if let Err(e) = passes::skills::try_ask(&state, msg).await {
+                error!("Team agent try failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::HealthCheck(msg) => {
+            info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Post-merge health check");
+            if let Err(e) = passes::health_check::run(&state, msg).await {
+                error!("Health check failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::AwaitMerge(msg) => {
+            info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Armed auto-merge check");
+            if let Err(e) = passes::await_merge::run(&state, msg).await {
+                error!("Await-merge failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::ToolProposals(msg) => {
+            info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), files = msg.paths.len(), "Tool proposals from repo");
+            if let Err(e) = passes::tool_proposals::run(&state, msg).await {
+                error!("Tool proposals failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::TagSweep(msg) => {
+            info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), remaining_secs = msg.delay_remaining_secs, "Batched release-tag sweep");
+            if let Err(e) = passes::review_actions::run_tag_sweep(&state, msg).await {
+                error!("Tag sweep failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::ReleaseNotes(msg) => {
+            info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), tag = %msg.tag, resend = %msg.resend, "Release notes");
+            if let Err(e) = passes::release_notes::run(&state, msg).await {
+                error!("Release notes failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::TestIngest(msg) => {
+            info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), run_id = msg.run_id, "Reading E2E results");
+            if let Err(e) = passes::e2e::ingest(&state, msg).await {
+                error!("E2E ingest failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::TestAction(msg) => {
+            info!(team_id = %msg.team_id, repo = %msg.repo, action = %msg.action, "E2E action");
+            if let Err(e) = passes::e2e::act(&state, msg).await {
+                error!("E2E action failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::WeeklySummary => {
+            info!("Weekly summary emails");
+            if let Err(e) = passes::weekly_summary::run(&state).await {
+                error!("Weekly summary failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::WeeklySummaryTest(msg) => {
+            info!(team_id = %msg.team_id, "Weekly summary test email");
+            if let Err(e) = passes::weekly_summary::run_test(&state, msg).await {
+                error!("Weekly summary test failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::GraphIndex(msg) => {
+            info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), incremental = msg.changed_files.is_some(), "Code-graph index pass");
+            if let Err(e) = passes::code_graph::run(&state, msg).await {
+                error!("Code-graph index failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::UsageReconcile(msg) => {
+            info!(day = %msg.day, "Usage reconciliation");
+            if let Err(e) = passes::usage_reconcile::run(&state, msg).await {
+                error!("Usage reconciliation failed: {e}");
+            }
+        }
+    }
 }
 
 async fn mark_pr_ready(
