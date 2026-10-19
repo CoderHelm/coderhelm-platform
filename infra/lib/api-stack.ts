@@ -493,6 +493,16 @@ export class ApiStack extends cdk.Stack {
 
     props.bucket.grantReadWrite(this.mcpProxyFunction);
     this.mcpProxyFunction.grantInvoke(this.gatewayFunction);
+    // The plan chat's skills, agents and data source tools run in the
+    // worker, named rather than referenced: the worker stack depends on this
+    // one.
+    this.gatewayFunction.addEnvironment("WORKER_FUNCTION_NAME", `${prefix}-worker`);
+    this.gatewayFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["lambda:InvokeFunction"],
+        resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-worker`],
+      })
+    );
     this.gatewayFunction.addEnvironment(
       "MCP_PROXY_FUNCTION_NAME",
       this.mcpProxyFunction.functionName

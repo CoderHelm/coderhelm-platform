@@ -641,6 +641,7 @@ fn has_time_for_remediation(start: &Instant) -> bool {
     remaining_secs(start) >= MIN_TIME_FOR_REMEDIATION_SECS
 }
 
+pub mod agent_tools;
 pub mod await_merge;
 pub mod code_graph;
 pub mod e2e;
@@ -654,6 +655,7 @@ pub mod live_sources;
 pub mod onboard;
 pub mod ops_tools;
 mod plan;
+pub mod plan_chat;
 pub mod plan_execute;
 mod pr;
 pub mod pr_outcomes;

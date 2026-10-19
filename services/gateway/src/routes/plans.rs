@@ -139,6 +139,12 @@ pub async fn create_plan(
         .item("created_at", attr_s(&now))
         .item("updated_at", attr_s(&now));
 
+    // The chat the plan was made in, so its page can say what the chat used.
+    let chat_id = super::plan_chat_tools::chat_id(body["chat_id"].as_str());
+    if chat_id != "unsaved" {
+        put = put.item("chat_id", attr_s(&chat_id));
+    }
+
     // Store which MCP servers were used during chat planning
     if let Some(servers) = body["mcp_servers"].as_array() {
         let server_list: Vec<aws_sdk_dynamodb::types::AttributeValue> = servers
@@ -1178,6 +1184,7 @@ fn plan_from_item(
         "tokens_out": item.get("total_tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "destination": item.get("destination").and_then(|v| v.as_s().ok()),
         "mcp_servers": if mcp_servers.is_empty() { Value::Null } else { json!(mcp_servers) },
+        "chat_id": item.get("chat_id").and_then(|v| v.as_s().ok()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
         "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
         "executed_at": item.get("executed_at").and_then(|v| v.as_s().ok()),
@@ -2016,6 +2023,9 @@ struct PlanChatContext {
     github_token: Option<String>,
     /// Repo name → default branch mapping for codebase tools
     repo_branches: std::collections::HashMap<String, String>,
+    /// The team's skills, agents and data source tools, run in the worker.
+    worker: super::plan_chat_tools::WorkerTools,
+    scope: super::plan_chat_tools::ChatScope,
 }
 
 /// Load all context needed for plan chat (DynamoDB, S3, prompt assembly, message conversion).
@@ -2024,6 +2034,7 @@ async fn load_plan_chat_context(
     state: &AppState,
     team_id: &str,
     messages_input: &[Value],
+    body: &Value,
 ) -> Result<PlanChatContext, StatusCode> {
     // Load org context, repo list, log analyzer flag, enabled plugins, templates, and team META in parallel
     let (
@@ -2107,6 +2118,23 @@ async fn load_plan_chat_context(
                 .collect()
         })
         .unwrap_or_default();
+
+    // The chat's repository (the one picked, else the first), for the team's
+    // skills, agents and data sources run in the worker.
+    let chat_repo = body["repo"]
+        .as_str()
+        .filter(|r| repo_list.iter().any(|x| x == r))
+        .map(str::to_string)
+        .or_else(|| repo_list.first().cloned())
+        .unwrap_or_default();
+    let scope = super::plan_chat_tools::ChatScope {
+        team_id: team_id.to_string(),
+        chat_id: super::plan_chat_tools::chat_id(body["chat_id"].as_str()),
+        branch: repo_branches.get(&chat_repo).cloned().unwrap_or_default(),
+        repo: chat_repo,
+        first: messages_input.len() <= 1,
+    };
+    let worker = super::plan_chat_tools::setup(state, &scope).await;
 
     // Get GitHub installation token for codebase tools
     let installation_id_opt = team_meta_result
@@ -2263,6 +2291,7 @@ async fn load_plan_chat_context(
              before breaking it into tasks.",
         );
     }
+    system_prompt.push_str(&super::plan_chat_tools::prompt(&worker));
     if let Some(context) = log_analyzer_context.filter(|c| !c.is_empty()) {
         system_prompt.push_str(&format!(
             "\n\nAWS Log Analyzer context (enabled in workflow settings):\n{context}"
@@ -2349,6 +2378,8 @@ async fn load_plan_chat_context(
         }));
     }
 
+    tools.extend(worker.tools.iter().cloned());
+
     // Add cache_control to last tool for prompt caching
     if let Some(last) = tools.last_mut() {
         last["cache_control"] = json!({"type": "ephemeral"});
@@ -2370,6 +2401,8 @@ async fn load_plan_chat_context(
         tools,
         github_token,
         repo_branches,
+        worker,
+        scope,
     })
 }
 
@@ -2386,7 +2419,7 @@ pub async fn plan_chat(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input).await?;
+    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input, &body).await?;
     let mut api_messages = ctx.messages;
 
     // Load team's Anthropic API key
@@ -2427,6 +2460,8 @@ pub async fn plan_chat(
     let max_turns = 5;
     let mut mcp_servers_used: std::collections::HashSet<String> = std::collections::HashSet::new();
     let http = reqwest::Client::new();
+    let mut worker_used = super::plan_chat_tools::Used::default();
+    let mut used_items: Vec<Value> = Vec::new();
 
     for turn in 0..max_turns {
         let mut body = json!({
@@ -2502,8 +2537,36 @@ pub async fn plan_chat(
                 .join("");
 
             let servers: Vec<&str> = mcp_servers_used.iter().map(|s| s.as_str()).collect();
-            return Ok(Json(json!({ "content": text, "mcp_servers": servers })));
+            return Ok(Json(
+                json!({ "content": text, "mcp_servers": servers, "used": used_items }),
+            ));
         }
+
+        // The team's skills, agents and data sources run in the worker, one
+        // at a time so their limits hold.
+        let mut worker_results: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for tu in &tool_uses {
+            let name = tu["name"].as_str().unwrap_or("");
+            if ctx.worker.names.contains(name) {
+                let (text, used) = super::plan_chat_tools::call(
+                    &state,
+                    &ctx.scope,
+                    &mut worker_used,
+                    name,
+                    &tu["input"],
+                )
+                .await;
+                if let Some(u) = used {
+                    used_items.push(u);
+                }
+                worker_results.insert(tu["id"].as_str().unwrap_or("").to_string(), text);
+            }
+        }
+        let tool_uses: Vec<Value> = tool_uses
+            .into_iter()
+            .filter(|tu| !ctx.worker.names.contains(tu["name"].as_str().unwrap_or("")))
+            .collect();
 
         // Execute tool calls in parallel (built-in GitHub tools + MCP proxy tools)
         let github_token_ref = &ctx.github_token;
@@ -2541,7 +2604,10 @@ pub async fn plan_chat(
         }).collect();
         let tool_results_raw = futures::future::join_all(tool_futures).await;
 
-        let mut tool_results: Vec<Value> = Vec::new();
+        let mut tool_results: Vec<Value> = worker_results
+            .into_iter()
+            .map(|(id, text)| json!({"type": "tool_result", "tool_use_id": id, "content": text}))
+            .collect();
         for (tool_use_id, server_id, result) in tool_results_raw {
             if let Some(sid) = server_id {
                 mcp_servers_used.insert(sid);
@@ -2579,7 +2645,9 @@ pub async fn plan_chat(
         .unwrap_or_default();
 
     let servers: Vec<&str> = mcp_servers_used.iter().map(|s| s.as_str()).collect();
-    Ok(Json(json!({ "content": text, "mcp_servers": servers })))
+    Ok(Json(
+        json!({ "content": text, "mcp_servers": servers, "used": used_items }),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2610,8 +2678,11 @@ async fn run_anthropic_stream(
     team_id: &str,
     github_token: &Option<String>,
     repo_branches: &std::collections::HashMap<String, String>,
+    worker: &super::plan_chat_tools::WorkerTools,
+    scope: &super::plan_chat_tools::ChatScope,
 ) {
     use futures::StreamExt;
+    let mut worker_used = super::plan_chat_tools::Used::default();
 
     let http = reqwest::Client::new();
     let max_turns = 5;
@@ -2865,7 +2936,14 @@ async fn run_anthropic_stream(
                 ))
                 .await;
 
-            let result = if let Some((server_id, tool_name)) = tu_name.split_once("__") {
+            let mut used = None;
+            let result = if worker.names.contains(tu_name.as_str()) {
+                let (text, u) =
+                    super::plan_chat_tools::call(state, scope, &mut worker_used, tu_name, &input)
+                        .await;
+                used = u;
+                json!(text)
+            } else if let Some((server_id, tool_name)) = tu_name.split_once("__") {
                 if server_id == "github" {
                     let output =
                         execute_github_tool(&http, github_token, repo_branches, tool_name, &input)
@@ -2902,7 +2980,7 @@ async fn run_anthropic_stream(
             let _ = tx
                 .send(sse_event(
                     "tool_result",
-                    json!({"id": tu_id, "name": tu_name, "status": status, "summary": summary}),
+                    json!({"id": tu_id, "name": tu_name, "status": status, "summary": summary, "used": used}),
                 ))
                 .await;
 
@@ -2985,7 +3063,7 @@ pub async fn plan_chat_stream(
         "plan_chat_stream: starting"
     );
 
-    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input).await.inspect_err(|&s| {
+    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input, &body).await.inspect_err(|&s| {
         error!(status = %s, team_id = %claims.team_id, "plan_chat_stream: load_plan_chat_context failed");
     })?;
     let mut api_messages = ctx.messages;
@@ -3026,6 +3104,8 @@ pub async fn plan_chat_stream(
     let tools = ctx.tools;
     let github_token = ctx.github_token;
     let repo_branches = ctx.repo_branches;
+    let worker = ctx.worker;
+    let scope = ctx.scope;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<
         Result<axum::response::sse::Event, std::convert::Infallible>,
@@ -3053,6 +3133,8 @@ pub async fn plan_chat_stream(
                 &team_id,
                 &github_token,
                 &repo_branches,
+                &worker,
+                &scope,
             )
             .await;
         } else {

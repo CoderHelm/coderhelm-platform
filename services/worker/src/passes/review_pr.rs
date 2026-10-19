@@ -421,6 +421,7 @@ pub async fn run(
         }
         if let Some(s) = &skills {
             tools.extend(s.tools());
+            s.offer(&tools);
         }
         let mut messages = vec![(
             "user".to_string(),

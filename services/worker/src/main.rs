@@ -68,11 +68,28 @@ async fn main() -> Result<(), Error> {
         secrets,
     });
 
-    lambda_runtime::run(service_fn(move |event: LambdaEvent<SqsEvent>| {
+    lambda_runtime::run(service_fn(move |event: LambdaEvent<serde_json::Value>| {
         let state = Arc::clone(&state);
-        async move { handle_sqs(state, event).await }
+        async move { handle_event(state, event).await }
     }))
     .await
+}
+
+/// An SQS batch (the queues), or a direct call from the gateway: the plan
+/// chat's skills, agents and data source tools, answered right away.
+async fn handle_event(
+    state: Arc<WorkerState>,
+    event: LambdaEvent<serde_json::Value>,
+) -> Result<serde_json::Value, Error> {
+    let (payload, context) = event.into_parts();
+    if let Some(req) = payload.get("plan_chat") {
+        let req: passes::plan_chat::Request = serde_json::from_value(req.clone())?;
+        let call = passes::plan_chat::handle(&state, req);
+        return Ok(common::usage::with_feature(common::usage::feature::CHAT, call).await);
+    }
+    let sqs: SqsEvent = serde_json::from_value(payload)?;
+    handle_sqs(state, LambdaEvent::new(sqs, context)).await?;
+    Ok(serde_json::Value::Null)
 }
 
 async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Result<(), Error> {

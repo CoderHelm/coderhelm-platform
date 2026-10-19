@@ -94,6 +94,9 @@ export class StreamingStack extends cdk.Stack {
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         MODEL_ID: "claude-sonnet-5-5",
         MCP_PROXY_FUNCTION_NAME: props.mcpProxyFunction.functionName,
+        // The plan chat's skills, agents and data source tools run in the
+        // worker (by name: the worker stack depends on the API stack).
+        WORKER_FUNCTION_NAME: `${prefix}-worker`,
         // Unused by streaming but required by shared binary
         TICKET_QUEUE_URL: "unused",
         CI_FIX_QUEUE_URL: "unused",
@@ -122,6 +125,13 @@ export class StreamingStack extends cdk.Stack {
       `${prefix}-analytics`
     );
     analyticsTable.grantReadWriteData(this.streamingFunction);
+
+    this.streamingFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["lambda:InvokeFunction"],
+        resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-worker`],
+      })
+    );
 
     // Bedrock streaming access
     this.streamingFunction.addToRolePolicy(

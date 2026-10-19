@@ -32,6 +32,9 @@ pub struct Config {
     pub cognito_client_id: String,
     pub cognito_domain: String,
     pub mcp_proxy_function_name: String,
+    /// The worker, called directly for the plan chat's skills, agents and
+    /// data source tools. Empty: the chat goes without them.
+    pub worker_function_name: String,
     pub traces_table_name: String,
     /// KMS key that seals teams' data-source keys. Empty disables saving them.
     pub secrets_key_id: String,
@@ -86,6 +89,7 @@ impl Config {
                 .expect("COGNITO_CLIENT_ID required"),
             cognito_domain: std::env::var("COGNITO_DOMAIN").expect("COGNITO_DOMAIN required"),
             mcp_proxy_function_name: std::env::var("MCP_PROXY_FUNCTION_NAME").unwrap_or_default(),
+            worker_function_name: std::env::var("WORKER_FUNCTION_NAME").unwrap_or_default(),
             traces_table_name: std::env::var("TRACES_TABLE_NAME").unwrap_or_default(),
             secrets_key_id: std::env::var("SECRETS_KEY_ID").unwrap_or_default(),
             tests_table_name: std::env::var("TESTS_TABLE_NAME").unwrap_or_default(),

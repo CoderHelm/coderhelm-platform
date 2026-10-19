@@ -510,6 +510,7 @@ Rules:
     });
     if let Some(s) = &skills {
         tools.extend(s.tools());
+        s.offer(&tools);
         full_system.push_str(&s.prompt_section());
         s.record_applied(state).await;
     }
@@ -1353,7 +1354,24 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
             }
         }
         if let Some(skills) = self.skills {
-            if let Some(out) = skills.handle(self.state, name, input).await {
+            if let Some(out) = skills
+                .handle(
+                    self.state,
+                    name,
+                    input,
+                    &skills.host(
+                        self,
+                        Some(super::agent_tools::RepoReads {
+                            github: self.github,
+                            owner: self.owner,
+                            repo: self.repo,
+                            git_ref: self.branch,
+                            http: &self.state.http,
+                        }),
+                    ),
+                )
+                .await
+            {
                 return Ok(serde_json::json!(out));
             }
         }

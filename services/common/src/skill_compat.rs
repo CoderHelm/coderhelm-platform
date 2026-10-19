@@ -33,14 +33,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Bumped when the analysis format changes, so every item is checked again.
-pub const FORMAT: u32 = 6;
+pub const FORMAT: u32 = 7;
 /// Longest translated text kept.
 pub const MAX_TRANSLATED_CHARS: usize = 64_000;
 const MAX_STEPS: usize = 40;
 const MAX_REQUIREMENTS: usize = 12;
 
 /// One tool Coderhelm's agents have.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
     pub what: String,
@@ -48,7 +48,15 @@ pub struct Tool {
     /// system.
     #[serde(default)]
     pub writes_repo: bool,
+    /// Which of Coderhelm's agents have it ("planner", "coder", "reviewer"),
+    /// when not all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passes: Vec<String>,
 }
+
+/// What runs an item, which decides the tools it is checked against.
+pub const RUNTIME_READERS: &str = "readers";
+pub const RUNTIME_AGENT: &str = "agent";
 
 /// An MCP server the team switched on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +123,17 @@ pub struct Inventory {
     #[serde(default)]
     pub connections: Vec<String>,
     pub never: Vec<String>,
+    /// What runs the item: [`RUNTIME_READERS`] (a skill or command, read by
+    /// the planner, coder and reviewer) or [`RUNTIME_AGENT`] (a team agent,
+    /// asked a question and given only the read-only tools its own file
+    /// lists). Empty is the readers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub runtime: String,
+    /// Coderhelm tools that exist but this item never gets (an agent's
+    /// file didn't list them, or they write). Never valid in `uses` or the
+    /// translation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub elsewhere: Vec<String>,
 }
 
 impl Inventory {
@@ -130,7 +149,75 @@ impl Inventory {
         self.sources
             .sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
         self.team_tools.sort_by(|a, b| a.name.cmp(&b.name));
+        self.elsewhere.sort();
+        self.elsewhere.dedup();
         self
+    }
+
+    /// Whether this is a team agent's inventory.
+    pub fn is_agent(&self) -> bool {
+        self.runtime == RUNTIME_AGENT
+    }
+
+    /// The inventory a team agent runs with: only the `granted` tools (the
+    /// read-only ones its file lists), no MCP server (agents never get one),
+    /// and every other Coderhelm tool listed under `elsewhere`.
+    pub fn for_agent(&self, granted: &[String]) -> Inventory {
+        let has = |n: &str| granted.iter().any(|g| g == n);
+        let all = self.tool_names();
+        let builtin: Vec<Tool> = self
+            .builtin
+            .iter()
+            .filter(|t| has(&t.name))
+            .cloned()
+            .map(|t| Tool {
+                passes: Vec::new(),
+                ..t
+            })
+            .collect();
+        let sources: Vec<Source> = self
+            .sources
+            .iter()
+            .filter_map(|s| {
+                let tools: Vec<String> = s.tools.iter().filter(|t| has(t)).cloned().collect();
+                (!tools.is_empty()).then(|| Source {
+                    tools,
+                    writes: Vec::new(),
+                    ..s.clone()
+                })
+            })
+            .collect();
+        let team_tools: Vec<Tool> = self
+            .team_tools
+            .iter()
+            .filter(|t| has(&t.name))
+            .cloned()
+            .collect();
+        let translations = self
+            .translations
+            .iter()
+            .filter(|t| t.uses.iter().all(|u| builtin.iter().any(|b| &b.name == u)))
+            .cloned()
+            .collect();
+        let mut inv = Inventory {
+            builtin,
+            github: self.github.clone(),
+            servers: Vec::new(),
+            connectable: self.connectable.clone(),
+            sources,
+            team_tools,
+            translations,
+            connections: self.connections.clone(),
+            never: AGENT_NEVER.iter().map(|s| s.to_string()).collect(),
+            runtime: RUNTIME_AGENT.into(),
+            elsewhere: Vec::new(),
+        };
+        let mine = inv.tool_names();
+        inv.elsewhere = all.into_iter().filter(|t| !mine.contains(t)).collect();
+        for s in &self.servers {
+            inv.elsewhere.extend(s.tools.iter().cloned());
+        }
+        inv.sorted()
     }
 
     /// Changes whenever anything an item can rely on changes, or the
@@ -193,6 +280,16 @@ impl Inventory {
         })
     }
 }
+
+/// What a team agent never does in Coderhelm.
+const AGENT_NEVER: &[&str] = &[
+    "Write anything: no file, pull request, comment or outside page (it answers the agent that \
+     asked it, which decides what to do)",
+    "Run commands, checks or builds: there is no terminal",
+    "Use a tool its own file doesn't list (tools: / allowed-tools:), or an MCP server",
+    "Read a person's computer or home folder (paths like ~/...)",
+    "Browse the web",
+];
 
 /// What one step relies on, and how Coderhelm covers it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +483,15 @@ the team really has in Coderhelm, a hosted coding agent. The item was written fo
 read and change the repository through a pull request and may use only the tools in the \
 inventory you are given.
 
+The inventory's `runtime` says what runs the item. `readers` (or none): a skill or command, \
+read as guidance by Coderhelm's planner, coder and reviewer, with the tools listed (a tool's \
+`passes` says which of them has it when not all). `agent`: a team agent. Coderhelm's planner, \
+coder or reviewer asks it one question; it answers with ONLY the read-only tools its own file \
+lists, mapped to Coderhelm's (exactly the inventory's tools), within a few calls. It never \
+writes (no file, pull request, comment or page: a write it asks for is blocked, `write` repo or \
+outside), never runs a command or check, and never gets any other tool. `elsewhere` lists \
+Coderhelm tools this item does NOT get: never put one in `uses` or in the translation.
+
 Read the WHOLE text, not just its front matter. Split it into the ordered steps it lays out (its \
 own headings or numbered steps; a short item may be one or two steps). For each step list every \
 tool, command, system, data source, file path or outside write it relies on, and classify each \
@@ -439,7 +545,8 @@ repository, a file on someone's own computer.
 directly; don't change your mind between checks of the same text.
 
 Then write `translated`: the item rewritten for Coderhelm, in the same markdown style. Keep its \
-intent, structure, order and output format. Replace each tool or command with the Coderhelm tool \
+intent, structure, order and output format. Only name tools this inventory gives the item \
+(never one under `elsewhere`). Replace each tool or command with the Coderhelm tool \
 that does it, by its exact name and source (for a translated command, say so briefly, e.g. \
 \"uses the GitHub API instead of git clone\"). Where something is missing, keep the step and mark \
 it inline as `GAP: <step> — <what it tried to do> — not connected in Coderhelm (<fix>)`, so a \
@@ -506,6 +613,7 @@ pub fn finish(
             .filter(|q| !q.asks.trim().is_empty())
             .map(|q| check(q, inv))
             .collect();
+        let reqs = merge_same(reqs);
         let does = clip(&s.does, 400);
         let mut title = clip(&s.title, 120);
         if !has_words(&title) {
@@ -553,6 +661,10 @@ pub fn finish(
     if thin {
         translated.clear();
         notes.push("The translated version came back nearly empty, so none is kept. Re-check to try again.".into());
+    }
+    let (translated, named) = enforce_translation(&translated, inv);
+    if let Some(n) = repaired_note(&named, inv) {
+        notes.push(n);
     }
     Ok((tally(steps, notes), translated))
 }
@@ -802,6 +914,19 @@ fn check_inner(q: Requirement, inv: &Inventory) -> Requirement {
     if !STATUSES.contains(&q.status.as_str()) {
         q.status = "missing".into();
     }
+    if inv.is_agent() && q.kind != "person" && q.write == "repo" {
+        // A team agent never writes, not even to the repository.
+        q.status = "blocked".into();
+        q.uses.clear();
+        q.basis = "inventory".into();
+        q.needs = "Write access".into();
+        q.fix = AGENT_WRITE_FIX.into();
+        q.connect = "none".into();
+        q.server.clear();
+        q.connection.clear();
+        q.action = "none".into();
+        return q;
+    }
     let settled = settle(&mut q, inv);
     q.basis = if settled { "inventory" } else { "model" }.into();
     let talks = settled && q.kind == "person";
@@ -815,6 +940,26 @@ fn check_inner(q: Requirement, inv: &Inventory) -> Requirement {
             .collect();
         q.status = "missing".into();
         q.uses.retain(|u| inv.has_tool(u));
+        let not_given: Vec<&String> = unknown
+            .iter()
+            .filter(|u| inv.elsewhere.contains(u))
+            .collect();
+        if !not_given.is_empty() {
+            // Coderhelm has it, this item doesn't get it: say so, whatever
+            // the model wrote.
+            q.fix = elsewhere_fix(inv, &not_given);
+            q.needs = clip(
+                &not_given
+                    .iter()
+                    .map(|u| u.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                60,
+            );
+            q.connect = "none".into();
+            q.server.clear();
+            q.connection.clear();
+        }
         if q.fix.is_empty() {
             q.fix = if unknown.is_empty() {
                 "Coderhelm has no tool for this.".into()
@@ -913,6 +1058,192 @@ fn check_inner(q: Requirement, inv: &Inventory) -> Requirement {
     }
     .to_string();
     q
+}
+
+/// What `fix` says for a team agent's write.
+const AGENT_WRITE_FIX: &str =
+    "Team agents only read and answer; the planner, coder or reviewer that asked makes any change.";
+
+/// What `fix` says for tools Coderhelm has that this item doesn't get. No
+/// backticks: it names tools the item can't use.
+fn elsewhere_fix(inv: &Inventory, tools: &[&String]) -> String {
+    let names = tools
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if inv.is_agent() {
+        format!(
+            "A team agent gets only the read-only tools its own file lists; {names} isn't one \
+             of them. Add the matching tool to its tools: line if it should read this."
+        )
+    } else {
+        format!("{names} isn't given to the agents that read this item.")
+    }
+}
+
+/// A requirement as compared within a step: what it asks for, lowercased,
+/// without backticks, quotes or extra spaces.
+fn asks_key(asks: &str) -> String {
+    asks.to_lowercase()
+        .replace(['`', '"', '\''], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(['.', ',', ';', ':'])
+        .to_string()
+}
+
+/// One requirement per thing a step asks for: two that ask for the same
+/// (the same words, or a command and the same command with arguments) are
+/// one, with the best status the runtime really supports (each was already
+/// checked against the inventory, so a translated or available one names
+/// tools the item has), and the tools of every requirement with that
+/// status. Order is kept from the first.
+pub fn merge_same(reqs: Vec<Requirement>) -> Vec<Requirement> {
+    let same = |a: &str, b: &str| {
+        a == b || a.starts_with(&format!("{b} ")) || b.starts_with(&format!("{a} "))
+    };
+    let mut out: Vec<(String, Requirement)> = Vec::new();
+    for q in reqs {
+        let key = asks_key(&q.asks);
+        match out.iter_mut().find(|(k, _)| same(k, &key)) {
+            Some((k, kept)) => {
+                if rank(&q.status) < rank(&kept.status) {
+                    // The shorter wording names it.
+                    let asks = if key.len() < k.len() {
+                        q.asks.clone()
+                    } else {
+                        kept.asks.clone()
+                    };
+                    if key.len() < k.len() {
+                        *k = key;
+                    }
+                    *kept = Requirement { asks, ..q };
+                } else if q.status == kept.status {
+                    for u in q.uses {
+                        if !kept.uses.contains(&u) {
+                            kept.uses.push(u);
+                        }
+                    }
+                }
+            }
+            None => out.push((key, q)),
+        }
+    }
+    out.into_iter().map(|(_, q)| q).collect()
+}
+
+/// Every name in backticks in `text`, in order.
+pub fn backticked(text: &str) -> Vec<String> {
+    text.split('`')
+        .skip(1)
+        .step_by(2)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The translation with every tool this item doesn't get (`elsewhere`)
+/// taken out of backticks and marked as a gap, and the tools it named. A
+/// translation is guidance an agent follows: it must never send it to a
+/// tool it can't call.
+pub fn enforce_translation(text: &str, inv: &Inventory) -> (String, Vec<String>) {
+    let mut named: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(text.len());
+    let mut parts = text.split('`').peekable();
+    let mut inside = false;
+    while let Some(part) = parts.next() {
+        if !inside {
+            out.push_str(part);
+        } else if parts.peek().is_none() {
+            // An unclosed backtick: keep the text as it was.
+            out.push('`');
+            out.push_str(part);
+        } else {
+            let t = part.trim();
+            if inv.elsewhere.iter().any(|e| e == t) {
+                if !named.iter().any(|n| n == t) {
+                    named.push(t.to_string());
+                }
+                out.push_str(&format!(
+                    "{t} (GAP: {})",
+                    if inv.is_agent() {
+                        "not one of this agent's tools"
+                    } else {
+                        "not given to the agents that read this"
+                    }
+                ));
+            } else {
+                out.push('`');
+                out.push_str(part);
+                out.push('`');
+            }
+        }
+        inside = !inside;
+    }
+    (out, named)
+}
+
+/// The note kept when the translation named tools the item doesn't get.
+fn repaired_note(named: &[String], inv: &Inventory) -> Option<String> {
+    (!named.is_empty()).then(|| {
+        format!(
+            "The translation named {} that {} doesn't get; each is marked as a gap.",
+            named.join(", "),
+            if inv.is_agent() {
+                "this agent"
+            } else {
+                "this item"
+            }
+        )
+    })
+}
+
+/// A kept check and translation, held to the item's runtime: any tool it
+/// can't call is taken out of the translation (with a note, once) and its
+/// requirements merged and settled again. What's stored always passes
+/// [`violations`].
+pub fn enforce(mut a: Analysis, translated: String, inv: &Inventory) -> (Analysis, String) {
+    let (translated, named) = enforce_translation(&translated, inv);
+    if a.status == "partial" || a.steps.is_empty() {
+        return (a, translated);
+    }
+    let meta = a.clone();
+    let mut notes = std::mem::take(&mut a.notes);
+    if let Some(n) = repaired_note(&named, inv) {
+        if !notes.contains(&n) {
+            notes.push(n);
+        }
+    }
+    let mut out = tally(resettle(&a.steps, inv), notes);
+    out.model = meta.model;
+    out.input_tokens = meta.input_tokens;
+    out.output_tokens = meta.output_tokens;
+    out.cost_usd = meta.cost_usd;
+    out.ms = meta.ms;
+    (out, translated)
+}
+
+/// Tools a kept check names that its runtime doesn't have: in the
+/// translation's backticks and in any requirement's `uses`. Empty when the
+/// check is sound.
+pub fn violations(a: &Analysis, translated: &str, inv: &Inventory) -> Vec<String> {
+    let mut v: Vec<String> = backticked(translated)
+        .into_iter()
+        .filter(|t| inv.elsewhere.contains(t))
+        .map(|t| format!("translation: {t}"))
+        .collect();
+    for s in &a.steps {
+        for q in &s.requirements {
+            for u in &q.uses {
+                if !inv.has_tool(u) {
+                    v.push(format!("step \"{}\": {u}", s.title));
+                }
+            }
+        }
+    }
+    v
 }
 
 /// What the item needs, most steps held up first.
@@ -1181,6 +1512,7 @@ fn resettle(steps: &[Step], inv: &Inventory) -> Vec<Step> {
                 .cloned()
                 .map(|q| check(q, inv))
                 .collect();
+            let requirements = merge_same(requirements);
             Step {
                 status: step_status(&requirements),
                 requirements,
@@ -1201,11 +1533,13 @@ mod tests {
                     name: "read_file".into(),
                     what: "Read a file".into(),
                     writes_repo: false,
+                    passes: vec![],
                 },
                 Tool {
                     name: "write_file".into(),
                     what: "Write a file".into(),
                     writes_repo: true,
+                    passes: vec![],
                 },
             ],
             github: vec!["Compare the branch to its base".into()],
@@ -1241,6 +1575,7 @@ mod tests {
                 note: "Searches the repository through GitHub".into(),
             }],
             never: vec!["Run a shell".into()],
+            ..Default::default()
         }
         .sorted()
     }
@@ -1259,6 +1594,174 @@ mod tests {
             "connect": "plugins", "server": "", "connection": connection
         }))
         .unwrap()
+    }
+
+    /// A reader inventory with the coder's check runner and the reading
+    /// tools, as a team agent's comes from it.
+    fn readers() -> Inventory {
+        let t = |name: &str, writes_repo: bool| Tool {
+            name: name.into(),
+            what: name.into(),
+            writes_repo,
+            passes: vec![],
+        };
+        Inventory {
+            builtin: vec![
+                t("read_file", false),
+                t("read_file_lines", false),
+                t("search_code", false),
+                t("github_history", false),
+                t("run_checks", false),
+                t("write_file", true),
+            ],
+            translations: vec![
+                Translation {
+                    commands: "git log, git blame".into(),
+                    uses: vec!["github_history".into()],
+                    note: "".into(),
+                },
+                Translation {
+                    commands: "grep, rg".into(),
+                    uses: vec!["search_code".into()],
+                    note: "".into(),
+                },
+            ],
+            servers: vec![Server {
+                id: "tracker".into(),
+                name: "Tracker".into(),
+                what: "".into(),
+                ready: true,
+                tools: vec!["tracker__get".into()],
+            }],
+            ..Default::default()
+        }
+        .sorted()
+    }
+
+    fn agent_answer() -> Value {
+        let q = |asks: &str, kind: &str, status: &str, uses: &[&str], write: &str| {
+            json!({ "asks": asks, "kind": kind, "status": status, "uses": uses, "write": write,
+                    "needs": if status == "missing" { "Shell access" } else { "" }, "fix": "",
+                    "connect": "none", "server": "", "connection": "" })
+        };
+        json!({
+            "steps": [
+                { "title": "Scan the code", "does": "Read and search", "dropped": false,
+                  "requirements": [q("Read", "tool", "translated", &["read_file"], "none"),
+                                   q("grep -r TODO", "command", "translated", &["search_code"], "none")] },
+                { "title": "Audit dependencies", "does": "Run npm audit", "dropped": false,
+                  "requirements": [q("npm audit", "command", "translated", &["run_checks"], "none"),
+                                   q("`npm audit`", "command", "missing", &[], "none")] },
+                { "title": "History", "does": "Churn", "dropped": false,
+                  "requirements": [q("git log --stat", "command", "translated", &["github_history"], "none")] },
+                { "title": "Write the report", "does": "Save it", "dropped": false,
+                  "requirements": [q("docs/debt.md", "path", "available", &["write_file"], "repo")] }
+            ],
+            "translated": "1. Read with `read_file` and search with `search_code`.\n2. Run `npm audit` with `run_checks`.\n3. Read churn with `github_history`.\n4. Save with `write_file`."
+        })
+    }
+
+    #[test]
+    fn a_team_agent_is_checked_against_only_the_tools_its_file_gives_it() {
+        let granted: Vec<String> = ["read_file", "read_file_lines", "search_code"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let inv = readers().for_agent(&granted);
+        assert!(inv.is_agent());
+        assert!(inv.has_tool("read_file") && !inv.has_tool("run_checks"));
+        assert!(
+            !inv.has_tool("tracker__get"),
+            "agents never get an MCP server"
+        );
+        for t in ["run_checks", "github_history", "write_file", "tracker__get"] {
+            assert!(inv.elsewhere.contains(&t.to_string()), "{t}");
+        }
+        // git log isn't translated for an agent without the history tool.
+        assert!(inv.translations.iter().all(|t| t.uses == ["search_code"]));
+        let (a, translated) = finish(&agent_answer(), &inv, 10).unwrap();
+        let st: Vec<&str> = a.steps.iter().map(|s| s.status.as_str()).collect();
+        assert_eq!(st, ["translated", "missing", "missing", "blocked"]);
+        // The two npm audit requirements are one, missing (run_checks is
+        // the coder's, not this agent's).
+        let audit = &a.steps[1].requirements;
+        assert_eq!(audit.len(), 1, "{audit:?}");
+        assert_eq!(audit[0].status, "missing");
+        assert!(
+            audit[0].fix.contains("run_checks isn't one of them"),
+            "{}",
+            audit[0].fix
+        );
+        assert_eq!(a.steps[3].requirements[0].fix, AGENT_WRITE_FIX);
+        // The translation names only the agent's tools.
+        assert!(violations(&a, &translated, &inv).is_empty(), "{translated}");
+        assert!(translated.contains("`read_file`") && translated.contains("`search_code`"));
+        assert!(translated.contains("run_checks (GAP: not one of this agent's tools)"));
+        assert!(!translated.contains("`github_history`"));
+        assert!(
+            a.notes.iter().any(|n| n.contains("github_history")),
+            "{:?}",
+            a.notes
+        );
+        // Enforcing again changes nothing.
+        let (b, again) = enforce(a.clone(), translated.clone(), &inv);
+        assert_eq!(again, translated);
+        assert_eq!(b.steps, a.steps);
+        assert_eq!(b.notes, a.notes);
+    }
+
+    #[test]
+    fn the_same_item_read_by_coderhelms_agents_keeps_their_tools() {
+        let inv = readers();
+        let (a, translated) = finish(&agent_answer(), &inv, 10).unwrap();
+        let st: Vec<&str> = a.steps.iter().map(|s| s.status.as_str()).collect();
+        assert_eq!(st, ["translated", "translated", "translated", "available"]);
+        // One requirement for npm audit, the translated one.
+        assert_eq!(a.steps[1].requirements.len(), 1);
+        assert_eq!(a.steps[1].requirements[0].uses, ["run_checks"]);
+        assert!(violations(&a, &translated, &inv).is_empty());
+        assert!(translated.contains("`run_checks`"));
+    }
+
+    #[test]
+    fn requirements_asking_for_the_same_thing_are_one() {
+        let r = |asks: &str, status: &str, uses: &[&str]| Requirement {
+            asks: asks.into(),
+            kind: "command".into(),
+            status: status.into(),
+            uses: uses.iter().map(|u| u.to_string()).collect(),
+            write: "none".into(),
+            needs: String::new(),
+            fix: String::new(),
+            connect: "none".into(),
+            server: String::new(),
+            connection: String::new(),
+            action: String::new(),
+            basis: String::new(),
+        };
+        let merged = merge_same(vec![
+            r("`git log`", "missing", &[]),
+            r("read the code", "available", &["read_file"]),
+            r("git log --oneline", "translated", &["github_history"]),
+            r("Git log", "translated", &["read_file"]),
+        ]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].status, "translated");
+        assert_eq!(merged[0].asks, "`git log`");
+        assert_eq!(merged[0].uses, ["github_history", "read_file"]);
+        assert_eq!(merged[1].asks, "read the code");
+    }
+
+    #[test]
+    fn backticks_are_read_in_pairs() {
+        assert_eq!(backticked("a `x` b `y z` `"), ["x", "y z"]);
+        let inv = readers().for_agent(&["read_file".into()]);
+        let (t, named) = enforce_translation("use `run_checks` then `read_file` and `", &inv);
+        assert_eq!(named, ["run_checks"]);
+        assert_eq!(
+            t,
+            "use run_checks (GAP: not one of this agent's tools) then `read_file` and `"
+        );
     }
 
     #[test]
