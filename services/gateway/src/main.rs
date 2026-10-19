@@ -474,6 +474,7 @@ async fn main() -> Result<(), Error> {
             put(routes::skills::set_use_translated),
         )
         .route("/skills/activity", get(routes::skills::activity))
+        .route("/skills/used", get(routes::skills::used))
         .route("/activity/summary", get(routes::activity::summary))
         .route("/data-sources", get(routes::data_sources::list))
         .route("/connectors", get(routes::connectors::list))

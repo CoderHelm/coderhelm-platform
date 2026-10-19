@@ -317,7 +317,7 @@ pub fn review_tools() -> Vec<ToolDefinition> {
 /// Live registry lookup backing the `check_package` tool. Fail-open: any
 /// network/parse error returns a "(could not verify …)" string — the agent must
 /// then phrase its concern as a question, never a confident claim.
-async fn check_package_registry(
+pub(crate) async fn check_package_registry(
     http: &reqwest::Client,
     registry: &str,
     name: &str,
@@ -481,7 +481,24 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
             }
         }
         if let Some(skills) = self.skills {
-            if let Some(out) = skills.handle(self.state, name, input).await {
+            if let Some(out) = skills
+                .handle(
+                    self.state,
+                    name,
+                    input,
+                    &skills.host(
+                        self,
+                        Some(super::agent_tools::RepoReads {
+                            github: self.github,
+                            owner: self.owner,
+                            repo: self.repo,
+                            git_ref: self.head_sha,
+                            http: &self.state.http,
+                        }),
+                    ),
+                )
+                .await
+            {
                 return Ok(json!(out));
             }
         }
@@ -866,6 +883,7 @@ pub async fn generate_review(
     }
     if let Some(s) = skills {
         tools.extend(s.tools());
+        s.offer(&tools);
     }
     let reply = provider::converse(
         state,

@@ -123,6 +123,34 @@ fn first_sentence(text: &str) -> String {
     common::truncate_str(&flat, end).to_string()
 }
 
+/// Which of Coderhelm's agents have a tool, when not all of them: a skill
+/// or command is read by whichever is on the work, so the check says which
+/// can follow a step.
+const PASSES: &[(&str, &[&str])] = &[
+    ("read_file", &["coder", "reviewer"]),
+    ("read_tree", &["coder"]),
+    ("write_file", &["coder"]),
+    ("edit_file", &["coder"]),
+    ("batch_write", &["coder"]),
+    ("restore_file", &["coder"]),
+    ("get_diff", &["coder"]),
+    ("run_checks", &["coder"]),
+    ("run_codegen", &["coder"]),
+    ("graph_definition", &["coder", "reviewer"]),
+    ("graph_callers", &["coder", "reviewer"]),
+    ("graph_impact", &["coder", "reviewer"]),
+    ("search_org", &["reviewer"]),
+    ("check_package", &["reviewer"]),
+];
+
+fn passes_of(name: &str) -> Vec<String> {
+    PASSES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, p)| p.iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default()
+}
+
 /// Coderhelm's own tools as an item can rely on them: the coding agent's
 /// real tool list, then the other agents' tools.
 pub fn builtin_tools() -> Vec<Tool> {
@@ -131,6 +159,7 @@ pub fn builtin_tools() -> Vec<Tool> {
         .map(|t| Tool {
             writes_repo: WRITES_REPO.contains(&t.name.as_str()),
             what: first_sentence(&t.description),
+            passes: passes_of(&t.name),
             name: t.name,
         })
         .collect();
@@ -140,10 +169,22 @@ pub fn builtin_tools() -> Vec<Tool> {
                 name: name.to_string(),
                 what: what.to_string(),
                 writes_repo: false,
+                passes: passes_of(name),
             });
         }
     }
     out
+}
+
+/// The inventory an item is checked against: a team agent's own read-only
+/// tools (from its file), or what Coderhelm's agents that read a skill or
+/// command have.
+pub fn inventory_for(base: &Inventory, m: &SkillMeta, body: &str) -> Inventory {
+    if m.kind == common::skills::Kind::Agent {
+        base.for_agent(&common::skills::agent_toolset(body).granted)
+    } else {
+        base.clone()
+    }
 }
 
 /// The translations whose tools are all in `tools`.
@@ -318,17 +359,18 @@ pub fn hold_to_last(
 /// path.
 pub fn to_check<'a>(
     items: &'a [Queued],
-    fingerprint: &str,
+    fingerprint: impl Fn(&Queued) -> String,
     only: &str,
     force: bool,
 ) -> Vec<&'a Queued> {
     items
         .iter()
         .filter(|(m, _, _)| only.is_empty() || m.path == only)
-        .filter(|(m, _, _)| {
+        .filter(|item| {
+            let m = &item.0;
             skill_compat::needs_check(
                 &m.hash,
-                fingerprint,
+                &fingerprint(item),
                 &m.compat.hash,
                 &m.compat.fingerprint,
                 force,
@@ -337,10 +379,12 @@ pub fn to_check<'a>(
         .collect()
 }
 
-/// One item's path, checked text hash, whether its last check was of other
+/// One item's path, checked text hash, the fingerprint of the inventory it
+/// was checked against, whether its last check was of other
 /// text or another inventory, and its check (`None` when the run's time
 /// was up before it started).
 type Outcome = (
+    String,
     String,
     String,
     bool,
@@ -368,9 +412,13 @@ async fn run_inner(state: &WorkerState, team_id: &str, repo: &str, only: &str, f
             return;
         }
     };
-    let inv = inventory(state, team_id).await;
-    let fp = inv.fingerprint();
-    let todo = to_check(&items, &fp, only, force);
+    let base = inventory(state, team_id).await;
+    let todo = to_check(
+        &items,
+        |(m, body, _)| inventory_for(&base, m, body).fingerprint(),
+        only,
+        force,
+    );
     if todo.is_empty() {
         return;
     }
@@ -397,16 +445,20 @@ async fn run_inner(state: &WorkerState, team_id: &str, repo: &str, only: &str, f
     let results: Vec<Outcome> = futures::stream::iter(todo)
         .map(|item| {
             let (m, body, _) = item;
-            let (checker, inv) = (&checker, &inv);
+            let checker = &checker;
+            let inv = inventory_for(&base, m, body);
+            let fp = inv.fingerprint();
             let outdated = m.compat.hash != m.hash || m.compat.fingerprint != fp;
             async move {
                 if started.elapsed() > BUDGET {
-                    return (m.path.clone(), m.hash.clone(), outdated, None);
+                    return (m.path.clone(), m.hash.clone(), fp, outdated, None);
                 }
-                let r = check_item(checker, inv, m, body)
-                    .await
-                    .map(|done| hold_to_last(item, inv, done));
-                (m.path.clone(), m.hash.clone(), outdated, Some(r))
+                let r = check_item(checker, &inv, m, body).await.map(|done| {
+                    let (a, t) = hold_to_last(item, &inv, done);
+                    // What's kept names only tools this item's runtime has.
+                    skill_compat::enforce(a, t, &inv)
+                });
+                (m.path.clone(), m.hash.clone(), fp, outdated, Some(r))
             }
         })
         .buffer_unordered(PARALLEL)
@@ -414,7 +466,7 @@ async fn run_inner(state: &WorkerState, team_id: &str, repo: &str, only: &str, f
         .await;
     let mut done = 0usize;
     let mut cost = 0.0f64;
-    for (path, hash, outdated, r) in results {
+    for (path, hash, fp, outdated, r) in results {
         let Some(r) = r else { continue };
         let kept = match &r {
             Ok((a, translated)) => {
@@ -527,6 +579,7 @@ pub async fn inventory(state: &WorkerState, team_id: &str) -> Inventory {
                     name: t.name,
                     what: "The team's own approved lookup on a data source".into(),
                     writes_repo: false,
+                    passes: vec![],
                 });
             }
         }
@@ -543,6 +596,8 @@ pub async fn inventory(state: &WorkerState, team_id: &str) -> Inventory {
         translations,
         connections: super::ops_tools::connectable(state, team_id).await,
         never: NEVER.iter().map(|s| s.to_string()).collect(),
+        runtime: skill_compat::RUNTIME_READERS.into(),
+        elsewhere: Vec::new(),
     }
     .sorted()
 }
@@ -877,6 +932,7 @@ mod tests {
             name: "github_history".into(),
             what: "Read the repository's history".into(),
             writes_repo: false,
+            passes: vec![],
         });
         assert!(translations(&with_history)
             .iter()
@@ -938,13 +994,11 @@ mod tests {
             (meta("d", "h4", "", ""), String::new(), None),
         ];
         let paths = |v: Vec<&Queued>| v.iter().map(|(m, _, _)| m.path.clone()).collect::<Vec<_>>();
-        assert_eq!(paths(to_check(&items, "fp", "", false)), ["b", "c", "d"]);
-        assert_eq!(
-            paths(to_check(&items, "fp", "", true)),
-            ["a", "b", "c", "d"]
-        );
-        assert_eq!(paths(to_check(&items, "fp", "a", true)), ["a"]);
-        assert!(to_check(&items, "fp", "a", false).is_empty());
+        let fp = |_: &Queued| "fp".to_string();
+        assert_eq!(paths(to_check(&items, fp, "", false)), ["b", "c", "d"]);
+        assert_eq!(paths(to_check(&items, fp, "", true)), ["a", "b", "c", "d"]);
+        assert_eq!(paths(to_check(&items, fp, "a", true)), ["a"]);
+        assert!(to_check(&items, fp, "a", false).is_empty());
     }
 
     /// The inventory reads the coder's real tools, and every translation
@@ -987,6 +1041,33 @@ mod tests {
             first_sentence("Read a file. Large files are cut."),
             "Read a file."
         );
+    }
+
+    #[test]
+    fn a_team_agents_inventory_comes_from_its_own_file() {
+        let base = inv();
+        let mut m = meta("agents/debt.md", "h1", "", "");
+        m.kind = Kind::Agent;
+        let body = "---\nname: debt\ntools: Read, Grep, Bash, TodoWrite, WebFetch\n---\nFind debt.";
+        let a = inventory_for(&base, &m, body);
+        let mut names: Vec<String> = a.tool_names().into_iter().collect();
+        names.sort();
+        assert_eq!(names, ["read_file", "read_file_lines", "search_code"]);
+        assert!(a.elsewhere.iter().any(|t| t == "run_checks"));
+        assert!(a.elsewhere.iter().any(|t| t == "logs_search"));
+        assert_ne!(a.fingerprint(), base.fingerprint());
+        // An agent listing no tools gets none.
+        let none = inventory_for(&base, &m, "---\nname: x\n---\nAnswer.");
+        assert!(none.tool_names().is_empty());
+        // A skill is checked against the readers' tools, each with its passes.
+        m.kind = Kind::Skill;
+        assert_eq!(inventory_for(&base, &m, body), base);
+        let run_checks = base
+            .builtin
+            .iter()
+            .find(|t| t.name == "run_checks")
+            .unwrap();
+        assert_eq!(run_checks.passes, ["coder"]);
     }
 
     #[test]

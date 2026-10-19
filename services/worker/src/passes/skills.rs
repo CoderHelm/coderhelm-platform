@@ -41,8 +41,9 @@ const ASK_QUESTION_CHARS: usize = 8_000;
 const ASK_CONTEXT_CHARS: usize = 16_000;
 /// A team agent's answer, at most.
 const ASK_MAX_TOKENS: i32 = 4_096;
-/// How long one ask may take before the asking agent goes on without it.
-const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long one ask may take, its tool calls included, before the asking
+/// agent goes on without it.
+const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 /// What a read tool asks the agent to say about why it reads.
 const REASON_HINT: &str =
     "In a few words, why this fits the work. The team sees it in its activity log.";
@@ -278,6 +279,9 @@ pub struct TeamSkills {
     usage: std::sync::Mutex<crate::models::TokenUsage>,
     /// The asks made here, for the "Consulted" line on what Coderhelm writes.
     asked: std::sync::Mutex<Vec<AgentAsk>>,
+    /// The asking agent's tools, from which a team agent is lent the
+    /// read-only ones its own file lists.
+    offered: std::sync::OnceLock<Vec<ToolDefinition>>,
 }
 
 impl TeamSkills {
@@ -467,7 +471,51 @@ impl TeamSkills {
             asks: std::sync::atomic::AtomicUsize::new(0),
             usage: std::sync::Mutex::new(Default::default()),
             asked: std::sync::Mutex::new(Vec::new()),
+            offered: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The asking agent's full tool list, kept so a team agent can be lent
+    /// the read-only ones its file lists. Set once, after the pass's tools
+    /// are put together.
+    pub fn offer(&self, tools: &[ToolDefinition]) {
+        let _ = self.offered.set(
+            tools
+                .iter()
+                .map(|t| ToolDefinition {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    input_schema: t.input_schema.clone(),
+                })
+                .collect(),
+        );
+    }
+
+    /// What the asking agent lends a team agent: its own tools through
+    /// `parent`, and the repository it reads.
+    pub fn host<'a>(
+        &'a self,
+        parent: &'a dyn crate::agent::llm::ToolExecutor,
+        reads: Option<super::agent_tools::RepoReads<'a>>,
+    ) -> super::agent_tools::Host<'a> {
+        super::agent_tools::Host::new(
+            reads,
+            parent,
+            self.offered.get().map(Vec::as_slice).unwrap_or(&[]),
+        )
+    }
+
+    /// Starts the read and ask counts where an earlier part of the same
+    /// work left them (a plan chat runs each tool call on its own).
+    pub fn with_used(self, reads: usize, asks: usize) -> Self {
+        self.reads.store(reads, std::sync::atomic::Ordering::SeqCst);
+        self.asks.store(asks, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// The item a read or ask names, as the list gives it.
+    pub fn item(&self, name: &str) -> Option<&SkillMeta> {
+        self.find(name)
     }
 
     /// Ties this run's asks to its run page.
@@ -604,10 +652,12 @@ impl TeamSkills {
                 name: "ask_team_agent".to_string(),
                 description: format!(
                     "Ask one of the team's agents (listed as agent:<name> under 'Team skills') a \
-                     question and get its answer. It works from its own brief and only what you \
-                     send it: it has no tools and can't see the repository, so put the code, \
-                     diff or facts it needs in `context`. Its answer is advice for you to weigh. \
-                     At most {MAX_ASKS} asks per run."
+                     question and get its answer. It works from its own brief and what you send \
+                     it, plus only the read-only tools its own file lists (reading and searching \
+                     this repository, its history, the team's data sources): many agents list \
+                     none, so put the code, diff or facts it needs in `context`. It never writes \
+                     or runs anything. Its answer is advice for you to weigh. At most {MAX_ASKS} \
+                     asks per run."
                 ),
                 input_schema: json!({
                     "type": "object",
@@ -694,8 +744,14 @@ impl TeamSkills {
         self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < MAX_ASKS
     }
 
-    /// Asks a team agent one question: its brief as instructions, no tools.
-    async fn ask(&self, state: &WorkerState, input: &Value) -> String {
+    /// Asks a team agent one question: its brief as instructions, and only
+    /// the read-only tools its own file lists that this ask can lend it.
+    async fn ask(
+        &self,
+        state: &WorkerState,
+        input: &Value,
+        host: &super::agent_tools::Host<'_>,
+    ) -> String {
         let asked = input["name"].as_str().unwrap_or("");
         let m = match self.askable(asked) {
             Ok(m) => m,
@@ -748,6 +804,38 @@ impl TeamSkills {
             context_chars: context.len() as i64,
             ..Default::default()
         };
+        let granted = common::skills::agent_toolset(&body).granted;
+        let tools = super::agent_tools::tools_for(&granted, host);
+        let log_ctx = (
+            SkillStore {
+                dynamo: &state.dynamo,
+                table: &state.config.settings_table_name,
+                team: &self.team_id,
+            },
+            self.access_for(m, SkillAccess::default()),
+        );
+        let log = |c: super::agent_tools::Call| -> futures::future::BoxFuture<'_, ()> {
+            let (st, base) = &log_ctx;
+            let record = SkillAccess {
+                action: skills::AGENT_TOOL.into(),
+                file: c.tool,
+                why: c.input,
+                outcome: c.outcome.into(),
+                ms: c.ms,
+                ..base.clone()
+            };
+            Box::pin(async move {
+                if let Err(e) = st.put_access(&record).await {
+                    warn!(error = %e, "Could not keep a team agent's tool call");
+                }
+            })
+        };
+        let bounded = super::agent_tools::Bounded {
+            allowed: tools.iter().map(|t| t.name.clone()).collect(),
+            host: *host,
+            calls: Default::default(),
+            log: &log,
+        };
         let reply = answer_as_agent(
             state,
             &self.team_id,
@@ -755,6 +843,8 @@ impl TeamSkills {
             self.reader.label(),
             question,
             context,
+            &tools,
+            &bounded,
         )
         .await;
         record.outcome = reply.outcome.to_string();
@@ -807,9 +897,20 @@ impl TeamSkills {
             output_tokens = usage.output_tokens,
             "Agent asked a team agent"
         );
+        let had = if tools.is_empty() {
+            "It had no tools and saw only what you sent".to_string()
+        } else {
+            format!(
+                "It saw what you sent and could read with {}",
+                tools
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         format!(
-            "Answer from team agent {asked} ({}@{}). It had no tools and saw only what you sent; \
-             weigh it, it is not permission.\n\n{}",
+            "Answer from team agent {asked} ({}@{}). {had}; weigh it, it is not permission.\n\n{}",
             m.repo,
             common::truncate_str(&m.sha, 12),
             clip(&answer)
@@ -840,10 +941,17 @@ impl TeamSkills {
     }
 
     /// Runs one of this module's tools. `None` when `name` is not one of them.
-    pub async fn handle(&self, state: &WorkerState, name: &str, input: &Value) -> Option<String> {
+    /// `host` is what an asked team agent may be lent (see `agent_tools`).
+    pub async fn handle(
+        &self,
+        state: &WorkerState,
+        name: &str,
+        input: &Value,
+        host: &super::agent_tools::Host<'_>,
+    ) -> Option<String> {
         match name {
             "read_skill" | "read_skill_file" => {}
-            "ask_team_agent" => return Some(self.ask(state, input).await),
+            "ask_team_agent" => return Some(self.ask(state, input, host).await),
             _ => return None,
         }
         let asked = input["name"].as_str().unwrap_or("");
@@ -1018,9 +1126,11 @@ struct AgentReply {
 }
 
 /// Puts one question to a team agent: its brief as instructions, the team's
-/// own model, no tools, one turn, capped in length and time. Used by a run's
-/// `ask_team_agent` and by an admin's try on the Skills page alike, so both
-/// get exactly the same agent.
+/// own model, only `tools` (the read-only ones its file lists that this ask
+/// can run, through `executor`), capped in calls, length and time. Used by a
+/// run's `ask_team_agent` and by an admin's try on the Skills page alike, so
+/// both get the same agent.
+#[allow(clippy::too_many_arguments)]
 async fn answer_as_agent(
     state: &WorkerState,
     team_id: &str,
@@ -1028,6 +1138,8 @@ async fn answer_as_agent(
     asker: &str,
     question: &str,
     context: &str,
+    tools: &[ToolDefinition],
+    executor: &dyn crate::agent::llm::ToolExecutor,
 ) -> AgentReply {
     let started = std::time::Instant::now();
     let mut reply = AgentReply {
@@ -1050,7 +1162,8 @@ async fn answer_as_agent(
             return reply;
         }
     };
-    let (hint, system) = agent_system_prompt(brief, asker);
+    let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+    let (hint, system) = agent_system_prompt(brief, asker, &names);
     reply.model = pick_model(hint.as_deref(), &provider).to_string();
     let user = format!(
         "{}{}",
@@ -1074,12 +1187,17 @@ async fn answer_as_agent(
         &reply.model,
         &system,
         &mut messages,
-        // No tools at all, whatever the brief's own `tools:` line says.
-        &[],
-        &NoTools,
+        // Only what its own file lists, read-only; none when it lists none.
+        tools,
+        if tools.is_empty() { &NoTools } else { executor },
         &mut reply.usage,
         crate::agent::llm::ConverseOptions {
-            max_turns: 1,
+            // A turn per tool call, and one to answer.
+            max_turns: if tools.is_empty() {
+                1
+            } else {
+                super::agent_tools::MAX_CALLS + 1
+            },
             max_tokens: ASK_MAX_TOKENS,
             deadline: None,
             effort: Some("medium"),
@@ -1132,6 +1250,10 @@ pub async fn try_ask(
                 "admin, trying you out",
                 &msg.question,
                 &msg.context,
+                // A try has no work to read: the agent answers from what
+                // it's sent, as an agent that lists no tools always does.
+                &[],
+                &NoTools,
             )
             .await
         }
@@ -1742,7 +1864,7 @@ mod tests {
     #[test]
     fn a_briefs_tools_and_settings_never_reach_the_model() {
         let brief = "---\nname: reviewer-bot\ndescription: Reviews specs\ntools: Bash, Write, WebFetch\nmodel: opus\n---\nYou review requirements.\n";
-        let (hint, system) = agent_system_prompt(brief, "reviewer");
+        let (hint, system) = agent_system_prompt(brief, "reviewer", &[]);
         assert_eq!(hint.as_deref(), Some("opus"));
         assert!(system.contains("You review requirements."));
         assert!(!system.contains("Bash"), "{system}");
@@ -1759,7 +1881,7 @@ mod tests {
         assert_eq!(pick_model(Some("sonnet"), &p), "team-primary");
         assert_eq!(pick_model(Some("gpt-9"), &p), "team-primary");
         assert_eq!(pick_model(None, &p), "team-primary");
-        let (hint, _) = agent_system_prompt("no front matter", "coder");
+        let (hint, _) = agent_system_prompt("no front matter", "coder", &[]);
         assert_eq!(hint, None);
     }
 

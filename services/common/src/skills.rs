@@ -256,6 +256,17 @@ pub fn parse_front_matter(text: &str) -> (Option<String>, Option<String>, String
 /// name (`Bash`); an MCP tool (`mcp__server__tool`) keeps its full name. Each
 /// name appears once, in the order first asked for.
 pub fn front_matter_tools(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    front_matter_tool_specs(text)
+        .into_iter()
+        .filter_map(|t| tool_base_name(&t))
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
+}
+
+/// The tools an item asks for as written, patterns kept
+/// (`Bash(git log:*)`), each once, in the order first asked for.
+pub fn front_matter_tool_specs(text: &str) -> Vec<String> {
     let Some((head, _)) = split_front_matter(text) else {
         return Vec::new();
     };
@@ -304,7 +315,8 @@ pub fn front_matter_tools(text: &str) -> Vec<String> {
     }
     let mut seen = HashSet::new();
     raw.into_iter()
-        .filter_map(|t| tool_base_name(&t))
+        .map(|t| t.trim().trim_matches(['"', '\'']).trim().to_string())
+        .filter(|t| tool_base_name(t).is_some())
         .filter(|t| seen.insert(t.clone()))
         .collect()
 }
@@ -377,6 +389,200 @@ pub fn missing_tools(asked: &[String]) -> Vec<String> {
         })
         .cloned()
         .collect()
+}
+
+// ─── What a team agent may use ──────────────────────────────
+
+/// Coderhelm tools a team agent may be given: each only reads (the
+/// repository, its history, a registry, a connected data source or
+/// connection). An agent gets one only when its own file asks for it, by
+/// this name or through [`AGENT_TOOL_MAP`].
+pub const AGENT_READ_TOOLS: &[&str] = &[
+    "read_file",
+    "read_file_lines",
+    "search_code",
+    "read_tree",
+    "list_directory",
+    "github_history",
+    "graph_definition",
+    "graph_callers",
+    "graph_impact",
+    "check_package",
+    "live_describe",
+    "live_lookup",
+    "db_query",
+    "logs_search",
+    "aws_identity",
+    "newrelic_accounts",
+    "newrelic_nrql",
+    "newrelic_entities",
+    "newrelic_changes",
+    "newrelic_deployment_impact",
+    "newrelic_golden_metrics",
+    "confluence_search",
+    "confluence_page",
+    "metrics_list",
+    "metrics_query",
+    "airflow_dags",
+    "airflow_dag_runs",
+    "airflow_task_instances",
+    "airflow_task_log",
+    "airflow_import_errors",
+    "airflow_health",
+];
+
+/// Tools that write (the repository, a notebook, an outside page): never
+/// given to a team agent, whatever its file asks for.
+pub const AGENT_WRITE_TOOLS: &[&str] = &[
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "write_file",
+    "edit_file",
+    "batch_write",
+    "restore_file",
+    "run_codegen",
+    "confluence_append",
+];
+
+/// Claude Code's tools an agent file may list, and the read-only Coderhelm
+/// tools that do the same for a team agent. Fixed: an agent never gets a
+/// tool by any other route.
+pub const AGENT_TOOL_MAP: &[(&str, &[&str])] = &[
+    ("Read", &["read_file", "read_file_lines"]),
+    ("Grep", &["search_code"]),
+    ("Glob", &["read_tree", "list_directory"]),
+    ("LS", &["list_directory"]),
+];
+
+/// Read-only git and GitHub commands a `Bash(...)` pattern may be limited
+/// to; such a pattern gives `github_history` (and only that), plain `Bash`
+/// gives nothing.
+const AGENT_GIT_READS: &[&str] = &[
+    "git log",
+    "git blame",
+    "git show",
+    "git tag",
+    "git shortlog",
+    "gh pr list",
+    "gh pr view",
+    "gh release",
+    "gh run list",
+    "gh run view",
+];
+
+/// MCP servers an agent file may list (`mcp__<server>__...`) whose reads a
+/// Coderhelm connection does, by a word in the server's name.
+const AGENT_MCP_MAP: &[(&str, &[&str])] = &[
+    (
+        "newrelic",
+        &[
+            "newrelic_accounts",
+            "newrelic_nrql",
+            "newrelic_entities",
+            "newrelic_changes",
+            "newrelic_deployment_impact",
+            "newrelic_golden_metrics",
+        ],
+    ),
+    ("confluence", &["confluence_search", "confluence_page"]),
+    ("atlassian", &["confluence_search", "confluence_page"]),
+    (
+        "cloudwatch",
+        &[
+            "metrics_list",
+            "metrics_query",
+            "logs_search",
+            "live_describe",
+        ],
+    ),
+    (
+        "airflow",
+        &[
+            "airflow_dags",
+            "airflow_dag_runs",
+            "airflow_task_instances",
+            "airflow_task_log",
+            "airflow_import_errors",
+            "airflow_health",
+        ],
+    ),
+    ("postgres", &["db_query", "live_describe"]),
+    ("redshift", &["db_query", "live_describe"]),
+];
+
+/// The tools one team agent runs with, worked out from its own file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentToolset {
+    /// What its file lists, as written.
+    pub declared: Vec<String>,
+    /// The Coderhelm tools it gets: read-only, each from something it lists.
+    pub granted: Vec<String>,
+    /// What it lists that Coderhelm has no read-only equivalent for.
+    pub missing: Vec<String>,
+    /// What it lists that writes: never given to an agent.
+    pub blocked: Vec<String>,
+}
+
+/// The tools a team agent whose file is `text` runs with: what its
+/// `tools:` / `allowed-tools:` list maps to through the fixed tables above,
+/// read-only only. A file that lists no tools gets none.
+pub fn agent_toolset(text: &str) -> AgentToolset {
+    let mut out = AgentToolset::default();
+    let grant = |out: &mut AgentToolset, names: &[&str]| {
+        for n in names {
+            if !out.granted.iter().any(|g| g == n) {
+                out.granted.push(n.to_string());
+            }
+        }
+    };
+    for spec in front_matter_tool_specs(text) {
+        let base = tool_base_name(&spec).unwrap_or_default();
+        out.declared.push(spec.clone());
+        if AGENT_WRITE_TOOLS.contains(&base.as_str()) {
+            out.blocked.push(base);
+            continue;
+        }
+        if let Some((_, ours)) = AGENT_TOOL_MAP.iter().find(|(n, _)| *n == base) {
+            grant(&mut out, ours);
+            continue;
+        }
+        if AGENT_READ_TOOLS.contains(&base.as_str()) {
+            grant(&mut out, &[base.as_str()]);
+            continue;
+        }
+        if base == "Bash" {
+            let inner = spec
+                .split_once('(')
+                .map(|(_, r)| r.trim_end_matches(')').to_ascii_lowercase())
+                .unwrap_or_default();
+            let cmd = inner.split(':').next().unwrap_or("").trim().to_string();
+            if !cmd.is_empty()
+                && AGENT_GIT_READS
+                    .iter()
+                    .any(|g| cmd == *g || cmd.starts_with(&format!("{g} ")))
+            {
+                grant(&mut out, &["github_history"]);
+                continue;
+            }
+            if !out.missing.iter().any(|m| m == "Bash") {
+                out.missing.push("Bash".into());
+            }
+            continue;
+        }
+        if let Some(server) = base.strip_prefix("mcp__") {
+            let server = server.split("__").next().unwrap_or("").to_ascii_lowercase();
+            if let Some((_, ours)) = AGENT_MCP_MAP.iter().find(|(w, _)| server.contains(w)) {
+                grant(&mut out, ours);
+                continue;
+            }
+        }
+        if !out.missing.contains(&base) {
+            out.missing.push(base);
+        }
+    }
+    out
 }
 
 /// When there's no description, the first line of text that isn't a heading.
@@ -504,15 +710,17 @@ pub struct Parsed {
     pub missing_tools: Vec<String>,
 }
 
-/// The tools an item asks for that it won't get. A team agent answers with
-/// no tools at all (see [`agent_system_prompt`]), so every tool it lists is
-/// missing; a skill or command is read by Coderhelm's agents, who have the
-/// tools [`missing_tools`] knows.
+/// The tools an item asks for that it won't get. A team agent gets only
+/// read-only equivalents of what its file lists ([`agent_toolset`]): what has
+/// none, and every write, is missing. A skill or command is read by
+/// Coderhelm's agents, who have the tools [`missing_tools`] knows.
 pub fn item_missing_tools(kind: Kind, text: &str) -> Vec<String> {
-    let asked = front_matter_tools(text);
     match kind {
-        Kind::Agent => asked,
-        Kind::Skill | Kind::Command => missing_tools(&asked),
+        Kind::Agent => {
+            let t = agent_toolset(text);
+            t.missing.into_iter().chain(t.blocked).collect()
+        }
+        Kind::Skill | Kind::Command => missing_tools(&front_matter_tools(text)),
     }
 }
 
@@ -947,8 +1155,9 @@ pub struct SkillAccess {
     /// "skill", "agent" or "command".
     pub kind: String,
     pub name: String,
-    /// "read" (the item), "read_file" (a file kept with a skill), "ask", or
-    /// "apply" (given in full by its "always apply" setting).
+    /// "read" (the item), "read_file" (a file kept with a skill), "ask",
+    /// "apply" (given in full by its "always apply" setting), or
+    /// [`AGENT_TOOL`] (a tool call a team agent made answering an ask).
     pub action: String,
     /// For `read_file`: which file, by path.
     pub file: String,
@@ -969,6 +1178,10 @@ pub struct SkillAccess {
     pub ask_id: String,
     pub ms: i64,
 }
+
+/// The access log's action for one tool call a team agent made while it
+/// answered an ask: `name` is the agent, `file` the tool, `why` its input.
+pub const AGENT_TOOL: &str = "agent_tool";
 
 /// How long access records are kept.
 pub const ACCESS_DAYS: i64 = 180;
@@ -1019,7 +1232,7 @@ impl AccessFilter {
         match self.action.as_str() {
             "" => {}
             "read" if !a.action.starts_with("read") => return false,
-            "ask" if a.action != "ask" => return false,
+            "ask" if a.action != "ask" && a.action != AGENT_TOOL => return false,
             "apply" if a.action != "apply" => return false,
             _ => {}
         }
@@ -1116,6 +1329,10 @@ pub struct AccessCounts {
 
 impl AccessCounts {
     pub fn add(&mut self, action: &str, outcome: &str) {
+        if action == AGENT_TOOL {
+            // Part of an ask, counted with it.
+            return;
+        }
         let problem = access_problem(outcome);
         if action == "ask" {
             self.asks += 1;
@@ -1136,16 +1353,27 @@ pub const AGENT_BRIEF_CHARS: usize = 24_000;
 /// the text after the front matter is used: the file's `tools:`, `model:` and
 /// any other settings never reach the model as instructions. The Skills page
 /// shows this exact text, so what an admin sees is what the agent gets.
-pub fn agent_system_prompt(brief: &str, asker: &str) -> (Option<String>, String) {
+///
+/// `tools` are the read-only tools it has for this ask (empty: none).
+pub fn agent_system_prompt(brief: &str, asker: &str, tools: &[String]) -> (Option<String>, String) {
     let (_, _, body) = parse_front_matter(brief);
     let hint = front_matter_value(brief, "model").map(|v| v.to_ascii_lowercase());
+    let has = if tools.is_empty() {
+        "You have no tools: you can't read files, run commands or look anything up, so if you'd \
+         need something you weren't given, say what."
+            .to_string()
+    } else {
+        format!(
+            "You have these read-only tools, from the ones your brief lists: {}. Use them only \
+             as far as the question needs, a few calls at most. You can't write, run commands or \
+             use any other tool; where your brief asks for one, say what you couldn't do.",
+            tools.join(", ")
+        )
+    };
     let system = format!(
-        "You are one of this team's own agents, asked a question by Coderhelm's {}. Answer from \
-         your brief below and the question and context you're given. You have no tools: you \
-         can't read files, run commands or look anything up, so if you'd need something you \
-         weren't given, say what. Keep the answer focused, under about 600 words.\n\n\
-         ## Your brief\n{}",
-        asker,
+        "You are one of this team's own agents, asked a question by Coderhelm's {asker}. Answer \
+         from your brief below and the question and context you're given. {has} Keep the answer \
+         focused, under about 600 words.\n\n## Your brief\n{}",
         crate::truncate_str(&body, AGENT_BRIEF_CHARS)
     );
     (hint, system)
@@ -1951,6 +2179,49 @@ impl SkillStore<'_> {
         }
     }
 
+    /// Access records between `since` and `until` (RFC 3339) that `keep`
+    /// accepts, oldest first, looking at no more than [`ACCESS_SCAN_CAP`].
+    pub async fn access_between(
+        &self,
+        since: &str,
+        until: &str,
+        keep: impl Fn(&SkillAccess) -> bool,
+    ) -> Result<Vec<SkillAccess>, String> {
+        let (low, high) = AccessFilter {
+            since: since.to_string(),
+            until: until.to_string(),
+            ..Default::default()
+        }
+        .key_range();
+        let mut out = Vec::new();
+        let mut looked = 0usize;
+        let mut start = None;
+        loop {
+            let r = self
+                .dynamo
+                .query()
+                .table_name(self.table)
+                .key_condition_expression("pk = :p AND sk BETWEEN :lo AND :hi")
+                .expression_attribute_values(":p", av(self.team))
+                .expression_attribute_values(":lo", av(&low))
+                .expression_attribute_values(":hi", av(&high))
+                .set_exclusive_start_key(start)
+                .send()
+                .await
+                .map_err(|e| format!("skill store access log: {e}"))?;
+            for i in r.items() {
+                looked += 1;
+                if let Some(a) = SkillAccess::from_item(i).filter(|a| keep(a)) {
+                    out.push(a);
+                }
+            }
+            start = r.last_evaluated_key().cloned();
+            if start.is_none() || looked >= ACCESS_SCAN_CAP {
+                return Ok(out);
+            }
+        }
+    }
+
     /// Counts of reads and asks since `since` (RFC 3339).
     pub async fn access_counts(&self, since: &str) -> Result<AccessCounts, String> {
         let (low, high) = AccessFilter {
@@ -2730,9 +3001,10 @@ mod tests {
         assert_eq!(p.missing_tools, ["Bash", "WebFetch"]);
         let p = parse_item("skills/fix/SKILL.md", text).unwrap();
         assert_eq!(p.missing_tools, ["Bash", "WebFetch"]);
-        // A team agent answers with no tools, so all of them are missing.
+        // A team agent gets read-only equivalents only: Read is given, the
+        // shell and the web are missing, and Edit (a write) is never given.
         let p = parse_item("agents/fix.md", text).unwrap();
-        assert_eq!(p.missing_tools, ["Read", "Edit", "Bash", "WebFetch"]);
+        assert_eq!(p.missing_tools, ["Bash", "WebFetch", "Edit"]);
         let p = parse_item("agents/plain.md", "---\nname: plain\n---\nAnswer.").unwrap();
         assert!(p.missing_tools.is_empty());
     }
@@ -2962,9 +3234,57 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_gets_only_read_only_equivalents_of_what_its_file_lists() {
+        let t = agent_toolset(
+            "---\nname: debt\ntools: Read, Grep, Bash, TodoWrite, WebFetch\n---\nFind debt.\n",
+        );
+        assert_eq!(t.granted, ["read_file", "read_file_lines", "search_code"]);
+        assert_eq!(t.missing, ["Bash", "TodoWrite", "WebFetch"]);
+        assert!(t.blocked.is_empty());
+        assert_eq!(t.declared.len(), 5);
+        // Writes are never given, even when listed.
+        let w = agent_toolset("---\ntools: [Write, Edit, Glob, write_file]\n---\nx");
+        assert_eq!(w.granted, ["read_tree", "list_directory"]);
+        assert_eq!(w.blocked, ["Write", "Edit", "write_file"]);
+        // A Bash pattern limited to git reads gives the history tool only.
+        let g = agent_toolset("---\nallowed-tools: Bash(git log:*), Bash(npm test:*), github_history, logs_search\n---\nx");
+        assert_eq!(g.granted, ["github_history", "logs_search"]);
+        assert_eq!(g.missing, ["Bash"]);
+        // An MCP server Coderhelm has a connection for maps to its reads.
+        let m = agent_toolset("---\ntools: mcp__newrelic__run_nrql, mcp__slack__post\n---\nx");
+        assert!(m.granted.contains(&"newrelic_nrql".to_string()));
+        assert_eq!(m.missing, ["mcp__slack__post"]);
+        // No tools listed: none given.
+        assert_eq!(
+            agent_toolset("---\nname: x\n---\nbody"),
+            AgentToolset::default()
+        );
+        assert!(agent_toolset("no front matter").granted.is_empty());
+        // Every granted name is read-only.
+        for (_, ours) in AGENT_TOOL_MAP.iter().chain(AGENT_MCP_MAP) {
+            for o in *ours {
+                assert!(AGENT_READ_TOOLS.contains(o), "{o}");
+            }
+        }
+        assert_eq!(
+            item_missing_tools(Kind::Agent, "---\ntools: Read, Bash, Write\n---\nx"),
+            ["Bash", "Write"]
+        );
+    }
+
+    #[test]
+    fn the_prompt_names_the_tools_an_agent_has() {
+        let (_, system) =
+            agent_system_prompt("---\ntools: Read\n---\nB", "coder", &["read_file".into()]);
+        assert!(system.contains("read-only tools, from the ones your brief lists: read_file."));
+        let (_, none) = agent_system_prompt("B", "coder", &[]);
+        assert!(none.contains("You have no tools"));
+    }
+
+    #[test]
     fn the_prompt_an_agent_gets_leaves_its_settings_out() {
         let brief = "---\nname: x\ntools: Bash, Write\nmodel: \"Opus\"\n---\nCheck the spec.\n";
-        let (hint, system) = agent_system_prompt(brief, "reviewer");
+        let (hint, system) = agent_system_prompt(brief, "reviewer", &[]);
         assert_eq!(hint.as_deref(), Some("opus"));
         assert!(system.contains("Coderhelm's reviewer"));
         assert!(system.ends_with("## Your brief\nCheck the spec.\n"));

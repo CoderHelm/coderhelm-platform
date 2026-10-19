@@ -16,6 +16,7 @@ pub mod jira_webhook;
 pub mod log_analyzer;
 pub mod memory;
 pub mod paging;
+pub mod plan_chat_tools;
 pub mod plans;
 pub mod plugins;
 pub mod reviewer;

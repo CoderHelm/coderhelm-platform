@@ -313,8 +313,10 @@ pub async fn item(
     if meta.kind == Kind::Agent {
         // Exactly what the agent is told when it's asked, so the page shows
         // what it gets rather than a description of it.
-        let (_, system) = common::skills::agent_system_prompt(&body, "reviewer");
+        let toolset = common::skills::agent_toolset(&body);
+        let (_, system) = common::skills::agent_system_prompt(&body, "reviewer", &toolset.granted);
         out["prompt"] = json!(system);
+        out["agent_tools"] = json!(toolset);
     }
     out["body"] = json!(body);
     Ok(Json(out))
@@ -772,6 +774,49 @@ pub async fn try_agent(
     }
     info!(team_id = %claims.team_id, agent = %ask.path, "Agent try queued");
     Ok(Json(json!({ "id": ask.id })))
+}
+
+/// The window a "Used" line reads: from when the work began, for up to
+/// this long.
+const USED_WINDOW_DAYS: i64 = 21;
+
+/// GET /api/skills/used?since=…&run_id=… | &origin=…[&repo=…&pr=…] — what a
+/// run, review or plan chat used: the team skills it read, the team agents
+/// it asked (and the tools they called), the data sources it looked up and
+/// the standards it was given in full.
+pub async fn used(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Reply {
+    let get = |k: &str| q.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+    let work = common::work_usage::Work {
+        run_id: get("run_id"),
+        origin: get("origin"),
+        repo: get("repo"),
+        pr: get("pr").parse().unwrap_or(0),
+    };
+    if work.run_id.is_empty() && work.origin.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "Name a run or the work."));
+    }
+    let since = chrono::DateTime::parse_from_rfc3339(&get("since"))
+        .map_err(|_| fail(StatusCode::BAD_REQUEST, "since must be a time."))?
+        .with_timezone(&chrono::Utc)
+        - chrono::Duration::minutes(5);
+    let until = since + chrono::Duration::days(USED_WINDOW_DAYS);
+    let fmt =
+        |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let used = common::work_usage::load(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        &work,
+        &fmt(since),
+        &fmt(until),
+    )
+    .await
+    .map_err(|e| internal("work usage", e))?;
+    Ok(Json(json!(used)))
 }
 
 #[cfg(test)]

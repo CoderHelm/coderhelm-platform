@@ -494,6 +494,66 @@ pub async fn list_activity(
         .collect())
 }
 
+/// One lookup, as the work it was made during sees it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lookup {
+    pub source_id: String,
+    pub source_name: String,
+    pub actor: String,
+    pub repo: String,
+    pub pr: u64,
+    pub run_id: String,
+    pub origin: String,
+    pub outcome: String,
+}
+
+/// Lookups between `since` and `until` (RFC 3339), oldest first, at most
+/// `cap` looked at.
+pub async fn lookups_between(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    since: &str,
+    until: &str,
+    cap: usize,
+) -> Result<Vec<Lookup>, String> {
+    let mut out = Vec::new();
+    let mut start = None;
+    loop {
+        let r = dynamo
+            .query()
+            .table_name(table)
+            .key_condition_expression("pk = :pk AND sk BETWEEN :lo AND :hi")
+            .expression_attribute_values(":pk", av_s(team_id))
+            .expression_attribute_values(":lo", av_s(&format!("{LOG_PREFIX}{since}")))
+            .expression_attribute_values(":hi", av_s(&format!("{LOG_PREFIX}{until}~")))
+            .set_exclusive_start_key(start)
+            .send()
+            .await
+            .map_err(|e| format!("lookups: {e}"))?;
+        for i in r.items() {
+            out.push(Lookup {
+                source_id: s(i, "source_id"),
+                source_name: s(i, "source_name"),
+                actor: s(i, "actor"),
+                repo: s(i, "repo"),
+                pr: i
+                    .get("pr")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0),
+                run_id: s(i, "run_id"),
+                origin: s(i, "origin"),
+                outcome: s(i, "outcome"),
+            });
+        }
+        start = r.last_evaluated_key().cloned();
+        if start.is_none() || out.len() >= cap {
+            return Ok(out);
+        }
+    }
+}
+
 /// Lookups since `since` (RFC 3339) by outcome: `(ok, refused, failed)`.
 pub async fn count_activity(
     dynamo: &aws_sdk_dynamodb::Client,
