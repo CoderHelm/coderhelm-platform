@@ -29,8 +29,12 @@ pub struct McpPlugin {
     pub npx_package: String,
     /// Credential key → env var name
     pub env_mapping: Vec<(String, String)>,
-    /// Decrypted credential values (key → value)
-    pub credentials: std::collections::HashMap<String, String>,
+    pub team_id: String,
+    /// The saved values, still sealed. Opened per call by [`build_env_vars`]
+    /// and dropped when the call's payload is built; never logged.
+    pub stored: common::mcp_credentials::Stored,
+    /// Opens `stored` (decrypt only: the worker never seals).
+    pub kms: aws_sdk_kms::Client,
     /// Custom prompt from user (optional)
     pub custom_prompt: Option<String>,
 }
@@ -85,7 +89,7 @@ pub async fn list_tools(
     function_name: &str,
     plugin: &McpPlugin,
 ) -> Result<Vec<McpToolSchema>, Box<dyn std::error::Error + Send + Sync>> {
-    let env_vars = build_env_vars(plugin);
+    let env_vars = build_env_vars(plugin).await?;
 
     let payload = json!({
         "action": "list_tools",
@@ -125,7 +129,7 @@ pub async fn call_tool(
     tool_name: &str,
     tool_input: &Value,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    let env_vars = build_env_vars(plugin);
+    let env_vars = build_env_vars(plugin).await?;
 
     let payload = json!({
         "action": "call_tool",
@@ -180,15 +184,26 @@ pub async fn call_tool(
     Ok(json!(text))
 }
 
-/// Build env var map from plugin credentials + env_mapping.
-fn build_env_vars(plugin: &McpPlugin) -> Value {
+/// Build env var map from plugin credentials + env_mapping. The values are
+/// opened here, for this one call, and the opened map is dropped on return.
+async fn build_env_vars(
+    plugin: &McpPlugin,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let kms = common::mcp_credentials::Kms {
+        client: &plugin.kms,
+        key_id: "",
+    };
+    let credentials =
+        common::mcp_credentials::load(&kms, &plugin.team_id, &plugin.server_id, &plugin.stored)
+            .await
+            .map_err(|e| format!("could not open {} credentials: {e}", plugin.server_id))?;
     let mut env = serde_json::Map::new();
     for (cred_key, env_var) in &plugin.env_mapping {
-        if let Some(value) = plugin.credentials.get(cred_key) {
+        if let Some(value) = credentials.get(cred_key) {
             env.insert(env_var.clone(), Value::String(value.clone()));
         }
     }
-    Value::Object(env)
+    Ok(Value::Object(env))
 }
 
 /// Load enabled MCP plugins with credentials for a team from DynamoDB.
@@ -198,6 +213,7 @@ pub type McpCatalog<'a> = &'a [(&'a str, &'a str, &'a [(&'a str, &'a str)])];
 /// Returns plugins that are enabled AND have credentials stored.
 pub async fn load_team_plugins(
     dynamo: &aws_sdk_dynamodb::Client,
+    kms: &aws_sdk_kms::Client,
     settings_table: &str,
     team_id: &str,
     catalog: McpCatalog<'_>,
@@ -261,12 +277,12 @@ pub async fn load_team_plugins(
             }
         };
 
-        // Parse stored credentials JSON
-        let credentials: std::collections::HashMap<String, String> = item
-            .get("credentials")
-            .and_then(|v| v.as_s().ok())
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
+        // Kept sealed until a call needs them. A record saved before sealing
+        // still works; the gateway seals it (the worker cannot write here).
+        let stored = common::mcp_credentials::stored(item);
+        if matches!(stored, common::mcp_credentials::Stored::Plain(_)) {
+            warn!(server_id, "Plugin credentials not sealed yet");
+        }
 
         let custom_prompt = item
             .get("custom_prompt")
@@ -280,7 +296,9 @@ pub async fn load_team_plugins(
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            credentials,
+            team_id: team_id.to_string(),
+            stored,
+            kms: kms.clone(),
             custom_prompt,
         });
     }

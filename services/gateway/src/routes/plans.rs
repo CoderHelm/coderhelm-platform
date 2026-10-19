@@ -3471,35 +3471,17 @@ async fn invoke_mcp_tool(
         .find(|(id, _, _)| *id == server_id)
         .ok_or_else(|| format!("Unknown MCP server: {server_id}"))?;
 
-    // Load credentials from DynamoDB
-    let creds_item = state
-        .dynamo
-        .get_item()
-        .table_name(mcp_table(state))
-        .key("pk", attr_s(team_id))
-        .key("sk", attr_s(&format!("PLUGIN#{server_id}")))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to load plugin credentials: {e}"))?
-        .item()
-        .cloned();
-
-    let creds_json: Value = creds_item
-        .as_ref()
-        .and_then(|item| {
-            item.get("credentials")
-                .and_then(|v| v.as_s().ok())
-                .and_then(|s| serde_json::from_str(s).ok())
-        })
-        .unwrap_or(json!({}));
+    // Open the saved values for this call only.
+    let creds = super::plugins::load_credentials(state, team_id, server_id).await?;
 
     // Map credential fields to env vars
     let mut env_vars = serde_json::Map::new();
     for (cred_key, env_var) in *env_mapping {
-        if let Some(val) = creds_json.get(*cred_key).and_then(|v| v.as_str()) {
+        if let Some(val) = creds.get(*cred_key) {
             env_vars.insert(env_var.to_string(), json!(val));
         }
     }
+    drop(creds);
 
     // Build proxy Lambda payload
     let payload = json!({

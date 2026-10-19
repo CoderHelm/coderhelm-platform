@@ -95,6 +95,7 @@ async fn main() -> Result<(), Error> {
     // Sync MCP server catalog to S3 on cold start (skip for streaming Lambda)
     if std::env::var("STREAMING_MODE").is_err() {
         routes::plugins::sync_catalog_to_s3(&state).await;
+        routes::plugins::seal_plain_credentials(&state).await;
     }
 
     // Build router

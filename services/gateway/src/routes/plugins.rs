@@ -6,6 +6,7 @@ use tracing::{error, info};
 use crate::models::Claims;
 use crate::AppState;
 use aws_sdk_dynamodb::types::AttributeValue;
+use common::mcp_credentials::{self, Credentials, Kms};
 
 fn attr_s(val: &str) -> AttributeValue {
     AttributeValue::S(val.to_string())
@@ -528,9 +529,99 @@ pub(crate) fn catalog_json() -> Vec<Value> {
         .collect()
 }
 
+fn cipher(state: &AppState) -> Kms<'_> {
+    Kms {
+        client: &state.kms,
+        key_id: &state.config.secrets_key_id,
+    }
+}
+
+/// The saved values for one team's MCP server, opened for this call only.
+/// A record still holding plain values (saved before sealing) is sealed in
+/// place on the way through. Never logs a value.
+pub(crate) async fn load_credentials(
+    state: &AppState,
+    team_id: &str,
+    plugin_id: &str,
+) -> Result<Credentials, String> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(mcp_table(state))
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to load plugin credentials: {e}"))?
+        .item()
+        .cloned()
+        .unwrap_or_default();
+    let stored = mcp_credentials::stored(&item);
+    let kms = cipher(state);
+    if matches!(stored, mcp_credentials::Stored::Plain(_)) {
+        match mcp_credentials::migrate_item(&state.dynamo, &kms, mcp_table(state), &item).await {
+            Ok(sealed) => {
+                info!(team = %team_id, plugin = %plugin_id, sealed, "Sealed plain plugin credentials on read")
+            }
+            Err(e) => {
+                error!(team = %team_id, plugin = %plugin_id, "Could not seal plain plugin credentials: {e}")
+            }
+        }
+    }
+    mcp_credentials::load(&kms, team_id, plugin_id, &stored).await
+}
+
+/// Seals every plugin record across teams that still holds plain values.
+/// Runs on the gateway's cold start; a sealed record is left alone, so it is
+/// safe to run any number of times. Logs counts only.
+pub async fn seal_plain_credentials(state: &AppState) {
+    if state.config.secrets_key_id.is_empty() {
+        error!("No secrets key configured; plugin credentials not sealed");
+        return;
+    }
+    match mcp_credentials::migrate_all(&state.dynamo, &cipher(state), mcp_table(state)).await {
+        Ok(sw) => info!(
+            plain_found = sw.plain_found,
+            sealed_now = sw.sealed_now,
+            raced = sw.raced,
+            failed = sw.failed,
+            "Plugin credential sealing sweep"
+        ),
+        Err(e) => error!("Plugin credential sealing sweep failed: {e}"),
+    }
+}
+
 /// GET /api/plugins/catalog — return all available plugins.
 pub async fn list_catalog() -> Json<Value> {
     Json(json!({ "plugins": CATALOG }))
+}
+
+/// What the dashboard sees of one plugin record. Built field by field, so a
+/// saved credential value (sealed or plain) can never reach a response.
+fn plugin_summary(item: &std::collections::HashMap<String, AttributeValue>) -> Option<Value> {
+    let sk = item.get("sk")?.as_s().ok()?;
+    let plugin_id = sk.strip_prefix("PLUGIN#")?;
+    let enabled = item
+        .get("enabled")
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false);
+    let has_credentials = item
+        .get("has_credentials")
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false);
+    let enabled_at = item
+        .get("enabled_at")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.to_string());
+    Some(json!({
+        "plugin_id": plugin_id,
+        "enabled": enabled,
+        "has_credentials": has_credentials,
+        "enabled_at": enabled_at,
+        "custom_prompt": item.get("custom_prompt").and_then(|v| v.as_s().ok()).map(|s| s.to_string()),
+    }))
 }
 
 /// GET /api/plugins — list plugins enabled for this team.
@@ -552,35 +643,7 @@ pub async fn list_enabled(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let plugins: Vec<Value> = result
-        .items()
-        .iter()
-        .filter_map(|item| {
-            let sk = item.get("sk")?.as_s().ok()?;
-            let plugin_id = sk.strip_prefix("PLUGIN#")?;
-            let enabled = item
-                .get("enabled")
-                .and_then(|v| v.as_bool().ok())
-                .copied()
-                .unwrap_or(false);
-            let has_credentials = item
-                .get("has_credentials")
-                .and_then(|v| v.as_bool().ok())
-                .copied()
-                .unwrap_or(false);
-            let enabled_at = item
-                .get("enabled_at")
-                .and_then(|v| v.as_s().ok())
-                .map(|s| s.to_string());
-            Some(json!({
-                "plugin_id": plugin_id,
-                "enabled": enabled,
-                "has_credentials": has_credentials,
-                "enabled_at": enabled_at,
-                "custom_prompt": item.get("custom_prompt").and_then(|v| v.as_s().ok()).map(|s| s.to_string()),
-            }))
-        })
-        .collect();
+    let plugins: Vec<Value> = result.items().iter().filter_map(plugin_summary).collect();
 
     Ok(Json(json!({ "plugins": plugins })))
 }
@@ -686,11 +749,28 @@ pub async fn update_credentials(
         }
     }
 
-    // Store credentials as JSON string in the item
-    let creds_json = serde_json::to_string(&credentials).map_err(|e| {
-        error!("Failed to serialize credentials: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Only the catalog's fields, as text; sealed for this team and server.
+    let creds: Credentials = plugin_def
+        .credential_fields
+        .iter()
+        .filter_map(|f| {
+            credentials
+                .get(f.key)
+                .and_then(|v| v.as_str())
+                .map(|v| (f.key.to_string(), v.to_string()))
+        })
+        .collect();
+    let sealed =
+        match mcp_credentials::seal(&cipher(&state), &claims.team_id, &plugin_id, &creds).await {
+            Ok(s) => s,
+            Err(e) if e.contains("too long") => {
+                return Ok(Json(json!({ "error": "Credentials are too long" })));
+            }
+            Err(e) => {
+                error!(plugin = %plugin_id, "Failed to seal credentials: {e}");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
 
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -701,9 +781,11 @@ pub async fn update_credentials(
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
         .update_expression(
-            "SET credentials = :creds, has_credentials = :hc, credentials_updated_at = :ts",
+            "SET #sealed = :creds, has_credentials = :hc, credentials_updated_at = :ts REMOVE #plain",
         )
-        .expression_attribute_values(":creds", attr_s(&creds_json))
+        .expression_attribute_names("#sealed", mcp_credentials::SEALED_ATTR)
+        .expression_attribute_names("#plain", mcp_credentials::PLAIN_ATTR)
+        .expression_attribute_values(":creds", attr_s(&sealed))
         .expression_attribute_values(":hc", AttributeValue::Bool(true))
         .expression_attribute_values(":ts", attr_s(&now))
         .condition_expression("attribute_exists(pk)")
@@ -777,38 +859,22 @@ pub async fn test_connection(
         .find(|p| p.id == plugin_id)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Load stored credentials
-    let item = state
-        .dynamo
-        .get_item()
-        .table_name(mcp_table(&state))
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
-        .send()
+    // Open the saved values for this call only.
+    let creds = load_credentials(&state, &claims.team_id, &plugin_id)
         .await
         .map_err(|e| {
-            error!("Failed to load plugin item for test: {e}");
+            error!(plugin = %plugin_id, "Failed to load plugin credentials for test: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .item()
-        .cloned();
-
-    let creds_json: serde_json::Value = item
-        .as_ref()
-        .and_then(|i| {
-            i.get("credentials")
-                .and_then(|v| v.as_s().ok())
-                .and_then(|s| serde_json::from_str(s).ok())
-        })
-        .unwrap_or(json!({}));
+        })?;
 
     // Map credentials to env vars
     let mut env_vars = serde_json::Map::new();
     for (cred_key, env_var) in plugin_def.env_mapping {
-        if let Some(val) = creds_json.get(*cred_key).and_then(|v| v.as_str()) {
+        if let Some(val) = creds.get(*cred_key) {
             env_vars.insert(env_var.to_string(), json!(val));
         }
     }
+    drop(creds);
 
     // Invoke MCP proxy Lambda with list_tools action
     let payload = json!({
@@ -877,4 +943,34 @@ async fn record_test(state: &AppState, team_id: &str, plugin_id: &str, ok: bool,
         .condition_expression("attribute_exists(pk)")
         .send()
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plugin_summary_never_carries_credentials() {
+        let item = std::collections::HashMap::from([
+            ("pk".to_string(), attr_s("TEAM#a")),
+            ("sk".to_string(), attr_s("PLUGIN#figma")),
+            ("enabled".to_string(), AttributeValue::Bool(true)),
+            ("has_credentials".to_string(), AttributeValue::Bool(true)),
+            (
+                "credentials".to_string(),
+                attr_s(r#"{"api_token":"figd_plain_secret"}"#),
+            ),
+            (
+                "credentials_sealed".to_string(),
+                attr_s("c2VhbGVkX3NlY3JldA=="),
+            ),
+        ]);
+        let out = plugin_summary(&item).unwrap();
+        let text = out.to_string();
+        assert!(!text.contains("figd_plain_secret"));
+        assert!(!text.contains("c2VhbGVkX3NlY3JldA=="));
+        assert!(!text.contains("credentials_sealed"));
+        assert_eq!(out["plugin_id"], "figma");
+        assert_eq!(out["has_credentials"], true);
+    }
 }
