@@ -33,6 +33,8 @@ pub struct Config {
     pub sandbox_project_name: String,
     /// E2E results. Empty disables the feature.
     pub tests_table_name: String,
+    /// The Monday weekly summary goes out only when this is true.
+    pub weekly_summary_enabled: bool,
 }
 
 impl Config {
@@ -73,6 +75,9 @@ impl Config {
             sandbox_bucket_name: std::env::var("SANDBOX_BUCKET_NAME").unwrap_or_default(),
             sandbox_project_name: std::env::var("SANDBOX_PROJECT_NAME").unwrap_or_default(),
             tests_table_name: std::env::var("TESTS_TABLE_NAME").unwrap_or_default(),
+            weekly_summary_enabled: std::env::var("WEEKLY_SUMMARY_ENABLED")
+                .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 }
@@ -81,6 +86,10 @@ impl Config {
 pub struct Secrets {
     pub github_app_id: String,
     pub github_private_key: String,
+    /// Signs unsubscribe links (a key derived from it, never the secret
+    /// itself); the gateway checks them with the same secret.
+    #[serde(default)]
+    pub jwt_secret: String,
 }
 
 impl Secrets {
@@ -160,6 +169,13 @@ pub enum WorkerMessage {
     #[serde(rename = "skill_sync")]
     SkillSync(common::skills::SkillSyncMessage),
     SkillAsk(common::skills::SkillAskMessage),
+    /// The Monday weekly summary emails (EventBridge → SQS). Sends nothing
+    /// unless WEEKLY_SUMMARY_ENABLED is true.
+    #[serde(rename = "weekly_summary")]
+    WeeklySummary,
+    /// One test weekly summary for a team, to one address only.
+    #[serde(rename = "weekly_summary_test")]
+    WeeklySummaryTest(crate::passes::weekly_summary::WeeklySummaryTestMessage),
 }
 
 /// A code-graph index job. `changed_files: None` ⇒ full index of the branch

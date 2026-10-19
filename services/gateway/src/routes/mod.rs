@@ -5,6 +5,7 @@ pub mod api;
 pub mod auth;
 pub mod banners;
 pub mod data_sources;
+pub mod email;
 pub mod github;
 pub mod github_webhook;
 pub mod graph;

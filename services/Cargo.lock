@@ -1172,6 +1172,7 @@ dependencies = [
  "base64",
  "chrono",
  "graphql-parser",
+ "hmac",
  "quick-xml",
  "regex",
  "reqwest",

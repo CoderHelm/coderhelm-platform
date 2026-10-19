@@ -570,6 +570,17 @@ async fn main() -> Result<(), Error> {
             middleware::rate_limit::rate_limit_auth,
         ));
 
+    // Unsubscribe links in emails: public, the signed token is the credential.
+    let email_routes = Router::new()
+        .route(
+            "/unsubscribe",
+            get(routes::email::unsubscribe_link).post(routes::email::unsubscribe_one_click),
+        )
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit::rate_limit_email,
+        ));
+
     let app = Router::new()
         // Root health/info
         .route(
@@ -589,6 +600,7 @@ async fn main() -> Result<(), Error> {
             post(routes::api::forge_register_urls),
         )
         .nest("/auth", auth_routes)
+        .nest("/email", email_routes)
         // Nest protected routes under /api
         .nest("/api", api_routes)
         .layer(SetResponseHeaderLayer::overriding(

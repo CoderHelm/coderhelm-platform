@@ -41,6 +41,18 @@ pub async fn rate_limit_auth(
     Ok(next.run(req).await)
 }
 
+/// Rate limit for the public unsubscribe links: 60 requests per IP per
+/// 5 minutes, counted apart from sign-in so mail apps posting one-click
+/// unsubscribes never use up anyone's sign-in attempts.
+pub async fn rate_limit_email(
+    State(_state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    check_rate_limit(&client_ip(&req), "email", 60, 300)?;
+    Ok(next.run(req).await)
+}
+
 /// In-memory sliding window rate limiter.
 /// Zero latency, no external calls. Resets on cold start.
 fn check_rate_limit(

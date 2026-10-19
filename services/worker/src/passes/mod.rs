@@ -672,6 +672,7 @@ pub mod syntax_check;
 mod test;
 pub mod tool_proposals;
 mod triage;
+pub mod weekly_summary;
 pub mod write_guard;
 
 /// Minimal MCP plugin catalog: (server_id, npx_package, env_mapping).
