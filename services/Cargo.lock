@@ -5124,6 +5124,7 @@ dependencies = [
  "chrono",
  "common",
  "flate2",
+ "futures",
  "jsonwebtoken",
  "lambda_runtime",
  "mentedb",

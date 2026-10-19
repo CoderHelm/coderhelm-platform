@@ -750,6 +750,12 @@ fn run_codegen_tool() -> ToolDefinition {
     }
 }
 
+/// The names of the coding agent's own tools.
+#[cfg(test)]
+pub(crate) fn tool_names() -> Vec<String> {
+    all_tools().into_iter().map(|t| t.name).collect()
+}
+
 fn all_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
