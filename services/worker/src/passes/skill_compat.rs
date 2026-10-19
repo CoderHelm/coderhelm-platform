@@ -189,10 +189,24 @@ pub async fn check_item(
 ) -> Result<(Analysis, String), String> {
     let started = Instant::now();
     let user = skill_compat::user_message(inv, m.kind.as_str(), &m.name, body, &m.files);
-    let (raw, usage) = checker
-        .check(skill_compat::SYSTEM, &user, &skill_compat::output_schema())
-        .await;
-    let (mut a, translated) = skill_compat::finish(&raw?, inv)?;
+    let source_chars = common::skills::parse_front_matter(body)
+        .2
+        .trim()
+        .chars()
+        .count();
+    let schema = skill_compat::output_schema();
+    // A stub or malformed answer is asked again once; both calls count.
+    let mut usage = TokenUsage::default();
+    let mut result = Err(String::new());
+    for _ in 0..2 {
+        let (raw, spent) = checker.check(skill_compat::SYSTEM, &user, &schema).await;
+        usage.merge(&spent);
+        result = raw.and_then(|v| skill_compat::finish(&v, inv, source_chars));
+        if result.is_ok() {
+            break;
+        }
+    }
+    let (mut a, translated) = result?;
     a.model = checker.model().to_string();
     a.input_tokens = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
     a.output_tokens = usage.output_tokens;
@@ -648,6 +662,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("expected shape"), "{err}");
+    }
+
+    /// Answers a stub first, then a real check.
+    struct StubThenReal(std::sync::atomic::AtomicUsize, Value);
+
+    #[async_trait::async_trait]
+    impl Checker for StubThenReal {
+        fn model(&self) -> &str {
+            "fake-light"
+        }
+        async fn check(&self, _: &str, _: &str, _: &Value) -> (Result<Value, String>, TokenUsage) {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let usage = TokenUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                ..Default::default()
+            };
+            let stub = json!({ "steps": [{ "title": "x", "does": "", "dropped": false, "requirements": [] }], "translated": "x" });
+            (Ok(if n == 0 { stub } else { self.1.clone() }), usage)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stub_answer_is_asked_again_once_and_both_calls_count() {
+        let real = json!({
+            "steps": [{ "title": "Read the rules", "does": "Read them", "dropped": false, "requirements": [] }],
+            "translated": "Read the rules before changing the code, every time."
+        });
+        let fake = StubThenReal(Default::default(), real);
+        let m = meta("skills/triage/SKILL.md", "h1", "", "");
+        let (a, _) = check_item(&fake, &inv(), &m, "Read the rules first.")
+            .await
+            .unwrap();
+        assert_eq!(a.status, "ready");
+        assert_eq!((a.input_tokens, a.output_tokens), (200, 20));
+        assert_eq!(fake.0.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
