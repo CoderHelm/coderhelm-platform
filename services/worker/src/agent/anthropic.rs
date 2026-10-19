@@ -356,8 +356,11 @@ pub async fn converse_simple(
     extract_text(&resp.blocks())
 }
 
-/// One call whose answer must match `schema` (structured outputs), parsed.
-/// No tools. Counted like every other call.
+/// One call whose answer is a JSON object matching `schema`, parsed. With
+/// `constrained`, the API holds the answer to the schema (structured
+/// outputs); without, the schema is in the instructions and the answer's
+/// JSON object is parsed from its text. No tools. Counted like every other
+/// call.
 #[allow(clippy::too_many_arguments)]
 pub async fn converse_json(
     client: &AnthropicClient,
@@ -365,6 +368,7 @@ pub async fn converse_json(
     system: &str,
     user_message: &str,
     schema: &Value,
+    constrained: bool,
     effort: &str,
     max_tokens: i32,
     usage: &mut crate::models::TokenUsage,
@@ -391,7 +395,19 @@ pub async fn converse_json(
         tool_choice: None,
     };
     apply_model_family(&mut request, Some(effort), false);
-    request.output_config = Some(json_output_config(request.output_config.take(), schema));
+    if constrained {
+        request.output_config = Some(json_output_config(request.output_config.take(), schema));
+    } else {
+        request.system = vec![SystemBlock::Text {
+            text: format!(
+                "{system}\n\nAnswer with only one JSON object that matches this JSON schema, \
+                 and nothing before or after it:\n{schema}"
+            ),
+            cache_control: Some(CacheControl {
+                r#type: "ephemeral".to_string(),
+            }),
+        }];
+    }
     // A decline is an error to see, not an answer from another model.
     request.fallbacks = None;
     let resp = send_request(client, &request).await?;
@@ -415,8 +431,17 @@ pub async fn converse_json(
         return Err("The answer was cut off before it finished.".into());
     }
     let text = extract_text(&resp.blocks())?;
-    serde_json::from_str(text.trim())
+    serde_json::from_str(json_object(&text))
         .map_err(|e| format!("The answer wasn't valid JSON: {e}").into())
+}
+
+/// The JSON object in an answer: from its first `{` to its last `}`, so a
+/// code fence or a stray line around it doesn't matter.
+fn json_object(text: &str) -> &str {
+    match (text.find('{'), text.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &text[a..=b],
+        _ => text.trim(),
+    }
 }
 
 /// `output_config` with the JSON schema format added to whatever the model
@@ -869,6 +894,22 @@ fn compact_messages(messages: &mut [(String, Vec<Value>)], keep_last: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_json_object_is_found_inside_a_fence() {
+        assert_eq!(
+            json_object("```json\n{\"a\": {\"b\": 1}}\n```"),
+            "{\"a\": {\"b\": 1}}"
+        );
+        assert_eq!(json_object(" {} "), "{}");
+        assert_eq!(json_object(" nothing "), "nothing");
+        let cfg = json_output_config(
+            Some(json!({"effort": "medium"})),
+            &json!({"type": "object"}),
+        );
+        assert_eq!(cfg["effort"], "medium");
+        assert_eq!(cfg["format"]["type"], "json_schema");
+    }
 
     fn request(model: &str) -> MessagesRequest {
         MessagesRequest {

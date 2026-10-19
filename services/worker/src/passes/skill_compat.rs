@@ -24,8 +24,14 @@ const PARALLEL: usize = 4;
 /// worker's 15 minutes; what's left is checked on the next sweep.
 const BUDGET: Duration = Duration::from_secs(11 * 60);
 const EFFORT: &str = "medium";
-/// After a stub answer, the one more try thinks harder.
+/// After a stub answer, the one more try thinks harder and isn't held to
+/// the schema by the API (the stubs came from constrained answers): the
+/// schema is in its instructions and its answer is checked the same way.
 const RETRY_EFFORT: &str = "high";
+
+/// How each try asks: its effort, and whether the API holds the answer to
+/// the schema.
+pub const TRIES: [(&str, bool); 2] = [(EFFORT, true), (RETRY_EFFORT, false)];
 const MAX_TOKENS: i32 = 32_000;
 
 /// Coderhelm's own tools, as an item can rely on them. A test checks each
@@ -137,14 +143,13 @@ const NEVER: &[&str] = &[
 #[async_trait::async_trait]
 pub trait Checker: Send + Sync {
     fn model(&self) -> &str;
-    /// `effort` is the model's effort: the usual one first, a higher one
-    /// for the one more try after a stub answer.
+    /// `attempt` is which of [`TRIES`] this is.
     async fn check(
         &self,
         system: &str,
         user: &str,
         schema: &Value,
-        effort: &str,
+        attempt: usize,
     ) -> (Result<Value, String>, TokenUsage);
 }
 
@@ -165,16 +170,18 @@ impl Checker for TeamModel<'_> {
         system: &str,
         user: &str,
         schema: &Value,
-        effort: &str,
+        attempt: usize,
     ) -> (Result<Value, String>, TokenUsage) {
         let mut usage = TokenUsage::default();
         let client = self.provider.client();
+        let (effort, constrained) = TRIES[attempt.min(TRIES.len() - 1)];
         let r = crate::agent::anthropic::converse_json(
             &client,
             &self.model,
             system,
             user,
             schema,
+            constrained,
             effort,
             MAX_TOKENS,
             &mut usage,
@@ -204,9 +211,9 @@ pub async fn check_item(
     // A stub or malformed answer is asked again once; both calls count.
     let mut usage = TokenUsage::default();
     let mut result = Err(String::new());
-    for effort in [EFFORT, RETRY_EFFORT] {
+    for (attempt, (effort, _)) in TRIES.iter().enumerate() {
         let (raw, spent) = checker
-            .check(skill_compat::SYSTEM, &user, &schema, effort)
+            .check(skill_compat::SYSTEM, &user, &schema, attempt)
             .await;
         usage.merge(&spent);
         result = raw.and_then(|v| skill_compat::finish(&v, inv, source_chars));
@@ -580,9 +587,9 @@ mod tests {
             system: &str,
             user: &str,
             schema: &Value,
-            effort: &str,
+            attempt: usize,
         ) -> (Result<Value, String>, TokenUsage) {
-            assert!([EFFORT, RETRY_EFFORT].contains(&effort));
+            assert!(attempt < TRIES.len());
             assert!(system.contains("Read the WHOLE text"));
             assert!(user.contains("## Coderhelm inventory"));
             assert!(user.contains("skill `triage`"));
@@ -695,10 +702,10 @@ mod tests {
             _: &str,
             _: &str,
             _: &Value,
-            effort: &str,
+            attempt: usize,
         ) -> (Result<Value, String>, TokenUsage) {
             let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            assert_eq!(effort, if n == 0 { EFFORT } else { RETRY_EFFORT });
+            assert_eq!(attempt, n);
             let usage = TokenUsage {
                 input_tokens: 100,
                 output_tokens: 10,
