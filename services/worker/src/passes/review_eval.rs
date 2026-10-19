@@ -13,17 +13,29 @@
 //!   (c) every head ends with a formal outcome, and a redelivered job never
 //!       posts twice.
 //!
+//! Merge-gate steps (approvals, dismissals, CI results, a person's draft)
+//! drive the real gate decision (`await_merge::decide_gate`), the re-arm
+//! rules the gateway applies (`common::merge_gate::wakes_on_*`), the approval
+//! reading (`review_actions::approval_state`) and the draft guard
+//! (`human_converted_to_draft`), and check one more invariant:
+//!   (d) the gate never merges a draft, a PR whose CoderHelm approval was
+//!       dismissed or never given, or one whose CI is running or failing.
+//!
 //! Live layer (`cargo test -p worker review_eval -- --ignored`, nightly): the
 //! model reads each recorded comment and reply, and its classification must
 //! land in the case's outcome class.
 
+use super::await_merge::{classify_check_runs, decide_gate, Action, GateView};
+use super::review_actions::approval_state;
 use super::review_agent::{self, Evidence, Finding, ReviewOutput, VerdictChange};
 use super::review_pr::{
     failure_plan, reply_after_formal, retry_message, FailurePlan, FormalResult,
 };
 use super::review_sweep::{stuck, FailureNote, ReviewRecord};
 use super::review_verdict::{decide, Context, Decision, Input, StandingReview};
+use crate::clients::github::human_converted_to_draft;
 use crate::models::ReviewMessage;
+use common::merge_gate;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -35,8 +47,43 @@ struct Case {
     self_authored: bool,
     #[serde(default)]
     require_tests: bool,
+    /// The repo's auto-merge policy; absent = auto-merge off (no gate).
+    #[serde(default)]
+    auto_merge: Option<AutoMerge>,
     steps: Vec<Step>,
     expect: Expect,
+}
+
+#[derive(Deserialize, Clone)]
+struct AutoMerge {
+    #[serde(default = "yes")]
+    require_human: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+struct CiStep {
+    name: String,
+    status: String,
+    #[serde(default)]
+    conclusion: String,
+    /// The check suite finished with this run (GitHub sends `check_suite
+    /// completed`).
+    #[serde(default)]
+    suite_completed: bool,
+}
+
+#[derive(Deserialize)]
+struct GateIs {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    merged: Option<bool>,
+    #[serde(default)]
+    draft: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +104,29 @@ enum Step {
         minutes_later: i64,
         review: Option<ReviewStep>,
     },
+    /// A person approves the PR (GitHub `pull_request_review` approved).
+    Approve {
+        by: String,
+    },
+    /// A person requests changes.
+    RequestChanges {
+        by: String,
+    },
+    /// A review is dismissed (`who` = `coderhelm` or a person's login).
+    Dismiss {
+        who: String,
+    },
+    /// A check run on the head changes.
+    Ci(CiStep),
+    /// A person converts the PR back to draft.
+    ConvertToDraft {
+        by: String,
+    },
+    /// CI passed on CoderHelm's branch: the pipeline tries to mark the PR
+    /// ready (the MarkReady path).
+    CiPassedMarkReady {},
+    /// Assert the gate's state mid-case.
+    GateIs(GateIs),
 }
 
 #[derive(Deserialize, Clone)]
@@ -92,6 +162,9 @@ struct Expect {
     formal_events: Option<Vec<(String, String)>>,
     #[serde(default)]
     first_approval_has_notes: bool,
+    /// The merge gate's final state, whether it merged, whether the PR is a draft.
+    #[serde(default)]
+    gate: Option<GateIs>,
 }
 
 #[derive(Deserialize)]
@@ -129,7 +202,21 @@ struct Sim {
     claims: HashSet<String>,
     failure: Option<FailureNote>,
     replies: Vec<String>,
+    /// Asks handed to the fix loop (CoderHelm's own PRs).
+    fix_loop: Vec<String>,
     violations: Vec<String>,
+    // ── merge gate ──
+    auto_merge: Option<AutoMerge>,
+    /// CoderHelm's recorded verdict per head (stored even when not posted).
+    bot_verdicts: std::collections::HashMap<String, String>,
+    /// GitHub's review list, oldest first.
+    gh_reviews: Vec<Value>,
+    checks: Vec<Value>,
+    timeline: Vec<Value>,
+    draft: bool,
+    /// The gate record: (head, state). None = never armed.
+    gate: Option<(String, String)>,
+    merged: bool,
 }
 
 fn ts(minutes: i64) -> String {
@@ -222,6 +309,7 @@ impl Sim {
             trigger: "synchronize".into(),
             dedup_key: dedup_key.into(),
             reply_to_comment_id: None,
+            requested_by: String::new(),
             attempt: 0,
             wait_secs: 0,
             reconcile_note: None,
@@ -282,6 +370,8 @@ impl Sim {
             },
             &self.ctx(),
         );
+        self.bot_verdicts
+            .insert(step.head.clone(), verdict.to_string());
         // New findings become open threads.
         for f in &findings {
             self.threads.push(Thread {
@@ -298,10 +388,109 @@ impl Sim {
                     notes: findings.iter().filter(|f| !f.holds_merge()).count(),
                     at: self.now,
                 });
+                let gh_state = match event {
+                    "APPROVE" => "APPROVED",
+                    "REQUEST_CHANGES" => "CHANGES_REQUESTED",
+                    _ => "COMMENTED",
+                };
+                self.gh_reviews.push(serde_json::json!({
+                    "user": {"login": "coderhelm[bot]"},
+                    "state": gh_state,
+                    "commit_id": step.head,
+                }));
+                // run_on_approve arms the gate on every APPROVE verdict.
+                if verdict == "APPROVE" {
+                    self.arm_gate();
+                }
                 Some(event)
             }
-            Decision::Nothing => None,
+            Decision::Nothing => {
+                if verdict == "APPROVE" {
+                    self.arm_gate();
+                }
+                None
+            }
             Decision::Review => panic!("a finished review never asks for another"),
+        }
+    }
+
+    /// The gateway re-arms an existing gate on this head when `wake` accepts
+    /// its state.
+    fn rearm_gate(&mut self, wake: fn(&str) -> bool) {
+        if let Some((head, state)) = &self.gate {
+            if *head == self.head && wake(state) {
+                self.arm_gate();
+            }
+        }
+    }
+
+    /// One evaluation of the real gate decision.
+    fn arm_gate(&mut self) {
+        let Some(cfg) = self.auto_merge.clone() else {
+            return;
+        };
+        if self.merged {
+            return;
+        }
+        let mut view = GateView {
+            head: self.head.clone(),
+            draft: self.draft,
+            require_human: cfg.require_human || self.self_authored,
+            bot_verdict: self.bot_verdicts.get(&self.head).cloned(),
+            approvals: approval_state(&Value::Array(self.gh_reviews.clone()), &self.head),
+            want_labels: vec![],
+            present_labels: vec![],
+            labels_added_at: None,
+            ci: None,
+            now: 1_800_000_000 + self.now * 60,
+        };
+        let mut d = decide_gate(&view);
+        if d.action == Action::ReadCi {
+            view.ci = Some(classify_check_runs(&self.checks));
+            d = decide_gate(&view);
+        }
+        let state = if d.action == Action::Merge {
+            // Invariant (d), checked against the raw inputs, not the gate.
+            let ci = classify_check_runs(&self.checks);
+            let approvals = approval_state(&Value::Array(self.gh_reviews.clone()), &self.head);
+            if self.draft
+                || approvals.bot_dismissed_at_head
+                || self.bot_verdicts.get(&self.head).map(String::as_str) != Some("APPROVE")
+                || !ci.pending.is_empty()
+                || !ci.failing.is_empty()
+            {
+                self.violations.push(format!(
+                    "the gate merged {} while it was a draft, unapproved by CoderHelm, or CI was not green",
+                    self.head
+                ));
+            }
+            self.merged = true;
+            merge_gate::STATE_MERGED.to_string()
+        } else {
+            d.state.to_string()
+        };
+        self.gate = Some((self.head.clone(), state));
+    }
+
+    fn gate_check(&mut self, case: &str, want: &GateIs) {
+        let state = self.gate.as_ref().map(|(_, s)| s.as_str()).unwrap_or("");
+        if let Some(w) = &want.state {
+            if w != state {
+                self.violations
+                    .push(format!("{case}: the gate is {state:?}, want {w:?}"));
+            }
+        }
+        if let Some(w) = want.merged {
+            if w != self.merged {
+                self.violations
+                    .push(format!("{case}: merged is {}, want {w}", self.merged));
+            }
+        }
+        if let Some(w) = want.draft {
+            if w != self.draft {
+                self.violations
+                    .push(format!("{case}: draft is {}, want {w}", self.draft));
+            }
         }
     }
 
@@ -326,6 +515,7 @@ impl Sim {
         let mut sim = Sim {
             self_authored: case.self_authored,
             require_tests: case.require_tests,
+            auto_merge: case.auto_merge.clone(),
             ..Default::default()
         };
         // The dedup key of the job that reviews the current head next.
@@ -402,7 +592,63 @@ impl Sim {
                         (None, None) => {}
                     }
                 }
+                Step::Approve { by } => {
+                    sim.gh_reviews.push(serde_json::json!({
+                        "user": {"login": by}, "state": "APPROVED", "commit_id": sim.head,
+                    }));
+                    // A person's approval always arms the gate.
+                    sim.arm_gate();
+                }
+                Step::RequestChanges { by } => {
+                    sim.gh_reviews.push(serde_json::json!({
+                        "user": {"login": by}, "state": "CHANGES_REQUESTED", "commit_id": sim.head,
+                    }));
+                    sim.rearm_gate(merge_gate::wakes_on_review);
+                }
+                Step::Dismiss { who } => {
+                    let login = if who == "coderhelm" {
+                        "coderhelm[bot]".to_string()
+                    } else {
+                        who.clone()
+                    };
+                    sim.gh_reviews.push(serde_json::json!({
+                        "user": {"login": login}, "state": "DISMISSED", "commit_id": sim.head,
+                    }));
+                    sim.rearm_gate(merge_gate::wakes_on_review);
+                }
+                Step::Ci(c) => {
+                    sim.checks.push(serde_json::json!({
+                        "name": c.name,
+                        "status": c.status,
+                        "conclusion": c.conclusion,
+                        "started_at": ts(sim.now),
+                    }));
+                    if c.suite_completed {
+                        sim.rearm_gate(merge_gate::wakes_on_ci);
+                    }
+                }
+                Step::ConvertToDraft { by } => {
+                    sim.draft = true;
+                    sim.timeline.push(serde_json::json!({
+                        "event": "convert_to_draft", "actor": {"login": by, "type": "User"},
+                    }));
+                }
+                Step::CiPassedMarkReady {} => {
+                    let timeline = Value::Array(sim.timeline.clone());
+                    if sim.draft && human_converted_to_draft(&timeline).is_none() {
+                        sim.draft = false;
+                        sim.timeline.push(serde_json::json!({
+                            "event": "ready_for_review",
+                            "actor": {"login": "coderhelm[bot]", "type": "Bot"},
+                        }));
+                        sim.rearm_gate(merge_gate::wakes_on_review);
+                    }
+                }
+                Step::GateIs(want) => sim.gate_check(&case.name, want),
             }
+        }
+        if let Some(want) = &case.expect.gate {
+            sim.gate_check(&case.name, want);
         }
         sim
     }
@@ -413,11 +659,18 @@ impl Sim {
             return;
         }
         let kind = review_agent::parse_ask(&serde_json::json!({ "kind": c.ask_kind }));
-        if kind.wants_formal_review() || self.self_authored {
-            if let Some(r) = &c.review {
-                self.finished_review(r, true);
+        match review_agent::route_ask(kind, self.self_authored) {
+            review_agent::AskRoute::FormalReview => {
+                if let Some(r) = &c.review {
+                    self.finished_review(r, true);
+                }
+                return;
             }
-            return;
+            review_agent::AskRoute::FixLoop => {
+                self.fix_loop.push(c.text.clone());
+                return;
+            }
+            review_agent::AskRoute::Reply => {}
         }
         let answer = c.reply.clone().unwrap_or_default();
         let conclusion =
@@ -532,17 +785,35 @@ fn review_eval_replays_every_case() {
     );
 }
 
-/// Live layer: the model reads each recorded comment and reply. Needs
-/// ANTHROPIC_API_KEY (and optionally EVAL_MODEL); run nightly.
+/// Live layer: the model reads each recorded comment and reply; run nightly.
+/// `EVAL_PROVIDER=bedrock` sends the same requests through Amazon Bedrock
+/// with the ambient AWS credentials (the nightly workflow's narrow OIDC
+/// role, no API key); otherwise ANTHROPIC_API_KEY is used. EVAL_MODEL picks
+/// the model (a Bedrock model or inference profile id on Bedrock).
 #[tokio::test]
 #[ignore]
 async fn review_eval_live_classification() {
-    let Ok(key) = std::env::var("ANTHROPIC_API_KEY") else {
-        panic!("ANTHROPIC_API_KEY is required for the live reviewer evals");
+    let meter = common::usage::UsageMeter::memory("").0;
+    let bedrock = std::env::var("EVAL_PROVIDER").is_ok_and(|p| p == "bedrock");
+    let (client, default_model) = if bedrock {
+        let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        (
+            crate::agent::anthropic::AnthropicClient::bedrock(
+                aws_sdk_bedrockruntime::Client::new(&cfg),
+                meter,
+            ),
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        )
+    } else {
+        let Ok(key) = std::env::var("ANTHROPIC_API_KEY") else {
+            panic!("set EVAL_PROVIDER=bedrock (AWS credentials) or ANTHROPIC_API_KEY for the live reviewer evals");
+        };
+        (
+            crate::agent::anthropic::AnthropicClient::new(key, meter),
+            "claude-haiku-4-5",
+        )
     };
-    let model = std::env::var("EVAL_MODEL").unwrap_or_else(|_| "claude-haiku-4-5".into());
-    let client =
-        crate::agent::anthropic::AnthropicClient::new(key, common::usage::UsageMeter::memory("").0);
+    let model = std::env::var("EVAL_MODEL").unwrap_or_else(|_| default_model.into());
     let mut usage = crate::models::TokenUsage::default();
     let mut failures = vec![];
     for (file, case) in cases() {

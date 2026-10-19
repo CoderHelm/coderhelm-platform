@@ -334,6 +334,15 @@ pub struct AwaitMergeMessage {
     pub self_authored: bool,
     #[serde(default)]
     pub attempts: u32,
+    /// Which arming this tick belongs to. Every arming starts a new chain; a
+    /// tick whose chain is no longer the record's current one stops, so one
+    /// PR never runs two polling loops. Empty on a fresh arming.
+    #[serde(default)]
+    pub chain_id: String,
+    /// Evaluations in a row that failed on an error (GitHub or DynamoDB).
+    /// They are retried on their own schedule and never end the gate.
+    #[serde(default)]
+    pub error_retries: u32,
 }
 
 /// Post-merge health check job. Baseline = checks already failing at merge time,
@@ -389,6 +398,11 @@ pub struct ReviewMessage {
     /// answer is posted back into that thread instead of the conversation.
     #[serde(default)]
     pub reply_to_comment_id: Option<u64>,
+    /// Login of the person whose comment asked for this job (empty for
+    /// label, push and sweep triggers). On CoderHelm's own PRs a fix request
+    /// goes on to the fix loop, which answers this person on the PR.
+    #[serde(default)]
+    pub requested_by: String,
     /// How many times this review already failed for a service error and
     /// was sent again (0 on the first run).
     #[serde(default)]
@@ -514,6 +528,12 @@ pub struct FeedbackMessage {
     pub review_id: u64,
     pub review_body: String,
     pub comments: Vec<ReviewComment>,
+    /// Login of the person whose comment or review body addressed CoderHelm.
+    /// Empty for automated feedback (CI results, CoderHelm's own review). When
+    /// set and there is no inline thread to answer in, the fix loop replies on
+    /// the PR addressed to them.
+    #[serde(default)]
+    pub trigger_author: String,
     /// How many times this feedback has been re-enqueued because the per-run
     /// writer slot was busy. Absent on messages from the gateway (defaults to 0);
     /// bounds the defer loop so a wedged slot can't churn indefinitely.
@@ -689,6 +709,7 @@ mod tests {
                 node_id: None,
                 is_context: false,
             }],
+            trigger_author: "alice".into(),
             defer_count: 2,
             model_retries: 0,
         });
@@ -696,6 +717,23 @@ mod tests {
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();
         match parsed {
             WorkerMessage::Feedback(f) => assert_eq!(f.defer_count, 2),
+            _ => panic!("expected feedback"),
+        }
+    }
+
+    #[test]
+    fn messages_queued_before_new_fields_still_parse() {
+        let gate = r#"{"type":"await_merge","team_id":"T","installation_id":1,"repo_owner":"o","repo_name":"r","pr_number":2,"head_sha":"h","base_branch":"main","attempts":3}"#;
+        match serde_json::from_str::<WorkerMessage>(gate).unwrap() {
+            WorkerMessage::AwaitMerge(m) => {
+                assert!(m.chain_id.is_empty());
+                assert_eq!(m.error_retries, 0);
+            }
+            _ => panic!("expected await_merge"),
+        }
+        let feedback = r#"{"type":"feedback","team_id":"T","installation_id":1,"run_id":"x","repo_owner":"o","repo_name":"r","pr_number":2,"review_id":0,"review_body":"hi","comments":[]}"#;
+        match serde_json::from_str::<WorkerMessage>(feedback).unwrap() {
+            WorkerMessage::Feedback(m) => assert!(m.trigger_author.is_empty()),
             _ => panic!("expected feedback"),
         }
     }

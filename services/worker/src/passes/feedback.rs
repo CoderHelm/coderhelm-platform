@@ -614,7 +614,20 @@ Rules:
         .filter(|c| c.comment_id.is_some() && !c.is_context)
         .collect();
 
-    if actionable_comments.is_empty() {
+    if let Some(reply) = top_level_reply(
+        &msg.trigger_author,
+        actionable_comments.len(),
+        &response,
+        &consulted,
+    ) {
+        // A person's top-level comment (or review body) addressed to CoderHelm
+        // has no inline thread to answer in: reply on the PR, to them, so
+        // nobody is left unanswered.
+        github
+            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
+            .await?;
+        info!(run_id = %msg.run_id, author = %msg.trigger_author, "Replied to a top-level PR comment");
+    } else if actionable_comments.is_empty() {
         // CI-only fix — the commit diff speaks for itself, no comment needed
         info!(run_id = %msg.run_id, "CI-only feedback — skipping PR comment (commit is the communication)");
     } else if sections.len() == actionable_comments.len() {
@@ -2450,5 +2463,54 @@ mod write_schema_tests {
         let tools = feedback_tools();
         let w = tools.iter().find(|t| t.name == "write_file").unwrap();
         assert!(w.input_schema["properties"].get("sha").is_none());
+    }
+}
+
+/// Pure: the PR comment that answers a person's top-level comment or review
+/// body, when there is no inline thread to reply in. None for automated
+/// feedback (no `trigger_author`) or when inline threads carry the answer.
+pub(crate) fn top_level_reply(
+    trigger_author: &str,
+    inline_threads: usize,
+    response: &str,
+    consulted: &str,
+) -> Option<String> {
+    let author = trigger_author.trim();
+    if author.is_empty() || inline_threads > 0 {
+        return None;
+    }
+    let text = response
+        .split("---SPLIT---")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let text = if text.is_empty() {
+        "Done — the changes are in the latest commit.".to_string()
+    } else {
+        common::truncate_str(&text, 60_000).to_string()
+    };
+    Some(format!("@{author} {text}{consulted}"))
+}
+
+#[cfg(test)]
+mod top_level_reply_tests {
+    use super::top_level_reply;
+
+    #[test]
+    fn a_person_s_top_level_ask_gets_an_addressed_reply() {
+        let r = top_level_reply("alice", 0, "Renamed the flag.", "").unwrap();
+        assert_eq!(r, "@alice Renamed the flag.");
+        let r = top_level_reply("alice", 0, "one---SPLIT---two", "").unwrap();
+        assert_eq!(r, "@alice one\n\ntwo");
+        assert!(top_level_reply("alice", 0, "", "")
+            .unwrap()
+            .starts_with("@alice "));
+    }
+
+    #[test]
+    fn automated_feedback_and_inline_threads_get_no_top_level_reply() {
+        assert_eq!(top_level_reply("", 0, "fixed CI", ""), None);
+        assert_eq!(top_level_reply("alice", 2, "fixed", ""), None);
     }
 }

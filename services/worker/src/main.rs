@@ -374,6 +374,22 @@ async fn mark_pr_ready(
     let pr = github
         .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await?;
+    if pr["state"].as_str() != Some("open") || pr["draft"].as_bool() != Some(true) {
+        info!(
+            pr_number = msg.pr_number,
+            "PR is closed or not a draft — nothing to mark ready"
+        );
+        return Ok(());
+    }
+    // A person put this PR back into draft: a CI pass must not undo that. A
+    // timeline that can't be read leaves the draft alone (fail closed).
+    let timeline = github
+        .list_issue_timeline(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await?;
+    if let Some(who) = clients::github::human_converted_to_draft(&timeline) {
+        info!(pr_number = msg.pr_number, converted_by = %who, "PR was put back into draft by a person — not marking ready");
+        return Ok(());
+    }
     let node_id = pr
         .get("node_id")
         .and_then(|v| v.as_str())

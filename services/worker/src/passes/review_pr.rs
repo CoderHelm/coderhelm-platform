@@ -738,15 +738,23 @@ async fn run_once(
             &mut usage,
         )
         .await;
-        info!(pr = msg.pr_number, kind = ?kind, "Reviewer ask classified");
-        if kind.wants_formal_review() {
-            msg.question = None;
-            msg.reply_to_comment_id = None;
-        } else if self_authored {
-            // On CoderHelm's own PR, other asks are fix requests for the
-            // feedback path, not questions for the reviewer.
-            record_review_usage(state, &msg.team_id, None, &usage).await;
-            return Ok(DONE);
+        let route = review_agent::route_ask(kind, self_authored);
+        info!(pr = msg.pr_number, kind = ?kind, route = ?route, "Reviewer ask classified");
+        match route {
+            review_agent::AskRoute::FormalReview => {
+                msg.question = None;
+                msg.reply_to_comment_id = None;
+            }
+            review_agent::AskRoute::FixLoop => {
+                // CoderHelm's own PR: the fix loop changes the code and answers
+                // the person on the PR. With no run to hand it to, the reviewer
+                // answers instead, so the person is never left unanswered.
+                if forward_ask_to_fix_loop(state, &msg, &comment).await {
+                    record_review_usage(state, &msg.team_id, None, &usage).await;
+                    return Ok(DONE);
+                }
+            }
+            review_agent::AskRoute::Reply => {}
         }
     }
 
@@ -1696,18 +1704,10 @@ async fn run_once(
             self_authored,
         )
         .await;
-        // Arm regardless (the gate is head-bound, so a new commit must re-arm),
-        // but only COMMENT the "armed" note when there's news — otherwise every
-        // re-approved commit re-posts it.
+        // Arm regardless (the gate is head-bound, so a new commit must re-arm).
+        // Nothing is posted here: the gate keeps ONE status comment on the PR,
+        // edited in place, instead of an "armed" note per verdict.
         if should_comment && !report.summary.is_empty() {
-            let _ = github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.pr_number,
-                    &report.summary,
-                )
-                .await;
             // Attach the action summary to the record we JUST wrote — an
             // UPDATE, not a second put. A second put (timestamp-keyed) showed
             // up as a duplicate "review" in the dashboard for every armed
@@ -1907,6 +1907,61 @@ async fn run_budgeted(
     };
     settle_job_claim(state, &job, out.is_ok()).await;
     out
+}
+
+/// Hand a person's fix request on CoderHelm's own PR to the run's fix loop,
+/// addressed to them so the loop replies on the PR. False when there is no
+/// run or no queue (the caller answers the person itself).
+async fn forward_ask_to_fix_loop(state: &WorkerState, msg: &ReviewMessage, ask: &str) -> bool {
+    if state.config.feedback_queue_url.is_empty() {
+        warn!("FEEDBACK_QUEUE_URL not set — cannot route a fix request");
+        return false;
+    }
+    let Some(run_id) = lookup_run_by_pr(
+        state,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+    )
+    .await
+    else {
+        info!(
+            pr = msg.pr_number,
+            "Fix request on CoderHelm's PR but no run found — answering it as a question"
+        );
+        return false;
+    };
+    let body = serde_json::json!({
+        "type": "feedback",
+        "team_id": msg.team_id,
+        "installation_id": msg.installation_id,
+        "run_id": run_id,
+        "repo_owner": msg.repo_owner,
+        "repo_name": msg.repo_name,
+        "pr_number": msg.pr_number,
+        "review_id": 0,
+        "review_body": ask,
+        "comments": [],
+        "trigger_author": msg.requested_by,
+    });
+    match state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.feedback_queue_url)
+        .message_body(body.to_string())
+        .send()
+        .await
+    {
+        Ok(_) => {
+            info!(pr = msg.pr_number, run_id = %run_id, "Fix request on CoderHelm's PR → fix loop");
+            true
+        }
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "Failed to enqueue the fix request");
+            false
+        }
+    }
 }
 
 /// Route a self-review's requested changes into the originating run's feedback
@@ -2777,6 +2832,7 @@ mod superseded_tests {
             trigger: "synchronize".into(),
             dedup_key: String::new(),
             reply_to_comment_id: None,
+            requested_by: String::new(),
             attempt: 0,
             wait_secs: 0,
             reconcile_note: None,
@@ -3067,6 +3123,7 @@ mod failure_tests {
             trigger: "synchronize".into(),
             dedup_key: "head#a1b2c3d4".into(),
             reply_to_comment_id: None,
+            requested_by: String::new(),
             attempt: 0,
             wait_secs: 0,
             reconcile_note: None,

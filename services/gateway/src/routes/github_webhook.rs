@@ -15,6 +15,7 @@ use crate::models::{
     TicketMessage, TicketSource, WorkerMessage,
 };
 use crate::AppState;
+use common::merge_gate;
 
 /// Look up team_id by GitHub installation_id using the teams table GSI.
 /// Returns None if no team has linked this installation yet.
@@ -63,9 +64,12 @@ pub async fn resolve_team_by_installation(
             .collect();
         // Member counts are only needed for records linked before
         // `installation_linked_at` existed.
+        // A count that fails routes nowhere (the delivery fails visibly and
+        // GitHub redelivers) rather than to a team that merely looked biggest
+        // because the real one could not be counted.
         if candidates.iter().all(|c| c.linked_at.is_none()) {
             for c in candidates.iter_mut() {
-                c.members = state
+                c.members = match state
                     .dynamo
                     .query()
                     .table_name(&state.config.users_table_name)
@@ -75,8 +79,13 @@ pub async fn resolve_team_by_installation(
                     .select(aws_sdk_dynamodb::types::Select::Count)
                     .send()
                     .await
-                    .map(|r| r.count)
-                    .unwrap_or(0);
+                {
+                    Ok(r) => r.count,
+                    Err(e) => {
+                        tracing::error!(installation_id, team_id = %c.team_id, error = %e, "Could not count team members — not routing this delivery");
+                        return None;
+                    }
+                };
             }
         }
         let owner = pick_installation_owner(&candidates);
@@ -532,6 +541,7 @@ async fn handle_review_comment(
         trigger: "reply".to_string(),
         dedup_key: format!("reply#{comment_id}"),
         reply_to_comment_id: Some(comment_id),
+        requested_by: commenter.to_string(),
     });
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
@@ -579,12 +589,29 @@ async fn handle_issue_comment(
         parse_reviewer_ask(body)
     };
 
-    // If this comment is on a PR opened by coderhelm, treat as feedback — except an
-    // explicit re-review ask, which is the reviewer's job (falls through below).
+    // On a PR CoderHelm opened, every person's comment reaches it. One that
+    // addresses CoderHelm (`@coderhelm …`) goes to the reviewer when review is
+    // on for the repo: a model reads what it asks for there (another look,
+    // the approval, a question, a fix) and a fix request continues to the fix
+    // loop, which answers the person on the PR. Other conversation goes
+    // straight to the fix loop, as before.
     if payload["issue"]["pull_request"].is_object() {
         let pr_user = payload["issue"]["user"]["login"].as_str().unwrap_or("");
-        let rereview_ask = ask.as_ref().is_some_and(|a| a.rereview);
-        if pr_user.contains("coderhelm") && !commenter.contains("coderhelm") && !rereview_ask {
+        let bot_pr = pr_user.contains("coderhelm") && !commenter.contains("coderhelm");
+        let review_takes_ask = if bot_pr && ask.is_some() {
+            let repo = &payload["repository"];
+            let cfg = load_review_config(
+                state,
+                team_id,
+                repo["owner"]["login"].as_str().unwrap_or(""),
+                repo["name"].as_str().unwrap_or(""),
+            )
+            .await?;
+            cfg.enabled && !cfg.killed
+        } else {
+            false
+        };
+        if bot_pr && !review_takes_ask {
             let repo = &payload["repository"];
             let owner = repo["owner"]["login"].as_str().unwrap_or("");
             let name = repo["name"].as_str().unwrap_or("");
@@ -620,6 +647,13 @@ async fn handle_issue_comment(
                 review_id: 0,
                 review_body: body.to_string(),
                 comments: vec![],
+                // A person who addressed CoderHelm gets a reply on the PR;
+                // other conversation is applied without a reply to each remark.
+                trigger_author: if ask.is_some() {
+                    commenter.to_string()
+                } else {
+                    String::new()
+                },
             });
             // Budget gate — the review-feedback path checks this, but the comment
             // path didn't, letting over-limit teams keep spending via PR comments.
@@ -672,6 +706,7 @@ async fn handle_issue_comment(
                     trigger: "reply".to_string(),
                     dedup_key: format!("reply#{comment_id}"),
                     reply_to_comment_id: None,
+                    requested_by: commenter.to_string(),
                 });
                 return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
             } else {
@@ -798,6 +833,7 @@ async fn handle_pull_request(
             trigger: "rerequest".to_string(),
             dedup_key: format!("rerequest#{req_head}"),
             reply_to_comment_id: None,
+            requested_by: String::new(),
         });
         return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
     }
@@ -808,6 +844,23 @@ async fn handle_pull_request(
         || action == "reopened"
         || action == "ready_for_review"
     {
+        if action == "ready_for_review" {
+            // A gate held only because the PR was a draft moves on now.
+            let repo = &payload["repository"];
+            let pr = &payload["pull_request"];
+            rearm_gate(
+                state,
+                team_id,
+                installation_id,
+                repo["owner"]["login"].as_str().unwrap_or(""),
+                repo["name"].as_str().unwrap_or(""),
+                pr["number"].as_u64().unwrap_or(0),
+                pr["head"]["sha"].as_str().unwrap_or(""),
+                merge_gate::wakes_on_review,
+                "marked ready for review",
+            )
+            .await?;
+        }
         return handle_review_trigger(state, payload, installation_id, team_id, action).await;
     }
 
@@ -1002,6 +1055,31 @@ async fn handle_pr_review(
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let pr = &payload["pull_request"];
+    let pr_number = pr["number"].as_u64().unwrap_or(0);
+    let pr_head = pr["head"]["sha"].as_str().unwrap_or("");
+
+    // A dismissal — of CoderHelm's approval or of a person's — withdraws a
+    // key. Re-evaluate the gate at once, so it never merges on a withdrawn
+    // key and its status comment says so (fail closed).
+    if action == "dismissed" {
+        rearm_gate(
+            state,
+            team_id,
+            installation_id,
+            owner,
+            name,
+            pr_number,
+            pr_head,
+            merge_gate::wakes_on_review,
+            "review dismissed",
+        )
+        .await?;
+        return Ok(StatusCode::OK);
+    }
     if action != "submitted" {
         return Ok(StatusCode::OK);
     }
@@ -1015,11 +1093,23 @@ async fn handle_pr_review(
         return Ok(StatusCode::OK);
     }
 
-    let repo = &payload["repository"];
-    let owner = repo["owner"]["login"].as_str().unwrap_or("");
-    let name = repo["name"].as_str().unwrap_or("");
-    let pr = &payload["pull_request"];
-    let pr_number = pr["number"].as_u64().unwrap_or(0);
+    // A person's request for changes (or a comment) can withdraw the person
+    // key: wake a gate already armed on this head so it re-reads the reviews.
+    // Waiting on people never polls; these events are what move it.
+    if review_state != "approved" {
+        rearm_gate(
+            state,
+            team_id,
+            installation_id,
+            owner,
+            name,
+            pr_number,
+            pr_head,
+            merge_gate::wakes_on_review,
+            "review submitted",
+        )
+        .await?;
+    }
 
     // A human APPROVED review is the second key for armed auto-merge. Re-arm the
     // gate so an approval that arrives AFTER the bot review still triggers the
@@ -1052,8 +1142,12 @@ async fn handle_pr_review(
                 base_branch,
                 self_authored,
                 attempts: 0,
+                chain_id: String::new(),
+                error_retries: 0,
             });
-            let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+            // A lost arming is a lost merge: a failed enqueue fails the
+            // delivery so GitHub shows it and can redeliver.
+            return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
         }
         return Ok(StatusCode::OK);
     }
@@ -1097,6 +1191,7 @@ async fn handle_pr_review(
                     trigger: "reply".to_string(),
                     dedup_key: format!("review#{review_id}"),
                     reply_to_comment_id: None,
+                    requested_by: reviewer.to_string(),
                 });
                 return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
             }
@@ -1142,11 +1237,89 @@ async fn handle_pr_review(
         repo_name: name.to_string(),
         pr_number,
         review_id,
+        // A review with a written body is addressed to CoderHelm on its own
+        // PR: the fix loop answers it on the PR when there is no inline
+        // thread to answer in.
+        trigger_author: if review_body.trim().is_empty() {
+            String::new()
+        } else {
+            reviewer.to_string()
+        },
         review_body,
         comments: vec![],
     });
 
     send_to_queue(state, &state.config.feedback_queue_url, &message).await
+}
+
+/// Re-arm an existing merge gate for this PR from its stored record, when the
+/// record is bound to `head_sha` and its state passes `wake`. No record,
+/// another head, or a state `wake` rejects: nothing to do. A failed read or
+/// enqueue is returned as 500 so GitHub shows the failed delivery and can
+/// redeliver it.
+#[allow(clippy::too_many_arguments)]
+async fn rearm_gate(
+    state: &AppState,
+    team_id: &str,
+    installation_id: u64,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+    head_sha: &str,
+    wake: fn(&str) -> bool,
+    reason: &str,
+) -> Result<(), StatusCode> {
+    if pr_number == 0 || head_sha.is_empty() {
+        return Ok(());
+    }
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&merge_gate::record_sk(owner, name, pr_number)))
+        .send()
+        .await
+        .map_err(|e| {
+            error!(owner, name, pr_number, error = %e, "Could not read merge gate record");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item()
+        .cloned();
+    let Some(item) = item else {
+        return Ok(());
+    };
+    let get_s = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let gate_state = get_s("state");
+    if get_s("head_sha") != head_sha || !wake(&gate_state) {
+        return Ok(());
+    }
+    info!(owner, name, pr_number, gate_state = %gate_state, reason, "Re-arming merge gate");
+    let message = WorkerMessage::AwaitMerge(AwaitMergeMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
+        head_sha: head_sha.to_string(),
+        base_branch: get_s("base_branch"),
+        self_authored: item
+            .get("self_authored")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false),
+        attempts: 0,
+        chain_id: String::new(),
+        error_retries: 0,
+    });
+    send_to_queue(state, &state.config.ticket_queue_url, &message)
+        .await
+        .map(|_| ())
 }
 
 async fn handle_check_run(
@@ -1495,28 +1668,54 @@ async fn handle_installation_repos(
 
 /// Handle check_suite events — delegated to workflow_run handler.
 async fn handle_check_suite(
-    _state: &AppState,
+    state: &AppState,
     payload: &Value,
-    _installation_id: u64,
-    _team_id: &str,
+    installation_id: u64,
+    team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
     if action != "completed" {
         return Ok(StatusCode::OK);
     }
+    let suite = &payload["check_suite"];
+    let branch = suite["head_branch"].as_str().unwrap_or("");
+    let conclusion = suite["conclusion"].as_str().unwrap_or("");
+    let head_sha = suite["head_sha"].as_str().unwrap_or("");
 
-    let branch = payload["check_suite"]["head_branch"].as_str().unwrap_or("");
-    if !branch.starts_with("coderhelm/") {
-        return Ok(StatusCode::OK);
+    // CI finished on a PR's head: wake that PR's merge gate if it is waiting
+    // on (or was stopped by) CI, on any branch. The gate re-reads every check
+    // itself, so a flaky job re-run to green, or a deploy slower than the
+    // gate's poll window, still merges.
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    for pr in suite["pull_requests"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+    {
+        rearm_gate(
+            state,
+            team_id,
+            installation_id,
+            owner,
+            name,
+            pr["number"].as_u64().unwrap_or(0),
+            head_sha,
+            merge_gate::wakes_on_ci,
+            "check suite completed",
+        )
+        .await?;
     }
 
-    let conclusion = payload["check_suite"]["conclusion"].as_str().unwrap_or("");
-    // All CI result handling is done by the workflow_run event handler.
-    // check_suite just logs for observability.
-    info!(
-        branch,
-        conclusion, "check_suite completed — workflow_run handler will process"
-    );
+    if branch.starts_with("coderhelm/") {
+        // CI result handling for CoderHelm's own runs is done by the
+        // workflow_run handler; this is for observability.
+        info!(
+            branch,
+            conclusion, "check_suite completed — workflow_run handler will process"
+        );
+    }
     Ok(StatusCode::OK)
 }
 
@@ -2309,6 +2508,7 @@ async fn handle_review_trigger(
         trigger: action.to_string(),
         dedup_key,
         reply_to_comment_id: None,
+        requested_by: String::new(),
     });
     send_to_queue_after(
         state,

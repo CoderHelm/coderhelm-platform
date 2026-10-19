@@ -1,5 +1,8 @@
-//! Anthropic Messages API client for direct Claude API calls.
-//! Used when a team provides their own Anthropic API key instead of using Bedrock.
+//! Anthropic Messages API client for Claude calls.
+//! Teams call the Anthropic API with their own key. The same Messages
+//! requests can also go through Amazon Bedrock with the caller's AWS
+//! credentials (no API key): the nightly reviewer evals use that, so CI holds
+//! no long-lived model key.
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -11,10 +14,13 @@ use crate::models::TokenUsage;
 static ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 static ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Reusable Anthropic HTTP client.
+/// Reusable Anthropic client.
 pub struct AnthropicClient {
     http: Client,
     api_key: String,
+    /// Set when requests go through Amazon Bedrock instead of the Anthropic
+    /// API (the model id is then a Bedrock model or inference profile id).
+    bedrock: Option<aws_sdk_bedrockruntime::Client>,
     /// Counts every response into the team's analytics counters. Required:
     /// a client can't be built without saying where its usage goes.
     meter: common::usage::UsageMeter,
@@ -28,7 +34,20 @@ impl AnthropicClient {
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             api_key,
+            bedrock: None,
             meter,
+        }
+    }
+
+    /// The same Messages requests, sent through Amazon Bedrock with the AWS
+    /// credentials of `client` (no API key).
+    pub fn bedrock(
+        client: aws_sdk_bedrockruntime::Client,
+        meter: common::usage::UsageMeter,
+    ) -> Self {
+        Self {
+            bedrock: Some(client),
+            ..Self::new(String::new(), meter)
         }
     }
 }
@@ -817,6 +836,9 @@ async fn send_request(
     client: &AnthropicClient,
     request: &MessagesRequest,
 ) -> Result<MessagesResponse, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(bedrock) = &client.bedrock {
+        return api_result(send_bedrock(bedrock, request).await?);
+    }
     let reply = common::model_retry::send(
         || {
             client
@@ -833,6 +855,71 @@ async fn send_request(
     .await
     .map_err(Box::new)?;
     api_result(reply)
+}
+
+/// The Bedrock body for a Messages request: the same fields, with the model
+/// in the URL instead of the body, Bedrock's version marker, and the betas
+/// Bedrock needs (prompt caching needs none there).
+fn bedrock_body(request: &MessagesRequest) -> Result<Value, serde_json::Error> {
+    let mut body = serde_json::to_value(request)?;
+    if let Some(o) = body.as_object_mut() {
+        o.remove("model");
+        o.insert("anthropic_version".into(), json!("bedrock-2023-05-31"));
+        let header = beta_header(request);
+        let betas: Vec<&str> = header
+            .split(',')
+            .filter(|b| !b.is_empty() && *b != BETA_PROMPT_CACHING)
+            .collect();
+        if !betas.is_empty() {
+            o.insert("anthropic_beta".into(), json!(betas));
+        }
+    }
+    Ok(body)
+}
+
+/// One Messages request through Bedrock's InvokeModel, retried on the same
+/// transient statuses and schedule as the Anthropic API path.
+async fn send_bedrock(
+    client: &aws_sdk_bedrockruntime::Client,
+    request: &MessagesRequest,
+) -> Result<common::model_retry::Reply, Box<dyn std::error::Error + Send + Sync>> {
+    use common::model_retry::{
+        backoff, is_transient_status, ModelCallError, ModelErrorKind, Reply, WORKER_BACKOFF_SECS,
+    };
+    let body = serde_json::to_vec(&bedrock_body(request)?)?;
+    let mut attempt = 0;
+    loop {
+        let result = client
+            .invoke_model()
+            .model_id(&request.model)
+            .content_type("application/json")
+            .accept("application/json")
+            .body(aws_smithy_types::Blob::new(body.clone()))
+            .send()
+            .await;
+        let (status, text) = match result {
+            Ok(out) => {
+                return Ok(Reply {
+                    status: 200,
+                    body: out.body.into_inner(),
+                })
+            }
+            Err(e) => (
+                e.raw_response().map(|r| r.status().as_u16()),
+                aws_sdk_bedrockruntime::error::DisplayErrorContext(&e).to_string(),
+            ),
+        };
+        let transient = status.is_none_or(is_transient_status);
+        if !transient || attempt >= WORKER_BACKOFF_SECS.len() {
+            return Err(Box::new(ModelCallError::new(
+                status.map_or(ModelErrorKind::Network, ModelErrorKind::Status),
+                text,
+            )));
+        }
+        warn!(model = %request.model, attempt, status = ?status, "Bedrock call failed — retrying");
+        tokio::time::sleep(backoff(&WORKER_BACKOFF_SECS, attempt, None)).await;
+        attempt += 1;
+    }
 }
 
 /// A final response read as the API's answer or its error.
@@ -908,6 +995,30 @@ fn compact_messages(messages: &mut [(String, Vec<Value>)], keep_last: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bedrock_body_moves_the_model_out_and_marks_the_version() {
+        let request = MessagesRequest {
+            model: "us.anthropic.claude-haiku-4-5-20251001-v1:0".into(),
+            max_tokens: 64,
+            system: vec![],
+            messages: vec![],
+            tools: None,
+            cache_control: None,
+            thinking: None,
+            output_config: Some(json!({"format": {"type": "json_schema", "schema": {}}})),
+            context_management: None,
+            fallbacks: None,
+            tool_choice: None,
+            temperature: Some(0.0),
+        };
+        let body = super::bedrock_body(&request).unwrap();
+        assert!(body.get("model").is_none());
+        assert_eq!(body["anthropic_version"], "bedrock-2023-05-31");
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        // Prompt caching needs no beta on Bedrock.
+        assert!(body.get("anthropic_beta").is_none());
+    }
+
     use super::*;
 
     #[test]

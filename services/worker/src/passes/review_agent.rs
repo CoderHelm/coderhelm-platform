@@ -1623,6 +1623,32 @@ impl AskKind {
     }
 }
 
+/// Where a classified ask goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskRoute {
+    /// A formal review of the head, in this job.
+    FormalReview,
+    /// The reviewer answers in a reply.
+    Reply,
+    /// CoderHelm's own PR: the fix loop changes the code and answers the
+    /// person on the PR.
+    FixLoop,
+}
+
+/// Pure: route a person's ask by what the model read in it. On CoderHelm's
+/// own PRs a fix request (and other conversation) belongs to the fix loop,
+/// which can change the code it wrote; a question is answered by the reviewer.
+/// On a person's PR the reviewer answers everything that isn't a review.
+pub fn route_ask(kind: AskKind, self_authored: bool) -> AskRoute {
+    if kind.wants_formal_review() {
+        AskRoute::FormalReview
+    } else if self_authored && matches!(kind, AskKind::FixRequest | AskKind::Other) {
+        AskRoute::FixLoop
+    } else {
+        AskRoute::Reply
+    }
+}
+
 /// What the ask classifier is told.
 pub const ASK_SYSTEM: &str = "You classify a comment a person wrote to CoderHelm, a code \
      reviewer, on a pull request. kind: \"re_review\" when they ask for the latest code to be \
@@ -1707,6 +1733,21 @@ pub fn enforce_manual_checks_are_notes(findings: &mut [Finding]) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn asks_route_by_the_model_s_reading() {
+        for own in [false, true] {
+            assert_eq!(route_ask(AskKind::ReReview, own), AskRoute::FormalReview);
+            assert_eq!(
+                route_ask(AskKind::ApproveRequest, own),
+                AskRoute::FormalReview
+            );
+            assert_eq!(route_ask(AskKind::Question, own), AskRoute::Reply);
+        }
+        assert_eq!(route_ask(AskKind::FixRequest, true), AskRoute::FixLoop);
+        assert_eq!(route_ask(AskKind::Other, true), AskRoute::FixLoop);
+        assert_eq!(route_ask(AskKind::FixRequest, false), AskRoute::Reply);
+    }
 
     #[test]
     fn changed_right_lines_marks_added_lines_only() {

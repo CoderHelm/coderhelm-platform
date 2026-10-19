@@ -388,5 +388,44 @@ export class WorkerStack extends cdk.Stack {
     // NOTE: the review-reminder EventBridge → SQS schedule lives in the API stack
     // (where the ticket queue is defined). Putting it here created a worker→api
     // dependency cycle (api already depends on worker).
+
+    // ── Nightly reviewer evals (.github/workflows/reviewer-evals.yml) ──
+    // The live evals call the model through Amazon Bedrock with this role's
+    // short-lived credentials, so CI stores no model key and never touches a
+    // team's key. Least privilege: GitHub's OIDC token from this repository's
+    // main branch only (the nightly schedule and manual runs both run there),
+    // and the one permission to invoke the one eval model. Nothing else in the
+    // account is readable.
+    const githubOidc = iam.OpenIdConnectProvider.fromOpenIdConnectProviderArn(
+      this,
+      "GithubActionsOidc",
+      `arn:aws:iam::${this.account}:oidc-provider/token.actions.githubusercontent.com`,
+    );
+    const evalModel = "anthropic.claude-haiku-4-5-20251001-v1:0";
+    const evalRole = new iam.Role(this, "ReviewerEvalsRole", {
+      roleName: `${prefix}-reviewer-evals`,
+      description:
+        "Nightly reviewer evals (GitHub Actions, main branch): invoke the eval model on Bedrock",
+      maxSessionDuration: cdk.Duration.hours(1),
+      assumedBy: new iam.WebIdentityPrincipal(githubOidc.openIdConnectProviderArn, {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub":
+            "repo:CoderHelm/coderhelm-platform:ref:refs/heads/main",
+        },
+      }),
+    });
+    evalRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["bedrock:InvokeModel"],
+        resources: [
+          // The US cross-region inference profile and the model it routes to
+          // (any of the profile's regions).
+          `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/us.${evalModel}`,
+          `arn:aws:bedrock:*::foundation-model/${evalModel}`,
+        ],
+      }),
+    );
+    new cdk.CfnOutput(this, "ReviewerEvalsRoleArn", { value: evalRole.roleArn });
   }
 }

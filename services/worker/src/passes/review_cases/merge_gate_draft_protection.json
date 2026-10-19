@@ -1,0 +1,23 @@
+{
+  "name": "merge gate: a PR a person put back into draft stays a draft and never merges",
+  "description": "CoderHelm's own PR, approved by its review. A person converts it back to draft; a later CI pass on CoderHelm's branch must not mark it ready again, and a person's approval must not merge the draft.",
+  "self_authored": true,
+  "auto_merge": {"require_human": true},
+  "steps": [
+    {"push": "h1"},
+    {"review": {"head": "h1", "model_output": {
+      "verdict": "APPROVE", "summary": "Adds pagination to the orders list.", "findings": []
+    }}},
+    {"convert_to_draft": {"by": "alice"}},
+    {"ci": {"name": "Build", "status": "completed", "conclusion": "success", "suite_completed": true}},
+    {"ci_passed_mark_ready": {}},
+    {"gate_is": {"draft": true}},
+    {"approve": {"by": "bob"}},
+    {"gate_is": {"state": "waiting_approval", "merged": false, "draft": true}},
+    {"comment": {"id": 601, "text": "@coderhelm please rename the page size constant", "ask_kind": "fix_request"}}
+  ],
+  "expect": {
+    "final_formal": {"head": "h1", "event": "COMMENT"},
+    "gate": {"state": "waiting_approval", "merged": false, "draft": true}
+  }
+}

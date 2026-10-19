@@ -16,13 +16,20 @@ case, so the same class of mistake can't come back silently.
   2. no reply that says nothing blocks is posted while CoderHelm's own
      request for changes stands;
   3. the current head ends with a formal outcome, and a redelivered job
-     never posts twice.
+     never posts twice;
+  4. the merge gate never merges a draft, a PR whose CoderHelm approval was
+     dismissed or never given, or one whose CI is running or failing.
 - **Live (nightly, model in the loop).**
-  `cargo test -p worker review_eval -- --ignored` with `ANTHROPIC_API_KEY`
-  set. The model classifies every recorded comment (`ask_kind`) and reads
-  every recorded reply (`conclusion`), and each answer must fall in the
-  case's class. `.github/workflows/reviewer-evals.yml` runs it nightly and
-  opens an issue when it fails.
+  `cargo test -p worker review_eval -- --ignored`. The model classifies
+  every recorded comment (`ask_kind`) and reads every recorded reply
+  (`conclusion`), and each answer must fall in the case's class.
+  `.github/workflows/reviewer-evals.yml` runs it nightly and opens an issue
+  when it fails. It holds no model key: GitHub's OIDC token becomes
+  short-lived credentials for the `coderhelm-prod-reviewer-evals` role
+  (`infra/lib/worker-stack.ts`), which only this repo's main branch can
+  assume and which may only invoke the eval model on Bedrock
+  (`EVAL_PROVIDER=bedrock`). Locally: `EVAL_PROVIDER=bedrock` with AWS
+  credentials, or `ANTHROPIC_API_KEY` with your own key.
 
 ## Add a case from a real PR (one step)
 
@@ -45,6 +52,8 @@ list are scrubbed. Then:
    - `formal_events` (optional): the exact list of formal reviews.
    - `first_approval_has_notes` (optional): the approval carries its
      non-blocking notes.
+   - `gate` (optional, with `auto_merge` set on the case): the merge gate's
+     final `state`, whether it `merged`, and whether the PR is a `draft`.
 4. Run `cargo test -p worker review_eval`. The case should fail on the
    behavior you're fixing and pass once the fix is in.
 
@@ -58,3 +67,21 @@ list are scrubbed. Then:
 | `{"legacy_error_review": {"head", "error"}}` | The old system posted a failure as "changes requested". |
 | `{"comment": {"id", "text", "ask_kind", "reply"?, "conclusion"?, "review"?}}` | A person addressed CoderHelm. `review` is the formal review that runs if the ask or the reply needs one. |
 | `{"sweep": {"minutes_later", "review"?}}` | The stuck-review sweep runs. `review` is what it gets if it picks the PR. |
+
+### Merge-gate steps
+
+A case with `"auto_merge": {"require_human": true}` runs the real gate
+decision (`await_merge::decide_gate`) whenever production would: CoderHelm's
+APPROVE verdict arms it, a person's approval arms it, and the gateway's
+re-arm rules (`common::merge_gate::wakes_on_review` / `wakes_on_ci`) decide
+which later events wake it.
+
+| step | meaning |
+|---|---|
+| `{"approve": {"by"}}` | A person approves the head. |
+| `{"request_changes": {"by"}}` | A person requests changes. |
+| `{"dismiss": {"who"}}` | A review is dismissed (`"coderhelm"` or a login). |
+| `{"ci": {"name", "status", "conclusion"?, "suite_completed"?}}` | A check run on the head changes; `suite_completed` sends GitHub's `check_suite completed`. |
+| `{"convert_to_draft": {"by"}}` | A person converts the PR back to draft. |
+| `{"ci_passed_mark_ready": {}}` | CI passed on CoderHelm's branch and the pipeline tries to mark the PR ready. |
+| `{"gate_is": {"state"?, "merged"?, "draft"?}}` | Asserts the gate mid-case. |

@@ -1,0 +1,22 @@
+{
+  "name": "merge gate: a flaky job re-run to green merges without anyone re-arming it",
+  "description": "Both keys are in while an end-to-end job has failed: the gate stops (no polling) and says CI is failing. A person re-runs the flaky job; when its check suite completes green on the same head, the gateway wakes the gate and it merges.",
+  "auto_merge": {"require_human": true},
+  "steps": [
+    {"push": "h1"},
+    {"ci": {"name": "Lint", "status": "completed", "conclusion": "success"}},
+    {"ci": {"name": "E2E", "status": "completed", "conclusion": "failure", "suite_completed": true}},
+    {"review": {"head": "h1", "model_output": {
+      "verdict": "APPROVE", "summary": "Adds a retry to the export job.", "findings": []
+    }}},
+    {"gate_is": {"state": "waiting_approval", "merged": false}},
+    {"approve": {"by": "alice"}},
+    {"gate_is": {"state": "blocked_ci", "merged": false}},
+    {"ci": {"name": "E2E", "status": "in_progress"}},
+    {"ci": {"name": "E2E", "status": "completed", "conclusion": "success", "suite_completed": true}}
+  ],
+  "expect": {
+    "final_formal": {"head": "h1", "event": "APPROVE"},
+    "gate": {"state": "merged", "merged": true}
+  }
+}

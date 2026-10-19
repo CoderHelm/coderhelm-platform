@@ -222,6 +222,15 @@ pub struct AwaitMergeMessage {
     pub self_authored: bool,
     #[serde(default)]
     pub attempts: u32,
+    /// Which arming this tick belongs to. Every arming starts a new chain; a
+    /// tick whose chain is no longer the record's current one stops, so one
+    /// PR never runs two polling loops. Empty on a fresh arming.
+    #[serde(default)]
+    pub chain_id: String,
+    /// Evaluations in a row that failed on an error (GitHub or DynamoDB).
+    /// They are retried on their own schedule and never end the gate.
+    #[serde(default)]
+    pub error_retries: u32,
 }
 
 /// A label-triggered code-review job for an existing PR. Keyed by (pr_number,
@@ -256,6 +265,11 @@ pub struct ReviewMessage {
     /// answer is posted back into that thread instead of the conversation.
     #[serde(default)]
     pub reply_to_comment_id: Option<u64>,
+    /// Login of the person whose comment asked for this job (empty for
+    /// label, push and sweep triggers). On CoderHelm's own PRs a fix request
+    /// goes on to the fix loop, which answers this person on the PR.
+    #[serde(default)]
+    pub requested_by: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -340,6 +354,12 @@ pub struct FeedbackMessage {
     pub review_id: u64,
     pub review_body: String,
     pub comments: Vec<ReviewComment>,
+    /// Login of the person whose comment or review body addressed CoderHelm.
+    /// Empty for automated feedback (CI results, CoderHelm's own review). When
+    /// set and there is no inline thread to answer in, the fix loop replies on
+    /// the PR addressed to them.
+    #[serde(default)]
+    pub trigger_author: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
