@@ -435,11 +435,14 @@ pub struct InfraAnalyzeMessage {
     pub repo: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ResumeMessage {
     pub team_id: String,
     pub run_id: String,
     pub installation_id: u64,
+    /// Times this resume was sent again after a transient model error.
+    #[serde(default)]
+    pub model_retries: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -475,6 +478,11 @@ pub struct TicketMessage {
     /// Epoch ms of the first attempt — the wall-clock runaway backstop.
     #[serde(default)]
     pub first_attempt_ms: u64,
+    /// Times this run was sent again after a transient model error (a 5xx,
+    /// 429, 529 or network failure that outlasted the client's own retries).
+    /// The run keeps its run_id across these, like a continuation.
+    #[serde(default)]
+    pub model_retries: u32,
     /// Set in-process when the ticket changed under an open PR: the implement
     /// agent gets this note (old→new ticket diff + PR diff) and updates the
     /// existing PR instead of starting over. Never serialized.
@@ -495,7 +503,7 @@ pub enum TicketSource {
     Alert,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FeedbackMessage {
     pub team_id: String,
     pub installation_id: u64,
@@ -511,6 +519,9 @@ pub struct FeedbackMessage {
     /// bounds the defer loop so a wedged slot can't churn indefinitely.
     #[serde(default)]
     pub defer_count: u32,
+    /// Times this feedback was sent again after a transient model error.
+    #[serde(default)]
+    pub model_retries: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -651,6 +662,7 @@ mod tests {
             continuation: 0,
             continuation_run_id: None,
             first_attempt_ms: 0,
+            model_retries: 0,
             ticket_update_note: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
@@ -678,6 +690,7 @@ mod tests {
                 is_context: false,
             }],
             defer_count: 2,
+            model_retries: 0,
         });
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();

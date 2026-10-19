@@ -796,6 +796,7 @@ async fn own_pr_failures(
             review_body: body,
             comments: Vec::new(),
             defer_count: 0,
+            model_retries: 0,
         };
         let queue = if state.config.feedback_queue_url.is_empty() {
             &state.config.ticket_queue_url
@@ -1464,6 +1465,7 @@ async fn start_fix_ticket(
         continuation: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
+        model_retries: 0,
         ticket_update_note: None,
     };
     match enqueue(state, crate::models::WorkerMessage::Ticket(ticket)).await {
@@ -1660,6 +1662,7 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
                 continuation: 0,
                 continuation_run_id: None,
                 first_attempt_ms: 0,
+                model_retries: 0,
                 ticket_update_note: None,
             };
             enqueue(state, crate::models::WorkerMessage::Ticket(ticket)).await?;

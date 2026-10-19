@@ -1,0 +1,22 @@
+{
+  "name": "standing error review, approval ask on a fine diff",
+  "description": "The final state of the outage case: CoderHelm's standing review is an error 'changes requested' on the head, the author asks for the approval, and the diff is fine except for a by-hand test suggestion. One formal approval of the head, with the note in it.",
+  "steps": [
+    {"push": "h2"},
+    {"legacy_error_review": {"head": "h2", "error": "Anthropic API error (520 <unknown status code>): error code: 520"}},
+    {"comment": {"id": 201, "text": "@coderhelm ready now?",
+      "ask_kind": "approve_request",
+      "review": {"head": "h2", "model_output": {
+        "verdict": "REQUEST_CHANGES",
+        "summary": "The change looks right.",
+        "findings": [{"file": "ios/App/AppDelegate.swift", "line": 120, "severity": "blocking", "category": "manual-check", "evidence": "verified-defect",
+          "title": "Test on a staging build before merge", "body": "Check a cold-start link on a staging build."}]
+      }}
+    }}
+  ],
+  "expect": {
+    "final_formal": {"head": "h2", "event": "APPROVE"},
+    "formal_events": [["h2", "APPROVE"]],
+    "first_approval_has_notes": true
+  }
+}

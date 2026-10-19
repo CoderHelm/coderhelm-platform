@@ -350,25 +350,77 @@ async fn handle_issue_event(
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
 
-/// A comment addressed to the reviewer: `@coderhelm …` anywhere (any case — GitHub
-/// autocompletes the display name, e.g. `@CoderHelm`), or `/coderhelm …` at the start.
+/// A comment addressed to the reviewer: `@coderhelm …` anywhere outside
+/// quoted text and code (any case — GitHub autocompletes the display name,
+/// e.g. `@CoderHelm`), or `/coderhelm …` at the start. One parser for every
+/// surface: conversation comments, inline thread replies, review bodies.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ReviewerAsk {
-    /// Asked for a fresh verdict ("re-review", "rereview", "review again", "review").
+    /// The exact re-review command (`re-review`, `re review`, `rereview`,
+    /// `review`, `review again`, or the bare mention): a fast path that
+    /// skips the worker's model classification.
     pub rereview: bool,
-    /// Anything else is a question for the reviewer to answer.
+    /// Anything else, as written. What it asks for (another look, the
+    /// approval, a question, a fix) is decided by the worker's model, never
+    /// by keywords here.
     pub question: Option<String>,
+}
+
+/// The comment without quoted lines (`> …`), fenced code blocks and inline
+/// code: a mention someone quoted or pasted is not addressed to CoderHelm.
+pub(crate) fn addressed_text(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut in_fence = false;
+    for line in body.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || t.starts_with('>') {
+            continue;
+        }
+        // Drop `inline code` spans (every other piece between backticks).
+        for (i, part) in line.split('`').enumerate() {
+            if i % 2 == 0 {
+                out.push_str(part);
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The exact re-review commands (after the mention is stripped).
+fn is_rereview_command(text: &str) -> bool {
+    let t = text
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .trim()
+        .to_lowercase();
+    matches!(
+        t.as_str(),
+        "" | "re-review" | "re review" | "rereview" | "review" | "review again"
+    )
 }
 
 pub(crate) fn parse_reviewer_ask(body: &str) -> Option<ReviewerAsk> {
     const MENTION: &str = "@coderhelm";
     const SLASH: &str = "/coderhelm";
-    // ASCII lowercasing keeps byte offsets identical to `body`.
-    let lower = body.to_ascii_lowercase();
-    let slash = lower.trim_start().starts_with(SLASH);
-    if !slash && !lower.contains(MENTION) {
+    // Addressed only when the mention is outside quotes and code.
+    let addressed = addressed_text(body).to_ascii_lowercase();
+    if !addressed.trim_start().starts_with(SLASH) && !addressed.contains(MENTION) {
         return None;
     }
+    // The ask as written, without the quoted lines it replies to.
+    let body: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = body.trim();
+    // ASCII lowercasing keeps byte offsets identical to `body`.
+    let lower = body.to_ascii_lowercase();
     // Strip every address token (and a trailing "[bot]") to recover the message.
     let mut cleaned = String::with_capacity(body.len());
     let mut i = 0;
@@ -389,16 +441,21 @@ pub(crate) fn parse_reviewer_ask(body: &str) -> Option<ReviewerAsk> {
     if cleaned.to_ascii_lowercase().starts_with(SLASH) {
         cleaned = cleaned[SLASH.len()..].trim().to_string();
     }
-    let l = cleaned.to_lowercase();
-    let rereview = l.contains("re-review")
-        || l.contains("rereview")
-        || l.contains("review again")
-        || l == "review"
-        || l.is_empty();
+    let rereview = is_rereview_command(&cleaned);
     Some(ReviewerAsk {
         rereview,
         question: if rereview { None } else { Some(cleaned) },
     })
+}
+
+/// For an `edited` comment: the ask only when the edit added it (the old
+/// text had none), so an edit runs a command once and a typo fix to a
+/// comment that already asked doesn't ask again.
+pub(crate) fn ask_added_by_edit(old_body: &str, new_body: &str) -> Option<ReviewerAsk> {
+    if parse_reviewer_ask(old_body).is_some() {
+        return None;
+    }
+    parse_reviewer_ask(new_body)
 }
 
 /// A reply inside an inline review thread (`pull_request_review_comment`). Same
@@ -412,8 +469,16 @@ async fn handle_review_comment(
     installation_id: u64,
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
-    if payload["action"].as_str() != Some("created") {
-        return Ok(StatusCode::OK);
+    match payload["action"].as_str() {
+        Some("created") => {}
+        Some("edited") => {
+            let old = payload["changes"]["body"]["from"].as_str().unwrap_or("");
+            let new = payload["comment"]["body"].as_str().unwrap_or("");
+            if ask_added_by_edit(old, new).is_none() {
+                return Ok(StatusCode::OK);
+            }
+        }
+        _ => return Ok(StatusCode::OK),
     }
     let commenter = payload["comment"]["user"]["login"].as_str().unwrap_or("");
     if commenter.contains("coderhelm") {
@@ -436,7 +501,7 @@ async fn handle_review_comment(
     let name = repo["name"].as_str().unwrap_or("");
     let pr_number = pr["number"].as_u64().unwrap_or(0);
     let comment_id = payload["comment"]["id"].as_u64().unwrap_or(0);
-    let cfg = load_review_config(state, team_id, owner, name).await;
+    let cfg = load_review_config(state, team_id, owner, name).await?;
     if !cfg.enabled || cfg.killed || pr_number == 0 || comment_id == 0 {
         info!(
             owner,
@@ -484,8 +549,17 @@ async fn handle_issue_comment(
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
-    if action != "created" {
+    if action != "created" && action != "edited" {
         return Ok(StatusCode::OK);
+    }
+    // An edit counts only when it adds a command to the reviewer; every
+    // other edit is ignored (the original comment was already handled).
+    if action == "edited" {
+        let old = payload["changes"]["body"]["from"].as_str().unwrap_or("");
+        let new = payload["comment"]["body"].as_str().unwrap_or("");
+        if ask_added_by_edit(old, new).is_none() {
+            return Ok(StatusCode::OK);
+        }
     }
 
     // Comments from bot accounts (CI coverage/preview/E2E reports, other apps)
@@ -565,7 +639,7 @@ async fn handle_issue_comment(
             let owner = repo["owner"]["login"].as_str().unwrap_or("");
             let name = repo["name"].as_str().unwrap_or("");
             let pr_number = payload["issue"]["number"].as_u64().unwrap_or(0);
-            let cfg = load_review_config(state, team_id, owner, name).await;
+            let cfg = load_review_config(state, team_id, owner, name).await?;
             if cfg.enabled && !cfg.killed && pr_number != 0 {
                 if let Some(reason) = check_run_budget(state, team_id).await {
                     post_limit_comment(state, installation_id, owner, name, pr_number, &reason)
@@ -693,7 +767,7 @@ async fn handle_pull_request(
         let owner = repo["owner"]["login"].as_str().unwrap_or("");
         let name = repo["name"].as_str().unwrap_or("");
         let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
-        let cfg = load_review_config(state, team_id, owner, name).await;
+        let cfg = load_review_config(state, team_id, owner, name).await?;
         if !cfg.enabled || cfg.killed || pr_number == 0 {
             return Ok(StatusCode::OK);
         }
@@ -956,7 +1030,7 @@ async fn handle_pr_review(
     // staging deploy and never merges on failing CI). Here we only gate on the
     // repo having review enabled, so approvals on non-review repos are ignored.
     if review_state == "approved" {
-        let cfg = load_review_config(state, team_id, owner, name).await;
+        let cfg = load_review_config(state, team_id, owner, name).await?;
         let head_sha = pr["head"]["sha"].as_str().unwrap_or("").to_string();
         let base_branch = pr["base"]["ref"].as_str().unwrap_or("").to_string();
         if cfg.enabled && !cfg.killed && pr_number != 0 && !head_sha.is_empty() {
@@ -992,6 +1066,41 @@ async fn handle_pr_review(
     }
     let pr_user = pr["user"]["login"].as_str().unwrap_or("");
     if !pr_user.contains("coderhelm") {
+        // A review body that addresses the reviewer on a person's PR is the
+        // same ask as a comment: one command surface for every comment type.
+        let body = payload["review"]["body"].as_str().unwrap_or("");
+        let review_id = payload["review"]["id"].as_u64().unwrap_or(0);
+        if let Some(ask) = parse_reviewer_ask(body) {
+            let cfg = load_review_config(state, team_id, owner, name).await?;
+            if cfg.enabled && !cfg.killed && pr_number != 0 && review_id != 0 {
+                if let Some(reason) = check_run_budget(state, team_id).await {
+                    post_limit_comment(state, installation_id, owner, name, pr_number, &reason)
+                        .await;
+                    return Ok(StatusCode::OK);
+                }
+                info!(
+                    owner,
+                    name,
+                    pr_number,
+                    is_rereview = ask.rereview,
+                    "Reviewer: review body → review job"
+                );
+                let message = WorkerMessage::Review(ReviewMessage {
+                    team_id: team_id.to_string(),
+                    installation_id,
+                    repo_owner: owner.to_string(),
+                    repo_name: name.to_string(),
+                    pr_number,
+                    head_sha: String::new(),
+                    label: cfg.label,
+                    question: ask.question,
+                    trigger: "reply".to_string(),
+                    dedup_key: format!("review#{review_id}"),
+                    reply_to_comment_id: None,
+                });
+                return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+            }
+        }
         return Ok(StatusCode::OK);
     }
 
@@ -1804,12 +1913,15 @@ impl Default for ReviewConfig {
     }
 }
 
+/// The repo's reviewer config. A failed read is an error (the webhook
+/// fails and GitHub shows it for redelivery), never "review off": that used
+/// to drop reviews silently on a DynamoDB blip.
 pub(crate) async fn load_review_config(
     state: &AppState,
     team_id: &str,
     owner: &str,
     name: &str,
-) -> ReviewConfig {
+) -> Result<ReviewConfig, StatusCode> {
     let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
     let item = state
         .dynamo
@@ -1819,13 +1931,17 @@ pub(crate) async fn load_review_config(
         .key("sk", attr_s(&sk))
         .send()
         .await
-        .ok()
-        .and_then(|o| o.item().cloned());
+        .map_err(|e| {
+            error!(owner, name, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Reviewer config read failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item()
+        .cloned();
     let Some(item) = item else {
-        return ReviewConfig::default();
+        return Ok(ReviewConfig::default());
     };
     let d = ReviewConfig::default();
-    ReviewConfig {
+    Ok(ReviewConfig {
         enabled: item
             .get("enabled")
             .and_then(|v| v.as_bool().ok())
@@ -1842,7 +1958,7 @@ pub(crate) async fn load_review_config(
             .and_then(|v| v.as_bool().ok())
             .copied()
             .unwrap_or(d.killed),
-    }
+    })
 }
 
 /// Push to a branch: if the repo's code graph is enabled and the push is to the
@@ -2085,7 +2201,7 @@ async fn handle_review_trigger(
     let owner = repo["owner"]["login"].as_str().unwrap_or("");
     let name = repo["name"].as_str().unwrap_or("");
 
-    let cfg = load_review_config(state, team_id, owner, name).await;
+    let cfg = load_review_config(state, team_id, owner, name).await?;
     if !cfg.enabled || cfg.killed {
         return Ok(StatusCode::OK);
     }
@@ -2226,7 +2342,7 @@ const REVIEW_PUSH_SETTLE_SECS: i32 = 60;
 /// still self-expiring so a stuck/failed review can be re-driven later (push a new
 /// commit, or `@coderhelm review`). The claim is keyed by head_sha, so a new commit
 /// is never blocked regardless of this window.
-const REVIEW_DEDUP_TTL_SECS: u64 = 3600;
+const REVIEW_DEDUP_TTL_SECS: u64 = 600;
 
 /// Atomically claim the review slot for (team, repo, pr, head). Returns `true` if
 /// THIS caller won the claim (should proceed to enqueue), `false` if a sibling
@@ -2242,44 +2358,21 @@ async fn claim_review_slot(
     pr_number: u64,
     head_sha: &str,
 ) -> bool {
-    let now = chrono::Utc::now();
     let sk = format!("REVIEWCLAIM#{owner}/{name}#{pr_number:06}#{head_sha}");
-    match state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(team_id))
-        .item("sk", attr_s(&sk))
-        .item(
-            "ttl",
-            attr_n(now.timestamp() as u64 + REVIEW_DEDUP_TTL_SECS),
-        )
-        .item("created_at", attr_s(&now.to_rfc3339()))
-        .condition_expression("attribute_not_exists(pk)")
-        .send()
-        .await
-    {
-        Ok(_) => true,
-        Err(e) => {
-            // ConditionalCheckFailed => a sibling event already claimed this head.
-            // Any other error (network/throttle/etc.) fails OPEN so a transient blip
-            // never silently drops a real review. `as_service_error` (not
-            // `into_service_error`) so a non-service error can't panic here.
-            let already_claimed = e
-                .as_service_error()
-                .map(|se| se.is_conditional_check_failed_exception())
-                .unwrap_or(false);
-            if already_claimed {
-                false
-            } else {
-                warn!(
-                    owner,
-                    name, pr_number, "Review dedup claim errored — allowing review (fail-open)"
-                );
-                true
-            }
-        }
+    // An expired claim is taken over (common::claim compares `ttl` itself;
+    // DynamoDB's sweeper deletes expired items hours late).
+    let c = common::claim::claim(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+        &sk,
+        REVIEW_DEDUP_TTL_SECS,
+    )
+    .await;
+    if let common::claim::Claim::Failed(e) = &c {
+        warn!(owner, name, pr_number, error = %e, "Review dedup claim errored — allowing review (fail-open)");
     }
+    c.won_or_failed_open()
 }
 
 pub(crate) async fn send_to_queue(
@@ -2729,13 +2822,73 @@ mod reviewer_ask_tests {
         })
     }
 
+    fn ask(q: &str) -> Option<ReviewerAsk> {
+        Some(ReviewerAsk {
+            rereview: false,
+            question: Some(q.into()),
+        })
+    }
+
     #[test]
     fn mention_is_case_insensitive() {
         assert_eq!(parse_reviewer_ask("@CoderHelm re-review"), rereview());
-        assert_eq!(parse_reviewer_ask("@CODERHELM rereview please"), rereview());
+        assert_eq!(parse_reviewer_ask("@CODERHELM rereview"), rereview());
         assert_eq!(parse_reviewer_ask("@coderhelm review again"), rereview());
+        assert_eq!(parse_reviewer_ask("@coderhelm re review!"), rereview());
         assert_eq!(parse_reviewer_ask("@coderhelm[bot] re-review"), rereview());
         assert_eq!(parse_reviewer_ask("@CoderHelm"), rereview());
+    }
+
+    /// Only the exact command is a fast path; what any other ask means is
+    /// for the worker's model to read, so it is passed on as written.
+    #[test]
+    fn every_other_ask_goes_to_the_model() {
+        assert_eq!(
+            parse_reviewer_ask("@coderhelm can you approve?"),
+            ask("can you approve?")
+        );
+        assert_eq!(
+            parse_reviewer_ask("@coderhelm all addressed, please take another look"),
+            ask("all addressed, please take another look")
+        );
+        assert_eq!(
+            parse_reviewer_ask("@CODERHELM rereview please"),
+            ask("rereview please")
+        );
+    }
+
+    #[test]
+    fn quoted_text_and_code_are_not_addressed_to_the_reviewer() {
+        assert_eq!(parse_reviewer_ask("> @coderhelm re-review\nthanks!"), None);
+        assert_eq!(
+            parse_reviewer_ask("run `@coderhelm re-review` to retry"),
+            None
+        );
+        assert_eq!(
+            parse_reviewer_ask("```\n@coderhelm re-review\n```\nok"),
+            None
+        );
+        assert_eq!(
+            parse_reviewer_ask("> old text\n@coderhelm re-review"),
+            rereview()
+        );
+    }
+
+    #[test]
+    fn an_edit_runs_a_command_only_when_it_adds_one() {
+        use super::ask_added_by_edit;
+        assert_eq!(
+            ask_added_by_edit("looks good", "@coderhelm re-review"),
+            rereview()
+        );
+        assert!(
+            ask_added_by_edit("looks good", "looks good, @coderhelm can you approve?").is_some()
+        );
+        assert_eq!(
+            ask_added_by_edit("@coderhelm re-review", "@coderhelm re-review (typo fixed)"),
+            None
+        );
+        assert_eq!(ask_added_by_edit("a", "b"), None);
     }
 
     #[test]

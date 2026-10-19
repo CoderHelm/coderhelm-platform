@@ -263,12 +263,13 @@ export class ApiStack extends cdk.Stack {
       ],
     });
 
-    // Stuck-review sweep: every 30 min, re-run the review of open PRs whose
-    // standing CoderHelm review didn't finish (a service error), once per head.
+    // Stuck-review sweep (permanent): every 15 min, re-run the review of open
+    // PRs whose standing CoderHelm review didn't finish (a service error),
+    // once per head. Idempotent: a head is re-run at most once a day.
     new events.Rule(this, "ReviewSweepSchedule", {
       ruleName: `${prefix}-review-sweep`,
       description: "Re-run reviews stuck on a review that didn't finish",
-      schedule: events.Schedule.rate(cdk.Duration.minutes(30)),
+      schedule: events.Schedule.rate(cdk.Duration.minutes(15)),
       targets: [
         new targets.SqsQueue(this.ticketQueue, {
           message: events.RuleTargetInput.fromObject({

@@ -83,6 +83,47 @@ fn is_budget_exhausted(err_msg: &str) -> bool {
     err_msg.contains("maximum number of steps")
 }
 
+/// Sends a ticket run again after a transient model error, keeping its
+/// run_id, per [`common::model_retry::requeue_delay`]. False once the policy
+/// is spent or the queue is missing (the run then fails as before).
+async fn requeue_after_model_error(state: &WorkerState, msg: &TicketMessage, run_id: &str) -> bool {
+    let Some(delay) = common::model_retry::requeue_delay(msg.model_retries) else {
+        return false;
+    };
+    if state.config.ticket_queue_url.is_empty() {
+        return false;
+    }
+    let mut next = msg.clone();
+    next.model_retries = msg.model_retries + 1;
+    next.continuation_run_id = Some(run_id.to_string());
+    let Ok(body) = serde_json::to_string(&crate::models::WorkerMessage::Ticket(next)) else {
+        return false;
+    };
+    match state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(body)
+        .delay_seconds(delay as i32)
+        .send()
+        .await
+    {
+        Ok(_) => {
+            warn!(
+                run_id,
+                retry = msg.model_retries + 1,
+                delay,
+                "model_error_requeued: run sent again after a transient model error"
+            );
+            true
+        }
+        Err(e) => {
+            warn!(run_id, error = %e, "Could not requeue the run after a model error");
+            false
+        }
+    }
+}
+
 /// Auto-continue a run that ran out of budget (wall-clock OR step limit) with
 /// real partial work already committed to its branch: re-enqueue the ticket to
 /// resume from that branch (reusing run_id). Hard-bounded by count AND
@@ -670,11 +711,14 @@ pub mod resume;
 mod review;
 pub mod review_actions;
 pub mod review_agent;
+#[cfg(test)]
+mod review_eval;
 pub mod review_labels;
 pub mod review_pr;
 pub mod review_reminder;
 pub mod review_risk;
 pub mod review_sweep;
+pub mod review_verdict;
 mod security;
 pub mod skill_compat;
 pub mod skill_suggest;
@@ -789,7 +833,7 @@ pub async fn orchestrate_ticket(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // A continuation reuses its original run_id (so it's ONE run, not a
     // duplicate); a fresh ticket mints a new one.
-    let is_continuation = msg.continuation > 0
+    let is_continuation = (msg.continuation > 0 || msg.model_retries > 0)
         && msg
             .continuation_run_id
             .as_deref()
@@ -882,6 +926,16 @@ pub async fn orchestrate_ticket(
                 let continued = is_budget_exhausted(&err_msg)
                     && try_auto_continue(state, &msg, &run_id, &checkpoint, &["implement_started"])
                         .await;
+                // A transient model failure (5xx incl. 520-524, 429, 529, no
+                // response) that outlasted the client's own retries is not the
+                // ticket's fault: the run is sent again later (same run_id), by
+                // the one requeue policy every pass uses. Decided from the
+                // error's kind, never its text.
+                let continued = continued || {
+                    let err: &(dyn std::error::Error + 'static) = &*e;
+                    common::model_retry::is_transient_model_error(err)
+                        && requeue_after_model_error(state, &msg, &run_id).await
+                };
                 // Salvage before failing: an implement that burned its turn
                 // budget mid-task has already pushed real commits to the branch.
                 // Only mid-implement deaths salvage: for later-pass errors a

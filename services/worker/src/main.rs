@@ -119,7 +119,16 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             info!(team_id = %msg.team_id, run_id = %msg.run_id, "Processing feedback");
             let team_id = msg.team_id.clone();
             let run_id = msg.run_id.clone();
+            let retry_msg = msg.clone();
             if let Err(e) = passes::feedback::run(&state, msg).await {
+                // A transient model failure is sent again later by the one
+                // requeue policy; only a real failure marks the run failed.
+                let err: &(dyn std::error::Error + 'static) = &*e;
+                if common::model_retry::is_transient_model_error(err)
+                    && passes::feedback::requeue_after_model_error(&state, &retry_msg).await
+                {
+                    return;
+                }
                 error!("Feedback run failed: {e}");
                 let now = chrono::Utc::now().to_rfc3339();
                 let _ = state

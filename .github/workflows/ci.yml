@@ -29,6 +29,19 @@ jobs:
           cache-on-failure: true
       - run: cargo fmt --check --all
       - run: cargo clippy --workspace -- -D warnings
+      # Includes the reviewer evals (worker passes::review_eval): recorded
+      # review histories replayed through the real decision code, no model.
+      - run: cargo test --workspace
+
+  lambda-tests:
+    name: Lambda (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m unittest discover -s lambda/tests
 
   mcp-proxy:
     name: MCP Proxy (Node)
