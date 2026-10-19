@@ -571,26 +571,6 @@ pub(crate) async fn load_credentials(
     mcp_credentials::load(&kms, team_id, plugin_id, &stored).await
 }
 
-/// Seals every plugin record across teams that still holds plain values.
-/// Runs on the gateway's cold start; a sealed record is left alone, so it is
-/// safe to run any number of times. Logs counts only.
-pub async fn seal_plain_credentials(state: &AppState) {
-    if state.config.secrets_key_id.is_empty() {
-        error!("No secrets key configured; plugin credentials not sealed");
-        return;
-    }
-    match mcp_credentials::migrate_all(&state.dynamo, &cipher(state), mcp_table(state)).await {
-        Ok(sw) => info!(
-            plain_found = sw.plain_found,
-            sealed_now = sw.sealed_now,
-            raced = sw.raced,
-            failed = sw.failed,
-            "Plugin credential sealing sweep"
-        ),
-        Err(e) => error!("Plugin credential sealing sweep failed: {e}"),
-    }
-}
-
 /// GET /api/plugins/catalog — return all available plugins.
 pub async fn list_catalog() -> Json<Value> {
     Json(json!({ "plugins": CATALOG }))

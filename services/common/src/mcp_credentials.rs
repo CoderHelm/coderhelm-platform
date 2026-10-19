@@ -8,8 +8,8 @@
 //! or written to a log.
 //!
 //! Records written before sealing hold the values as plain JSON in
-//! `credentials`. Reading one seals it in place ([`migrate_item`]), and
-//! [`migrate_all`] does the same for every record in the table.
+//! `credentials`. Reading one seals it in place ([`migrate_item`]). Every
+//! production record has been sealed; the read path stays as a safety net.
 
 use std::collections::HashMap;
 
@@ -280,56 +280,6 @@ pub async fn migrate_item(
         Some(rw) => write_rewrite(dynamo, table, &rw).await,
         None => Ok(false),
     }
-}
-
-/// Counts from a sweep over the table. Never carries a value.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Sweep {
-    /// Records that still held plain values when read.
-    pub plain_found: usize,
-    pub sealed_now: usize,
-    /// Changed between the read and the write; the next read seals them.
-    pub raced: usize,
-    pub failed: usize,
-}
-
-/// Seals every plugin record in `table` that still holds plain values.
-/// Safe to run any number of times: a sealed record is left alone.
-pub async fn migrate_all(
-    dynamo: &aws_sdk_dynamodb::Client,
-    cipher: &dyn Cipher,
-    table: &str,
-) -> Result<Sweep, String> {
-    let mut sweep = Sweep::default();
-    let mut start: Option<Item> = None;
-    loop {
-        let page = dynamo
-            .scan()
-            .table_name(table)
-            .filter_expression("begins_with(sk, :p) AND attribute_exists(#plain)")
-            .expression_attribute_names("#plain", PLAIN_ATTR)
-            .expression_attribute_values(":p", AttributeValue::S(PREFIX.to_string()))
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await
-            .map_err(|e| format!("dynamodb scan: {}", e.into_service_error()))?;
-        for item in page.items() {
-            if !matches!(stored(item), Stored::Plain(_)) {
-                continue;
-            }
-            sweep.plain_found += 1;
-            match migrate_item(dynamo, cipher, table, item).await {
-                Ok(true) => sweep.sealed_now += 1,
-                Ok(false) => sweep.raced += 1,
-                Err(_) => sweep.failed += 1,
-            }
-        }
-        match page.last_evaluated_key() {
-            Some(k) if !k.is_empty() => start = Some(k.clone()),
-            _ => break,
-        }
-    }
-    Ok(sweep)
 }
 
 #[cfg(test)]
