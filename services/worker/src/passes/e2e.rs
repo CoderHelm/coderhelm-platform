@@ -12,8 +12,12 @@
 //!   jobs are re-run once to confirm and one short comment says why, instead of
 //!   staying silent.
 //! - **For flaky tests:** a cause label, quarantine when the team allows it, a
-//!   ticket after two weeks in quarantine, and fix PRs that must prove
-//!   themselves ([`act`]).
+//!   ticket after the team's number of days in quarantine (two by default),
+//!   and fix PRs that must prove themselves ([`act`]).
+//! - **For quarantined tests:** a run whose only failures are quarantined
+//!   tests is marked rescued, its outcome is kept with the run's claim so CI
+//!   decisions can treat it as passing ([`super::quarantine`]), and the PR
+//!   gets one note saying so.
 //! - **For coverage:** areas and untested routes, and recommendations for the
 //!   tests a team is missing.
 
@@ -24,8 +28,8 @@ use common::e2e::coverage::{parse_test_map, uncovered_routes, TestMap, TEST_MAP_
 use common::e2e::detect::{apply_run, is_bad_run};
 use common::e2e::messages::{TestAction, TestIngest};
 use common::e2e::model::{
-    Cause, Evidence, Execution, HistoryEntry, Outcome, ParsedTest, Recommendation, Run, Settings,
-    State, StateEvent, TestRecord, CAUSES,
+    Cause, Evidence, Execution, HistoryEntry, IngestOutcome, Outcome, ParsedTest, Recommendation,
+    Run, Settings, State, StateEvent, TestRecord, CAUSES,
 };
 use common::e2e::owners::{owners_of, CODEOWNERS_PATHS};
 use common::e2e::parse::{parse_any, Links};
@@ -54,8 +58,6 @@ const REPRO_RUNS: u32 = 20;
 const BURN_IN_RUNS: u32 = 20;
 /// Repeat runs a generated test must pass.
 const GENERATED_RUNS: u32 = 10;
-/// Days in quarantine before the owner gets a ticket.
-const TICKET_AFTER_DAYS: i64 = 14;
 /// Cause labels worked out per run, at most.
 const MAX_CLASSIFY: usize = 5;
 /// Fix PRs Coderhelm starts on its own, per repo per week (people can always
@@ -302,6 +304,15 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
             reports = reports.len(),
             "No test reports in this run"
         );
+        let _ = st
+            .finish_run(
+                &msg.team_id,
+                &run_key,
+                &repo,
+                &started_at,
+                &IngestOutcome::NoTests,
+            )
+            .await;
         return Ok(());
     }
 
@@ -382,6 +393,7 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
         },
         quarantined_failures: 0,
         rescued: false,
+        quarantined_tests: Vec::new(),
     };
 
     let codeowners = read_first(
@@ -436,7 +448,6 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
                 .or(r.owner.take());
         }
         let outcome = Outcome::of(&t.attempts);
-        let was_quarantined = r.quarantined;
         let entry = compact_entry(&run, t, bad_run);
         let applied = apply_run(
             &mut r,
@@ -450,8 +461,11 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
         }
 
         if outcome == Outcome::Failed {
-            if was_quarantined {
+            // Quarantined as of this run: a test this run just quarantined
+            // counts, one it just found broken (released) does not.
+            if r.quarantined {
                 run.quarantined_failures += 1;
+                run.quarantined_tests.push(t.full_title());
             }
             if pr.is_some() {
                 let v = verdict(before.as_ref(), bad_run, &msg.default_branch);
@@ -496,17 +510,16 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
         {
             auto_fix.push(id.clone());
         }
-        if r.quarantined && r.ticket_url.is_none() && settings.tickets != "off" {
-            let long = r
-                .quarantined_since
-                .as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .is_some_and(|since| {
-                    now.signed_duration_since(since) >= chrono::Duration::days(TICKET_AFTER_DAYS)
-                });
-            if long {
-                file_ticket(state, &gh, &msg, &settings, &mut r).await;
-            }
+        if r.quarantined
+            && r.ticket_url.is_none()
+            && settings.tickets != "off"
+            && quarantined_long_enough(
+                r.quarantined_since.as_deref(),
+                now,
+                settings.ticket_after_days,
+            )
+        {
+            file_ticket(state, &gh, &msg, &settings, &mut r).await;
         }
         st.put_record(&msg.team_id, &r).await?;
         executions.push(Execution {
@@ -537,7 +550,7 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
             }
         }
     }
-    run.rescued = failed > 0 && run.quarantined_failures == failed;
+    run.rescued = is_rescued(failed, run.quarantined_failures);
     st.put_run(&msg.team_id, &run).await?;
     let detail = serde_json::to_vec(&executions)?;
     state
@@ -549,11 +562,28 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
         .body(detail.into())
         .send()
         .await?;
-    info!(run_key, repo = %repo, passed, failed, flaky, bad_run, "E2E run read");
+    let _ = st
+        .finish_run(
+            &msg.team_id,
+            &run_key,
+            &repo,
+            &started_at,
+            &IngestOutcome::Read {
+                failed,
+                rescued: run.rescued,
+                quarantined: run.quarantined_tests.clone(),
+            },
+        )
+        .await;
+    info!(run_key, repo = %repo, passed, failed, flaky, bad_run, rescued = run.rescued, "E2E run read");
 
     if let Some(pr) = pr {
         save_triage(&st, &msg, &run, pr, &lines).await;
-        if msg.head_branch.starts_with("coderhelm/") && failed > 0 {
+        if run.rescued {
+            note_rescued(&st, &gh, &msg, &run, pr).await;
+        }
+        // A run that failed only on quarantined tests needs no fix or re-run.
+        if msg.head_branch.starts_with("coderhelm/") && failed > 0 && !run.rescued {
             own_pr_failures(state, &gh, &msg, &run, pr, &lines).await;
         }
         recommend_from_pr(state, &gh, &msg, pr, &changed, map.as_ref()).await;
@@ -943,6 +973,84 @@ async fn classify(state: &WorkerState, team_id: &str, repo: &str, id: &str) {
     }
 }
 
+/// Every failure in a run was a quarantined test.
+fn is_rescued(failed: u32, quarantined_failures: u32) -> bool {
+    failed > 0 && quarantined_failures == failed
+}
+
+/// A test quarantined since `since` has waited `days` for a ticket.
+fn quarantined_long_enough(
+    since: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    days: u32,
+) -> bool {
+    since
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .is_some_and(|since| {
+            now.signed_duration_since(since) >= chrono::Duration::days(days.into())
+        })
+}
+
+fn plural_days(days: u32) -> String {
+    if days == 1 {
+        "1 day".into()
+    } else {
+        format!("{days} days")
+    }
+}
+
+/// The PR note for a run that failed only on quarantined tests.
+pub(crate) fn rescued_note(workflow: &str, sha: &str, tests: &[String]) -> String {
+    let mut names: Vec<&str> = tests.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    names.dedup();
+    let shown: Vec<String> = names
+        .iter()
+        .take(10)
+        .map(|t| format!("`{}`", common::truncate_str(t, 120).replace('`', "'")))
+        .collect();
+    let more = if names.len() > shown.len() {
+        format!(" and {} more", names.len() - shown.len())
+    } else {
+        String::new()
+    };
+    let wf = if workflow.is_empty() { "E2E" } else { workflow };
+    format!(
+        "Only quarantined tests failed: {}{more}. Coderhelm treats this as passing.\n\n\
+         From **{wf}** on `{}`. Quarantined tests still run and are still recorded. To keep them from \
+         failing the build itself, see \"Make quarantined tests stop failing your build\" on the Tests page.",
+        shown.join(", "),
+        &sha[..sha.len().min(7)],
+    )
+}
+
+/// Says on the PR, in one comment kept up to date, that a run failed only on
+/// quarantined tests.
+async fn note_rescued(st: &Store<'_>, gh: &GitHubClient, msg: &TestIngest, run: &Run, pr: u64) {
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let body = rescued_note(&run.workflow, &run.sha, &run.quarantined_tests);
+    if let Ok(Some(id)) = st.pr_note(&msg.team_id, &repo, pr).await {
+        if gh
+            .edit_issue_comment(&msg.repo_owner, &msg.repo_name, id, &body)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+    match gh
+        .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &body)
+        .await
+    {
+        Ok(c) => {
+            if let Some(id) = c["id"].as_u64() {
+                let _ = st.put_pr_note(&msg.team_id, &repo, pr, id).await;
+            }
+        }
+        Err(e) => warn!(pr, error = %e, "Could not note a quarantined-only failure"),
+    }
+}
+
 async fn file_ticket(
     state: &WorkerState,
     gh: &GitHubClient,
@@ -951,8 +1059,10 @@ async fn file_ticket(
     r: &mut TestRecord,
 ) {
     let _ = state;
+    let days = settings.ticket_after_days;
     let title = format!(
-        "Flaky E2E test quarantined for {TICKET_AFTER_DAYS} days: {}",
+        "Flaky E2E test quarantined for {}: {}",
+        plural_days(days),
         common::truncate_str(&r.title, 120)
     );
     let s = common::e2e::stats::stats(r, chrono::Utc::now());
@@ -961,7 +1071,7 @@ async fn file_ticket(
          - Failure or flip rate over 30 days: {rate:.0}% of {runs} runs\n\
          - Likely cause: {cause}\n\
          - Owner: {owner}\n\n\
-         Fix it or remove it; Coderhelm can open a fix PR from the Tests page. This was filed automatically after {days} days in quarantine.",
+         Fix it or remove it; Coderhelm can open a fix PR from the Tests page. This was filed automatically after {days} in quarantine.",
         title = r.title,
         file = r.file,
         since = r.quarantined_since.as_deref().unwrap_or("?"),
@@ -969,7 +1079,7 @@ async fn file_ticket(
         runs = s.runs_30d,
         cause = r.cause.as_ref().map(|c| format!("{} ({})", c.label, c.evidence)).unwrap_or_else(|| "not worked out yet".into()),
         owner = r.owner.as_deref().unwrap_or("no CODEOWNERS entry"),
-        days = TICKET_AFTER_DAYS,
+        days = plural_days(days),
     );
     // Jira tickets need a project the team picked; until one is set for test
     // tickets, they go to the repo's GitHub issues, which always works.
@@ -986,7 +1096,7 @@ async fn file_ticket(
                 at: chrono::Utc::now().to_rfc3339(),
                 from: "quarantined".into(),
                 to: "quarantined".into(),
-                reason: format!("Ticket filed after {TICKET_AFTER_DAYS} days in quarantine."),
+                reason: format!("Ticket filed after {} in quarantine.", plural_days(days)),
                 actor: "coderhelm".into(),
             });
         }
@@ -2169,6 +2279,42 @@ async fn refresh_coverage(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn a_run_is_rescued_only_when_every_failure_was_quarantined() {
+        assert!(is_rescued(2, 2));
+        assert!(!is_rescued(2, 1));
+        assert!(!is_rescued(0, 0));
+    }
+
+    #[test]
+    fn tickets_wait_the_teams_number_of_days() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let since = Some("2026-10-18T11:00:00Z");
+        assert!(quarantined_long_enough(since, now, 2));
+        assert!(!quarantined_long_enough(since, now, 3));
+        assert!(quarantined_long_enough(since, now, 1));
+        assert!(!quarantined_long_enough(None, now, 1));
+        assert_eq!(plural_days(1), "1 day");
+        assert_eq!(plural_days(2), "2 days");
+    }
+
+    #[test]
+    fn the_rescued_note_names_the_quarantined_tests() {
+        let note = rescued_note(
+            "E2E",
+            "abcdef1234567",
+            &["checkout › pays".into(), "login".into(), "login".into()],
+        );
+        assert!(note.starts_with(
+            "Only quarantined tests failed: `checkout › pays`, `login`. Coderhelm treats this as passing."
+        ));
+        assert!(note.contains("**E2E** on `abcdef1`"));
+        let many: Vec<String> = (0..12).map(|i| format!("t{i:02}")).collect();
+        assert!(rescued_note("", "abc", &many).contains("and 2 more"));
+    }
 
     #[test]
     fn dispatch_inputs_are_found_in_the_workflow() {

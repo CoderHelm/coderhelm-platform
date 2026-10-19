@@ -5,6 +5,7 @@ use tracing::{error, info, warn};
 use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{ResumeMessage, TicketMessage, TicketSource, TokenUsage};
+use crate::passes::quarantine::{self, Gate};
 use crate::passes::{
     attr_n, attr_s, implement, plan, review, save_checkpoint, write_pass_trace, FileCache,
 };
@@ -230,6 +231,61 @@ async fn evaluate_ci_verdict(
     }
 }
 
+/// What a quarantine check does to a CI verdict: a failure made only of
+/// quarantined tests counts as green, one whose test report isn't read yet
+/// counts as still running. Anything else is left as is.
+fn apply_quarantine(verdict: CiVerdict, gate: &Gate) -> CiVerdict {
+    match (verdict, gate) {
+        (CiVerdict::Failed, Gate::OnlyQuarantined(_)) => CiVerdict::Green,
+        (CiVerdict::Failed, Gate::Waiting) => CiVerdict::Pending,
+        (v, _) => v,
+    }
+}
+
+/// [`evaluate_ci_verdict`], with failures made only of quarantined tests
+/// treated as passing (see `passes::quarantine`). Returns the quarantined tests
+/// when that happened.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_ci_verdict_with_quarantine(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    branch: &str,
+    head: Option<&str>,
+) -> (CiVerdict, Option<Vec<String>>) {
+    let verdict = evaluate_ci_verdict(github, owner, name, branch).await;
+    if verdict != CiVerdict::Failed {
+        return (verdict, None);
+    }
+    let gate = quarantine::gate(state, github, team_id, owner, name, head.unwrap_or(branch)).await;
+    let names = match &gate {
+        Gate::OnlyQuarantined(n) => Some(n.clone()),
+        _ => None,
+    };
+    (apply_quarantine(verdict, &gate), names)
+}
+
+/// Where a resume goes once the quarantine check has looked at a CI failure.
+#[derive(Debug, PartialEq, Eq)]
+enum FailRoute {
+    /// Start a fix attempt.
+    Fix,
+    /// A test report isn't read yet: look again shortly, change nothing.
+    Wait,
+    /// Only quarantined tests failed: carry on as if CI passed.
+    TreatAsPassed(Vec<String>),
+}
+
+fn fail_route(gate: Gate) -> FailRoute {
+    match gate {
+        Gate::Real => FailRoute::Fix,
+        Gate::Waiting => FailRoute::Wait,
+        Gate::OnlyQuarantined(names) => FailRoute::TreatAsPassed(names),
+    }
+}
+
 /// The run branch's current head commit, or None when the run record lacks
 /// repo/branch or GitHub can't be reached.
 async fn current_branch_head(
@@ -293,8 +349,40 @@ async fn record_synthetic_ci_failed(state: &WorkerState, run_id: &str, head_sha:
 
 #[cfg(test)]
 mod ci_verdict_tests {
-    use super::{ci_verdict_from_checks, CiVerdict};
+    use super::{apply_quarantine, ci_verdict_from_checks, fail_route, CiVerdict, FailRoute, Gate};
     use serde_json::json;
+
+    #[test]
+    fn quarantined_only_failures_never_start_a_fix() {
+        assert_eq!(
+            fail_route(Gate::OnlyQuarantined(vec!["a".into()])),
+            FailRoute::TreatAsPassed(vec!["a".into()])
+        );
+        assert_eq!(fail_route(Gate::Waiting), FailRoute::Wait);
+        assert_eq!(fail_route(Gate::Real), FailRoute::Fix);
+    }
+
+    #[test]
+    fn quarantine_turns_only_a_failed_verdict() {
+        let only = Gate::OnlyQuarantined(vec!["a".into()]);
+        assert_eq!(apply_quarantine(CiVerdict::Failed, &only), CiVerdict::Green);
+        assert_eq!(
+            apply_quarantine(CiVerdict::Failed, &Gate::Waiting),
+            CiVerdict::Pending
+        );
+        assert_eq!(
+            apply_quarantine(CiVerdict::Failed, &Gate::Real),
+            CiVerdict::Failed
+        );
+        assert_eq!(
+            apply_quarantine(CiVerdict::Pending, &only),
+            CiVerdict::Pending
+        );
+        assert_eq!(
+            apply_quarantine(CiVerdict::NoChecks, &only),
+            CiVerdict::NoChecks
+        );
+    }
 
     #[test]
     fn no_checks_when_total_zero() {
@@ -787,7 +875,18 @@ pub async fn run(
 
         // Aggregate check state is the source of truth (see CiVerdict). A failed
         // API call yields Pending here — never a false "no checks → complete".
-        match evaluate_ci_verdict(&github, &repo_owner, &repo_name, &branch).await {
+        // A failure made only of quarantined tests counts as green.
+        let (verdict, quarantined) = evaluate_ci_verdict_with_quarantine(
+            state,
+            &github,
+            &msg.team_id,
+            &repo_owner,
+            &repo_name,
+            &branch,
+            branch_head.as_deref(),
+        )
+        .await;
+        match verdict {
             CiVerdict::NoChecks => {
                 // No CI workflows at all — mark PR ready and complete
                 info!(
@@ -831,6 +930,15 @@ pub async fn run(
                     run_id = msg.run_id,
                     "CI passed (missed webhook) — marking PR ready and completing"
                 );
+                if let Some(names) = &quarantined {
+                    super::add_progress_note(
+                        state,
+                        &msg.team_id,
+                        &msg.run_id,
+                        &quarantine::passing_line(names),
+                    )
+                    .await;
+                }
                 mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
                 set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
                 return Ok(());
@@ -839,8 +947,8 @@ pub async fn run(
     }
 
     // Determine what happened
-    let has_ci_pass = events.iter().any(|e| e.event_type == "ci_passed");
-    let has_ci_fail = events.iter().any(|e| e.event_type == "ci_failed");
+    let mut has_ci_pass = events.iter().any(|e| e.event_type == "ci_passed");
+    let mut has_ci_fail = events.iter().any(|e| e.event_type == "ci_failed");
     let has_review_feedback = events
         .iter()
         .any(|e| e.event_type == "pr_review" || e.event_type == "pr_comment");
@@ -905,6 +1013,45 @@ pub async fn run(
 
     // (writer slot already held — acquired right after the awaiting_ci gate so
     // it also covers the squash fast-paths above.)
+
+    // Quarantined tests don't fail Coderhelm's decisions: when every failing
+    // check failed only on quarantined tests, there's nothing to fix and the
+    // run carries on as if CI passed. Decided before claiming the run, so a
+    // wait for an unread test report leaves the run untouched.
+    let mut quarantined_only: Option<Vec<String>> = None;
+    if has_ci_fail && !repo_owner.is_empty() && !repo_name.is_empty() {
+        if let Ok(gh) = GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            msg.installation_id,
+            &state.http,
+        ) {
+            let git_ref = branch_head.as_deref().unwrap_or(&branch);
+            let gate =
+                quarantine::gate(state, &gh, &msg.team_id, &repo_owner, &repo_name, git_ref).await;
+            match fail_route(gate) {
+                FailRoute::Fix => {}
+                FailRoute::Wait => {
+                    info!(
+                        run_id = msg.run_id,
+                        "CI failed; waiting for the test report to tell whether only quarantined tests failed"
+                    );
+                    send_delayed_resume(state, &msg, 60).await;
+                    return Ok(());
+                }
+                FailRoute::TreatAsPassed(names) => {
+                    info!(
+                        run_id = msg.run_id,
+                        tests = ?names,
+                        "Only quarantined tests failed — treating CI as passed"
+                    );
+                    has_ci_fail = false;
+                    has_ci_pass = true;
+                    quarantined_only = Some(names);
+                }
+            }
+        }
+    }
 
     // Atomically claim this run: transition awaiting_ci → running.
     // If another Resume Lambda already claimed it, this fails and we exit.
@@ -1316,7 +1463,20 @@ pub async fn run(
         // not conclude the run while tests are still running — or after a straggler
         // has already failed. Events are wake-ups; the aggregate is the source of
         // truth (see CiVerdict).
-        match evaluate_ci_verdict(&github, &repo_owner, &repo_name, &branch).await {
+        let (verdict, quarantined) = evaluate_ci_verdict_with_quarantine(
+            state,
+            &github,
+            &msg.team_id,
+            &repo_owner,
+            &repo_name,
+            &branch,
+            branch_head.as_deref(),
+        )
+        .await;
+        if quarantined.is_some() {
+            quarantined_only = quarantined;
+        }
+        match verdict {
             CiVerdict::Pending => {
                 info!(
                     run_id = msg.run_id,
@@ -1384,6 +1544,15 @@ pub async fn run(
             feedback_len = review_feedback.len(),
             "CI passed — running review"
         );
+        if let Some(names) = &quarantined_only {
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &quarantine::passing_line(names),
+            )
+            .await;
+        }
         super::record_ci_outcome(state, &msg.team_id, &msg.run_id, super::CiOutcome::Passed).await;
         super::update_pass(state, &msg.team_id, &msg.run_id, "review").await?;
 

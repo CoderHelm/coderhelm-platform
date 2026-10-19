@@ -176,12 +176,36 @@ pub struct Run {
     /// Every failure in the run was quarantined, so it no longer blocks.
     #[serde(default)]
     pub rescued: bool,
+    /// Titles of the quarantined tests that failed in this run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantined_tests: Vec<String>,
 }
 
 impl Run {
     pub fn key(run_id: u64, run_attempt: u32) -> String {
         format!("{run_id}-{run_attempt}")
     }
+}
+
+/// What reading one workflow run found. Kept with the run's claim, so a CI
+/// decision can tell a run that failed only on quarantined tests from a real
+/// failure, or from one still being read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum IngestOutcome {
+    /// Claimed and still being read.
+    Reading,
+    /// The run uploaded no test report Coderhelm can read.
+    NoTests,
+    /// The run's tests were read.
+    Read {
+        failed: u32,
+        /// Every failure was a quarantined test.
+        rescued: bool,
+        /// Titles of the quarantined tests that failed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        quarantined: Vec<String>,
+    },
 }
 
 /// A test's line in a stored run.
@@ -393,10 +417,22 @@ pub struct Settings {
     /// `owner/name` repos it applies to. Empty means all.
     #[serde(default)]
     pub repos: Vec<String>,
+    /// Days a test stays quarantined before its owner gets a ticket.
+    #[serde(default = "default_ticket_after_days")]
+    pub ticket_after_days: u32,
 }
 
 fn default_tickets() -> String {
     "off".to_string()
+}
+
+/// Days in quarantine before a ticket, unless the team picks another number.
+pub const DEFAULT_TICKET_AFTER_DAYS: u32 = 2;
+/// The range a team can pick for `ticket_after_days`.
+pub const TICKET_AFTER_DAYS_RANGE: std::ops::RangeInclusive<u32> = 1..=30;
+
+fn default_ticket_after_days() -> u32 {
+    DEFAULT_TICKET_AFTER_DAYS
 }
 
 impl Default for Settings {
@@ -408,6 +444,7 @@ impl Default for Settings {
             tickets: default_tickets(),
             burn_in: false,
             repos: Vec::new(),
+            ticket_after_days: DEFAULT_TICKET_AFTER_DAYS,
         }
     }
 }
@@ -418,11 +455,27 @@ impl Settings {
             && (self.repos.is_empty() || self.repos.iter().any(|r| r.eq_ignore_ascii_case(repo)))
     }
 
+    /// Why a requested change can't be saved, if it can't.
+    pub fn validate(&self) -> Result<(), String> {
+        if !TICKET_AFTER_DAYS_RANGE.contains(&self.ticket_after_days) {
+            return Err(format!(
+                "Pick between {} and {} days before a ticket is filed.",
+                TICKET_AFTER_DAYS_RANGE.start(),
+                TICKET_AFTER_DAYS_RANGE.end()
+            ));
+        }
+        Ok(())
+    }
+
     /// Keeps only known values, so a bad request can't store junk.
     pub fn sanitized(mut self) -> Settings {
         if !matches!(self.tickets.as_str(), "github" | "jira" | "off") {
             self.tickets = "off".to_string();
         }
+        self.ticket_after_days = self.ticket_after_days.clamp(
+            *TICKET_AFTER_DAYS_RANGE.start(),
+            *TICKET_AFTER_DAYS_RANGE.end(),
+        );
         self.repos.retain(|r| {
             let r = r.trim();
             r.split('/').count() == 2 && !r.starts_with('/') && !r.ends_with('/') && r.len() <= 200
@@ -566,5 +619,31 @@ mod tests {
         assert!(scoped.covers("Acme/Web"));
         assert!(!scoped.covers("acme/api"));
         assert!(!Settings::default().covers("acme/web"));
+    }
+
+    #[test]
+    fn ticket_days_default_to_two_and_stay_in_range() {
+        let old: Settings = serde_json::from_str(r#"{"enabled":true,"tickets":"off"}"#).unwrap();
+        assert_eq!(old.ticket_after_days, 2);
+        assert!(old.validate().is_ok());
+        for bad in [0, 31] {
+            let s = Settings {
+                ticket_after_days: bad,
+                ..Default::default()
+            };
+            assert!(s.validate().is_err(), "{bad}");
+        }
+        let s = Settings {
+            ticket_after_days: 99,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(s.ticket_after_days, 30);
+        let s = Settings {
+            ticket_after_days: 7,
+            ..Default::default()
+        };
+        assert!(s.validate().is_ok());
+        assert_eq!(s.sanitized().ticket_after_days, 7);
     }
 }

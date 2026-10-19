@@ -72,6 +72,17 @@ fn classify_check_runs(runs: &[serde_json::Value]) -> (bool, Vec<String>) {
     (pending, failing)
 }
 
+/// What a quarantine check does to a failing verdict: only quarantined tests
+/// failed → green; a test report still being read → pending (keep waiting).
+fn with_quarantine(ci: Ci, gate: &crate::passes::quarantine::Gate) -> Ci {
+    use crate::passes::quarantine::Gate;
+    match (ci, gate) {
+        (Ci::Failing(_), Gate::OnlyQuarantined(_)) => Ci::Green,
+        (Ci::Failing(_), Gate::Waiting) => Ci::Pending,
+        (ci, _) => ci,
+    }
+}
+
 /// Combine GitHub Actions check-runs + legacy commit statuses into one verdict.
 /// No checks at all ⇒ Green (nothing to gate on).
 async fn ci_state(github: &GitHubClient, owner: &str, repo: &str, sha: &str) -> Ci {
@@ -344,7 +355,27 @@ pub async fn run(
     }
 
     // Gate 3 — all CI green (now includes the deploy CI the label triggered).
-    match ci_state(&github, owner, repo, &msg.head_sha).await {
+    // Failures made only of quarantined tests don't hold the merge back.
+    let mut quarantined: Option<Vec<String>> = None;
+    let ci = match ci_state(&github, owner, repo, &msg.head_sha).await {
+        Ci::Failing(names) => {
+            let gate = crate::passes::quarantine::gate(
+                state,
+                &github,
+                &msg.team_id,
+                owner,
+                repo,
+                &msg.head_sha,
+            )
+            .await;
+            if let crate::passes::quarantine::Gate::OnlyQuarantined(tests) = &gate {
+                quarantined = Some(tests.clone());
+            }
+            with_quarantine(Ci::Failing(names), &gate)
+        }
+        other => other,
+    };
+    match ci {
         Ci::Failing(names) => {
             // Post the abort notice at most once per head (the gate re-arms on many
             // events). CI is only reported failing once every check is terminal, so
@@ -393,6 +424,10 @@ pub async fn run(
                         &msg.base_branch,
                     )
                     .await;
+                    let mut lines = lines;
+                    if let Some(tests) = &quarantined {
+                        lines.push(crate::passes::quarantine::passing_line(tests));
+                    }
                     let _ = github
                         .create_issue_comment(
                             owner,
@@ -544,8 +579,25 @@ async fn send(state: &WorkerState, msg: &AwaitMergeMessage, attempts: u32, delay
 
 #[cfg(test)]
 mod ci_tests {
-    use super::classify_check_runs;
+    use super::{classify_check_runs, with_quarantine, Ci};
+    use crate::passes::quarantine::Gate;
     use serde_json::json;
+
+    #[test]
+    fn quarantined_only_failures_do_not_hold_back_the_merge() {
+        let failing = || Ci::Failing("e2e".into());
+        let only = Gate::OnlyQuarantined(vec!["a".into()]);
+        assert!(matches!(with_quarantine(failing(), &only), Ci::Green));
+        assert!(matches!(
+            with_quarantine(failing(), &Gate::Waiting),
+            Ci::Pending
+        ));
+        assert!(matches!(
+            with_quarantine(failing(), &Gate::Real),
+            Ci::Failing(_)
+        ));
+        assert!(matches!(with_quarantine(Ci::Pending, &only), Ci::Pending));
+    }
 
     fn cr(name: &str, status: &str, conclusion: &str, started_at: &str) -> serde_json::Value {
         json!({"name": name, "status": status, "conclusion": conclusion, "started_at": started_at})

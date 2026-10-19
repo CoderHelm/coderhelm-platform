@@ -185,12 +185,14 @@ pub async fn put_settings(
     Json(body): Json<Settings>,
 ) -> Reply {
     admin(&claims)?;
+    body.validate()
+        .map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
     let st = store(&state)?;
     let s = body.sanitized();
     st.put_settings(&claims.team_id, &s)
         .await
         .map_err(|e| internal("e2e save settings", e))?;
-    info!(team = %claims.team_id, enabled = s.enabled, "E2E settings saved");
+    info!(team = %claims.team_id, enabled = s.enabled, ticket_after_days = s.ticket_after_days, "E2E settings saved");
     Ok(Json(json!(s)))
 }
 
@@ -1069,6 +1071,16 @@ fn regex_escape(s: &str) -> String {
         .collect()
 }
 
+/// A test's title as Playwright's `--grep` sees it. Coderhelm keeps titles as
+/// `describe › title`; Playwright matches the title path joined by spaces.
+fn grep_pattern(title: &str) -> String {
+    title
+        .split(" › ")
+        .map(regex_escape)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// GET /webhooks/ci/tests/quarantine — the tests quarantined for the calling
 /// repo, so a CI step can keep their failures from failing the build.
 pub async fn ci_quarantine(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Reply {
@@ -1091,7 +1103,7 @@ pub async fn ci_quarantine(State(state): State<Arc<AppState>>, headers: HeaderMa
         tests
             .iter()
             .filter_map(|t| t["title"].as_str())
-            .map(regex_escape)
+            .map(grep_pattern)
             .collect::<Vec<_>>()
             .join("|")
     };
@@ -1116,6 +1128,15 @@ mod unit {
             regex_escape("pays (card) $5.00?"),
             "pays \\(card\\) \\$5\\.00\\?"
         );
+    }
+
+    #[test]
+    fn grep_patterns_match_playwrights_title_path() {
+        assert_eq!(
+            grep_pattern("checkout › pays (card)"),
+            "checkout pays \\(card\\)"
+        );
+        assert_eq!(grep_pattern("login"), "login");
     }
 
     #[tokio::test]
