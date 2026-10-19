@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Bumped when the analysis format changes, so every item is checked again.
-pub const FORMAT: u32 = 5;
+pub const FORMAT: u32 = 6;
 /// Longest translated text kept.
 pub const MAX_TRANSLATED_CHARS: usize = 64_000;
 const MAX_STEPS: usize = 40;
@@ -101,6 +101,10 @@ pub struct Inventory {
     /// Commands Coderhelm does another way (only those whose tools it has).
     #[serde(default)]
     pub translations: Vec<Translation>,
+    /// Monitoring, docs and pipeline connections the team can set up in Data
+    /// sources but hasn't, by `id: what it reads`.
+    #[serde(default)]
+    pub connections: Vec<String>,
     pub never: Vec<String>,
 }
 
@@ -113,6 +117,7 @@ impl Inventory {
             s.tools.sort();
         }
         self.connectable.sort();
+        self.connections.sort();
         self.sources
             .sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
         self.team_tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -196,6 +201,10 @@ pub struct Requirement {
     /// For `plugins`: the MCP server it means, by inventory id, or empty.
     #[serde(default)]
     pub server: String,
+    /// For `data_sources`: the monitoring, docs or pipeline connection it
+    /// means (`newrelic`, `confluence`, `metrics`, `airflow`), or empty.
+    #[serde(default)]
+    pub connection: String,
     /// Worked out here, never by the model: "connect" (offer a link to
     /// connect it), "credentials" (switched on, its credentials missing) or
     /// "none" (nothing to connect: the integration is already there and
@@ -228,6 +237,9 @@ pub struct Need {
     /// As on [`Requirement::action`].
     #[serde(default)]
     pub action: String,
+    /// As on [`Requirement::connection`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub connection: String,
     /// "missing", or "blocked" for a write no connected tool can make.
     pub status: String,
     /// Steps it holds up.
@@ -314,7 +326,7 @@ pub fn output_schema() -> Value {
                             "items": {
                                 "type": "object",
                                 "additionalProperties": false,
-                                "required": ["asks", "kind", "status", "uses", "write", "needs", "fix", "connect", "server"],
+                                "required": ["asks", "kind", "status", "uses", "write", "needs", "fix", "connect", "server", "connection"],
                                 "properties": {
                                     "asks": { "type": "string" },
                                     "kind": enum_of(&["tool", "command", "data", "path", "other"]),
@@ -324,7 +336,8 @@ pub fn output_schema() -> Value {
                                     "needs": { "type": "string" },
                                     "fix": { "type": "string" },
                                     "connect": enum_of(&["plugins", "data_sources", "github", "none"]),
-                                    "server": { "type": "string" }
+                                    "server": { "type": "string" },
+                                    "connection": enum_of(&["", "newrelic", "confluence", "metrics", "airflow"])
                                 }
                             }
                         }
@@ -365,7 +378,10 @@ short name of what's missing (a product name like the monitoring tool's name, or
 `fix` one plain line on what to connect in Coderhelm or why it can't run there, `connect` where \
 that's done: plugins (MCP servers), data_sources (APIs, databases, logs), github, or none. For \
 plugins, `server` is the id of the MCP server it means from the inventory's servers or \
-connectable list, or empty when none fits. Only genuinely impossible things stay missing: running \
+connectable list, or empty when none fits. When it is one of the inventory's `connections` (New \
+Relic, Confluence, CloudWatch metrics, Airflow on MWAA: these are Coderhelm data sources, not MCP \
+servers), set `connect` to data_sources and `connection` to its id; otherwise `connection` is \
+empty. Only genuinely impossible things stay missing: running \
 arbitrary shell commands, a person's local files, systems not connected.
 - blocked: the step writes to an outside system (a wiki page, a ticket, an incident, a message) \
 and no connected tool can write there. Set `write` to outside. Writing files in the repository \
@@ -650,12 +666,33 @@ fn check(q: Requirement, inv: &Inventory) -> Requirement {
     if q.status == "blocked" && q.write == "none" {
         q.write = "outside".into();
     }
+    if crate::live::connectors::ConnKind::parse(&q.connection).is_none() {
+        q.connection.clear();
+    }
     if matches!(q.status.as_str(), "available" | "translated") {
         q.needs.clear();
         q.fix.clear();
         q.connect = "none".into();
         q.server.clear();
+        q.connection.clear();
         q.action = "none".into();
+        return q;
+    }
+    if let Some(kind) = crate::live::connectors::ConnKind::parse(&q.connection) {
+        // A monitoring, docs or pipeline connection: set up on the Data
+        // sources page, never an MCP server.
+        let connected = inv.sources.iter().any(|s| s.kind == kind.as_str());
+        q.connect = "data_sources".into();
+        q.server.clear();
+        q.action = "connect".into();
+        q.fix = match (connected, q.status.as_str()) {
+            (true, "blocked") => format!(
+                "Turn on {} writes and list the page in Data sources, or leave this step to a person.",
+                kind.label()
+            ),
+            (true, _) => format!("{} is connected; check its settings in Data sources.", kind.label()),
+            (false, _) => format!("Connect {} in Data sources.", kind.label()),
+        };
         return q;
     }
     let server = inv
@@ -713,6 +750,7 @@ fn needs(steps: &[Step]) -> Vec<Need> {
                 fix: q.fix.clone(),
                 connect: q.connect.clone(),
                 action: q.action.clone(),
+                connection: q.connection.clone(),
                 status: q.status.clone(),
                 steps: 0,
             });
@@ -821,6 +859,7 @@ mod tests {
                 writes: vec!["wiki_append".into()],
             }],
             team_tools: vec![],
+            connections: vec!["newrelic: New Relic".into()],
             translations: vec![Translation {
                 commands: "grep -r".into(),
                 uses: vec!["read_file".into()],
@@ -836,6 +875,37 @@ mod tests {
             "asks": asks, "kind": "tool", "status": status, "uses": uses,
             "write": write, "needs": needs, "fix": "", "connect": "plugins"
         })
+    }
+
+    fn conn_req(status: &str, connection: &str, write: &str) -> Requirement {
+        serde_json::from_value(json!({
+            "asks": "Read the lessons page", "kind": "tool", "status": status, "uses": [],
+            "write": write, "needs": "Confluence", "fix": "Connect an MCP server",
+            "connect": "plugins", "server": "", "connection": connection
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_monitoring_or_docs_connection_links_to_data_sources() {
+        let q = check(conn_req("missing", "confluence", "none"), &inv());
+        assert_eq!(q.connect, "data_sources");
+        assert_eq!(q.connection, "confluence");
+        assert_eq!(q.action, "connect");
+        assert_eq!(q.fix, "Connect Confluence in Data sources.");
+        let mut connected = inv();
+        connected.sources.push(Source {
+            kind: "confluence".into(),
+            name: "Confluence".into(),
+            detail: String::new(),
+            tools: vec!["confluence_page".into()],
+            writes: vec![],
+        });
+        let q = check(conn_req("blocked", "confluence", "outside"), &connected);
+        assert!(q.fix.starts_with("Turn on Confluence writes"), "{}", q.fix);
+        let q = check(conn_req("missing", "jira", "none"), &inv());
+        assert_eq!(q.connection, "", "not a connection id");
+        assert_eq!(q.connect, "plugins");
     }
 
     #[test]

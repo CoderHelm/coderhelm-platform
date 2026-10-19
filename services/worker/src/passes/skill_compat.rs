@@ -513,6 +513,7 @@ pub async fn inventory(state: &WorkerState, team_id: &str) -> Inventory {
         sources,
         team_tools,
         translations,
+        connections: super::ops_tools::connectable(state, team_id).await,
         never: NEVER.iter().map(|s| s.to_string()).collect(),
     }
     .sorted()

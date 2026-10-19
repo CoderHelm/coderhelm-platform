@@ -543,6 +543,36 @@ impl OpsTools {
     }
 }
 
+/// The connections the team can set up in Data sources but hasn't turned on
+/// and made ready, for the skill check (`id: what it reads`).
+pub async fn connectable(state: &WorkerState, team_id: &str) -> Vec<String> {
+    let ready: Vec<ConnKind> =
+        connectors::list(&state.dynamo, &state.config.settings_table_name, team_id)
+            .await
+            .map(|l| {
+                l.into_iter()
+                    .filter(|c| c.enabled && c.status == "ready")
+                    .map(|c| c.kind())
+                    .collect()
+            })
+            .unwrap_or_default();
+    ConnKind::ALL
+        .into_iter()
+        .filter(|k| !ready.contains(k))
+        .map(|k| format!("{}: {}", k.as_str(), connectable_line(k)))
+        .collect()
+}
+
+/// What a connection would give, before it's set up.
+pub fn connectable_line(k: ConnKind) -> &'static str {
+    match k {
+        ConnKind::NewRelic => "New Relic: NRQL, entities, change events and deployment markers, deployment impact, response time, error rate and throughput",
+        ConnKind::Confluence => "Confluence: search and read pages; optionally append to listed pages",
+        ConnKind::Metrics => "CloudWatch metrics: ECS, RDS, Lambda, CloudFront, load balancers, SQS, DynamoDB",
+        ConnKind::Airflow => "Airflow on MWAA: DAGs, DAG runs, task instances, task logs, import errors",
+    }
+}
+
 /// The team's connections as the skill check sees them: one source per
 /// connection that's on and ready, and one for `aws_identity` when Coderhelm
 /// uses any AWS role for the team.
