@@ -1386,8 +1386,10 @@ impl SkillStore<'_> {
 
     /// Keeps one item's check: the full check as JSON, its short form for
     /// lists, the translated text, and what it was checked against. Only
-    /// written while the item still has the text that was checked. With
-    /// `error`, keeps why the check failed and leaves the last good check.
+    /// written while the item still has the text that was checked. With an
+    /// error, keeps why the check failed; the last check stays unless
+    /// `drop_old` (it was of other text or another inventory, so showing it
+    /// would mislead).
     #[allow(clippy::too_many_arguments)]
     pub async fn put_compat(
         &self,
@@ -1395,7 +1397,7 @@ impl SkillStore<'_> {
         path: &str,
         hash: &str,
         fingerprint: &str,
-        result: Result<(&crate::skill_compat::Analysis, &str), &str>,
+        result: Result<(&crate::skill_compat::Analysis, &str), (&str, bool)>,
     ) -> Result<bool, String> {
         let mut req = self
             .dynamo
@@ -1427,10 +1429,13 @@ impl SkillStore<'_> {
                 )
                 .expression_attribute_values(":t", av(translated))
                 .expression_attribute_values(":e", av("")),
-            Err(error) => req
-                .update_expression(
-                    "SET compat_error = :e, compat_hash = :h, compat_fp = :fp, compat_at = :at",
-                )
+            Err((error, drop_old)) => req
+                .update_expression(if drop_old {
+                    "SET compat_error = :e, compat_hash = :h, compat_fp = :fp, compat_at = :at \
+                     REMOVE compat, compat_status, compat_summary, compat_needs, translated"
+                } else {
+                    "SET compat_error = :e, compat_hash = :h, compat_fp = :fp, compat_at = :at"
+                })
                 .expression_attribute_values(":e", av(crate::truncate_str(error, 500))),
         };
         match req.send().await {
