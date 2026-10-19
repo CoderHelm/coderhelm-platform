@@ -5,12 +5,15 @@
 //! Runs after every sync and every sweep, and when an admin asks for a
 //! re-check. An item is sent to the model only when its text or the team's
 //! inventory changed since its last check, or when an admin asked: one call
-//! per item, on the light model, counted as `skill_sync`.
+//! per item, on the light model, counted as `skill_sync`. A check of the same
+//! text against the same tools is held to the last one
+//! (`skill_compat::stabilize`), so a re-check never flips a step on the
+//! model's whim.
 
 use std::time::{Duration, Instant};
 
 use common::skill_compat::{self, Analysis, Inventory, Server, Source, Tool, Translation};
-use common::skills::{SkillMeta, SkillStore};
+use common::skills::{Queued, SkillMeta, SkillStore};
 use futures::StreamExt;
 use serde_json::Value;
 use tracing::{info, warn};
@@ -288,19 +291,41 @@ pub async fn check_item(
     Ok((a, translated))
 }
 
+/// A new check of `item`, held to its last check when that was of the same
+/// text (see `skill_compat::stabilize`).
+pub fn hold_to_last(
+    item: &Queued,
+    inv: &Inventory,
+    (a, translated): (Analysis, String),
+) -> (Analysis, String) {
+    let (m, _, kept) = item;
+    match kept {
+        Some((last, last_translated)) if m.compat.hash == m.hash => {
+            let tools_changed = !skill_compat::same_tools(inv, &m.compat.fingerprint, last.format);
+            let last = skill_compat::Last {
+                analysis: last,
+                translated: last_translated,
+                tools_changed,
+            };
+            skill_compat::stabilize(a, translated, &last, inv)
+        }
+        _ => (a, translated),
+    }
+}
+
 /// The items to check: those whose text or inventory changed since their
 /// last check, or every one asked for when `force`. `only` limits it to one
 /// path.
 pub fn to_check<'a>(
-    items: &'a [(SkillMeta, String)],
+    items: &'a [Queued],
     fingerprint: &str,
     only: &str,
     force: bool,
-) -> Vec<&'a (SkillMeta, String)> {
+) -> Vec<&'a Queued> {
     items
         .iter()
-        .filter(|(m, _)| only.is_empty() || m.path == only)
-        .filter(|(m, _)| {
+        .filter(|(m, _, _)| only.is_empty() || m.path == only)
+        .filter(|(m, _, _)| {
             skill_compat::needs_check(
                 &m.hash,
                 fingerprint,
@@ -370,14 +395,17 @@ async fn run_inner(state: &WorkerState, team_id: &str, repo: &str, only: &str, f
     let started = Instant::now();
     let total = todo.len();
     let results: Vec<Outcome> = futures::stream::iter(todo)
-        .map(|(m, body)| {
+        .map(|item| {
+            let (m, body, _) = item;
             let (checker, inv) = (&checker, &inv);
             let outdated = m.compat.hash != m.hash || m.compat.fingerprint != fp;
             async move {
                 if started.elapsed() > BUDGET {
                     return (m.path.clone(), m.hash.clone(), outdated, None);
                 }
-                let r = check_item(checker, inv, m, body).await;
+                let r = check_item(checker, inv, m, body)
+                    .await
+                    .map(|done| hold_to_last(item, inv, done));
                 (m.path.clone(), m.hash.clone(), outdated, Some(r))
             }
         })
@@ -903,15 +931,13 @@ mod tests {
 
     #[test]
     fn only_changed_items_are_checked_unless_forced() {
-        let items = vec![
-            (meta("a", "h1", "h1", "fp"), String::new()),
-            (meta("b", "h2", "old", "fp"), String::new()),
-            (meta("c", "h3", "h3", "old-fp"), String::new()),
-            (meta("d", "h4", "", ""), String::new()),
+        let items: Vec<Queued> = vec![
+            (meta("a", "h1", "h1", "fp"), String::new(), None),
+            (meta("b", "h2", "old", "fp"), String::new(), None),
+            (meta("c", "h3", "h3", "old-fp"), String::new(), None),
+            (meta("d", "h4", "", ""), String::new(), None),
         ];
-        let paths = |v: Vec<&(SkillMeta, String)>| {
-            v.iter().map(|(m, _)| m.path.clone()).collect::<Vec<_>>()
-        };
+        let paths = |v: Vec<&Queued>| v.iter().map(|(m, _, _)| m.path.clone()).collect::<Vec<_>>();
         assert_eq!(paths(to_check(&items, "fp", "", false)), ["b", "c", "d"]);
         assert_eq!(
             paths(to_check(&items, "fp", "", true)),
@@ -967,5 +993,260 @@ mod tests {
     fn server_names_read_well() {
         assert_eq!(display_name("sentry"), "Sentry");
         assert_eq!(display_name(""), "");
+    }
+
+    /// A model that answers the same item differently on every call, in
+    /// the borderline ways a real one does: it leaves talking to the user
+    /// out, files it as a person, or calls it a missing tool; it names the
+    /// history read by its command but calls it missing or picks the wrong
+    /// tool; it calls a vague "shell" missing one time and translated the
+    /// next; it marks a laptop path readable.
+    struct Wavering(std::sync::atomic::AtomicUsize);
+
+    fn wavering_answer(n: usize) -> Value {
+        let q = |asks: &str, kind: &str, status: &str, uses: &[&str], needs: &str| {
+            json!({ "asks": asks, "kind": kind, "status": status, "uses": uses, "write": "none",
+                    "needs": needs, "fix": if needs.is_empty() { "" } else { "Not here." },
+                    "connect": "none", "server": "", "connection": "" })
+        };
+        let step = |title: &str, reqs: Vec<Value>| json!({ "title": title, "does": format!("{title} (answer {n})"), "dropped": false, "requirements": reqs });
+        let v = n % 3;
+        let ask_user = match v {
+            0 => vec![],
+            1 => vec![q(
+                "ask the user which version",
+                "person",
+                "available",
+                &[],
+                "",
+            )],
+            _ => vec![q("ask the user", "other", "missing", &[], "User input")],
+        };
+        let commit = match v {
+            0 => vec![q(
+                "suggest a git commit message",
+                "person",
+                "available",
+                &[],
+                "",
+            )],
+            1 => vec![q("git commit", "command", "missing", &[], "Shell access")],
+            _ => vec![q("suggest a commit", "other", "missing", &[], "Git")],
+        };
+        let history = match v {
+            0 => vec![q(
+                "git log --oneline",
+                "command",
+                "translated",
+                &["github_history"],
+                "",
+            )],
+            1 => vec![q(
+                "git log --oneline",
+                "command",
+                "missing",
+                &[],
+                "Shell access",
+            )],
+            _ => vec![q(
+                "`git log --oneline`",
+                "command",
+                "translated",
+                &["read_file"],
+                "",
+            )],
+        };
+        let shell = match v {
+            0 => vec![q("shell", "command", "missing", &[], "Shell access")],
+            1 => vec![q("shell", "command", "translated", &["search_code"], "")],
+            _ => vec![q("shell", "command", "missing", &[], "A terminal")],
+        };
+        let notes = match v {
+            0 => vec![q(
+                "~/notes/release.md",
+                "path",
+                "missing",
+                &[],
+                "Local files",
+            )],
+            1 => vec![q(
+                "~/notes/release.md",
+                "path",
+                "available",
+                &["read_file"],
+                "",
+            )],
+            _ => vec![q(
+                "~/notes/release.md",
+                "path",
+                "missing",
+                &[],
+                "The laptop",
+            )],
+        };
+        json!({
+            "steps": [
+                step("Ask the user", ask_user),
+                step("Suggest a commit", commit),
+                step("Read the history", history),
+                step("Count merges", shell),
+                step("Read the release notes", notes),
+            ],
+            "translated": format!("1. Ask the user which version.\n2. Read the history with github_history.\n(answer {n})")
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl Checker for Wavering {
+        fn model(&self) -> &str {
+            "fake-light"
+        }
+        async fn check(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Value,
+            _: usize,
+        ) -> (Result<Value, String>, TokenUsage) {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let usage = TokenUsage {
+                input_tokens: 10 + n as u64,
+                output_tokens: 5,
+                ..Default::default()
+            };
+            (Ok(wavering_answer(n)), usage)
+        }
+    }
+
+    /// What's kept on an item, without what differs on every call anyway
+    /// (tokens, cost, time).
+    fn stored(a: &Analysis, translated: &str) -> String {
+        let mut a = a.clone();
+        (a.input_tokens, a.output_tokens, a.cost_usd, a.ms) = (0, 0, 0.0, 0);
+        format!("{}\n{translated}", serde_json::to_string(&a).unwrap())
+    }
+
+    /// Checks `item` and keeps the result on it, as a run does.
+    async fn check_and_keep(checker: &dyn Checker, inv: &Inventory, item: &mut Queued) -> String {
+        let (m, body, _) = item.clone();
+        let done = check_item(checker, inv, &m, &body).await.unwrap();
+        let (a, translated) = hold_to_last(item, inv, done);
+        item.0.compat.hash = m.hash.clone();
+        item.0.compat.fingerprint = inv.fingerprint();
+        let out = stored(&a, &translated);
+        item.2 = Some((a, translated));
+        out
+    }
+
+    const BODY: &str = "Bump the version: ask the user which version, read the history, count merges with a shell, read ~/notes/release.md, suggest a commit.";
+
+    #[tokio::test]
+    async fn five_checks_of_the_same_item_keep_the_same_result() {
+        let i = inv();
+        let fake = Wavering(Default::default());
+        // Checked under the last format, then re-checked five times after
+        // the format bump with the text and tools unchanged.
+        let mut item: Queued = (
+            meta("skills/bump/SKILL.md", "h1", "", ""),
+            BODY.into(),
+            None,
+        );
+        let first = check_and_keep(&fake, &i, &mut item).await;
+        if let Some((a, _)) = item.2.as_mut() {
+            a.format = skill_compat::FORMAT - 1;
+        }
+        item.0.compat.fingerprint = i.fingerprint_at(skill_compat::FORMAT - 1);
+        let mut runs = Vec::new();
+        for _ in 0..5 {
+            runs.push(check_and_keep(&fake, &i, &mut item).await);
+        }
+        for (n, r) in runs.iter().enumerate() {
+            assert_eq!(r, &first, "re-check {} differs from the first check", n + 1);
+        }
+        let (a, _) = item.2.as_ref().unwrap();
+        let st: Vec<(&str, &str)> = a
+            .steps
+            .iter()
+            .map(|s| (s.title.as_str(), s.status.as_str()))
+            .collect();
+        assert_eq!(
+            st,
+            [
+                ("Ask the user", "available"),
+                ("Suggest a commit", "available"),
+                ("Read the history", "translated"),
+                ("Count merges", "missing"),
+                ("Read the release notes", "missing"),
+            ]
+        );
+        assert!(a.notes.is_empty(), "nothing flipped: {:?}", a.notes);
+        assert_eq!(
+            fake.0.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "every check asked the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_the_inventory_settles_is_the_same_on_every_answer() {
+        let i = inv();
+        let fake = Wavering(Default::default());
+        let m = meta("skills/bump/SKILL.md", "h1", "", "");
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let (a, _) = check_item(&fake, &i, &m, BODY).await.unwrap();
+            let settled: Vec<(String, String, Vec<String>)> = a.steps[2..]
+                .iter()
+                .filter(|s| s.title != "Count merges")
+                .map(|s| {
+                    (
+                        s.title.clone(),
+                        s.status.clone(),
+                        s.requirements[0].uses.clone(),
+                    )
+                })
+                .collect();
+            seen.push(settled);
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+        assert_eq!(seen[0][0].2, ["github_history"]);
+    }
+
+    #[tokio::test]
+    async fn a_bad_first_check_is_corrected_once_per_step_with_a_note_then_stays() {
+        let i = inv();
+        // Starts on the answer that calls asking the user a missing tool.
+        let fake = Wavering(std::sync::atomic::AtomicUsize::new(2));
+        let mut item: Queued = (
+            meta("skills/bump/SKILL.md", "h1", "", ""),
+            BODY.into(),
+            None,
+        );
+        check_and_keep(&fake, &i, &mut item).await;
+        assert_eq!(item.2.as_ref().unwrap().0.steps[0].status, "missing");
+        // The next answer files the commit suggestion as talking to the
+        // person, which the inventory settles; asking the user it leaves
+        // out (the model's judgment), so that step is held.
+        check_and_keep(&fake, &i, &mut item).await;
+        let (a, _) = item.2.as_ref().unwrap();
+        assert_eq!(
+            (a.steps[0].status.as_str(), a.steps[1].status.as_str()),
+            ("missing", "available")
+        );
+        // The one after files asking the user as talking to the person too.
+        let fixed = check_and_keep(&fake, &i, &mut item).await;
+        let (a, _) = item.2.as_ref().unwrap();
+        assert_eq!(a.steps[0].status, "available");
+        assert_eq!(a.notes.len(), 2, "{:?}", a.notes);
+        assert!(
+            a.notes
+                .iter()
+                .any(|n| n.starts_with("Step \"Ask the user\" changed from missing to available")),
+            "{:?}",
+            a.notes
+        );
+        for _ in 0..4 {
+            assert_eq!(check_and_keep(&fake, &i, &mut item).await, fixed);
+        }
     }
 }

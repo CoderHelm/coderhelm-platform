@@ -74,6 +74,21 @@ struct MessagesRequest {
     /// used: tools stay declared (the history has tool calls) but can't be called.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    /// Sent only where the model takes it: always-thinking models refuse any
+    /// sampling value but the default (see [`deterministic_temperature`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+/// Temperature 0 for a call that should answer the same way every time, on
+/// models that accept it. Always-thinking models (Opus 5.x, Sonnet 5.x,
+/// Fable) return a 400 for any non-default sampling value, so they get none
+/// and their answer is held steady by the checks after it instead.
+fn deterministic_temperature(model_id: &str) -> Option<f32> {
+    match ModelFamily::of(model_id) {
+        ModelFamily::Legacy => Some(0.0),
+        ModelFamily::AlwaysThinking => None,
+    }
 }
 
 /// How a model must be called. `AlwaysThinking` models (Opus 5.x, Sonnet 5.x,
@@ -345,6 +360,7 @@ pub async fn converse_simple(
         context_management: None,
         fallbacks: None,
         tool_choice: None,
+        temperature: None,
     };
     apply_model_family(&mut request, None, false);
 
@@ -393,8 +409,10 @@ pub async fn converse_json(
         context_management: None,
         fallbacks: None,
         tool_choice: None,
+        temperature: None,
     };
     apply_model_family(&mut request, Some(effort), false);
+    request.temperature = deterministic_temperature(model_id);
     if constrained {
         request.output_config = Some(json_output_config(request.output_config.take(), schema));
     } else {
@@ -596,6 +614,7 @@ pub async fn converse_tool_loop(
             context_management: None,
             fallbacks: None,
             tool_choice: answer_now.then(|| json!({"type": "none"})),
+            temperature: None,
         };
         apply_model_family(&mut request, effort, true);
 
@@ -924,7 +943,25 @@ mod tests {
             context_management: None,
             fallbacks: None,
             tool_choice: None,
+            temperature: None,
         }
+    }
+
+    #[test]
+    fn structured_answers_ask_for_temperature_zero_only_where_the_model_takes_it() {
+        assert_eq!(deterministic_temperature("claude-haiku-4-5"), Some(0.0));
+        assert_eq!(deterministic_temperature("claude-sonnet-4-6"), Some(0.0));
+        assert_eq!(deterministic_temperature("claude-sonnet-5-5"), None);
+        assert_eq!(deterministic_temperature("claude-opus-5-5"), None);
+        let mut r = request("claude-haiku-4-5");
+        r.temperature = deterministic_temperature(&r.model);
+        assert_eq!(serde_json::to_value(&r).unwrap()["temperature"], 0.0);
+        let mut r = request("claude-sonnet-5-5");
+        r.temperature = deterministic_temperature(&r.model);
+        assert!(serde_json::to_value(&r)
+            .unwrap()
+            .get("temperature")
+            .is_none());
     }
 
     #[test]

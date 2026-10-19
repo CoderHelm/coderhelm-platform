@@ -718,6 +718,14 @@ pub struct SkillMeta {
     pub suggestion: Suggestion,
 }
 
+/// An item waiting for a check: what's kept on it, its text, and its last
+/// check with the translated text, when it has one.
+pub type Queued = (
+    SkillMeta,
+    String,
+    Option<(crate::skill_compat::Analysis, String)>,
+);
+
 /// The short form of an item's last check, for lists. The full check and
 /// the translated text are read with the item.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1426,12 +1434,18 @@ impl SkillStore<'_> {
 
     /// Every item of `repo` with what a check reads: its text, its files and
     /// what it was last checked against.
-    pub async fn compat_queue(&self, repo: &str) -> Result<Vec<(SkillMeta, String)>, String> {
+    pub async fn compat_queue(&self, repo: &str) -> Result<Vec<Queued>, String> {
         Ok(self
             .query(&format!("{SKILL}{repo}#"), None)
             .await?
             .iter()
-            .filter_map(|i| SkillMeta::from_item(i).map(|m| (m, s(i, "body"))))
+            .filter_map(|i| {
+                let m = SkillMeta::from_item(i)?;
+                let kept = serde_json::from_str::<crate::skill_compat::Analysis>(&s(i, "compat"))
+                    .ok()
+                    .map(|a| (a, s(i, "translated")));
+                Some((m, s(i, "body"), kept))
+            })
             .collect())
     }
 
