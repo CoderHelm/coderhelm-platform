@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Bumped when the analysis format changes, so every item is checked again.
-pub const FORMAT: u32 = 4;
+pub const FORMAT: u32 = 5;
 /// Longest translated text kept.
 pub const MAX_TRANSLATED_CHARS: usize = 64_000;
 const MAX_STEPS: usize = 40;
@@ -472,7 +472,17 @@ pub fn finish(
         notes.push(format!("{empty} empty step{} left out.", plural(empty)));
     }
     let mut translated = crate::truncate_str(r.translated.trim(), MAX_TRANSLATED_CHARS).to_string();
-    if translated.chars().count() < (source_chars / 4).max(20) {
+    let thin = translated.chars().count() < (source_chars / 4).max(20);
+    // A placeholder answer: no translation, and no step says what it does
+    // or relies on anything. That's the shape of a stub, not a check.
+    if thin
+        && steps
+            .iter()
+            .all(|s| !has_words(&s.does) && s.requirements.is_empty())
+    {
+        return Err("The answer was a placeholder, not a check.".into());
+    }
+    if thin {
         translated.clear();
         notes.push("The translated version came back nearly empty, so none is kept. Re-check to try again.".into());
     }
@@ -955,6 +965,19 @@ mod tests {
             ]
         );
         assert!(!translated.is_empty());
+    }
+
+    #[test]
+    fn a_placeholder_answer_is_unusable() {
+        for title in ["placeholder", "Step one"] {
+            let raw = json!({ "steps": [step(title, "", vec![])], "translated": "" });
+            assert!(finish(&raw, &inv(), 1000)
+                .unwrap_err()
+                .contains("placeholder"));
+        }
+        // A real step with a thin translation is kept, with a note.
+        let raw = json!({ "steps": [step("Read it", "Read the file.", vec![])], "translated": "" });
+        assert!(finish(&raw, &inv(), 1000).is_ok());
     }
 
     #[test]
