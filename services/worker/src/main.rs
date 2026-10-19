@@ -275,6 +275,18 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
                     error!("E2E action failed: {e:?}");
                 }
             }
+            models::WorkerMessage::WeeklySummary => {
+                info!("Weekly summary emails");
+                if let Err(e) = passes::weekly_summary::run(&state).await {
+                    error!("Weekly summary failed: {e:?}");
+                }
+            }
+            models::WorkerMessage::WeeklySummaryTest(msg) => {
+                info!(team_id = %msg.team_id, "Weekly summary test email");
+                if let Err(e) = passes::weekly_summary::run_test(&state, msg).await {
+                    error!("Weekly summary test failed: {e:?}");
+                }
+            }
             models::WorkerMessage::GraphIndex(msg) => {
                 info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), incremental = msg.changed_files.is_some(), "Code-graph index pass");
                 if let Err(e) = passes::code_graph::run(&state, msg).await {

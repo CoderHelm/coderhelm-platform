@@ -17,6 +17,7 @@ import * as ses from "aws-cdk-lib/aws-ses";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import { Construct } from "constructs";
+import { WEEKLY_SUMMARY_ENABLED } from "./flags";
 
 interface ApiStackProps extends cdk.StackProps {
   stage: string;
@@ -257,6 +258,23 @@ export class ApiStack extends cdk.Stack {
         new targets.SqsQueue(this.ticketQueue, {
           message: events.RuleTargetInput.fromObject({
             type: "review_reminder",
+          }),
+        }),
+      ],
+    });
+
+    // Weekly summary email: Mondays 13:00 UTC, one constant message on the
+    // ticket queue; the worker sends each team's summary to members who have
+    // it on. Ships disabled (see flags.ts) until a test email is approved.
+    new events.Rule(this, "WeeklySummarySchedule", {
+      ruleName: `${prefix}-weekly-summary`,
+      description: "Weekly summary email (Mondays 13:00 UTC)",
+      enabled: WEEKLY_SUMMARY_ENABLED,
+      schedule: events.Schedule.cron({ minute: "0", hour: "13", weekDay: "MON" }),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "weekly_summary",
           }),
         }),
       ],
@@ -536,6 +554,14 @@ export class ApiStack extends cdk.Stack {
     // Auth routes
     httpApi.addRoutes({
       path: "/auth/{proxy+}",
+      methods: [apigatewayv2.HttpMethod.GET, apigatewayv2.HttpMethod.POST],
+      integration: lambdaIntegration,
+    });
+
+    // Unsubscribe links in emails (public; a signed token is the credential).
+    // GET is the link, POST is a mail app's one-click unsubscribe (RFC 8058).
+    httpApi.addRoutes({
+      path: "/email/{proxy+}",
       methods: [apigatewayv2.HttpMethod.GET, apigatewayv2.HttpMethod.POST],
       integration: lambdaIntegration,
     });

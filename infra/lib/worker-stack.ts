@@ -13,6 +13,7 @@ import * as eventsources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as codebuild from "aws-cdk-lib/aws-codebuild";
 import { Construct } from "constructs";
 import * as path from "path";
+import { WEEKLY_SUMMARY_ENABLED } from "./flags";
 
 interface WorkerStackProps extends cdk.StackProps {
   stage: string;
@@ -100,6 +101,8 @@ export class WorkerStack extends cdk.Stack {
         LIGHT_MODEL_ID: process.env.LIGHT_MODEL_ID || "claude-sonnet-5-5",
         SES_FROM_ADDRESS: "noreply@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
+        // The Monday weekly summary sends nothing unless this is "true".
+        WEEKLY_SUMMARY_ENABLED: WEEKLY_SUMMARY_ENABLED ? "true" : "false",
         CI_FIX_QUEUE_URL: props.ciFixQueue.queueUrl,
         TICKET_QUEUE_URL: props.ticketQueue.queueUrl,
         FEEDBACK_QUEUE_URL: props.feedbackQueue.queueUrl,

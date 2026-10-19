@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 sha2 = "0.10"
+# unsubscribe: signed links in emails
+hmac = "0.12"
 # memlock: the shared memory fencing lock (worker runs + gateway deletes)
 aws-sdk-dynamodb = "1"
 chrono = "0.4"

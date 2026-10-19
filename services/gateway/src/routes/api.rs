@@ -3541,7 +3541,7 @@ pub async fn update_budget(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
-    claims.require_role(4)?; // owner only
+    claims.require_role(3)?; // admin or owner
     let max_tokens = body["max_tokens"].as_u64().unwrap_or(0);
 
     state

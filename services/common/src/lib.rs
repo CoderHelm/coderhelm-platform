@@ -25,6 +25,8 @@ pub mod pr_outcome;
 // review_stats: time-ordered review records for analytics
 pub mod review_stats;
 pub mod skills;
+/// Signed links that turn off one email for one person, without signing in.
+pub mod unsubscribe;
 
 /// GitHub's per-request override for the installation-token format, sent on
 /// `POST /app/installations/{id}/access_tokens`. GitHub is moving installation

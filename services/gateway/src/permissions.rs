@@ -61,14 +61,15 @@ pub const ROLES: &[RoleInfo] = &[
         key: "admin",
         label: "Admin",
         level: 3,
-        summary: "Runs the workspace: repos, integrations, agent settings and people.",
+        summary:
+            "Runs the workspace: repos, integrations, agent settings, the token limit and people.",
         assignable: true,
     },
     RoleInfo {
         key: "owner",
         label: "Owner",
         level: 4,
-        summary: "Everything, plus budget, account-level changes and managing admins.",
+        summary: "Everything, plus account-level changes and managing admins.",
         assignable: true,
     },
 ];
@@ -361,6 +362,12 @@ pub const CAPABILITIES: &[Capability] = &[
             "api::purge_dlq",
         ],
     },
+    Capability {
+        key: "budget",
+        label: "Set the monthly token limit",
+        min_role: "admin",
+        handlers: &["api::update_budget"],
+    },
     // ── Owners ──────────────────────────────────────────────────────
     Capability {
         key: "manage_admins",
@@ -374,12 +381,6 @@ pub const CAPABILITIES: &[Capability] = &[
         label: "Rename the team",
         min_role: "owner",
         handlers: &["api::rename_team"],
-    },
-    Capability {
-        key: "budget",
-        label: "Set the monthly budget",
-        min_role: "owner",
-        handlers: &["api::update_budget"],
     },
     Capability {
         key: "disconnect",
