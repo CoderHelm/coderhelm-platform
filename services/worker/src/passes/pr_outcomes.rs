@@ -32,10 +32,13 @@ struct Pending {
 
 pub async fn backfill(state: &WorkerState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pending = find_pending(state).await?;
-    if pending.is_empty() {
-        return Ok(());
-    }
     let mut clients: HashMap<u64, GitHubClient> = HashMap::new();
+    // The second sweep runs whether or not the first found anything: once
+    // every older merge was filled, an early return here meant finished runs
+    // never learned their PR closed or merged.
+    if pending.is_empty() {
+        return reconcile_finished(state, &mut clients).await;
+    }
     let (mut filled, mut unknown) = (0, 0);
     for p in pending {
         let Some((owner, repo, number)) = parse_pr_url(&p.pr_url) else {
