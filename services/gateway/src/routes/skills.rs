@@ -66,6 +66,7 @@ async fn queue_sync(state: &AppState, team: &str, repo: &str) -> bool {
         team_id: team.to_string(),
         repo: repo.to_string(),
         force: true,
+        ..Default::default()
     });
     crate::routes::github_webhook::send_to_queue(state, &state.config.ticket_queue_url, &message)
         .await
@@ -290,14 +291,24 @@ pub async fn item(
     if !valid_repo(repo) || path.is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, "Give a repo and a path."));
     }
-    let Some((meta, body)) = store(&state, &claims)
-        .item(repo, path)
+    let Some((meta, body, compat, translated)) = store(&state, &claims)
+        .item_with_compat(repo, path)
         .await
         .map_err(|e| internal("get skill", e))?
     else {
         return Err(fail(StatusCode::NOT_FOUND, "No such skill."));
     };
     let mut out = meta.json();
+    // The full check (steps, what each relies on) and the translated text,
+    // when the item was checked. `compat.current` says whether it was its
+    // current text.
+    if let Some(full) = serde_json::from_str::<Value>(&compat)
+        .ok()
+        .filter(|v| v.is_object())
+    {
+        out["compat"] = full_compat(meta.compat_json(), &full);
+    }
+    out["translated"] = json!(translated);
     if meta.kind == Kind::Agent {
         // Exactly what the agent is told when it's asked, so the page shows
         // what it gets rather than a description of it.
@@ -306,6 +317,23 @@ pub async fn item(
     }
     out["body"] = json!(body);
     Ok(Json(out))
+}
+
+/// The short check with the full one's steps, counts and cost added, and
+/// its list of what to connect as `needs_detail` (the short `needs` stays a
+/// list of names).
+fn full_compat(short: Value, full: &Value) -> Value {
+    let mut c = short;
+    if let (Some(obj), Some(full)) = (c.as_object_mut(), full.as_object()) {
+        for (k, v) in full {
+            if k == "needs" {
+                obj.insert("needs_detail".into(), v.clone());
+            } else {
+                obj.entry(k.clone()).or_insert(v.clone());
+            }
+        }
+    }
+    c
 }
 
 /// PUT /api/skills/item `{repo, path, enabled}` — switches an item on or off
@@ -333,6 +361,108 @@ pub async fn set_enabled(
     }
     info!(team_id = %claims.team_id, repo, path, enabled = on, "Skill switched");
     Ok(Json(json!({ "ok": true, "enabled": on })))
+}
+
+/// POST /api/skills/recheck `{repo, path?}` — checks a repository's items
+/// (or one) again against what the team has in Coderhelm, now. One model
+/// call per item, done by the worker.
+pub async fn recheck(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Reply {
+    admin(&claims)?;
+    let repo = body["repo"].as_str().unwrap_or("").to_string();
+    let path = body["path"].as_str().unwrap_or("").trim().to_string();
+    let st = store(&state, &claims);
+    if !valid_repo(&repo)
+        || st
+            .repo(&repo)
+            .await
+            .map_err(|e| internal("get skill repo", e))?
+            .is_none()
+    {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "That repository isn't connected.",
+        ));
+    }
+    if !path.is_empty()
+        && st
+            .item(&repo, &path)
+            .await
+            .map_err(|e| internal("get skill", e))?
+            .is_none()
+    {
+        return Err(fail(StatusCode::NOT_FOUND, "No such skill."));
+    }
+    let message = WorkerMessage::SkillSync(SkillSyncMessage {
+        team_id: claims.team_id.clone(),
+        repo: repo.clone(),
+        recheck: true,
+        path: path.clone(),
+        ..Default::default()
+    });
+    if crate::routes::github_webhook::send_to_queue(
+        &state,
+        &state.config.ticket_queue_url,
+        &message,
+    )
+    .await
+    .is_err()
+    {
+        return Err(fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't start the check. Try again.",
+        ));
+    }
+    info!(team_id = %claims.team_id, repo = %repo, path = %path, "Skill re-check queued");
+    Ok(Json(json!({ "ok": true, "checking": true })))
+}
+
+/// PUT /api/skills/translated `{repo, path, enabled}` — whether agents read
+/// the translated version of an item instead of its text as written. Kept
+/// across syncs; agents only get a translation made from the current text.
+pub async fn set_use_translated(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Reply {
+    admin(&claims)?;
+    let repo = body["repo"].as_str().unwrap_or("");
+    let path = body["path"].as_str().unwrap_or("");
+    let Some(on) = body["enabled"].as_bool() else {
+        return Err(fail(StatusCode::BAD_REQUEST, "Say enabled: true or false."));
+    };
+    if !valid_repo(repo) || path.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "Give a repo and a path."));
+    }
+    let st = store(&state, &claims);
+    if on {
+        match st
+            .item_with_compat(repo, path)
+            .await
+            .map_err(|e| internal("get skill", e))?
+        {
+            None => return Err(fail(StatusCode::NOT_FOUND, "No such skill.")),
+            Some((_, _, _, t)) if t.trim().is_empty() => {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "There's no translated version yet. Check it first.",
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    let found = st
+        .set_use_translated(repo, path, on, &claims.email)
+        .await
+        .map_err(|e| internal("switch translated", e))?;
+    if !found {
+        return Err(fail(StatusCode::NOT_FOUND, "No such skill."));
+    }
+    info!(team_id = %claims.team_id, repo, path, enabled = on, "Skill translated version switched");
+    Ok(Json(json!({ "ok": true, "use_translated": on })))
 }
 
 /// Tries one agent may take in a day, so the try box can't run up a bill.
@@ -546,6 +676,22 @@ mod tests {
             at: (chrono::Utc::now() - chrono::Duration::hours(hours_ago)).to_rfc3339(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn an_items_page_gets_the_full_check_with_names_kept_short() {
+        let short = json!({ "status": "needs_tools", "needs": ["Monitoring"], "current": true });
+        let full = json!({
+            "status": "ignored", "steps": [{ "title": "a" }],
+            "needs": [{ "name": "Monitoring", "fix": "Connect it" }], "cost_usd": 0.02
+        });
+        let c = full_compat(short, &full);
+        assert_eq!(c["status"], "needs_tools", "the short form leads");
+        assert_eq!(c["needs"], json!(["Monitoring"]));
+        assert_eq!(c["needs_detail"][0]["fix"], "Connect it");
+        assert_eq!(c["steps"][0]["title"], "a");
+        assert_eq!(c["cost_usd"], 0.02);
+        assert_eq!(c["current"], true);
     }
 
     #[test]

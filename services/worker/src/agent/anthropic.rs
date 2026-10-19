@@ -356,6 +356,63 @@ pub async fn converse_simple(
     extract_text(&resp.blocks())
 }
 
+/// One call whose answer must match `schema` (structured outputs), parsed.
+/// No tools. Counted like every other call.
+#[allow(clippy::too_many_arguments)]
+pub async fn converse_json(
+    client: &AnthropicClient,
+    model_id: &str,
+    system: &str,
+    user_message: &str,
+    schema: &Value,
+    effort: &str,
+    max_tokens: i32,
+    usage: &mut crate::models::TokenUsage,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let mut request = MessagesRequest {
+        model: model_id.to_string(),
+        max_tokens,
+        system: vec![SystemBlock::Text {
+            text: system.to_string(),
+            cache_control: Some(CacheControl {
+                r#type: "ephemeral".to_string(),
+            }),
+        }],
+        messages: vec![ApiMessage {
+            role: "user".to_string(),
+            content: vec![json!({ "type": "text", "text": user_message })],
+        }],
+        tools: None,
+        cache_control: None,
+        thinking: None,
+        output_config: None,
+        context_management: None,
+        fallbacks: None,
+        tool_choice: None,
+    };
+    apply_model_family(&mut request, Some(effort), false);
+    request.output_config = Some(json_output_config(request.output_config.take(), schema));
+    let resp = send_request(client, &request).await?;
+    account(client, model_id, &resp.usage, usage).await;
+    if let Some(refusal) = resp.refusal() {
+        return Err(refusal.into());
+    }
+    if resp.stop_reason.as_deref() == Some("max_tokens") {
+        return Err("The answer was cut off before it finished.".into());
+    }
+    let text = extract_text(&resp.blocks())?;
+    serde_json::from_str(text.trim())
+        .map_err(|e| format!("The answer wasn't valid JSON: {e}").into())
+}
+
+/// `output_config` with the JSON schema format added to whatever the model
+/// family set (its effort).
+fn json_output_config(base: Option<Value>, schema: &Value) -> Value {
+    let mut cfg = base.unwrap_or_else(|| json!({}));
+    cfg["format"] = json!({ "type": "json_schema", "schema": schema });
+    cfg
+}
+
 /// Agentic tool-use loop. Equivalent to `converse_with_opts` for Bedrock.
 #[allow(clippy::too_many_arguments)]
 pub async fn converse_tool_loop(

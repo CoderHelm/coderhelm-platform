@@ -79,12 +79,19 @@ const TEXT_EXTENSIONS: &[&str] = &[
 /// Asks the worker to read a connected repository's default branch again (a
 /// push to it, a new connection, or an admin's "Sync now"). `force` reads it
 /// even when the commit is the one already read.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+///
+/// With `recheck`, the repository isn't read: its items are checked again
+/// against what the team has in Coderhelm (one item when `path` is set).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct SkillSyncMessage {
     pub team_id: String,
     pub repo: String,
     #[serde(default)]
     pub force: bool,
+    #[serde(default)]
+    pub recheck: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
 }
 
 /// Asks the worker to put an admin's question to a team agent from the
@@ -686,9 +693,75 @@ pub struct SkillMeta {
     /// Who last flipped its switch, and when. Empty if never.
     pub switched_by: String,
     pub switched_at: String,
+    /// How Coderhelm runs it, from its last check (see `skill_compat`).
+    pub compat: CompatMeta,
+}
+
+/// The short form of an item's last check, for lists. The full check and
+/// the translated text are read with the item.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompatMeta {
+    /// "ready", "translated" or "needs_tools"; empty before the first check.
+    pub status: String,
+    pub summary: String,
+    /// Names of what it needs that the team hasn't connected.
+    pub needs: Vec<String>,
+    /// The item's text hash and the team's inventory fingerprint it was
+    /// checked against.
+    pub hash: String,
+    pub fingerprint: String,
+    pub at: String,
+    /// Why the last check failed, or empty.
+    pub error: String,
+    /// An admin chose to give agents the translated version.
+    pub use_translated: bool,
+    pub translated_by: String,
+    pub translated_at: String,
+}
+
+impl CompatMeta {
+    fn from_item(i: &Item) -> Self {
+        Self {
+            status: s(i, "compat_status"),
+            summary: s(i, "compat_summary"),
+            needs: i
+                .get("compat_needs")
+                .and_then(|v| v.as_l().ok())
+                .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
+                .unwrap_or_default(),
+            hash: s(i, "compat_hash"),
+            fingerprint: s(i, "compat_fp"),
+            at: s(i, "compat_at"),
+            error: s(i, "compat_error"),
+            use_translated: i
+                .get("use_translated")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(false),
+            translated_by: s(i, "translated_by"),
+            translated_at: s(i, "translated_at"),
+        }
+    }
 }
 
 impl SkillMeta {
+    /// Whether the last check was of the item's current text.
+    pub fn compat_current(&self) -> bool {
+        !self.compat.hash.is_empty() && self.compat.hash == self.hash
+    }
+
+    /// The short check for lists, or null before any check.
+    pub fn compat_json(&self) -> Value {
+        if self.compat.at.is_empty() {
+            return Value::Null;
+        }
+        json!({
+            "status": self.compat.status, "summary": self.compat.summary,
+            "needs": self.compat.needs, "at": self.compat.at,
+            "error": self.compat.error, "current": self.compat_current(),
+        })
+    }
+
     fn from_item(i: &Item) -> Option<Self> {
         let sk = s(i, "sk");
         let rest = sk.strip_prefix(SKILL)?;
@@ -724,6 +797,7 @@ impl SkillMeta {
             last_asked_at: s(i, "last_asked_at"),
             switched_by: s(i, "switched_by"),
             switched_at: s(i, "switched_at"),
+            compat: CompatMeta::from_item(i),
         })
         .filter(|m| !rest.is_empty() && !m.repo.is_empty() && !m.path.is_empty())
     }
@@ -738,6 +812,10 @@ impl SkillMeta {
             "last_used_by": self.last_used_by, "updated_at": self.updated_at,
             "asks": self.asks, "last_asked_at": self.last_asked_at,
             "switched_by": self.switched_by, "switched_at": self.switched_at,
+            "compat": self.compat_json(),
+            "use_translated": self.compat.use_translated,
+            "translated_by": self.compat.translated_by,
+            "translated_at": self.compat.translated_at,
         })
     }
 }
@@ -1214,7 +1292,9 @@ impl SkillStore<'_> {
                 Some(
                     "sk, repo, #p, kind, #n, description, sha, #h, enabled, files, uses, \
                      last_used_at, last_used_by, updated_at, asks, last_asked_at, \
-                     switched_by, switched_at",
+                     switched_by, switched_at, missing_tools, compat_status, compat_summary, \
+                     compat_needs, compat_hash, compat_fp, compat_at, compat_error, \
+                     use_translated, translated_by, translated_at",
                 ),
             )
             .await?
@@ -1276,6 +1356,125 @@ impl SkillStore<'_> {
                 Ok(false)
             }
             Err(e) => Err(format!("skill store switch: {e}")),
+        }
+    }
+
+    /// One item with its text, its full last check (JSON, empty before one)
+    /// and its translated text (empty before one).
+    pub async fn item_with_compat(
+        &self,
+        repo: &str,
+        path: &str,
+    ) -> Result<Option<(SkillMeta, String, String, String)>, String> {
+        let Some(i) = self.get(&format!("{SKILL}{repo}#{path}")).await? else {
+            return Ok(None);
+        };
+        Ok(SkillMeta::from_item(&i)
+            .map(|m| (m, s(&i, "body"), s(&i, "compat"), s(&i, "translated"))))
+    }
+
+    /// Every item of `repo` with what a check reads: its text, its files and
+    /// what it was last checked against.
+    pub async fn compat_queue(&self, repo: &str) -> Result<Vec<(SkillMeta, String)>, String> {
+        Ok(self
+            .query(&format!("{SKILL}{repo}#"), None)
+            .await?
+            .iter()
+            .filter_map(|i| SkillMeta::from_item(i).map(|m| (m, s(i, "body"))))
+            .collect())
+    }
+
+    /// Keeps one item's check: the full check as JSON, its short form for
+    /// lists, the translated text, and what it was checked against. Only
+    /// written while the item still has the text that was checked. With
+    /// `error`, keeps why the check failed and leaves the last good check.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_compat(
+        &self,
+        repo: &str,
+        path: &str,
+        hash: &str,
+        fingerprint: &str,
+        result: Result<(&crate::skill_compat::Analysis, &str), &str>,
+    ) -> Result<bool, String> {
+        let mut req = self
+            .dynamo
+            .update_item()
+            .table_name(self.table)
+            .key("pk", av(self.team))
+            .key("sk", av(&format!("{SKILL}{repo}#{path}")))
+            .condition_expression("attribute_exists(sk) AND #h = :h")
+            .expression_attribute_names("#h", "hash")
+            .expression_attribute_values(":h", av(hash))
+            .expression_attribute_values(":fp", av(fingerprint))
+            .expression_attribute_values(":at", av(&now()));
+        req = match result {
+            Ok((a, translated)) => req
+                .update_expression(
+                    "SET compat = :c, compat_status = :st, compat_summary = :su, \
+                     compat_needs = :n, translated = :t, compat_hash = :h, compat_fp = :fp, \
+                     compat_at = :at, compat_error = :e",
+                )
+                .expression_attribute_values(
+                    ":c",
+                    av(&serde_json::to_string(a).map_err(|e| format!("compat json: {e}"))?),
+                )
+                .expression_attribute_values(":st", av(&a.status))
+                .expression_attribute_values(":su", av(&a.summary))
+                .expression_attribute_values(
+                    ":n",
+                    AttributeValue::L(a.needs.iter().map(|n| av(&n.name)).collect()),
+                )
+                .expression_attribute_values(":t", av(translated))
+                .expression_attribute_values(":e", av("")),
+            Err(error) => req
+                .update_expression(
+                    "SET compat_error = :e, compat_hash = :h, compat_fp = :fp, compat_at = :at",
+                )
+                .expression_attribute_values(":e", av(crate::truncate_str(error, 500))),
+        };
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(format!("skill store compat: {e}")),
+        }
+    }
+
+    /// An admin's choice to give agents the translated version of an item.
+    pub async fn set_use_translated(
+        &self,
+        repo: &str,
+        path: &str,
+        on: bool,
+        by: &str,
+    ) -> Result<bool, String> {
+        let r = self
+            .dynamo
+            .update_item()
+            .table_name(self.table)
+            .key("pk", av(self.team))
+            .key("sk", av(&format!("{SKILL}{repo}#{path}")))
+            .update_expression("SET use_translated = :on, translated_by = :by, translated_at = :at")
+            .condition_expression("attribute_exists(sk)")
+            .expression_attribute_values(":on", AttributeValue::Bool(on))
+            .expression_attribute_values(":by", av(by))
+            .expression_attribute_values(":at", av(&now()))
+            .send()
+            .await;
+        match r {
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(format!("skill store translated switch: {e}")),
         }
     }
 
@@ -2521,6 +2720,7 @@ mod tests {
             last_asked_at: String::new(),
             switched_by: String::new(),
             switched_at: String::new(),
+            compat: Default::default(),
         }
     }
 

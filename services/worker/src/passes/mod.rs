@@ -667,6 +667,7 @@ pub mod review_pr;
 pub mod review_reminder;
 pub mod review_risk;
 mod security;
+pub mod skill_compat;
 pub mod skills;
 pub mod syntax_check;
 #[allow(dead_code)]

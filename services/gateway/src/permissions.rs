@@ -315,6 +315,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "skills::sync",
             "skills::set_enabled",
             "skills::try_agent",
+            "skills::recheck",
+            "skills::set_use_translated",
         ],
     },
     Capability {

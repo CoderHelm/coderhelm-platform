@@ -1984,7 +1984,7 @@ async fn handle_push(
         let message = WorkerMessage::SkillSync(common::skills::SkillSyncMessage {
             team_id: team_id.to_string(),
             repo: full,
-            force: false,
+            ..Default::default()
         });
         let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
     }
