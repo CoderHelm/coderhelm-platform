@@ -401,6 +401,8 @@ pub struct PrReviewToolExecutor<'a> {
     pub graph: Option<&'a super::code_graph::Graph>,
     /// Repository history (commits, blame, pull requests, releases, deploys).
     pub history: Option<&'a super::github_history::GithubHistory>,
+    /// Monitoring, docs and pipeline connections and the AWS identity check.
+    pub ops: Option<&'a super::ops_tools::OpsTools>,
     /// The team's connected live systems this review may read from, if any.
     pub live: Option<&'a super::live_sources::LiveSources>,
     /// The team's written skills, read-only.
@@ -465,6 +467,11 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
         }
         if let Some(history) = self.history {
             if let Some(out) = history.handle(self.state, self.github, name, input).await {
+                return Ok(json!(out));
+            }
+        }
+        if let Some(ops) = self.ops {
+            if let Some(out) = ops.handle(self.state, name, input).await {
                 return Ok(json!(out));
             }
         }
@@ -755,6 +762,7 @@ pub async fn generate_review(
     graph_context: &str,
     prior_context: &str,
     history: Option<&super::github_history::GithubHistory>,
+    ops: Option<&super::ops_tools::OpsTools>,
     live: Option<&super::live_sources::LiveSources>,
     skills: Option<&super::skills::TeamSkills>,
     usage: &mut TokenUsage,
@@ -821,7 +829,7 @@ pub async fn generate_review(
             .map(|_| super::github_history::prompt_line())
             .unwrap_or_default(),
         live.map(|l| l.prompt_section()).unwrap_or_default()
-    );
+    ) + &ops.map(|o| o.prompt_section()).unwrap_or_default();
     let skills_context = skills.map(|s| s.prompt_section()).unwrap_or_default();
     let prompt = format!(
         "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{graph_context}{prior_context}{live_context}{skills_context}\n\
@@ -839,6 +847,7 @@ pub async fn generate_review(
         state,
         graph,
         history,
+        ops,
         live,
         skills,
     };
@@ -848,6 +857,9 @@ pub async fn generate_review(
     }
     if history.is_some() {
         tools.push(super::github_history::tool());
+    }
+    if let Some(o) = ops {
+        tools.extend(o.tools());
     }
     if let Some(live) = live {
         tools.extend(live.tools());

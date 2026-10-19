@@ -467,6 +467,13 @@ async fn main() -> Result<(), Error> {
         .route("/skills/activity", get(routes::skills::activity))
         .route("/activity/summary", get(routes::activity::summary))
         .route("/data-sources", get(routes::data_sources::list))
+        .route("/connectors", get(routes::connectors::list))
+        .route("/connectors/aws-check", get(routes::connectors::aws_check))
+        .route(
+            "/connectors/:kind",
+            put(routes::connectors::save).delete(routes::connectors::remove),
+        )
+        .route("/connectors/:kind/test", post(routes::connectors::test))
         .route(
             "/data-sources/activity",
             get(routes::data_sources::activity),

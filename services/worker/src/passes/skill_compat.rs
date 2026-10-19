@@ -481,6 +481,7 @@ pub async fn inventory(state: &WorkerState, team_id: &str) -> Inventory {
         }
         Err(e) => warn!(error = %e, "Skill check: couldn't list data sources"),
     }
+    sources.extend(super::ops_tools::inventory_sources(state, team_id).await);
 
     let mut team_tools = Vec::new();
     let tool_store = common::live::tools_store::ToolStore {
@@ -512,6 +513,7 @@ pub async fn inventory(state: &WorkerState, team_id: &str) -> Inventory {
         sources,
         team_tools,
         translations,
+        connections: super::ops_tools::connectable(state, team_id).await,
         never: NEVER.iter().map(|s| s.to_string()).collect(),
     }
     .sorted()
@@ -567,6 +569,7 @@ pub fn source(s: &common::live::store::Source) -> Source {
         name: s.name.clone(),
         detail: format!("{detail}.{only}"),
         tools: vec!["live_describe".into(), read.into()],
+        writes: Vec::new(),
     }
 }
 
@@ -695,6 +698,7 @@ mod tests {
                 name: "Service logs".into(),
                 detail: String::new(),
                 tools: vec!["live_describe".into(), "logs_search".into()],
+                writes: Vec::new(),
             }],
             ..Default::default()
         }

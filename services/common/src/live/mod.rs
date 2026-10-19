@@ -22,13 +22,20 @@
 //!   role the team creates in its own account, usable only with that team's
 //!   private ID and only able to read ([`aws`]).
 
+pub mod airflow;
 pub mod api;
 pub mod aws;
 pub mod catalog;
+pub mod confluence;
+pub mod connectors;
 pub mod db;
 pub mod graphql;
+pub mod http;
+pub mod identity;
 pub mod logs;
+pub mod metrics;
 pub mod net;
+pub mod newrelic;
 pub mod redact;
 pub mod redshift;
 pub mod secret;

@@ -362,6 +362,18 @@ pub async fn run(
             msg.pr_number,
         );
         let system = format!("{system}{}", super::github_history::prompt_line());
+        let ops = super::ops_tools::OpsTools::load(
+            state,
+            &msg.team_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            "reviewer",
+            msg.pr_number,
+        )
+        .await;
+        let system = match &ops {
+            Some(o) => format!("{system}{}", o.prompt_section()),
+            None => system,
+        };
         let skills = super::skills::TeamSkills::load(
             state,
             &msg.team_id,
@@ -395,11 +407,15 @@ pub async fn run(
             state,
             graph: None,
             history: Some(&history),
+            ops: ops.as_ref(),
             live: live.as_ref(),
             skills: skills.as_ref(),
         };
         let mut tools = review_agent::review_tools();
         tools.push(super::github_history::tool());
+        if let Some(o) = &ops {
+            tools.extend(o.tools());
+        }
         if let Some(l) = &live {
             tools.extend(l.tools());
         }
@@ -662,6 +678,14 @@ pub async fn run(
         "reviewer",
         msg.pr_number,
     );
+    let ops = super::ops_tools::OpsTools::load(
+        state,
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        "reviewer",
+        msg.pr_number,
+    )
+    .await;
     // Live systems the team connected for this repo, if any.
     let live = super::live_sources::LiveSources::load(
         state,
@@ -705,6 +729,7 @@ pub async fn run(
         &extra_context,
         &prior_context,
         Some(&history),
+        ops.as_ref(),
         live.as_ref(),
         skills.as_ref(),
         &mut usage,
