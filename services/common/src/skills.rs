@@ -408,6 +408,7 @@ pub const AGENT_READ_TOOLS: &[&str] = &[
     "graph_callers",
     "graph_impact",
     "check_package",
+    "check_url",
     "live_describe",
     "live_lookup",
     "db_query",
@@ -542,6 +543,16 @@ pub fn agent_toolset(text: &str) -> AgentToolset {
         out.declared.push(spec.clone());
         if AGENT_WRITE_TOOLS.contains(&base.as_str()) {
             out.blocked.push(base);
+            continue;
+        }
+        if base == "WebFetch" {
+            // Web read access, in part: `check_url` says whether a page on
+            // the team's own sites loads, where it redirects and its title.
+            // Reading a page's content stays missing.
+            grant(&mut out, &["check_url"]);
+            if !out.missing.contains(&base) {
+                out.missing.push(base);
+            }
             continue;
         }
         if let Some((_, ours)) = AGENT_TOOL_MAP.iter().find(|(n, _)| *n == base) {
@@ -3238,7 +3249,11 @@ mod tests {
         let t = agent_toolset(
             "---\nname: debt\ntools: Read, Grep, Bash, TodoWrite, WebFetch\n---\nFind debt.\n",
         );
-        assert_eq!(t.granted, ["read_file", "read_file_lines", "search_code"]);
+        // WebFetch gives the page check only; reading pages stays missing.
+        assert_eq!(
+            t.granted,
+            ["read_file", "read_file_lines", "search_code", "check_url"]
+        );
         assert_eq!(t.missing, ["Bash", "TodoWrite", "WebFetch"]);
         assert!(t.blocked.is_empty());
         assert_eq!(t.declared.len(), 5);

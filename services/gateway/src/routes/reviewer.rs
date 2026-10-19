@@ -76,39 +76,91 @@ pub async fn get_org_config(
         .ok()
         .and_then(|o| o.item().cloned())
         .unwrap_or_default();
-    Ok(Json(
-        json!({ "instructions": item_str(&item, "instructions", "") }),
-    ))
+    let web_domains: Vec<String> = item
+        .get(common::web_domains::ATTR)
+        .and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect())
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "instructions": item_str(&item, "instructions", ""),
+        // The team's own public sites agents may check pages on (check_url);
+        // a domain covers its subdomains.
+        "web_domains": web_domains,
+    })))
 }
 
-/// PUT /api/reviewer/org-config — set team-wide review instructions (admin).
+/// The `web_domains` a PUT sets: `None` when the body doesn't send them (so
+/// they're kept), `Err` with the entries that aren't domains.
+fn web_domains_from(body: &Value) -> Result<Option<Vec<String>>, Vec<String>> {
+    let Some(raw) = body.get(common::web_domains::ATTR) else {
+        return Ok(None);
+    };
+    let list: Vec<String> = raw
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let bad = common::web_domains::rejected(&list);
+    if !bad.is_empty() {
+        return Err(bad);
+    }
+    Ok(Some(common::web_domains::clean_all(&list)))
+}
+
+/// PUT /api/reviewer/org-config — set team-wide review instructions and the
+/// team's public domains (admin). A field left out of the body is kept.
 pub async fn update_org_config(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<(StatusCode, Json<Value>), StatusCode> {
     claims.require_role(3)?; // admin+
-    let instructions: String = body["instructions"]
-        .as_str()
-        .unwrap_or("")
-        .chars()
-        .take(16_000)
-        .collect();
-    state
+    let domains = match web_domains_from(&body) {
+        Ok(d) => d,
+        Err(bad) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!(
+                        "These aren't domain names: {}. List bare domains like example.com.",
+                        bad.join(", ")
+                    )
+                })),
+            ))
+        }
+    };
+    let mut sets = vec!["updated_at = :u"];
+    let mut req = state
         .dynamo
-        .put_item()
+        .update_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&claims.team_id))
-        .item("sk", attr_s("REVIEW_CONFIG#GLOBAL"))
-        .item("instructions", attr_s(&instructions))
-        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s("REVIEW_CONFIG#GLOBAL"))
+        .expression_attribute_values(":u", attr_s(&chrono::Utc::now().to_rfc3339()));
+    if let Some(i) = body.get("instructions").and_then(|v| v.as_str()) {
+        let instructions: String = i.chars().take(16_000).collect();
+        sets.push("instructions = :i");
+        req = req.expression_attribute_values(":i", attr_s(&instructions));
+    }
+    if let Some(d) = &domains {
+        sets.push("web_domains = :w");
+        req = req.expression_attribute_values(
+            ":w",
+            AttributeValue::L(d.iter().map(|s| attr_s(s)).collect()),
+        );
+        info!(team = %claims.team_id, domains = d.len(), by = %claims.email, "Team web domains set");
+    }
+    req.update_expression(format!("SET {}", sets.join(", ")))
         .send()
         .await
         .map_err(|e| {
-            error!("put org review config: {e}");
+            error!("update org review config: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    Ok(StatusCode::OK)
+    Ok((StatusCode::OK, Json(json!({ "web_domains": domains }))))
 }
 
 /// GET /api/reviewer/config/:owner/:name — current reviewer config (defaults
@@ -871,4 +923,29 @@ pub async fn send_release(
         name, tag, resend, "Release notes: queued from dashboard"
     );
     Ok(Json(json!({ "status": "queued" })))
+}
+
+#[cfg(test)]
+mod web_domains_tests {
+    use super::web_domains_from;
+    use serde_json::json;
+
+    #[test]
+    fn domains_are_kept_when_left_out_and_cleaned_when_sent() {
+        assert_eq!(web_domains_from(&json!({"instructions": "x"})), Ok(None));
+        assert_eq!(
+            web_domains_from(&json!({"web_domains": ["https://WWW.Example.com/", "example.org"]})),
+            Ok(Some(vec!["www.example.com".into(), "example.org".into()]))
+        );
+        assert_eq!(
+            web_domains_from(&json!({"web_domains": []})),
+            Ok(Some(vec![]))
+        );
+        assert_eq!(
+            web_domains_from(
+                &json!({"web_domains": ["example.com", "169.254.169.254", "intranet"]})
+            ),
+            Err(vec!["169.254.169.254".into(), "intranet".into()])
+        );
+    }
 }

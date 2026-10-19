@@ -681,6 +681,7 @@ mod test;
 pub mod tool_proposals;
 mod triage;
 pub mod usage_reconcile;
+pub mod web_check;
 pub mod weekly_summary;
 pub mod write_guard;
 
