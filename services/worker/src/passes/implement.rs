@@ -756,6 +756,15 @@ pub(crate) fn tool_names() -> Vec<String> {
     all_tools().into_iter().map(|t| t.name).collect()
 }
 
+/// Every tool the coding agent can be given: its file tools and, when a
+/// sandbox is set up, the checks and code generation.
+pub(crate) fn coder_tools() -> Vec<ToolDefinition> {
+    let mut v = all_tools();
+    v.push(run_checks_tool());
+    v.push(run_codegen_tool());
+    v
+}
+
 fn all_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
