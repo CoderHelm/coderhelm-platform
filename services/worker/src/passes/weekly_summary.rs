@@ -35,6 +35,8 @@ const MAX_PAGES: usize = 40;
 const RUN_LOOKBACK_DAYS: i64 = 30;
 /// Merged PRs listed by name; the rest are counted.
 const TOP_MERGED: usize = 5;
+/// PRs and runs waiting on a person, listed by name; the rest are counted.
+const TOP_ATTENTION: usize = 5;
 /// How long the once-per-week send marker blocks a second send.
 const SENT_MARKER_SECS: u64 = 14 * 86_400;
 /// Mail apps read this address for the `mailto:` unsubscribe; requests that
@@ -58,9 +60,45 @@ pub struct MergedPr {
     pub repo: String,
 }
 
+/// Why something is waiting on a person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiting {
+    /// The run stopped to ask a question.
+    Input,
+    /// The PR is open and done on Coderhelm's side.
+    Review,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attention {
+    pub title: String,
+    pub repo: String,
+    /// The PR when there is one, otherwise the run's page.
+    pub url: String,
+    pub why: Waiting,
+}
+
+/// Tokens split the same way everywhere: new (uncached) input, read from
+/// cache, written to cache, and output.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Tokens {
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub output: u64,
+}
+
+impl Tokens {
+    pub fn total(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write + self.output
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunStats {
     pub started: u64,
+    /// Runs started this week that finished their work.
+    pub completed: u64,
     pub merged: u64,
     pub open: u64,
     pub failed: u64,
@@ -68,8 +106,12 @@ pub struct RunStats {
     /// Commits CoderHelm pushed to fix CI, and on how many runs.
     pub ci_fix_pushes: u64,
     pub ci_fix_runs: u64,
-    pub tokens: u64,
-    pub cost_usd: f64,
+    /// PRs whose CI Coderhelm could not get green, left for a person.
+    pub ci_handed_off: u64,
+    /// Waiting on a person, most recent first, at most `TOP_ATTENTION`.
+    pub attention: Vec<Attention>,
+    pub attention_total: u64,
+    pub tokens: Tokens,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -98,9 +140,8 @@ pub struct LookupStats {
 pub struct Usage {
     /// "October 2026"
     pub month: String,
-    pub month_tokens: u64,
-    pub month_cost_usd: f64,
-    /// 0 = no limit.
+    pub month_tokens: Tokens,
+    /// 0 = no limit. Counts all four kinds of tokens.
     pub limit_tokens: u64,
 }
 
@@ -174,12 +215,14 @@ fn within(ts: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
         .unwrap_or(false)
 }
 
-/// Runs from the last 30 days → the week's numbers. Started, open, failed,
-/// CI fixes and tokens count runs started in the week; merged counts PRs
-/// merged in the week, whenever their run started.
+/// Runs from the last 30 days → the week's numbers. Started, completed, open,
+/// failed, CI fixes and tokens count runs started in the week; merged counts
+/// PRs merged in the week, whenever their run started; waiting on a person
+/// counts every run in the 30 days that still is.
 pub fn run_stats(rows: &[Item], start: DateTime<Utc>, end: DateTime<Utc>) -> RunStats {
     let mut out = RunStats::default();
     let mut merged: Vec<(String, MergedPr)> = Vec::new();
+    let mut waiting: Vec<(String, Attention)> = Vec::new();
     for r in rows {
         let created = s(r, "created_at");
         let in_week = within(&created, start, end);
@@ -188,10 +231,10 @@ pub fn run_stats(rows: &[Item], start: DateTime<Utc>, end: DateTime<Utc>) -> Run
         let is_merged = status == "merged" || outcome == "merged";
         let merged_at = s(r, "merged_at");
         let has_pr = n(r, "pr_number") > 0.0;
+        let pr_url = s(r, "pr_url");
         if is_merged && (within(&merged_at, start, end) || (merged_at.is_empty() && in_week)) {
             out.merged += 1;
-            let url = s(r, "pr_url");
-            if !url.is_empty() {
+            if !pr_url.is_empty() {
                 let when = if merged_at.is_empty() {
                     created.clone()
                 } else {
@@ -201,16 +244,42 @@ pub fn run_stats(rows: &[Item], start: DateTime<Utc>, end: DateTime<Utc>) -> Run
                     when,
                     MergedPr {
                         title: s(r, "title"),
-                        url,
+                        url: pr_url.clone(),
                         repo: s(r, "repo"),
                     },
                 ));
             }
         }
+        let why = if status == "needs_input" {
+            Some(Waiting::Input)
+        } else if status == "completed" && has_pr && !is_merged && outcome != "closed" {
+            Some(Waiting::Review)
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            let url = if pr_url.is_empty() {
+                format!("{APP}/runs/detail/?id={}", s(r, "run_id"))
+            } else {
+                pr_url.clone()
+            };
+            waiting.push((
+                created.clone(),
+                Attention {
+                    title: s(r, "title"),
+                    repo: s(r, "repo"),
+                    url,
+                    why,
+                },
+            ));
+        }
         if !in_week {
             continue;
         }
         out.started += 1;
+        if matches!(status.as_str(), "completed" | "merged") {
+            out.completed += 1;
+        }
         if status == "failed" {
             out.failed += 1;
         } else if has_pr && !is_merged && outcome != "closed" && status != "cancelled" {
@@ -221,15 +290,31 @@ pub fn run_stats(rows: &[Item], start: DateTime<Utc>, end: DateTime<Utc>) -> Run
             out.ci_fix_pushes += fixes;
             out.ci_fix_runs += 1;
         }
-        out.tokens += (n(r, "tokens_in") + n(r, "tokens_out")) as u64;
-        out.cost_usd += n(r, "cost_usd");
+        // Coderhelm said on the PR that a person has it now, or it tried and
+        // CI was still red when the run ended.
+        let finished = matches!(status.as_str(), "completed" | "failed" | "merged");
+        let still_red = finished && n(r, "ci_fix_attempts") > 0.0 && s(r, "ci_last") == "failed";
+        if has_pr && (b(r, "handoff_notified") == Some(true) || still_red) {
+            out.ci_handed_off += 1;
+        }
+        out.tokens.input += n(r, "tokens_in") as u64;
+        out.tokens.cache_read += n(r, "cache_read_tokens") as u64;
+        out.tokens.cache_write += n(r, "cache_write_tokens") as u64;
+        out.tokens.output += n(r, "tokens_out") as u64;
     }
-    // Most recent merges first.
+    // Most recent first.
     merged.sort_by(|a, b| b.0.cmp(&a.0));
     out.top_merged = merged
         .into_iter()
         .take(TOP_MERGED)
         .map(|(_, p)| p)
+        .collect();
+    waiting.sort_by(|a, b| b.0.cmp(&a.0));
+    out.attention_total = waiting.len() as u64;
+    out.attention = waiting
+        .into_iter()
+        .take(TOP_ATTENTION)
+        .map(|(_, a)| a)
         .collect();
     out
 }
@@ -274,6 +359,74 @@ pub fn alert_stats(rows: &[Item]) -> AlertStats {
 }
 
 // ── Pure: numbers → email ─────────────────────────────────────────────────
+//
+// Built the way mail apps need it: tables for layout, every style inline
+// (the <style> blocks only add dark mode, Outlook.com's dark mode and phone
+// spacing on top), a 600px column that shrinks on phones, system fonts, no
+// images (the mark is text, so nothing breaks with images off), a VML
+// button for Outlook on Windows, and a hidden preview line. Colors are the
+// dashboard's zinc grays and blue, never pure white or black, so apps that
+// invert colors on their own still land on something readable.
+
+/// Light colors, inline. Dark ones live in `DARK_CSS` under the same names.
+mod c {
+    pub const PAGE: &str = "#f4f4f5";
+    pub const CARD: &str = "#fdfdfd";
+    pub const TILE: &str = "#f4f4f5";
+    pub const BORDER: &str = "#e4e4e7";
+    pub const T1: &str = "#18181b";
+    pub const T2: &str = "#52525b";
+    pub const T3: &str = "#71717a";
+    pub const LINK: &str = "#2563eb";
+    pub const BLUE: &str = "#3b82f6";
+    pub const BUTTON: &str = "#2563eb";
+    pub const TRACK: &str = "#e4e4e7";
+    pub const GREEN: &str = "#16a34a";
+    pub const AMBER: &str = "#d97706";
+    pub const RED: &str = "#dc2626";
+    pub const GRAY: &str = "#a1a1aa";
+}
+
+const FONT: &str = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+const MONO: &str = "ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace";
+
+/// Dark mode for apps that support the media query (Apple Mail, iOS,
+/// Outlook for Mac). Gmail ignores it and inverts on its own.
+const DARK_CSS: &str = "@media (prefers-color-scheme: dark) {\
+.bg-page{background:#09090b !important}\
+.bg-card{background:#18181b !important;border-color:#27272a !important}\
+.bg-tile{background:#222226 !important;border-color:#2e2e33 !important}\
+.t1{color:#f4f4f5 !important}\
+.t2{color:#b4b4bc !important}\
+.t3{color:#8f8f99 !important}\
+.lk{color:#60a5fa !important}\
+.ln{border-color:#2a2a2e !important}\
+.trk{background:#2e2e33 !important}\
+.chip-r{background:#172554 !important;color:#bfdbfe !important}\
+.chip-i{background:#422006 !important;color:#fde68a !important}\
+}";
+
+/// Outlook.com marks its dark mode with these attributes instead.
+const OGSC_CSS: &str = "[data-ogsc] .t1{color:#f4f4f5 !important}\
+[data-ogsc] .t2{color:#b4b4bc !important}\
+[data-ogsc] .t3{color:#8f8f99 !important}\
+[data-ogsc] .lk{color:#60a5fa !important}\
+[data-ogsb] .bg-page{background:#09090b !important}\
+[data-ogsb] .bg-card{background:#18181b !important}\
+[data-ogsb] .bg-tile{background:#222226 !important}";
+
+/// Phones: tighter padding, a smaller headline. Resets for links that mail
+/// apps restyle on their own.
+const BASE_CSS: &str = ":root{color-scheme:light dark;supported-color-schemes:light dark}\
+body{margin:0;padding:0;-webkit-text-size-adjust:100%}\
+a[x-apple-data-detectors]{color:inherit !important;text-decoration:none !important;font:inherit !important}\
+u + .body a{color:inherit}\
+@media (max-width:620px){\
+.px{padding-left:20px !important;padding-right:20px !important}\
+.h1{font-size:24px !important;line-height:32px !important}\
+.tile{padding:14px !important}\
+.num{font-size:28px !important;line-height:34px !important}\
+}";
 
 fn esc(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
@@ -303,12 +456,17 @@ fn num(v: u64) -> String {
     out
 }
 
-/// 1_234_567 → "1.2M".
+/// 1_234_567 → "1.2M", 20_000_000 → "20M", 45_600 → "46K".
 fn tokens(v: u64) -> String {
+    let short = |x: f64, unit: &str| {
+        let s = format!("{x:.1}");
+        format!("{}{unit}", s.strip_suffix(".0").unwrap_or(&s))
+    };
     match v {
         0..=9_999 => num(v),
-        10_000..=999_999 => format!("{:.0}K", v as f64 / 1_000.0),
-        _ => format!("{:.1}M", v as f64 / 1_000_000.0),
+        10_000..=999_499 => format!("{:.0}K", v as f64 / 1_000.0),
+        999_500..=999_949_999 => short(v as f64 / 1_000_000.0, "M"),
+        _ => short(v as f64 / 1_000_000_000.0, "B"),
     }
 }
 
@@ -316,366 +474,874 @@ fn plural(v: u64, one: &str, many: &str) -> String {
     format!("{} {}", num(v), if v == 1 { one } else { many })
 }
 
+/// "Oct 12 – 18, 2026", "Sep 28 – Oct 4, 2026".
 fn period(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
     let last = end - Duration::seconds(1);
-    if start.year() == last.year() {
-        format!("{} – {}", start.format("%b %-d"), last.format("%b %-d, %Y"))
-    } else {
+    if start.year() != last.year() {
         format!(
             "{} – {}",
             start.format("%b %-d, %Y"),
             last.format("%b %-d, %Y")
         )
+    } else if start.month() != last.month() {
+        format!("{} – {}", start.format("%b %-d"), last.format("%b %-d, %Y"))
+    } else {
+        format!("{} – {}", start.format("%b %-d"), last.format("%-d, %Y"))
     }
 }
 
-/// One stat in a section: a number and what it counts.
-struct Stat {
+/// The number at the end of a PR link: ".../pull/41" → 41.
+fn pr_number(url: &str) -> Option<u64> {
+    url.trim_end_matches('/')
+        .rsplit_once("/pull/")
+        .and_then(|(_, n)| n.parse().ok())
+}
+
+/// "example/api · #41"
+fn pr_meta(repo: &str, url: &str) -> String {
+    match (repo.is_empty(), pr_number(url)) {
+        (false, Some(n)) => format!("{repo} · #{n}"),
+        (false, None) => repo.to_string(),
+        (true, Some(n)) => format!("#{n}"),
+        (true, None) => String::new(),
+    }
+}
+
+/// Joins the last two words so a line never ends on one word alone.
+fn no_orphan(html: &str) -> String {
+    match html.rsplit_once(' ') {
+        Some((head, tail)) if !head.is_empty() => format!("{head}&nbsp;{tail}"),
+        _ => html.to_string(),
+    }
+}
+
+fn title_or(title: &str, fallback: &str) -> String {
+    let t = title.trim();
+    if t.is_empty() {
+        fallback.to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// One of the big numbers at the top.
+struct Card {
     value: String,
     label: String,
-    tone: Tone,
+    note: Option<String>,
 }
 
-#[derive(Clone, Copy)]
-enum Tone {
-    Plain,
-    Good,
-    Bad,
-}
-
-impl Tone {
-    fn color(self) -> &'static str {
-        match self {
-            Tone::Plain => "#ffffff",
-            Tone::Good => "#4ade80",
-            Tone::Bad => "#f87171",
-        }
+fn card(v: u64, one: &str, many: &str, note: Option<String>) -> Card {
+    Card {
+        value: num(v),
+        label: (if v == 1 { one } else { many }).to_string(),
+        note,
     }
 }
 
-/// A count with its label in the right number: "1 review", "2 reviews".
-fn counted(v: u64, one: &str, many: &str, tone: Tone) -> Stat {
-    stat(num(v), if v == 1 { one } else { many }, tone)
-}
-
-fn stat(value: impl Into<String>, label: impl Into<String>, tone: Tone) -> Stat {
-    Stat {
-        value: value.into(),
-        label: label.into(),
-        tone,
+/// The week's most telling numbers, most telling first, at most four, only
+/// ones that are not zero.
+fn cards(sm: &Summary, access: Access) -> Vec<Card> {
+    let r = &sm.runs;
+    let v = &sm.reviews;
+    let a = &sm.alerts;
+    let waiting_review = r
+        .attention
+        .iter()
+        .filter(|x| x.why == Waiting::Review)
+        .count() as u64;
+    let mut out = Vec::new();
+    if r.merged > 0 {
+        let note =
+            (waiting_review > 0).then(|| format!("{} waiting on review", num(waiting_review)));
+        out.push(card(r.merged, "PR merged", "PRs merged", note));
     }
+    if r.completed > 0 {
+        let note = (r.started > r.completed).then(|| format!("of {} started", num(r.started)));
+        out.push(card(r.completed, "run completed", "runs completed", note));
+    }
+    if v.total > 0 {
+        let note = (v.approve > 0).then(|| format!("{} approved", num(v.approve)));
+        out.push(card(v.total, "PR reviewed", "PRs reviewed", note));
+    }
+    if access >= Access::Member && a.received > 0 {
+        let note = (a.recovered > 0).then(|| format!("{} recovered", num(a.recovered)));
+        out.push(card(a.received, "alert handled", "alerts handled", note));
+    }
+    if r.ci_fix_pushes > 0 {
+        let note = Some(format!("on {}", plural(r.ci_fix_runs, "PR", "PRs")));
+        out.push(card(
+            r.ci_fix_pushes,
+            "CI fix pushed",
+            "CI fixes pushed",
+            note,
+        ));
+    }
+    if sm.skill_reads > 0 {
+        out.push(card(sm.skill_reads, "skill read", "skill reads", None));
+    }
+    if access >= Access::Admin && sm.lookups.total > 0 {
+        out.push(card(sm.lookups.total, "data lookup", "data lookups", None));
+    }
+    // Tokens have their own section; a card only when nothing else happened.
+    if out.is_empty() && r.tokens.total() > 0 {
+        out.push(Card {
+            value: tokens(r.tokens.total()),
+            label: "tokens used".into(),
+            note: None,
+        });
+    }
+    out.truncate(4);
+    out
 }
 
-struct Section {
-    title: &'static str,
-    stats: Vec<Stat>,
-    /// Extra lines under the numbers, already plain text; links render in HTML.
-    lines: Vec<(String, Option<String>)>,
+/// "71.4M tokens · 1.1M new input · 61.4M read from cache · 8.8M written to
+/// cache · 1.0M output": the split used everywhere tokens are shown.
+fn token_split(t: &Tokens) -> String {
+    format!(
+        "{} new input · {} read from cache · {} written to cache · {} output",
+        tokens(t.input),
+        tokens(t.cache_read),
+        tokens(t.cache_write),
+        tokens(t.output)
+    )
+}
+
+/// The token split as a small table: this week and the month so far, in
+/// the same order as everywhere else (total, new input, read from cache,
+/// written to cache, output).
+fn token_table(week: &Tokens, month: &Tokens, month_name: &str) -> String {
+    let head = format!(
+        r#"<tr><th scope="col" align="left" class="t3" style="padding:0 0 8px;font-size:13px;line-height:18px;font-weight:600;color:{t3}">Tokens</th><th scope="col" align="right" class="t3" style="padding:0 0 8px 12px;font-size:13px;line-height:18px;font-weight:600;color:{t3};white-space:nowrap">This week</th><th scope="col" align="right" class="t3" style="padding:0 0 8px 12px;font-size:13px;line-height:18px;font-weight:600;color:{t3};white-space:nowrap">{} so far</th></tr>"#,
+        esc(month_name),
+        t3 = c::T3
+    );
+    let mut rows = head;
+    for (i, (name, w, m)) in [
+        ("Total", week.total(), month.total()),
+        ("New input", week.input, month.input),
+        ("Read from cache", week.cache_read, month.cache_read),
+        ("Written to cache", week.cache_write, month.cache_write),
+        ("Output", week.output, month.output),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (class, color, weight) = if i == 0 {
+            ("t1", c::T1, 600)
+        } else {
+            ("t2", c::T2, 400)
+        };
+        let cell = |v: String, first: bool| {
+            let align = if first { "left" } else { "right" };
+            let pad = if first { "0" } else { "0 0 0 12px" };
+            format!(
+                r#"<td align="{align}" class="{class} ln" style="padding:{pad};border-top:1px solid {line};font-size:14px;line-height:34px;font-weight:{weight};color:{color};font-variant-numeric:tabular-nums;white-space:nowrap">{v}</td>"#,
+                line = c::BORDER
+            )
+        };
+        let _ = write!(
+            rows,
+            "<tr>{}{}{}</tr>",
+            cell(esc(name), true),
+            cell(tokens(w), false),
+            cell(tokens(m), false)
+        );
+    }
+    format!(
+        r#"<table class="tokens" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;margin-top:20px;border-collapse:collapse">{rows}</table>"#
+    )
+}
+
+/// A row in "The rest of the week": a name, a short line, and a link.
+struct Detail {
+    name: &'static str,
+    line: String,
+    /// Extra HTML under the line (the review bar), already escaped.
+    extra: String,
     link_label: &'static str,
     link: String,
 }
 
-fn sections(sm: &Summary, access: Access) -> Vec<Section> {
-    let mut out = Vec::new();
-    let r = &sm.runs;
-    if r.started + r.merged + r.open + r.failed > 0 {
-        let mut stats = vec![
-            stat(num(r.started), "started", Tone::Plain),
-            stat(num(r.merged), "merged", Tone::Good),
-            counted(r.open, "PR open", "PRs open", Tone::Plain),
-        ];
-        if r.failed > 0 {
-            stats.push(stat(num(r.failed), "failed", Tone::Bad));
-        }
-        let mut lines: Vec<(String, Option<String>)> = r
-            .top_merged
-            .iter()
-            .map(|p| {
-                let title = if p.title.trim().is_empty() {
-                    p.url.clone()
-                } else {
-                    p.title.trim().to_string()
-                };
-                let label = if p.repo.is_empty() {
-                    title
-                } else {
-                    format!("{title} ({})", p.repo)
-                };
-                (label, Some(p.url.clone()))
-            })
-            .collect();
-        let more = r.merged.saturating_sub(r.top_merged.len() as u64);
-        if more > 0 && !lines.is_empty() {
-            lines.push((format!("and {} more merged", num(more)), None));
-        }
-        out.push(Section {
-            title: "Runs",
-            stats,
-            lines,
-            link_label: "See all runs",
-            link: format!("{APP}/"),
-        });
+fn bar_cells(parts: &[(u64, &str, &str)]) -> String {
+    let total: u64 = parts.iter().map(|p| p.0).sum();
+    if total == 0 {
+        return String::new();
     }
+    // Whole percents that add up to 100; anything above zero gets at least 2.
+    let mut widths: Vec<u64> = parts
+        .iter()
+        .map(|p| {
+            if p.0 == 0 {
+                0
+            } else {
+                ((p.0 as f64 / total as f64 * 100.0).round() as u64).max(2)
+            }
+        })
+        .collect();
+    let sum: u64 = widths.iter().sum();
+    if let Some(i) = (0..widths.len()).max_by_key(|&i| widths[i]) {
+        widths[i] = (widths[i] + 100).saturating_sub(sum);
+    }
+    let mut cells = String::new();
+    for (w, (_, color, class)) in widths.iter().zip(parts) {
+        if *w == 0 {
+            continue;
+        }
+        let _ = write!(
+            cells,
+            r#"<td width="{w}%" height="8" bgcolor="{color}" class="{class}" style="width:{w}%;height:8px;background:{color};font-size:0;line-height:0;mso-line-height-rule:exactly">&nbsp;</td>"#
+        );
+    }
+    format!(
+        r#"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="trk" bgcolor="{track}" style="width:100%;border-collapse:separate;background:{track};border-radius:4px;overflow:hidden;table-layout:fixed"><tr>{cells}</tr></table>"#,
+        track = c::TRACK
+    )
+}
+
+/// How full the month is against the limit: a filled share and the rest.
+fn meter(pct: u64, color: &str) -> String {
+    let fill = pct.clamp(1, 100);
+    let rest = if fill < 100 {
+        format!(
+            r#"<td width="{w}%" height="8" style="width:{w}%;height:8px;font-size:0;line-height:0;mso-line-height-rule:exactly">&nbsp;</td>"#,
+            w = 100 - fill
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="trk" bgcolor="{track}" style="width:100%;border-collapse:separate;background:{track};border-radius:4px;overflow:hidden;table-layout:fixed"><tr><td width="{fill}%" height="8" bgcolor="{color}" style="width:{fill}%;height:8px;background:{color};border-radius:4px;font-size:0;line-height:0;mso-line-height-rule:exactly">&nbsp;</td>{rest}</tr></table>"#,
+        track = c::TRACK
+    )
+}
+
+fn details(sm: &Summary, access: Access) -> Vec<Detail> {
+    let mut out = Vec::new();
     let v = &sm.reviews;
     if v.total > 0 {
-        out.push(Section {
-            title: "PR reviews",
-            stats: vec![
-                counted(v.total, "review", "reviews", Tone::Plain),
-                stat(num(v.approve), "approved", Tone::Good),
-                stat(num(v.request_changes), "changes asked", Tone::Bad),
-                stat(num(v.comment), "commented", Tone::Plain),
-            ],
-            lines: vec![],
-            link_label: "See reviews",
+        let mut legend = Vec::new();
+        for (n, word, color, class) in [
+            (v.approve, "approved", c::GREEN, "t1"),
+            (v.request_changes, "changes requested", c::AMBER, "t1"),
+            (v.comment, "commented", c::GRAY, "t1"),
+        ] {
+            if n > 0 {
+                legend.push(format!(
+                    r#"<span style="display:inline-block;margin:0 14px 0 0;white-space:nowrap"><span style="color:{color}">&#9679;</span>&nbsp;<span class="{class}" style="color:{t1}">{}</span> {word}</span>"#,
+                    num(n),
+                    t1 = c::T1,
+                ));
+            }
+        }
+        let bar = bar_cells(&[
+            (v.approve, c::GREEN, ""),
+            (v.request_changes, c::AMBER, ""),
+            (v.comment, c::GRAY, ""),
+        ]);
+        out.push(Detail {
+            name: "Reviews",
+            line: format!("{} posted", plural(v.total, "review", "reviews")),
+            extra: format!(
+                r#"<div style="margin:12px 0 8px">{bar}</div><div class="t2" style="font-size:14px;line-height:22px;color:{t2}">{}</div>"#,
+                legend.join(""),
+                t2 = c::T2
+            ),
+            link_label: "View",
             link: format!("{APP}/reviewer/"),
         });
     }
-    if r.ci_fix_pushes > 0 {
-        out.push(Section {
-            title: "CI fixes",
-            stats: vec![
-                counted(r.ci_fix_pushes, "fix pushed", "fixes pushed", Tone::Plain),
-                counted(r.ci_fix_runs, "run fixed", "runs fixed", Tone::Plain),
-            ],
-            lines: vec![],
-            link_label: "See analytics",
+    let r = &sm.runs;
+    if r.ci_fix_pushes + r.ci_handed_off > 0 {
+        let mut parts = Vec::new();
+        if r.ci_fix_pushes > 0 {
+            parts.push(format!(
+                "{} on {}",
+                plural(r.ci_fix_pushes, "fix pushed", "fixes pushed"),
+                plural(r.ci_fix_runs, "PR", "PRs")
+            ));
+        }
+        if r.ci_handed_off > 0 {
+            parts.push(format!(
+                "{} handed to a person",
+                plural(r.ci_handed_off, "PR", "PRs")
+            ));
+        }
+        out.push(Detail {
+            name: "CI",
+            line: parts.join(" · "),
+            extra: String::new(),
+            link_label: "View",
             link: format!("{APP}/analytics/"),
         });
     }
     let a = &sm.alerts;
     if access >= Access::Member && a.received + a.recovered > 0 {
-        let mut stats = vec![
-            stat(num(a.received), "received", Tone::Plain),
-            stat(num(a.recovered), "recovered", Tone::Good),
-        ];
+        let mut line = format!(
+            "{} received · {} recovered",
+            num(a.received),
+            num(a.recovered)
+        );
         if a.runs_started > 0 {
-            stats.push(counted(
-                a.runs_started,
-                "run started",
-                "runs started",
-                Tone::Plain,
-            ));
+            let _ = write!(
+                line,
+                " · {}",
+                plural(a.runs_started, "run started", "runs started")
+            );
         }
-        out.push(Section {
-            title: "Alerts",
-            stats,
-            lines: vec![],
-            link_label: "See alerts",
+        out.push(Detail {
+            name: "Alerts",
+            line,
+            extra: String::new(),
+            link_label: "View",
             link: format!("{APP}/alerts/"),
         });
     }
     if sm.skill_reads + sm.agent_asks > 0 {
-        out.push(Section {
-            title: "Skills and agents",
-            stats: vec![
-                counted(sm.skill_reads, "skill read", "skill reads", Tone::Plain),
-                counted(sm.agent_asks, "agent ask", "agent asks", Tone::Plain),
-            ],
-            lines: vec![],
-            link_label: "See skill activity",
+        out.push(Detail {
+            name: "Skills",
+            line: format!(
+                "{} · {}",
+                plural(sm.skill_reads, "skill read", "skill reads"),
+                plural(sm.agent_asks, "agent ask", "agent asks")
+            ),
+            extra: String::new(),
+            link_label: "View",
             link: format!("{APP}/skills/?tab=activity&range=7d"),
         });
     }
     let l = &sm.lookups;
     if access >= Access::Admin && l.total > 0 {
         let problems = l.failed + l.refused;
-        let mut stats = vec![counted(l.total, "lookup", "lookups", Tone::Plain)];
-        stats.push(stat(
-            num(l.failed),
-            "failed",
-            if l.failed > 0 { Tone::Bad } else { Tone::Plain },
-        ));
-        stats.push(stat(num(l.refused), "refused", Tone::Plain));
-        let lines = if problems > 0 {
-            vec![(
-                format!(
-                    "Look at the {} that went wrong",
-                    plural(problems, "lookup", "lookups")
-                ),
-                Some(format!(
-                    "{APP}/data-sources/activity/?outcome=problems&range=7d"
-                )),
-            )]
-        } else {
-            vec![]
-        };
-        out.push(Section {
-            title: "Data source lookups",
-            stats,
-            lines,
-            link_label: "See lookups",
-            link: format!("{APP}/data-sources/activity/?range=7d"),
-        });
-    }
-    let u = &sm.usage;
-    if r.tokens > 0 || u.month_tokens > 0 {
-        let mut stats = vec![stat(tokens(r.tokens), "tokens this week", Tone::Plain)];
-        if r.cost_usd >= 0.01 {
-            stats.push(stat(
-                format!("${:.2}", r.cost_usd),
-                "cost this week",
-                Tone::Plain,
-            ));
-        }
-        let month_line = if u.limit_tokens > 0 {
-            let pct = (u.month_tokens as f64 / u.limit_tokens as f64 * 100.0).round() as u64;
-            stats.push(stat(
-                format!("{pct}%"),
-                format!("of the {} limit", u.month),
-                if pct >= 80 { Tone::Bad } else { Tone::Plain },
-            ));
-            format!(
-                "{} of {} tokens used in {}",
-                tokens(u.month_tokens),
-                tokens(u.limit_tokens),
-                u.month
+        let (link_label, link) = if problems > 0 {
+            (
+                "See problems",
+                format!("{APP}/data-sources/activity/?outcome=problems&range=7d"),
             )
         } else {
-            format!(
-                "{} tokens used in {}, no monthly limit set",
-                tokens(u.month_tokens),
-                u.month
-            )
+            ("View", format!("{APP}/data-sources/activity/?range=7d"))
         };
-        out.push(Section {
-            title: "Usage",
-            stats,
-            lines: vec![(month_line, None)],
-            link_label: "See the token limit",
-            link: format!("{APP}/settings/budget/"),
+        out.push(Detail {
+            name: "Data lookups",
+            line: format!(
+                "{} · {} failed · {} refused",
+                plural(l.total, "lookup", "lookups"),
+                num(l.failed),
+                num(l.refused)
+            ),
+            extra: String::new(),
+            link_label,
+            link,
         });
     }
     out
 }
 
+fn waiting_label(w: Waiting) -> &'static str {
+    match w {
+        Waiting::Input => "Needs your answer",
+        Waiting::Review => "Ready for review",
+    }
+}
+
+/// The section label above each block.
+fn h2(text: &str) -> String {
+    format!(
+        r#"<h2 class="t3" style="margin:0 0 4px;font-family:{FONT};font-size:13px;line-height:20px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:{t3};mso-line-height-rule:exactly">{}</h2>"#,
+        esc(text),
+        t3 = c::T3
+    )
+}
+
+fn more_link(label: &str, url: &str) -> String {
+    format!(
+        r#"<p style="margin:16px 0 0;font-size:15px;line-height:22px"><a href="{}" class="lk" style="color:{lk};font-weight:600;text-decoration:none">{}&nbsp;&rarr;</a></p>"#,
+        esc(url),
+        esc(label),
+        lk = c::LINK
+    )
+}
+
+/// A block of the card with space and a hairline above it.
+fn block(inner: &str) -> String {
+    format!(
+        r#"<tr><td class="px" style="padding:0 40px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td class="ln" style="padding:28px 0 0;border-top:1px solid {line}">{inner}</td></tr></table></td></tr><tr><td height="28" style="height:28px;font-size:0;line-height:0">&nbsp;</td></tr>"#,
+        line = c::BORDER
+    )
+}
+
+/// One linked PR or run: the title, then a quiet line under it.
+fn list_row(
+    title: &str,
+    url: &str,
+    meta: &str,
+    chip: Option<(&str, &str, &str, &str)>,
+    first: bool,
+) -> String {
+    let border = if first {
+        String::new()
+    } else {
+        format!("border-top:1px solid {};", c::BORDER)
+    };
+    let chip = chip
+        .map(|(text, bg, fg, class)| {
+            format!(
+                r#"<span class="{class}" style="display:inline-block;padding:0 8px;border-radius:999px;background:{bg};color:{fg};font-size:12px;line-height:20px;font-weight:600;white-space:nowrap">{}</span>&nbsp;&nbsp;"#,
+                esc(text)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<tr><td class="ln" style="padding:12px 0;{border}"><a href="{url}" class="t1" style="color:{t1};font-size:16px;line-height:24px;font-weight:600;text-decoration:none;word-break:break-word">{title}</a><div class="t3" style="margin-top:4px;font-size:14px;line-height:20px;color:{t3}">{chip}{meta}</div></td></tr>"#,
+        url = esc(url),
+        title = esc(title),
+        meta = esc(meta),
+        t1 = c::T1,
+        t3 = c::T3,
+    )
+}
+
+fn list(rows: &[String]) -> String {
+    format!(
+        r#"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:4px">{}</table>"#,
+        rows.join("")
+    )
+}
+
+fn stat_tile(cd: &Card, colspan: bool) -> String {
+    let span = if colspan {
+        r#" colspan="3""#
+    } else {
+        r#" width="48%""#
+    };
+    let note = cd
+        .note
+        .as_ref()
+        .map(|n| {
+            format!(
+                r#"<div class="t3" style="margin-top:2px;font-size:13px;line-height:18px;color:{t3}">{}</div>"#,
+                esc(n),
+                t3 = c::T3
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<td{span} valign="top" class="bg-tile tile" bgcolor="{tile}" style="padding:20px;background:{tile};border:1px solid {border};border-radius:12px"><div class="t1 num" style="font-size:32px;line-height:38px;font-weight:700;letter-spacing:-0.02em;color:{t1};font-variant-numeric:tabular-nums;mso-line-height-rule:exactly">{value}</div><div class="t2" style="margin-top:6px;font-size:15px;line-height:20px;font-weight:500;color:{t2}">{label}</div>{note}</td>"#,
+        tile = c::TILE,
+        border = c::BORDER,
+        t1 = c::T1,
+        t2 = c::T2,
+        value = esc(&cd.value),
+        label = esc(&cd.label),
+    )
+}
+
+fn stat_grid(cs: &[Card]) -> String {
+    let gap = r#"<td width="4%" style="width:4%;font-size:0;line-height:0">&nbsp;</td>"#;
+    let mut rows = Vec::new();
+    for pair in cs.chunks(2) {
+        match pair {
+            [a, b] => rows.push(format!(
+                "<tr>{}{gap}{}</tr>",
+                stat_tile(a, false),
+                stat_tile(b, false)
+            )),
+            [a] => rows.push(format!("<tr>{}</tr>", stat_tile(a, true))),
+            _ => {}
+        }
+    }
+    format!(
+        r#"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:separate">{}</table>"#,
+        rows.join(r#"<tr><td colspan="3" height="12" style="height:12px;font-size:0;line-height:0">&nbsp;</td></tr>"#)
+    )
+}
+
+/// A button Outlook on Windows draws too (VML), with the link everyone
+/// else gets.
+fn button(label: &str, url: &str) -> String {
+    let url = esc(url);
+    let label = esc(label);
+    format!(
+        r#"<!--[if mso]><v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="{url}" style="height:48px;v-text-anchor:middle;width:200px;" arcsize="17%" stroke="f" fillcolor="{bg}"><w:anchorlock/><center style="color:#fafafa;font-family:Arial,sans-serif;font-size:16px;font-weight:bold;">{label}</center></v:roundrect><![endif]--><!--[if !mso]><!--><a href="{url}" style="display:inline-block;background:{bg};color:#fafafa;font-family:{FONT};font-size:16px;line-height:48px;font-weight:600;text-align:center;text-decoration:none;padding:0 28px;border-radius:8px;white-space:nowrap;-webkit-text-size-adjust:none">{label}</a><!--<![endif]-->"#,
+        bg = c::BUTTON
+    )
+}
+
+/// The hidden line mail apps show next to the subject, padded so no body
+/// text leaks in after it.
+fn preheader(text: &str) -> String {
+    let filler = "&#8199;&#65279;&#847; ".repeat(90);
+    format!(
+        r#"<div style="display:none;max-height:0;max-width:0;overflow:hidden;mso-hide:all;font-size:1px;line-height:1px;opacity:0" aria-hidden="true">{}{filler}</div>"#,
+        esc(text)
+    )
+}
+
 pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
-    let secs = sections(sm, access);
-    let has_data = !secs.is_empty();
+    let r = &sm.runs;
+    let u = &sm.usage;
+    let cs = cards(sm, access);
+    let ds = details(sm, access);
+    let month_total = u.month_tokens.total();
+    let has_usage = r.tokens.total() > 0 || month_total > 0;
+    let has_data = !cs.is_empty() || !r.attention.is_empty() || !ds.is_empty() || has_usage;
     let when = period(sm.start, sm.end);
     let team = if sm.team_name.trim().is_empty() {
         "your team".to_string()
     } else {
         sm.team_name.trim().to_string()
     };
-    let subject = format!("Your Coderhelm week: {team}, {when}");
+    let fact = |cd: &Card| format!("{} {}", cd.value, cd.label);
+    let (subject, headline) = match cs.as_slice() {
+        [] => (
+            "Your Coderhelm week: a quiet one".to_string(),
+            "A quiet week on Coderhelm".to_string(),
+        ),
+        [a] => (
+            format!("Your Coderhelm week: {}", fact(a)),
+            format!("Your week on Coderhelm: {}", fact(a)),
+        ),
+        [a, b, ..] => (
+            format!("Your Coderhelm week: {} and {}", fact(a), fact(b)),
+            format!("Your week on Coderhelm: {}", fact(a)),
+        ),
+    };
+    let intro = if has_data {
+        format!("Here is what Coderhelm did for {team} this week.")
+    } else {
+        format!("Nothing happened in Coderhelm for {team} from {when}.")
+    };
+    let preview = if r.attention_total > 0 {
+        format!(
+            "{} waiting on you. {team}, {when}.",
+            plural(r.attention_total, "thing is", "things are")
+        )
+    } else {
+        let rest: Vec<String> = cs.iter().skip(2).map(fact).collect();
+        if rest.is_empty() {
+            format!("{team}, {when}.")
+        } else {
+            format!("Also {}. {team}, {when}.", rest.join(", "))
+        }
+    };
 
-    // Plain text.
-    let mut text = format!("Coderhelm weekly summary for {team}\n{when}\n");
+    // Usage lines, shared by both parts.
+    let month = &u.month;
+    let usage_head;
+    let mut usage_pct = None;
+    if u.limit_tokens > 0 {
+        let pct = (month_total as f64 / u.limit_tokens as f64 * 100.0).round() as u64;
+        usage_pct = Some(pct);
+        usage_head = format!(
+            "{} of {} tokens · {pct}%",
+            tokens(month_total),
+            tokens(u.limit_tokens)
+        );
+    } else {
+        usage_head = format!("{} tokens · no monthly limit set", tokens(month_total));
+    }
+    let month_line = format!(
+        "{} tokens in {month} so far · {}",
+        tokens(month_total),
+        token_split(&u.month_tokens)
+    );
+    let week_line = format!(
+        "{} tokens this week · {}",
+        tokens(r.tokens.total()),
+        token_split(&r.tokens)
+    );
+
+    // ── Plain text ──
+    let mut text = format!("{headline}\n{team} · {when}\n");
     if !has_data {
         text.push_str("\nNothing happened in Coderhelm this week.\n");
     }
-    for sec in &secs {
-        let _ = write!(text, "\n{}\n", sec.title.to_uppercase());
-        let parts: Vec<String> = sec
-            .stats
-            .iter()
-            .map(|s| format!("{} {}", s.value, s.label))
-            .collect();
-        let _ = writeln!(text, "{}", parts.join(" · "));
-        for (line, link) in &sec.lines {
-            match link {
-                Some(l) => {
-                    let _ = writeln!(text, "- {line}: {l}");
-                }
-                None => {
-                    let _ = writeln!(text, "- {line}");
-                }
+    if !cs.is_empty() {
+        text.push('\n');
+        for cd in &cs {
+            let _ = write!(text, "  {} {}", cd.value, cd.label);
+            if let Some(n) = &cd.note {
+                let _ = write!(text, " ({n})");
             }
+            text.push('\n');
         }
-        let _ = writeln!(text, "{}: {}", sec.link_label, sec.link);
+    }
+    if !r.attention.is_empty() {
+        text.push_str("\nNEEDS YOUR ATTENTION\n");
+        for a in &r.attention {
+            let meta = pr_meta(&a.repo, &a.url);
+            let _ = writeln!(
+                text,
+                "- {} ({}{})\n  {}",
+                title_or(&a.title, "Untitled run"),
+                waiting_label(a.why).to_lowercase(),
+                if meta.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {meta}")
+                },
+                a.url
+            );
+        }
+        let more = r.attention_total.saturating_sub(r.attention.len() as u64);
+        if more > 0 {
+            let _ = writeln!(text, "  and {} more: {APP}/", num(more));
+        }
+    }
+    if !r.top_merged.is_empty() {
+        text.push_str("\nMERGED THIS WEEK\n");
+        for p in &r.top_merged {
+            let meta = pr_meta(&p.repo, &p.url);
+            let _ = writeln!(
+                text,
+                "- {}{}\n  {}",
+                title_or(&p.title, &p.url),
+                if meta.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({meta})")
+                },
+                p.url
+            );
+        }
+        let more = r.merged.saturating_sub(r.top_merged.len() as u64);
+        if more > 0 {
+            let _ = writeln!(text, "  and {} more: {APP}/", num(more));
+        }
+    }
+    if !ds.is_empty() {
+        text.push_str("\nTHE REST OF THE WEEK\n");
+        for d in &ds {
+            let mut line = d.line.clone();
+            if d.name == "Reviews" {
+                let v = &sm.reviews;
+                let _ = write!(
+                    line,
+                    " ({} approved, {} changes requested, {} commented)",
+                    num(v.approve),
+                    num(v.request_changes),
+                    num(v.comment)
+                );
+            }
+            let _ = writeln!(text, "- {}: {line}\n  {}", d.name, d.link);
+        }
+    }
+    if has_usage {
+        let _ = writeln!(
+            text,
+            "\nTOKEN USAGE\n{usage_head}\n{month_line}\n{week_line}\nToken limit: {APP}/settings/budget/"
+        );
     }
     let _ = write!(
         text,
-        "\n--\nYou get this every Monday because the weekly summary is on for your \
-         Coderhelm account.\nUnsubscribe from weekly summaries: {unsubscribe_url}\n\
-         Email settings: {APP}/settings/notifications/\n"
+        "\nOpen Coderhelm: {APP}/\n\n--\nYou get this every Monday because weekly summaries are on \
+         for your Coderhelm account.\nManage notifications: {APP}/settings/notifications/\n\
+         Unsubscribe from weekly summaries: {unsubscribe_url}\nCoderhelm · https://coderhelm.com\n"
     );
 
-    // HTML: inline styles and tables, so it holds up in every mail app.
-    let mut body = String::new();
+    // ── HTML ──
+    let mut rows = String::new();
+    // Headline and intro.
     let _ = write!(
-        body,
-        "<h1 style=\"color:#fff;font-size:20px;line-height:1.3;margin:0 0 4px\">Your week in Coderhelm</h1>\
-         <p style=\"color:#888;font-size:14px;margin:0 0 8px\">{} · {}</p>",
-        esc(&team),
-        esc(&when)
+        rows,
+        r#"<tr><td class="px" style="padding:40px 40px 28px"><h1 class="t1 h1" style="margin:0;font-family:{FONT};font-size:28px;line-height:36px;font-weight:700;letter-spacing:-0.02em;color:{t1};mso-line-height-rule:exactly">{}</h1><p class="t2" style="margin:8px 0 0;font-size:16px;line-height:24px;color:{t2}">{}</p></td></tr>"#,
+        match cs.first() {
+            // The number and what it counts stay on one line.
+            Some(a) => format!(
+                "Your week on Coderhelm: {}",
+                esc(&fact(a)).replace(' ', "&nbsp;")
+            ),
+            None => no_orphan(&esc(&headline)),
+        },
+        no_orphan(&esc(&intro)),
+        t1 = c::T1,
+        t2 = c::T2,
     );
-    if !has_data {
-        body.push_str(
-            "<p style=\"color:#ccc;font-size:15px;line-height:1.6;margin:24px 0 0\">\
-             Nothing happened in Coderhelm this week.</p>",
+    if !cs.is_empty() {
+        let _ = write!(
+            rows,
+            r#"<tr><td class="px" style="padding:0 40px 28px">{}</td></tr>"#,
+            stat_grid(&cs)
         );
     }
-    for sec in &secs {
-        let _ = write!(
-            body,
-            "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" \
-             style=\"margin-top:24px;border-top:1px solid #222\"><tr><td style=\"padding-top:20px\">\
-             <h2 style=\"color:#fff;font-size:15px;margin:0 0 12px;font-weight:600\">{}</h2>",
-            esc(sec.title)
-        );
-        // Stats as inline blocks: side by side on a wide screen, wrapping on a phone.
-        for st in &sec.stats {
+    if !r.attention.is_empty() {
+        let items: Vec<String> = r
+            .attention
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let chip = match a.why {
+                    Waiting::Input => ("Needs your answer", "#fef3c7", "#92400e", "chip-i"),
+                    Waiting::Review => ("Ready for review", "#dbeafe", "#1e40af", "chip-r"),
+                };
+                list_row(
+                    &title_or(&a.title, "Untitled run"),
+                    &a.url,
+                    &pr_meta(&a.repo, &a.url),
+                    Some(chip),
+                    i == 0,
+                )
+            })
+            .collect();
+        let more = r.attention_total.saturating_sub(r.attention.len() as u64);
+        let tail = if more > 0 {
+            more_link(&format!("and {} more", num(more)), &format!("{APP}/"))
+        } else {
+            String::new()
+        };
+        rows.push_str(&block(&format!(
+            "{}{}{tail}",
+            h2("Needs your attention"),
+            list(&items)
+        )));
+    }
+    if !r.top_merged.is_empty() {
+        let items: Vec<String> = r
+            .top_merged
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                list_row(
+                    &title_or(&p.title, &p.url),
+                    &p.url,
+                    &pr_meta(&p.repo, &p.url),
+                    None,
+                    i == 0,
+                )
+            })
+            .collect();
+        let more = r.merged.saturating_sub(r.top_merged.len() as u64);
+        let tail = if more > 0 {
+            more_link(&format!("and {} more", num(more)), &format!("{APP}/"))
+        } else {
+            more_link("See all runs", &format!("{APP}/"))
+        };
+        rows.push_str(&block(&format!(
+            "{}{}{tail}",
+            h2("Merged this week"),
+            list(&items)
+        )));
+    }
+    if !ds.is_empty() {
+        let mut inner = String::new();
+        for (i, d) in ds.iter().enumerate() {
+            let border = if i == 0 {
+                String::new()
+            } else {
+                format!("border-top:1px solid {};", c::BORDER)
+            };
             let _ = write!(
-                body,
-                "<div style=\"display:inline-block;vertical-align:top;min-width:96px;margin:0 16px 12px 0\">\
-                 <div style=\"color:{};font-size:22px;font-weight:700;line-height:1.2\">{}</div>\
-                 <div style=\"color:#888;font-size:13px;line-height:1.4\">{}</div></div>",
-                st.tone.color(),
-                esc(&st.value),
-                esc(&st.label)
+                inner,
+                r#"<tr><td class="ln" style="padding:14px 0;{border}"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td valign="top" class="t1" style="font-size:16px;line-height:24px;font-weight:600;color:{t1}">{name}</td><td valign="top" align="right" style="font-size:14px;line-height:24px;white-space:nowrap;padding-left:12px"><a href="{link}" class="lk" style="color:{lk};font-weight:600;text-decoration:none">{label}&nbsp;&rarr;</a></td></tr><tr><td colspan="2" class="t2" style="padding-top:2px;font-size:15px;line-height:22px;color:{t2}">{line}{extra}</td></tr></table></td></tr>"#,
+                name = esc(d.name),
+                link = esc(&d.link),
+                label = esc(d.link_label),
+                line = esc(&d.line),
+                extra = d.extra,
+                t1 = c::T1,
+                t2 = c::T2,
+                lk = c::LINK,
             );
         }
-        if !sec.lines.is_empty() {
-            body.push_str("<ul style=\"margin:4px 0 0;padding-left:18px\">");
-            for (line, link) in &sec.lines {
-                match link {
-                    Some(l) => {
-                        let _ = write!(
-                            body,
-                            "<li style=\"color:#ccc;font-size:14px;line-height:1.6\"><a href=\"{}\" style=\"color:#60a5fa;text-decoration:none\">{}</a></li>",
-                            esc(l),
-                            esc(line)
-                        );
-                    }
-                    None => {
-                        let _ = write!(
-                            body,
-                            "<li style=\"color:#ccc;font-size:14px;line-height:1.6\">{}</li>",
-                            esc(line)
-                        );
-                    }
-                }
-            }
-            body.push_str("</ul>");
-        }
-        let _ = write!(
-            body,
-            "<p style=\"margin:12px 0 0\"><a href=\"{}\" style=\"color:#60a5fa;font-size:14px;text-decoration:none\">{} &rarr;</a></p>\
-             </td></tr></table>",
-            esc(&sec.link),
-            esc(sec.link_label)
-        );
+        rows.push_str(&block(&format!(
+            r#"{}<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:4px">{inner}</table>"#,
+            h2("The rest of the week")
+        )));
     }
+    if has_usage {
+        let (big, small) = match u.limit_tokens {
+            0 => (
+                tokens(month_total),
+                "tokens · no monthly limit set".to_string(),
+            ),
+            limit => (
+                tokens(month_total),
+                format!("of {} tokens · {}%", tokens(limit), usage_pct.unwrap_or(0)),
+            ),
+        };
+        let bar = usage_pct
+            .map(|pct| {
+                let color = match pct {
+                    0..=79 => c::BLUE,
+                    80..=99 => c::AMBER,
+                    _ => c::RED,
+                };
+                format!(
+                    r#"<div style="margin:12px 0 0">{}</div>"#,
+                    meter(pct, color)
+                )
+            })
+            .unwrap_or_default();
+        rows.push_str(&block(&format!(
+            r#"{h}<p style="margin:4px 0 0;font-size:16px;line-height:28px"><span class="t1" style="font-size:22px;font-weight:700;color:{t1};font-variant-numeric:tabular-nums">{big}</span> <span class="t2" style="color:{t2}">{small}</span></p>{bar}{split}{more}"#,
+            h = h2("Token usage"),
+            big = esc(&big),
+            small = esc(&small),
+            split = token_table(&r.tokens, &u.month_tokens, month),
+            more = more_link("Token limit", &format!("{APP}/settings/budget/")),
+            t1 = c::T1,
+            t2 = c::T2,
+        )));
+    }
+    let _ = write!(
+        rows,
+        r#"<tr><td class="px" style="padding:4px 40px 40px">{}</td></tr>"#,
+        button("Open Coderhelm", &format!("{APP}/"))
+    );
+
     let html = format!(
-        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <meta name=\"color-scheme\" content=\"dark\"><title>{title}</title></head>\
-         <body style=\"margin:0;padding:0;background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif\">\
-         <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#0a0a0a\"><tr><td align=\"center\" style=\"padding:32px 12px\">\
-         <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:600px;background:#111;border-radius:8px;border:1px solid #222\">\
-         <tr><td style=\"padding:32px 28px 24px\">\
-         <img src=\"https://coderhelm.com/favicon.svg\" width=\"32\" height=\"32\" alt=\"Coderhelm\" style=\"display:block;margin-bottom:24px\">\
-         {body}\
-         <a href=\"{app}/\" style=\"display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;font-size:14px;margin-top:28px\">Open Coderhelm</a>\
-         <p style=\"color:#666;font-size:12px;line-height:1.6;margin-top:32px;padding-top:16px;border-top:1px solid #222\">\
-         You get this every Monday because the weekly summary is on for your Coderhelm account.<br>\
-         <a href=\"{unsub}\" style=\"color:#888\">Unsubscribe from weekly summaries</a> · \
-         <a href=\"{app}/settings/notifications/\" style=\"color:#888\">Email settings</a> · \
-         <a href=\"https://coderhelm.com/privacy\" style=\"color:#888\">Privacy</a></p>\
-         </td></tr></table></td></tr></table></body></html>",
+        r#"<!DOCTYPE html>
+<html lang="en" dir="ltr" xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="x-apple-disable-message-reformatting">
+<meta name="format-detection" content="telephone=no,date=no,address=no,email=no,url=no">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<title>{title}</title>
+<!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><style>td,th,div,p,a,h1,h2{{font-family:Arial,sans-serif;mso-line-height-rule:exactly}}</style><![endif]-->
+<style>{base}</style>
+<style>{dark}</style>
+<style>{ogsc}</style>
+</head>
+<body class="body bg-page" xml:lang="en" style="margin:0;padding:0;background:{page};word-spacing:normal">
+{pre}
+<div role="article" aria-roledescription="email" aria-label="{title}" lang="en" dir="ltr" style="font-family:{FONT};font-size:16px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="bg-page" bgcolor="{page}" style="width:100%;background:{page}"><tr><td align="center" style="padding:32px 16px 40px">
+<!--[if mso]><table role="presentation" width="600" align="center" cellpadding="0" cellspacing="0" border="0"><tr><td><![endif]-->
+<div style="max-width:600px;margin:0 auto">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+<td style="padding:0 4px 20px;font-family:{MONO};font-size:18px;line-height:24px;font-weight:700;white-space:nowrap"><span class="t1" style="color:{t1};letter-spacing:-0.08em">/</span><span style="color:{blue};letter-spacing:-0.08em">/</span><span class="t1" style="color:{t1};letter-spacing:-0.08em">/</span>&nbsp;<span class="t1" style="color:{t1};letter-spacing:-0.02em">Coderhelm</span></td>
+<td align="right" class="t3" style="padding:0 4px 20px;font-size:13px;line-height:24px;color:{t3}">{when}</td>
+</tr></table>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="bg-card" bgcolor="{card}" style="width:100%;background:{card};border:1px solid {border};border-radius:16px;border-collapse:separate">
+{rows}
+</table>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" class="t3" style="padding:28px 24px 0;font-size:13px;line-height:20px;color:{t3}">
+<p style="margin:0">You get this every Monday because weekly summaries are on for your Coderhelm account.</p>
+<p style="margin:8px 0 0"><a href="{app}/settings/notifications/" class="t2" style="color:{t2};text-decoration:underline;white-space:nowrap">Manage notifications</a> &nbsp;·&nbsp; <a href="{unsub}" class="t2" style="color:{t2};text-decoration:underline;white-space:nowrap">Unsubscribe from weekly summaries</a></p>
+<p style="margin:16px 0 0">Coderhelm&nbsp;·&nbsp;<a href="https://coderhelm.com" class="t3" style="color:{t3};text-decoration:none">coderhelm.com</a>&nbsp;·&nbsp;<a href="https://coderhelm.com/privacy" class="t3" style="color:{t3};text-decoration:none">Privacy</a></p>
+</td></tr></table>
+</div>
+<!--[if mso]></td></tr></table><![endif]-->
+</td></tr></table>
+</div>
+</body>
+</html>"#,
         title = esc(&subject),
+        base = BASE_CSS,
+        dark = DARK_CSS,
+        ogsc = OGSC_CSS,
+        pre = preheader(&preview),
+        page = c::PAGE,
+        card = c::CARD,
+        border = c::BORDER,
+        t1 = c::T1,
+        t2 = c::T2,
+        t3 = c::T3,
+        blue = c::BLUE,
+        when = esc(&when),
         app = APP,
         unsub = esc(unsubscribe_url),
     );
@@ -748,8 +1414,9 @@ async fn load_runs(
             .expression_attribute_values(":lo", av(&lo))
             .expression_attribute_values(":hi", av(&hi))
             .projection_expression(
-                "created_at, #s, repo, title, cost_usd, tokens_in, tokens_out, pr_number, \
-                 pr_url, ci_fix_commits, pr_outcome, merged_at",
+                "run_id, created_at, #s, repo, title, tokens_in, tokens_out, \
+                 cache_read_tokens, cache_write_tokens, pr_number, pr_url, ci_fix_commits, \
+                 ci_fix_attempts, ci_last, handoff_notified, pr_outcome, merged_at",
             )
             .expression_attribute_names("#s", "status")
             .set_exclusive_start_key(start.take())
@@ -788,9 +1455,13 @@ async fn load_usage(state: &WorkerState, team: &str, end: DateTime<Utc>) -> Resu
     Ok(Usage {
         month: end.format("%B %Y").to_string(),
         month_tokens: m
-            .map(|i| (n(i, "total_tokens_in") + n(i, "total_tokens_out")) as u64)
-            .unwrap_or(0),
-        month_cost_usd: m.map(|i| n(i, "total_cost_usd")).unwrap_or(0.0),
+            .map(|i| Tokens {
+                input: n(i, "total_tokens_in") as u64,
+                cache_read: n(i, "cache_read_tokens") as u64,
+                cache_write: n(i, "cache_write_tokens") as u64,
+                output: n(i, "total_tokens_out") as u64,
+            })
+            .unwrap_or_default(),
         limit_tokens: limit.item().map(|i| n(i, "max_tokens") as u64).unwrap_or(0),
     })
 }
@@ -1116,6 +1787,14 @@ mod tests {
         (end - Duration::days(7), end)
     }
 
+    fn pr(title: &str, repo: &str, n: u64) -> MergedPr {
+        MergedPr {
+            title: title.into(),
+            url: format!("https://github.com/{repo}/pull/{n}"),
+            repo: repo.into(),
+        }
+    }
+
     fn sample() -> Summary {
         let (start, end) = week();
         Summary {
@@ -1123,26 +1802,46 @@ mod tests {
             start,
             end,
             runs: RunStats {
-                started: 12,
-                merged: 7,
+                started: 16,
+                completed: 12,
+                merged: 14,
                 open: 3,
                 failed: 2,
                 top_merged: vec![
-                    MergedPr {
-                        title: "Add retry to the webhook sender".into(),
-                        url: "https://github.com/example/api/pull/41".into(),
-                        repo: "example/api".into(),
-                    },
-                    MergedPr {
-                        title: "Fix <script> escaping & quotes".into(),
-                        url: "https://github.com/example/web/pull/9".into(),
-                        repo: "example/web".into(),
-                    },
+                    pr("Add retry to the webhook sender", "example/api", 41),
+                    pr("Fix <script> escaping & quotes", "example/web", 9),
+                    pr("Cache the pricing page query", "example/web", 12),
+                    pr("Move session cleanup to a nightly job", "example/api", 44),
+                    pr(
+                        "Bump the image library to the patched release",
+                        "example/mobile",
+                        230,
+                    ),
                 ],
                 ci_fix_pushes: 4,
                 ci_fix_runs: 3,
-                tokens: 2_350_000,
-                cost_usd: 18.4,
+                ci_handed_off: 1,
+                attention: vec![
+                    Attention {
+                        title: "Show billing errors on the settings page".into(),
+                        repo: "example/web".into(),
+                        url: "https://github.com/example/web/pull/15".into(),
+                        why: Waiting::Review,
+                    },
+                    Attention {
+                        title: "Which region should the new queue live in?".into(),
+                        repo: "example/api".into(),
+                        url: format!("{APP}/runs/detail/?id=01JABC"),
+                        why: Waiting::Input,
+                    },
+                ],
+                attention_total: 2,
+                tokens: Tokens {
+                    input: 1_100_000,
+                    cache_read: 61_400_000,
+                    cache_write: 8_800_000,
+                    output: 1_000_000,
+                },
             },
             reviews: ReviewStats {
                 total: 9,
@@ -1163,10 +1862,52 @@ mod tests {
                 refused: 1,
             },
             usage: Usage {
-                month: "October 2026".into(),
-                month_tokens: 8_200_000,
-                month_cost_usd: 61.0,
-                limit_tokens: 10_000_000,
+                month: "October".into(),
+                month_tokens: Tokens {
+                    input: 2_000_000,
+                    cache_read: 100_000_000,
+                    cache_write: 14_000_000,
+                    output: 2_000_000,
+                },
+                limit_tokens: 200_000_000,
+            },
+        }
+    }
+
+    /// A week with almost nothing in it.
+    fn sparse() -> Summary {
+        let (start, end) = week();
+        Summary {
+            team_name: "Quiet Team".into(),
+            start,
+            end,
+            runs: RunStats {
+                started: 1,
+                completed: 1,
+                merged: 1,
+                top_merged: vec![pr("Fix a typo in the README", "example/docs", 3)],
+                tokens: Tokens {
+                    input: 40_000,
+                    cache_read: 300_000,
+                    cache_write: 50_000,
+                    output: 10_000,
+                },
+                ..Default::default()
+            },
+            reviews: ReviewStats::default(),
+            alerts: AlertStats::default(),
+            skill_reads: 0,
+            agent_asks: 0,
+            lookups: LookupStats::default(),
+            usage: Usage {
+                month: "October".into(),
+                month_tokens: Tokens {
+                    input: 40_000,
+                    cache_read: 300_000,
+                    cache_write: 50_000,
+                    output: 10_000,
+                },
+                limit_tokens: 0,
             },
         }
     }
@@ -1179,6 +1920,7 @@ mod tests {
         let rows = vec![
             // Started this week, merged this week.
             item(&[
+                ("run_id", "r1"),
                 ("created_at", "2026-10-14T10:00:00Z"),
                 ("status", "merged"),
                 ("pr_number", "#5"),
@@ -1187,8 +1929,11 @@ mod tests {
                 ("merged_at", "2026-10-16T10:00:00Z"),
                 ("tokens_in", "#1000"),
                 ("tokens_out", "#500"),
-                ("cost_usd", "#1.5"),
+                ("cache_read_tokens", "#7000"),
+                ("cache_write_tokens", "#300"),
                 ("ci_fix_commits", "#2"),
+                ("ci_fix_attempts", "#2"),
+                ("ci_last", "passed"),
             ]),
             // Started weeks ago, merged this week.
             item(&[
@@ -1201,11 +1946,15 @@ mod tests {
                 ("merged_at", "2026-10-13T10:00:00Z"),
                 ("tokens_in", "#99999"),
             ]),
-            // Open PR this week.
+            // Open PR this week, waiting on review; CI was left red.
             item(&[
                 ("created_at", "2026-10-15T10:00:00Z"),
                 ("status", "completed"),
                 ("pr_number", "#6"),
+                ("pr_url", "https://github.com/x/y/pull/6"),
+                ("title", "Waiting"),
+                ("ci_fix_attempts", "#3"),
+                ("ci_last", "failed"),
             ]),
             // Closed without merging: neither open nor merged.
             item(&[
@@ -1215,6 +1964,13 @@ mod tests {
                 ("pr_number", "#7"),
             ]),
             item(&[("created_at", "2026-10-17T10:00:00Z"), ("status", "failed")]),
+            // Asked a question two weeks ago and still waiting.
+            item(&[
+                ("run_id", "r9"),
+                ("created_at", "2026-10-03T10:00:00Z"),
+                ("status", "needs_input"),
+                ("title", "Asks"),
+            ]),
             // Merged last week: not this week's.
             item(&[
                 ("created_at", "2026-10-01T10:00:00Z"),
@@ -1224,12 +1980,32 @@ mod tests {
             ]),
         ];
         let r = run_stats(&rows, start, end);
-        assert_eq!((r.started, r.merged, r.open, r.failed), (4, 2, 1, 1));
+        assert_eq!(
+            (r.started, r.completed, r.merged, r.open, r.failed),
+            (4, 3, 2, 1, 1)
+        );
         assert_eq!(r.top_merged.len(), 2);
         assert_eq!(r.top_merged[0].title, "Newer");
-        assert_eq!((r.ci_fix_pushes, r.ci_fix_runs), (2, 1));
-        assert_eq!(r.tokens, 1500);
-        assert!((r.cost_usd - 1.5).abs() < 1e-9);
+        assert_eq!((r.ci_fix_pushes, r.ci_fix_runs, r.ci_handed_off), (2, 1, 1));
+        assert_eq!(
+            r.tokens,
+            Tokens {
+                input: 1000,
+                cache_read: 7000,
+                cache_write: 300,
+                output: 500
+            }
+        );
+        assert_eq!(r.tokens.total(), 8800);
+        assert_eq!(r.attention_total, 2);
+        assert_eq!(r.attention[0].title, "Waiting");
+        assert_eq!(r.attention[0].why, Waiting::Review);
+        assert_eq!(r.attention[0].url, "https://github.com/x/y/pull/6");
+        assert_eq!(r.attention[1].why, Waiting::Input);
+        assert_eq!(
+            r.attention[1].url,
+            "https://app.coderhelm.com/runs/detail/?id=r9"
+        );
     }
 
     #[test]
@@ -1268,24 +2044,46 @@ mod tests {
     }
 
     #[test]
+    fn no_money_anywhere_in_the_email() {
+        for sm in [sample(), sparse()] {
+            for access in [Access::Admin, Access::Member, Access::Viewer] {
+                let e = render(&sm, access, LINK);
+                for (part, body) in [
+                    ("subject", &e.subject),
+                    ("html", &e.html),
+                    ("text", &e.text),
+                ] {
+                    let lower = body.to_lowercase();
+                    assert!(!body.contains('$'), "{part} has a $");
+                    for word in ["cost", "spend", "spent", "usd", "price", "dollar"] {
+                        assert!(!lower.contains(word), "{part} says {word}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn lookups_are_for_admins_and_alerts_for_members() {
         let sm = sample();
         let admin = render(&sm, Access::Admin, LINK);
         let member = render(&sm, Access::Member, LINK);
         let viewer = render(&sm, Access::Viewer, LINK);
         for e in [&admin.html, &admin.text] {
-            assert!(e.contains("Data source lookups") || e.contains("DATA SOURCE LOOKUPS"));
+            assert!(e.contains("Data lookups"));
             assert!(
                 e.contains("outcome=problems&amp;range=7d")
                     || e.contains("outcome=problems&range=7d")
             );
         }
         for e in [&member.html, &member.text, &viewer.html, &viewer.text] {
-            assert!(!e.to_lowercase().contains("lookups"), "{e}");
+            assert!(!e.to_lowercase().contains("lookup"), "{e}");
         }
         assert!(member.html.contains(">Alerts<"));
+        assert!(member.html.contains("alerts handled"));
         assert!(!viewer.html.contains(">Alerts<"));
-        assert!(viewer.html.contains(">Runs<"));
+        assert!(!viewer.html.contains("alerts handled"));
+        assert!(viewer.html.contains("Merged this week"));
     }
 
     #[test]
@@ -1309,14 +2107,16 @@ mod tests {
         };
         let e = render(&sm, Access::Admin, LINK);
         assert!(e.has_data);
-        assert!(e.html.contains("PR reviews"));
+        assert!(e.html.contains(">Reviews<"));
+        assert_eq!(e.subject, "Your Coderhelm week: 1 PR reviewed");
         for gone in [
-            ">Runs<",
-            "CI fixes",
+            "Needs your attention",
+            "Merged this week",
+            ">CI<",
             ">Alerts<",
-            "Skills and agents",
-            "lookups",
-            ">Usage<",
+            ">Skills<",
+            "Data lookups",
+            "Token usage",
         ] {
             assert!(!e.html.contains(gone), "{gone}");
         }
@@ -1338,9 +2138,11 @@ mod tests {
             "https://app.coderhelm.com/analytics/",
             "https://app.coderhelm.com/alerts/",
             "https://app.coderhelm.com/skills/?tab=activity&amp;range=7d",
-            "https://app.coderhelm.com/data-sources/activity/?range=7d",
             "https://app.coderhelm.com/settings/budget/",
+            "https://app.coderhelm.com/settings/notifications/",
+            "https://app.coderhelm.com/runs/detail/?id=01JABC",
             "https://github.com/example/api/pull/41",
+            "https://github.com/example/web/pull/15",
         ] {
             assert!(e.html.contains(link), "{link}");
         }
@@ -1351,14 +2153,63 @@ mod tests {
             .contains(&format!("Unsubscribe from weekly summaries: {LINK}")));
         assert_eq!(
             e.subject,
-            "Your Coderhelm week: Example Team, Oct 12 – Oct 19, 2026"
+            "Your Coderhelm week: 14 PRs merged and 12 runs completed"
         );
+        assert!(e
+            .html
+            .contains("Your week on Coderhelm: 14&nbsp;PRs&nbsp;merged"));
+        assert!(e.html.contains("Oct 12 – 19, 2026"));
+        // Five merged PRs by name, the rest counted.
+        assert!(e.html.contains("and 9 more"));
+        assert!(e.html.contains("example/api · #41"));
         // Titles are escaped, not markup.
         assert!(e.html.contains("Fix &lt;script&gt; escaping &amp; quotes"));
         assert!(!e.html.contains("<script>"));
-        // Usage against the limit.
-        assert!(e.text.contains("8.2M of 10.0M tokens used in October 2026"));
-        assert!(e.html.contains("82%"));
+        // Tokens against the limit, split the same way everywhere.
+        assert!(e.text.contains("118M of 200M tokens · 59%"));
+        assert!(e.html.contains("of 200M tokens · 59%"));
+        let split = "72.3M tokens this week · 1.1M new input · 61.4M read from cache · \
+                     8.8M written to cache · 1M output";
+        assert!(e.text.contains(split), "{}", e.text);
+        assert!(e.html.contains("Read from cache") && e.html.contains("61.4M"));
+        // Waiting on a person.
+        assert!(e.html.contains("Ready for review"));
+        assert!(e.html.contains("Needs your answer"));
+        assert!(
+            e.text.contains("2 things are waiting on you")
+                || e.html.contains("2 things are waiting on you")
+        );
+    }
+
+    #[test]
+    fn the_html_is_built_for_mail_apps() {
+        for sm in [sample(), sparse()] {
+            let e = render(&sm, Access::Admin, LINK);
+            let h = &e.html;
+            // Gmail clips messages over about 100KB.
+            assert!(h.len() < 60_000, "{} bytes", h.len());
+            assert!(h.contains(r#"<html lang="en""#));
+            assert!(h.contains(r#"name="color-scheme" content="light dark""#));
+            assert!(h.contains(r#"name="supported-color-schemes""#));
+            assert!(h.contains("prefers-color-scheme: dark"));
+            assert!(h.contains("[data-ogsc]"));
+            assert!(h.contains("v:roundrect"));
+            assert!(h.contains(r#"aria-hidden="true""#));
+            assert!(h.contains("<h1"));
+            // Every table is for layout except the token split, and nothing needs an image.
+            assert_eq!(
+                h.matches("<table").count(),
+                h.matches(r#"<table role="presentation""#).count()
+                    + h.matches(r#"<table class="tokens""#).count()
+            );
+            assert!(!h.contains("<img"));
+            assert!(!h.contains("background-image"));
+            // No pure white or black backgrounds to fight forced dark mode.
+            assert!(!h.contains("background:#ffffff") && !h.contains("background:#000000"));
+            // The plain text part stands on its own.
+            assert!(!e.text.contains("<td") && !e.text.contains("<a "));
+            assert!(e.text.contains("https://app.coderhelm.com/"));
+        }
     }
 
     #[test]
@@ -1399,7 +2250,21 @@ mod tests {
         assert_eq!(num(1234567), "1,234,567");
         assert_eq!(tokens(9_999), "9,999");
         assert_eq!(tokens(45_600), "46K");
+        assert_eq!(tokens(999_600), "1M");
         assert_eq!(tokens(2_350_000), "2.4M");
+        assert_eq!(tokens(20_000_000), "20M");
+        assert_eq!(tokens(1_250_000_000), "1.2B");
+        assert_eq!(pr_number("https://github.com/a/b/pull/41"), Some(41));
+        assert_eq!(
+            pr_number("https://app.coderhelm.com/runs/detail/?id=x"),
+            None
+        );
+        let (start, end) = week();
+        assert_eq!(period(start, end), "Oct 12 – 19, 2026");
+        assert_eq!(
+            period(start - Duration::days(14), end - Duration::days(14)),
+            "Sep 28 – Oct 5, 2026"
+        );
         assert_eq!(week_key(week().1), "2026-W43");
         assert_eq!(Access::from_role("owner"), Access::Admin);
         assert_eq!(Access::from_role(""), Access::Member);
@@ -1407,15 +2272,23 @@ mod tests {
     }
 
     /// `WEEKLY_SUMMARY_PREVIEW=/path/dir cargo test -p worker weekly_summary_preview -- --ignored`
-    /// writes the sample email as HTML and text, to look at in a browser.
+    /// writes sample emails as HTML and text, to look at in a browser.
     #[test]
     #[ignore]
     fn weekly_summary_preview() {
         let dir = std::env::var("WEEKLY_SUMMARY_PREVIEW").expect("WEEKLY_SUMMARY_PREVIEW dir");
-        let e = render(&sample(), Access::Admin, LINK);
-        std::fs::write(format!("{dir}/weekly-summary.html"), &e.html).unwrap();
-        std::fs::write(format!("{dir}/weekly-summary.txt"), &e.text).unwrap();
-        let m = render(&sample(), Access::Member, LINK);
-        std::fs::write(format!("{dir}/weekly-summary-member.html"), &m.html).unwrap();
+        for (name, sm, access) in [
+            ("full", sample(), Access::Admin),
+            ("member", sample(), Access::Member),
+            ("sparse", sparse(), Access::Admin),
+        ] {
+            let e = render(&sm, access, LINK);
+            std::fs::write(format!("{dir}/weekly-summary-{name}.html"), &e.html).unwrap();
+            std::fs::write(
+                format!("{dir}/weekly-summary-{name}.txt"),
+                format!("Subject: {}\n\n{}", e.subject, e.text),
+            )
+            .unwrap();
+        }
     }
 }
