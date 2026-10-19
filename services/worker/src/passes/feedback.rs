@@ -454,6 +454,20 @@ Rules:
         tools.extend(l.tools());
         full_system.push_str(&l.prompt_section());
     }
+    // Repository history through the GitHub App: no setup.
+    let history = super::github_history::GithubHistory::new(
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        plan::fetch_team_repos(state, &msg.team_id).await,
+        "coder",
+        msg.pr_number,
+    )
+    .with_run(
+        &msg.run_id,
+        format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
+    );
+    tools.push(super::github_history::tool());
+    full_system.push_str(super::github_history::prompt_line());
     // The team's own written skills, read-only guidance.
     let skills = super::skills::TeamSkills::load(
         state,
@@ -481,6 +495,7 @@ Rules:
         base_branch: &base,
         files_modified: std::sync::Mutex::new(false),
         scope_guard,
+        history: Some(&history),
         live: live.as_ref(),
         skills: skills.as_ref(),
         state,
@@ -1275,6 +1290,8 @@ struct FeedbackToolExecutor<'a> {
     /// Ticket-scope guard: CI-only cycles may only write files the PR already
     /// changed (bounded escape). Human-directed feedback is unscoped.
     scope_guard: super::write_guard::ScopeGuard,
+    /// Repository history (commits, blame, pull requests, releases, deploys).
+    history: Option<&'a super::github_history::GithubHistory>,
     /// The team's connected live systems, read-only.
     live: Option<&'a super::live_sources::LiveSources>,
     /// The team's written skills, read-only.
@@ -1289,6 +1306,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(history) = self.history {
+            if let Some(out) = history.handle(self.state, self.github, name, input).await {
+                return Ok(serde_json::json!(out));
+            }
+        }
         if let Some(live) = self.live {
             if let Some(out) = live.handle(self.state, name, input).await {
                 return Ok(serde_json::json!(out));

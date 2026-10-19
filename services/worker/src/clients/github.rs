@@ -1536,6 +1536,43 @@ impl GitHubClient {
         Ok(out)
     }
 
+    // ─── History (read-only) ───────────────────────────────────
+
+    /// GET a path under `/repos/{owner}/{repo}/` (built by the history tool
+    /// from checked inputs). Only ever a GET.
+    pub async fn get_repo_path(
+        &self,
+        owner: &str,
+        repo: &str,
+        rest: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/{}",
+            rest.trim_start_matches('/')
+        );
+        self.get(&url).await
+    }
+
+    /// One GraphQL query, refused unless it only reads.
+    pub async fn graphql_read(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let read = common::live::graphql::check_read_only(query).map_err(|e| e.message)?;
+        let v = self
+            .post(
+                &format!("{API_BASE}/graphql"),
+                &serde_json::json!({ "query": read.text, "variables": variables }),
+            )
+            .await?;
+        if let Some(errs) = v["errors"].as_array().filter(|e| !e.is_empty()) {
+            let msg: Vec<&str> = errs.iter().filter_map(|e| e["message"].as_str()).collect();
+            return Err(msg.join("; ").into());
+        }
+        Ok(v["data"].clone())
+    }
+
     // ─── Pull requests ─────────────────────────────────────────
 
     /// Get a single pull request.

@@ -354,6 +354,14 @@ pub async fn run(
             Some(l) => format!("{system}{}", l.prompt_section()),
             None => system,
         };
+        let history = super::github_history::GithubHistory::new(
+            &msg.team_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            super::plan::fetch_team_repos(state, &msg.team_id).await,
+            "reviewer",
+            msg.pr_number,
+        );
+        let system = format!("{system}{}", super::github_history::prompt_line());
         let skills = super::skills::TeamSkills::load(
             state,
             &msg.team_id,
@@ -377,10 +385,12 @@ pub async fn run(
             head_sha: &head_sha,
             state,
             graph: None,
+            history: Some(&history),
             live: live.as_ref(),
             skills: skills.as_ref(),
         };
         let mut tools = review_agent::review_tools();
+        tools.push(super::github_history::tool());
         if let Some(l) = &live {
             tools.extend(l.tools());
         }
@@ -632,6 +642,14 @@ pub async fn run(
     };
     let prior_context = format!("{prior_context}{label_context}{tests_context}");
 
+    // Repository history through the GitHub App: no setup.
+    let history = super::github_history::GithubHistory::new(
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        super::plan::fetch_team_repos(state, &msg.team_id).await,
+        "reviewer",
+        msg.pr_number,
+    );
     // Live systems the team connected for this repo, if any.
     let live = super::live_sources::LiveSources::load(
         state,
@@ -665,6 +683,7 @@ pub async fn run(
         graph.as_ref(),
         &extra_context,
         &prior_context,
+        Some(&history),
         live.as_ref(),
         skills.as_ref(),
         &mut usage,
