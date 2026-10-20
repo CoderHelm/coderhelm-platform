@@ -28,6 +28,7 @@ use common::live::connectors::{self, ConnKind, Connector, MAX_CALLS_PER_RUN, MAX
 use common::live::http::Https;
 use common::live::newrelic::NewRelic;
 use common::live::opensearch::OpenSearch;
+use common::live::rest::Rest;
 use common::live::store::{self, Activity, RunRef};
 use common::live::{airflow, identity, metrics, secret, StepError};
 use serde_json::{json, Value};
@@ -265,6 +266,7 @@ pub fn tool_names(kind: ConnKind, conn: &Connector) -> Vec<String> {
             "opensearch_search",
             "opensearch_count",
         ],
+        ConnKind::Rest => &["rest_get"],
         ConnKind::Metrics => &["metrics_list", "metrics_query"],
         ConnKind::Airflow => &[
             "airflow_dags",
@@ -304,6 +306,11 @@ pub fn describe(c: &Connector) -> String {
             "OpenSearch at {}: list indexes, read a mapping, search and count documents (read only){}",
             c.site,
             if c.indexes.is_empty() { String::new() } else { format!("; indexes {}", c.indexes.join(", ")) }
+        ),
+        ConnKind::Rest => format!(
+            "REST API at {}: GET under {}",
+            c.site,
+            c.paths.join(", ")
         ),
         ConnKind::Metrics => format!(
             "CloudWatch metrics in account {} ({}): ECS, RDS, Lambda, CloudFront, load balancers, SQS, DynamoDB",
@@ -530,6 +537,20 @@ impl OpsTools {
                 json!({ "type": "object", "properties": { "index": index, "query": { "type": "object" } }, "required": ["index"] }),
             ));
         }
+        if let Some(l) = self.get(ConnKind::Rest) {
+            out.push(tool(
+                "rest_get",
+                &format!(
+                    "GET a path on the team's REST API at {} and read the JSON it returns (the source system's own record). Only paths under {} can be read; pass ids in the path and filters in `query`. Read only.",
+                    l.conn.site,
+                    l.conn.paths.join(", ")
+                ),
+                json!({ "type": "object", "properties": {
+                    "path": { "type": "string", "description": "a path under an allowed prefix, e.g. the prefix plus /42" },
+                    "query": { "type": "object", "description": "query parameters as names and plain values" }
+                }, "required": ["path"] }),
+            ));
+        }
         if !self.aws.metrics.is_empty() {
             let ns: Vec<String> = metrics::NAMESPACES
                 .iter()
@@ -610,6 +631,7 @@ impl OpsTools {
             n if n.starts_with("newrelic_") => Some(ConnKind::NewRelic),
             n if n.starts_with("confluence_") => Some(ConnKind::Confluence),
             n if n.starts_with("opensearch_") => Some(ConnKind::OpenSearch),
+            "rest_get" => Some(ConnKind::Rest),
             n if n.starts_with("metrics_") => Some(ConnKind::Metrics),
             n if n.starts_with("airflow_") => Some(ConnKind::Airflow),
             _ => return None,
@@ -849,6 +871,16 @@ impl OpsTools {
                 };
                 Ok((a.text, a.asked))
             }
+            ConnKind::Rest => {
+                let a = Rest {
+                    conn: &l.conn,
+                    key: &l.key,
+                    http: &Https,
+                }
+                .get(s("path").unwrap_or(""), input.get("query"))
+                .await?;
+                Ok((a.text, a.asked))
+            }
             // Handled above, through the AWS accounts.
             ConnKind::Metrics | ConnKind::Airflow => Err(StepError::new(
                 "read_only",
@@ -896,6 +928,7 @@ pub fn connectable_line(k: ConnKind) -> &'static str {
         ConnKind::NewRelic => "New Relic: NRQL, entities, change events and deployment markers, deployment impact, response time, error rate and throughput",
         ConnKind::Confluence => "Confluence: search and read pages; optionally append to listed pages",
         ConnKind::OpenSearch => "OpenSearch: list indexes, read mappings, search and count documents, read only",
+        ConnKind::Rest => "REST API: GET records from a system you use, under the paths you allow",
         ConnKind::Metrics => "CloudWatch metrics (an ability of a connected AWS account): ECS, RDS, Lambda, CloudFront, load balancers, SQS, DynamoDB",
         ConnKind::Airflow => "Airflow on MWAA (an ability of a connected AWS account): DAGs, DAG runs, task instances, task logs, import errors",
     }
@@ -1202,9 +1235,10 @@ mod tests {
         let kinds: Vec<&str> = src.iter().map(|s| s.kind.as_str()).collect();
         assert_eq!(kinds, vec!["newrelic", "metrics", "airflow", "aws"]);
         let open = connectable_from(&[nr], &aws);
-        assert_eq!(open.len(), 2, "{open:?}");
+        assert_eq!(open.len(), 3, "{open:?}");
         assert!(open[0].starts_with("confluence:"));
         assert!(open[1].starts_with("opensearch:"));
+        assert!(open[2].starts_with("rest:"));
         let none = connectable_from(&[], &AwsAbilities::default());
         assert!(none
             .iter()

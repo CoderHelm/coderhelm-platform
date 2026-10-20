@@ -41,6 +41,7 @@ pub mod newrelic;
 pub mod opensearch;
 pub mod redact;
 pub mod redshift;
+pub mod rest;
 pub mod secret;
 pub mod sql;
 pub mod store;

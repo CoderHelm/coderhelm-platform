@@ -64,7 +64,7 @@ fn ob(item: &Item, k: &str) -> Option<bool> {
 pub fn section_of(id: &str) -> &'static str {
     match id {
         "github" | "jira" => "code",
-        "aws" | "opensearch" => "cloud",
+        "aws" | "opensearch" | "rest" => "cloud",
         "newrelic" | "sentry" => "monitoring",
         "confluence" | "notion" | "figma" | "sanity" => "docs",
         "teams" => "chat",
@@ -423,6 +423,10 @@ pub async fn list(
         (
             ConnKind::OpenSearch,
             "Searches your OpenSearch or Elasticsearch indexes read-only, so agents can see the documents your app actually reads. Limit it to the indexes you list.",
+        ),
+        (
+            ConnKind::Rest,
+            "Reads a REST API you use (a booking or payments system, a vendor's API) with GET requests under the paths you allow, so agents can compare its records with yours.",
         ),
     ] {
         let c = saved.iter().find(|c| c.kind() == kind);
