@@ -428,6 +428,15 @@ fn push_evidence(out: &mut String, d: &FixDecision) {
             ev.data_shows.trim()
         ));
     }
+    if !ev.producer.where_.trim().is_empty() {
+        out.push_str(&format!(
+            "**What writes it:** {}\n\n",
+            ev.producer.where_.trim()
+        ));
+    }
+    if !ev.scope.trim().is_empty() {
+        out.push_str(&format!("**How widespread:** {}\n\n", ev.scope.trim()));
+    }
 }
 
 fn push_change(out: &mut String, c: &OutsideChange) {
@@ -769,5 +778,92 @@ mod unchecked_data_tests {
         assert_eq!(d.fix_location, FixLocation::Unknown);
         assert!(d.cause.starts_with("Not checked against the data"));
         assert_ne!(route(Some(&d)), route(Some(&decision(""))));
+    }
+}
+
+#[cfg(test)]
+mod gaps_tests {
+    use super::*;
+
+    fn decision(location: &str, producer: serde_json::Value, scope: &str) -> FixDecision {
+        let block = format!(
+            "```fix_location.json\n{}\n```",
+            serde_json::json!({
+                "fix_location": location,
+                "cause": "The parent record's value is overwritten on each sync.",
+                "evidence": {
+                    "looked_up": ["[prod database] the item and its parent"],
+                    "code_rule": "",
+                    "data_shows": "The item is at one place, its parent at another.",
+                    "producer": producer,
+                    "scope": scope
+                },
+                "outside_change": null,
+                "history_check": ""
+            })
+        );
+        parse(&block).expect("parses")
+    }
+
+    const SYNC: &str = "acme/pipelines:dags/sync.py";
+
+    #[test]
+    fn a_settled_decision_needs_a_producer_it_opened_and_a_scope() {
+        let code = serde_json::json!({"kind": "code", "where": "acme/pipelines:dags/sync.py sync_groups()"});
+        let full = decision("code", code.clone(), "50 parents, 530 items");
+        assert!(gaps(Some(&full), true, 4, &[SYNC.into()]).is_empty());
+
+        // Named but never opened in this run.
+        let g = gaps(
+            Some(&full),
+            true,
+            4,
+            &["acme/pipelines:dags/other.py".into()],
+        );
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert!(g[0].contains("didn't open it"), "{g:?}");
+
+        // No producer, no scope.
+        let bare = decision("outside_code", serde_json::json!({}), "");
+        assert_eq!(gaps(Some(&bare), true, 4, &[]).len(), 2);
+
+        // A source record needs no file.
+        let src = decision(
+            "outside_code",
+            serde_json::json!({"kind": "source", "where": "booking system, record 42"}),
+            "3 records",
+        );
+        assert!(gaps(Some(&src), true, 4, &[]).is_empty());
+    }
+
+    #[test]
+    fn only_settled_data_decisions_are_held_to_it() {
+        let open = decision("unknown", serde_json::json!({}), "");
+        assert!(
+            gaps(Some(&open), true, 4, &[]).is_empty(),
+            "unknown says where it stopped"
+        );
+        assert_eq!(
+            gaps(Some(&open), true, 0, &[]).len(),
+            1,
+            "still needs a lookup"
+        );
+        let mut feature = decision("code", serde_json::json!({}), "");
+        feature.evidence.data_shows.clear();
+        assert!(
+            gaps(Some(&feature), true, 0, &[]).is_empty(),
+            "not a data question"
+        );
+        assert!(gaps(None, true, 0, &[]).is_empty());
+    }
+
+    #[test]
+    fn an_untraced_decision_writes_no_code_and_says_why() {
+        let d = decision("code", serde_json::json!({}), "");
+        let g = gaps(Some(&d), true, 4, &[]);
+        let m = mark_untraced(d, &g);
+        assert_eq!(m.fix_location, FixLocation::Unknown);
+        assert!(m.cause.starts_with("Not traced far enough to decide"));
+        assert!(send_back(&g).starts_with("Before this decision stands:\n- "));
     }
 }
