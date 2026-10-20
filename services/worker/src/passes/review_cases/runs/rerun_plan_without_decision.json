@@ -1,0 +1,9 @@
+{
+  "name": "a plan with no decision on where the fix belongs never codes",
+  "description": "A cached plan written before plans carried the fix_location decision was reused and treated as a code plan. A plan without the decision now asks on the ticket instead.",
+  "kind": "rerun",
+  "history": {"runs": []},
+  "current_hash": "h1",
+  "plan": null,
+  "expect": {"new_pr": false, "route": "ask"}
+}

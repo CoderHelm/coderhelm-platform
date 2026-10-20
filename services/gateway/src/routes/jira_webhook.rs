@@ -774,234 +774,137 @@ async fn handle_jira_comment(
         .map(|s| s.as_str())
         .unwrap_or("");
 
-    match run_status {
-        // Failed or needs_input run — retry by re-queuing the ticket
-        "failed" | "needs_input" => {
-            // Use the current ticket description from the payload (re-fetched by Forge)
-            // instead of the stale body from the previous run
-            let raw_description = issue
-                .get("fields")
-                .and_then(|f| f.get("description"))
-                .or_else(|| issue.get("description"));
-            let fresh_body = match raw_description {
-                Some(Value::String(s)) => s.clone(),
-                Some(other) => extract_adf_text(other),
-                None => run_item
-                    .get("body")
-                    .and_then(|v| v.as_s().ok())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
-            };
+    let pr_outcome = run_item
+        .get("pr_outcome")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
 
-            let extended_body = if comment_body.is_empty() {
-                fresh_body
-            } else {
-                format!("{fresh_body}\n\n---\n\n**Additional context (from Jira comment by {comment_author}):**\n\n{comment_body}")
-            };
-
-            let message = WorkerMessage::Ticket(TicketMessage {
-                team_id: team_id.to_string(),
-                installation_id,
-                source: TicketSource::Jira,
-                ticket_id: ticket_key.to_string(),
-                title: title.to_string(),
-                body: extended_body,
-                repo_owner: String::new(), // let worker auto-detect via select_repo
-                repo_name: String::new(),
-                issue_number: 0,
-                sender: comment_author.to_string(),
-                image_attachments: if !fresh_images.is_empty() {
-                    fresh_images.clone()
-                } else {
-                    run_item
-                        .get("image_attachments")
-                        .and_then(|v| v.as_s().ok())
-                        .and_then(|s| serde_json::from_str(s).ok())
-                        .unwrap_or_default()
-                },
-            });
-
-            // Acquire ticket lock to prevent duplicate concurrent runs
-            if !acquire_ticket_lock(state, team_id, ticket_key).await {
-                let repo_display = format!("{repo_owner}/{repo_name}");
-                log_jira_event(
-                    state,
-                    team_id,
-                    "comment_retry",
-                    ticket_key,
-                    title,
-                    "lock_held",
-                    Some(&repo_display),
-                )
-                .await;
-                return Ok(StatusCode::OK);
-            }
-
-            info!(
-                team_id,
-                ticket_key, run_id, run_status, "Retrying Jira run after comment"
-            );
-            let result = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
-            let repo_display = format!("{repo_owner}/{repo_name}");
-            log_jira_event(
-                state,
-                team_id,
-                "comment_retry",
-                ticket_key,
-                title,
-                if result.is_ok() {
-                    "reprocessing"
-                } else {
-                    "error"
-                },
-                Some(&repo_display),
-            )
-            .await;
-            result
-        }
-        // Completed run without PR — treat like needs_input, re-trigger. A run
-        // that reported a change outside the code is the same: a reply ("done,
-        // still missing") runs it again with that context.
-        "completed" | "success" | "needs_outside_change" if pr_number == 0 => {
-            let raw_description = issue
-                .get("fields")
-                .and_then(|f| f.get("description"))
-                .or_else(|| issue.get("description"));
-            let fresh_body = match raw_description {
-                Some(Value::String(s)) => s.clone(),
-                Some(other) => extract_adf_text(other),
-                None => run_item
-                    .get("body")
-                    .and_then(|v| v.as_s().ok())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
-            };
-
-            let extended_body = if comment_body.is_empty() {
-                fresh_body
-            } else {
-                format!("{fresh_body}\n\n---\n\n**Additional context (from Jira comment by {comment_author}):**\n\n{comment_body}")
-            };
-
-            let message = WorkerMessage::Ticket(TicketMessage {
-                team_id: team_id.to_string(),
-                installation_id,
-                source: TicketSource::Jira,
-                ticket_id: ticket_key.to_string(),
-                title: title.to_string(),
-                body: extended_body,
-                repo_owner: String::new(), // let worker auto-detect via select_repo
-                repo_name: String::new(),
-                issue_number: 0,
-                sender: comment_author.to_string(),
-                image_attachments: if !fresh_images.is_empty() {
-                    fresh_images.clone()
-                } else {
-                    run_item
-                        .get("image_attachments")
-                        .and_then(|v| v.as_s().ok())
-                        .and_then(|s| serde_json::from_str(s).ok())
-                        .unwrap_or_default()
-                },
-            });
-
-            if !acquire_ticket_lock(state, team_id, ticket_key).await {
-                let repo_display = format!("{repo_owner}/{repo_name}");
-                log_jira_event(
-                    state,
-                    team_id,
-                    "comment_retry",
-                    ticket_key,
-                    title,
-                    "lock_held",
-                    Some(&repo_display),
-                )
-                .await;
-                return Ok(StatusCode::OK);
-            }
-
-            info!(
-                team_id,
-                ticket_key, run_id, "Retrying completed run (no PR) after comment"
-            );
-            let result = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
-            let repo_display = format!("{repo_owner}/{repo_name}");
-            log_jira_event(
-                state,
-                team_id,
-                "comment_retry",
-                ticket_key,
-                title,
-                if result.is_ok() {
-                    "reprocessing"
-                } else {
-                    "error"
-                },
-                Some(&repo_display),
-            )
-            .await;
-            result
-        }
-        // Completed run with PR — send feedback
-        "completed" | "success" if pr_number > 0 => {
-            let message = WorkerMessage::Feedback(crate::models::FeedbackMessage {
-                team_id: team_id.to_string(),
-                installation_id,
-                run_id: run_id.to_string(),
-                repo_owner: repo_owner.to_string(),
-                repo_name: repo_name.to_string(),
-                pr_number,
-                review_id: 0,
-                review_body: format!("Jira comment by {comment_author}: {comment_body}"),
-                comments: vec![],
-                // Not a GitHub comment: nobody to address on the PR.
-                trigger_author: String::new(),
-            });
-
-            info!(
-                team_id,
-                ticket_key, run_id, "Sending feedback for Jira comment on completed run"
-            );
-            let result = send_to_queue(state, &state.config.feedback_queue_url, &message).await;
-            let repo_display = format!("{repo_owner}/{repo_name}");
-            log_jira_event(
-                state,
-                team_id,
-                "comment_feedback",
-                ticket_key,
-                title,
-                if result.is_ok() { "feedback" } else { "error" },
-                Some(&repo_display),
-            )
-            .await;
-            result
-        }
-        // Running/queued/awaiting_ci — don't reprocess
-        "running" | "queued" | "awaiting_ci" => {
-            info!(
-                ticket_key,
-                run_status, "Ignoring Jira comment — run already in progress"
-            );
-            log_jira_event(
-                state,
-                team_id,
-                "comment_skipped",
-                ticket_key,
-                title,
-                "skipped",
-                None,
-            )
-            .await;
-            Ok(StatusCode::OK)
-        }
-        _ => {
-            info!(
-                ticket_key,
-                run_status, "Ignoring Jira comment — run status not actionable"
-            );
-            Ok(StatusCode::OK)
-        }
+    // A run in flight owns the ticket; the comment waits for it.
+    if matches!(run_status, "running" | "queued" | "awaiting_ci") {
+        info!(
+            ticket_key,
+            run_status, "Ignoring Jira comment — run already in progress"
+        );
+        log_jira_event(
+            state,
+            team_id,
+            "comment_skipped",
+            ticket_key,
+            title,
+            "skipped",
+            None,
+        )
+        .await;
+        return Ok(StatusCode::OK);
     }
+
+    // The ticket's current text (re-fetched by Forge) rather than the stale
+    // body from the previous run.
+    let raw_description = issue
+        .get("fields")
+        .and_then(|f| f.get("description"))
+        .or_else(|| issue.get("description"));
+    let fresh_body = match raw_description {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => extract_adf_text(other),
+        None => run_item
+            .get("body")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
+    };
+    let fresh_title = issue
+        .get("fields")
+        .and_then(|f| f.get("summary"))
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())
+        .unwrap_or(title)
+        .to_string();
+    let expected_keys = super::trigger_gate::expected_attachment_keys(team_id, ticket_key, payload);
+    let context_hash = common::ticket_context_hash(&fresh_title, &fresh_body, &expected_keys);
+
+    // What the comment would start if it asks for work: feedback on the
+    // run's PR while that PR is open, otherwise a run with the comment as
+    // added context. The worker reads the comment first and decides.
+    let pr_open = pr_number > 0
+        && matches!(run_status, "completed" | "success")
+        && !matches!(pr_outcome, "closed" | "merged");
+    let action = if pr_open {
+        WorkerMessage::Feedback(crate::models::FeedbackMessage {
+            team_id: team_id.to_string(),
+            installation_id,
+            run_id: run_id.to_string(),
+            repo_owner: repo_owner.to_string(),
+            repo_name: repo_name.to_string(),
+            pr_number,
+            review_id: 0,
+            review_body: format!("Jira comment by {comment_author}: {comment_body}"),
+            comments: vec![],
+            // Not a GitHub comment: nobody to address on the PR.
+            trigger_author: String::new(),
+        })
+    } else {
+        let extended_body = if comment_body.is_empty() {
+            fresh_body.clone()
+        } else {
+            format!("{fresh_body}\n\n---\n\n**Additional context (from Jira comment by {comment_author}):**\n\n{comment_body}")
+        };
+        WorkerMessage::Ticket(TicketMessage {
+            team_id: team_id.to_string(),
+            installation_id,
+            source: TicketSource::Jira,
+            ticket_id: ticket_key.to_string(),
+            title: title.to_string(),
+            body: extended_body,
+            repo_owner: String::new(), // let worker auto-detect via select_repo
+            repo_name: String::new(),
+            issue_number: 0,
+            sender: comment_author.to_string(),
+            image_attachments: if !fresh_images.is_empty() {
+                fresh_images.clone()
+            } else {
+                run_item
+                    .get("image_attachments")
+                    .and_then(|v| v.as_s().ok())
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default()
+            },
+        })
+    };
+
+    let message = WorkerMessage::JiraComment(crate::models::JiraCommentMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        ticket_id: ticket_key.to_string(),
+        title: fresh_title,
+        run_id: run_id.to_string(),
+        run_status: run_status.to_string(),
+        pr_number,
+        repo_owner: repo_owner.to_string(),
+        repo_name: repo_name.to_string(),
+        author: comment_author.to_string(),
+        comment: comment_body.to_string(),
+        context_hash,
+        action: Some(Box::new(action)),
+    });
+    info!(
+        team_id,
+        ticket_key, run_id, run_status, "Jira comment sent to the worker to read"
+    );
+    let result = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+    let repo_display = format!("{repo_owner}/{repo_name}");
+    log_jira_event(
+        state,
+        team_id,
+        "comment_read",
+        ticket_key,
+        title,
+        if result.is_ok() { "queued" } else { "error" },
+        Some(&repo_display),
+    )
+    .await;
+    result
 }
 
 async fn send_to_queue(

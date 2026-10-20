@@ -119,6 +119,12 @@ pub struct FixDecision {
     pub evidence: FixEvidence,
     #[serde(default)]
     pub outside_change: Option<OutsideChange>,
+    /// When the ticket has history (an earlier CoderHelm pull request closed
+    /// without merging, a lesson or a person saying the fix is elsewhere):
+    /// why a code change is still right, answering that history. Empty when
+    /// the ticket has none.
+    #[serde(default)]
+    pub history_check: String,
 }
 
 fn string_or_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
@@ -164,11 +170,13 @@ impl FixDecision {
     }
 }
 
-/// How the run proceeds. A plan without a decision (older plans, or a model
-/// that left the block out) is a code plan, as every plan was before.
+/// How the run proceeds. A plan without a decision (a model that left the
+/// block out, or one that didn't read) is not a code plan: where the fix
+/// belongs was never decided, so the run asks instead of coding.
 pub fn route(decision: Option<&FixDecision>) -> Route {
     match decision.map(FixDecision::effective_location) {
-        None | Some(FixLocation::Code) => Route::Code,
+        None => Route::Ask,
+        Some(FixLocation::Code) => Route::Code,
         Some(FixLocation::OutsideCode) => Route::OutsideOnly,
         Some(FixLocation::Both) => Route::CodeAndOutside,
         Some(FixLocation::Unknown) => Route::Ask,
@@ -238,6 +246,7 @@ Before writing tasks, decide whether the fix belongs in this code at all.
 - If you looked and still cannot tell whether the code or the data is at fault, use `unknown`, say what you checked and what a person needs to confirm, and set tasks.md to `NO_CODE_CHANGE: <what is unclear>`. Prefer asking over coding.
 - Ordinary feature work and bugs in the code's own logic are `code`.
 - Quote values only as the tools returned them; a value shown as `[hidden]` stays hidden.
+- If the prompt has a "This ticket's history" section (an earlier pull request for this ticket closed without merging, a lesson, or a person saying the fix is elsewhere), read it first. The default then is NOT to plan code again: use `outside_code` or `unknown`. Plan code only when you can say why a code change is right despite that history, in `history_check`; a change like the one already closed is never right.
 
 After the four openspec files, output this block (JSON, all fields required; `outside_change` is null for `code`):
 
@@ -255,7 +264,8 @@ After the four openspec files, output this block (JSON, all fields required; `ou
     "change": "exactly what to change, naming the record(s)",
     "where": "who can make it, or where in that system",
     "verify": "how to confirm afterwards (for example: after the next sync, the item shows on the site)"
-  }
+  },
+  "history_check": "only when the prompt has a ticket history: why a code change is right despite it; otherwise empty"
 }
 ```"#;
 
@@ -321,6 +331,17 @@ pub fn outside_report(d: &FixDecision, heading: bool) -> String {
          made, nothing else is needed here.",
     );
     out
+}
+
+/// The decision a run asks with when the plan carried none.
+pub fn undecided() -> FixDecision {
+    FixDecision {
+        fix_location: FixLocation::Unknown,
+        cause: "The plan didn't say where the fix belongs (in this code or in data or settings \
+                in another system), so I stopped before changing any code."
+            .to_string(),
+        ..Default::default()
+    }
 }
 
 /// The report when the planner could not tell where the fix belongs.
@@ -482,8 +503,9 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_without_a_decision_is_a_code_plan() {
-        assert_eq!(route(None), Route::Code);
+    fn a_plan_without_a_decision_asks_and_never_codes() {
+        assert_eq!(route(None), Route::Ask);
+        assert!(unknown_report(&undecided(), false).contains("stopped before changing any code"));
         assert_eq!(parse("```tasks.md\n- [ ] a.rs: x\n```"), None);
         let d = FixDecision::default();
         assert_eq!(route(Some(&d)), Route::Code);
@@ -544,7 +566,10 @@ mod tests {
             Route::Ask
         );
         assert_eq!(route_for_plan(None, "NO_CODE_CHANGE: x"), Route::Ask);
-        assert_eq!(route_for_plan(None, "- [ ] a.rs: x"), Route::Code);
+        // No decision is never a code plan: the run asks (fail closed).
+        assert_eq!(route_for_plan(None, "- [ ] a.rs: x"), Route::Ask);
+        assert_eq!(route(None), Route::Ask);
+        assert_eq!(route(Some(&code)), Route::Code);
         let d = parse(fixture::PLANNER_REPLY).unwrap();
         let tasks = "NO_CODE_CHANGE: the term's setting is off";
         assert_eq!(route_for_plan(Some(&d), tasks), Route::OutsideOnly);

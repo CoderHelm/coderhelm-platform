@@ -168,6 +168,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                     .await;
             }
         }
+        models::WorkerMessage::JiraComment(msg) => {
+            info!(team_id = %msg.team_id, ticket_id = %msg.ticket_id, "Reading a ticket comment");
+            if let Err(e) = passes::jira_comment::run(&state, msg).await {
+                error!("Ticket comment failed: {e:?}");
+            }
+        }
         models::WorkerMessage::Lesson(msg) => {
             info!(team_id = %msg.team_id, run_id = %msg.run_id, trigger = %msg.trigger, "Lesson on where the fix belongs");
             if let Err(e) = passes::lessons::run(&state, msg).await {

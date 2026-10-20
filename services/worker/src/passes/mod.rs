@@ -694,6 +694,7 @@ pub mod health_check;
 pub mod hidden_suggest;
 mod implement;
 pub mod infra_analyze;
+pub mod jira_comment;
 pub mod lessons;
 pub mod live_sources;
 pub mod onboard;
@@ -726,6 +727,7 @@ pub mod skills;
 pub mod syntax_check;
 #[allow(dead_code)]
 mod test;
+pub mod ticket_history;
 pub mod tool_proposals;
 mod triage;
 pub mod usage_reconcile;
@@ -1155,7 +1157,8 @@ async fn run_passes(
     };
 
     // Load repo-level instruction files (AGENTS.md, CLAUDE.md, copilot-instructions, etc.)
-    let repo_instructions = load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
+    let mut repo_instructions =
+        load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
 
     // Post "working on it" comment only for GitHub-sourced tickets.
     let mut progress_comment_id: Option<u64> = None;
@@ -1522,6 +1525,27 @@ async fn run_passes(
     // Compute context hash to detect ticket changes (body, images)
     let context_hash = plan::compute_ticket_context_hash(msg);
 
+    // The ticket's history with CoderHelm: earlier runs, how their PRs
+    // ended, lessons, what people wrote on the ticket. The planner is shown
+    // it, and the plan is held to it below.
+    let mut history = ticket_history::load(state, &msg.team_id, &msg.ticket_id, run_id).await;
+    ticket_history::add_pr_comments(&mut history, &github).await;
+    if !history.is_empty() {
+        msg.ticket_history_note = Some(history.planner_note());
+        info!(
+            run_id,
+            earlier_runs = history.runs.len(),
+            closed_unmerged = history.closed_unmerged().len(),
+            notes = history.notes.len(),
+            "Ticket has history — the planner gets it"
+        );
+    }
+    // The cached plan is reused only when nothing that can change it has
+    // changed: the ticket, what memory recalled (lessons), the history, and
+    // the planner itself.
+    let plan_key = plan::plan_cache_key(&context_hash, &memory_context, &history.digest());
+    msg.plan_cache_key = Some(plan_key.clone());
+
     // Try to reuse existing plan from S3 (same ticket, repo, and content)
     let lookup = load_existing_plan(
         state,
@@ -1530,6 +1554,7 @@ async fn run_passes(
         &msg.repo_owner,
         &msg.repo_name,
         &context_hash,
+        &plan_key,
     )
     .await;
     // The ticket changed ONLY when a stored hash exists and differs. A missing
@@ -1597,12 +1622,200 @@ async fn run_passes(
     )
     .await;
 
+    // --- Repo check, before anything is decided on this plan ---
+    // A plan written against the wrong repo (its files live in another
+    // one) is planned again in the right repo before its decision counts or
+    // a branch is made; a plan naming files that don't exist is planned
+    // again once, and never implemented while they still don't.
+    let mut early_validation: Option<PlanValidation> = None;
+    if !plan_result.tasks.trim().is_empty() {
+        let team_repos = plan::fetch_team_repos(state, &msg.team_id).await;
+        let mut v = validate_plan(
+            &plan_result,
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.base_branch,
+            state,
+            &msg.team_id,
+            &team_repos,
+            &provider,
+            usage,
+        )
+        .await;
+        if let Some(better_repo) = v.switch_repo.take() {
+            if switch_run_repo(state, msg, run_id, &github, &better_repo, &v.switch_reason).await {
+                plan_was_reused = false;
+                // The new repo's own instructions and memory (its lessons)
+                // go into the plan made there.
+                repo_instructions =
+                    load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
+                close_memory(state, agent_memory.take()).await;
+                agent_memory =
+                    AgentMemory::open(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+                if let Some(mem) = agent_memory.as_mut() {
+                    let ctx = mem
+                        .recall_context(&format!("{} {} {}", msg.title, msg.body, msg.repo_name), 5)
+                        .await;
+                    record_memory_use(state, msg, run_id, &mem.last_recalled).await;
+                    if !ctx.is_empty() {
+                        triage_result.summary.push_str("\n\n");
+                        triage_result.summary.push_str(&ctx);
+                    }
+                    msg.plan_cache_key = Some(plan::plan_cache_key(
+                        &context_hash,
+                        &format!("{memory_context}{ctx}"),
+                        &history.digest(),
+                    ));
+                }
+                plan_result = plan::run(
+                    state,
+                    msg,
+                    &github,
+                    &triage_result,
+                    &repo_instructions,
+                    &provider,
+                    usage,
+                    run_id,
+                )
+                .await?;
+                v = validate_plan(
+                    &plan_result,
+                    &github,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    &msg.base_branch,
+                    state,
+                    &msg.team_id,
+                    &team_repos,
+                    &provider,
+                    usage,
+                )
+                .await;
+                if let Some(again) = v.switch_repo.take() {
+                    warn!(run_id, suggested = %again, "Repo check suggests switching again — staying");
+                }
+            }
+        }
+        let codes = !plan_result.tasks.starts_with("NO_CHANGES_NEEDED:")
+            && !plan_result.tasks.starts_with("CLARIFICATION_NEEDED:")
+            && matches!(
+                fix_location::route_for_plan(plan_result.fix.as_ref(), &plan_result.tasks),
+                fix_location::Route::Code | fix_location::Route::CodeAndOutside
+            );
+        if codes && !v.missing_files.is_empty() {
+            info!(
+                run_id,
+                missing = ?v.missing_files,
+                "Plan names files that don't exist — planning again"
+            );
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Plan named {} files that don't exist in {}/{} — planning again",
+                    v.missing_files.len(),
+                    msg.repo_owner,
+                    msg.repo_name
+                ),
+            )
+            .await;
+            let mut corrected = msg.clone();
+            corrected.body.push_str(&missing_files_note(
+                &v.missing_files,
+                &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            ));
+            plan_was_reused = false;
+            plan_result = plan::run(
+                state,
+                &corrected,
+                &github,
+                &triage_result,
+                &repo_instructions,
+                &provider,
+                usage,
+                run_id,
+            )
+            .await?;
+            restore_plan_hash(state, msg, &context_hash).await;
+            v = validate_plan(
+                &plan_result,
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                &msg.base_branch,
+                state,
+                &msg.team_id,
+                &team_repos,
+                &provider,
+                usage,
+            )
+            .await;
+            v.switch_repo = None;
+            if !v.missing_files.is_empty() {
+                warn!(run_id, missing = ?v.missing_files, "Plan still names files that don't exist — not implementing");
+                let decision = fix_location::FixDecision {
+                    fix_location: fix_location::FixLocation::Unknown,
+                    cause: format!(
+                        "The plan for this ticket names files that don't exist in {}/{} ({}), \
+                         even after planning again, so I stopped before changing any code. \
+                         The ticket may belong in another repository.",
+                        msg.repo_owner,
+                        msg.repo_name,
+                        v.missing_files.join(", ")
+                    ),
+                    ..Default::default()
+                };
+                finish_without_code(
+                    state,
+                    msg,
+                    run_id,
+                    &github,
+                    &decision,
+                    fix_location::Route::Ask,
+                    usage,
+                    start,
+                    &used_mcp_ids,
+                )
+                .await;
+                close_memory(state, agent_memory.take()).await;
+                return Ok(());
+            }
+        }
+        early_validation = Some(v);
+    }
+
     // --- Guard: a malformed/truncated plan must not proceed to implement ---
     // parse_openspec_files returns empty strings for any fence the model
     // omitted; an empty task list used to flow straight into implement and
     // produce a guaranteed zero-change run.
     // Where the fix belongs, as the planner decided it from what it looked up.
-    let fix_route = fix_location::route_for_plan(plan_result.fix.as_ref(), &plan_result.tasks);
+    let mut fix_route = fix_location::route_for_plan(plan_result.fix.as_ref(), &plan_result.tasks);
+    // The ticket's history holds the plan: no second pull request after
+    // CoderHelm learned the fix is outside the code, or after its PR was
+    // closed unmerged, unless the plan answers why (see ticket_history).
+    if !plan_result.tasks.starts_with("NO_CHANGES_NEEDED:")
+        && !plan_result.tasks.starts_with("CLARIFICATION_NEEDED:")
+    {
+        if let ticket_history::Guard::Stop {
+            route,
+            decision,
+            why,
+        } = history.guard(plan_result.fix.as_ref(), &context_hash)
+        {
+            info!(run_id, why = %why, "Ticket history holds the plan — no code change");
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("No new pull request: {why}"),
+            )
+            .await;
+            plan_result.fix = Some(*decision);
+            fix_route = route;
+        }
+    }
     let plan_is_directive = plan_result.tasks.starts_with("NO_CHANGES_NEEDED:")
         || plan_result.tasks.starts_with("CLARIFICATION_NEEDED:")
         || matches!(
@@ -1635,7 +1848,10 @@ async fn run_passes(
             fix_location::Route::OutsideOnly | fix_location::Route::Ask
         )
     {
-        let mut decision = plan_result.fix.clone().unwrap_or_default();
+        let mut decision = plan_result
+            .fix
+            .clone()
+            .unwrap_or_else(fix_location::undecided);
         if decision.cause.trim().is_empty() {
             // A plan that codes nothing but wrote no decision: its one line
             // is what it found.
@@ -2371,19 +2587,25 @@ async fn run_passes(
 
         // --- Plan Validation (deterministic, no LLM) ---
         let team_repos = plan::fetch_team_repos(state, &msg.team_id).await;
-        let mut plan_warnings = validate_plan(
-            &plan_result,
-            &github,
-            &msg.repo_owner,
-            &msg.repo_name,
-            &msg.base_branch,
-            state,
-            &msg.team_id,
-            &team_repos,
-            &provider,
-            usage,
-        )
-        .await;
+        // Already validated (and the repo settled) right after planning.
+        let mut plan_warnings = match early_validation.take() {
+            Some(v) => v,
+            None => {
+                validate_plan(
+                    &plan_result,
+                    &github,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    &msg.base_branch,
+                    state,
+                    &msg.team_id,
+                    &team_repos,
+                    &provider,
+                    usage,
+                )
+                .await
+            }
+        };
         // Over the file cap: ask the planner ONCE to narrow the scope before
         // failing the run — most oversized plans pad the change set.
         if let Some((planned, cap)) = plan_warnings.over_cap {
@@ -4754,6 +4976,47 @@ pub(crate) fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::At
 }
 
 /// Release a ticket-level lock after a run completes (any terminal state).
+/// Takes the ticket lock the gateway takes before it starts a run (same
+/// record), so a run started from the worker can't run twice. Fails open on
+/// an unexpected DynamoDB error, like the gateway.
+pub(crate) async fn acquire_ticket_lock(
+    state: &WorkerState,
+    team_id: &str,
+    ticket_id: &str,
+) -> bool {
+    let sk = format!("TICKET_LOCK#{ticket_id}");
+    let now = chrono::Utc::now();
+    let now_str = now.to_rfc3339();
+    let result = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.teams_table_name)
+        .item("team_id", attr_s(team_id))
+        .item("sk", attr_s(&sk))
+        .item("locked_by", attr_s("worker"))
+        .item(
+            "locked_until",
+            attr_s(&(now + chrono::Duration::minutes(15)).to_rfc3339()),
+        )
+        .item("created_at", attr_s(&now_str))
+        .condition_expression("attribute_not_exists(sk) OR locked_until < :now")
+        .expression_attribute_values(":now", attr_s(&now_str))
+        .send()
+        .await;
+    match result {
+        Ok(_) => true,
+        Err(e) => {
+            let held = e
+                .as_service_error()
+                .is_some_and(|s| s.is_conditional_check_failed_exception());
+            if !held {
+                warn!(team_id, ticket_id, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Ticket lock check failed — allowing through");
+            }
+            !held
+        }
+    }
+}
+
 async fn release_ticket_lock(state: &WorkerState, team_id: &str, ticket_id: &str) {
     let sk = format!("TICKET_LOCK#{ticket_id}");
     let _ = state
@@ -5741,6 +6004,20 @@ struct PlanValidation {
     mentioned_file_count: usize,
     /// `(files the plan changes, hard cap)` when the plan is over the cap.
     over_cap: Option<(usize, usize)>,
+    /// Files the plan changes that don't exist in the repo (and aren't
+    /// created by a task), when enough are missing to warn about.
+    missing_files: Vec<String>,
+}
+
+/// The note a re-plan gets when the plan named files that don't exist.
+fn missing_files_note(missing: &[String], repo: &str) -> String {
+    format!(
+        "\n\n---\n\n**Planning note (from CoderHelm):** the previous plan for this ticket named \
+         files that don't exist in {repo}: {}. Look the paths up with your tools and plan only \
+         with files that exist (or tasks that create them, marked as new). If the change doesn't \
+         belong in this repository, say so instead of planning code.",
+        missing.join(", ")
+    )
 }
 
 /// A file one plan task changes, read from the `- [ ] <path>: <description>`
@@ -5820,6 +6097,7 @@ async fn validate_plan(
     let mut blocked = false;
     let mut switch_repo: Option<String> = None;
     let mut switch_reason = String::new();
+    let mut missing_files: Vec<String> = Vec::new();
 
     // Extract file paths from plan text (design + tasks)
     let plan_text = format!("{}\n{}", plan.design, plan.tasks);
@@ -5913,6 +6191,7 @@ async fn validate_plan(
                 missing.len(),
                 missing.join(", "),
             ));
+            missing_files = missing.clone();
 
             // Check if these files exist in another enabled repo (triage may have picked wrong)
             let current_repo = format!("{repo_owner}/{repo_name}");
@@ -6207,6 +6486,7 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
         switch_reason,
         mentioned_file_count: changed_files.len(),
         over_cap,
+        missing_files,
     }
 }
 
@@ -6758,6 +7038,7 @@ async fn load_existing_plan(
     repo_owner: &str,
     repo_name: &str,
     context_hash: &str,
+    plan_key: &str,
 ) -> PlanLookup {
     let prefix = openspec_prefix(team_id, ticket_id, repo_owner, repo_name);
 
@@ -6778,11 +7059,109 @@ async fn load_existing_plan(
         }
     }
 
+    // Reused only when the plan was made under the same key (same ticket,
+    // lessons, history and planner) AND carries the decision on where the
+    // fix belongs that plans must now have.
+    let stored_key = read_s3_text(state, &format!("{prefix}/{}", plan::PLAN_KEY_FILE)).await;
+    let plan = match stored_key {
+        Some(k) if k.trim() == plan_key => {
+            load_cached_plan_files(state, &prefix).await.filter(|p| {
+                let decided = p.fix.is_some();
+                if !decided {
+                    info!("Cached plan has no decision on where the fix belongs — re-planning");
+                }
+                decided
+            })
+        }
+        Some(_) => {
+            info!("Cached plan was made under a different key (lessons, history or planner changed) — re-planning");
+            None
+        }
+        None => None,
+    };
     PlanLookup {
-        plan: load_cached_plan_files(state, &prefix).await,
+        plan,
         hash_changed: false,
         previous_ticket_text: None,
     }
+}
+
+/// Puts the real ticket's context hash back on the cached plan after a
+/// re-plan whose ticket text carried a planning note.
+async fn restore_plan_hash(state: &WorkerState, msg: &TicketMessage, context_hash: &str) {
+    let prefix = openspec_prefix(
+        &msg.team_id,
+        &msg.ticket_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+    );
+    let _ = state
+        .s3
+        .put_object()
+        .bucket(&state.config.bucket_name)
+        .key(format!("{prefix}/context_hash.txt"))
+        .body(context_hash.as_bytes().to_vec().into())
+        .content_type("text/plain")
+        .send()
+        .await;
+}
+
+/// Moves the run to `repo` before anything is built: the message, its
+/// default branch and the run record. No branch is made here. False when
+/// `repo` isn't `owner/name`.
+async fn switch_run_repo(
+    state: &WorkerState,
+    msg: &mut TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    repo: &str,
+    reason: &str,
+) -> bool {
+    let Some((owner, name)) = repo
+        .split_once('/')
+        .filter(|(o, n)| !o.is_empty() && !n.is_empty())
+    else {
+        return false;
+    };
+    warn!(
+        run_id,
+        from = %format!("{}/{}", msg.repo_owner, msg.repo_name),
+        to = %repo,
+        "Plan belongs in another repo — switching before planning is final"
+    );
+    msg.repo_owner = owner.to_string();
+    msg.repo_name = name.to_string();
+    msg.base_branch = github
+        .get_default_branch(owner, name)
+        .await
+        .unwrap_or_else(|_| "main".to_string());
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET repo = :r, team_repo = :tr, base_branch = :b")
+        .expression_attribute_values(":r", attr_s(repo))
+        .expression_attribute_values(":tr", attr_s(&format!("{}#{repo}", msg.team_id)))
+        .expression_attribute_values(":b", attr_s(&msg.base_branch))
+        .send()
+        .await;
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!(
+            "Switched to {repo} ({}) — planning again there",
+            if reason.is_empty() {
+                "repo routing"
+            } else {
+                reason
+            }
+        ),
+    )
+    .await;
+    true
 }
 
 async fn load_cached_plan_files(state: &WorkerState, prefix: &str) -> Option<plan::PlanResult> {

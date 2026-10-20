@@ -39,9 +39,27 @@ pub async fn run(
     // A person saying the fix belongs outside the code (a setting in another
     // system) is a lesson for the team, not a request to change this code.
     // Checked first: it also holds when they closed the PR.
-    if super::lessons::check_comment(state, &provider, &github, &msg, &mut usage).await {
+    if let Some(judgment) =
+        super::lessons::check_comment(state, &provider, &github, &msg, &mut usage).await
+    {
         info!(run_id = %msg.run_id, "Feedback says the fix is outside the code — lesson recorded, no code change");
-        finish_without_change(state, &msg).await;
+        let closed = close_own_pr_outside(
+            state,
+            &github,
+            &OwnPr {
+                team_id: &msg.team_id,
+                run_id: &msg.run_id,
+                owner: &msg.repo_owner,
+                repo: &msg.repo_name,
+                pr_number: msg.pr_number,
+            },
+            &judgment.where_,
+            &judgment.lesson,
+        )
+        .await;
+        if !closed {
+            finish_without_change(state, &msg).await;
+        }
         return Ok(());
     }
 
@@ -178,6 +196,8 @@ pub async fn run(
                     first_attempt_ms: 0,
                     model_retries: 0,
                     ticket_update_note: None,
+                    ticket_history_note: None,
+                    plan_cache_key: None,
                 };
                 match super::pr::resolve_conflicts(
                     state,
@@ -1954,6 +1974,8 @@ async fn handle_wrong_repo(
         first_attempt_ms: 0,
         model_retries: 0,
         ticket_update_note: None,
+        ticket_history_note: None,
+        plan_cache_key: None,
     });
 
     if state.config.ticket_queue_url.is_empty() {
@@ -2017,6 +2039,187 @@ async fn handle_wrong_repo(
 
 /// Puts a run back to `completed` after a feedback cycle that changed nothing,
 /// unless it is still working (resume owns those states).
+/// CoderHelm's own pull request, by the run that opened it.
+pub(crate) struct OwnPr<'a> {
+    pub team_id: &'a str,
+    pub run_id: &'a str,
+    pub owner: &'a str,
+    pub repo: &'a str,
+    pub pr_number: u64,
+}
+
+/// The fix for CoderHelm's own pull request belongs outside the code (a
+/// person said so, or its reviewer found the diff overrides another system's
+/// data). CoderHelm closes the PR with a short note (the cause and where the
+/// fix belongs), deletes its branch, tells the ticket unless the run already
+/// reported the outside change there, and the run ends as needing a change
+/// outside the code. A PR CoderHelm didn't open is left as it is (false).
+pub(crate) async fn close_own_pr_outside(
+    state: &WorkerState,
+    github: &GitHubClient,
+    pr_ref: &OwnPr<'_>,
+    where_: &str,
+    cause: &str,
+) -> bool {
+    use super::fix_location::{self, FixDecision, FixLocation, OutsideChange};
+    let pr = match github
+        .get_pull_request(pr_ref.owner, pr_ref.repo, pr_ref.pr_number)
+        .await
+    {
+        Ok(pr) => pr,
+        Err(e) => {
+            warn!(run_id = %pr_ref.run_id, error = %e, "Could not read the PR to close it");
+            return false;
+        }
+    };
+    let author = pr["user"]["login"].as_str().unwrap_or("");
+    if !author.contains("coderhelm") {
+        return false;
+    }
+    if pr["state"].as_str() == Some("open") {
+        let _ = github
+            .create_issue_comment(
+                pr_ref.owner,
+                pr_ref.repo,
+                pr_ref.pr_number,
+                &super::lessons::closing_note(where_, cause),
+            )
+            .await;
+        match github
+            .close_pull_request(pr_ref.owner, pr_ref.repo, pr_ref.pr_number)
+            .await
+        {
+            Ok(_) => {
+                info!(run_id = %pr_ref.run_id, pr = pr_ref.pr_number, "Closed own PR — the fix belongs outside the code")
+            }
+            Err(e) => warn!(run_id = %pr_ref.run_id, error = %e, "Could not close own PR"),
+        }
+    }
+    // CoderHelm's own branch only.
+    if let Some(branch) = pr["head"]["ref"]
+        .as_str()
+        .filter(|b| b.starts_with("coderhelm/"))
+    {
+        if let Err(e) = github
+            .delete_branch(pr_ref.owner, pr_ref.repo, branch)
+            .await
+        {
+            warn!(run_id = %pr_ref.run_id, error = %e, "Could not delete own branch");
+        }
+    }
+
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(pr_ref.team_id))
+        .key("run_id", super::attr_s(pr_ref.run_id))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item);
+    let field = |k: &str| {
+        item.as_ref()
+            .and_then(|i| i.get(k))
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut report = field("outside_change_report");
+    if report.trim().is_empty() {
+        // The planner's own outside change when it named one; otherwise
+        // what the person said.
+        let decision = serde_json::from_str::<FixDecision>(&field("fix_decision"))
+            .ok()
+            .filter(|d| d.effective_location() == FixLocation::OutsideCode)
+            .unwrap_or_else(|| FixDecision {
+                fix_location: FixLocation::OutsideCode,
+                cause: cause.trim().to_string(),
+                outside_change: Some(OutsideChange {
+                    system: if where_.trim().is_empty() {
+                        "the system that holds this data".to_string()
+                    } else {
+                        where_.trim().to_string()
+                    },
+                    change: cause.trim().to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let body = fix_location::outside_report(&decision, false);
+        let closed_line = format!(
+            "\n\nCoderHelm's pull request #{} for this was closed.",
+            pr_ref.pr_number
+        );
+        let ticket = field("ticket_id");
+        let issue_number = item
+            .as_ref()
+            .and_then(|i| i.get("issue_number"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        match field("ticket_source").as_str() {
+            "jira" if !ticket.is_empty() => {
+                if let Err(e) = super::post_jira_comment(
+                    state,
+                    pr_ref.team_id,
+                    &ticket,
+                    &fix_location::jira_text(&format!("{body}{closed_line}")),
+                    "clarification",
+                    "Needs a change outside the code",
+                )
+                .await
+                {
+                    warn!(run_id = %pr_ref.run_id, error = %e, "Could not post the outside-the-code report on the ticket");
+                }
+            }
+            "github" if issue_number > 0 => {
+                let _ = github
+                    .create_issue_comment(
+                        pr_ref.owner,
+                        pr_ref.repo,
+                        issue_number,
+                        &format!("**Needs a change outside the code**\n\n{body}{closed_line}"),
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+        report = format!("**Needs a change outside the code**\n\n{body}");
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(pr_ref.team_id))
+        .key("run_id", super::attr_s(pr_ref.run_id))
+        .update_expression(
+            "SET #s = :s, status_run_id = :sri, updated_at = :t, current_pass = :cp, \
+             fix_location = :fl, outside_change_report = :rep",
+        )
+        .condition_expression("#s <> :cancelled")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", super::attr_s(fix_location::STATUS_OUTSIDE))
+        .expression_attribute_values(
+            ":sri",
+            super::attr_s(&format!(
+                "{}#{}",
+                fix_location::STATUS_OUTSIDE,
+                pr_ref.run_id
+            )),
+        )
+        .expression_attribute_values(":t", super::attr_s(&now))
+        .expression_attribute_values(":cp", super::attr_s("done"))
+        .expression_attribute_values(":fl", super::attr_s(FixLocation::OutsideCode.as_str()))
+        .expression_attribute_values(":rep", super::attr_s(&report))
+        .expression_attribute_values(":cancelled", super::attr_s("cancelled"))
+        .send()
+        .await;
+    true
+}
+
 async fn finish_without_change(state: &WorkerState, msg: &FeedbackMessage) {
     let now = chrono::Utc::now().to_rfc3339();
     let _ = state

@@ -871,3 +871,311 @@ async fn review_eval_live_classification() {
         failures.join("\n")
     );
 }
+
+// ── Run cases (`review_cases/runs/`) ─────────────────────────────────────
+//
+// What a ticket run does around its review: a re-run of a ticket with
+// history, a person's comment on the ticket, and the PR reviewer's verdict on
+// the run's own PR. Each case drives the real decision code
+// (`ticket_history::TicketHistory::guard`, `fix_location::route`,
+// `jira_comment::decide`, the reviewer's enforcement rules and
+// `decide_verdict`) with recorded inputs, and checks the invariants:
+//   (e) a ticket whose CoderHelm PR was closed unmerged with an outside-code
+//       lesson never gets another PR while the ticket is unchanged;
+//   (f) a plan with no decision on where the fix belongs never codes;
+//   (g) a ticket comment that is informational or a status note never
+//       starts a run;
+//   (h) a run never completes while its PR reviewer's verdict blocks.
+
+#[derive(Deserialize)]
+struct RunCase {
+    #[allow(dead_code)]
+    name: String,
+    kind: String,
+    #[serde(default)]
+    history: Option<RunCaseHistory>,
+    #[serde(default)]
+    current_hash: String,
+    #[serde(default)]
+    plan: Option<super::fix_location::FixDecision>,
+    #[serde(default)]
+    run_status: String,
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    intent: String,
+    #[serde(default)]
+    model_output: Option<Value>,
+    expect: Value,
+}
+
+#[derive(Deserialize, Default)]
+struct RunCaseHistory {
+    #[serde(default)]
+    runs: Vec<RunCaseRun>,
+    #[serde(default)]
+    notes: Vec<common::ticket_state::Note>,
+}
+
+#[derive(Deserialize, Default)]
+struct RunCaseRun {
+    run_id: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    pr_number: u64,
+    #[serde(default)]
+    pr_outcome: String,
+    #[serde(default)]
+    cancel_reason: String,
+    #[serde(default)]
+    lesson: String,
+    #[serde(default)]
+    lesson_where: String,
+    #[serde(default)]
+    fix_location: String,
+    #[serde(default)]
+    context_hash: String,
+}
+
+fn run_cases() -> Vec<(String, RunCase)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/passes/review_cases/runs");
+    let mut out = vec![];
+    for entry in std::fs::read_dir(&dir).expect("review_cases/runs exists") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let case: RunCase =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        out.push((
+            path.file_name().unwrap().to_string_lossy().into_owned(),
+            case,
+        ));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    assert!(out.len() >= 3, "the run cases are found");
+    out
+}
+
+fn route_name(r: super::fix_location::Route) -> &'static str {
+    use super::fix_location::Route;
+    match r {
+        Route::Code => "code",
+        Route::OutsideOnly => "outside_only",
+        Route::CodeAndOutside => "code_and_outside",
+        Route::Ask => "ask",
+    }
+}
+
+#[test]
+fn review_eval_replays_every_run_case() {
+    use super::fix_location::{self, Route};
+    use super::jira_comment::{self, Act, ActionKind};
+    use super::ticket_history::{Guard, PriorRun, TicketHistory};
+    let mut failures = vec![];
+    for (file, case) in run_cases() {
+        let mut fail = |m: String| failures.push(format!("{file}: {m}"));
+        let want = |k: &str| case.expect.get(k).cloned().unwrap_or(Value::Null);
+        match case.kind.as_str() {
+            "rerun" => {
+                let h = case.history.unwrap_or_default();
+                let history = TicketHistory {
+                    runs: h
+                        .runs
+                        .into_iter()
+                        .map(|r| PriorRun {
+                            run_id: r.run_id,
+                            status: r.status,
+                            repo: r.repo,
+                            pr_number: r.pr_number,
+                            pr_outcome: r.pr_outcome,
+                            cancel_reason: r.cancel_reason,
+                            lesson: r.lesson,
+                            lesson_where: r.lesson_where,
+                            fix_location: r.fix_location,
+                            context_hash: r.context_hash,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    notes: h.notes,
+                    done_hash: String::new(),
+                };
+                // What the run does: the planner's route, then the history.
+                let route = match history.guard(case.plan.as_ref(), &case.current_hash) {
+                    Guard::Stop { route, .. } => route,
+                    Guard::Proceed => fix_location::route(case.plan.as_ref()),
+                };
+                let new_pr = matches!(route, Route::Code | Route::CodeAndOutside);
+                if !history.closed_unmerged().is_empty()
+                    && history.outside_conclusion().is_some()
+                    && new_pr
+                {
+                    fail(
+                        "invariant (e): a second PR after a closed PR with an outside lesson"
+                            .into(),
+                    );
+                }
+                if case.plan.is_none() && new_pr {
+                    fail("invariant (f): a plan with no decision coded".into());
+                }
+                if want("new_pr").as_bool() != Some(new_pr) {
+                    fail(format!("new_pr = {new_pr}, want {}", want("new_pr")));
+                }
+                if let Some(r) = want("route").as_str() {
+                    if r != route_name(route) {
+                        fail(format!("route {}, want {r}", route_name(route)));
+                    }
+                }
+            }
+            "jira_comment" => {
+                let kind = match case.action.as_str() {
+                    "feedback" => ActionKind::Feedback,
+                    "run" => ActionKind::Run,
+                    _ => ActionKind::None,
+                };
+                let intent = common::ticket_state::Intent::parse(&case.intent);
+                let act = jira_comment::decide(Some(intent), &case.run_status, kind);
+                let starts_run = matches!(act, Act::Dispatch) && kind == ActionKind::Run;
+                let act_name = match act {
+                    Act::Dispatch => "dispatch",
+                    Act::Elsewhere { .. } => "elsewhere",
+                    Act::Nothing => "nothing",
+                };
+                if matches!(
+                    intent,
+                    common::ticket_state::Intent::FixElsewhereInfo
+                        | common::ticket_state::Intent::StatusOnly
+                ) && starts_run
+                {
+                    fail("invariant (g): an informational comment started a run".into());
+                }
+                if want("act").as_str() != Some(act_name) {
+                    fail(format!("act {act_name}, want {}", want("act")));
+                }
+                if want("starts_run").as_bool() != Some(starts_run) {
+                    fail(format!(
+                        "starts_run = {starts_run}, want {}",
+                        want("starts_run")
+                    ));
+                }
+                assert!(
+                    !case.comment.is_empty(),
+                    "{file}: a comment case needs its comment"
+                );
+            }
+            "own_pr_review" => {
+                let out: ReviewOutput =
+                    serde_json::from_value(case.model_output.clone().expect("model_output"))
+                        .expect("model_output is a review");
+                let mut findings = out.findings.clone();
+                review_agent::enforce_source_data_override(&mut findings);
+                review_agent::enforce_manual_checks_are_notes(&mut findings);
+                let verdict = review_agent::decide_verdict(&findings, 0, 0, false);
+                let override_found = findings.iter().any(|f| {
+                    f.category
+                        .eq_ignore_ascii_case(review_agent::SOURCE_DATA_OVERRIDE)
+                        && f.severity == "blocking"
+                });
+                // The run completes only when the verdict doesn't block.
+                let completes = verdict != "REQUEST_CHANGES";
+                if verdict == "REQUEST_CHANGES" && completes {
+                    fail("invariant (h): the run completed under a blocking review".into());
+                }
+                if want("verdict").as_str() != Some(verdict) {
+                    fail(format!("verdict {verdict}, want {}", want("verdict")));
+                }
+                if want("closes_own_pr").as_bool() != Some(override_found) {
+                    fail(format!(
+                        "closes_own_pr = {override_found}, want {}",
+                        want("closes_own_pr")
+                    ));
+                }
+            }
+            other => fail(format!("unknown run case kind {other}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "run eval failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Live layer for the run cases: the model reads each recorded ticket
+/// comment, and its intent must be the case's.
+#[tokio::test]
+#[ignore]
+async fn review_eval_live_ticket_comments() {
+    let meter = common::usage::UsageMeter::memory("").0;
+    let bedrock = std::env::var("EVAL_PROVIDER").is_ok_and(|p| p == "bedrock");
+    let (client, default_model) = if bedrock {
+        let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        (
+            crate::agent::anthropic::AnthropicClient::bedrock(
+                aws_sdk_bedrockruntime::Client::new(&cfg),
+                meter,
+            ),
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        )
+    } else {
+        let Ok(key) = std::env::var("ANTHROPIC_API_KEY") else {
+            panic!("set EVAL_PROVIDER=bedrock (AWS credentials) or ANTHROPIC_API_KEY for the live evals");
+        };
+        (
+            crate::agent::anthropic::AnthropicClient::new(key, meter),
+            "claude-haiku-4-5",
+        )
+    };
+    let model = std::env::var("EVAL_MODEL").unwrap_or_else(|_| default_model.into());
+    let mut usage = crate::models::TokenUsage::default();
+    let mut failures = vec![];
+    for (file, case) in run_cases() {
+        if case.kind != "jira_comment" {
+            continue;
+        }
+        let msg = crate::models::JiraCommentMessage {
+            team_id: String::new(),
+            installation_id: 0,
+            ticket_id: "ABC-1".into(),
+            title: "A class is missing from the site schedule".into(),
+            run_id: String::new(),
+            run_status: case.run_status.clone(),
+            pr_number: 0,
+            repo_owner: String::new(),
+            repo_name: String::new(),
+            author: "a person".into(),
+            comment: case.comment.clone(),
+            context_hash: String::new(),
+            action: None,
+        };
+        let v = crate::agent::anthropic::converse_json(
+            &client,
+            &model,
+            super::jira_comment::SYSTEM,
+            &super::jira_comment::prompt(&msg),
+            &super::jira_comment::schema(),
+            true,
+            "low",
+            512,
+            &mut usage,
+        )
+        .await;
+        let want = common::ticket_state::Intent::parse(&case.intent);
+        match v.map(|v| common::ticket_state::Intent::parse(v["intent"].as_str().unwrap_or(""))) {
+            Ok(got) if got == want => {}
+            Ok(got) => failures.push(format!("{file}: read as {got:?}, want {want:?}")),
+            Err(e) => failures.push(format!("{file}: {e}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "live run eval failures:\n{}",
+        failures.join("\n")
+    );
+}

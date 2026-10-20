@@ -1,0 +1,20 @@
+{
+  "name": "a ticket re-run after its PR was closed unmerged with an outside-code lesson",
+  "description": "A class was missing from the site because its term isn't available on the web in the booking system. The first run hardcoded the program id into a force-active list; people closed that PR unmerged. A second run (started by a field change on the ticket) reused the old plan, opened the same override again, and only then learned the fix belongs in the booking system. A third trigger on the unchanged ticket must not open another PR, whatever the planner says.",
+  "kind": "rerun",
+  "history": {
+    "runs": [
+      {"run_id": "01A", "status": "cancelled", "repo": "acme/pipelines", "pr_number": 11, "pr_outcome": "closed", "cancel_reason": "pr_closed_by_human", "context_hash": "h1"},
+      {"run_id": "01B", "status": "completed", "repo": "acme/pipelines", "pr_number": 12, "context_hash": "h1",
+       "lesson": "When a class is missing from the site schedule, check whether its term is marked available on the web in the booking system before changing code.",
+       "lesson_where": "the booking system"}
+    ]
+  },
+  "current_hash": "h1",
+  "plan": {
+    "fix_location": "code",
+    "cause": "The class is inactive because its term is not available on the web.",
+    "history_check": "Forcing the program active is the quickest way to show the class."
+  },
+  "expect": {"new_pr": false, "route": "outside_only"}
+}

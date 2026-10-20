@@ -1,0 +1,13 @@
+{
+  "name": "the run's own PR overrides a source system's records: the run doesn't complete as passed",
+  "description": "The run's internal review passed a diff that adds a frozenset of booking program ids forced active. The PR reviewer flagged it as a source-data override a minute later, after the run had completed. The run now asks the PR reviewer before it completes: the override finding blocks, and the run closes its own PR instead of completing it.",
+  "kind": "own_pr_review",
+  "model_output": {
+    "verdict": "COMMENT",
+    "summary": "Moves the status logic into a helper; also forces one program active.",
+    "findings": [{"file": "dags/utils/class_status.py", "line": 11, "severity": "medium", "category": "source-data-override", "evidence": "unverified-concern",
+      "title": "Hardcoded program id works around the booking system's term setting",
+      "body": "FORCE_ACTIVE_PROGRAM_IDS = frozenset({\"12345\"}) makes one record active by overriding the term's web setting, which the booking system owns. Set the term to be available on the web instead."}]
+  },
+  "expect": {"verdict": "REQUEST_CHANGES", "closes_own_pr": true}
+}

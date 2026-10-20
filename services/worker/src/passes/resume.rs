@@ -1110,6 +1110,8 @@ pub async fn run(
         first_attempt_ms: 0,
         model_retries: 0,
         ticket_update_note: None,
+        ticket_history_note: None,
+        plan_cache_key: None,
     };
 
     let provider = ModelProvider::load_for_team(
@@ -1608,6 +1610,80 @@ pub async fn run(
             None,
         )
         .await;
+
+        // One review authority: the run's own checks passing is not enough.
+        // The PR reviewer gives its verdict on this head now, and the run
+        // completes only when that verdict doesn't block.
+        let mut review_result = review_result;
+        if review_result.passed {
+            let budget =
+                std::time::Duration::from_secs(super::remaining_secs(&start).saturating_sub(150));
+            if let Some(rr) = super::review_pr::review_for_run(
+                state,
+                &msg.team_id,
+                msg.installation_id,
+                &repo_owner,
+                &repo_name,
+                pr_number,
+                branch_head.as_deref().unwrap_or(""),
+                budget,
+            )
+            .await
+            {
+                if let Some(finding) = rr.override_finding.as_deref() {
+                    // The diff overrides data another system owns: the fix
+                    // belongs there, not in another commit on this PR.
+                    let planned = run_record
+                        .get("fix_decision")
+                        .and_then(|v| v.as_s().ok())
+                        .and_then(|j| {
+                            serde_json::from_str::<super::fix_location::FixDecision>(j).ok()
+                        });
+                    let where_ = planned
+                        .as_ref()
+                        .and_then(|d| d.outside_change.as_ref())
+                        .map(|c| c.system.clone())
+                        .unwrap_or_default();
+                    let cause = planned
+                        .as_ref()
+                        .map(|d| d.cause.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                        .unwrap_or_else(|| finding.to_string());
+                    info!(
+                        run_id = msg.run_id,
+                        "PR reviewer found the diff overrides another system's data — closing own PR"
+                    );
+                    let closed = super::feedback::close_own_pr_outside(
+                        state,
+                        &github,
+                        &super::feedback::OwnPr {
+                            team_id: &msg.team_id,
+                            run_id: &msg.run_id,
+                            owner: &repo_owner,
+                            repo: &repo_name,
+                            pr_number,
+                        },
+                        &where_,
+                        &cause,
+                    )
+                    .await;
+                    if closed {
+                        mark_events_processed(state, &msg.run_id, &events).await;
+                        return Ok(());
+                    }
+                }
+                if rr.blocks() {
+                    info!(
+                        run_id = msg.run_id,
+                        "PR reviewer requested changes — the run doesn't complete as passed"
+                    );
+                    review_result = review::ReviewResult {
+                        passed: false,
+                        summary: format!("The PR reviewer requested changes:\n\n{}", rr.body),
+                    };
+                }
+            }
+        }
 
         if review_result.passed {
             info!(run_id = msg.run_id, "Review passed — completing run");
