@@ -222,6 +222,9 @@ pub fn gaps(
         return out;
     }
     let p = &d.evidence.producer;
+    if p.kind.trim() == "code" && d.fix_location == FixLocation::OutsideCode {
+        out.push("You found that code writes the wrong value, so it is our bug: the fix is in that code (`code`, or `both` when a source record must change too), not outside it. A display fallback alone isn't the fix.".to_string());
+    }
     match p.kind.trim() {
         "code" => {
             let cited = p.where_.trim();
@@ -371,7 +374,10 @@ Before writing tasks, decide whether the fix belongs in this code at all.
 - When the wrong value is written by a sync or pipeline, the producer is where the cause usually is: read that pipeline's code (in its repository) and the rows it writes. A change in the code that reads the data instead is a workaround; plan one only when you can say why the producer can't or shouldn't be fixed.
 - If a person says the fix is tracked in another ticket, check that ticket's fix against your own trace. If it covers the cause you found, use `outside_code` naming that ticket. If your trace finds a deeper cause it doesn't cover, say so and plan the fix for that cause; the other ticket can stay as a safeguard.
 - Never call a cause settled while you haven't read the code that writes the wrong value. If you write "I did not read" about the step that produces it, read it before deciding.
-- When records that should be separate are merged, or a value flips between runs, read the table's unique constraints and indexes (query them from the database) and the code that matches existing rows: a key that leaves out a field forces records that differ in that field into one.
+- When records that should be separate are merged, or a value flips between runs, read the table's unique constraints and indexes (query them from the database), the upsert's conflict target (`ON CONFLICT`) and the code that matches existing rows: a key that leaves out a field forces records that differ in that field into one, and the last write wins.
+- Only call it a data problem when the source system's own record holds the wrong value: look the record up in the source (or its raw copy) and quote the value. If the source is right and ours is wrong, it is our bug, in the code that copies or transforms it.
+- "Can't reproduce" is a finding, not noise: when a value differs between checks, look for what rewrites it (sync order, last write wins, a cache or index rebuilt at another moment) before setting it aside.
+- Fix the cause, not the display. A fallback in the screen that shows the value is an extra safeguard, never the whole fix, while the stored value stays wrong.
 - Measure how widespread the problem is with a query (how many records share the defect) before choosing a fix, and say the number.
 - A fix that changes the shape of data (splitting or merging records, a new unique key) needs the readers of that data: search the team's other repositories for code that depends on the old shape, and say which links or ids would change.
 - Before your first query on a table, read its columns (describe it); don't guess column names from other tables' conventions.
@@ -394,7 +400,7 @@ After the four openspec files, output this block (JSON, all fields required; `ou
     "looked_up": ["each lookup you made and a short summary of what came back"],
     "code_rule": "the rule the code is meant to follow for this case",
     "data_shows": "what the data or settings show for the records in the ticket",
-    "producer": {"kind": "code | source", "where": "for code: owner/repo:path and the function that writes the wrong value (a file you opened); for source: the system and the record"},
+    "producer": {"kind": "code | source", "where": "for code: owner/repo:path:line and the function that writes the wrong value (a file you opened); for source: the system, the record and the wrong value it holds"},
     "scope": "how many records have the same defect, from a query (e.g. 50 groups, 530 classes)"
   },
   "outside_change": {
@@ -865,5 +871,76 @@ mod gaps_tests {
         assert_eq!(m.fix_location, FixLocation::Unknown);
         assert!(m.cause.starts_with("Not traced far enough to decide"));
         assert!(send_back(&g).starts_with("Before this decision stands:\n- "));
+    }
+}
+
+#[cfg(test)]
+mod our_bug_tests {
+    use super::*;
+
+    fn decision(location: &str, kind: &str, where_: &str) -> FixDecision {
+        let block = format!(
+            "```fix_location.json\n{}\n```",
+            serde_json::json!({
+                "fix_location": location,
+                "cause": "A copy step overwrites the value.",
+                "evidence": {
+                    "looked_up": ["[prod database] the record"],
+                    "data_shows": "Ours differs from the source.",
+                    "producer": {"kind": kind, "where": where_},
+                    "scope": "12 records"
+                },
+                "outside_change": {"system": "the booking system", "change": "edit the record", "where": "", "verify": ""},
+                "history_check": ""
+            })
+        );
+        parse(&block).expect("parses")
+    }
+
+    #[test]
+    fn code_that_writes_the_wrong_value_is_our_bug() {
+        let read = vec!["acme/pipelines:dags/sync.py".to_string()];
+        let outside = decision(
+            "outside_code",
+            "code",
+            "acme/pipelines:dags/sync.py:120 sync_groups()",
+        );
+        let g = gaps(Some(&outside), true, 3, &read);
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert!(g[0].contains("our bug"), "{g:?}");
+        assert!(gaps(
+            Some(&decision(
+                "code",
+                "code",
+                "acme/pipelines:dags/sync.py:120 sync_groups()"
+            )),
+            true,
+            3,
+            &read
+        )
+        .is_empty());
+        assert!(gaps(
+            Some(&decision(
+                "both",
+                "code",
+                "acme/pipelines:dags/sync.py:120 sync_groups()"
+            )),
+            true,
+            3,
+            &read
+        )
+        .is_empty());
+        // The source holding the wrong value is a change outside the code.
+        assert!(gaps(
+            Some(&decision(
+                "outside_code",
+                "source",
+                "booking system, record 42 has the old address"
+            )),
+            true,
+            3,
+            &read
+        )
+        .is_empty());
     }
 }
