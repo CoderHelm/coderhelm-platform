@@ -900,7 +900,15 @@ pub async fn run(
                     super::CiOutcome::Passed,
                 )
                 .await;
-                mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                ready_or_prove(
+                    state,
+                    &github,
+                    &msg.team_id,
+                    &repo_owner,
+                    &repo_name,
+                    pr_number,
+                )
+                .await;
                 set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
                 return Ok(());
             }
@@ -939,7 +947,15 @@ pub async fn run(
                     )
                     .await;
                 }
-                mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                ready_or_prove(
+                    state,
+                    &github,
+                    &msg.team_id,
+                    &repo_owner,
+                    &repo_name,
+                    pr_number,
+                )
+                .await;
                 set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
                 return Ok(());
             }
@@ -1687,7 +1703,15 @@ pub async fn run(
 
         if review_result.passed {
             info!(run_id = msg.run_id, "Review passed — completing run");
-            mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+            ready_or_prove(
+                state,
+                &github,
+                &msg.team_id,
+                &repo_owner,
+                &repo_name,
+                pr_number,
+            )
+            .await;
             complete_run_with_status(
                 state,
                 &ticket_msg,
@@ -2182,6 +2206,30 @@ pub(crate) async fn mark_pr_ready(
 
 /// Marks an E2E fix or generated-test PR ready once its repeat runs proved it.
 /// Those PRs are skipped by [`mark_pr_ready`]: green CI alone isn't enough.
+/// Marks a finished run's PR ready for review. A flaky-test fix PR starts its
+/// proof first, and stays a draft while the proof runs or after the fix was
+/// refused; when no proof can run it is marked ready with a note saying so.
+pub(crate) async fn ready_or_prove(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    repo_owner: &str,
+    repo_name: &str,
+    pr_number: u64,
+) {
+    use super::e2e::Proof;
+    match super::e2e::start_fix_proof(state, github, team_id, repo_owner, repo_name, pr_number)
+        .await
+    {
+        Proof::Ready => mark_e2e_pr_ready(github, repo_owner, repo_name, pr_number).await,
+        Proof::Running | Proof::Refused => info!(
+            pr_number,
+            "Flaky-test fix PR stays a draft while its proof runs or after it was refused"
+        ),
+        Proof::NotAFix => mark_pr_ready(github, repo_owner, repo_name, pr_number).await,
+    }
+}
+
 pub(crate) async fn mark_e2e_pr_ready(
     github: &GitHubClient,
     repo_owner: &str,
