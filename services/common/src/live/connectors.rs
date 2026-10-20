@@ -1,5 +1,5 @@
 //! Monitoring, docs and pipeline connections a team turns on for its agents:
-//! New Relic, Confluence, CloudWatch metrics and Airflow (MWAA).
+//! New Relic, Confluence, OpenSearch, CloudWatch metrics and Airflow (MWAA).
 //!
 //! One record per kind per team (`CONNECTOR#<kind>` in the settings table).
 //! Each is off until an admin turns it on, reads only, and every call it makes
@@ -29,14 +29,16 @@ type Item = HashMap<String, AttributeValue>;
 pub enum ConnKind {
     NewRelic,
     Confluence,
+    OpenSearch,
     Metrics,
     Airflow,
 }
 
 impl ConnKind {
-    pub const ALL: [ConnKind; 4] = [
+    pub const ALL: [ConnKind; 5] = [
         ConnKind::NewRelic,
         ConnKind::Confluence,
+        ConnKind::OpenSearch,
         ConnKind::Metrics,
         ConnKind::Airflow,
     ];
@@ -45,6 +47,7 @@ impl ConnKind {
         match self {
             ConnKind::NewRelic => "newrelic",
             ConnKind::Confluence => "confluence",
+            ConnKind::OpenSearch => "opensearch",
             ConnKind::Metrics => "metrics",
             ConnKind::Airflow => "airflow",
         }
@@ -59,6 +62,7 @@ impl ConnKind {
         match self {
             ConnKind::NewRelic => "New Relic",
             ConnKind::Confluence => "Confluence",
+            ConnKind::OpenSearch => "OpenSearch",
             ConnKind::Metrics => "CloudWatch metrics",
             ConnKind::Airflow => "Airflow (MWAA)",
         }
@@ -84,16 +88,18 @@ pub struct Connector {
     /// `ready` once a test passed; `error` when the last test failed.
     pub status: String,
     pub status_message: String,
-    /// New Relic: a user key. Confluence: an API token. Sealed for the team.
+    /// New Relic: a user key. Confluence: an API token. OpenSearch: the
+    /// password. Sealed for the team.
     pub key_sealed: String,
     pub key_hint: String,
     /// New Relic: `us` or `eu`. Metrics and Airflow: the AWS region.
     pub region: String,
     /// New Relic accounts agents may query. Empty: every account the key sees.
     pub account_ids: Vec<String>,
-    /// Confluence: `https://<site>.atlassian.net`.
+    /// Confluence: `https://<site>.atlassian.net`. OpenSearch: the cluster's
+    /// `https://` address.
     pub site: String,
-    /// Confluence: the account the token belongs to.
+    /// Confluence: the account the token belongs to. OpenSearch: the user.
     pub email: String,
     /// Confluence spaces agents may read (keys). Empty: every space the
     /// account sees.
@@ -106,6 +112,11 @@ pub struct Connector {
     pub aws: Option<AwsTarget>,
     /// Airflow: MWAA environment names agents may read.
     pub environments: Vec<String>,
+    /// OpenSearch: index names or patterns agents may read. Empty: every
+    /// index the user sees.
+    pub indexes: Vec<String>,
+    /// OpenSearch: field names hidden in results, on top of the defaults.
+    pub hidden_fields: Vec<String>,
     /// `owner/name` repos whose work may use it. Empty: every repo.
     pub repos: Vec<String>,
     pub updated_at: String,
@@ -173,6 +184,8 @@ impl Connector {
             ),
             ("write_pages".to_string(), av_list(&self.write_pages)),
             ("environments".to_string(), av_list(&self.environments)),
+            ("indexes".to_string(), av_list(&self.indexes)),
+            ("hidden_fields".to_string(), av_list(&self.hidden_fields)),
             ("repos".to_string(), av_list(&self.repos)),
             ("updated_at".to_string(), av_s(&self.updated_at)),
             ("updated_by".to_string(), av_s(&self.updated_by)),
@@ -204,6 +217,8 @@ impl Connector {
             write_pages: strings(item, "write_pages"),
             aws: serde_json::from_str(&s(item, "aws")).ok(),
             environments: strings(item, "environments"),
+            indexes: strings(item, "indexes"),
+            hidden_fields: strings(item, "hidden_fields"),
             repos: strings(item, "repos"),
             updated_at: s(item, "updated_at"),
             updated_by: s(item, "updated_by"),
@@ -236,6 +251,8 @@ impl Connector {
             "write_enabled": self.write_enabled,
             "write_pages": self.write_pages,
             "environments": self.environments,
+            "indexes": self.indexes,
+            "hidden_fields": self.hidden_fields,
             "repos": self.repos,
             "aws": aws,
             "updated_at": self.updated_at,

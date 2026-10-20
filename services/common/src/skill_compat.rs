@@ -317,7 +317,8 @@ pub struct Requirement {
     #[serde(default)]
     pub server: String,
     /// For `data_sources`: the monitoring, docs or pipeline connection it
-    /// means (`newrelic`, `confluence`, `metrics`, `airflow`), or empty.
+    /// means (`newrelic`, `confluence`, `opensearch`, `metrics`, `airflow`), or
+    /// empty.
     #[serde(default)]
     pub connection: String,
     /// Worked out here, never by the model: "connect" (offer a link to
@@ -464,7 +465,7 @@ pub fn output_schema() -> Value {
                                     "fix": { "type": "string" },
                                     "connect": enum_of(&["plugins", "data_sources", "github", "none"]),
                                     "server": { "type": "string" },
-                                    "connection": enum_of(&["", "newrelic", "confluence", "metrics", "airflow"])
+                                    "connection": enum_of(&["", "newrelic", "confluence", "opensearch", "metrics", "airflow"])
                                 }
                             }
                         }

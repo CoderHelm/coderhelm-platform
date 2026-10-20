@@ -38,6 +38,7 @@ pub mod logs;
 pub mod metrics;
 pub mod net;
 pub mod newrelic;
+pub mod opensearch;
 pub mod redact;
 pub mod redshift;
 pub mod secret;

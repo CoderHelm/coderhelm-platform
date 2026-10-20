@@ -64,7 +64,7 @@ fn ob(item: &Item, k: &str) -> Option<bool> {
 pub fn section_of(id: &str) -> &'static str {
     match id {
         "github" | "jira" => "code",
-        "aws" => "cloud",
+        "aws" | "opensearch" => "cloud",
         "newrelic" | "sentry" => "monitoring",
         "confluence" | "notion" | "figma" | "sanity" => "docs",
         "teams" => "chat",
@@ -410,7 +410,7 @@ pub async fn list(
         }
     }
 
-    // New Relic and Confluence.
+    // New Relic, Confluence and OpenSearch.
     for (kind, does) in [
         (
             ConnKind::NewRelic,
@@ -419,6 +419,10 @@ pub async fn list(
         (
             ConnKind::Confluence,
             "Searches and reads Confluence pages. Optionally adds text to the end of pages you list.",
+        ),
+        (
+            ConnKind::OpenSearch,
+            "Searches your OpenSearch or Elasticsearch indexes read-only, so agents can see the documents your app actually reads. Limit it to the indexes you list.",
         ),
     ] {
         let c = saved.iter().find(|c| c.kind() == kind);
