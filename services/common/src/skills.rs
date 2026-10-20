@@ -41,6 +41,9 @@ const SKILL: &str = "SKILL#";
 const FILE: &str = "SKILLFILE#";
 const ASK: &str = "SKILLASK#";
 const DAY: &str = "SKILLDAY#";
+/// Closes a `SKILLDAY#` range: '~' sorts after every digit, so it is greater
+/// than any date. ('$' sorts before digits, which DynamoDB rejects as an empty range.)
+const DAY_END: &str = "~";
 /// One read or ask, for the access log: `SKILLUSE#<ulid>`.
 const USE: &str = "SKILLUSE#";
 /// One partition listing every team's connected repositories, so the periodic
@@ -1944,8 +1947,7 @@ impl SkillStore<'_> {
                 .key_condition_expression("pk = :p AND sk BETWEEN :a AND :b")
                 .expression_attribute_values(":p", av(self.team))
                 .expression_attribute_values(":a", av(&format!("{DAY}{since}")))
-                // '$' sorts after '#' and every digit, closing the range.
-                .expression_attribute_values(":b", av(&format!("{DAY}$")))
+                .expression_attribute_values(":b", av(&format!("{DAY}{DAY_END}")))
                 .set_exclusive_start_key(start)
                 .send()
                 .await
@@ -2627,6 +2629,14 @@ pub fn usage_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_day_range_end_sorts_after_every_date() {
+        let end = format!("{DAY}{DAY_END}");
+        for d in ["2000-01-01", "2026-10-19", "9999-12-31"] {
+            assert!(end.as_str() > format!("{DAY}{d}").as_str(), "{d}");
+        }
+    }
 
     fn access(by: &str, action: &str, outcome: &str) -> SkillAccess {
         SkillAccess {
