@@ -201,13 +201,19 @@ impl TicketHistory {
             out.push('\n');
         }
         if !self.notes.is_empty() {
-            out.push_str("What people wrote on the ticket:\n");
+            out.push_str(
+                "What people wrote on the ticket, oldest first. A later comment corrects an \
+                 earlier one. Where a person already traced the cause, start from their \
+                 finding: check it against the data and the code, and build on it rather \
+                 than starting over:\n",
+            );
             for n in &self.notes {
                 out.push_str(&format!(
-                    "- {} ({}): {}\n",
+                    "- {} {} ({}): {}\n",
+                    n.at.get(..16).unwrap_or(&n.at),
                     n.author,
                     n.intent.as_str(),
-                    one_line(&n.text, 600)
+                    one_line(&common::jira_text::text_of(&n.text), NOTE_CHARS)
                 ));
             }
         }
@@ -308,6 +314,10 @@ impl TicketHistory {
         Guard::Proceed
     }
 }
+
+/// How much of each ticket comment the planner reads: enough for a person's
+/// written investigation, not only its first sentence.
+const NOTE_CHARS: usize = 2500;
 
 fn one_line(s: &str, max: usize) -> String {
     let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");

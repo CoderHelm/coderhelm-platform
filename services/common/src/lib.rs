@@ -30,6 +30,7 @@ pub mod paged;
 /// What happened to a PR Coderhelm opened, read from GitHub.
 pub mod pr_outcome;
 // review_stats: time-ordered review records for analytics
+pub mod jira_text;
 pub mod review_stats;
 pub mod skill_apply;
 pub mod skill_compat;

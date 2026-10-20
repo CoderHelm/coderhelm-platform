@@ -353,7 +353,7 @@ async fn process_jira_payload(
 
     let body_text = match raw_description {
         Some(Value::String(s)) => s.clone(),
-        Some(other) => extract_adf_text(other),
+        Some(other) => common::jira_text::adf_text(other),
         None => String::new(),
     };
 
@@ -670,11 +670,14 @@ async fn handle_jira_comment(
         return Ok(StatusCode::OK);
     }
 
+    // Jira sends the body as a document (JSON, or JSON in a string); keep
+    // its words only.
     let comment_body = payload
         .get("comment")
         .and_then(|c| c.get("body"))
-        .and_then(|b| b.as_str())
-        .unwrap_or("");
+        .map(common::jira_text::body_text)
+        .unwrap_or_default();
+    let comment_body = comment_body.as_str();
 
     let comment_author = payload
         .get("comment")
@@ -807,7 +810,7 @@ async fn handle_jira_comment(
         .or_else(|| issue.get("description"));
     let fresh_body = match raw_description {
         Some(Value::String(s)) => s.clone(),
-        Some(other) => extract_adf_text(other),
+        Some(other) => common::jira_text::adf_text(other),
         None => run_item
             .get("body")
             .and_then(|v| v.as_s().ok())
@@ -1094,98 +1097,4 @@ async fn upload_image_attachments(
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(input).ok()
-}
-
-/// Extract plain text from Jira Atlassian Document Format (ADF).
-/// ADF is a nested JSON tree with `content` arrays and `text` leaf nodes.
-/// Falls back to raw JSON if the structure is unexpected.
-fn extract_adf_text(value: &Value) -> String {
-    let mut parts = Vec::new();
-    extract_adf_text_inner(value, &mut parts);
-    let result = parts.join("");
-    if result.trim().is_empty() {
-        // Fallback: serialize as JSON so we don't lose data entirely
-        serde_json::to_string(value).unwrap_or_default()
-    } else {
-        result.trim().to_string()
-    }
-}
-
-fn extract_adf_text_inner(value: &Value, parts: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            // Text leaf node
-            if let Some(Value::String(text)) = map.get("text") {
-                parts.push(text.clone());
-                return;
-            }
-            // Block nodes that should produce line breaks
-            let node_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let is_block = matches!(
-                node_type,
-                "paragraph"
-                    | "heading"
-                    | "bulletList"
-                    | "orderedList"
-                    | "listItem"
-                    | "blockquote"
-                    | "codeBlock"
-                    | "rule"
-                    | "table"
-                    | "tableRow"
-                    | "tableCell"
-            );
-            // Hard break inline node
-            if node_type == "hardBreak" {
-                parts.push("\n".to_string());
-                return;
-            }
-            // Media nodes (images/attachments embedded in the description)
-            if node_type == "media" || node_type == "mediaSingle" || node_type == "mediaInline" {
-                let filename = map
-                    .get("attrs")
-                    .and_then(|a| a.get("alt"))
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        map.get("attrs")
-                            .and_then(|a| a.get("id"))
-                            .and_then(|v| v.as_str())
-                    })
-                    .unwrap_or("image");
-                parts.push(format!("[Attached image: {filename}]"));
-                // Recurse into children (mediaSingle wraps a media node)
-                if let Some(Value::Array(children)) = map.get("content") {
-                    for child in children {
-                        extract_adf_text_inner(child, parts);
-                    }
-                }
-                return;
-            }
-            // Inline card (pasted URLs like Notion links)
-            if node_type == "inlineCard" || node_type == "blockCard" {
-                if let Some(url) = map
-                    .get("attrs")
-                    .and_then(|a| a.get("url"))
-                    .and_then(|v| v.as_str())
-                {
-                    parts.push(url.to_string());
-                }
-                return;
-            }
-            if let Some(Value::Array(children)) = map.get("content") {
-                for child in children {
-                    extract_adf_text_inner(child, parts);
-                }
-            }
-            if is_block && !parts.last().is_none_or(|s| s.ends_with('\n')) {
-                parts.push("\n".to_string());
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr {
-                extract_adf_text_inner(item, parts);
-            }
-        }
-        _ => {}
-    }
 }
