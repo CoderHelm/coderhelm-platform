@@ -82,6 +82,25 @@ pub struct FixEvidence {
     /// What the data or settings show.
     #[serde(default)]
     pub data_shows: String,
+    /// What writes the wrong value, when the ticket is about one.
+    #[serde(default)]
+    pub producer: Producer,
+    /// How many records have the same defect, from a query.
+    #[serde(default)]
+    pub scope: String,
+}
+
+/// What writes a wrong value: code (a repository file and function the
+/// planner read) or a record in the source system.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Producer {
+    /// `code` or `source`.
+    #[serde(default)]
+    pub kind: String,
+    /// For code: `owner/repo:path` and the function. For a source record:
+    /// the system and the record.
+    #[serde(default, rename = "where")]
+    pub where_: String,
 }
 
 /// The change a person makes outside the code.
@@ -176,8 +195,78 @@ pub fn unchecked_data(d: Option<&FixDecision>, can_look_up: bool, lookups: usize
     can_look_up && lookups == 0 && d.is_some_and(|d| !d.evidence.data_shows.trim().is_empty())
 }
 
-/// The message that sends such a planner back to check before deciding.
-pub const CHECK_THE_DATA: &str = "Before this decision stands: you describe what the data shows, but you made no lookups. What people wrote on the ticket are leads to verify, not facts. Check the records the ticket and the comments name against the connected data now (the stored values by id, and where they come from: the sync or pipeline that writes them). Then answer again in full: the four openspec files and the fix_location.json block, with `data_shows` saying only what your lookups returned.";
+/// What a settled decision about data still lacks, in plain instructions
+/// (empty when nothing is missing): a lookup at all, what writes the wrong
+/// value, that code named as the writer was actually opened in this run
+/// (`read_paths`: `owner/repo:path` of every file the planner read), and how
+/// many records share the defect.
+pub fn gaps(
+    d: Option<&FixDecision>,
+    can_look_up: bool,
+    lookups: usize,
+    read_paths: &[String],
+) -> Vec<String> {
+    let Some(d) = d else { return Vec::new() };
+    if d.evidence.data_shows.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if unchecked_data(Some(d), can_look_up, lookups) {
+        out.push("You describe what the data shows but made no lookups. Check the records the ticket and the comments name against the connected data (stored values by id, and the sync or pipeline that writes them); what people wrote are leads, not facts.".to_string());
+    }
+    let settled = matches!(
+        d.fix_location,
+        FixLocation::Code | FixLocation::OutsideCode | FixLocation::Both
+    );
+    if !settled {
+        return out;
+    }
+    let p = &d.evidence.producer;
+    match p.kind.trim() {
+        "code" => {
+            let cited = p.where_.trim();
+            let opened = read_paths.iter().any(|r| {
+                let file = r.split_once(':').map_or(r.as_str(), |(_, f)| f);
+                !file.is_empty() && cited.contains(file)
+            });
+            if cited.is_empty() {
+                out.push("Name the file and function that write the wrong value (`producer.where`: owner/repo:path function).".to_string());
+            } else if !opened {
+                out.push(format!(
+                    "You named `{cited}` as what writes the wrong value but didn't open it in this run. Read the code that writes it (the write statement itself) before deciding."
+                ));
+            }
+        }
+        "source" if !p.where_.trim().is_empty() => {}
+        _ => out.push("Say what writes the wrong value (`producer`): the code (repository file and function) or the source record. Read it before deciding.".to_string()),
+    }
+    if d.evidence.scope.trim().is_empty() {
+        out.push("Say how many records have the same defect (`scope`), from a query.".to_string());
+    }
+    out
+}
+
+/// The message that sends a planner back with what its decision lacks.
+pub fn send_back(gaps: &[String]) -> String {
+    format!(
+        "Before this decision stands:\n{}\nThen answer again in full: the four openspec files and the fix_location.json block, with `data_shows` saying only what your lookups returned.",
+        gaps.iter().map(|g| format!("- {g}")).collect::<Vec<_>>().join("\n")
+    )
+}
+
+/// A decision still missing part of its trace after being sent back: no
+/// code is written on it. It becomes `unknown`, saying what is missing.
+pub fn mark_untraced(mut d: FixDecision, gaps: &[String]) -> FixDecision {
+    d.fix_location = FixLocation::Unknown;
+    d.cause = format!(
+        "Not traced far enough to decide ({}): {}",
+        gaps.first()
+            .map(String::as_str)
+            .unwrap_or("the trace is incomplete"),
+        d.cause.trim()
+    );
+    d
+}
 
 /// A decision still unchecked after being sent back: no code is written on
 /// it. It becomes `unknown`, saying the data wasn't checked.
@@ -299,7 +388,9 @@ After the four openspec files, output this block (JSON, all fields required; `ou
   "evidence": {
     "looked_up": ["each lookup you made and a short summary of what came back"],
     "code_rule": "the rule the code is meant to follow for this case",
-    "data_shows": "what the data or settings show for the records in the ticket"
+    "data_shows": "what the data or settings show for the records in the ticket",
+    "producer": {"kind": "code | source", "where": "for code: owner/repo:path and the function that writes the wrong value (a file you opened); for source: the system and the record"},
+    "scope": "how many records have the same defect, from a query (e.g. 50 groups, 530 classes)"
   },
   "outside_change": {
     "system": "the system the change is made in",
