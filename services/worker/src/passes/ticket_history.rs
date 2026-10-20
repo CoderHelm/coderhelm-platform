@@ -207,13 +207,22 @@ impl TicketHistory {
                  finding: check it against the data and the code, and build on it rather \
                  than starting over:\n",
             );
-            for n in &self.notes {
+            let texts = fit_notes(
+                self.notes
+                    .iter()
+                    .map(|n| common::jira_text::text_of(&n.text).trim().to_string())
+                    .collect(),
+                NOTES_BUDGET,
+            );
+            for (n, text) in self.notes.iter().zip(texts) {
+                // Kept whole, line breaks included: a written investigation
+                // (a query, a table of rows) reads as written.
                 out.push_str(&format!(
-                    "- {} {} ({}): {}\n",
+                    "- {} {} ({}):\n  {}\n",
                     n.at.get(..16).unwrap_or(&n.at),
                     n.author,
                     n.intent.as_str(),
-                    one_line(&common::jira_text::text_of(&n.text), NOTE_CHARS)
+                    text.replace('\n', "\n  ")
                 ));
             }
         }
@@ -315,9 +324,33 @@ impl TicketHistory {
     }
 }
 
-/// How much of each ticket comment the planner reads: enough for a person's
-/// written investigation, not only its first sentence.
-const NOTE_CHARS: usize = 2500;
+/// Characters of ticket comments the planner reads in all. Each comment is
+/// given whole; only a ticket past this total has comments shortened.
+const NOTES_BUDGET: usize = 60_000;
+/// What an oldest comment keeps when the total has to be cut.
+const NOTE_FLOOR: usize = 300;
+
+/// The comments' texts within `budget` characters. When they don't fit, the
+/// oldest are shortened first (a later comment corrects an earlier one), each
+/// down to `NOTE_FLOOR`, with a mark saying how much was left out.
+fn fit_notes(mut texts: Vec<String>, budget: usize) -> Vec<String> {
+    let total: usize = texts.iter().map(|t| t.chars().count()).sum();
+    let mut excess = total.saturating_sub(budget);
+    for t in texts.iter_mut() {
+        if excess == 0 {
+            break;
+        }
+        let len = t.chars().count();
+        if len <= NOTE_FLOOR {
+            continue;
+        }
+        let cut = excess.min(len - NOTE_FLOOR);
+        let keep: String = t.chars().take(len - cut).collect();
+        *t = format!("{keep} … ({cut} characters of this older comment left out)");
+        excess -= cut;
+    }
+    texts
+}
 
 fn one_line(s: &str, max: usize) -> String {
     let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -616,5 +649,38 @@ mod tests {
         });
         assert_ne!(h.digest(), h2.digest());
         assert_eq!(h.digest(), closed_with_lesson("h1").digest());
+    }
+}
+
+#[cfg(test)]
+mod fit_notes_tests {
+    use super::{fit_notes, NOTE_FLOOR};
+
+    #[test]
+    fn comments_are_whole_when_they_fit() {
+        let t = vec!["a".repeat(5_000), "b".repeat(8_000)];
+        assert_eq!(fit_notes(t.clone(), 60_000), t);
+    }
+
+    #[test]
+    fn the_oldest_are_shortened_first() {
+        let t = vec!["a".repeat(1_000), "b".repeat(1_000), "c".repeat(1_000)];
+        // 3,000 characters, 500 over: the oldest gives up 500.
+        let out = fit_notes(t.clone(), 2_500);
+        assert!(out[0].starts_with(&"a".repeat(500)));
+        assert!(out[0].contains("500 characters of this older comment left out"));
+        assert_eq!(out[1..], t[1..], "newer comments stay whole");
+        // Far over: every older comment goes down to the floor before the
+        // newest is touched.
+        let out = fit_notes(t, 1_200);
+        assert!(
+            out[0].starts_with(&"a".repeat(NOTE_FLOOR))
+                && !out[0].starts_with(&"a".repeat(NOTE_FLOOR + 1))
+        );
+        assert!(
+            out[1].starts_with(&"b".repeat(NOTE_FLOOR))
+                && !out[1].starts_with(&"b".repeat(NOTE_FLOOR + 1))
+        );
+        assert!(out[2].starts_with(&"c".repeat(600)));
     }
 }
