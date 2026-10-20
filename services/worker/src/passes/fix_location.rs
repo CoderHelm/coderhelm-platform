@@ -266,6 +266,11 @@ Before writing tasks, decide whether the fix belongs in this code at all.
   - When a saved lookup doesn't return the field you need, write your own read-only query against the connected database.
   - When the ticket names a page you can check with `check_url`, look at what it shows.
   - Your cause must explain the exact wrong value in the ticket (why that one and not another). If it doesn't, keep looking.
+  - Production first: every claim about data or behaviour comes from production; use a test environment only to try a change. Label each check with where it ran (for example `[prod database]`, `[staging API]`).
+  - Values, not schema: confirm a field by querying it on the same path the failing screen uses and reading the value it returns. A field existing in a schema or type says nothing about what it holds.
+  - Record the value at every step it passes through (source record, pipeline output, database, search index, API response, the code that maps it, the page). The first step where it is wrong is where the bug is.
+  - When the data comes from another system and a copy of that system's own records is connected (a raw or staging copy in a warehouse), compare the source record with what the pipeline wrote, so you know whether the source, the pipeline or the code is wrong.
+  - Don't stop at "not sure where the fix belongs" while you can still read the code that serves the request: read the handler or resolver that actually answers it.
   - Start from what was actually shown: check the page with `check_url` and `find` (the record id, the field, the wrong text), or query the live API, before reading the code you expect ran.
   - A field's name can carry another record's value. Read what the code that fills it assigns (the resolver, serializer or mapper), then confirm it with a live query.
   - A value on a parent record (a group, a category, a summary) is not the value of each item under it. Anything shown for one item must come from that item; check whether a parent spans items with different values.

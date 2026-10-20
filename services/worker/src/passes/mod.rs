@@ -1543,7 +1543,12 @@ async fn run_passes(
     // The cached plan is reused only when nothing that can change it has
     // changed: the ticket, what memory recalled (lessons), the history, and
     // the planner itself.
-    let plan_key = plan::plan_cache_key(&context_hash, &memory_context, &history.digest());
+    let plan_key = plan::plan_cache_key(
+        &context_hash,
+        &memory_context,
+        &history.digest(),
+        &plan::team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await,
+    );
     msg.plan_cache_key = Some(plan_key.clone());
 
     // Try to reuse existing plan from S3 (same ticket, repo, and content)
@@ -1666,6 +1671,13 @@ async fn run_passes(
                         &context_hash,
                         &format!("{memory_context}{ctx}"),
                         &history.digest(),
+                        &plan::team_instructions(
+                            state,
+                            &msg.team_id,
+                            &msg.repo_owner,
+                            &msg.repo_name,
+                        )
+                        .await,
                     ));
                 }
                 plan_result = plan::run(

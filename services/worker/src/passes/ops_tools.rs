@@ -997,7 +997,7 @@ mod tests {
         let a = checked_account(
             "123456789012",
             true,
-            &["prod-bi-airflow", "staging-bi-airflow"],
+            &["prod-data-airflow", "staging-data-airflow"],
         );
         let o = with_aws(AwsAbilities::from_parts(vec![a], &[]));
         let n = names(&o);
@@ -1005,11 +1005,11 @@ mod tests {
         assert!(n.contains(&"airflow_dag_runs".to_string()));
         assert_eq!(
             o.aws.environments(),
-            vec!["prod-bi-airflow", "staging-bi-airflow"]
+            vec!["prod-data-airflow", "staging-data-airflow"]
         );
         assert_eq!(
             o.aws
-                .airflow_for("prod-bi-airflow")
+                .airflow_for("prod-data-airflow")
                 .unwrap()
                 .target
                 .account(),
@@ -1024,7 +1024,7 @@ mod tests {
             p.contains("CloudWatch metrics in account 123456789012"),
             "{p}"
         );
-        assert!(p.contains("prod-bi-airflow"), "{p}");
+        assert!(p.contains("prod-data-airflow"), "{p}");
     }
 
     #[test]
@@ -1047,8 +1047,8 @@ mod tests {
     fn airflow_reads_production_unless_told_otherwise() {
         let v = |l: &[&str]| l.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            preferred_environment(&v(&["prod-bi-airflow", "staging-bi-airflow"])),
-            Some("prod-bi-airflow")
+            preferred_environment(&v(&["prod-data-airflow", "staging-data-airflow"])),
+            Some("prod-data-airflow")
         );
         assert_eq!(
             preferred_environment(&v(&["bi-prod", "bi-dev"])),
@@ -1061,7 +1061,7 @@ mod tests {
             vec![checked_account(
                 "123456789012",
                 false,
-                &["prod-bi-airflow", "staging-bi-airflow"],
+                &["prod-data-airflow", "staging-data-airflow"],
             )],
             &[],
         ));
@@ -1073,7 +1073,7 @@ mod tests {
         assert!(t.input_schema["properties"]["environment"]["description"]
             .as_str()
             .unwrap()
-            .contains("default prod-bi-airflow"));
+            .contains("default prod-data-airflow"));
     }
 
     #[test]
