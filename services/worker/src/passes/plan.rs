@@ -12,7 +12,7 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-19.fix-location-history";
+pub const PLANNER_VERSION: &str = "2026-10-20.debug-the-data";
 
 /// The cached plan's file holding its key.
 pub const PLAN_KEY_FILE: &str = "plan_key.txt";
@@ -491,11 +491,10 @@ Then the ```fix_location.json block described above."#,
         // A planner reads the code before it plans; 5 and 8 steps ran out in
         // seconds on ordinary tickets (16 failed runs). The last step is
         // always an answer from what it read (see the agent loop).
-        max_turns: match triage.complexity.as_str() {
-            "simple" => 8,
-            "medium" => 15,
-            _ => 25,
-        },
+        max_turns: planner_turns(
+            &triage.complexity,
+            live.as_ref().is_some_and(|l| !l.tools().is_empty()),
+        ),
         max_tokens: 16384,
         deadline: None,
         effort: None,
@@ -1062,6 +1061,23 @@ impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
 /// S3 file (next to the openspec) holding the ticket text a plan was built from.
 pub const TICKET_TEXT_FILE: &str = "ticket.md";
 
+/// Steps the planner may take. With live data to look up, a ticket triaged
+/// as simple can still be a data question that takes several lookups to
+/// trace (a wrong address was blamed on a CMS after two lookups in eight
+/// steps), so it always gets room to follow the data.
+fn planner_turns(complexity: &str, can_look_up_data: bool) -> usize {
+    let by_size = match complexity {
+        "simple" => 8,
+        "medium" => 15,
+        _ => 25,
+    };
+    if can_look_up_data {
+        by_size.max(20)
+    } else {
+        by_size
+    }
+}
+
 /// The ticket text as stored next to its plan and compared on an update.
 pub fn ticket_text(title: &str, body: &str) -> String {
     format!("# {title}\n\n{body}")
@@ -1079,4 +1095,17 @@ pub fn compute_ticket_context_hash(msg: &TicketMessage) -> String {
         .map(|img| img.s3_key.clone())
         .collect();
     common::ticket_context_hash(&msg.title, &msg.body, &image_keys)
+}
+
+#[cfg(test)]
+mod planner_turns_tests {
+    use super::planner_turns;
+
+    #[test]
+    fn live_data_gives_room_to_trace_it() {
+        assert_eq!(planner_turns("simple", false), 8);
+        assert_eq!(planner_turns("simple", true), 20);
+        assert_eq!(planner_turns("medium", true), 20);
+        assert_eq!(planner_turns("complex", true), 25);
+    }
 }
