@@ -433,7 +433,6 @@ impl Sim {
             return;
         }
         let mut view = GateView {
-            head: self.head.clone(),
             draft: self.draft,
             require_human: cfg.require_human || self.self_authored,
             bot_verdict: self.bot_verdicts.get(&self.head).cloned(),
