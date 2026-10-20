@@ -5,7 +5,10 @@
 //!
 //! What a check returns: every hop's status (redirects followed, at most
 //! [`MAX_REDIRECTS`]), the final URL, its content type and the page's
-//! `<title>`. Nothing else of the body is read or returned.
+//! `<title>`. Asked to `find` terms, it also returns the text around each
+//! match in the page's source, including the data the server rendered into
+//! it (what a visitor's browser receives), so an agent can see the value a
+//! page actually shows.
 //!
 //! Safety, enforced here and covered by the tests below:
 //! - https only, on the default port, no credentials in the URL, a host name
@@ -48,8 +51,15 @@ pub const MAX_CHECKS: usize = 15;
 pub const MAX_REDIRECTS: usize = 5;
 /// Time for one URL, all hops included.
 pub const TIMEOUT: Duration = Duration::from_secs(8);
-/// Bytes of an HTML page read to find its `<title>`.
+/// Bytes of an HTML page searched for its `<title>`.
 const TITLE_SCAN_BYTES: usize = 64 * 1024;
+/// Bytes of an HTML page read: enough for a server-rendered page's data.
+const PAGE_SCAN_BYTES: usize = 4 * 1024 * 1024;
+/// Terms one check may look for, and matches shown per term.
+const MAX_FIND_TERMS: usize = 8;
+const MAX_MATCHES: usize = 3;
+/// Characters shown on each side of a match.
+const MATCH_CONTEXT: usize = 300;
 const MAX_URL_LEN: usize = 2048;
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; CoderHelm-LinkCheck/1.0)";
 const SOURCE_ID: &str = "web-check";
@@ -64,7 +74,10 @@ pub fn tool() -> ToolDefinition {
         description: format!(
             "Check that pages on the team's OWN public sites load: for each https URL, the \
              status of every hop (redirects followed, up to {MAX_REDIRECTS}), the final URL, its \
-             content type and the page title. It does not return page content. Only the team's \
+             content type and the page title. With `find`, it also returns the text around each \
+             match of those terms in the page's source, including the data the server rendered \
+             into it: use it to see the value a page actually shows (an id, an address, a price) \
+             before explaining why it's wrong. Only the team's \
              hosts can be checked (listed in your instructions, named in a URL in the work at \
              hand, or used in the team's repositories); others are refused. Use it before \
              asking anyone to confirm a link, redirect target or page works: check it and \
@@ -77,6 +90,11 @@ pub fn tool() -> ToolDefinition {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "https URLs to check, e.g. every redirect target the change adds"
+                },
+                "find": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional: exact text to look for in each page's source, e.g. a record id from the URL and a field name. Up to 8 terms; up to 3 matches each, with the text around them."
                 }
             },
             "required": ["urls"]
@@ -272,8 +290,8 @@ pub struct Resp {
     pub status: u16,
     pub location: Option<String>,
     pub content_type: String,
-    /// The start of the body (GET of an HTML page only), for its title.
-    pub head_of_body: Vec<u8>,
+    /// The body (GET of an HTML page only), up to [`PAGE_SCAN_BYTES`].
+    pub body: Vec<u8>,
 }
 
 /// DNS and HTTP, behind a trait so the tests can script them.
@@ -334,21 +352,21 @@ impl Transport for Net {
         let location = header(reqwest::header::LOCATION);
         let content_type = header(reqwest::header::CONTENT_TYPE).unwrap_or_default();
         let status = resp.status().as_u16();
-        let mut head_of_body = Vec::new();
+        let mut body = Vec::new();
         if method == Method::Get && is_html(&content_type) {
-            while head_of_body.len() < TITLE_SCAN_BYTES {
+            while body.len() < PAGE_SCAN_BYTES {
                 match resp.chunk().await {
-                    Ok(Some(c)) => head_of_body.extend_from_slice(&c),
+                    Ok(Some(c)) => body.extend_from_slice(&c),
                     _ => break,
                 }
             }
-            head_of_body.truncate(TITLE_SCAN_BYTES);
+            body.truncate(PAGE_SCAN_BYTES);
         }
         Ok(Resp {
             status,
             location,
             content_type,
-            head_of_body,
+            body,
         })
     }
 }
@@ -360,7 +378,7 @@ fn is_html(content_type: &str) -> bool {
 
 /// The page's `<title>`, plain text, at most 200 characters.
 pub fn page_title(html: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(html);
+    let text = String::from_utf8_lossy(&html[..html.len().min(TITLE_SCAN_BYTES)]);
     let lower = text.to_ascii_lowercase();
     let open = lower.find("<title")?;
     let start = open + lower[open..].find('>')? + 1;
@@ -395,6 +413,59 @@ pub struct Checked {
     /// Why the chain stopped before a final answer (a redirect not
     /// followed), if it did.
     pub stopped: Option<String>,
+    /// For each term asked for: the text around its matches in the page.
+    pub found: Vec<(String, Vec<String>)>,
+}
+
+/// The text around each match of `term` in `page`: up to [`MAX_MATCHES`],
+/// [`MATCH_CONTEXT`] characters each side, on one line. Data a server
+/// renders into a page is JSON inside a script, often escaped again; the
+/// escaping is undone so the values read as they are.
+pub fn find_in(page: &str, term: &str) -> Vec<String> {
+    let plain = unescape_payload(page);
+    let mut out = Vec::new();
+    if term.is_empty() {
+        return out;
+    }
+    let mut from = 0;
+    while let Some(i) = plain[from..].find(term) {
+        let at = from + i;
+        let start = floor_char(&plain, at.saturating_sub(MATCH_CONTEXT));
+        let end = floor_char(&plain, (at + term.len() + MATCH_CONTEXT).min(plain.len()));
+        let flat = plain[start..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push(format!(
+            "{}{flat}{}",
+            if start > 0 { "…" } else { "" },
+            if end < plain.len() { "…" } else { "" }
+        ));
+        if out.len() == MAX_MATCHES {
+            break;
+        }
+        from = end.max(at + term.len());
+    }
+    out
+}
+
+fn floor_char(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Undoes the string escaping around server-rendered JSON (`\"` and `\\"`
+/// for quotes, `\u0026` and friends for markup characters).
+fn unescape_payload(s: &str) -> String {
+    s.replace("\\\"", "\"")
+        .replace("\\\\", "\\")
+        .replace("\\\"", "\"")
+        .replace("\\u0026", "&")
+        .replace("\\u003c", "<")
+        .replace("\\u003e", ">")
+        .replace("\\u0027", "'")
 }
 
 impl Checked {
@@ -425,6 +496,14 @@ impl Checked {
                     .map(|t| format!(" title: \"{t}\""))
                     .unwrap_or_default()
             ));
+        }
+        for (term, hits) in &self.found {
+            if hits.is_empty() {
+                s.push_str(&format!("  \"{term}\": not in the page\n"));
+            }
+            for h in hits {
+                s.push_str(&format!("  \"{term}\": {h}\n"));
+            }
         }
         s
     }
@@ -460,8 +539,19 @@ async fn vetted_addr(t: &dyn Transport, host: &str) -> Result<SocketAddr, CheckE
 
 /// Checks one URL: HEAD, then GET when HEAD fails, errs, or the page is
 /// HTML (for its title); redirects followed with every hop re-vetted.
+#[cfg(test)]
 pub async fn check(
     raw: &str,
+    gate: &dyn HostGate,
+    t: &dyn Transport,
+) -> Result<Checked, CheckError> {
+    check_and_find(raw, &[], gate, t).await
+}
+
+/// [`check`], and the text around each match of `find` in the final page.
+pub async fn check_and_find(
+    raw: &str,
+    find: &[String],
     gate: &dyn HostGate,
     t: &dyn Transport,
 ) -> Result<Checked, CheckError> {
@@ -509,10 +599,17 @@ pub async fn check(
         let Some(loc) = next else {
             out.content_type = resp.content_type.clone();
             out.title = if is_html(&resp.content_type) {
-                page_title(&resp.head_of_body)
+                page_title(&resp.body)
             } else {
                 None
             };
+            if !find.is_empty() {
+                let page = String::from_utf8_lossy(&resp.body);
+                out.found = find
+                    .iter()
+                    .map(|term| (term.clone(), find_in(&page, term)))
+                    .collect();
+            }
             return Ok(out);
         };
         if hop == MAX_REDIRECTS {
@@ -672,6 +769,9 @@ impl WebCheck {
              team's own sites load: status of each redirect hop, final URL, content type and \
              title. Before asking anyone to confirm that a link, redirect target or page works, \
              check it and report what came back (\"Checked: all six targets return 200\"). \
+             When a ticket says a page shows a wrong value, pass `find` (the record id in the \
+             URL, the field or the wrong text) to see what the page really rendered, and start \
+             from that value. \
              Hosts known for this work: {list}.\n"
         )
     }
@@ -722,9 +822,10 @@ impl WebCheck {
         if urls.is_empty() {
             return "Give `urls`: one or more https URLs.".into();
         }
+        let find = find_terms(input);
         let mut out = String::new();
         for u in urls {
-            let (outcome, text, detail, ms) = self.one(gate, t, &u).await;
+            let (outcome, text, detail, ms) = self.one(gate, t, &u, &find).await;
             let logged = store::log_activity_in(
                 &state.dynamo,
                 &state.config.settings_table_name,
@@ -761,6 +862,7 @@ impl WebCheck {
         gate: &dyn HostGate,
         t: &dyn Transport,
         u: &str,
+        find: &[String],
     ) -> (&'static str, String, String, u128) {
         let started = Instant::now();
         if !self.take() {
@@ -769,7 +871,7 @@ impl WebCheck {
             );
             return ("refused", format!("{u}\n  {msg}\n"), msg, 0);
         }
-        let res = match tokio::time::timeout(TIMEOUT, check(u, gate, t)).await {
+        let res = match tokio::time::timeout(TIMEOUT, check_and_find(u, find, gate, t)).await {
             Ok(r) => r,
             Err(_) => Err(CheckError::Failed(format!(
                 "timed out after {}s",
@@ -807,6 +909,22 @@ impl WebCheck {
             }
         }
     }
+}
+
+/// The terms a call asks to find in each page, at most [`MAX_FIND_TERMS`].
+fn find_terms(input: &Value) -> Vec<String> {
+    let mut v: Vec<String> = input["find"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.dedup();
+    v.truncate(MAX_FIND_TERMS);
+    v
 }
 
 /// The URLs a call asks for: `urls`, or a single `url`.
@@ -899,7 +1017,7 @@ mod tests {
                     status,
                     location: None,
                     content_type: ct.into(),
-                    head_of_body: body.as_bytes().to_vec(),
+                    body: body.as_bytes().to_vec(),
                 },
             );
             self
@@ -947,7 +1065,7 @@ mod tests {
                 ..Default::default()
             });
             if m == Method::Head {
-                r.head_of_body.clear();
+                r.body.clear();
             }
             Ok(r)
         }
@@ -1120,6 +1238,56 @@ mod tests {
         assert_eq!(c.status(), Some(404));
     }
 
+    /// The shape a server-rendered page carries its data in: JSON escaped
+    /// inside a script string.
+    const RENDERED: &str = r#"<html><head><title>Pottery classes</title></head><body><script>self.__next_f.push([1,"{\"id\":\"class-42\",\"location\":\"loc-east\",\"locationName\":\"East Studio\",\"address\":\"1 Example Street, Springfield\"}"])</script></body></html>"#;
+
+    #[test]
+    fn find_shows_the_rendered_value_unescaped() {
+        let hits = find_in(RENDERED, "\"address\"");
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].contains(r#""address":"1 Example Street, Springfield""#),
+            "{hits:?}"
+        );
+        assert!(
+            hits[0].contains(r#""locationName":"East Studio""#),
+            "{hits:?}"
+        );
+        assert!(find_in(RENDERED, "West Studio").is_empty());
+    }
+
+    #[test]
+    fn find_caps_matches_and_keeps_char_boundaries() {
+        let page = format!("{}é", "x id é ".repeat(200));
+        let hits = find_in(&page, "id");
+        assert_eq!(hits.len(), MAX_MATCHES);
+        assert!(find_in("short", "").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_check_with_find_returns_what_the_page_rendered() {
+        let t = Fake::default().host("example.com", PUBLIC).page(
+            "https://example.com/classes",
+            200,
+            "text/html",
+            RENDERED,
+        );
+        let find = vec!["class-42".to_string(), "West Studio".to_string()];
+        let c = check_and_find(
+            "https://example.com/classes",
+            &find,
+            &policy(&["example.com"]),
+            &t,
+        )
+        .await
+        .unwrap();
+        assert_eq!(c.title.as_deref(), Some("Pottery classes"));
+        let text = c.render("https://example.com/classes");
+        assert!(text.contains("1 Example Street"), "{text}");
+        assert!(text.contains("\"West Studio\": not in the page"), "{text}");
+    }
+
     #[tokio::test]
     async fn redirects_are_followed_and_reported() {
         let t = Fake::default()
@@ -1259,7 +1427,9 @@ mod tests {
         let mut ok = 0;
         let mut limited = 0;
         for _ in 0..(MAX_CHECKS + 3) {
-            let (outcome, text, _, _) = web.one(&web.policy, &t, "https://www.example.com/x").await;
+            let (outcome, text, _, _) = web
+                .one(&web.policy, &t, "https://www.example.com/x", &[])
+                .await;
             match outcome {
                 "ok" => ok += 1,
                 _ => {
