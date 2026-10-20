@@ -266,6 +266,20 @@ impl TicketHistory {
             return Guard::Proceed;
         }
         let answered = decision.is_some_and(|d| !d.history_check.trim().is_empty());
+        // A plan traced to the code that writes the wrong value (code it
+        // opened in this run, checked before here), with the defect measured
+        // and the history answered, is newer evidence than an earlier "outside
+        // the code" conclusion: that conclusion may be the very mistake the
+        // trace corrects, and an unchanged ticket text doesn't make it right.
+        let traced = answered
+            && decision.is_some_and(|d| {
+                d.evidence.producer.kind.trim() == "code"
+                    && !d.evidence.producer.where_.trim().is_empty()
+                    && !d.evidence.scope.trim().is_empty()
+            });
+        if traced {
+            return Guard::Proceed;
+        }
         let closed = self.closed_unmerged();
         if let Some(c) = self.outside_conclusion() {
             let unchanged = c.context_hash.is_empty() || c.context_hash == current_hash;
@@ -682,5 +696,68 @@ mod fit_notes_tests {
                 && !out[1].starts_with(&"b".repeat(NOTE_FLOOR + 1))
         );
         assert!(out[2].starts_with(&"c".repeat(600)));
+    }
+}
+
+#[cfg(test)]
+mod traced_guard_tests {
+    use super::*;
+    use crate::passes::fix_location::{FixEvidence, Producer};
+
+    fn outside_before(hash: &str) -> TicketHistory {
+        TicketHistory {
+            runs: vec![PriorRun {
+                run_id: "01B".into(),
+                status: "needs_outside_change".into(),
+                repo: "acme/pipelines".into(),
+                fix_location: "outside_code".into(),
+                lesson: "The fix is in another ticket.".into(),
+                lesson_where: "another ticket".into(),
+                context_hash: hash.into(),
+                ..Default::default()
+            }],
+            notes: vec![],
+            done_hash: String::new(),
+        }
+    }
+
+    fn plan(kind: &str, scope: &str, history_check: &str) -> FixDecision {
+        FixDecision {
+            fix_location: FixLocation::Code,
+            cause: "A sync merges records that differ by place and overwrites the place.".into(),
+            evidence: FixEvidence {
+                data_shows: "Items at two places share one parent.".into(),
+                producer: Producer {
+                    kind: kind.into(),
+                    where_: "acme/pipelines:dags/sync.py:1230 sync_groups()".into(),
+                },
+                scope: scope.into(),
+                ..Default::default()
+            },
+            history_check: history_check.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_traced_code_decision_supersedes_an_earlier_outside_conclusion() {
+        let h = outside_before("h1");
+        let answer = "The earlier runs deferred to a display fix; the trace shows the sync writes the wrong value.";
+        assert_eq!(
+            h.guard(Some(&plan("code", "41 parents, 7027 items", answer)), "h1"),
+            Guard::Proceed
+        );
+        // Untraced, unmeasured or unanswered: the history still holds it.
+        for p in [
+            plan("", "41 parents", answer),
+            plan("code", "", answer),
+            plan("code", "41 parents", ""),
+            plan("source", "41 parents", answer),
+        ] {
+            assert!(
+                matches!(h.guard(Some(&p), "h1"), Guard::Stop { .. }),
+                "{p:?}"
+            );
+        }
     }
 }
