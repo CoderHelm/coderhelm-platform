@@ -1,5 +1,5 @@
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::agent::mcp;
@@ -12,7 +12,7 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-20.comments-as-text";
+pub const PLANNER_VERSION: &str = "2026-10-20.verify-the-data";
 
 /// The cached plan's file holding its key.
 pub const PLAN_KEY_FILE: &str = "plan_key.txt";
@@ -501,7 +501,9 @@ Then the ```fix_location.json block described above."#,
     };
 
     let model_id = provider.primary_model_id();
-    let response = provider::converse(
+    let can_look_up = live.as_ref().is_some_and(|l| !l.tools().is_empty());
+    let lookups = || live.as_ref().map_or(0, |l| l.lookups_made());
+    let mut response = provider::converse(
         state,
         provider,
         model_id,
@@ -515,11 +517,41 @@ Then the ```fix_location.json block described above."#,
         None,
     )
     .await?;
+    // A decision about data the planner never looked at goes back once.
+    if super::fix_location::unchecked_data(
+        super::fix_location::parse(&response).as_ref(),
+        can_look_up,
+        lookups(),
+    ) {
+        info!(ticket_id = %msg.ticket_id, "Plan describes data it never looked up — sending it back to check");
+        messages.push((
+            "user".to_string(),
+            vec![serde_json::json!({"type": "text", "text": super::fix_location::CHECK_THE_DATA})],
+        ));
+        response = provider::converse(
+            state,
+            provider,
+            model_id,
+            &full_system,
+            &mut messages,
+            &tools,
+            &executor,
+            usage,
+            plan_opts,
+            None,
+            None,
+        )
+        .await?;
+    }
     if let Some(s) = &skills {
         s.drain_usage_into(usage);
     }
 
-    let files = parse_openspec_files(&response);
+    let mut files = parse_openspec_files(&response);
+    if super::fix_location::unchecked_data(files.fix.as_ref(), can_look_up, lookups()) {
+        warn!(ticket_id = %msg.ticket_id, "Plan still unchecked against the data — no code on it");
+        files.fix = files.fix.take().map(super::fix_location::mark_unchecked);
+    }
 
     // Write openspec to S3
     let prefix = crate::passes::openspec_prefix(

@@ -280,6 +280,11 @@ impl LiveSources {
         self.loaded.iter().any(|l| l.source.kind == kind)
     }
 
+    /// Lookups this agent made so far.
+    pub fn lookups_made(&self) -> usize {
+        self.lookups.load(Ordering::SeqCst)
+    }
+
     pub fn tools(&self) -> Vec<ToolDefinition> {
         let source_prop = |kind: Option<Kind>| {
             json!({

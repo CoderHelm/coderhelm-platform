@@ -170,6 +170,26 @@ impl FixDecision {
     }
 }
 
+/// Whether a decision rests on data the planner never looked at: it could
+/// look things up, made no lookup, and still says what the data shows.
+pub fn unchecked_data(d: Option<&FixDecision>, can_look_up: bool, lookups: usize) -> bool {
+    can_look_up && lookups == 0 && d.is_some_and(|d| !d.evidence.data_shows.trim().is_empty())
+}
+
+/// The message that sends such a planner back to check before deciding.
+pub const CHECK_THE_DATA: &str = "Before this decision stands: you describe what the data shows, but you made no lookups. What people wrote on the ticket are leads to verify, not facts. Check the records the ticket and the comments name against the connected data now (the stored values by id, and where they come from: the sync or pipeline that writes them). Then answer again in full: the four openspec files and the fix_location.json block, with `data_shows` saying only what your lookups returned.";
+
+/// A decision still unchecked after being sent back: no code is written on
+/// it. It becomes `unknown`, saying the data wasn't checked.
+pub fn mark_unchecked(mut d: FixDecision) -> FixDecision {
+    d.fix_location = FixLocation::Unknown;
+    d.cause = format!(
+        "Not checked against the data (no lookups were made): {}",
+        d.cause.trim()
+    );
+    d
+}
+
 /// How the run proceeds. A plan without a decision (a model that left the
 /// block out, or one that didn't read) is not a code plan: where the fix
 /// belongs was never decided, so the run asks instead of coding.
@@ -246,6 +266,9 @@ Before writing tasks, decide whether the fix belongs in this code at all.
   - When a saved lookup doesn't return the field you need, write your own read-only query against the connected database.
   - When the ticket names a page you can check with `check_url`, look at what it shows.
   - Your cause must explain the exact wrong value in the ticket (why that one and not another). If it doesn't, keep looking.
+- What people wrote on the ticket are leads, not facts. Check a person's finding against the data before you build on it, and say which lookup confirmed it.
+- When the wrong value is written by a sync or pipeline, the producer is where the cause usually is: read that pipeline's code (in its repository) and the rows it writes. A change in the code that reads the data instead is a workaround; plan one only when you can say why the producer can't or shouldn't be fixed.
+- If a person says the fix is tracked in another ticket, don't build it here: use `outside_code`, naming that ticket.
 - Never name a cause in a system you couldn't read. If the trace through what you can read is complete and leads into another system, say so with that trace. If you couldn't finish the trace, use `unknown`, say where it stopped, and list the next lookups a person should make, without a likely culprit.
 - If the code behaves as designed and the outcome comes from data or configuration in a source system (a booking or scheduling system, a CMS, a ticket tool's configuration, a feature flag held in another system, a cloud console setting), the fix is a change in that system, not in this code. Set `fix_location` to `outside_code`, describe the exact change, and set tasks.md to `NO_CODE_CHANGE: <one line>`.
 - Never override source data in code: no hardcoded record ids, allowlists, denylists or "force" lists that change behavior for specific records the source system already decides. That hides the cause and goes stale. If that is the only way you see to make the ticket's symptom go away, the fix is outside the code.
@@ -600,5 +623,44 @@ mod tests {
         assert!(stored.contains("\"where\":"));
         let back: FixDecision = serde_json::from_str(&stored).unwrap();
         assert_eq!(back, d);
+    }
+}
+
+#[cfg(test)]
+mod unchecked_data_tests {
+    use super::*;
+
+    fn decision(data_shows: &str) -> FixDecision {
+        let block = format!(
+            "```fix_location.json\n{}\n```",
+            serde_json::json!({
+                "fix_location": "code",
+                "cause": "The group row's facility flips on each sync.",
+                "evidence": {"looked_up": [], "code_rule": "", "data_shows": data_shows},
+                "outside_change": null,
+                "history_check": ""
+            })
+        );
+        parse(&block).expect("parses")
+    }
+
+    #[test]
+    fn a_claim_about_data_with_no_lookup_is_unchecked() {
+        let d = decision("Per the ticket: the group row flips between facilities.");
+        assert!(unchecked_data(Some(&d), true, 0));
+        // It looked: fine. It couldn't look: nothing to send it back for.
+        assert!(!unchecked_data(Some(&d), true, 3));
+        assert!(!unchecked_data(Some(&d), false, 0));
+        // No claim about data (ordinary feature work): fine.
+        assert!(!unchecked_data(Some(&decision("")), true, 0));
+        assert!(!unchecked_data(None, true, 0));
+    }
+
+    #[test]
+    fn an_unchecked_decision_writes_no_code() {
+        let d = mark_unchecked(decision("Per the ticket: it flips."));
+        assert_eq!(d.fix_location, FixLocation::Unknown);
+        assert!(d.cause.starts_with("Not checked against the data"));
+        assert_ne!(route(Some(&d)), route(Some(&decision(""))));
     }
 }

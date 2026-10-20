@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 /// Options for controlling the converse loop.
+#[derive(Clone, Copy)]
 pub struct ConverseOptions {
     pub max_turns: usize,
     pub max_tokens: i32,
