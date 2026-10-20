@@ -1,0 +1,10 @@
+{
+  "name": "an informational ticket comment starts no run",
+  "description": "After CoderHelm's PR was closed, the ticket owner wrote that the fix was made in the booking system. The comment used to re-run the ticket and open the same PR again. It records the lesson, marks the ticket done, and starts nothing.",
+  "kind": "jira_comment",
+  "run_status": "cancelled",
+  "action": "run",
+  "comment": "This was fixed in the booking system: the winter term is now available on the web, and the class shows on the site after the sync.",
+  "intent": "fix_elsewhere_info",
+  "expect": {"act": "elsewhere", "starts_run": false}
+}

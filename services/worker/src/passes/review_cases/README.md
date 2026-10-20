@@ -85,3 +85,22 @@ which later events wake it.
 | `{"convert_to_draft": {"by"}}` | A person converts the PR back to draft. |
 | `{"ci_passed_mark_ready": {}}` | CI passed on CoderHelm's branch and the pipeline tries to mark the PR ready. |
 | `{"gate_is": {"state"?, "merged"?, "draft"?}}` | Asserts the gate mid-case. |
+
+## Run cases (`runs/`)
+
+What a ticket run does around its review, replayed by
+`review_eval_replays_every_run_case` (deterministic, every PR) and
+`review_eval_live_ticket_comments` (live, nightly: the model reads each
+recorded ticket comment and must give the case's `intent`). `kind` is one of:
+
+| kind | inputs | `expect` |
+|---|---|---|
+| `rerun` | `history` (earlier `runs`: status, PR and how it ended, lesson, content hash; `notes` people wrote), `current_hash`, `plan` (the planner's `fix_location.json`, or `null`) | `new_pr`, `route` (`code`, `outside_only`, `code_and_outside`, `ask`) |
+| `jira_comment` | `run_status`, `action` (`run`, `feedback`, `none`), `comment`, `intent` | `act` (`dispatch`, `elsewhere`, `nothing`), `starts_run` |
+| `own_pr_review` | `model_output` (the PR reviewer's `ReviewOutput` on the run's own PR) | `verdict`, `closes_own_pr` |
+
+Invariants checked on every case: a ticket whose CoderHelm PR was closed
+unmerged with an outside-code lesson never gets another PR while the ticket
+is unchanged; a plan with no decision on where the fix belongs never codes; an
+informational or status-only ticket comment never starts a run; a run never
+completes while its PR reviewer's verdict blocks.

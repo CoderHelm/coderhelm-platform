@@ -200,6 +200,37 @@ pub enum WorkerMessage {
     /// merging, or a person said the fix was outside the code.
     #[serde(rename = "lesson")]
     Lesson(LessonMessage),
+    /// A person commented on a ticket CoderHelm worked on: read what the
+    /// comment is before anything runs.
+    #[serde(rename = "jira_comment")]
+    JiraComment(JiraCommentMessage),
+}
+
+/// A ticket comment to read (gateway → worker). `action` is what it would
+/// start if it asks for work: a ticket run, or feedback on the open PR.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct JiraCommentMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub ticket_id: String,
+    #[serde(default)]
+    pub title: String,
+    /// The ticket's latest run.
+    pub run_id: String,
+    pub run_status: String,
+    #[serde(default)]
+    pub pr_number: u64,
+    #[serde(default)]
+    pub repo_owner: String,
+    #[serde(default)]
+    pub repo_name: String,
+    pub author: String,
+    pub comment: String,
+    /// The ticket's content hash now.
+    #[serde(default)]
+    pub context_hash: String,
+    #[serde(default)]
+    pub action: Option<Box<WorkerMessage>>,
 }
 
 /// A lesson job (gateway on a closed PR, or the feedback pass on a comment).
@@ -217,6 +248,9 @@ pub struct LessonMessage {
     /// The lesson, when it was already judged (a comment, or a retry).
     #[serde(default)]
     pub lesson: Option<String>,
+    /// The system the fix belonged in, when it was already judged.
+    #[serde(default)]
+    pub lesson_where: Option<String>,
     /// Retries while another run held the repository's memory.
     #[serde(default)]
     pub attempts: u32,
@@ -239,7 +273,7 @@ impl WorkerMessage {
             WorkerMessage::Ticket(_) | WorkerMessage::Resume(_) | WorkerMessage::MarkReady(_) => {
                 f::RUN
             }
-            WorkerMessage::Feedback(_) => f::FEEDBACK,
+            WorkerMessage::Feedback(_) | WorkerMessage::JiraComment(_) => f::FEEDBACK,
             WorkerMessage::Lesson(_) => f::MEMORY,
             WorkerMessage::Onboard(_) => f::ONBOARD,
             WorkerMessage::PlanExecute(_) | WorkerMessage::PlanTaskContinue(_) => f::PLAN,
@@ -502,6 +536,15 @@ pub struct TicketMessage {
     /// existing PR instead of starting over. Never serialized.
     #[serde(skip)]
     pub ticket_update_note: Option<String>,
+    /// Set in-process: the ticket's history with CoderHelm (earlier PRs and
+    /// how they ended, lessons, what people wrote), for the planner. Never
+    /// serialized.
+    #[serde(skip)]
+    pub ticket_history_note: Option<String>,
+    /// Set in-process: the key a plan written for this run is cached under
+    /// (see `plan::plan_cache_key`). Never serialized.
+    #[serde(skip)]
+    pub plan_cache_key: Option<String>,
 }
 
 fn default_branch() -> String {
@@ -684,6 +727,8 @@ mod tests {
             first_attempt_ms: 0,
             model_retries: 0,
             ticket_update_note: None,
+            ticket_history_note: None,
+            plan_cache_key: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();

@@ -9,6 +9,24 @@ use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
 use crate::WorkerState;
 
+/// The planner's logic version. Part of every cached plan's key: bump it on
+/// any change to how plans are made or what a plan must carry, so a plan
+/// written by an older planner is never reused.
+pub const PLANNER_VERSION: &str = "2026-10-19.fix-location-history";
+
+/// The cached plan's file holding its key.
+pub const PLAN_KEY_FILE: &str = "plan_key.txt";
+
+/// The key a plan is cached under: everything that can change the plan.
+/// The ticket's content (title, body, images; a Jira comment that re-runs
+/// the ticket rides in the body), what memory recalled for it (team lessons
+/// included), the ticket's history (earlier runs, how their PRs ended,
+/// lessons, people's notes), and the planner's version.
+pub fn plan_cache_key(context_hash: &str, memory_context: &str, history_digest: &str) -> String {
+    let memory = common::sha256_hex(&[memory_context]);
+    common::sha256_hex(&[PLANNER_VERSION, context_hash, &memory, history_digest])
+}
+
 /// Result of the plan pass: the four openspec files.
 pub struct PlanResult {
     pub proposal: String,
@@ -210,6 +228,11 @@ Then the ```fix_location.json block described above."#,
         body = msg.body,
         complexity_guidance = complexity_guidance,
     );
+    // The ticket's history comes right after the issue's own text.
+    let prompt = match msg.ticket_history_note.as_deref() {
+        Some(h) if !h.trim().is_empty() => format!("{prompt}{h}"),
+        _ => prompt,
+    };
 
     let mut tools = read_only_tools();
 
@@ -541,6 +564,38 @@ Then the ```fix_location.json block described above."#,
             fix_location = fix.effective_location().as_str(),
             "Planner decided where the fix belongs"
         );
+    } else {
+        // No decision this time: an older one must not ride along with it.
+        let _ = state
+            .s3
+            .delete_object()
+            .bucket(&state.config.bucket_name)
+            .key(format!("{prefix}/{}", super::fix_location::FILE))
+            .send()
+            .await;
+    }
+    // The key this plan is cached under; without it the plan is never reused.
+    match msg.plan_cache_key.as_deref() {
+        Some(k) => {
+            let _ = state
+                .s3
+                .put_object()
+                .bucket(&state.config.bucket_name)
+                .key(format!("{prefix}/{PLAN_KEY_FILE}"))
+                .body(k.as_bytes().to_vec().into())
+                .content_type("text/plain")
+                .send()
+                .await;
+        }
+        None => {
+            let _ = state
+                .s3
+                .delete_object()
+                .bucket(&state.config.bucket_name)
+                .key(format!("{prefix}/{PLAN_KEY_FILE}"))
+                .send()
+                .await;
+        }
     }
 
     info!("Plan openspec written to S3");

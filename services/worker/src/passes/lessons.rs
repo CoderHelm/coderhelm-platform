@@ -208,14 +208,14 @@ fn run_context(item: &Item) -> LessonContext {
 /// feedback. When it says the fix belongs outside the code, the lesson is
 /// recorded, the person hears that CoderHelm understood, and — unless they
 /// also asked for a code change — feedback stops there instead of changing
-/// code to answer it. Returns true when feedback should stop.
+/// code to answer it. Returns the judgment when feedback should stop.
 pub async fn check_comment(
     state: &WorkerState,
     provider: &ModelProvider,
     github: &GitHubClient,
     msg: &crate::models::FeedbackMessage,
     usage: &mut TokenUsage,
-) -> bool {
+) -> Option<Judgment> {
     let mut text = msg.review_body.trim().to_string();
     for c in &msg.comments {
         if !c.body.trim().is_empty() {
@@ -224,11 +224,9 @@ pub async fn check_comment(
         }
     }
     if text.trim().is_empty() {
-        return false;
+        return None;
     }
-    let Some(item) = load_run(state, &msg.team_id, &msg.run_id).await else {
-        return false;
-    };
+    let item = load_run(state, &msg.team_id, &msg.run_id).await?;
     let mut ctx = run_context(&item);
     if let Ok(pr) = github
         .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
@@ -238,12 +236,8 @@ pub async fn check_comment(
         ctx.pr_body = pr["body"].as_str().unwrap_or("").to_string();
     }
     ctx.comments = vec![("a person on the team".to_string(), text)];
-    let Some(j) = judge(state, provider, &ctx, usage).await else {
-        return false;
-    };
-    let Some(lesson) = j.lesson_to_store() else {
-        return false;
-    };
+    let j = judge(state, provider, &ctx, usage).await?;
+    let lesson = j.lesson_to_store()?;
     info!(run_id = %msg.run_id, where_ = %j.where_, "A person said the fix belongs outside the code");
     enqueue(
         state,
@@ -256,16 +250,79 @@ pub async fn check_comment(
             pr_number: msg.pr_number,
             trigger: TRIGGER_COMMENT.to_string(),
             lesson: Some(lesson.to_string()),
+            lesson_where: Some(j.where_.trim().to_string()).filter(|w| !w.is_empty()),
             attempts: 0,
         },
         0,
     )
     .await;
-    let reply = ack_reply(&j);
-    let _ = github
-        .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
+    if j.also_wants_code_change {
+        // Feedback goes on to change the code; say what was learned first.
+        let reply = ack_reply(&j);
+        let _ = github
+            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
+            .await;
+        return None;
+    }
+    // Feedback stops: the caller closes the PR with one note that says it.
+    Some(j)
+}
+
+/// A person wrote on the ticket that the fix was made, or belongs, in
+/// another system. The judge reads it with the run's ticket and findings;
+/// when it holds a lesson, the lesson is queued for the repository's memory.
+#[allow(clippy::too_many_arguments)]
+pub async fn learn_from_ticket_comment(
+    state: &WorkerState,
+    provider: &ModelProvider,
+    msg: &crate::models::JiraCommentMessage,
+    usage: &mut TokenUsage,
+) -> Option<Judgment> {
+    let item = load_run(state, &msg.team_id, &msg.run_id).await?;
+    let mut ctx = run_context(&item);
+    ctx.comments = vec![(
+        "a person on the team".to_string(),
+        msg.comment.trim().to_string(),
+    )];
+    let j = judge(state, provider, &ctx, usage).await?;
+    let lesson = j.lesson_to_store()?.to_string();
+    if !msg.repo_owner.is_empty() && !msg.repo_name.is_empty() {
+        enqueue(
+            state,
+            &LessonMessage {
+                team_id: msg.team_id.clone(),
+                installation_id: msg.installation_id,
+                run_id: msg.run_id.clone(),
+                repo_owner: msg.repo_owner.clone(),
+                repo_name: msg.repo_name.clone(),
+                pr_number: msg.pr_number,
+                trigger: TRIGGER_COMMENT.to_string(),
+                lesson: Some(lesson),
+                lesson_where: Some(j.where_.trim().to_string()).filter(|w| !w.is_empty()),
+                attempts: 0,
+            },
+            0,
+        )
         .await;
-    !j.also_wants_code_change
+    }
+    Some(j)
+}
+
+/// The note CoderHelm closes its own pull request with when the fix belongs
+/// outside the code: the cause and where the fix belongs, in a few lines.
+pub fn closing_note(where_: &str, cause: &str) -> String {
+    let place = if where_.trim().is_empty() {
+        "outside this code".to_string()
+    } else {
+        format!("in {}", where_.trim())
+    };
+    format!(
+        "Closing this pull request: the fix belongs {place}, not in this code. Changing the code \
+         would override data that system owns.\n\n**Cause:** {}\n\nI've noted this for future \
+         tickets on this repository and deleted the branch. Nothing else is needed here once the \
+         change is made there.",
+        cause.trim()
+    )
 }
 
 /// What CoderHelm says back when told the fix was elsewhere.
@@ -416,6 +473,18 @@ pub async fn run(
     mem.store_lesson(&lesson, &origin).await;
     mem.close_and_upload(state).await?;
     mark(state, &msg, "lesson", Some(&lesson)).await;
+    if let Some(w) = msg.lesson_where.as_deref().filter(|w| !w.trim().is_empty()) {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(&msg.team_id))
+            .key("run_id", attr_s(&msg.run_id))
+            .update_expression("SET lesson_where = :w")
+            .expression_attribute_values(":w", attr_s(w.trim()))
+            .send()
+            .await;
+    }
     info!(run_id = %msg.run_id, trigger = %msg.trigger, "Stored a lesson on where the fix belongs");
     Ok(())
 }
@@ -496,6 +565,21 @@ mod tests {
     }
 
     #[test]
+    fn the_closing_note_says_the_cause_and_where_the_fix_belongs() {
+        let j = Judgment {
+            fix_was_elsewhere: true,
+            where_: "the booking system".into(),
+            lesson: "Classes missing from the site are often because their term is not on the web."
+                .into(),
+            also_wants_code_change: false,
+        };
+        let n = closing_note(&j.where_, &j.lesson);
+        assert!(n.starts_with("Closing this pull request: the fix belongs in the booking system"));
+        assert!(n.contains("**Cause:** Classes missing"));
+        assert!(n.contains("deleted the branch"));
+    }
+
+    #[test]
     fn the_lesson_message_round_trips_on_the_queue() {
         let m = LessonMessage {
             team_id: "TEAM#1".into(),
@@ -506,6 +590,7 @@ mod tests {
             pr_number: 42,
             trigger: TRIGGER_PR_CLOSED.into(),
             lesson: None,
+            lesson_where: None,
             attempts: 0,
         };
         let mut v = serde_json::to_value(&m).unwrap();

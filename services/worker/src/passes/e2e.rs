@@ -1468,6 +1468,8 @@ async fn start_fix_ticket(
         first_attempt_ms: 0,
         model_retries: 0,
         ticket_update_note: None,
+        ticket_history_note: None,
+        plan_cache_key: None,
     };
     match enqueue(state, crate::models::WorkerMessage::Ticket(ticket)).await {
         Ok(()) => {
@@ -1665,6 +1667,8 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
                 first_attempt_ms: 0,
                 model_retries: 0,
                 ticket_update_note: None,
+                ticket_history_note: None,
+                plan_cache_key: None,
             };
             enqueue(state, crate::models::WorkerMessage::Ticket(ticket)).await?;
             rec.status = "generating".into();

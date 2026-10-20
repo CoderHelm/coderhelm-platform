@@ -335,7 +335,7 @@ pub async fn run(
         Ok(Outcome::ReviewThenReply { review, reply }) => {
             let mut head = review.head_sha.clone();
             let formal = match run_budgeted(state, (*review).clone(), &mut head).await {
-                Ok(Outcome::Done { posted }) => FormalResult::Posted(posted),
+                Ok(Outcome::Done { posted, .. }) => FormalResult::Posted(posted),
                 Ok(Outcome::ReviewThenReply { .. }) => FormalResult::Posted(None),
                 Err(e) => {
                     review_failed(state, &review, &head, &e.to_string()).await;
@@ -353,8 +353,12 @@ pub async fn run(
 
 /// What one run of a review job did.
 pub(crate) enum Outcome {
-    /// Finished. `posted` is the formal review event it posted, if any.
-    Done { posted: Option<&'static str> },
+    /// Finished. `posted` is the formal review event it posted, if any;
+    /// `run_review` is the verdict for the run that asked (trigger "run").
+    Done {
+        posted: Option<&'static str>,
+        run_review: Option<RunReview>,
+    },
     /// A reply is ready, but its conclusion disagrees with CoderHelm's
     /// standing formal verdict: run `review` first, then post `reply`.
     ReviewThenReply {
@@ -573,7 +577,10 @@ async fn run_once(
     mut msg: ReviewMessage,
     reviewed_head: &mut String,
 ) -> Result<Outcome, Box<dyn std::error::Error + Send + Sync>> {
-    const DONE: Outcome = Outcome::Done { posted: None };
+    const DONE: Outcome = Outcome::Done {
+        posted: None,
+        run_review: None,
+    };
     let job_started = chrono::Utc::now().to_rfc3339();
     let cfg = load_config(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await?;
     if !cfg.enabled || cfg.killed {
@@ -1729,6 +1736,12 @@ async fn run_once(
                 warn!(pr = msg.pr_number, error = %e, "Failed to attach action summary (non-fatal)");
             }
         }
+    } else if self_authored && verdict == "REQUEST_CHANGES" && msg.trigger == TRIGGER_RUN {
+        // The run that asked for this review acts on it itself.
+        info!(
+            pr = msg.pr_number,
+            "Own PR's review requested changes — the run handles it"
+        );
     } else if self_authored && verdict == "REQUEST_CHANGES" {
         // CoderHelm reviewed its OWN PR and wants changes → hand the findings to the
         // run's feedback loop so it applies the fixes. Two guards keep this review↔fix
@@ -1786,9 +1799,114 @@ async fn run_once(
         }
     }
 
+    let run_review = (msg.trigger == TRIGGER_RUN).then(|| RunReview {
+        verdict,
+        body: record_body.clone(),
+        override_finding: findings
+            .iter()
+            .find(|f| {
+                f.category
+                    .eq_ignore_ascii_case(review_agent::SOURCE_DATA_OVERRIDE)
+                    && f.severity == "blocking"
+            })
+            .map(|f| format!("{} {}", f.title.trim(), f.body.trim())),
+    });
     Ok(Outcome::Done {
         posted: posted_event,
+        run_review,
     })
+}
+
+/// The trigger of a review a ticket run asks for on its own PR before it
+/// completes (see [`review_for_run`]).
+pub(crate) const TRIGGER_RUN: &str = "run";
+
+/// The PR reviewer's verdict on a run's own PR, for the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunReview {
+    pub verdict: &'static str,
+    /// The review's summary and findings.
+    pub body: String,
+    /// A kept source-data-override finding (title and body): the diff
+    /// overrides data another system owns, so the fix belongs there.
+    pub override_finding: Option<String>,
+}
+
+impl RunReview {
+    /// The verdict holds the merge.
+    pub fn blocks(&self) -> bool {
+        self.verdict == "REQUEST_CHANGES"
+    }
+}
+
+/// One review authority. A ticket run whose own checks passed asks the PR
+/// reviewer for its verdict on the head before it completes, so a run never
+/// ends as "review passed" while the reviewer requests changes. The review is
+/// the same one the PR would get when marked ready (same per-head job key,
+/// so that later trigger doesn't review it twice), posted as usual.
+///
+/// `None` when the repo's reviewer is off, or the review didn't finish within
+/// `budget` (its job claim is given up, so the ready-for-review trigger
+/// reviews it as before).
+#[allow(clippy::too_many_arguments)]
+pub async fn review_for_run(
+    state: &WorkerState,
+    team_id: &str,
+    installation_id: u64,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    head_sha: &str,
+    budget: std::time::Duration,
+) -> Option<RunReview> {
+    let label = enabled_trigger_label(state, team_id, owner, repo).await?;
+    if head_sha.is_empty() || budget.as_secs() < 60 {
+        return None;
+    }
+    let msg = ReviewMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: repo.to_string(),
+        pr_number,
+        head_sha: head_sha.to_string(),
+        label,
+        question: None,
+        trigger: TRIGGER_RUN.to_string(),
+        // The key the ready-for-review trigger uses for this head.
+        dedup_key: format!("head#{head_sha}"),
+        reply_to_comment_id: None,
+        requested_by: String::new(),
+        attempt: 0,
+        wait_secs: 0,
+        reconcile_note: None,
+    };
+    let mut reviewed_head = head_sha.to_string();
+    let out = tokio::time::timeout(
+        budget.min(std::time::Duration::from_secs(REVIEW_BUDGET_SECS)),
+        run_once(state, msg.clone(), &mut reviewed_head),
+    )
+    .await;
+    match out {
+        Ok(Ok(Outcome::Done { run_review, .. })) => {
+            settle_job_claim(state, &msg, true).await;
+            run_review
+        }
+        Ok(Ok(Outcome::ReviewThenReply { .. })) => {
+            settle_job_claim(state, &msg, true).await;
+            None
+        }
+        Ok(Err(e)) => {
+            warn!(pr = pr_number, error = %e, "Run's review of its own PR didn't finish");
+            settle_job_claim(state, &msg, false).await;
+            None
+        }
+        Err(_) => {
+            warn!(pr = pr_number, "Run's review of its own PR ran out of time");
+            settle_job_claim(state, &msg, false).await;
+            None
+        }
+    }
 }
 
 /// How many self-review → self-fix rounds CoderHelm runs on its OWN PR before it

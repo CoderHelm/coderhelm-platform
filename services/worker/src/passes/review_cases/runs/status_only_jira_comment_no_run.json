@@ -1,0 +1,10 @@
+{
+  "name": "a status note on a handled ticket starts no run",
+  "description": "A person moved the ticket along and said so. A status note never starts a code run on a ticket CoderHelm already handled.",
+  "kind": "jira_comment",
+  "run_status": "completed",
+  "action": "run",
+  "comment": "Moving this to QA, will check it tomorrow.",
+  "intent": "status_only",
+  "expect": {"act": "nothing", "starts_run": false}
+}

@@ -14,7 +14,15 @@
 //!   fresh run would rebuild it from scratch as a second PR (people closed
 //!   five of those in one afternoon). A person asks explicitly for follow-up
 //!   work, which still goes through
-//! - a failed / needs_input / retried / cancelled latest run never blocks
+//! - a ticket CoderHelm already handled (its latest run completed, asked a
+//!   question, reported a change outside the code, or was cancelled — its PR
+//!   closed without merging included) starts a new run only when the ticket
+//!   CONTENT changed: a status or field change alone never starts one. The
+//!   run on a cancelled ticket used to re-run on any edit and open the same
+//!   PR again
+//! - a ticket a person marked done on the ticket itself ("fixed in the
+//!   booking system") stays done until its content changes
+//! - a failed / retried latest run never blocks
 //! - explicit human triggers (slash commands, comment retries) skip the
 //!   content check but still respect in-flight blocking
 
@@ -123,15 +131,36 @@ pub async fn gate_ticket_trigger(
         return TicketGate::Enqueue;
     };
 
+    // A person marked the ticket done on the ticket itself.
+    if let Some(item) = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&common::ticket_state::sk(ticket_id)))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+    {
+        let field = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).map(|s| s.as_str());
+        if common::ticket_state::done_blocks_run(
+            field(common::ticket_state::FIELD_STATE),
+            field(common::ticket_state::FIELD_DONE_HASH),
+            new_context_hash,
+        ) {
+            info!(
+                team_id,
+                ticket_id, "Trigger gate: ticket marked done and unchanged — skipping"
+            );
+            return TicketGate::SkipUnchanged;
+        }
+    }
+
     // "success" is a legacy terminal status from an old resume path;
     // "merged" means the PR landed — rework only on real content change.
     let latest_status = status_of(latest);
-    // "needs_outside_change": the fix is a change in another system; the run
-    // is done until the ticket itself changes.
-    if matches!(
-        latest_status.as_str(),
-        "completed" | "success" | "merged" | "needs_outside_change"
-    ) {
+    if handled(&latest_status) {
         let stored_hash = latest.get("context_hash").and_then(|v| v.as_s().ok());
         match (new_context_hash, stored_hash) {
             _ if !rework_on_edit(&latest_status) => {
@@ -164,6 +193,18 @@ pub async fn gate_ticket_trigger(
         // failed / needs_input / retried / cancelled — allow retry
         TicketGate::Enqueue
     }
+}
+
+/// The latest run left the ticket handled: only a change to the ticket's
+/// content starts another run. "needs_outside_change": the fix is a change in
+/// another system. "needs_input": CoderHelm asked; people answer by comment
+/// or by editing the ticket. "cancelled": a person stopped it, or closed its
+/// PR without merging. Only a failed (or retried) run re-runs on any event.
+fn handled(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "success" | "merged" | "needs_outside_change" | "needs_input" | "cancelled"
+    )
 }
 
 /// Whether editing a ticket may start a new run after its latest run ended
@@ -200,7 +241,19 @@ pub fn expected_attachment_keys(
 
 #[cfg(test)]
 mod tests {
-    use super::rework_on_edit;
+    use super::{handled, rework_on_edit};
+
+    #[test]
+    fn a_handled_ticket_needs_a_content_change_to_run_again() {
+        // The cancelled run whose PR a person closed: a status change on the
+        // ticket started the same PR again.
+        assert!(handled("cancelled"));
+        assert!(handled("needs_outside_change"));
+        assert!(handled("needs_input"));
+        assert!(handled("completed"));
+        assert!(!handled("failed"));
+        assert!(!handled("retried"));
+    }
 
     #[test]
     fn an_edit_reworks_an_open_pr_but_never_a_merged_one() {

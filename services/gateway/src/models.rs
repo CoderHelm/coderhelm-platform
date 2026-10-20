@@ -176,6 +176,32 @@ pub enum WorkerMessage {
     /// happened and records a lesson when the fix belonged outside the code.
     #[serde(rename = "lesson")]
     Lesson(LessonMessage),
+    /// A person commented on a ticket CoderHelm worked on: the worker reads
+    /// what the comment is before anything runs.
+    #[serde(rename = "jira_comment")]
+    JiraComment(JiraCommentMessage),
+}
+
+/// A ticket comment for the worker to read (must match the worker's
+/// `JiraCommentMessage`). `action` is what the comment would start if it
+/// asks for work: a ticket run or feedback on the open PR.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct JiraCommentMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub ticket_id: String,
+    pub title: String,
+    /// The ticket's latest run.
+    pub run_id: String,
+    pub run_status: String,
+    pub pr_number: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub author: String,
+    pub comment: String,
+    /// The ticket's content hash now (a done ticket stays done until it changes).
+    pub context_hash: String,
+    pub action: Option<Box<WorkerMessage>>,
 }
 
 /// A lesson job (must match the worker's `LessonMessage`).

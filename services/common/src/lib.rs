@@ -34,6 +34,8 @@ pub mod review_stats;
 pub mod skill_apply;
 pub mod skill_compat;
 pub mod skills;
+/// A ticket's comments as CoderHelm read them, and whether its work is done.
+pub mod ticket_state;
 /// Signed links that turn off one email for one person, without signing in.
 pub mod unsubscribe;
 /// Model usage accounting: every model call is counted here, once.
@@ -85,6 +87,17 @@ use sha2::{Digest, Sha256};
 /// Stable SHA-256 hex digest of a string.
 pub fn content_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+/// SHA-256 (hex) of the parts, each followed by a zero byte. A stable key
+/// for caches built from several inputs.
+pub fn sha256_hex(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for p in parts {
+        hasher.update(p.as_bytes());
+        hasher.update([0u8]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Stable content hash for a ticket's context: title + body + image keys.
