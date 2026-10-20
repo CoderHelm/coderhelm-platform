@@ -369,7 +369,12 @@ Before writing tasks, decide whether the fix belongs in this code at all.
   - When the trace crosses repositories, read the files in those repositories; a path belongs to the repository that contains it. Plan one change per repository, in the order they must ship.
 - What people wrote on the ticket are leads, not facts. Check a person's finding against the data before you build on it, and say which lookup confirmed it.
 - When the wrong value is written by a sync or pipeline, the producer is where the cause usually is: read that pipeline's code (in its repository) and the rows it writes. A change in the code that reads the data instead is a workaround; plan one only when you can say why the producer can't or shouldn't be fixed.
-- If a person says the fix is tracked in another ticket, don't build it here: use `outside_code`, naming that ticket.
+- If a person says the fix is tracked in another ticket, check that ticket's fix against your own trace. If it covers the cause you found, use `outside_code` naming that ticket. If your trace finds a deeper cause it doesn't cover, say so and plan the fix for that cause; the other ticket can stay as a safeguard.
+- Never call a cause settled while you haven't read the code that writes the wrong value. If you write "I did not read" about the step that produces it, read it before deciding.
+- When records that should be separate are merged, or a value flips between runs, read the table's unique constraints and indexes (query them from the database) and the code that matches existing rows: a key that leaves out a field forces records that differ in that field into one.
+- Measure how widespread the problem is with a query (how many records share the defect) before choosing a fix, and say the number.
+- A fix that changes the shape of data (splitting or merging records, a new unique key) needs the readers of that data: search the team's other repositories for code that depends on the old shape, and say which links or ids would change.
+- Before your first query on a table, read its columns (describe it); don't guess column names from other tables' conventions.
 - Never name a cause in a system you couldn't read. If the trace through what you can read is complete and leads into another system, say so with that trace. If you couldn't finish the trace, use `unknown`, say where it stopped, and list the next lookups a person should make, without a likely culprit.
 - If the code behaves as designed and the outcome comes from data or configuration in a source system (a booking or scheduling system, a CMS, a ticket tool's configuration, a feature flag held in another system, a cloud console setting), the fix is a change in that system, not in this code. Set `fix_location` to `outside_code`, describe the exact change, and set tasks.md to `NO_CODE_CHANGE: <one line>`.
 - Never override source data in code: no hardcoded record ids, allowlists, denylists or "force" lists that change behavior for specific records the source system already decides. That hides the cause and goes stale. If that is the only way you see to make the ticket's symptom go away, the fix is outside the code.
@@ -459,9 +464,8 @@ pub fn outside_report(d: &FixDecision, heading: bool) -> String {
         out.push('\n');
     }
     out.push_str(
-        "No code was changed and no pull request was opened: the code works as designed, and \
-         changing it would override the data in the source system. Once the change above is \
-         made, nothing else is needed here.",
+        "No code was changed and no pull request was opened here: the fix is the change above. \
+         Once it is made, nothing else is needed here.",
     );
     out
 }
