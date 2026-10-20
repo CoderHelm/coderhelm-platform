@@ -764,7 +764,9 @@ impl WebCheck {
     ) -> (&'static str, String, String, u128) {
         let started = Instant::now();
         if !self.take() {
-            let msg = format!("All {MAX_CHECKS} page checks for this run are used.");
+            let msg = format!(
+                "All {MAX_CHECKS} page checks for this run are used. Don't call check_url again in this run; say which pages weren't checked."
+            );
             return ("refused", format!("{u}\n  {msg}\n"), msg, 0);
         }
         let res = match tokio::time::timeout(TIMEOUT, check(u, gate, t)).await {
@@ -785,7 +787,16 @@ impl WebCheck {
                     Some(s) => format!("{} · {}", s, c.line()),
                     None => c.line(),
                 };
-                ("ok", c.render(u), detail, ms)
+                let left = MAX_CHECKS.saturating_sub(self.used.load(Ordering::SeqCst));
+                (
+                    "ok",
+                    format!(
+                        "{}  ({left} of {MAX_CHECKS} page checks left in this run)\n",
+                        c.render(u).trim_end()
+                    ),
+                    detail,
+                    ms,
+                )
             }
             Err(CheckError::Refused(m)) => ("refused", format!("{u}\n  refused: {m}\n"), m, ms),
             Err(CheckError::Failed(m)) => {

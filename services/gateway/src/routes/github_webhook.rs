@@ -90,7 +90,7 @@ pub async fn resolve_team_by_installation(
         }
         let owner = pick_installation_owner(&candidates);
         if first_time_seen_shared(installation_id) {
-            tracing::warn!(
+            tracing::debug!(
                 installation_id,
                 team_count = candidates.len(),
                 owner = owner.as_deref().unwrap_or(""),

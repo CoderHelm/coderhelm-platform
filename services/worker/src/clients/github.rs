@@ -100,6 +100,12 @@ struct TokenResponse {
     token: String,
 }
 
+/// True when the issue/PR was closed by a bot account (the app's own push),
+/// false when a person closed it or the closer is unknown.
+pub fn closed_by_a_bot(issue: &serde_json::Value) -> bool {
+    issue["closed_by"]["type"].as_str() == Some("Bot")
+}
+
 impl GitHubClient {
     pub fn new(
         app_id: &str,
@@ -2478,9 +2484,21 @@ impl GitHubClient {
             "{API_BASE}/repos/{owner}/{repo}/pulls?state=closed&head={owner}:{branch}&sort=created&direction=desc&per_page=5"
         );
         let data = self.get(&url).await?;
-        Ok(data
+        let Some(pr) = data
             .as_array()
-            .and_then(|arr| arr.iter().find(|pr| pr["merged_at"].is_null()).cloned()))
+            .and_then(|arr| arr.iter().find(|pr| pr["merged_at"].is_null()).cloned())
+        else {
+            return Ok(None);
+        };
+        // Only a PR GitHub closed for us (a force-reset removed its commits) is
+        // ours to reopen. A PR a person closed stays closed.
+        let Some(number) = pr["number"].as_u64() else {
+            return Ok(None);
+        };
+        let issue = self
+            .get(&format!("{API_BASE}/repos/{owner}/{repo}/issues/{number}"))
+            .await?;
+        Ok(closed_by_a_bot(&issue).then_some(pr))
     }
 
     /// Update a pull request's title.
@@ -2931,5 +2949,23 @@ mod status_error_tests {
     fn empty_body_keeps_the_status_line() {
         let m = status_error_message(reqwest::StatusCode::BAD_GATEWAY, "u", "  ");
         assert_eq!(m, "HTTP status server error (502 Bad Gateway) for url (u)");
+    }
+}
+
+#[cfg(test)]
+mod reopen_tests {
+    use super::closed_by_a_bot;
+    use serde_json::json;
+
+    #[test]
+    fn only_a_bot_closed_pr_is_reopened() {
+        assert!(closed_by_a_bot(
+            &json!({"closed_by": {"login": "app[bot]", "type": "Bot"}})
+        ));
+        assert!(!closed_by_a_bot(
+            &json!({"closed_by": {"login": "someone", "type": "User"}})
+        ));
+        assert!(!closed_by_a_bot(&json!({"closed_by": null})));
+        assert!(!closed_by_a_bot(&json!({})));
     }
 }
