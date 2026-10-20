@@ -1210,6 +1210,141 @@ fn is_phase_run(
         && attempts as u32 >= wanted / 2
 }
 
+/// A flaky-test fix PR, as `begin_fix_proof` needs it.
+struct FixPr<'a> {
+    owner: &'a str,
+    repo: &'a str,
+    default_branch: &'a str,
+    head_branch: &'a str,
+    head_sha: &'a str,
+    pr: Option<u64>,
+}
+
+/// Starts proving a fix: refuse a fix that weakens the test, then start the
+/// repeat runs on the fix branch. Without a workflow that can repeat tests the
+/// fix is opened for review with a note, since no proof can run.
+async fn begin_fix_proof(gh: &GitHubClient, f: &FixPr<'_>, r: &mut TestRecord, now: &str) {
+    if let Ok(files) = gh
+        .compare_files_with_patches(f.owner, f.repo, f.default_branch, f.head_sha)
+        .await
+    {
+        if let Some(why) = weakens_tests(&files) {
+            r.fix_status = Some("failed".into());
+            r.events
+                .push(event("flaky", "flaky", format!("Fix refused: {why}.")));
+            if let Some(pr) = f.pr {
+                let _ = gh
+                    .create_issue_comment(f.owner, f.repo, pr, &format!("This fix can't be used as is: {why}. A fix has to make the test pass without loosening it, so this PR stays a draft."))
+                    .await;
+            }
+            return;
+        }
+    }
+    if let Some(pr) = f.pr {
+        r.fix_pr_url = Some(format!(
+            "https://github.com/{}/{}/pull/{pr}",
+            f.owner, f.repo
+        ));
+    }
+    match dispatch_support(
+        gh,
+        f.owner,
+        f.repo,
+        r.workflow_path.as_deref(),
+        f.head_branch,
+    )
+    .await
+    {
+        Some(d) => match dispatch_repeats(
+            gh,
+            f.owner,
+            f.repo,
+            &d,
+            f.head_branch,
+            std::slice::from_ref(&r.title),
+            BURN_IN_RUNS,
+        )
+        .await
+        {
+            Ok(()) => {
+                r.fix_status = Some("burn_in".into());
+                r.fix_phase_at = Some(now.to_string());
+            }
+            Err(e) => {
+                warn!(error = %e, "Could not start burn-in runs");
+                no_burn_in_note(gh, f.owner, f.repo, r, f.pr).await;
+            }
+        },
+        None => no_burn_in_note(gh, f.owner, f.repo, r, f.pr).await,
+    }
+}
+
+/// Where a flaky-test fix PR stands when its run finishes: a draft only while
+/// a proof is running or after the fix was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Proof {
+    /// Repeat runs are going; their result marks the PR ready or keeps it a draft.
+    Running,
+    /// The fix weakened the test, or its repeat runs failed: it stays a draft.
+    Refused,
+    /// The fix held, or no proof can run here: ready for review.
+    Ready,
+    /// Not a flaky-test fix PR with a record.
+    NotAFix,
+}
+
+/// The proof state a fix record is in.
+pub(crate) fn proof_of(fix_status: Option<&str>) -> Proof {
+    match fix_status {
+        Some("burn_in") => Proof::Running,
+        Some("failed") => Proof::Refused,
+        Some("opened") | Some("merged") => Proof::Ready,
+        _ => Proof::NotAFix,
+    }
+}
+
+/// Called when a flaky-test fix run finishes with green CI: starts its proof
+/// now rather than waiting for test results from the fix branch, which a repo
+/// whose end-to-end tests only run on request never sends (the PR then sat as
+/// a draft with nothing to move it).
+pub(crate) async fn start_fix_proof(
+    state: &WorkerState,
+    gh: &GitHubClient,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) -> Proof {
+    let Ok(pr) = gh.get_pull_request(owner, repo, pr_number).await else {
+        return Proof::NotAFix;
+    };
+    let branch = pr["head"]["ref"].as_str().unwrap_or("");
+    let fix_prefix = format!("coderhelm/{}", FIX_TICKET_PREFIX.to_lowercase());
+    let Some(id) = branch.strip_prefix(&fix_prefix) else {
+        return Proof::NotAFix;
+    };
+    let st = store(state);
+    let Ok(Some(mut r)) = st.record(team_id, id).await else {
+        return Proof::NotAFix;
+    };
+    if r.fix_status.as_deref() == Some("fixing") && r.fix_branch.as_deref() == Some(branch) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let fix = FixPr {
+            owner,
+            repo,
+            default_branch: pr["base"]["ref"].as_str().unwrap_or("main"),
+            head_branch: branch,
+            head_sha: pr["head"]["sha"].as_str().unwrap_or(""),
+            pr: Some(pr_number),
+        };
+        begin_fix_proof(gh, &fix, &mut r, &now).await;
+        if let Err(e) = st.put_record(team_id, &r).await {
+            warn!(error = %e, "Could not save the fix's proof state");
+        }
+    }
+    proof_of(r.fix_status.as_deref())
+}
+
 /// Moves a test's fix along when this run is one of its repeat runs, or the
 /// first CI run of its fix PR.
 async fn follow_fix(
@@ -1253,66 +1388,20 @@ async fn follow_fix(
             if r.fix_branch.as_deref() == Some(msg.head_branch.as_str())
                 && msg.event != "workflow_dispatch" =>
         {
-            // The fix PR's first CI run: check it doesn't weaken the test,
-            // then prove it with repeat runs.
-            if let Ok(files) = gh
-                .compare_files_with_patches(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    &msg.default_branch,
-                    &msg.head_sha,
-                )
-                .await
-            {
-                if let Some(why) = weakens_tests(&files) {
-                    r.fix_status = Some("failed".into());
-                    r.events
-                        .push(event("flaky", "flaky", format!("Fix refused: {why}.")));
-                    if let Some(pr) = run.pr {
-                        let _ = gh
-                            .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("This fix can't be used as is: {why}. A fix has to make the test pass without loosening it, so this PR stays a draft."))
-                            .await;
-                    }
-                    return;
-                }
-            }
-            if let Some(pr) = run.pr {
-                r.fix_pr_url = Some(format!(
-                    "https://github.com/{}/{}/pull/{pr}",
-                    msg.repo_owner, msg.repo_name
-                ));
-            }
-            match dispatch_support(
+            begin_fix_proof(
                 gh,
-                &msg.repo_owner,
-                &msg.repo_name,
-                r.workflow_path.as_deref(),
-                &msg.head_branch,
-            )
-            .await
-            {
-                Some(d) => match dispatch_repeats(
-                    gh,
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    &d,
-                    &msg.head_branch,
-                    std::slice::from_ref(&r.title),
-                    BURN_IN_RUNS,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        r.fix_status = Some("burn_in".into());
-                        r.fix_phase_at = Some(now);
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Could not start burn-in runs");
-                        no_burn_in_note(gh, msg, r, run.pr).await;
-                    }
+                &FixPr {
+                    owner: &msg.repo_owner,
+                    repo: &msg.repo_name,
+                    default_branch: &msg.default_branch,
+                    head_branch: &msg.head_branch,
+                    head_sha: &msg.head_sha,
+                    pr: run.pr,
                 },
-                None => no_burn_in_note(gh, msg, r, run.pr).await,
-            }
+                r,
+                &now,
+            )
+            .await;
         }
         Some("burn_in")
             if is_phase_run(
@@ -1389,7 +1478,13 @@ fn event(from: &str, to: &str, reason: String) -> StateEvent {
     }
 }
 
-async fn no_burn_in_note(gh: &GitHubClient, msg: &TestIngest, r: &mut TestRecord, pr: Option<u64>) {
+async fn no_burn_in_note(
+    gh: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    r: &mut TestRecord,
+    pr: Option<u64>,
+) {
     r.fix_status = Some("opened".into());
     r.events.push(event(
         "flaky",
@@ -1399,11 +1494,11 @@ async fn no_burn_in_note(gh: &GitHubClient, msg: &TestIngest, r: &mut TestRecord
     if let Some(pr) = pr {
         let _ = gh
             .create_issue_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
+                owner,
+                repo,
                 pr,
                 &format!(
-                    "Coderhelm couldn't prove this fix with repeat runs, because the E2E workflow has no `workflow_dispatch` input for repeats. Run `{}` about 20 times (e.g. `npx playwright test --grep \"{}\" --repeat-each=20`) before marking this ready. Adding a `repeat_each` input to the workflow lets Coderhelm do this itself.",
+                    "Coderhelm couldn't prove this fix with repeat runs, because the E2E workflow has no `workflow_dispatch` input for repeats, so it's ready for review without them. Run `{}` about 20 times (e.g. `npx playwright test --grep \"{}\" --repeat-each=20`) before merging. Adding a `repeat_each` input to the workflow lets Coderhelm do this itself.",
                     r.title,
                     grep_for(std::slice::from_ref(&r.title))
                 ),
@@ -2500,5 +2595,23 @@ mod auto_fix_tests {
             !wants_auto_fix(&r, &stats(0.08, 12.0, 40)),
             "a fix is already under way"
         );
+    }
+}
+
+#[cfg(test)]
+mod proof_tests {
+    use super::{proof_of, Proof};
+
+    #[test]
+    fn a_fix_pr_is_a_draft_only_while_proving_or_refused() {
+        assert_eq!(proof_of(Some("burn_in")), Proof::Running);
+        assert_eq!(proof_of(Some("failed")), Proof::Refused);
+        // No repeat runs possible, or the fix held: ready for review.
+        assert_eq!(proof_of(Some("opened")), Proof::Ready);
+        assert_eq!(proof_of(Some("merged")), Proof::Ready);
+        // Still "fixing" after the proof start means it isn't a fix this
+        // record tracks for this branch: the ordinary ready rules apply.
+        assert_eq!(proof_of(Some("fixing")), Proof::NotAFix);
+        assert_eq!(proof_of(None), Proof::NotAFix);
     }
 }

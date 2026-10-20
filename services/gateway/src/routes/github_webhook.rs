@@ -1719,6 +1719,88 @@ async fn handle_check_suite(
     Ok(StatusCode::OK)
 }
 
+/// A workflow conclusion that means a check failed (as opposed to skipped,
+/// cancelled or neutral, which are ignored before this).
+fn is_failed_conclusion(conclusion: &str) -> bool {
+    matches!(conclusion, "failure" | "timed_out" | "startup_failure")
+}
+
+/// Only a run that finished as completed is reopened: a cancelled or failed
+/// run stays as a person or the run left it.
+fn reopens_for_ci(run_status: &str) -> bool {
+    run_status == "completed"
+}
+
+/// Send a CI failure on CoderHelm's own PR to the run that opened it, when
+/// that run already finished. Best effort: no run, a run that didn't complete,
+/// or a spent token budget is a logged no-op.
+async fn reopen_finished_run_for_ci(
+    state: &AppState,
+    team_id: &str,
+    installation_id: u64,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+    workflow_name: &str,
+) {
+    let run_id = lookup_run_by_pr(state, team_id, owner, name, pr_number).await;
+    if run_id.is_empty() {
+        info!(
+            pr_number,
+            workflow_name, "CI failed on own PR but no run found — not fixing"
+        );
+        return;
+    }
+    let status = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(&run_id))
+        .projection_expression("#s")
+        .expression_attribute_names("#s", "status")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| i.get("status").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default();
+    if !reopens_for_ci(&status) {
+        info!(
+            pr_number,
+            run_id, status, workflow_name, "CI failed on own PR; run not completed — not reopening"
+        );
+        return;
+    }
+    if check_run_budget(state, team_id).await.is_some() {
+        info!(
+            pr_number,
+            run_id, "CI failed on own PR; token limit reached — not fixing"
+        );
+        return;
+    }
+    info!(
+        pr_number,
+        run_id,
+        workflow_name,
+        "CI failed on own PR after its run finished — sending to the fix loop"
+    );
+    let message = WorkerMessage::Feedback(FeedbackMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        run_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
+        // 0: feedback reads the PR's failing checks itself.
+        review_id: 0,
+        review_body: String::new(),
+        comments: vec![],
+        trigger_author: String::new(),
+    });
+    let _ = send_to_queue(state, &state.config.feedback_queue_url, &message).await;
+}
+
 /// Handle workflow_run events — write CI events and trigger resume for coderhelm branches.
 async fn handle_workflow_run(
     state: &AppState,
@@ -1766,6 +1848,33 @@ async fn handle_workflow_run(
     let run_id = match find_run_by_branch(state, team_id, repo_owner, repo_name, branch).await {
         Some(id) => id,
         None => {
+            // No run is waiting on CI. A failure on CoderHelm's own PR after its
+            // run finished (a check that started after the run completed, like
+            // E2E a label kicked off) goes to the run's fix loop: feedback reads
+            // the failing checks and fixes them, within the run's fix budget.
+            if is_failed_conclusion(conclusion) {
+                for pr in wf["pull_requests"]
+                    .as_array()
+                    .map(|a| a.as_slice())
+                    .unwrap_or(&[])
+                {
+                    let pr_number = pr["number"].as_u64().unwrap_or(0);
+                    if pr_number == 0 {
+                        continue;
+                    }
+                    reopen_finished_run_for_ci(
+                        state,
+                        team_id,
+                        installation_id,
+                        repo_owner,
+                        repo_name,
+                        pr_number,
+                        workflow_name,
+                    )
+                    .await;
+                }
+                return Ok(StatusCode::OK);
+            }
             // Fallback: still handle success via MarkReady for backward compat
             if conclusion == "success" {
                 let prs = wf["pull_requests"].as_array().cloned().unwrap_or_default();
@@ -3200,5 +3309,43 @@ mod installation_owner_tests {
     fn shared_installation_is_logged_once() {
         assert!(first_time_seen_shared(987_654_321));
         assert!(!first_time_seen_shared(987_654_321));
+    }
+}
+
+#[cfg(test)]
+mod own_pr_ci_after_run_tests {
+    use super::{is_failed_conclusion, reopens_for_ci};
+
+    #[test]
+    fn only_real_failures_reopen_a_finished_run() {
+        for c in ["failure", "timed_out", "startup_failure"] {
+            assert!(is_failed_conclusion(c), "{c}");
+        }
+        for c in [
+            "success",
+            "skipped",
+            "cancelled",
+            "neutral",
+            "stale",
+            "action_required",
+            "",
+        ] {
+            assert!(!is_failed_conclusion(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn only_a_completed_run_is_reopened() {
+        assert!(reopens_for_ci("completed"));
+        for s in [
+            "cancelled",
+            "failed",
+            "awaiting_ci",
+            "running",
+            "needs_outside_change",
+            "",
+        ] {
+            assert!(!reopens_for_ci(s), "{s}");
+        }
     }
 }
