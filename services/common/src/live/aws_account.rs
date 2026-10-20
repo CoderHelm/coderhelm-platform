@@ -480,20 +480,20 @@ mod tests {
     #[test]
     fn environments_are_discovered_not_typed() {
         let mut a = account();
-        a.apply_check(&check(Some(true), Some(true), &["prod-bi-airflow"]), "t1");
-        assert_eq!(a.airflow_environments(), vec!["prod-bi-airflow"]);
+        a.apply_check(&check(Some(true), Some(true), &["prod-data-airflow"]), "t1");
+        assert_eq!(a.airflow_environments(), vec!["prod-data-airflow"]);
         // A new environment appears; the next check finds it.
         a.apply_check(
             &check(
                 Some(true),
                 Some(true),
-                &["prod-bi-airflow", "staging-airflow"],
+                &["prod-data-airflow", "staging-airflow"],
             ),
             "t2",
         );
         assert_eq!(
             a.airflow_environments(),
-            vec!["prod-bi-airflow", "staging-airflow"]
+            vec!["prod-data-airflow", "staging-airflow"]
         );
         // An environment is deleted; it stops being offered.
         a.apply_check(&check(Some(true), Some(true), &["staging-airflow"]), "t3");

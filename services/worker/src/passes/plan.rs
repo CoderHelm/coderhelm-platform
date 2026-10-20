@@ -12,7 +12,7 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-20.verify-the-data";
+pub const PLANNER_VERSION: &str = "2026-10-20.trace-every-step";
 
 /// The cached plan's file holding its key.
 pub const PLAN_KEY_FILE: &str = "plan_key.txt";
@@ -22,9 +22,50 @@ pub const PLAN_KEY_FILE: &str = "plan_key.txt";
 /// the ticket rides in the body), what memory recalled for it (team lessons
 /// included), the ticket's history (earlier runs, how their PRs ended,
 /// lessons, people's notes), and the planner's version.
-pub fn plan_cache_key(context_hash: &str, memory_context: &str, history_digest: &str) -> String {
+pub fn plan_cache_key(
+    context_hash: &str,
+    memory_context: &str,
+    history_digest: &str,
+    team_instructions: &str,
+) -> String {
     let memory = common::sha256_hex(&[memory_context]);
-    common::sha256_hex(&[PLANNER_VERSION, context_hash, &memory, history_digest])
+    let instructions = common::sha256_hex(&[team_instructions]);
+    common::sha256_hex(&[
+        PLANNER_VERSION,
+        context_hash,
+        &memory,
+        history_digest,
+        &instructions,
+    ])
+}
+
+/// The team's own instructions for this repository, as people wrote them in
+/// CoderHelm: the team-wide ones, then the repository's. Empty when none.
+pub async fn team_instructions(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> String {
+    let global = super::load_content(state, team_id, "INSTRUCTIONS#GLOBAL").await;
+    let repo =
+        super::load_content(state, team_id, &format!("INSTRUCTIONS#REPO#{owner}/{name}")).await;
+    [global.trim(), repo.trim()]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The planner's section for the team's instructions.
+fn team_instructions_block(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## Your team's instructions (follow them; they know this system better than the code shows)\n{text}"
+    )
 }
 
 /// Result of the plan pass: the four openspec files.
@@ -78,6 +119,9 @@ pub async fn run(
             .join("\n")
     };
 
+    let team_block = team_instructions_block(
+        &team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await,
+    );
     let instructions_block = if repo_instructions.is_empty() {
         String::new()
     } else {
@@ -109,7 +153,7 @@ pub async fn run(
          Research the codebase using the provided tools, then generate an implementation plan.\n\n\
          You have access to these repos:\n{repos_list}\n\n\
          All tools default to {owner}/{repo} when the `repo` parameter is omitted. \
-         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{instructions_block}{tests_block}",
+         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{instructions_block}{team_block}{tests_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );

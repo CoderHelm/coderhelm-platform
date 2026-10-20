@@ -122,6 +122,6 @@ mod tests {
         );
         assert_eq!(Intent::parse("Status only"), Intent::StatusOnly);
         assert_eq!(Intent::parse("???"), Intent::Other);
-        assert_eq!(sk("cpm-1"), "TICKETSTATE#CPM-1");
+        assert_eq!(sk("abc-1"), "TICKETSTATE#ABC-1");
     }
 }
