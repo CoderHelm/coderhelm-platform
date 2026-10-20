@@ -12,7 +12,7 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-20.read-the-producer";
+pub const PLANNER_VERSION: &str = "2026-10-20.producer-and-scope";
 
 /// The cached plan's file holding its key.
 pub const PLAN_KEY_FILE: &str = "plan_key.txt";
@@ -505,6 +505,7 @@ Then the ```fix_location.json block described above."#,
             default_repo: &msg.repo_name,
             base_branch: &msg.base_branch,
             allowed_repos: &team_repos,
+            read_paths: std::sync::Mutex::new(Vec::new()),
         },
         mcp_plugins: &loaded_mcp_plugins,
         lambda: &state.lambda,
@@ -561,16 +562,29 @@ Then the ```fix_location.json block described above."#,
         None,
     )
     .await?;
-    // A decision about data the planner never looked at goes back once.
-    if super::fix_location::unchecked_data(
+    // A decision about data that skipped part of the trace (no lookups, no
+    // producer, a producer it never opened, no scope) goes back once.
+    let read = || {
+        executor
+            .read_only
+            .read_paths
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    };
+    let gaps = super::fix_location::gaps(
         super::fix_location::parse(&response).as_ref(),
         can_look_up,
         lookups(),
-    ) {
-        info!(ticket_id = %msg.ticket_id, "Plan describes data it never looked up — sending it back to check");
+        &read(),
+    );
+    if !gaps.is_empty() {
+        info!(ticket_id = %msg.ticket_id, gaps = gaps.len(), "Plan's trace is incomplete — sending it back");
         messages.push((
             "user".to_string(),
-            vec![serde_json::json!({"type": "text", "text": super::fix_location::CHECK_THE_DATA})],
+            vec![
+                serde_json::json!({"type": "text", "text": super::fix_location::send_back(&gaps)}),
+            ],
         ));
         response = provider::converse(
             state,
@@ -592,9 +606,16 @@ Then the ```fix_location.json block described above."#,
     }
 
     let mut files = parse_openspec_files(&response);
-    if super::fix_location::unchecked_data(files.fix.as_ref(), can_look_up, lookups()) {
-        warn!(ticket_id = %msg.ticket_id, "Plan still unchecked against the data — no code on it");
-        files.fix = files.fix.take().map(super::fix_location::mark_unchecked);
+    let gaps = super::fix_location::gaps(files.fix.as_ref(), can_look_up, lookups(), &read());
+    if !gaps.is_empty() {
+        warn!(ticket_id = %msg.ticket_id, gaps = ?gaps, "Plan's trace still incomplete — no code on it");
+        files.fix = files.fix.take().map(|d| {
+            if super::fix_location::unchecked_data(Some(&d), can_look_up, lookups()) {
+                super::fix_location::mark_unchecked(d)
+            } else {
+                super::fix_location::mark_untraced(d, &gaps)
+            }
+        });
     }
 
     // Write openspec to S3
@@ -836,6 +857,9 @@ struct ReadOnlyToolExecutor<'a> {
     default_repo: &'a str,
     base_branch: &'a str,
     allowed_repos: &'a [String],
+    /// `owner/repo:path` of every file read, to check a decision cites code
+    /// the planner actually opened.
+    read_paths: std::sync::Mutex<Vec<String>>,
 }
 
 impl<'a> ReadOnlyToolExecutor<'a> {
@@ -895,6 +919,9 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
                     .github
                     .read_file_lines(&owner, &repo, path, branch, start, end)
                     .await?;
+                if let Ok(mut r) = self.read_paths.lock() {
+                    r.push(format!("{owner}/{repo}:{}", path.trim_start_matches('/')));
+                }
                 Ok(json!(content))
             }
             "search_code" => {
