@@ -240,6 +240,13 @@ Before writing tasks, decide whether the fix belongs in this code at all.
 
 - Find the rule the code is meant to follow for the case in the ticket (read the code path; read its comments, names and tests for intent).
 - When a live source, data lookup or check can show the actual record or setting, look it up and compare it with that rule.
+- Debug it; don't guess. For a wrong value on a page or in a result:
+  - Find the exact field the code reads to produce it (for example the `facility` id an address is looked up by), then look up that stored value for the ticket's own records by id. A display name, label or short code is not the value: several records can share one.
+  - Follow it hop by hop (the record, the row it points to, the setting it is matched against) until you reach the value that is shown.
+  - When a saved lookup doesn't return the field you need, write your own read-only query against the connected database.
+  - When the ticket names a page you can check with `check_url`, look at what it shows.
+  - Your cause must explain the exact wrong value in the ticket (why that one and not another). If it doesn't, keep looking.
+- Never name a cause in a system you couldn't read. If the trace through what you can read is complete and leads into another system, say so with that trace. If you couldn't finish the trace, use `unknown`, say where it stopped, and list the next lookups a person should make, without a likely culprit.
 - If the code behaves as designed and the outcome comes from data or configuration in a source system (a booking or scheduling system, a CMS, a ticket tool's configuration, a feature flag held in another system, a cloud console setting), the fix is a change in that system, not in this code. Set `fix_location` to `outside_code`, describe the exact change, and set tasks.md to `NO_CODE_CHANGE: <one line>`.
 - Never override source data in code: no hardcoded record ids, allowlists, denylists or "force" lists that change behavior for specific records the source system already decides. That hides the cause and goes stale. If that is the only way you see to make the ticket's symptom go away, the fix is outside the code.
 - If a code change is needed AND a change in another system, use `both`: plan the code part normally and describe the outside change.
@@ -253,7 +260,7 @@ After the four openspec files, output this block (JSON, all fields required; `ou
 ```fix_location.json
 {
   "fix_location": "code" | "outside_code" | "both" | "unknown",
-  "cause": "one or two plain sentences: why the ticket's symptom happens",
+  "cause": "one or two plain sentences: why the ticket's symptom happens, only as far as your lookups show it",
   "evidence": {
     "looked_up": ["each lookup you made and a short summary of what came back"],
     "code_rule": "the rule the code is meant to follow for this case",
