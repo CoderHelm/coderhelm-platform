@@ -1,5 +1,6 @@
 //! Monitoring, docs and pipeline connections a team turns on for its agents:
-//! New Relic, Confluence, OpenSearch, CloudWatch metrics and Airflow (MWAA).
+//! New Relic, Confluence, OpenSearch, a REST API, CloudWatch metrics and
+//! Airflow (MWAA).
 //!
 //! One record per kind per team (`CONNECTOR#<kind>` in the settings table).
 //! Each is off until an admin turns it on, reads only, and every call it makes
@@ -30,15 +31,17 @@ pub enum ConnKind {
     NewRelic,
     Confluence,
     OpenSearch,
+    Rest,
     Metrics,
     Airflow,
 }
 
 impl ConnKind {
-    pub const ALL: [ConnKind; 5] = [
+    pub const ALL: [ConnKind; 6] = [
         ConnKind::NewRelic,
         ConnKind::Confluence,
         ConnKind::OpenSearch,
+        ConnKind::Rest,
         ConnKind::Metrics,
         ConnKind::Airflow,
     ];
@@ -48,6 +51,7 @@ impl ConnKind {
             ConnKind::NewRelic => "newrelic",
             ConnKind::Confluence => "confluence",
             ConnKind::OpenSearch => "opensearch",
+            ConnKind::Rest => "rest",
             ConnKind::Metrics => "metrics",
             ConnKind::Airflow => "airflow",
         }
@@ -63,6 +67,7 @@ impl ConnKind {
             ConnKind::NewRelic => "New Relic",
             ConnKind::Confluence => "Confluence",
             ConnKind::OpenSearch => "OpenSearch",
+            ConnKind::Rest => "REST API",
             ConnKind::Metrics => "CloudWatch metrics",
             ConnKind::Airflow => "Airflow (MWAA)",
         }
@@ -97,7 +102,7 @@ pub struct Connector {
     /// New Relic accounts agents may query. Empty: every account the key sees.
     pub account_ids: Vec<String>,
     /// Confluence: `https://<site>.atlassian.net`. OpenSearch: the cluster's
-    /// `https://` address.
+    /// `https://` address. REST: the API's base address.
     pub site: String,
     /// Confluence: the account the token belongs to. OpenSearch: the user.
     pub email: String,
@@ -115,8 +120,13 @@ pub struct Connector {
     /// OpenSearch: index names or patterns agents may read. Empty: every
     /// index the user sees.
     pub indexes: Vec<String>,
-    /// OpenSearch: field names hidden in results, on top of the defaults.
+    /// OpenSearch and REST: field names hidden in results, on top of the
+    /// defaults.
     pub hidden_fields: Vec<String>,
+    /// REST: the header the key is sent in (e.g. `X-Api-Key`).
+    pub header_name: String,
+    /// REST: path prefixes agents may GET. Nothing outside them is read.
+    pub paths: Vec<String>,
     /// `owner/name` repos whose work may use it. Empty: every repo.
     pub repos: Vec<String>,
     pub updated_at: String,
@@ -186,6 +196,8 @@ impl Connector {
             ("environments".to_string(), av_list(&self.environments)),
             ("indexes".to_string(), av_list(&self.indexes)),
             ("hidden_fields".to_string(), av_list(&self.hidden_fields)),
+            ("header_name".to_string(), av_s(&self.header_name)),
+            ("paths".to_string(), av_list(&self.paths)),
             ("repos".to_string(), av_list(&self.repos)),
             ("updated_at".to_string(), av_s(&self.updated_at)),
             ("updated_by".to_string(), av_s(&self.updated_by)),
@@ -219,6 +231,8 @@ impl Connector {
             environments: strings(item, "environments"),
             indexes: strings(item, "indexes"),
             hidden_fields: strings(item, "hidden_fields"),
+            header_name: s(item, "header_name"),
+            paths: strings(item, "paths"),
             repos: strings(item, "repos"),
             updated_at: s(item, "updated_at"),
             updated_by: s(item, "updated_by"),
@@ -253,6 +267,8 @@ impl Connector {
             "environments": self.environments,
             "indexes": self.indexes,
             "hidden_fields": self.hidden_fields,
+            "header_name": self.header_name,
+            "paths": self.paths,
             "repos": self.repos,
             "aws": aws,
             "updated_at": self.updated_at,

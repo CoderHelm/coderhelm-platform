@@ -429,6 +429,7 @@ pub const AGENT_READ_TOOLS: &[&str] = &[
     "opensearch_mapping",
     "opensearch_search",
     "opensearch_count",
+    "rest_get",
     "metrics_list",
     "metrics_query",
     "airflow_dags",

@@ -23,6 +23,7 @@ use common::live::connectors::{self, check_page_ids, ConnKind, Connector};
 use common::live::http::Https;
 use common::live::newrelic::NewRelic;
 use common::live::opensearch::{check_endpoint, check_index, OpenSearch};
+use common::live::rest::{check_base, check_header, check_path, Rest, MAX_PATHS};
 use common::live::store::{self, Activity};
 use common::live::{airflow, identity, metrics, secret, StepError};
 use serde_json::{json, Value};
@@ -255,6 +256,21 @@ async fn try_connection(
             }
             Ok(who)
         }
+        ConnKind::Rest => {
+            let first = c.paths.first().cloned().unwrap_or_default();
+            let a = Rest {
+                conn: c,
+                key,
+                http: &Https,
+            }
+            .get(&first, None)
+            .await?;
+            Ok(format!(
+                "Signed in; {} answered ({} characters)",
+                a.asked,
+                a.text.len()
+            ))
+        }
         ConnKind::Metrics => {
             let t = c.aws.as_ref().ok_or_else(|| {
                 StepError::new("reach", "No AWS role is set.", "Pick the AWS account.")
@@ -483,6 +499,43 @@ pub async fn save(
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
                     "Enter the cluster address, a read-only user and its password.",
+                ));
+            }
+        }
+        ConnKind::Rest => {
+            if let Some(s) = text("site") {
+                c.site = check_base(&s).map_err(step)?;
+            }
+            if let Some(h) = text("header_name") {
+                c.header_name = check_header(&h).map_err(step)?;
+            }
+            if let Some(p) = strings(
+                &body,
+                "paths",
+                |p| check_path(p).is_ok(),
+                "path (like /v1/items)",
+            )? {
+                if p.len() > MAX_PATHS {
+                    return Err(fail(
+                        StatusCode::BAD_REQUEST,
+                        &format!("At most {MAX_PATHS} paths."),
+                    ));
+                }
+                c.paths = p;
+            }
+            if let Some(h) = strings(
+                &body,
+                "hidden_fields",
+                |h| !h.is_empty() && h.len() <= 100,
+                "field name",
+            )? {
+                c.hidden_fields = h;
+            }
+            if c.site.is_empty() || c.header_name.is_empty() || c.paths.is_empty() || key.is_empty()
+            {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "Enter the API address, the header the key goes in, the key and at least one path agents may read.",
                 ));
             }
         }
