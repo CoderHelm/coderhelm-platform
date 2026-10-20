@@ -1095,8 +1095,7 @@ pub const TICKET_TEXT_FILE: &str = "ticket.md";
 
 /// Steps the planner may take. With live data to look up, a ticket triaged
 /// as simple can still be a data question that takes several lookups to
-/// trace (a wrong address was blamed on a CMS after two lookups in eight
-/// steps), so it always gets room to follow the data.
+/// trace, so it always gets room to follow the data.
 fn planner_turns(complexity: &str, can_look_up_data: bool) -> usize {
     let by_size = match complexity {
         "simple" => 8,

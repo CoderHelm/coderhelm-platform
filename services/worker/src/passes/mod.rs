@@ -6171,6 +6171,11 @@ async fn validate_plan(
         .iter()
         .filter(|p| !new_files.contains(p.as_str()))
         .collect();
+    // The files the plan changes all exist here: that settles the repo. A
+    // plan that explains its cause by naming another repo (the API it reads,
+    // the pipeline that writes its data) still changes files here, so neither
+    // mentions nor the model check below may move it.
+    let mut files_here = false;
     if !existing_expected.is_empty() {
         let sample: Vec<&String> = existing_expected.iter().take(10).copied().collect();
         let mut missing = Vec::new();
@@ -6180,6 +6185,7 @@ async fn validate_plan(
                 Err(_) => missing.push(path.to_string()),
             }
         }
+        files_here = missing.is_empty();
         let missing_pct = if sample.is_empty() {
             0.0
         } else {
@@ -6241,7 +6247,7 @@ async fn validate_plan(
     //    "for mobile" — the device — routed web work into the repo
     //    named "mobile" because \bmobile\b matched twice).
     let mut mention_hint: Option<String> = None;
-    if switch_repo.is_none() {
+    if switch_repo.is_none() && !files_here {
         let current_repo = format!("{repo_owner}/{repo_name}");
         let full_plan = format!(
             "{}\n{}\n{}\n{}",
@@ -6308,7 +6314,7 @@ async fn validate_plan(
     // 4. LLM repo-fit check — ask the LLM if this plan actually belongs in this repo.
     //    Uses AGENTS#GLOBAL context, repo description, directory listing, and plan summary
     //    to detect mismatches that deterministic checks miss (e.g. new files, same language).
-    if switch_repo.is_none() && team_repos.len() > 1 {
+    if switch_repo.is_none() && !files_here && team_repos.len() > 1 {
         let current_repo = format!("{repo_owner}/{repo_name}");
 
         // Gather context: AGENTS#GLOBAL + repo info + directory listing

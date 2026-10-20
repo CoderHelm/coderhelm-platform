@@ -261,11 +261,18 @@ Before writing tasks, decide whether the fix belongs in this code at all.
 - Find the rule the code is meant to follow for the case in the ticket (read the code path; read its comments, names and tests for intent).
 - When a live source, data lookup or check can show the actual record or setting, look it up and compare it with that rule.
 - Debug it; don't guess. For a wrong value on a page or in a result:
-  - Find the exact field the code reads to produce it (for example the `facility` id an address is looked up by), then look up that stored value for the ticket's own records by id. A display name, label or short code is not the value: several records can share one.
+  - Find the exact field the code reads to produce it (for example the id a displayed name or address is looked up by), then look up that stored value for the ticket's own records by id. A display name, label or short code is not the value: several records can share one.
   - Follow it hop by hop (the record, the row it points to, the setting it is matched against) until you reach the value that is shown.
   - When a saved lookup doesn't return the field you need, write your own read-only query against the connected database.
   - When the ticket names a page you can check with `check_url`, look at what it shows.
   - Your cause must explain the exact wrong value in the ticket (why that one and not another). If it doesn't, keep looking.
+  - Start from what was actually shown: check the page with `check_url` and `find` (the record id, the field, the wrong text), or query the live API, before reading the code you expect ran.
+  - A field's name can carry another record's value. Read what the code that fills it assigns (the resolver, serializer or mapper), then confirm it with a live query.
+  - A value on a parent record (a group, a category, a summary) is not the value of each item under it. Anything shown for one item must come from that item; check whether a parent spans items with different values.
+  - Data often lives in several copies (the database, search indexes, caches). Compare them before calling something a sync or cache problem.
+  - Timestamps copied from a source system are the source's, not when the row was written.
+  - Before showing a per-item value instead of the parent's, look for items whose value has nothing to show (no mapping, an internal record) and keep the parent's as the fallback.
+  - When the trace crosses repositories, read the files in those repositories; a path belongs to the repository that contains it. Plan one change per repository, in the order they must ship.
 - What people wrote on the ticket are leads, not facts. Check a person's finding against the data before you build on it, and say which lookup confirmed it.
 - When the wrong value is written by a sync or pipeline, the producer is where the cause usually is: read that pipeline's code (in its repository) and the rows it writes. A change in the code that reads the data instead is a workaround; plan one only when you can say why the producer can't or shouldn't be fixed.
 - If a person says the fix is tracked in another ticket, don't build it here: use `outside_code`, naming that ticket.
@@ -635,7 +642,7 @@ mod unchecked_data_tests {
             "```fix_location.json\n{}\n```",
             serde_json::json!({
                 "fix_location": "code",
-                "cause": "The group row's facility flips on each sync.",
+                "cause": "The parent record's value is overwritten on each sync.",
                 "evidence": {"looked_up": [], "code_rule": "", "data_shows": data_shows},
                 "outside_change": null,
                 "history_check": ""
@@ -646,7 +653,7 @@ mod unchecked_data_tests {
 
     #[test]
     fn a_claim_about_data_with_no_lookup_is_unchecked() {
-        let d = decision("Per the ticket: the group row flips between facilities.");
+        let d = decision("Per the ticket: the parent record is overwritten on each sync.");
         assert!(unchecked_data(Some(&d), true, 0));
         // It looked: fine. It couldn't look: nothing to send it back for.
         assert!(!unchecked_data(Some(&d), true, 3));
@@ -658,7 +665,7 @@ mod unchecked_data_tests {
 
     #[test]
     fn an_unchecked_decision_writes_no_code() {
-        let d = mark_unchecked(decision("Per the ticket: it flips."));
+        let d = mark_unchecked(decision("Per the ticket: it is overwritten."));
         assert_eq!(d.fix_location, FixLocation::Unknown);
         assert!(d.cause.starts_with("Not checked against the data"));
         assert_ne!(route(Some(&d)), route(Some(&decision(""))));
