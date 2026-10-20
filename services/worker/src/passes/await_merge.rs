@@ -62,8 +62,9 @@ const RECORD_TTL_SECS: u64 = 30 * 86_400;
 /// Hidden marker that identifies the gate's status comment.
 pub const STATUS_MARKER: &str = "<!-- coderhelm:merge-status -->";
 
-const STATUS_FOOTER: &str =
-    "\n<sub>I merge automatically once every item is ✅. This comment updates in place.</sub>";
+/// Starts the small print under the checklist (the commit and branch). Notes
+/// are added above it.
+const FOOTER_START: &str = "\n<sub>";
 
 // ─── CI ─────────────────────────────────────────────────────────────────────
 
@@ -238,7 +239,6 @@ impl Mark {
 /// Everything the gate knows about the PR at one evaluation.
 #[derive(Debug, Clone)]
 pub(crate) struct GateView {
-    pub head: String,
     pub draft: bool,
     pub require_human: bool,
     /// CoderHelm's own latest verdict recorded for this head.
@@ -289,29 +289,21 @@ fn short(sha: &str) -> &str {
 /// keys, the deploy labels and CI are weighed, so the evals drive exactly
 /// what production runs.
 pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
-    let s = short(&v.head);
     let bot_dismissed = v.approvals.bot_dismissed_at_head;
     let bot_approved = v.bot_verdict.as_deref() == Some("APPROVE") && !bot_dismissed;
     let human_present = v.approvals.human_key();
 
     let mut lines: Vec<(Mark, String)> = Vec::new();
     lines.push(match (v.bot_verdict.as_deref(), bot_dismissed) {
-        (Some("APPROVE"), false) => (Mark::Done, format!("CoderHelm approved `{s}`")),
+        (Some("APPROVE"), false) => (Mark::Done, "CoderHelm approved".to_string()),
         (Some("APPROVE"), true) => (
             Mark::Blocked,
-            format!(
-                "CoderHelm's approval of `{s}` was dismissed — reply `@coderhelm re-review` to \
-                 review again"
-            ),
+            "CoderHelm's approval was dismissed. Comment `@coderhelm re-review` to review \
+             again"
+                .to_string(),
         ),
-        (Some(_), _) => (
-            Mark::Blocked,
-            format!("CoderHelm requested changes on `{s}`"),
-        ),
-        (None, _) => (
-            Mark::Waiting,
-            format!("Waiting for CoderHelm's review of `{s}`"),
-        ),
+        (Some(_), _) => (Mark::Blocked, "CoderHelm requested changes".to_string()),
+        (None, _) => (Mark::Waiting, "Waiting for CoderHelm's review".to_string()),
     });
     if v.require_human {
         lines.push(if human_present {
@@ -334,7 +326,7 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
     if v.draft {
         lines.push((
             Mark::Waiting,
-            "The PR is a draft — waiting for it to be marked ready".to_string(),
+            "Waiting for the PR to leave draft".to_string(),
         ));
     }
 
@@ -365,7 +357,7 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
         if !missing.is_empty() && v.labels_added_at.is_none() {
             lines.push((
                 Mark::Waiting,
-                format!("Adding {joined} — then waiting for its CI to start"),
+                format!("Adding {joined}, then waiting for its CI to start"),
             ));
             return GateDecision {
                 state: STATE_WAITING_CI,
@@ -410,8 +402,8 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
                 state: STATE_BLOCKED_CI,
                 lines,
                 note: Some(
-                    "Not merging. Re-run the failed checks or push a fix — I pick it up again \
-                     as soon as CI finishes."
+                    "Not merging. Re-run the failed checks or push a fix; this picks up again \
+                     when CI finishes."
                         .to_string(),
                 ),
                 action: Action::BlockedOnCi,
@@ -451,34 +443,45 @@ fn code_list(names: &[String]) -> String {
     out
 }
 
-/// Pure: the status comment body. No timestamps, so an unchanged state renders
-/// byte-identically and the comment is not rewritten.
+/// Pure: the status comment body: one bold line with the overall state, the
+/// checklist, any note, then the commit and branch in small print. No
+/// timestamps, so an unchanged state renders byte-identically and the comment
+/// is not rewritten.
 pub(crate) fn render_status(
     head: &str,
     base: &str,
     lines: &[(Mark, String)],
     note: Option<&str>,
 ) -> String {
-    let mut body = format!(
-        "{STATUS_MARKER}\n### 🚦 Auto-merge status — `{}` → `{base}`\n\n",
-        short(head)
-    );
+    let state = if lines.iter().any(|(m, _)| *m == Mark::Blocked) {
+        " · blocked"
+    } else if lines.iter().any(|(m, _)| *m == Mark::Waiting) {
+        " · waiting"
+    } else {
+        ""
+    };
+    let mut body = format!("{STATUS_MARKER}\n**Auto-merge**{state}\n\n");
     for (mark, line) in lines {
         body.push_str(&format!("- {} {line}\n", mark.icon()));
     }
     if let Some(note) = note {
         body.push_str(&format!("\n{note}\n"));
     }
-    body.push_str(STATUS_FOOTER);
+    body.push_str(&format!(
+        "{FOOTER_START}Commit {} into {base}. Merges on its own once every item is done.</sub>",
+        short(head)
+    ));
     body
 }
 
-/// Pure: the last status body with `note` added above the footer (used when
-/// the gate pauses, so the checklist of what it was waiting on stays visible).
+/// Pure: the last status body with `note` added above the small print (used
+/// when the gate pauses, so the checklist of what it was waiting on stays
+/// visible).
 fn with_note(last_body: &str, head: &str, base: &str, note: &str) -> String {
-    match last_body.strip_suffix(STATUS_FOOTER) {
-        Some(main) if last_body.starts_with(STATUS_MARKER) => {
-            format!("{}\n\n{note}\n{STATUS_FOOTER}", main.trim_end())
+    match last_body.rfind(FOOTER_START) {
+        Some(i) if last_body.starts_with(STATUS_MARKER) => {
+            let (main, footer) = last_body.split_at(i);
+            format!("{}\n\n{note}\n{footer}", main.trim_end())
         }
         _ => render_status(head, base, &[], Some(note)),
     }
@@ -894,8 +897,8 @@ async fn pause(
         last_error.unwrap_or("poll window elapsed"),
     )
     .await;
-    let mut note = "⏸️ I stopped checking for now. I pick this up again automatically when CI \
-                    finishes on this commit, or on a new review or commit."
+    let mut note = "Paused. This picks up again on its own when CI finishes on this commit, \
+                    or on a new review or commit."
         .to_string();
     if let Some(err) = last_error {
         note.push_str(&format!(
@@ -945,9 +948,9 @@ async fn evaluate(
         set_state(state, msg, STATE_CLOSED, "").await;
         if record.status_comment_id.is_some() || !record.status_body.is_empty() {
             let note = if pr["merged"].as_bool() == Some(true) {
-                "✋ Merged outside the gate — nothing left to do."
+                "Merged by hand. Nothing left to do."
             } else {
-                "✋ PR closed — nothing left to do."
+                "PR closed. Nothing left to do."
             };
             let body = render_status(&msg.head_sha, &msg.base_branch, &[], Some(note));
             publish_status(state, github, msg, record, &body).await;
@@ -967,7 +970,7 @@ async fn evaluate(
         set_state(state, msg, STATE_HEAD_MOVED, cur_head).await;
         if watched && !record.status_body.is_empty() {
             let note = format!(
-                "🔁 New commit `{}` — waiting for CoderHelm's review of it before merging.",
+                "New commit {}. Waiting for CoderHelm to review it before merging.",
                 short(cur_head)
             );
             let body = render_status(&msg.head_sha, &msg.base_branch, &[], Some(&note));
@@ -979,7 +982,6 @@ async fn evaluate(
     let approvals = fetch_approvals(github, owner, repo, msg.pr_number, &msg.head_sha).await?;
     let bot_verdict = bot_verdict_at_head(state, msg).await?;
     let mut view = GateView {
-        head: msg.head_sha.clone(),
         draft: pr["draft"].as_bool().unwrap_or(false),
         require_human: cfg.require_human_approval || msg.self_authored,
         bot_verdict,
@@ -1135,7 +1137,7 @@ async fn merge(
                     &body,
                     &msg.head_sha,
                     &msg.base_branch,
-                    &format!("### 🚀 Auto-merged\n\n{}", merged_lines.join("\n")),
+                    &format!("**After merging**\n\n{}", merged_lines.join("\n")),
                 );
             }
             publish_status(state, github, msg, record, &body).await;
@@ -1366,7 +1368,6 @@ mod ci_tests {
 
     fn view() -> GateView {
         GateView {
-            head: "abc1234def".into(),
             draft: false,
             require_human: true,
             bot_verdict: Some("APPROVE".into()),
@@ -1510,14 +1511,16 @@ mod ci_tests {
     #[test]
     fn status_renders_marks_and_is_stable() {
         let lines = vec![
-            (Mark::Done, "CoderHelm approved `abc1234`".to_string()),
+            (Mark::Done, "CoderHelm approved".to_string()),
             (Mark::Waiting, "Waiting for a person's approval".to_string()),
         ];
         let a = render_status("abc1234def", "main", &lines, None);
         let b = render_status("abc1234def", "main", &lines, None);
         assert_eq!(a, b, "same state must render identically (no rewrite)");
         assert!(a.starts_with(STATUS_MARKER));
-        assert!(a.contains("`abc1234` → `main`"));
+        assert!(a.contains("**Auto-merge** · waiting\n"));
+        assert!(!a.contains('#'), "no heading: the status is one bold line");
+        assert!(a.contains("Commit abc1234 into main."));
         assert!(a.contains("- ✅ CoderHelm approved"));
         assert!(a.contains("- ⏳ Waiting for a person's approval"));
     }
@@ -1526,12 +1529,21 @@ mod ci_tests {
     fn pause_note_keeps_the_checklist() {
         let lines = vec![(Mark::Waiting, "CI running: `Deploy`".to_string())];
         let last = render_status("abc1234", "main", &lines, None);
-        let paused = with_note(&last, "abc1234", "main", "⏸️ paused");
+        let paused = with_note(&last, "abc1234", "main", "Paused.");
         assert!(paused.contains("CI running: `Deploy`"));
-        assert!(paused.contains("⏸️ paused"));
-        assert!(paused.ends_with(STATUS_FOOTER));
-        let fresh = with_note("", "abc1234", "main", "⏸️ paused");
-        assert!(fresh.starts_with(STATUS_MARKER) && fresh.contains("⏸️ paused"));
+        assert!(paused.find("Paused.") < paused.find("Commit abc1234 into main."));
+        assert!(paused.ends_with("</sub>"));
+        let fresh = with_note("", "abc1234", "main", "Paused.");
+        assert!(fresh.starts_with(STATUS_MARKER) && fresh.contains("Paused."));
+    }
+
+    #[test]
+    fn a_note_on_an_old_style_comment_keeps_its_checklist() {
+        let old = format!(
+            "{STATUS_MARKER}\n### 🚦 Auto-merge status — `abc1234` → `main`\n\n- ⏳ CI running: `Deploy`\n\n<sub>I merge automatically once every item is ✅. This comment updates in place.</sub>"
+        );
+        let paused = with_note(&old, "abc1234", "main", "Paused.");
+        assert!(paused.contains("CI running: `Deploy`") && paused.contains("Paused."));
     }
 
     #[test]
