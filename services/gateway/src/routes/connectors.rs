@@ -22,6 +22,7 @@ use common::live::confluence::{check_site, Confluence};
 use common::live::connectors::{self, check_page_ids, ConnKind, Connector};
 use common::live::http::Https;
 use common::live::newrelic::NewRelic;
+use common::live::opensearch::{check_endpoint, check_index, OpenSearch};
 use common::live::store::{self, Activity};
 use common::live::{airflow, identity, metrics, secret, StepError};
 use serde_json::{json, Value};
@@ -237,6 +238,23 @@ async fn try_connection(
             .await?;
             Ok(format!("Signed in as {who}"))
         }
+        ConnKind::OpenSearch => {
+            let os = OpenSearch {
+                conn: c,
+                password: key,
+                http: &Https,
+            };
+            let who = os.whoami().await?;
+            let shared = os.indexes().await?;
+            if shared.text == "No shared indexes." {
+                return Err(StepError::new(
+                    "read",
+                    "Signed in, but the user sees none of the indexes you listed.",
+                    "Check the index names, or leave the list empty to allow every index the user sees.",
+                ));
+            }
+            Ok(who)
+        }
         ConnKind::Metrics => {
             let t = c.aws.as_ref().ok_or_else(|| {
                 StepError::new("reach", "No AWS role is set.", "Pick the AWS account.")
@@ -434,6 +452,37 @@ pub async fn save(
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
                     "Enter the site, the email and an API token.",
+                ));
+            }
+        }
+        ConnKind::OpenSearch => {
+            if let Some(s) = text("site") {
+                c.site = check_endpoint(&s).map_err(step)?;
+            }
+            if let Some(u) = text("email") {
+                if u.is_empty() || u.len() > 200 || u.chars().any(char::is_control) {
+                    return Err(fail(
+                        StatusCode::BAD_REQUEST,
+                        "Enter the cluster user CoderHelm signs in as.",
+                    ));
+                }
+                c.email = u;
+            }
+            if let Some(i) = strings(&body, "indexes", |i| check_index(i).is_ok(), "index name")? {
+                c.indexes = i;
+            }
+            if let Some(h) = strings(
+                &body,
+                "hidden_fields",
+                |h| !h.is_empty() && h.len() <= 100,
+                "field name",
+            )? {
+                c.hidden_fields = h;
+            }
+            if c.site.is_empty() || c.email.is_empty() || key.is_empty() {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "Enter the cluster address, a read-only user and its password.",
                 ));
             }
         }

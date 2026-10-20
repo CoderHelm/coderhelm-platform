@@ -27,6 +27,7 @@ use common::live::confluence::Confluence;
 use common::live::connectors::{self, ConnKind, Connector, MAX_CALLS_PER_RUN, MAX_WRITES_PER_RUN};
 use common::live::http::Https;
 use common::live::newrelic::NewRelic;
+use common::live::opensearch::OpenSearch;
 use common::live::store::{self, Activity, RunRef};
 use common::live::{airflow, identity, metrics, secret, StepError};
 use serde_json::{json, Value};
@@ -258,6 +259,12 @@ pub fn tool_names(kind: ConnKind, conn: &Connector) -> Vec<String> {
             "newrelic_golden_metrics",
         ],
         ConnKind::Confluence => &["confluence_search", "confluence_page"],
+        ConnKind::OpenSearch => &[
+            "opensearch_indexes",
+            "opensearch_mapping",
+            "opensearch_search",
+            "opensearch_count",
+        ],
         ConnKind::Metrics => &["metrics_list", "metrics_query"],
         ConnKind::Airflow => &[
             "airflow_dags",
@@ -292,6 +299,11 @@ pub fn describe(c: &Connector) -> String {
             } else {
                 String::new()
             }
+        ),
+        ConnKind::OpenSearch => format!(
+            "OpenSearch at {}: list indexes, read a mapping, search and count documents (read only){}",
+            c.site,
+            if c.indexes.is_empty() { String::new() } else { format!("; indexes {}", c.indexes.join(", ")) }
         ),
         ConnKind::Metrics => format!(
             "CloudWatch metrics in account {} ({}): ECS, RDS, Lambda, CloudFront, load balancers, SQS, DynamoDB",
@@ -488,6 +500,36 @@ impl OpsTools {
                 ));
             }
         }
+        if let Some(l) = self.get(ConnKind::OpenSearch) {
+            let shared = if l.conn.indexes.is_empty() {
+                "every index the user can see".to_string()
+            } else {
+                l.conn.indexes.join(", ")
+            };
+            let index = json!({ "type": "string", "description": "an index name, a pattern like orders-*, or several separated by commas" });
+            out.push(tool(
+                "opensearch_indexes",
+                &format!(
+                    "List the search indexes agents may read ({shared}), with document counts."
+                ),
+                json!({ "type": "object", "properties": {} }),
+            ));
+            out.push(tool(
+                "opensearch_mapping",
+                "An index's fields and their types. Read it before searching an index you haven't seen.",
+                json!({ "type": "object", "properties": { "index": index }, "required": ["index"] }),
+            ));
+            out.push(tool(
+                "opensearch_search",
+                &format!("Search an index with an OpenSearch query and read the matching documents as stored (at most {} per call). Use it to see what the index really holds for a record, e.g. {{\"query\": {{\"term\": {{\"id\": \"…\"}}}}}}. Read only; scripts are refused.", common::live::opensearch::MAX_HITS),
+                json!({ "type": "object", "properties": { "index": index, "body": { "type": "object", "description": "the search body: query, size, from, sort, _source, aggs" } }, "required": ["index", "body"] }),
+            ));
+            out.push(tool(
+                "opensearch_count",
+                "Count the documents in an index, optionally only those matching a query.",
+                json!({ "type": "object", "properties": { "index": index, "query": { "type": "object" } }, "required": ["index"] }),
+            ));
+        }
         if !self.aws.metrics.is_empty() {
             let ns: Vec<String> = metrics::NAMESPACES
                 .iter()
@@ -567,6 +609,7 @@ impl OpsTools {
             "aws_identity" => None,
             n if n.starts_with("newrelic_") => Some(ConnKind::NewRelic),
             n if n.starts_with("confluence_") => Some(ConnKind::Confluence),
+            n if n.starts_with("opensearch_") => Some(ConnKind::OpenSearch),
             n if n.starts_with("metrics_") => Some(ConnKind::Metrics),
             n if n.starts_with("airflow_") => Some(ConnKind::Airflow),
             _ => return None,
@@ -786,6 +829,26 @@ impl OpsTools {
                 };
                 Ok((a.text, a.asked))
             }
+            ConnKind::OpenSearch => {
+                let os = OpenSearch {
+                    conn: &l.conn,
+                    password: &l.key,
+                    http: &Https,
+                };
+                let a = match name {
+                    "opensearch_indexes" => os.indexes().await?,
+                    "opensearch_mapping" => os.mapping(s("index").unwrap_or("")).await?,
+                    "opensearch_count" => {
+                        os.count(
+                            s("index").unwrap_or(""),
+                            input.get("query").filter(|q| q.is_object()),
+                        )
+                        .await?
+                    }
+                    _ => os.search(s("index").unwrap_or(""), &input["body"]).await?,
+                };
+                Ok((a.text, a.asked))
+            }
             // Handled above, through the AWS accounts.
             ConnKind::Metrics | ConnKind::Airflow => Err(StepError::new(
                 "read_only",
@@ -832,6 +895,7 @@ pub fn connectable_line(k: ConnKind) -> &'static str {
     match k {
         ConnKind::NewRelic => "New Relic: NRQL, entities, change events and deployment markers, deployment impact, response time, error rate and throughput",
         ConnKind::Confluence => "Confluence: search and read pages; optionally append to listed pages",
+        ConnKind::OpenSearch => "OpenSearch: list indexes, read mappings, search and count documents, read only",
         ConnKind::Metrics => "CloudWatch metrics (an ability of a connected AWS account): ECS, RDS, Lambda, CloudFront, load balancers, SQS, DynamoDB",
         ConnKind::Airflow => "Airflow on MWAA (an ability of a connected AWS account): DAGs, DAG runs, task instances, task logs, import errors",
     }
@@ -1138,8 +1202,9 @@ mod tests {
         let kinds: Vec<&str> = src.iter().map(|s| s.kind.as_str()).collect();
         assert_eq!(kinds, vec!["newrelic", "metrics", "airflow", "aws"]);
         let open = connectable_from(&[nr], &aws);
-        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open.len(), 2, "{open:?}");
         assert!(open[0].starts_with("confluence:"));
+        assert!(open[1].starts_with("opensearch:"));
         let none = connectable_from(&[], &AwsAbilities::default());
         assert!(none
             .iter()
