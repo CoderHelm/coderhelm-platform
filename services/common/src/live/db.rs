@@ -95,6 +95,11 @@ fn classify_data_api_error(code: &str, msg: &str, transport: Option<&str>) -> St
             format!("The Data API refused the request ({why})."),
             "Check the SQL, then try again.",
         ),
+        "UnsupportedResultException" => StepError::new(
+            RESULT_TYPE_STEP,
+            format!("The database returned a column type the Data API can't send ({why})."),
+            "Cast such columns to text, e.g. conrelid::regclass::text or oid::text.",
+        ),
         "StatementTimeoutException" => StepError::new(
             "read",
             format!("That lookup took too long, so the database stopped it ({why})."),
@@ -159,7 +164,53 @@ fn data_api_params(params: &[BoundParam]) -> Vec<aws_sdk_rdsdata::types::SqlPara
 /// [`read_in_rolled_back_transaction`] with values bound to named
 /// parameters (`:name`) by the Data API, so no value is ever part of the SQL
 /// text.
+///
+/// The Data API can't send some Postgres types back (`regclass`, `oid`,
+/// `pg_lsn` and others) and fails the whole lookup. When it does, the same
+/// checked statement runs again in a fresh read-only transaction with each
+/// row turned into JSON text inside the database, and the rows are unpacked.
 async fn read_with_params(
+    client: &aws_sdk_rdsdata::Client,
+    t: &AwsTarget,
+    sql: &str,
+    params: &[BoundParam],
+) -> Result<Vec<Row>, StepError> {
+    match read_once(client, t, sql, params).await {
+        Err(e) if e.step == RESULT_TYPE_STEP => {
+            let rows = read_once(client, t, &rows_as_json(sql), params).await?;
+            Ok(unpack_json_rows(rows))
+        }
+        other => other,
+    }
+}
+
+/// Step name of a lookup the Data API couldn't return for a column's type.
+const RESULT_TYPE_STEP: &str = "result_type";
+/// The column the JSON-wrapped statement returns each row in.
+const JSON_ROW: &str = "coderhelm_row";
+
+/// `sql` with each row returned as one JSON text column, which the Data API
+/// can always send.
+fn rows_as_json(sql: &str) -> String {
+    format!(
+        "SELECT to_jsonb(q)::text AS {JSON_ROW} FROM ({}) q",
+        sql.trim().trim_end_matches(';')
+    )
+}
+
+/// The rows of a [`rows_as_json`] statement as their original columns.
+fn unpack_json_rows(rows: Vec<Row>) -> Vec<Row> {
+    rows.into_iter()
+        .map(|r| {
+            r.get(JSON_ROW)
+                .and_then(Value::as_str)
+                .and_then(|t| serde_json::from_str::<Row>(t).ok())
+                .unwrap_or(r)
+        })
+        .collect()
+}
+
+async fn read_once(
     client: &aws_sdk_rdsdata::Client,
     t: &AwsTarget,
     sql: &str,
@@ -848,5 +899,45 @@ mod tests {
             .transaction_id(&tx_id)
             .send()
             .await;
+    }
+}
+
+#[cfg(test)]
+mod result_type_tests {
+    use super::*;
+
+    #[test]
+    fn a_statement_is_wrapped_to_return_rows_as_json_text() {
+        assert_eq!(
+            rows_as_json("SELECT conrelid::regclass AS tbl FROM pg_constraint LIMIT 50;"),
+            "SELECT to_jsonb(q)::text AS coderhelm_row FROM (SELECT conrelid::regclass AS tbl FROM pg_constraint LIMIT 50) q"
+        );
+    }
+
+    #[test]
+    fn json_rows_unpack_to_their_columns() {
+        let mut r = Row::new();
+        r.insert(
+            JSON_ROW.into(),
+            Value::String(r#"{"tbl":"orders","conname":"fk_customer"}"#.into()),
+        );
+        let out = unpack_json_rows(vec![r]);
+        assert_eq!(out[0]["tbl"], "orders");
+        assert_eq!(out[0]["conname"], "fk_customer");
+        // Anything else is left as it came.
+        let mut plain = Row::new();
+        plain.insert("x".into(), Value::from(1));
+        assert_eq!(unpack_json_rows(vec![plain.clone()]), vec![plain]);
+    }
+
+    #[test]
+    fn an_unsupported_result_type_is_named_not_called_unreachable() {
+        let e = classify_data_api_error(
+            "UnsupportedResultException",
+            "The result contains the unsupported data type regclass.",
+            None,
+        );
+        assert_eq!(e.step, RESULT_TYPE_STEP);
+        assert!(!e.message.contains("couldn't reach"), "{}", e.message);
     }
 }
