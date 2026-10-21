@@ -200,6 +200,8 @@ async fn main() -> Result<(), Error> {
         .route("/reviewer/re-review", post(routes::reviewer::re_review))
         .route("/releases", get(routes::reviewer::list_releases))
         .route("/releases/send", post(routes::reviewer::send_release))
+        .route("/releases/pending", get(routes::reviewer::pending_releases))
+        .route("/releases/now", post(routes::reviewer::release_now))
         // Code graph — its own feature (serves the reviewer AND the PR maker)
         .route("/graph/repos", get(routes::graph::list_repos))
         .route("/graph/status", get(routes::graph::status))

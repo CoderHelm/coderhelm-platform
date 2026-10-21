@@ -333,6 +333,9 @@ pub struct ReleaseNotesMessage {
     /// notes when the tag's commit is on the repo's release branch.
     #[serde(default)]
     pub check_branch: bool,
+    /// Failed runs so far; a failure retries with a backoff before it alerts.
+    #[serde(default)]
+    pub attempt: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -350,6 +353,21 @@ pub struct TagSweepMessage {
     /// hop; the sweep runs when it reaches 0.
     #[serde(default)]
     pub delay_remaining_secs: u64,
+    /// The window this sweep belongs to (stored on the repo's marker). The
+    /// sweep that removes the marker with its own id is the one that cuts the
+    /// tag, so a "Release now" and the delayed sweep never both release.
+    /// Empty on sweeps armed before ids existed.
+    #[serde(default)]
+    pub sweep_id: String,
+    /// Asked for from the dashboard: cut even when auto-tagging is off.
+    #[serde(default)]
+    pub manual: bool,
+    /// A retry after a failed cut: the marker was already handled.
+    #[serde(default)]
+    pub claimed: bool,
+    /// Failed cuts so far (retries back off, then the failure is recorded).
+    #[serde(default)]
+    pub attempt: u32,
 }
 
 /// An armed auto-merge job. Bound to the reviewed head; a later commit aborts it

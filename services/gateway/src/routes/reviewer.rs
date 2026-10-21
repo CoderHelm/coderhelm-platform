@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info};
 
-use crate::models::{Claims, ReleaseNotesMessage, ReviewMessage, WorkerMessage};
+use crate::models::{Claims, ReleaseNotesMessage, ReviewMessage, TagSweepMessage, WorkerMessage};
 use crate::AppState;
 
 fn attr_s(val: &str) -> AttributeValue {
@@ -866,6 +866,8 @@ pub async fn list_releases(
                 "confluence_url": item_str(item, "confluence_url", ""),
                 "email_sent_at": item_str(item, "email_sent_at", ""),
                 "updated_at": item_str(item, "updated_at", ""),
+                "last_error": item_str(item, "last_error", ""),
+                "failed_at": item_str(item, "failed_at", ""),
             })
         })
         .collect();
@@ -924,6 +926,158 @@ pub async fn send_release(
         owner,
         name, tag, resend, "Release notes: queued from dashboard"
     );
+    Ok(Json(json!({ "status": "queued" })))
+}
+
+/// All of a team's items under `prefix` (small sets: one per repo).
+async fn items_under(
+    state: &AppState,
+    team_id: &str,
+    prefix: &str,
+) -> Result<Vec<HashMap<String, AttributeValue>>, StatusCode> {
+    let mut out = Vec::new();
+    let mut start: Option<HashMap<String, AttributeValue>> = None;
+    loop {
+        let page = state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .expression_attribute_values(":pk", attr_s(team_id))
+            .expression_attribute_values(":p", attr_s(prefix))
+            .set_exclusive_start_key(start)
+            .send()
+            .await
+            .map_err(|e| {
+                error!(error = %e, prefix, "Releases: query failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        out.extend(page.items.unwrap_or_default());
+        start = page.last_evaluated_key;
+        if start.is_none() {
+            return Ok(out);
+        }
+    }
+}
+
+/// GET /api/releases/pending?repo= — releases waiting out the batch window
+/// (when each fires, how many merges it holds) and releases that couldn't be
+/// cut after their retries (the error), per repo.
+pub async fn pending_releases(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, StatusCode> {
+    let repo = params.get("repo").filter(|r| !r.is_empty());
+    if let Some(r) = repo {
+        validate_repo(r)?;
+    }
+    let suffix = repo.map(|r| r.as_str()).unwrap_or("");
+    let now = chrono::Utc::now().timestamp() as u64;
+    let waiting: Vec<Value> = items_under(&state, &claims.team_id, &format!("TAGSWEEP#{suffix}"))
+        .await?
+        .iter()
+        // A marker past its window by an hour is a sweep that died; its TTL
+        // removes it.
+        .filter(|i| item_num(i, "fires_at", 0) + 3_600 > now)
+        .map(|i| {
+            json!({
+                "repo": item_str(i, "sk", "").trim_start_matches("TAGSWEEP#"),
+                "fires_at": item_num(i, "fires_at", 0),
+                "merges": item_num(i, "merges", 1),
+                "base_branch": item_str(i, "base_branch", ""),
+            })
+        })
+        .collect();
+    let blocked: Vec<Value> = items_under(&state, &claims.team_id, &format!("TAGFAIL#{suffix}"))
+        .await?
+        .iter()
+        .map(|i| {
+            json!({
+                "repo": item_str(i, "sk", "").trim_start_matches("TAGFAIL#"),
+                "error": item_str(i, "error", ""),
+                "failed_at": item_str(i, "failed_at", ""),
+                "attempts": item_num(i, "attempts", 1),
+                "base_branch": item_str(i, "base_branch", ""),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "waiting": waiting, "blocked": blocked })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ReleaseNowBody {
+    /// "owner/name"
+    pub repo: String,
+}
+
+/// POST /api/releases/now — cut the repo's release tag now instead of at the
+/// end of the batch window, or retry one that was blocked. Member+.
+///
+/// With a release waiting, the sweep carries that window's id: whichever of
+/// this and the delayed sweep claims the window first releases it, the other
+/// stops. With nothing waiting it tags the default branch's HEAD (no-op when
+/// that commit is already tagged).
+pub async fn release_now(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<ReleaseNowBody>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(1)?;
+    validate_repo(&body.repo)?;
+    let (owner, name) = body.repo.split_once('/').ok_or(StatusCode::BAD_REQUEST)?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let installation_id = super::api::get_team_installation_id(&state, &claims.team_id).await?;
+    let marker = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&format!("TAGSWEEP#{owner}/{name}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Release now: marker read failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item;
+    let blocked = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&format!("TAGFAIL#{owner}/{name}")))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item);
+    let from = marker.as_ref().or(blocked.as_ref());
+    let sweep_id = marker
+        .as_ref()
+        .map(|m| item_str(m, "sweep_id", ""))
+        .unwrap_or_default();
+    let message = WorkerMessage::TagSweep(TagSweepMessage {
+        team_id: claims.team_id.clone(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        base_branch: from
+            .map(|m| item_str(m, "base_branch", ""))
+            .unwrap_or_default(),
+        pr_number: from.map(|m| item_num(m, "pr_number", 0)).unwrap_or(0),
+        delay_remaining_secs: 0,
+        // A marker from before ids existed can't be claimed safely by id:
+        // treat it as nothing waiting (the delayed sweep then finds HEAD
+        // tagged and cuts nothing).
+        claimed: sweep_id.is_empty(),
+        sweep_id,
+        manual: true,
+        attempt: 0,
+    });
+    super::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &message).await?;
+    info!(owner, name, "Release now: queued from dashboard");
     Ok(Json(json!({ "status": "queued" })))
 }
 

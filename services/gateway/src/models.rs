@@ -162,6 +162,9 @@ pub enum WorkerMessage {
     GraphIndex(GraphIndexMessage),
     #[serde(rename = "release_notes")]
     ReleaseNotes(ReleaseNotesMessage),
+    /// Cut the repo's release tag now (the dashboard's "Release now").
+    #[serde(rename = "tag_sweep")]
+    TagSweep(TagSweepMessage),
     /// Read the test reports of a finished workflow run or an upload.
     #[serde(rename = "test_ingest")]
     TestIngest(common::e2e::messages::TestIngest),
@@ -647,6 +650,25 @@ pub struct ReleaseNotesMessage {
     /// notes when the tag's commit is on the repo's release branch.
     #[serde(default)]
     pub check_branch: bool,
+}
+
+/// A release-tag sweep. Mirrors the worker's TagSweepMessage.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TagSweepMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    /// Empty: the worker uses the repo's default branch.
+    pub base_branch: String,
+    pub pr_number: u64,
+    pub delay_remaining_secs: u64,
+    /// The waiting window's id: whichever sweep claims it first releases it.
+    pub sweep_id: String,
+    pub manual: bool,
+    /// No window to claim (nothing was waiting).
+    pub claimed: bool,
+    pub attempt: u32,
 }
 
 /// Work out suggested hidden fields for one database source from its table
