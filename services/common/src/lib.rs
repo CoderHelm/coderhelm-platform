@@ -33,6 +33,9 @@ pub mod pr_outcome;
 pub mod jira_text;
 /// Who asked for a run: one identity per person, for per-person analytics.
 pub mod requester;
+/// Where the reviewer is with each PR right now (queued, reviewing, retrying,
+/// done), and the one status a PR shows on the dashboard.
+pub mod review_live;
 pub mod review_stats;
 pub mod skill_apply;
 pub mod skill_compat;

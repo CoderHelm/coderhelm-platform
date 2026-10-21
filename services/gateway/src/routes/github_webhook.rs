@@ -2725,6 +2725,22 @@ pub(crate) async fn send_to_queue_after(
         })?;
 
     info!("Dispatched to SQS");
+    // Every review job the gateway sends shows as queued on the dashboard
+    // until the worker picks it up.
+    if let WorkerMessage::Review(r) = message {
+        common::review_live::mark_queued(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &r.team_id,
+            &r.repo_owner,
+            &r.repo_name,
+            r.pr_number,
+            &r.trigger,
+            r.question.as_deref().is_some_and(|q| !q.trim().is_empty()),
+            i64::from(delay_secs),
+        )
+        .await;
+    }
     Ok(StatusCode::ACCEPTED)
 }
 
