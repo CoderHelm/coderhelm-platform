@@ -1021,21 +1021,34 @@ mod tests {
             .iter()
             .filter(|c| matches!(c.kind(), ConnKind::Rest | ConnKind::OpenSearch))
             .collect();
-        assert!(!movable.is_empty(), "no REST or OpenSearch connections to move");
+        assert!(
+            !movable.is_empty(),
+            "no REST or OpenSearch connections to move"
+        );
         for c in movable {
             let s = Source::from_connection(c, &moved_id(c)).unwrap();
             assert_eq!(Source::from_item(&s.to_item(&team)).unwrap(), s);
-            let key = super::super::secret::open(&kms, &team, &s.key_sealed).await.unwrap();
+            let key = super::super::secret::open(&kms, &team, &s.key_sealed)
+                .await
+                .unwrap();
             let r = s.reader();
             let read = match s.kind {
-                Kind::Rest => Rest { conn: &r, key: &key, http: &Https }
-                    .get(&s.paths[0], None)
-                    .await
-                    .map(|a| format!("{} -> {} characters", a.asked, a.text.len())),
-                _ => OpenSearch { conn: &r, password: &key, http: &Https }
-                    .indexes()
-                    .await
-                    .map(|a| format!("{} -> {}", a.asked, a.text.lines().count())),
+                Kind::Rest => Rest {
+                    conn: &r,
+                    key: &key,
+                    http: &Https,
+                }
+                .get(&s.paths[0], None)
+                .await
+                .map(|a| format!("{} -> {} characters", a.asked, a.text.len())),
+                _ => OpenSearch {
+                    conn: &r,
+                    password: &key,
+                    http: &Https,
+                }
+                .indexes()
+                .await
+                .map(|a| format!("{} -> {}", a.asked, a.text.lines().count())),
             };
             println!(
                 "{} ({}) as data source {:?}: {:?}",
