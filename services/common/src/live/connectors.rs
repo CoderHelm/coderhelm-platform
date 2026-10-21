@@ -86,8 +86,16 @@ impl ConnKind {
     }
 }
 
-/// Checks a REST API's name: 1–40 lowercase letters, digits, `-` and `_`,
-/// starting with a letter (it is how agents pick the API and part of its key).
+/// Characters of a connection's guide for agents.
+pub const MAX_INSTRUCTIONS: usize = 4000;
+
+/// Whether a team may connect several of `kind`, each under its own name.
+pub fn nameable(kind: ConnKind) -> bool {
+    matches!(kind, ConnKind::Rest | ConnKind::OpenSearch)
+}
+
+/// Checks a connection's name: 1–40 lowercase letters, digits, `-` and `_`,
+/// starting with a letter (it is how agents pick it and part of its key).
 pub fn check_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= 40
@@ -152,6 +160,9 @@ pub struct Connector {
     pub paths: Vec<String>,
     /// `owner/name` repos whose work may use it. Empty: every repo.
     pub repos: Vec<String>,
+    /// What agents should know when using it (what the system is, what its
+    /// fields mean, where else its data lives). Shown with the connection.
+    pub instructions: String,
     pub updated_at: String,
     pub updated_by: String,
 }
@@ -236,6 +247,7 @@ impl Connector {
             ("header_name".to_string(), av_s(&self.header_name)),
             ("paths".to_string(), av_list(&self.paths)),
             ("repos".to_string(), av_list(&self.repos)),
+            ("instructions".to_string(), av_s(&self.instructions)),
             ("updated_at".to_string(), av_s(&self.updated_at)),
             ("updated_by".to_string(), av_s(&self.updated_by)),
         ]);
@@ -275,6 +287,7 @@ impl Connector {
             header_name: s(item, "header_name"),
             paths: strings(item, "paths"),
             repos: strings(item, "repos"),
+            instructions: s(item, "instructions"),
             updated_at: s(item, "updated_at"),
             updated_by: s(item, "updated_by"),
         })
@@ -313,6 +326,7 @@ impl Connector {
             "header_name": self.header_name,
             "paths": self.paths,
             "repos": self.repos,
+            "instructions": self.instructions,
             "aws": aws,
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
@@ -465,6 +479,7 @@ mod tests {
     #[test]
     fn a_record_survives_the_round_trip() {
         let mut c = confluence();
+        c.instructions = "Pages under ENG are the runbooks.".into();
         c.aws = Some(AwsTarget {
             role_arn: "arn:aws:iam::123456789012:role/CoderHelmLogReader".into(),
             external_id: "x".into(),

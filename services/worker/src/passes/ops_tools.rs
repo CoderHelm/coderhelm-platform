@@ -284,8 +284,21 @@ pub fn tool_names(kind: ConnKind, conn: &Connector) -> Vec<String> {
     out
 }
 
-/// What a connection covers, in a line, for the skill check and the prompt.
+/// What a connection covers, in a line, for the skill check and the prompt,
+/// followed by the team's guide for it when it has one.
 pub fn describe(c: &Connector) -> String {
+    let line = describe_line(c);
+    match c.instructions.trim() {
+        "" => line,
+        g => format!(
+            "{line}\n  Guide from the team for {}: {}",
+            c.label(),
+            g.replace('\n', "\n  ")
+        ),
+    }
+}
+
+fn describe_line(c: &Connector) -> String {
     match c.kind() {
         ConnKind::NewRelic => format!(
             "New Relic ({} region{}): NRQL queries, entity search, change events and deployment markers, deployment impact, response time, error rate and throughput",
@@ -303,9 +316,11 @@ pub fn describe(c: &Connector) -> String {
             }
         ),
         ConnKind::OpenSearch => format!(
-            "OpenSearch at {}: list indexes, read a mapping, search and count documents (read only){}",
+            "{} at {}: list indexes, read a mapping, search and count documents (read only){}{}",
+            c.label(),
             c.site,
-            if c.indexes.is_empty() { String::new() } else { format!("; indexes {}", c.indexes.join(", ")) }
+            if c.indexes.is_empty() { String::new() } else { format!("; indexes {}", c.indexes.join(", ")) },
+            if c.name.is_empty() { String::new() } else { format!(" (tools with connection \"{}\")", c.name) }
         ),
         ConnKind::Rest => format!(
             "{} at {}: GET under {}{}",
@@ -443,11 +458,12 @@ impl OpsTools {
         self.loaded.iter().find(|l| l.conn.kind() == kind)
     }
 
-    /// The team's REST APIs this work may read.
-    fn rest_apis(&self) -> Vec<&Loaded> {
+    /// The team's connections of `kind` this work may use (REST APIs and
+    /// OpenSearch clusters can be several, by name).
+    fn of(&self, kind: ConnKind) -> Vec<&Loaded> {
         self.loaded
             .iter()
-            .filter(|l| l.conn.kind() == ConnKind::Rest)
+            .filter(|l| l.conn.kind() == kind)
             .collect()
     }
 
@@ -517,12 +533,24 @@ impl OpsTools {
                 ));
             }
         }
-        if let Some(l) = self.get(ConnKind::OpenSearch) {
-            let shared = if l.conn.indexes.is_empty() {
-                "every index the user can see".to_string()
-            } else {
-                l.conn.indexes.join(", ")
-            };
+        let clusters = self.of(ConnKind::OpenSearch);
+        if !clusters.is_empty() {
+            let shared = clusters
+                .iter()
+                .map(|l| {
+                    let idx = if l.conn.indexes.is_empty() {
+                        "every index the user can see".to_string()
+                    } else {
+                        l.conn.indexes.join(", ")
+                    };
+                    if clusters.len() > 1 {
+                        format!("`{}`: {idx}", call_name(l))
+                    } else {
+                        idx
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
             let index = json!({ "type": "string", "description": "an index name, a pattern like orders-*, or several separated by commas" });
             out.push(tool(
                 "opensearch_indexes",
@@ -546,8 +574,19 @@ impl OpsTools {
                 "Count the documents in an index, optionally only those matching a query.",
                 json!({ "type": "object", "properties": { "index": index, "query": { "type": "object" } }, "required": ["index"] }),
             ));
+            if clusters.len() > 1 {
+                let names: Vec<&str> = clusters.iter().map(|l| call_name(l)).collect();
+                for t in out.iter_mut().filter(|t| t.name.starts_with("opensearch_")) {
+                    t.input_schema["properties"]["connection"] = json!({ "type": "string", "enum": names, "description": "which OpenSearch cluster" });
+                    if let Some(req) = t.input_schema["required"].as_array_mut() {
+                        req.push(json!("connection"));
+                    } else {
+                        t.input_schema["required"] = json!(["connection"]);
+                    }
+                }
+            }
         }
-        let apis = self.rest_apis();
+        let apis = self.of(ConnKind::Rest);
         if !apis.is_empty() {
             let listed: Vec<String> = apis
                 .iter()
@@ -805,7 +844,13 @@ impl OpsTools {
             return Ok((lines.join("\n"), common::live::count(n, "role")));
         };
         let picked = if kind == ConnKind::Rest {
-            pick_api(&self.rest_apis(), input["api"].as_str().unwrap_or(""))?
+            pick_named(&self.of(kind), input["api"].as_str().unwrap_or(""), "api")?
+        } else if kind == ConnKind::OpenSearch {
+            pick_named(
+                &self.of(kind),
+                input["connection"].as_str().unwrap_or(""),
+                "connection",
+            )?
         } else {
             self.get(kind)
         };
@@ -931,28 +976,42 @@ impl OpsTools {
     }
 }
 
-/// The REST API `name` names, or the only one when there's one and no name
-/// was given. An unknown name, or no name among several, is refused with the
-/// names to pick from.
-fn pick_api<'a>(apis: &[&'a Loaded], name: &str) -> Result<Option<&'a Loaded>, StepError> {
-    if name.is_empty() && apis.len() == 1 {
-        return Ok(apis.first().copied());
+/// How agents name a connection: its name, or `default` for the one saved
+/// without a name.
+fn call_name(l: &Loaded) -> &str {
+    if l.conn.name.is_empty() {
+        "default"
+    } else {
+        &l.conn.name
     }
-    if let Some(l) = apis
+}
+
+/// The connection `name` names (`param` is the tool argument), or the only
+/// one when there's one and no name was given. An unknown name, or no name
+/// among several, is refused with the names to pick from.
+fn pick_named<'a>(
+    conns: &[&'a Loaded],
+    name: &str,
+    param: &str,
+) -> Result<Option<&'a Loaded>, StepError> {
+    if name.is_empty() && conns.len() == 1 {
+        return Ok(conns.first().copied());
+    }
+    if let Some(l) = conns
         .iter()
-        .find(|l| !name.is_empty() && l.conn.name == name)
+        .find(|l| !name.is_empty() && call_name(l) == name)
     {
         return Ok(Some(*l));
     }
-    let names: Vec<&str> = apis.iter().map(|l| l.conn.name.as_str()).collect();
+    let names: Vec<&str> = conns.iter().map(|l| call_name(l)).collect();
     Err(StepError::new(
         "read_only",
         if name.is_empty() {
-            "Say which API to read.".to_string()
+            format!("Say which {param} to read.")
         } else {
-            format!("There's no API called {name}.")
+            format!("There's no {param} called {name}.")
         },
-        format!("Pass `api` as one of: {}.", names.join(", ")),
+        format!("Pass `{param}` as one of: {}.", names.join(", ")),
     ))
 }
 
@@ -1364,5 +1423,62 @@ mod tests {
         assert!(p.contains("New Relic"));
         assert!(p.contains("CloudWatch metrics"));
         assert!(p.contains("information only"));
+    }
+}
+
+#[cfg(test)]
+mod named_tests {
+    use super::*;
+
+    fn loaded(kind: ConnKind, name: &str) -> Loaded {
+        Loaded {
+            conn: Connector {
+                name: name.into(),
+                ..Connector::new(kind)
+            },
+            key: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_connection_is_picked_by_name_or_as_the_only_one() {
+        let one = loaded(ConnKind::OpenSearch, "");
+        let two = loaded(ConnKind::OpenSearch, "search2");
+        let only = [&one];
+        assert!(pick_named(&only, "", "connection").unwrap().is_some());
+        let both = [&one, &two];
+        assert_eq!(
+            pick_named(&both, "search2", "connection")
+                .unwrap()
+                .unwrap()
+                .conn
+                .name,
+            "search2"
+        );
+        assert_eq!(
+            pick_named(&both, "default", "connection")
+                .unwrap()
+                .unwrap()
+                .conn
+                .name,
+            ""
+        );
+        let e = pick_named(&both, "", "connection").err().unwrap();
+        assert!(e.fix.contains("default, search2"), "{}", e.fix);
+        assert!(pick_named(&both, "nope", "connection").is_err());
+    }
+
+    #[test]
+    fn the_team_guide_follows_the_connection() {
+        let mut c = loaded(ConnKind::Rest, "billing").conn;
+        c.site = "https://api.example.com".into();
+        c.paths = vec!["/v1/invoices".into()];
+        assert!(!describe(&c).contains("Guide"));
+        c.instructions = "quantity is sessions per week on weekly packs.".into();
+        let d = describe(&c);
+        assert!(
+            d.contains("Guide from the team for REST API (billing): quantity is sessions"),
+            "{d}"
+        );
     }
 }

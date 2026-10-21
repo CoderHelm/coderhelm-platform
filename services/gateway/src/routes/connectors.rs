@@ -71,7 +71,7 @@ fn kind_of(raw: &str) -> Result<(ConnKind, String), (StatusCode, Json<Value>)> {
     let kind =
         ConnKind::parse(k).ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such connection."))?;
     if !name.is_empty() {
-        if kind != ConnKind::Rest {
+        if !connectors::nameable(kind) {
             return Err(fail(StatusCode::NOT_FOUND, "No such connection."));
         }
         connectors::check_name(name).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
@@ -346,8 +346,10 @@ pub async fn list(
     for k in ConnKind::ALL.iter().filter(|k| !k.uses_aws()) {
         let mine: Vec<&Connector> = saved.iter().filter(|c| c.kind() == *k).collect();
         items.extend(mine.iter().map(|c| c.public_json()));
-        if mine.is_empty() || *k == ConnKind::Rest {
-            items.push(json!({ "kind": k.as_str(), "id": k.as_str(), "label": k.label(), "connected": false }));
+        if mine.is_empty() || connectors::nameable(*k) {
+            // Adding another needs a name (the unnamed slot may be taken).
+            let needs_name = *k == ConnKind::Rest || !mine.is_empty();
+            items.push(json!({ "kind": k.as_str(), "id": k.as_str(), "label": k.label(), "connected": false, "needs_name": needs_name }));
         }
     }
     let aws: Vec<Value> = aws_connections(&state, &claims.team_id)
@@ -375,9 +377,10 @@ pub async fn save(
 ) -> Reply {
     admin(&claims)?;
     let (kind, mut name) = kind_of(&kind)?;
-    // A new REST API is named in the body (the page's add form); saving one
-    // under an existing name updates that one.
-    if kind == ConnKind::Rest && name.is_empty() {
+    // A new named connection (a REST API, another OpenSearch cluster) is
+    // named in the body (the page's add form); saving one under an existing
+    // name updates that one.
+    if connectors::nameable(kind) && name.is_empty() {
         if let Some(n) = body["name"]
             .as_str()
             .map(str::trim)
@@ -425,6 +428,19 @@ pub async fn save(
         key = secret::open(&state.kms, &claims.team_id, &c.key_sealed)
             .await
             .map_err(|e| internal("open connector key", e))?;
+    }
+    if let Some(g) = body["instructions"].as_str() {
+        let g = g.trim();
+        if g.chars().count() > connectors::MAX_INSTRUCTIONS {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Keep the guide under {} characters.",
+                    connectors::MAX_INSTRUCTIONS
+                ),
+            ));
+        }
+        c.instructions = g.to_string();
     }
     if let Some(r) = strings(
         &body,
