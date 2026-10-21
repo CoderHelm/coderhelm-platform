@@ -434,17 +434,19 @@ pub async fn list(
         // REST: a card per connected API, then one to add another.
         let mine: Vec<&Connector> = saved.iter().filter(|c| c.kind() == kind).collect();
         let mut shown: Vec<Option<&Connector>> = mine.iter().map(|c| Some(*c)).collect();
-        if mine.is_empty() || kind == ConnKind::Rest {
+        if mine.is_empty() || connectors::nameable(kind) {
             shown.push(None);
         }
         for c in shown {
-            let detail = c
-                .map(|c| c.public_json())
-                .unwrap_or_else(|| json!({ "kind": kind.as_str(), "connected": false }));
+            let needs_name = kind == ConnKind::Rest || !mine.is_empty();
+            let detail = c.map(|c| c.public_json()).unwrap_or_else(
+                || json!({ "kind": kind.as_str(), "connected": false, "needs_name": needs_name }),
+            );
             let (id, name) = match c {
                 Some(c) => (c.id(), c.label()),
-                None if kind == ConnKind::Rest && !mine.is_empty() => {
-                    (kind.as_str().to_string(), "Another REST API".to_string())
+                // `kind:` so it never shares an id with a saved unnamed one.
+                None if !mine.is_empty() => {
+                    (format!("{}:", kind.as_str()), format!("Another {}", kind.label()))
                 }
                 None => (kind.as_str().to_string(), kind.label().to_string()),
             };

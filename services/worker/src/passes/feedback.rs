@@ -739,6 +739,19 @@ Rules:
     // has a consumer.
     let fix_pushed = *executor.files_modified.lock().unwrap();
     let code_pushed = fix_pushed || conflicts_pushed;
+    // The code changed after the description was written: keep it true.
+    if fix_pushed {
+        super::pr::refresh_description(
+            state,
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            &provider,
+            &mut usage,
+        )
+        .await;
+    }
     // A push that carried CI failures to fix is a CI fix, counted with its time.
     if fix_pushed && has_ci_failures {
         super::record_ci_outcome(

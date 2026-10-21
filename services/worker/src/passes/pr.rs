@@ -235,6 +235,14 @@ Return ONLY the markdown body text."#,
             .unwrap_or("")
             .to_string();
         info!(pr_number = number, pr_url = %url, "Using existing PR");
+        // A re-run changed the code: the description is rewritten from this
+        // diff, never left describing the earlier version.
+        if let Err(e) = github
+            .update_pr_body(&msg.repo_owner, &msg.repo_name, number, &full_body)
+            .await
+        {
+            warn!(pr_number = number, error = %e, "Could not update the existing PR's description");
+        }
         (number, url, nid)
     } else if let Some(pr_data) = reopen_prior_pr(github, msg, branch).await {
         let number = pr_data
@@ -865,6 +873,127 @@ fn is_lockfile(path: &str) -> bool {
     )
 }
 
+/// Rewrites an open pull request's description from its current full diff
+/// after later commits (review feedback, CI fixes), so it never describes an
+/// earlier version of the change. Keeps the description's structure and its
+/// ticket line; anything it says that the diff no longer bears out goes.
+/// Leaves the description alone when anything fails.
+pub async fn refresh_description(
+    state: &WorkerState,
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    provider: &ModelProvider,
+    usage: &mut TokenUsage,
+) {
+    let Ok(pr) = github.get_pull_request(owner, repo, pr_number).await else {
+        return;
+    };
+    let (Some(base), Some(head)) = (pr["base"]["ref"].as_str(), pr["head"]["ref"].as_str()) else {
+        return;
+    };
+    let old = pr["body"].as_str().unwrap_or("").trim().to_string();
+    if old.is_empty() {
+        return;
+    }
+    let Ok(diff) = github.get_diff(owner, repo, base, head).await else {
+        return;
+    };
+    let prompt = format!(
+        r#"This pull request got more commits after its description was written. Rewrite the description so every statement in it is true of the diff below, which is the whole change as it stands now.
+
+## Current description
+{old}
+
+## Files changed
+{files}
+
+## The full diff (the source of truth — read all of it)
+{patches}
+
+## Instructions
+- Keep the description's structure, headings and tone.
+- Keep any line that starts with "Source ticket:", "Closes #", "Fixes #" or "Resolves #" exactly as it is, and keep any HTML comments and `<sub>` lines at the end exactly as they are.
+- Remove or correct anything the diff no longer bears out (a field name, a guess, a step, a file), and describe what the later commits changed.
+- Don't add filler. If the description is already true, return it unchanged.
+
+Return ONLY the markdown body text."#,
+        files = format_diff_summary(&diff),
+        patches = format_diff_patches(&diff),
+    );
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![serde_json::json!({"type": "text", "text": prompt})],
+    )];
+    let body = match provider::converse(
+        state,
+        provider,
+        provider.primary_model_id(),
+        "You keep pull request descriptions accurate to their code.",
+        &mut messages,
+        &[],
+        &super::triage::NoOpExecutor,
+        usage,
+        llm::ConverseOptions {
+            max_turns: 1,
+            max_tokens: 4096,
+            deadline: None,
+            effort: Some("low"),
+        },
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(b) => b.trim().to_string(),
+        Err(e) => {
+            warn!(pr_number, error = %e, "Could not rewrite the PR description");
+            return;
+        }
+    };
+    if !keeps_ticket_line(&old, &body) {
+        warn!(
+            pr_number,
+            "Rewritten PR description dropped its ticket line; keeping the old one"
+        );
+        return;
+    }
+    if body != old {
+        match github.update_pr_body(owner, repo, pr_number, &body).await {
+            Ok(()) => info!(
+                pr_number,
+                "PR description rewritten to match the latest diff"
+            ),
+            Err(e) => warn!(pr_number, error = %e, "Could not save the rewritten PR description"),
+        }
+    }
+}
+
+/// Whether `new` is a usable rewrite of `old`: not empty, and keeping the
+/// ticket link line (`Source ticket:` / `Closes #N`) when `old` had one.
+fn keeps_ticket_line(old: &str, new: &str) -> bool {
+    if new.trim().is_empty() {
+        return false;
+    }
+    let link = |s: &str| {
+        s.lines()
+            .map(str::trim)
+            .find(|l| {
+                let lower = l.to_lowercase();
+                lower.starts_with("source ticket:")
+                    || lower.starts_with("closes #")
+                    || lower.starts_with("fixes #")
+                    || lower.starts_with("resolves #")
+            })
+            .map(str::to_string)
+    };
+    match link(old) {
+        Some(l) => link(new).as_deref() == Some(l.as_str()),
+        None => true,
+    }
+}
+
 /// Try to fetch a PR template from common locations in the repo.
 async fn fetch_pr_template(
     github: &GitHubClient,
@@ -889,6 +1018,23 @@ async fn fetch_pr_template(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::keeps_ticket_line;
+
+    #[test]
+    fn a_rewrite_must_keep_the_ticket_line() {
+        let old = "Source ticket: ABC-1\n\n**Problem** x";
+        assert!(keeps_ticket_line(
+            old,
+            "Source ticket: ABC-1\n\n**Problem** y"
+        ));
+        assert!(!keeps_ticket_line(old, "**Problem** y"));
+        assert!(!keeps_ticket_line(old, "   "));
+        assert!(keeps_ticket_line("no link here", "rewritten"));
+    }
 }
 
 #[cfg(test)]

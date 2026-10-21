@@ -2515,6 +2515,19 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Replace a pull request's description.
+    pub async fn update_pr_body(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        body: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}");
+        self.patch(&url, &serde_json::json!({"body": body})).await?;
+        Ok(())
+    }
+
     /// Reopen a closed pull request.
     pub async fn reopen_pull_request(
         &self,
