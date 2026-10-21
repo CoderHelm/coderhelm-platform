@@ -90,9 +90,7 @@ pub async fn run(
         }
         None => String::new(),
     };
-    let system = format!(
-        "You are writing a pull request description. Be concise and technical. Return only markdown.{voice_block}{standards_block}"
-    );
+    let system = writer_system(&voice_block, &standards_block, &msg.team_instructions);
 
     let ticket_ref = match msg.source {
         TicketSource::Github => format!("#{}", msg.issue_number),
@@ -799,6 +797,16 @@ fn strip_code_fences(s: &str) -> String {
     s.to_string()
 }
 
+/// The PR description writer's system prompt: the team's voice and
+/// standards, then its instructions (the sections a PR must have, say),
+/// which win over the default structure.
+fn writer_system(voice_block: &str, standards_block: &str, team_instructions: &str) -> String {
+    format!(
+        "You are writing a pull request description. Be concise and technical. Return only markdown.{voice_block}{standards_block}{team}",
+        team = super::team_instructions_block(team_instructions),
+    )
+}
+
 /// What the writer is told about the run's evidence: report it, never call
 /// something unverified that a lookup answered. Empty when the run gathered
 /// none.
@@ -910,12 +918,14 @@ fn is_lockfile(path: &str) -> bool {
 /// earlier version of the change. Keeps the description's structure and its
 /// ticket line; anything it says that the diff no longer bears out goes.
 /// Leaves the description alone when anything fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn refresh_description(
     state: &WorkerState,
     github: &GitHubClient,
     owner: &str,
     repo: &str,
     pr_number: u64,
+    team_instructions: &str,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) {
@@ -963,7 +973,10 @@ Return ONLY the markdown body text."#,
         state,
         provider,
         provider.primary_model_id(),
-        "You keep pull request descriptions accurate to their code.",
+        &format!(
+            "You keep pull request descriptions accurate to their code.{}",
+            super::team_instructions_block(team_instructions)
+        ),
         &mut messages,
         &[],
         &super::triage::NoOpExecutor,
@@ -1055,7 +1068,16 @@ async fn fetch_pr_template(
 
 #[cfg(test)]
 mod refresh_tests {
-    use super::{evidence_instructions, keeps_ticket_line};
+    use super::{evidence_instructions, keeps_ticket_line, writer_system};
+
+    #[test]
+    fn the_writer_gets_the_teams_instructions_when_set() {
+        let team = "PR descriptions have a Rollback section.";
+        let with = writer_system("", "", team);
+        assert!(with.contains("## Your team's instructions"));
+        assert!(with.contains(team));
+        assert!(!writer_system("", "", "").contains("team's instructions"));
+    }
 
     #[test]
     fn the_writer_reports_the_runs_evidence() {

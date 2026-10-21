@@ -566,6 +566,12 @@ pub struct TicketMessage {
     /// (see `plan::plan_cache_key`). Never serialized.
     #[serde(skip)]
     pub plan_cache_key: Option<String>,
+    /// Set in-process, once per run: the team's own instructions for this
+    /// repository (see `passes::load_team_instructions`). Every agent that
+    /// plans, writes, proves or describes the change gets them. Never
+    /// serialized.
+    #[serde(skip)]
+    pub team_instructions: String,
     /// A person's direction that started this run (a reply on the ticket
     /// telling CoderHelm where the fix is and to go ahead), as
     /// "author: words". The planner's trace checks then inform, not block.
@@ -756,6 +762,7 @@ mod tests {
             ticket_update_note: None,
             ticket_history_note: None,
             plan_cache_key: None,
+            team_instructions: String::new(),
             person_direction: None,
         });
         let json = serde_json::to_string(&msg).unwrap();

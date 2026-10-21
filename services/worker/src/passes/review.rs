@@ -34,9 +34,10 @@ pub async fn run(
     let system = format!(
         "You are a code review agent for the {owner}/{repo} repository. \
          Review the diff against the OpenSpec to verify correctness and completeness. \
-         You are READ-ONLY — you cannot modify files. Report issues for the implementation agent to fix.{rules_block}{instructions_block}",
+         You are READ-ONLY — you cannot modify files. Report issues for the implementation agent to fix.{rules_block}{instructions_block}{team_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
+        team_block = super::team_instructions_block(&msg.team_instructions),
     );
 
     let openspec_block = super::format_openspec_summary(plan);

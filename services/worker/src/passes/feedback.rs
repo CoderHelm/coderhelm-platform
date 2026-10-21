@@ -199,6 +199,7 @@ pub async fn run(
                     ticket_update_note: None,
                     ticket_history_note: None,
                     plan_cache_key: None,
+                    team_instructions: String::new(),
                     person_direction: None,
                 };
                 match super::pr::resolve_conflicts(
@@ -383,6 +384,12 @@ pub async fn run(
         format!(" Match the team's voice and tone as described below:\n{voice}")
     };
 
+    // The team's instructions, loaded once for this round: the replies, the
+    // code changes and the description rewrite all follow them.
+    let team_instructions =
+        super::load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    let team_block = super::team_instructions_block(&team_instructions);
+
     // Code changes made while addressing comments follow the same test rule.
     let tests_block =
         if super::review_pr::tests_required(state, &msg.team_id, &msg.repo_owner, &msg.repo_name)
@@ -400,7 +407,7 @@ pub async fn run(
          (the default, and the ONLY safe option for a few lines in a large file), and write_file \
          or batch_write only for new files or whole-file rewrites — then confirm briefly. \
          If a comment asks a question, read the code and answer clearly. \
-         Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}{tests_block}",
+         Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}{team_block}{tests_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
@@ -747,6 +754,7 @@ Rules:
             &msg.repo_owner,
             &msg.repo_name,
             msg.pr_number,
+            &team_instructions,
             &provider,
             &mut usage,
         )
@@ -2007,6 +2015,7 @@ async fn handle_wrong_repo(
         ticket_update_note: None,
         ticket_history_note: None,
         plan_cache_key: None,
+        team_instructions: String::new(),
         person_direction: None,
     });
 

@@ -1160,6 +1160,10 @@ async fn run_passes(
     // Load repo-level instruction files (AGENTS.md, CLAUDE.md, copilot-instructions, etc.)
     let mut repo_instructions =
         load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
+    // The team's own instructions, loaded once: every agent in the run that
+    // plans, writes, proves or describes the change gets them from `msg`.
+    msg.team_instructions =
+        load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
 
     // Post "working on it" comment only for GitHub-sourced tickets.
     let mut progress_comment_id: Option<u64> = None;
@@ -1548,7 +1552,7 @@ async fn run_passes(
         &context_hash,
         &memory_context,
         &history.digest(),
-        &plan::team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await,
+        &msg.team_instructions,
     );
     msg.plan_cache_key = Some(plan_key.clone());
 
@@ -1656,6 +1660,9 @@ async fn run_passes(
                 // go into the plan made there.
                 repo_instructions =
                     load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
+                msg.team_instructions =
+                    load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name)
+                        .await;
                 close_memory(state, agent_memory.take()).await;
                 agent_memory =
                     AgentMemory::open(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
@@ -1672,13 +1679,7 @@ async fn run_passes(
                         &context_hash,
                         &format!("{memory_context}{ctx}"),
                         &history.digest(),
-                        &plan::team_instructions(
-                            state,
-                            &msg.team_id,
-                            &msg.repo_owner,
-                            &msg.repo_name,
-                        )
-                        .await,
+                        &msg.team_instructions,
                     ));
                 }
                 plan_result = plan::run(
@@ -2968,6 +2969,13 @@ async fn run_passes(
                 // Load repo-specific instructions
                 let repo_instr =
                     load_repo_instructions(&github, &repo_task.owner, &repo_task.name).await;
+                repo_msg.team_instructions = load_team_instructions(
+                    state,
+                    &repo_msg.team_id,
+                    &repo_task.owner,
+                    &repo_task.name,
+                )
+                .await;
 
                 match run_repo_pipeline(
                     state,
@@ -5551,6 +5559,44 @@ pub fn format_instructions_block(instructions: &str) -> String {
     )
 }
 
+/// The team's own instructions for a repository, as people wrote them in
+/// CoderHelm: the team-wide ones, then the repository's. Empty when none.
+/// Load once per run and pass down (`TicketMessage::team_instructions`).
+pub async fn load_team_instructions(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> String {
+    let global = load_content(state, team_id, "INSTRUCTIONS#GLOBAL").await;
+    let repo = load_content(state, team_id, &format!("INSTRUCTIONS#REPO#{owner}/{name}")).await;
+    join_team_instructions(&global, &repo)
+}
+
+fn join_team_instructions(global: &str, repo: &str) -> String {
+    [global.trim(), repo.trim()]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The section every agent that plans, writes, proves, describes or reviews
+/// a change gets for the team's instructions. Empty when there are none.
+pub fn team_instructions_block(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## Your team's instructions\nThese are the team's working rules for this repository \
+         (how to test, log, describe and commit changes, which conventions and helpers to use). \
+         Follow them. Where they conflict with CoderHelm's default instructions, the team's win, \
+         except safety rules and read-only data rules, which always hold.\n\n{text}"
+    )
+}
+
 /// Derive the shell command the execution sandbox runs to verify the repo —
 /// its real build / type-check / lint (and tests, last, so a broken build
 /// short-circuits before the slow suite). Mirrors what the repo's own CI runs,
@@ -5849,6 +5895,30 @@ pub(crate) fn build_scoped_test_cmd(base_cmd: &str, changed_files: &[String]) ->
     } else {
         format!("{base_cmd} -- --passWithNoTests {args}")
     })
+}
+
+#[cfg(test)]
+mod team_instructions_tests {
+    use super::{join_team_instructions, team_instructions_block};
+
+    #[test]
+    fn team_wide_then_repo_instructions_and_nothing_when_empty() {
+        assert_eq!(
+            join_team_instructions(" Use make test. ", "Branches: fix/<ticket>.\n"),
+            "Use make test.\n\nBranches: fix/<ticket>."
+        );
+        assert_eq!(join_team_instructions("", " repo only "), "repo only");
+        assert_eq!(join_team_instructions(" ", "\n"), "");
+        assert_eq!(team_instructions_block(""), "");
+        assert_eq!(team_instructions_block(" \n "), "");
+        let b = team_instructions_block("Use make test.");
+        assert!(b.starts_with("\n\n## Your team's instructions\n"));
+        assert!(b.contains("Follow them."));
+        assert!(b.contains(
+            "the team's win, except safety rules and read-only data rules, which always hold"
+        ));
+        assert!(b.ends_with("\n\nUse make test."));
+    }
 }
 
 #[cfg(test)]

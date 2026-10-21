@@ -196,7 +196,7 @@ pub const SOURCE_DATA_RULE: &str = "SOURCE DATA OVERRIDES: when the diff adds a 
 /// shipped keyed on a vendor field nobody had read, saying its impact "was
 /// not measured" while a connected source could count it, with an INFO log
 /// per record on every sync.
-pub const PROOF_RULE: &str = "PROOF BEHIND THE CHANGE: check four things. (1) UNVERIFIED \
+pub const PROOF_RULE: &str = "PROOF BEHIND THE CHANGE: check these things. (1) UNVERIFIED \
      EXTERNAL FIELD: the diff relies on a field, value or behaviour of a system the repository \
      doesn't own (a vendor API, another service, a table another system writes) and neither the \
      PR description nor a lookup shows it in a real payload or row. When a live source can reach \
@@ -212,7 +212,23 @@ pub const PROOF_RULE: &str = "PROOF BEHIND THE CHANGE: check four things. (1) UN
      (the diff shows it), severity \"medium\": diagnostics belong at DEBUG. (4) UNPROVEN \
      ASSUMPTION: the logic depends on an assumption (what another system sends, the values a \
      field takes, uniqueness, ordering) that nothing in the PR proves. Check it with your tools \
-     when you can; otherwise one \"question\" saying exactly what has to be confirmed. ";
+     when you can; otherwise one \"question\" saying exactly what has to be confirmed. \
+     (5) NAME PARSING: the logic reads another system's data by parsing a name, title or \
+     description while the payload has a structured field or flag (a boolean, a type, a \
+     quantity, an id) that says the same thing; people rename things. A \"correctness\" finding \
+     naming the field to use (confirm it with a live source when you can). (6) UNSURVEYED \
+     FIELD: a rule about another system's field rests on the ticket's records only. With a live \
+     source, group the live records by shape and report the count per shape with one example id \
+     each; a shape the rule gets wrong is a verified defect. Otherwise a non-blocking note asking \
+     for that survey in the description. (7) SILENT FALLBACK: data that doesn't match the \
+     expected shape is defaulted or skipped with no WARNING log naming the record id and no \
+     count in the run's summary: a \"convention\" finding. A WARNING for an unexpected shape is \
+     not a noisy log. (8) FIXTURES: tests for how another system's data is handled use invented \
+     payloads instead of trimmed real ones (one per shape), or none fails on the old code: a \
+     non-blocking \"tests\" note. (9) ONE RECORD: the fix hard-codes ids, names, seasons or \
+     prices, or corrects existing records with a manual backfill or one-off script the normal \
+     pipeline could do on its next run and the verification steps don't list it: \
+     verified-defect. ";
 
 /// The critic's note for source-data-override candidates.
 const SOURCE_DATA_CRITIC_NOTE: &str = " A `source-data-override` candidate is REAL when the diff \
@@ -1185,6 +1201,25 @@ const LIVE_CRITIC_NOTE: &str = " The prompt lists facts the reviewer looked up i
      though the diff alone does not show it; judge it against what came back. A candidate that \
      contradicts what came back is wrong: DROP it.";
 
+/// The critic's note when the team wrote instructions for this repository.
+const TEAM_CRITIC_NOTE: &str = " The prompt lists the team's own instructions for this \
+     repository. A candidate saying the diff breaks one of them is grounded when the diff shows \
+     the break: keep it as verified-defect. Drop a candidate that asks for the opposite of what \
+     the team's instructions say.";
+
+/// The reviewer's section for the team's instructions: the standard every
+/// PR in the repository is held to, whoever wrote it. Empty when none.
+pub fn team_rules_block(team_instructions: &str) -> String {
+    let block = super::team_instructions_block(team_instructions);
+    if block.is_empty() {
+        return block;
+    }
+    format!(
+        "{block}\n\nHold this PR to them, whoever wrote it: a change that breaks one is a \
+         finding that names the rule."
+    )
+}
+
 /// What the critic is told beyond the diff and the candidate findings.
 pub struct CriticContext<'a> {
     pub require_tests: bool,
@@ -1192,6 +1227,8 @@ pub struct CriticContext<'a> {
     pub answered: &'a str,
     /// Facts looked up in the team's live systems during this review.
     pub live_evidence: &'a str,
+    /// The team's own instructions for this repository.
+    pub team_instructions: &'a str,
 }
 
 /// Critic pass: score each finding against the diff with claim-only context and
@@ -1210,6 +1247,7 @@ pub async fn critique_findings(
         require_tests,
         answered: answered_context,
         live_evidence,
+        team_instructions,
     } = ctx;
     if findings.is_empty() {
         return findings;
@@ -1252,12 +1290,16 @@ pub async fn critique_findings(
     if !live_evidence.is_empty() {
         system.push_str(LIVE_CRITIC_NOTE);
     }
+    let team = super::team_instructions_block(team_instructions);
+    if !team.is_empty() {
+        system.push_str(TEAM_CRITIC_NOTE);
+    }
     system.push_str(SOURCE_DATA_CRITIC_NOTE);
     system.push_str(PROOF_CRITIC_NOTE);
     system.push_str(COPY_CRITIC_NOTE);
     let system = system.as_str();
     let prompt = format!(
-        "## Diff\n{diff}\n{answered_context}{live_evidence}\n## Candidate findings\n{list}"
+        "## Diff\n{diff}\n{answered_context}{live_evidence}{team}\n\n## Candidate findings\n{list}"
     );
     let mut messages = vec![(
         "user".to_string(),
@@ -2010,12 +2052,29 @@ mod required_tests_tests {
             "UNMEASURED IMPACT",
             "NOISY LOGS",
             "UNPROVEN ASSUMPTION",
+            "NAME PARSING",
+            "UNSURVEYED FIELD",
+            "SILENT FALLBACK",
+            "FIXTURES",
+            "ONE RECORD",
         ] {
             assert!(PROOF_RULE.contains(point), "{point}");
         }
+        assert!(PROOF_RULE.contains("A WARNING for an unexpected shape is not a noisy log"));
         assert!(PROOF_RULE.contains("diagnostics belong at DEBUG"));
         assert!(PROOF_RULE.contains("look it up yourself"));
         assert!(PROOF_CRITIC_NOTE.contains("every scheduled run"));
+    }
+
+    #[test]
+    fn the_reviewer_holds_every_pr_to_the_teams_instructions_when_set() {
+        let team = "Log levels: INFO only for writes.";
+        let block = team_rules_block(team);
+        assert!(block.contains("## Your team's instructions"));
+        assert!(block.contains(team));
+        assert!(block.contains("whoever wrote it"));
+        assert_eq!(team_rules_block(""), "");
+        assert_eq!(team_rules_block(" \n "), "");
     }
 
     #[test]

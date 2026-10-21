@@ -64,11 +64,13 @@ pub async fn run(
         } else {
             ""
         };
-    let system = format!(
-        "You are an implementation agent for the {owner}/{repo} repository. \
-         Implement each task from the checklist. Follow existing code patterns exactly.{rules_block}{instructions_block}{tests_block}",
-        owner = msg.repo_owner,
-        repo = msg.repo_name,
+    // The team's instructions are never trimmed: they are its working rules.
+    let system = coder_system(
+        &msg.repo_owner,
+        &msg.repo_name,
+        &format!("{rules_block}{instructions_block}"),
+        &msg.team_instructions,
+        tests_block,
     );
 
     let feedback_section = match review_feedback {
@@ -856,6 +858,23 @@ struct TaskPrompt<'a> {
     files_hint: &'a str,
     feedback: &'a str,
     issue: &'a str,
+}
+
+/// The coder's system prompt, the same for every task prompt (simple or
+/// not) and every round of the run, so it stays cached: the rules and repo
+/// instruction files, the team's instructions, then the test rule.
+fn coder_system(
+    owner: &str,
+    repo: &str,
+    repo_context: &str,
+    team_instructions: &str,
+    tests_block: &str,
+) -> String {
+    format!(
+        "You are an implementation agent for the {owner}/{repo} repository. \
+         Implement each task from the checklist. Follow existing code patterns exactly.{repo_context}{team}{tests_block}",
+        team = super::team_instructions_block(team_instructions),
+    )
 }
 
 /// The coder's task prompt. Every change, simple or not, carries the rules
@@ -2542,7 +2561,7 @@ mod migration_registry_tests {
 
 #[cfg(test)]
 mod task_prompt_tests {
-    use super::{task_prompt, TaskPrompt, SCHEMA_CHANGE_RULES};
+    use super::{coder_system, task_prompt, TaskPrompt, SCHEMA_CHANGE_RULES};
     use crate::passes::proof::{CODER_RULES, EVIDENCE_OUTPUT};
 
     fn prompt(simple: bool) -> String {
@@ -2573,5 +2592,19 @@ mod task_prompt_tests {
         }
         assert!(!prompt(true).contains(SCHEMA_CHANGE_RULES));
         assert!(prompt(false).contains(SCHEMA_CHANGE_RULES));
+    }
+
+    #[test]
+    fn the_coder_gets_the_teams_instructions_when_set_and_nothing_when_empty() {
+        // One system prompt serves both task prompt sizes.
+        let team = "Run the unit tests with `make test`. Branches start with `fix/`.";
+        let with = coder_system("acme", "web", "\n\n## Repository Instructions\nx", team, "");
+        assert!(with.contains("## Your team's instructions"));
+        assert!(with.contains(team));
+        assert!(with.contains("the team's win, except safety rules and read-only data rules"));
+        // After the repo's own files, so the team's rules are read last.
+        assert!(with.find("## Repository Instructions") < with.find("## Your team's instructions"));
+        let without = coder_system("acme", "web", "", "  \n", "");
+        assert!(!without.contains("team's instructions"));
     }
 }
