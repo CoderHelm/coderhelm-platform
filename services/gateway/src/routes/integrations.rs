@@ -314,6 +314,10 @@ pub async fn list(
 
     // Everything else, read in parallel.
     let settings = &state.config.settings_table_name;
+    // REST APIs and OpenSearch connected here before live in Data sources.
+    if let Err(e) = common::live::store::adopt_connections(&state.dynamo, settings, &team).await {
+        warn!(error = %e, "Could not move connections to data sources");
+    }
     let team_key = [("team_id", team.as_str()), ("sk", "META")];
     let jira_key = [("pk", team.as_str()), ("sk", "JIRA#config")];
     let (saved, github, jira_secret, jira_config, teams, plugins) = tokio::join!(
@@ -412,7 +416,8 @@ pub async fn list(
         }
     }
 
-    // New Relic, Confluence and OpenSearch.
+    // New Relic and Confluence. REST APIs and OpenSearch are data sources
+    // (the Data sources page), with every other system agents read.
     for (kind, does) in [
         (
             ConnKind::NewRelic,
@@ -422,16 +427,7 @@ pub async fn list(
             ConnKind::Confluence,
             "Searches and reads Confluence pages. Optionally adds text to the end of pages you list.",
         ),
-        (
-            ConnKind::OpenSearch,
-            "Searches your OpenSearch or Elasticsearch indexes read-only, so agents can see the documents your app actually reads. Limit it to the indexes you list.",
-        ),
-        (
-            ConnKind::Rest,
-            "Reads a REST API you use (a booking or payments system, a vendor's API) with GET requests under the paths you allow, so agents can compare its records with yours.",
-        ),
     ] {
-        // REST: a card per connected API, then one to add another.
         let mine: Vec<&Connector> = saved.iter().filter(|c| c.kind() == kind).collect();
         let mut shown: Vec<Option<&Connector>> = mine.iter().map(|c| Some(*c)).collect();
         if mine.is_empty() || connectors::nameable(kind) {

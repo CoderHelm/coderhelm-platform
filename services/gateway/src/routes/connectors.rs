@@ -343,7 +343,10 @@ pub async fn list(
     // One entry per kind; REST APIs one per connected API, then one to add
     // another.
     let mut items: Vec<Value> = Vec::new();
-    for k in ConnKind::ALL.iter().filter(|k| !k.uses_aws()) {
+    for k in ConnKind::ALL
+        .iter()
+        .filter(|k| !k.uses_aws() && !connectors::nameable(**k))
+    {
         let mine: Vec<&Connector> = saved.iter().filter(|c| c.kind() == *k).collect();
         items.extend(mine.iter().map(|c| c.public_json()));
         if mine.is_empty() || connectors::nameable(*k) {
@@ -394,6 +397,12 @@ pub async fn save(
             connectors::check_name(n).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
             name = n.to_string();
         }
+    }
+    if connectors::nameable(kind) {
+        return Err(fail(
+            StatusCode::GONE,
+            "REST APIs and OpenSearch are data sources now. Add them in Data sources.",
+        ));
     }
     if kind.uses_aws() {
         // Metrics and Airflow are abilities of the connected AWS account now,

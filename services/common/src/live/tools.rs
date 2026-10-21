@@ -423,6 +423,8 @@ pub fn validate(def: &ToolDef, src: &SourceInfo) -> Result<Prepared, Vec<String>
                 Kind::Api => "GraphQL API",
                 Kind::Logs => "logs",
                 Kind::Database => "database",
+                Kind::Rest => "REST API",
+                Kind::Search => "search",
             }
         )),
     }

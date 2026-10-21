@@ -212,6 +212,11 @@ mod tests {
             created_at: String::new(),
             created_by: String::new(),
             aws: Some(t.clone()),
+            header_name: String::new(),
+            paths: Vec::new(),
+            user: String::new(),
+            indexes: Vec::new(),
+            instructions: String::new(),
         };
         let tool = parse_def(
             "name: count_tables\nuse_when: test\nsource: db\nkind: sql\nread: SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = :schema\ninputs:\n  schema: { type: string, pattern: \".{1,80}\", example: \"public\" }\nmax_rows: 5\n",

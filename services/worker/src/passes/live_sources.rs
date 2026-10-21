@@ -2,8 +2,9 @@
 //! the reviewer, the planner, the agent that writes the code, and the agent
 //! that answers review feedback.
 //!
-//! A team can connect three kinds of source: a GraphQL API, log groups in its
-//! AWS account, and a PostgreSQL database in its AWS account. No agent talks to
+//! A team can connect five kinds of source: a GraphQL API, a REST API, an
+//! OpenSearch cluster, log groups in its AWS account, and a PostgreSQL or
+//! Redshift database in its AWS account. No agent talks to
 //! any of them directly: each lookup goes through `common::live`, which allows
 //! a single read, to the source the team chose, and hides sensitive values. This module decides which sources a
 //! review may use, caps how many lookups one review can make, records each one,
@@ -15,6 +16,9 @@ use std::sync::{Arc, Mutex};
 use common::live::api::{self as live_api, run_lookup, ApiSource};
 use common::live::aws::{self as live_aws, AwsTarget};
 use common::live::catalog::{self, Catalog};
+use common::live::http::Https;
+use common::live::opensearch::OpenSearch;
+use common::live::rest::Rest;
 use common::live::store::{self, Activity, Kind, Source};
 use common::live::{db, logs, redshift};
 use common::live::{secret, StepError};
@@ -122,7 +126,7 @@ impl Loaded {
             return false;
         }
         let can = match self.source.kind {
-            Kind::Logs => false,
+            Kind::Logs | Kind::Rest | Kind::Search => false,
             Kind::Api => self.source.schema_available,
             Kind::Database => self.aws().is_some(),
         };
@@ -187,13 +191,15 @@ impl LiveSources {
         let mut loaded = Vec::new();
         for source in sources.into_iter().filter(|s| s.usable_for(repo)) {
             let key = match source.kind {
-                Kind::Api => match secret::open(&state.kms, team_id, &source.key_sealed).await {
-                    Ok(k) => k,
-                    Err(e) => {
-                        warn!(source = %source.id, error = %e, "Could not open a data source key; skipping it");
-                        continue;
+                Kind::Api | Kind::Rest | Kind::Search => {
+                    match secret::open(&state.kms, team_id, &source.key_sealed).await {
+                        Ok(k) => k,
+                        Err(e) => {
+                            warn!(source = %source.id, error = %e, "Could not open a data source key; skipping it");
+                            continue;
+                        }
                     }
-                },
+                }
                 Kind::Logs | Kind::Database if source.aws.is_none() => continue,
                 Kind::Logs | Kind::Database => String::new(),
             };
@@ -365,6 +371,67 @@ impl LiveSources {
                 }),
             });
         }
+        if self.has(Kind::Rest) {
+            let apis: Vec<String> = self
+                .loaded
+                .iter()
+                .filter(|l| l.source.kind == Kind::Rest)
+                .map(|l| {
+                    format!(
+                        "{} at {} (paths under {})",
+                        l.source.name,
+                        l.source.url,
+                        l.source.paths.join(", ")
+                    )
+                })
+                .collect();
+            tools.push(ToolDefinition {
+                name: "api_get".to_string(),
+                description: format!(
+                    "GET a path on one of the team's REST APIs and read the JSON it returns (the \
+                     source system's own record): {}. Only paths under a source's allowed \
+                     prefixes can be read; pass ids in the path and filters in `query`. Read only. \
+                     Never guess a path: first find where the team's code calls the API (search \
+                     the repos for its address or a path segment) and copy that exact shape, \
+                     including every parent id. At most {MAX_LOOKUPS} lookups in all.",
+                    apis.join("; ")
+                ),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "source": source_prop(Some(Kind::Rest)),
+                        "path": { "type": "string", "description": "a path under an allowed prefix, e.g. the prefix plus /42" },
+                        "query": { "type": "object", "description": "query parameters as names and plain values" }
+                    },
+                    "required": ["path"]
+                }),
+            });
+        }
+        if self.has(Kind::Search) {
+            tools.push(ToolDefinition {
+                name: "search_read".to_string(),
+                description: format!(
+                    "Read one of the team's OpenSearch clusters. `action` \"indexes\" lists the \
+                     indexes you may read, with document counts; \"mapping\" shows an index's \
+                     fields; \"search\" runs one search (`body`: query, size, from, sort, _source, \
+                     aggs) and returns documents as stored (at most {} per call); \"count\" counts \
+                     documents, optionally matching `query`. Read only; scripts are refused. Read \
+                     an index's mapping before searching it. At most {MAX_LOOKUPS} lookups in all.",
+                    common::live::opensearch::MAX_HITS
+                ),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "source": source_prop(Some(Kind::Search)),
+                        "action": { "type": "string", "enum": ["indexes", "mapping", "search", "count"] },
+                        "index": { "type": "string", "description": "an index name, a pattern like orders-*, or several separated by commas" },
+                        "body": { "type": "object", "description": "for search: the search body" },
+                        "query": { "type": "object", "description": "for count: a query" }
+                    },
+                    "required": ["action"]
+                }),
+            });
+        }
         if self.has(Kind::Logs) {
             tools.push(ToolDefinition {
                 name: "logs_search".to_string(),
@@ -450,6 +517,12 @@ impl LiveSources {
         if self.has(Kind::Logs) {
             tools.push("`logs_search` to search logs");
         }
+        if self.has(Kind::Rest) {
+            tools.push("`api_get` to read a REST API");
+        }
+        if self.has(Kind::Search) {
+            tools.push("`search_read` to read a search cluster");
+        }
         let mut s = format!(
             "\n## Live sources\n\
              This team connected the systems below so you can CHECK a fact instead of guessing \
@@ -480,8 +553,28 @@ impl LiveSources {
                 (Kind::Database, Some(n)) => format!("PostgreSQL database; {n} tables"),
                 (Kind::Database, None) => "PostgreSQL database".to_string(),
                 (Kind::Logs, n) => format!("CloudWatch logs; {} log groups", n.unwrap_or(0)),
+                (Kind::Rest, _) => format!(
+                    "REST API at {}; GET under {}",
+                    l.source.url,
+                    l.source.paths.join(", ")
+                ),
+                (Kind::Search, _) => format!(
+                    "OpenSearch at {}; {}",
+                    l.source.url,
+                    if l.source.indexes.is_empty() {
+                        "every index its user can see".to_string()
+                    } else {
+                        format!("indexes {}", l.source.indexes.join(", "))
+                    }
+                ),
             };
             s.push_str(&format!("- {} ({what})\n", l.source.name));
+            if !l.source.instructions.trim().is_empty() {
+                s.push_str(&format!(
+                    "  Guide from the team: {}\n",
+                    l.source.instructions.trim().replace('\n', "\n  ")
+                ));
+            }
             if let Some(names) = l.described().and_then(|d| table_names(&d.catalog)) {
                 s.push_str(&format!("  Tables: {names}\n"));
             }
@@ -537,7 +630,7 @@ impl LiveSources {
         let actor = format!("{}-pr{}", self.role.actor(), self.pr);
         let started = std::time::Instant::now();
         let read: Result<(String, String), StepError> = match l.source.kind {
-            Kind::Logs => return,
+            Kind::Logs | Kind::Rest | Kind::Search => return,
             Kind::Api => live_api::describe(&l.source.url, l.source.auth, &l.key)
                 .await
                 .map(|s| {
@@ -669,6 +762,8 @@ impl LiveSources {
             "live_lookup" => Some(self.lookup(state, Kind::Api, input).await),
             "db_query" => Some(self.lookup(state, Kind::Database, input).await),
             "logs_search" => Some(self.lookup(state, Kind::Logs, input).await),
+            "api_get" => Some(self.lookup(state, Kind::Rest, input).await),
+            "search_read" => Some(self.lookup(state, Kind::Search, input).await),
             n if n.starts_with("tool_") => {
                 let t = self.tools.iter().find(|t| t.def.function_name() == n)?;
                 Some(self.run_own_tool(state, t, input).await)
@@ -922,6 +1017,57 @@ impl LiveSources {
                         )
                     })
             }
+            Kind::Rest => {
+                let conn = l.source.reader();
+                let started = std::time::Instant::now();
+                let a = Rest {
+                    conn: &conn,
+                    key: &l.key,
+                    http: &Https,
+                }
+                .get(input["path"].as_str().unwrap_or(""), input.get("query"))
+                .await?;
+                Ok((
+                    a.asked,
+                    a.text,
+                    a.hidden,
+                    started.elapsed().as_millis(),
+                    String::new(),
+                ))
+            }
+            Kind::Search => {
+                let conn = l.source.reader();
+                let os = OpenSearch {
+                    conn: &conn,
+                    password: &l.key,
+                    http: &Https,
+                };
+                let index = input["index"].as_str().unwrap_or("");
+                let started = std::time::Instant::now();
+                let a = match input["action"].as_str().unwrap_or("") {
+                    "indexes" => os.indexes().await?,
+                    "mapping" => os.mapping(index).await?,
+                    "count" => {
+                        os.count(index, input.get("query").filter(|q| q.is_object()))
+                            .await?
+                    }
+                    "search" => os.search(index, &input["body"]).await?,
+                    other => {
+                        return Err(StepError::new(
+                            "read_only",
+                            format!("{other:?} isn't something this cluster can be asked."),
+                            "Use action indexes, mapping, search or count.",
+                        ))
+                    }
+                };
+                Ok((
+                    a.asked,
+                    a.text,
+                    0,
+                    started.elapsed().as_millis(),
+                    String::new(),
+                ))
+            }
             Kind::Logs => {
                 let t = l.aws().ok_or_else(|| {
                     StepError::new(
@@ -981,7 +1127,7 @@ impl LiveSources {
         let readable = match l.source.kind {
             Kind::Database => common::live::sql::check_read_only_sql(text, hidden).is_ok(),
             Kind::Api => common::live::graphql::check_read_only(text).is_ok(),
-            Kind::Logs => false,
+            Kind::Logs | Kind::Rest | Kind::Search => false,
         };
         if !readable {
             return Vec::new();
@@ -997,7 +1143,7 @@ impl LiveSources {
                 catalog::unknown_sql_names_in(&d.catalog, database.as_deref(), text, hidden)
             }
             Kind::Api => catalog::unknown_graphql_names(&d.catalog, text, hidden),
-            Kind::Logs => Vec::new(),
+            Kind::Logs | Kind::Rest | Kind::Search => Vec::new(),
         };
         let now = chrono::Utc::now().timestamp();
         if l.should_refresh(DESCRIPTION_MAX_AGE_SECS, now) {
@@ -1074,11 +1220,33 @@ impl LiveSources {
         if self.lookups.fetch_add(1, Ordering::SeqCst) >= MAX_LOOKUPS {
             return format!("All {MAX_LOOKUPS} lookups are used. Finish with what you have.");
         }
-        let asked_text = input["query"]
-            .as_str()
-            .or(input["sql"].as_str())
-            .unwrap_or("")
-            .to_string();
+        let asked_text = match kind {
+            Kind::Rest => format!(
+                "GET {}{}",
+                input["path"].as_str().unwrap_or(""),
+                input
+                    .get("query")
+                    .filter(|q| q.is_object())
+                    .map(|q| format!(" {q}"))
+                    .unwrap_or_default()
+            ),
+            Kind::Search => format!(
+                "{} {}{}",
+                input["action"].as_str().unwrap_or(""),
+                input["index"].as_str().unwrap_or(""),
+                input
+                    .get("body")
+                    .or(input.get("query"))
+                    .filter(|b| b.is_object())
+                    .map(|b| format!(" {b}"))
+                    .unwrap_or_default()
+            ),
+            _ => input["query"]
+                .as_str()
+                .or(input["sql"].as_str())
+                .unwrap_or("")
+                .to_string(),
+        };
         let outcome = self.run(state, l, input).await;
         // Real names for a failure about a name, kept with the record too so
         // the activity log shows the fix, not only the error.
@@ -1171,7 +1339,36 @@ impl LiveSources {
 /// What `live_describe` answers from a source's description: one type or
 /// table in full (`name`), the blocks matching a word (`search`), or the
 /// list of every table or type.
+/// The team's guide for a source, as a line to add to its description.
+fn guide_line(l: &Loaded) -> String {
+    match l.source.instructions.trim() {
+        "" => String::new(),
+        g => format!("\nGuide from the team: {g}"),
+    }
+}
+
 fn describe_text(l: &Loaded, input: &Value) -> String {
+    match l.source.kind {
+        Kind::Rest => {
+            return format!(
+                "{} is a REST API at {}. Read it with api_get under: {}.{}",
+                l.source.name,
+                l.source.url,
+                l.source.paths.join(", "),
+                guide_line(l)
+            )
+        }
+        Kind::Search => {
+            return format!(
+                "{} is an OpenSearch cluster at {}. Use search_read with action \"indexes\" to \
+                 list what it holds and \"mapping\" to see an index's fields.{}",
+                l.source.name,
+                l.source.url,
+                guide_line(l)
+            )
+        }
+        _ => {}
+    }
     let Some(d) = l.described() else {
         return match l.source.kind {
             Kind::Database => "The list of tables isn't available right now. Query \
@@ -1298,7 +1495,7 @@ fn hint_lines(
                 .unwrap_or("");
             catalog::sql_hints(catalog, &e.message, sql, hidden)
         }
-        Kind::Logs => Vec::new(),
+        Kind::Logs | Kind::Rest | Kind::Search => Vec::new(),
     }
 }
 
@@ -1373,6 +1570,11 @@ mod tests {
             created_at: String::new(),
             created_by: String::new(),
             aws: None,
+            header_name: String::new(),
+            paths: Vec::new(),
+            user: String::new(),
+            indexes: Vec::new(),
+            instructions: String::new(),
         }
     }
 
@@ -1493,7 +1695,7 @@ mod tests {
         let schema = match kind {
             Kind::Logs => Some(logs::describe(src.aws.as_ref().unwrap())),
             Kind::Database => Some(DB_SCHEMA.to_string()),
-            Kind::Api => None,
+            Kind::Api | Kind::Rest | Kind::Search => None,
         };
         Loaded::new(
             src,
@@ -1769,5 +1971,68 @@ mod tests {
         let c = Catalog::parse(DB_SCHEMA);
         assert_eq!(table_names(&c).as_deref(), Some("orders, billing.invoices"));
         assert_eq!(table_names(&Catalog::parse(API_SCHEMA)), None);
+    }
+
+    #[test]
+    fn rest_apis_and_clusters_are_read_by_name_with_their_guides() {
+        let mut bookings = source("Bookings");
+        bookings.kind = Kind::Rest;
+        bookings.url = "https://api.example.com".into();
+        bookings.paths = vec!["/v1/org/7/programs".into()];
+        bookings.instructions = "quantity is sessions per week on weekly packs.".into();
+        let mut search = source("Search");
+        search.kind = Kind::Search;
+        search.url = "https://search.example.com".into();
+        search.indexes = vec!["orders-*".into()];
+        let mut l = live(&[]);
+        l.loaded = vec![
+            Loaded::new(bookings, "k".into(), None, None),
+            Loaded::new(search, "p".into(), None, None),
+        ];
+        let tools = l.tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"api_get") && names.contains(&"search_read"),
+            "{names:?}"
+        );
+        assert!(!names.contains(&"live_lookup") && !names.contains(&"db_query"));
+        let api = tools.iter().find(|t| t.name == "api_get").unwrap();
+        assert!(api
+            .description
+            .contains("Bookings at https://api.example.com (paths under /v1/org/7/programs)"));
+        // A wrong guess (a parent id left out) is a 404 the agent can't learn from.
+        assert!(api.description.contains("Never guess a path"));
+        let prompt = l.prompt_section();
+        assert!(
+            prompt.contains(
+                "- Bookings (REST API at https://api.example.com; GET under /v1/org/7/programs)"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("  Guide from the team: quantity is sessions per week"),
+            "{prompt}"
+        );
+        assert!(
+            prompt
+                .contains("- Search (OpenSearch at https://search.example.com; indexes orders-*)"),
+            "{prompt}"
+        );
+        // Describing either says how to read it, with the guide, and never
+        // reaches out for a schema.
+        let d = describe_text(&l.loaded[0], &json!({}));
+        assert!(
+            d.contains("api_get") && d.contains("Guide from the team"),
+            "{d}"
+        );
+        assert!(!l.loaded[1].should_refresh(0, chrono::Utc::now().timestamp()));
+        // A call picks its source by name among sources of its kind.
+        assert_eq!(
+            l.pick(&json!({}), Some(Kind::Rest)).unwrap().source.name,
+            "Bookings"
+        );
+        assert!(l
+            .pick(&json!({"source": "Search"}), Some(Kind::Rest))
+            .is_err());
     }
 }
