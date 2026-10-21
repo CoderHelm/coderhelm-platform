@@ -54,6 +54,21 @@ fn action_kind(a: Option<&WorkerMessage>) -> ActionKind {
     }
 }
 
+/// Whether a comment that starts a run is a person's direction for it: it
+/// asks for the work, or it answers CoderHelm's own question on a waiting
+/// run (whatever words it uses).
+pub fn is_direction(intent: Option<Intent>, run_status: &str) -> bool {
+    let waiting_for_answer = matches!(
+        run_status,
+        "needs_input" | "needs_outside_change" | "failed"
+    );
+    match intent {
+        Some(Intent::NewRequirement) => true,
+        None | Some(Intent::Other) => waiting_for_answer,
+        _ => false,
+    }
+}
+
 /// The decision. `intent` is `None` when the model couldn't read the comment:
 /// feedback on an open PR (which reads it again) and an answer to
 /// CoderHelm's own question still go ahead; nothing else starts a run.
@@ -309,7 +324,7 @@ pub async fn run(
         intent: intent.unwrap_or(Intent::Other),
         at: chrono::Utc::now().to_rfc3339(),
     };
-    let direction = (intent == Some(Intent::NewRequirement))
+    let direction = is_direction(intent, &msg.run_status)
         .then(|| format!("{}: {}", note.author, common::truncate_str(&note.text, 600)));
     match act {
         Act::Dispatch => {
@@ -430,5 +445,24 @@ mod tests {
         };
         assert_eq!(action_kind(c.action.as_deref()), ActionKind::Run);
         assert!(prompt(&c).contains("Fixed in the booking system."));
+    }
+}
+
+#[cfg(test)]
+mod direction_tests {
+    use super::*;
+
+    #[test]
+    fn an_answer_to_a_waiting_run_is_a_direction() {
+        assert!(is_direction(Some(Intent::NewRequirement), "completed"));
+        assert!(
+            is_direction(None, "needs_input"),
+            "unread answer to our question"
+        );
+        assert!(is_direction(Some(Intent::Other), "needs_outside_change"));
+        assert!(!is_direction(None, "completed"));
+        assert!(!is_direction(Some(Intent::Question), "needs_input"));
+        assert!(!is_direction(Some(Intent::StatusOnly), "needs_input"));
+        assert!(!is_direction(Some(Intent::FixElsewhereInfo), "needs_input"));
     }
 }
