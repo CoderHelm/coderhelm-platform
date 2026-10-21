@@ -12,7 +12,7 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-20.fix-the-cause-across-repos";
+pub const PLANNER_VERSION: &str = "2026-10-21.basis-and-direction";
 
 /// The cached plan's file holding its key.
 pub const PLAN_KEY_FILE: &str = "plan_key.txt";
@@ -607,10 +607,25 @@ Then the ```fix_location.json block described above."#,
 
     let mut files = parse_openspec_files(&response);
     let gaps = super::fix_location::gaps(files.fix.as_ref(), can_look_up, lookups(), &read());
-    if !gaps.is_empty() {
+    if !gaps.is_empty() && msg.person_direction.is_some() {
+        // A person told CoderHelm where the fix is and to go ahead: their
+        // call stands; what the trace didn't show is noted, not blocking.
+        warn!(ticket_id = %msg.ticket_id, gaps = ?gaps, "Plan's trace incomplete — proceeding as a person directed");
+        super::add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!(
+                "Proceeding as directed ({}). Not shown by the plan's own trace: {}",
+                common::truncate_str(msg.person_direction.as_deref().unwrap_or(""), 200),
+                gaps.join(" ")
+            ),
+        )
+        .await;
+    } else if !gaps.is_empty() {
         warn!(ticket_id = %msg.ticket_id, gaps = ?gaps, "Plan's trace still incomplete — no code on it");
         files.fix = files.fix.take().map(|d| {
-            if super::fix_location::unchecked_data(Some(&d), can_look_up, lookups()) {
+            if super::fix_location::needs_lookup(Some(&d), can_look_up, lookups(), &read()) {
                 super::fix_location::mark_unchecked(d)
             } else {
                 super::fix_location::mark_untraced(d, &gaps)
