@@ -868,6 +868,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 /// do before it is written. Each rule is a way such a change shipped broken.
 const SCHEMA_CHANGE_RULES: &str = "
 ## When the change touches a table's schema, constraints, ids or stored rows
+- Read the current keys from the database first, from both `pg_constraint` and `pg_indexes` (a unique key may exist only as a unique index, possibly partial); don't recreate one that already exists.
 - Before changing a unique key or constraint, find EVERY writer of that table across all the repos you can search (`ON CONFLICT`, inserts, upserts, ORM `save`/`upsert`, raw SQL in pipelines and scripts) and update each one that names the old key in the same change. A writer you didn't update fails at runtime.
 - Register a new migration wherever the repo registers its siblings (an index or list of migrations) and keep the order; an unregistered migration never runs.
 - Tables written on a schedule (every minute, every sync) are being written while the migration runs: set a short lock timeout inside the migration (`SET LOCAL lock_timeout`), take locks in one fixed table order, and keep each statement small.
