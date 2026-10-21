@@ -64,8 +64,19 @@ fn admin(claims: &Claims) -> Result<(), (StatusCode, Json<Value>)> {
     }
 }
 
-fn kind_of(raw: &str) -> Result<ConnKind, (StatusCode, Json<Value>)> {
-    ConnKind::parse(raw).ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such connection."))
+/// A connection's id from the path: a kind, or `rest:<name>` for one of the
+/// team's REST APIs.
+fn kind_of(raw: &str) -> Result<(ConnKind, String), (StatusCode, Json<Value>)> {
+    let (k, name) = raw.split_once(':').unwrap_or((raw, ""));
+    let kind =
+        ConnKind::parse(k).ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such connection."))?;
+    if !name.is_empty() {
+        if kind != ConnKind::Rest {
+            return Err(fail(StatusCode::NOT_FOUND, "No such connection."));
+        }
+        connectors::check_name(name).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    }
+    Ok((kind, name.to_string()))
 }
 
 fn step(e: StepError) -> (StatusCode, Json<Value>) {
@@ -173,7 +184,7 @@ pub fn ops_stack_url(region: &str) -> String {
 async fn record(
     state: &AppState,
     claims: &Claims,
-    kind: ConnKind,
+    c: &Connector,
     what: &str,
     r: &Result<String, StepError>,
     ms: u128,
@@ -188,8 +199,8 @@ async fn record(
         &state.config.settings_table_name,
         &claims.team_id,
         &Activity {
-            source_id: kind.activity_id(),
-            source_name: kind.label().to_string(),
+            source_id: c.kind().activity_id(),
+            source_name: c.label(),
             actor: claims.email.clone(),
             repo: String::new(),
             pr: 0,
@@ -329,14 +340,16 @@ pub async fn list(
     .await
     .map_err(|e| internal("list connectors", e))?;
     // Metrics and Airflow are abilities of the AWS account (Integrations).
-    let items: Vec<Value> = ConnKind::ALL
-        .iter()
-        .filter(|k| !k.uses_aws())
-        .map(|k| match saved.iter().find(|c| c.kind() == *k) {
-            Some(c) => c.public_json(),
-            None => json!({ "kind": k.as_str(), "label": k.label(), "connected": false }),
-        })
-        .collect();
+    // One entry per kind; REST APIs one per connected API, then one to add
+    // another.
+    let mut items: Vec<Value> = Vec::new();
+    for k in ConnKind::ALL.iter().filter(|k| !k.uses_aws()) {
+        let mine: Vec<&Connector> = saved.iter().filter(|c| c.kind() == *k).collect();
+        items.extend(mine.iter().map(|c| c.public_json()));
+        if mine.is_empty() || *k == ConnKind::Rest {
+            items.push(json!({ "kind": k.as_str(), "id": k.as_str(), "label": k.label(), "connected": false }));
+        }
+    }
     let aws: Vec<Value> = aws_connections(&state, &claims.team_id)
         .await?
         .iter()
@@ -361,7 +374,19 @@ pub async fn save(
     Json(body): Json<Value>,
 ) -> Reply {
     admin(&claims)?;
-    let kind = kind_of(&kind)?;
+    let (kind, mut name) = kind_of(&kind)?;
+    // A new REST API is named in the body (the page's add form); saving one
+    // under an existing name updates that one.
+    if kind == ConnKind::Rest && name.is_empty() {
+        if let Some(n) = body["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            connectors::check_name(n).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+            name = n.to_string();
+        }
+    }
     if kind.uses_aws() {
         // Metrics and Airflow are abilities of the connected AWS account now,
         // found by checking its role.
@@ -371,10 +396,13 @@ pub async fn save(
         ));
     }
     let table = &state.config.settings_table_name;
-    let mut c = connectors::get(&state.dynamo, table, &claims.team_id, kind)
+    let mut c = connectors::get(&state.dynamo, table, &claims.team_id, kind, &name)
         .await
         .map_err(|e| internal("get connector", e))?
-        .unwrap_or_else(|| Connector::new(kind));
+        .unwrap_or_else(|| Connector {
+            name: name.clone(),
+            ..Connector::new(kind)
+        });
     let text = |k: &str| body[k].as_str().map(str::trim).map(str::to_string);
 
     // Key: replaced only when one is sent.
@@ -585,7 +613,7 @@ pub async fn save(
     record(
         &state,
         &claims,
-        kind,
+        &c,
         "test the connection",
         &tested,
         started.elapsed().as_millis(),
@@ -607,7 +635,7 @@ pub async fn save(
     connectors::put(&state.dynamo, table, &claims.team_id, &c)
         .await
         .map_err(|e| internal("save connector", e))?;
-    info!(team_id = %claims.team_id, kind = kind.as_str(), status = %c.status, "Connection saved");
+    info!(team_id = %claims.team_id, id = %c.id(), status = %c.status, "Connection saved");
     Ok(Json(json!({ "connector": c.public_json() })))
 }
 
@@ -618,9 +646,9 @@ pub async fn test(
     Path(kind): Path<String>,
 ) -> Reply {
     admin(&claims)?;
-    let kind = kind_of(&kind)?;
+    let (kind, name) = kind_of(&kind)?;
     let table = &state.config.settings_table_name;
-    let mut c = connectors::get(&state.dynamo, table, &claims.team_id, kind)
+    let mut c = connectors::get(&state.dynamo, table, &claims.team_id, kind, &name)
         .await
         .map_err(|e| internal("get connector", e))?
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "That connection isn't set up."))?;
@@ -636,7 +664,7 @@ pub async fn test(
     record(
         &state,
         &claims,
-        kind,
+        &c,
         "test the connection",
         &tested,
         started.elapsed().as_millis(),
@@ -664,16 +692,17 @@ pub async fn remove(
     Path(kind): Path<String>,
 ) -> Reply {
     admin(&claims)?;
-    let kind = kind_of(&kind)?;
+    let (kind, name) = kind_of(&kind)?;
     connectors::delete(
         &state.dynamo,
         &state.config.settings_table_name,
         &claims.team_id,
         kind,
+        &name,
     )
     .await
     .map_err(|e| internal("delete connector", e))?;
-    info!(team_id = %claims.team_id, kind = kind.as_str(), "Connection removed");
+    info!(team_id = %claims.team_id, kind = kind.as_str(), name, "Connection removed");
     Ok(Json(json!({ "ok": true })))
 }
 

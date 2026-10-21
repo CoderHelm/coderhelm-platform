@@ -62,6 +62,8 @@ fn ob(item: &Item, k: &str) -> Option<bool> {
 
 /// Where each integration sits on the page.
 pub fn section_of(id: &str) -> &'static str {
+    // A named REST API (`rest:<name>`) sits with the others.
+    let id = id.split_once(':').map(|(k, _)| k).unwrap_or(id);
     match id {
         "github" | "jira" => "code",
         "aws" | "opensearch" | "rest" => "cloud",
@@ -259,7 +261,7 @@ async fn migrate_legacy(state: &AppState, team_id: &str, accounts: &mut [AwsAcco
     }
     let mut removed = 0;
     for (kind, account) in &folded_kinds {
-        match connectors::delete(&state.dynamo, table, team_id, *kind).await {
+        match connectors::delete(&state.dynamo, table, team_id, *kind, "").await {
             Ok(()) => {
                 removed += 1;
                 info!(
@@ -429,19 +431,33 @@ pub async fn list(
             "Reads a REST API you use (a booking or payments system, a vendor's API) with GET requests under the paths you allow, so agents can compare its records with yours.",
         ),
     ] {
-        let c = saved.iter().find(|c| c.kind() == kind);
-        let detail = c
-            .map(|c| c.public_json())
-            .unwrap_or_else(|| json!({ "kind": kind.as_str(), "connected": false }));
-        items.push(card(
-            kind.as_str(),
-            kind.label(),
-            does,
-            connector_state(c),
-            c.map(|c| c.updated_at.as_str()).unwrap_or(""),
-            "",
-            detail,
-        ));
+        // REST: a card per connected API, then one to add another.
+        let mine: Vec<&Connector> = saved.iter().filter(|c| c.kind() == kind).collect();
+        let mut shown: Vec<Option<&Connector>> = mine.iter().map(|c| Some(*c)).collect();
+        if mine.is_empty() || kind == ConnKind::Rest {
+            shown.push(None);
+        }
+        for c in shown {
+            let detail = c
+                .map(|c| c.public_json())
+                .unwrap_or_else(|| json!({ "kind": kind.as_str(), "connected": false }));
+            let (id, name) = match c {
+                Some(c) => (c.id(), c.label()),
+                None if kind == ConnKind::Rest && !mine.is_empty() => {
+                    (kind.as_str().to_string(), "Another REST API".to_string())
+                }
+                None => (kind.as_str().to_string(), kind.label().to_string()),
+            };
+            items.push(card(
+                &id,
+                &name,
+                does,
+                connector_state(c),
+                c.map(|c| c.updated_at.as_str()).unwrap_or(""),
+                "",
+                detail,
+            ));
+        }
     }
 
     // Teams.

@@ -1675,6 +1675,29 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
             let Some(mut r) = st.record(&a.team_id, &a.target_id).await? else {
                 return Ok(());
             };
+            // One fix per test: never write another while one is under way
+            // or its pull request is open.
+            let branch = format!("coderhelm/{}{}", FIX_TICKET_PREFIX.to_lowercase(), r.id);
+            if let Some(why) = fix_under_way(
+                &gh,
+                owner,
+                name,
+                &branch,
+                r.fix_status.as_deref(),
+                r.fix_phase_at.as_deref(),
+                r.fix_pr_url.as_deref(),
+            )
+            .await
+            {
+                info!(test = %r.id, "E2E fix asked again while one is under way — not starting another");
+                r.events.push(event(
+                    "flaky",
+                    "flaky",
+                    format!("{why} Not starting another (asked by {}).", a.actor),
+                ));
+                st.put_record(&a.team_id, &r).await?;
+                return Ok(());
+            }
             // Reproduce first, when the workflow can repeat a test.
             match dispatch_support(
                 &gh,
@@ -1726,6 +1749,23 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
             let Some(mut rec) = st.recommendation(&a.team_id, &a.target_id).await? else {
                 return Ok(());
             };
+            let branch = format!("coderhelm/{}{}", GEN_TICKET_PREFIX.to_lowercase(), rec.id);
+            let status = (rec.status == "generating").then_some("fixing");
+            if fix_under_way(
+                &gh,
+                owner,
+                name,
+                &branch,
+                status,
+                None,
+                rec.pr_url.as_deref(),
+            )
+            .await
+            .is_some()
+            {
+                info!(rec = %rec.id, "E2E test already being written or in an open PR — not writing it again");
+                return Ok(());
+            }
             let map_note = read_first(&gh, owner, name, TEST_MAP_PATHS, &default_branch)
                 .await
                 .map(|_| "Add the new test to the repo's test map (its area's tag on the test, and the area's paths) so it runs for the right changes.")
@@ -1774,6 +1814,55 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
         other => warn!(action = other, "Unknown E2E action"),
     }
     Ok(())
+}
+
+/// Why a fix for this test (or a generated test) must not start again: one is
+/// in progress (reproducing, being written, proving itself on its PR), or an
+/// open pull request already carries it. `None` when there's nothing, or
+/// when an in-progress mark is over a day old (a run that died).
+async fn fix_under_way(
+    gh: &GitHubClient,
+    owner: &str,
+    name: &str,
+    branch: &str,
+    status: Option<&str>,
+    phase_at: Option<&str>,
+    pr_url: Option<&str>,
+) -> Option<String> {
+    let stale = phase_at
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| chrono::Utc::now().signed_duration_since(t) > chrono::Duration::days(1));
+    if let Some(st) = status.filter(|s| in_progress(s)) {
+        if !stale || matches!(st, "opened" | "burn_in") {
+            return Some(match pr_url {
+                Some(u) => format!("A fix is already {}: {u}.", progress_words(st)),
+                None => format!("A fix is already {}.", progress_words(st)),
+            });
+        }
+    }
+    let prs = gh.list_open_pulls(owner, name).await.ok()?;
+    prs.as_array()?.iter().find_map(|p| {
+        let head = p["head"]["ref"].as_str().unwrap_or("");
+        (head == branch || head.starts_with(&format!("{branch}-"))).then(|| {
+            format!(
+                "A fix is already open: {}.",
+                p["html_url"].as_str().unwrap_or(head)
+            )
+        })
+    })
+}
+
+fn in_progress(status: &str) -> bool {
+    matches!(status, "reproducing" | "fixing" | "opened" | "burn_in")
+}
+
+fn progress_words(status: &str) -> &'static str {
+    match status {
+        "reproducing" => "being reproduced",
+        "fixing" => "being written",
+        "opened" => "open",
+        _ => "proving itself on its pull request",
+    }
 }
 
 /// Moves a generated test along: link its PR, prove it with repeat runs, and
