@@ -349,7 +349,12 @@ pub async fn list(
         if mine.is_empty() || connectors::nameable(*k) {
             // Adding another needs a name (the unnamed slot may be taken).
             let needs_name = *k == ConnKind::Rest || !mine.is_empty();
-            items.push(json!({ "kind": k.as_str(), "id": k.as_str(), "label": k.label(), "connected": false, "needs_name": needs_name }));
+            let id = if mine.is_empty() {
+                k.as_str().to_string()
+            } else {
+                format!("{}:", k.as_str())
+            };
+            items.push(json!({ "kind": k.as_str(), "id": id, "label": k.label(), "connected": false, "needs_name": needs_name }));
         }
     }
     let aws: Vec<Value> = aws_connections(&state, &claims.team_id)

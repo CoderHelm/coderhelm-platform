@@ -444,8 +444,9 @@ pub async fn list(
             );
             let (id, name) = match c {
                 Some(c) => (c.id(), c.label()),
+                // `kind:` so it never shares an id with a saved unnamed one.
                 None if !mine.is_empty() => {
-                    (kind.as_str().to_string(), format!("Another {}", kind.label()))
+                    (format!("{}:", kind.as_str()), format!("Another {}", kind.label()))
                 }
                 None => (kind.as_str().to_string(), kind.label().to_string()),
             };
