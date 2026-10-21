@@ -236,6 +236,11 @@ pub async fn handle(
         }
     };
 
+    // People's pushback on a CoderHelm review (a reply, a PR comment, a
+    // dismissal, a close over its change request) queues one judgment per PR.
+    super::review_lessons::on_webhook(&state, event_type, &payload, installation_id, &team_id)
+        .await;
+
     match event_type {
         "issues" => handle_issue_event(&state, &payload, installation_id, &team_id).await,
         "issue_comment" => handle_issue_comment(&state, &payload, installation_id, &team_id).await,

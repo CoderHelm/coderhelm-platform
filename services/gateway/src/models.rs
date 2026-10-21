@@ -179,6 +179,10 @@ pub enum WorkerMessage {
     /// happened and records a lesson when the fix belonged outside the code.
     #[serde(rename = "lesson")]
     Lesson(LessonMessage),
+    /// People pushed back on a CoderHelm review: the worker judges whether the
+    /// reviewer was wrong and keeps the lesson.
+    #[serde(rename = "review_lesson")]
+    ReviewLesson(ReviewLessonMessage),
     /// A person commented on a ticket CoderHelm worked on: the worker reads
     /// what the comment is before anything runs.
     #[serde(rename = "jira_comment")]
@@ -218,6 +222,20 @@ pub struct LessonMessage {
     pub pr_number: u64,
     /// `pr_closed` or `comment`.
     pub trigger: String,
+}
+
+/// A judgment of people's pushback on a review (must match the worker's
+/// `ReviewLessonMessage`).
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ReviewLessonMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub trigger: String,
+    /// The event's time (ms) on the PR's pending record.
+    pub event_at: i64,
 }
 
 /// A code-graph index job. `changed_files: None` ⇒ full index; `Some(paths)` ⇒

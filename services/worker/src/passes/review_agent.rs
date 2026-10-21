@@ -1254,7 +1254,14 @@ pub struct CriticContext<'a> {
     pub live_evidence: &'a str,
     /// The team's own instructions for this repository.
     pub team_instructions: &'a str,
+    /// Lessons learned from the team's own corrections of earlier reviews
+    /// (`common::review_lessons::recall_block`).
+    pub lessons: &'a str,
 }
+
+const LESSONS_CRITIC_NOTE: &str = " The prompt lists lessons learned from this team's own \
+     corrections of earlier reviews. A candidate that a lesson says is not a problem here is \
+     wrong for this team: DROP it, unless it is a real security or data-loss defect.";
 
 /// Critic pass: score each finding against the diff with claim-only context and
 /// DROP the weak/unsupported ones, and the ones people already settled on the
@@ -1273,6 +1280,7 @@ pub async fn critique_findings(
         answered: answered_context,
         live_evidence,
         team_instructions,
+        lessons,
     } = ctx;
     if findings.is_empty() {
         return findings;
@@ -1319,12 +1327,15 @@ pub async fn critique_findings(
     if !team.is_empty() {
         system.push_str(TEAM_CRITIC_NOTE);
     }
+    if !lessons.is_empty() {
+        system.push_str(LESSONS_CRITIC_NOTE);
+    }
     system.push_str(SOURCE_DATA_CRITIC_NOTE);
     system.push_str(PROOF_CRITIC_NOTE);
     system.push_str(COPY_CRITIC_NOTE);
     let system = system.as_str();
     let prompt = format!(
-        "## Diff\n{diff}\n{answered_context}{live_evidence}{team}\n\n## Candidate findings\n{list}"
+        "## Diff\n{diff}\n{answered_context}{live_evidence}{team}{lessons}\n\n## Candidate findings\n{list}"
     );
     let mut messages = vec![(
         "user".to_string(),
