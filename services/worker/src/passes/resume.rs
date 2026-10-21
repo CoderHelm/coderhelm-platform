@@ -15,6 +15,10 @@ const MAX_CI_FIX_CYCLES: usize = 10;
 const MAX_LOG_CHARS: usize = 15_000;
 /// Cap on how long a run may sit in awaiting_ci before being finalized.
 const MAX_AWAITING_CI_HOURS: i64 = 24;
+/// Times the CI wait loop may re-arm in one run (about a day of two-minute
+/// checks). Counted on the run record, so writing the record on every check
+/// can't reset it, as the wall-clock backstop's last-write age could.
+const MAX_RESUME_POLLS: i64 = 720;
 /// Halt the fix loop once the SAME failure has recurred this many times in a
 /// row. This is the real "stop thrashing" signal: if the errors don't change,
 /// the fixes are making no progress (noop commits, placeholder stubs, wrong
@@ -734,6 +738,18 @@ pub async fn run(
         .and_then(|v| v.as_s().ok())
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|t| t.with_timezone(&chrono::Utc));
+
+    // A run that opened pull requests in several repositories waits on each
+    // pull request's own CI: its record holds one repo and one branch, which
+    // needn't belong together (see `resume_multi_repo`).
+    let pr_urls: Vec<String> = run_record
+        .get("pr_urls")
+        .and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
+        .unwrap_or_default();
+    if pr_urls.len() > 1 {
+        return resume_multi_repo(state, &msg, &pr_urls, created_at).await;
+    }
 
     // Wall-clock backstop: the reschedule loop has no cycle cap of its own
     // (unlike CI fixes), so a check that never concludes would keep a run in
@@ -2458,9 +2474,165 @@ async fn requeue_after_model_error(
 
 /// Send a delayed resume message to the CI fix queue.
 /// `delay_seconds` can be 0 (immediate) or up to 900 (15 min, SQS max).
+/// CI for a run that opened pull requests in several repositories. Each
+/// pull request's own head is checked: all green, every one is marked ready
+/// and the run completes; any failure, the run is handed to a person (this
+/// loop fixes CI in one repository, not across several); otherwise it checks
+/// again later, within [`MAX_RESUME_POLLS`].
+async fn resume_multi_repo(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    pr_urls: &[String],
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let github = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    )?;
+    let mut open = Vec::new();
+    let mut failed = Vec::new();
+    let mut waiting = Vec::new();
+    for url in pr_urls {
+        let Some((owner, name, number)) = common::pr_outcome::parse_pr_url(url) else {
+            continue;
+        };
+        let pr = match github.get_pull_request(&owner, &name, number).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(run_id = %msg.run_id, pr = %url, error = %e, "Could not read a pull request — checking again later");
+                waiting.push(url.clone());
+                continue;
+            }
+        };
+        if pr["state"].as_str() == Some("closed") {
+            continue;
+        }
+        let head = pr["head"]["sha"].as_str().unwrap_or("").to_string();
+        match evaluate_ci_verdict(&github, &owner, &name, &head).await {
+            CiVerdict::Failed => failed.push(url.clone()),
+            CiVerdict::Pending => waiting.push(url.clone()),
+            CiVerdict::Green | CiVerdict::NoChecks => {}
+        }
+        open.push((owner, name, number));
+    }
+    let events = load_unprocessed_events(state, &msg.run_id)
+        .await
+        .unwrap_or_default();
+    let n_open = open.len();
+    let finish = |note: Option<String>| async move {
+        if let Some(n) = note {
+            super::add_progress_note(state, &msg.team_id, &msg.run_id, &n).await;
+        }
+        for (o, n, num) in &open {
+            mark_pr_ready(&github, o, n, *num).await;
+        }
+        mark_events_processed(state, &msg.run_id, &events).await;
+        set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
+    };
+    if !failed.is_empty() {
+        info!(run_id = %msg.run_id, failed = ?failed, "Multi-repo run: CI failed — handing off");
+        finish(Some(format!(
+            "CI failed on {}. Handed off for a person: CoderHelm fixes CI within one repository, not across several in one run.",
+            failed.join(", ")
+        )))
+        .await;
+        return Ok(());
+    }
+    if waiting.is_empty() {
+        info!(run_id = %msg.run_id, prs = n_open, "Multi-repo run: CI green on every pull request — completing");
+        finish(None).await;
+        return Ok(());
+    }
+    info!(run_id = %msg.run_id, waiting = ?waiting, "Multi-repo run: CI still running — checking again later");
+    send_delayed_resume(state, msg, 120).await;
+    Ok(())
+}
+
+/// Counts one more re-arm of the CI wait loop and says whether it may go on.
+async fn may_poll_again(state: &WorkerState, msg: &ResumeMessage) -> bool {
+    let polls = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .update_expression("ADD ci_resume_polls :one")
+        .expression_attribute_values(":one", AttributeValue::N("1".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.attributes)
+        .and_then(|a| {
+            a.get("ci_resume_polls")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<i64>().ok())
+        })
+        .unwrap_or(0);
+    polls <= MAX_RESUME_POLLS
+}
+
+/// Hands a run whose CI never concluded to a person: its pull requests are
+/// marked ready and the run completes with a note saying why.
+async fn hand_off_after_ci_wait(state: &WorkerState, msg: &ResumeMessage) {
+    let rec = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .unwrap_or_default();
+    let mut urls: Vec<String> = rec
+        .get("pr_urls")
+        .and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
+        .unwrap_or_default();
+    if let Some(u) = rec.get("pr_url").and_then(|v| v.as_s().ok()) {
+        if !u.is_empty() && !urls.contains(u) {
+            urls.push(u.clone());
+        }
+    }
+    if let Ok(github) = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    ) {
+        for u in &urls {
+            if let Some((o, n, num)) = common::pr_outcome::parse_pr_url(u) {
+                mark_pr_ready(&github, &o, &n, num).await;
+            }
+        }
+    }
+    super::add_progress_note(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        "CI didn't conclude after about a day of checks — handed off for a person",
+    )
+    .await;
+    let created_at = rec
+        .get("created_at")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
+}
+
 async fn send_delayed_resume(state: &WorkerState, msg: &ResumeMessage, delay_seconds: i32) {
     if state.config.ci_fix_queue_url.is_empty() {
         warn!("CI_FIX_QUEUE_URL not configured — cannot send delayed resume");
+        return;
+    }
+    if !may_poll_again(state, msg).await {
+        warn!(run_id = %msg.run_id, "CI wait loop reached its cap — handing off instead of checking again");
+        hand_off_after_ci_wait(state, msg).await;
         return;
     }
     // Final backstop: never re-arm the resume loop for a cancelled run.
