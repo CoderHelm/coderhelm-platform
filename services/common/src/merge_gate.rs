@@ -7,9 +7,12 @@
 //! gateway reads it to decide whether an event should wake the gate; only the
 //! worker writes it.
 
+/// Sort-key prefix of every gate record.
+pub const SK_PREFIX: &str = "MERGEGATE#";
+
 /// Settings-table sort key of a PR's gate record (pk = team id).
 pub fn record_sk(owner: &str, repo: &str, pr: u64) -> String {
-    format!("MERGEGATE#{owner}/{repo}#{pr:06}")
+    format!("{SK_PREFIX}{owner}/{repo}#{pr:06}")
 }
 
 /// Both keys are not in yet (CoderHelm's approval, a person's approval).
@@ -48,9 +51,70 @@ pub fn wakes_on_review(state: &str) -> bool {
     !matches!(state, STATE_MERGED | STATE_CLOSED | STATE_HEAD_MOVED)
 }
 
+/// Icons of the status comment's checklist lines (done, waiting, blocked).
+pub const ICON_DONE: &str = "✅";
+pub const ICON_WAITING: &str = "⏳";
+pub const ICON_BLOCKED: &str = "🔴";
+
+/// One line of the gate's checklist: `mark` is "done", "waiting" or
+/// "blocked".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecklistLine {
+    pub mark: &'static str,
+    pub text: String,
+}
+
+/// Pure: the checklist lines of a stored status comment body (`- ✅ CI
+/// green`), in order. Markdown code ticks are dropped so the dashboard can
+/// show the text as is.
+pub fn checklist(status_body: &str) -> Vec<ChecklistLine> {
+    status_body
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .filter_map(|l| {
+            let (mark, rest) = [
+                ("done", ICON_DONE),
+                ("waiting", ICON_WAITING),
+                ("blocked", ICON_BLOCKED),
+            ]
+            .into_iter()
+            .find_map(|(m, icon)| l.strip_prefix(icon).map(|r| (m, r)))?;
+            Some(ChecklistLine {
+                mark,
+                text: rest.trim().replace('`', ""),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checklist_reads_marked_lines_only() {
+        let body = "<!-- marker -->\n**Auto-merge** · waiting\n\n- ✅ CoderHelm approved\n\
+                    - ⏳ Waiting for a person's approval\n- 🔴 CI failing: `build`, `lint`\n\
+                    - plain bullet\n\nNot merging.";
+        assert_eq!(
+            checklist(body),
+            vec![
+                ChecklistLine {
+                    mark: "done",
+                    text: "CoderHelm approved".into()
+                },
+                ChecklistLine {
+                    mark: "waiting",
+                    text: "Waiting for a person's approval".into()
+                },
+                ChecklistLine {
+                    mark: "blocked",
+                    text: "CI failing: build, lint".into()
+                },
+            ]
+        );
+        assert!(checklist("").is_empty());
+    }
 
     #[test]
     fn record_key_is_zero_padded() {

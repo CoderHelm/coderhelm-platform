@@ -569,6 +569,171 @@ pub async fn list_reviews(
 }
 
 #[derive(serde::Deserialize)]
+pub struct LiveQuery {
+    repo: Option<String>,
+}
+
+/// Most PRs `GET /api/reviewer/live` returns.
+const LIVE_MAX_ROWS: usize = 200;
+
+/// `owner/repo` and the PR number from a per-PR sort key
+/// (`{PREFIX}{owner}/{repo}#{pr:06}`).
+fn pr_from_sk<'a>(sk: &'a str, prefix: &str) -> Option<(&'a str, u64)> {
+    let (repo, pr) = sk.strip_prefix(prefix)?.rsplit_once('#')?;
+    Some((repo, pr.parse().ok()?))
+}
+
+fn item_i64(item: &HashMap<String, AttributeValue>, k: &str) -> Option<i64> {
+    item.get(k)?.as_n().ok()?.parse().ok()
+}
+
+/// RFC 3339 time of epoch seconds (empty for none).
+fn rfc3339(secs: Option<i64>) -> String {
+    secs.and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_default()
+}
+
+/// Pure: one row per PR from the reviewer's live records and the auto-merge
+/// gate records, each with the one status it shows
+/// (`common::review_live::pr_status`). In-flight first, then waiting, then
+/// done; newest first within each.
+fn live_rows(
+    live: &[HashMap<String, AttributeValue>],
+    gates: &[HashMap<String, AttributeValue>],
+    now: i64,
+) -> Vec<Value> {
+    use common::review_live as rl;
+    type Pair<'a> = (
+        Option<&'a HashMap<String, AttributeValue>>,
+        Option<&'a HashMap<String, AttributeValue>>,
+    );
+    let mut prs: std::collections::BTreeMap<(String, u64), Pair> = Default::default();
+    // DynamoDB deletes expired items late; an expired one is gone already.
+    let current =
+        |it: &&HashMap<String, AttributeValue>| item_i64(it, "ttl").is_none_or(|t| t >= now);
+    let (live, gates): (Vec<_>, Vec<_>) = (
+        live.iter().filter(current).collect(),
+        gates.iter().filter(current).collect(),
+    );
+    for it in live {
+        if let Some((repo, pr)) = pr_from_sk(&item_str(it, "sk", ""), rl::SK_PREFIX) {
+            prs.entry((repo.to_string(), pr)).or_default().0 = Some(it);
+        }
+    }
+    for it in gates {
+        if let Some((repo, pr)) = pr_from_sk(&item_str(it, "sk", ""), common::merge_gate::SK_PREFIX)
+        {
+            prs.entry((repo.to_string(), pr)).or_default().1 = Some(it);
+        }
+    }
+    let mut rows: Vec<(u8, String, Value)> = prs
+        .into_iter()
+        .map(|((repo, pr), (l, g))| {
+            let phase = l
+                .map(|l| {
+                    rl::effective_phase(&item_str(l, "phase", ""), item_i64(l, "expires_at"), now)
+                        .to_string()
+                })
+                .unwrap_or_default();
+            let gate_state = g.map(|g| item_str(g, "state", "")).unwrap_or_default();
+            let st = rl::pr_status(&phase, &gate_state);
+            let review = l.map(|l| {
+                json!({
+                    "phase": phase,
+                    "kind": item_str(l, "kind", "review"),
+                    "trigger": item_str(l, "trigger", ""),
+                    "head_sha": item_str(l, "head_sha", ""),
+                    "attempt": item_num(l, "attempt", 0),
+                    "reason": item_str(l, "reason", ""),
+                    "queued_at": rfc3339(item_i64(l, "queued_at")),
+                    "started_at": rfc3339(item_i64(l, "started_at")),
+                    "finished_at": rfc3339(item_i64(l, "finished_at")),
+                })
+            });
+            let gate = g.map(|g| {
+                let checklist: Vec<Value> =
+                    common::merge_gate::checklist(&item_str(g, "status_body", ""))
+                        .into_iter()
+                        .map(|c| json!({ "mark": c.mark, "text": c.text }))
+                        .collect();
+                json!({
+                    "state": gate_state,
+                    "detail": item_str(g, "detail", ""),
+                    "head_sha": item_str(g, "head_sha", ""),
+                    "armed_at": rfc3339(item_i64(g, "armed_at")),
+                    "checklist": checklist,
+                })
+            });
+            // RFC 3339 in UTC from one writer each, so strings order by time.
+            let updated_at = [
+                l.map(|l| item_str(l, "updated_at", "")),
+                g.map(|g| item_str(g, "updated_at", "")),
+                g.map(|g| rfc3339(item_i64(g, "armed_at"))),
+            ]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or_default();
+            let rank = match st.group {
+                rl::GROUP_ACTIVE => 0,
+                rl::GROUP_WAITING => 1,
+                _ => 2,
+            };
+            let row = json!({
+                "repo": repo,
+                "pr_number": pr,
+                "pr_title": l.map(|l| item_str(l, "pr_title", "")).unwrap_or_default(),
+                "status": st.status,
+                "group": st.group,
+                "updated_at": updated_at,
+                "review": review,
+                "gate": gate,
+            });
+            (rank, updated_at, row)
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    rows.into_iter()
+        .take(LIVE_MAX_ROWS)
+        .map(|(_, _, row)| row)
+        .collect()
+}
+
+/// GET /api/reviewer/live?repo= — where the reviewer is with each PR it
+/// handles: queued, being reviewed, retrying, waiting for CI or people
+/// (auto-merge), merged, closed, or reviewed. One row per PR, from the
+/// review status records and the auto-merge gate records (both expire on
+/// their own).
+pub async fn live_prs(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<LiveQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let suffix = match q.repo.as_deref().filter(|r| !r.is_empty()) {
+        Some(r) => {
+            validate_repo(r)?;
+            format!("{r}#")
+        }
+        None => String::new(),
+    };
+    let live = items_under(
+        &state,
+        &claims.team_id,
+        &format!("{}{suffix}", common::review_live::SK_PREFIX),
+    )
+    .await?;
+    let gates = items_under(
+        &state,
+        &claims.team_id,
+        &format!("{}{suffix}", common::merge_gate::SK_PREFIX),
+    )
+    .await?;
+    let now = chrono::Utc::now().timestamp();
+    Ok(Json(json!({ "prs": live_rows(&live, &gates, now) })))
+}
+
+#[derive(serde::Deserialize)]
 pub struct ReviewKeyQuery {
     sk: String,
 }
@@ -740,6 +905,102 @@ mod tests {
         // Still valid UTF-8 (no panic) and actually shortened.
         assert!(s.contains("truncated"));
         assert!(s.starts_with('★'));
+    }
+
+    fn item(pairs: &[(&str, AttributeValue)]) -> HashMap<String, AttributeValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn live_rows_join_review_status_and_gate_per_pr() {
+        let now = 1_000_000;
+        let live = vec![
+            // Being reviewed now, and auto-merge was waiting on CI before.
+            item(&[
+                ("sk", attr_s("REVIEWLIVE#acme/web#000012")),
+                ("phase", attr_s("reviewing")),
+                ("expires_at", attr_n(now + 600)),
+                ("pr_title", attr_s("Add login page")),
+                ("updated_at", attr_s("2026-01-01T10:00:00+00:00")),
+            ]),
+            // A crashed review: past its expiry, it shows as stalled.
+            item(&[
+                ("sk", attr_s("REVIEWLIVE#acme/api#000003")),
+                ("phase", attr_s("reviewing")),
+                ("expires_at", attr_n(now - 1)),
+                ("updated_at", attr_s("2026-01-01T09:00:00+00:00")),
+            ]),
+            // Finished long ago; its record expired but wasn't deleted yet.
+            item(&[
+                ("sk", attr_s("REVIEWLIVE#acme/api#000001")),
+                ("phase", attr_s("done")),
+                ("ttl", attr_n(now - 10)),
+            ]),
+        ];
+        let body = "x\n- ✅ CoderHelm approved\n- ⏳ Waiting for a person's approval\n";
+        let gates = vec![
+            item(&[
+                ("sk", attr_s("MERGEGATE#acme/web#000012")),
+                ("state", attr_s("waiting_ci")),
+            ]),
+            item(&[
+                ("sk", attr_s("MERGEGATE#acme/web#000009")),
+                ("state", attr_s("waiting_approval")),
+                ("status_body", attr_s(body)),
+                ("updated_at", attr_s("2026-01-01T08:00:00+00:00")),
+            ]),
+            item(&[
+                ("sk", attr_s("MERGEGATE#acme/web#000007")),
+                ("state", attr_s("merged")),
+                ("updated_at", attr_s("2026-01-01T11:00:00+00:00")),
+            ]),
+        ];
+        let rows = live_rows(&live, &gates, now);
+        let summary: Vec<(String, u64, String, String)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["repo"].as_str().unwrap().to_string(),
+                    r["pr_number"].as_u64().unwrap(),
+                    r["status"].as_str().unwrap().to_string(),
+                    r["group"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let row = |repo: &str, pr: u64, status: &str, group: &str| {
+            (repo.to_string(), pr, status.to_string(), group.to_string())
+        };
+        assert_eq!(
+            summary,
+            vec![
+                row("acme/web", 12, "reviewing", "active"),
+                // Waiting: the stalled review (newer) before the gate on people.
+                row("acme/api", 3, "stalled", "waiting"),
+                row("acme/web", 9, "waiting_people", "waiting"),
+                row("acme/web", 7, "merged", "done"),
+            ]
+        );
+        assert_eq!(rows[0]["pr_title"], "Add login page");
+        assert_eq!(rows[0]["gate"]["state"], "waiting_ci");
+        assert_eq!(rows[2]["review"], Value::Null);
+        assert_eq!(rows[2]["gate"]["checklist"][1]["mark"], "waiting");
+        assert_eq!(
+            rows[2]["gate"]["checklist"][1]["text"],
+            "Waiting for a person's approval"
+        );
+    }
+
+    #[test]
+    fn pr_keys_parse_or_are_skipped() {
+        assert_eq!(
+            pr_from_sk("MERGEGATE#acme/web#000042", "MERGEGATE#"),
+            Some(("acme/web", 42))
+        );
+        assert_eq!(pr_from_sk("MERGEGATE#acme/web", "MERGEGATE#"), None);
+        assert_eq!(pr_from_sk("REVIEW#acme/web#000042", "MERGEGATE#"), None);
     }
 
     #[test]
@@ -949,7 +1210,7 @@ async fn items_under(
             .send()
             .await
             .map_err(|e| {
-                error!(error = %e, prefix, "Releases: query failed");
+                error!(error = %e, prefix, "Settings query failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
         out.extend(page.items.unwrap_or_default());

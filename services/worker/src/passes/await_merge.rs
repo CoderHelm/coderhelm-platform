@@ -231,9 +231,10 @@ pub(crate) enum Mark {
 impl Mark {
     fn icon(self) -> &'static str {
         match self {
-            Mark::Done => "✅",
-            Mark::Waiting => "⏳",
-            Mark::Blocked => "🔴",
+            // Shared with the dashboard's reading of the comment.
+            Mark::Done => common::merge_gate::ICON_DONE,
+            Mark::Waiting => common::merge_gate::ICON_WAITING,
+            Mark::Blocked => common::merge_gate::ICON_BLOCKED,
         }
     }
 }
@@ -1528,6 +1529,28 @@ mod ci_tests {
         assert!(a.contains("Commit abc1234 into main."));
         assert!(a.contains("- ✅ CoderHelm approved"));
         assert!(a.contains("- ⏳ Waiting for a person's approval"));
+    }
+
+    #[test]
+    fn dashboard_reads_back_the_rendered_checklist() {
+        let lines = vec![
+            (Mark::Done, "CoderHelm approved".to_string()),
+            (Mark::Blocked, "CI failing: `build`".to_string()),
+            (Mark::Waiting, "Waiting for a person's approval".to_string()),
+        ];
+        let body = render_status("abc1234", "main", &lines, Some("Not merging."));
+        let read: Vec<(&str, String)> = common::merge_gate::checklist(&body)
+            .into_iter()
+            .map(|l| (l.mark, l.text))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                ("done", "CoderHelm approved".to_string()),
+                ("blocked", "CI failing: build".to_string()),
+                ("waiting", "Waiting for a person's approval".to_string()),
+            ]
+        );
     }
 
     #[test]

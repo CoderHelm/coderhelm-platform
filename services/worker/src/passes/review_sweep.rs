@@ -373,6 +373,7 @@ async fn sweep_repo(
         }
         let msg = sweep_message(r, installation_id, owner, name, number, head);
         if super::review_pr::enqueue_review(state, &msg, 0).await {
+            super::review_pr::note_queued(state, &msg, 0).await;
             let line = format!("{}#{number}@{}: {why}", r.repo, &head[..head.len().min(7)]);
             info!(team_id = %r.team_id, repo = %r.repo, pr = number, head, why, "review_sweep_requeued: stuck review sent again");
             report.requeued.push(line);

@@ -310,6 +310,81 @@ pub(crate) async fn enqueue_review(
     }
 }
 
+/// A review job as the dashboard sees it (`common::review_live`): its id, and
+/// when it started. Only this job may end the status it set.
+pub(crate) struct LiveJob {
+    pub id: String,
+    pub started_at: i64,
+}
+
+impl LiveJob {
+    pub(crate) fn start() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            started_at: chrono::Utc::now().timestamp(),
+        }
+    }
+
+    /// The PR is being reviewed by this job now.
+    async fn reviewing(&self, state: &WorkerState, msg: &ReviewMessage, head: &str, title: &str) {
+        common::review_live::mark_reviewing(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            &common::review_live::Reviewing {
+                job: &self.id,
+                head_sha: head,
+                title,
+                trigger: &msg.trigger,
+                is_question: msg.question.is_some(),
+                attempt: msg.attempt,
+                budget_secs: REVIEW_LEASE_SECS as i64,
+            },
+        )
+        .await;
+    }
+
+    async fn finished(
+        &self,
+        state: &WorkerState,
+        msg: &ReviewMessage,
+        how: common::review_live::Finished<'_>,
+    ) {
+        common::review_live::mark_finished(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            &self.id,
+            self.started_at,
+            how,
+        )
+        .await;
+    }
+}
+
+/// Show a review job sent by the worker itself (the stuck-review sweep) as
+/// queued on the dashboard.
+pub(crate) async fn note_queued(state: &WorkerState, msg: &ReviewMessage, delay_secs: u64) {
+    common::review_live::mark_queued(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+        &msg.trigger,
+        msg.question.is_some(),
+        delay_secs as i64,
+    )
+    .await;
+}
+
 /// Runs one review job. A job that fails is retried or, after the last
 /// retry, reported on the PR; it never posts a verdict for a failure.
 pub async fn run(
@@ -326,26 +401,37 @@ pub async fn run(
         }
         return Ok(());
     }
+    let job = LiveJob::start();
     let mut reviewed_head = msg.head_sha.clone();
-    match run_budgeted(state, msg.clone(), &mut reviewed_head).await {
-        Ok(Outcome::Done { .. }) => Ok(()),
+    match run_budgeted(state, msg.clone(), &mut reviewed_head, &job).await {
+        Ok(Outcome::Done { .. }) => {
+            job.finished(state, &msg, common::review_live::Finished::Done)
+                .await;
+            Ok(())
+        }
         // A reply that disagrees with the standing formal verdict: the formal
         // review runs first, in this job, and the reply is posted after it so
         // the two never contradict each other.
         Ok(Outcome::ReviewThenReply { review, reply }) => {
             let mut head = review.head_sha.clone();
-            let formal = match run_budgeted(state, (*review).clone(), &mut head).await {
+            let formal = match run_budgeted(state, (*review).clone(), &mut head, &job).await {
                 Ok(Outcome::Done { posted, .. }) => FormalResult::Posted(posted),
                 Ok(Outcome::ReviewThenReply { .. }) => FormalResult::Posted(None),
                 Err(e) => {
-                    review_failed(state, &review, &head, &e.to_string()).await;
+                    review_failed(state, &review, &head, &e.to_string(), &job).await;
                     FormalResult::Failed
                 }
             };
-            post_reply(state, &msg, *reply, formal).await
+            let out = post_reply(state, &msg, *reply, formal).await;
+            // A failed formal review already shows its retry.
+            if formal != FormalResult::Failed {
+                job.finished(state, &msg, common::review_live::Finished::Done)
+                    .await;
+            }
+            out
         }
         Err(e) => {
-            review_failed(state, &msg, &reviewed_head, &e.to_string()).await;
+            review_failed(state, &msg, &reviewed_head, &e.to_string(), &job).await;
             Ok(())
         }
     }
@@ -489,7 +575,13 @@ async fn send_reply(
 /// A review didn't finish: log it (for the failed-review metric), then send
 /// it again or, once every retry failed, leave a note on the PR. Never a
 /// REQUEST_CHANGES, and never touches an earlier verdict.
-async fn review_failed(state: &WorkerState, msg: &ReviewMessage, head: &str, reason: &str) {
+async fn review_failed(
+    state: &WorkerState,
+    msg: &ReviewMessage,
+    head: &str,
+    reason: &str,
+    job: &LiveJob,
+) {
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     tracing::error!(
         team_id = %msg.team_id,
@@ -513,6 +605,16 @@ async fn review_failed(state: &WorkerState, msg: &ReviewMessage, head: &str, rea
         let (next, hop) = retry_message(msg, head, delay_secs);
         if enqueue_review(state, &next, hop).await {
             super::review_sweep::note_failure(state, msg, head, reason, false).await;
+            job.finished(
+                state,
+                msg,
+                common::review_live::Finished::Retrying {
+                    reason,
+                    retry_in_secs: delay_secs as i64,
+                    budget_secs: REVIEW_LEASE_SECS as i64,
+                },
+            )
+            .await;
             info!(
                 pr = msg.pr_number,
                 attempt = next.attempt,
@@ -531,6 +633,8 @@ async fn review_failed(state: &WorkerState, msg: &ReviewMessage, head: &str, rea
         "review_gave_up: every retry of the review failed"
     );
     super::review_sweep::note_failure(state, msg, head, reason, msg.question.is_none()).await;
+    job.finished(state, msg, common::review_live::Finished::Failed { reason })
+        .await;
     // Tell the PR once per head (or per question).
     let once = format!(
         "REVIEWFAILNOTE#{repo}#{:0>6}#{}",
@@ -576,6 +680,7 @@ async fn run_once(
     state: &WorkerState,
     mut msg: ReviewMessage,
     reviewed_head: &mut String,
+    live_job: &LiveJob,
 ) -> Result<Outcome, Box<dyn std::error::Error + Send + Sync>> {
     const DONE: Outcome = Outcome::Done {
         posted: None,
@@ -673,6 +778,9 @@ async fn run_once(
         info!(pr = msg.pr_number, head = %head_sha, "Reply re-review skipped — this commit is already being reviewed");
         return Ok(DONE);
     }
+
+    // Real work starts here: the dashboard shows the PR as being reviewed.
+    live_job.reviewing(state, &msg, &head_sha, title).await;
 
     // Build the diff (base...head compare gives per-file patches), bounded.
     let compare = github
@@ -1882,28 +1990,37 @@ pub async fn review_for_run(
         reconcile_note: None,
     };
     let mut reviewed_head = head_sha.to_string();
+    let job = LiveJob::start();
     let out = tokio::time::timeout(
         budget.min(std::time::Duration::from_secs(REVIEW_BUDGET_SECS)),
-        run_once(state, msg.clone(), &mut reviewed_head),
+        run_once(state, msg.clone(), &mut reviewed_head, &job),
     )
     .await;
+    use common::review_live::Finished;
     match out {
         Ok(Ok(Outcome::Done { run_review, .. })) => {
             settle_job_claim(state, &msg, true).await;
+            job.finished(state, &msg, Finished::Done).await;
             run_review
         }
         Ok(Ok(Outcome::ReviewThenReply { .. })) => {
             settle_job_claim(state, &msg, true).await;
+            job.finished(state, &msg, Finished::Done).await;
             None
         }
         Ok(Err(e)) => {
             warn!(pr = pr_number, error = %e, "Run's review of its own PR didn't finish");
             settle_job_claim(state, &msg, false).await;
+            let reason = e.to_string();
+            job.finished(state, &msg, Finished::Failed { reason: &reason })
+                .await;
             None
         }
         Err(_) => {
             warn!(pr = pr_number, "Run's review of its own PR ran out of time");
             settle_job_claim(state, &msg, false).await;
+            let reason = "the review ran out of time";
+            job.finished(state, &msg, Finished::Failed { reason }).await;
             None
         }
     }
@@ -2012,11 +2129,12 @@ async fn run_budgeted(
     state: &WorkerState,
     msg: ReviewMessage,
     reviewed_head: &mut String,
+    live_job: &LiveJob,
 ) -> Result<Outcome, Box<dyn std::error::Error + Send + Sync>> {
     let job = msg.clone();
     let out = match tokio::time::timeout(
         std::time::Duration::from_secs(REVIEW_BUDGET_SECS),
-        run_once(state, msg, reviewed_head),
+        run_once(state, msg, reviewed_head, live_job),
     )
     .await
     {
