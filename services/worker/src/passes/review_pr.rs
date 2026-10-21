@@ -1110,10 +1110,17 @@ async fn run_once(
     // ── Verdict mode (agentic: walk the repo, structured findings, self-critique) ──
     // Fold this team's past 👎 feedback into the prompt so the reviewer learns and
     // stops repeating rejected comment styles ("leave comments to learn").
+    // People's pushback on this PR still waiting out its quiet period is
+    // judged now, so this review already has what was learned from it.
+    super::review_lessons::settle_before_review(state, &provider, &github, &msg, &mut usage).await;
+    // Lessons from the team's own corrections of earlier reviews (repository
+    // and team-wide); given to the reviewer and to its critic.
+    let team_lessons =
+        super::review_lessons::recall(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
     let learning =
         load_learning_context(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
     let instructions_block = format!(
-        "{}{org_block}{extra}{learning}",
+        "{}{org_block}{extra}{learning}{team_lessons}",
         super::format_instructions_block(&repo_instructions)
     );
     let changed = review_agent::changed_right_lines(&compare);
@@ -1445,6 +1452,7 @@ async fn run_once(
             answered: &answered_context,
             live_evidence: &live_evidence,
             team_instructions: &team_instructions,
+            lessons: &team_lessons,
         },
         &mut usage,
     )

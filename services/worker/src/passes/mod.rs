@@ -716,6 +716,7 @@ pub mod review_agent;
 #[cfg(test)]
 mod review_eval;
 pub mod review_labels;
+pub mod review_lessons;
 pub mod review_pr;
 pub mod review_reminder;
 pub mod review_risk;

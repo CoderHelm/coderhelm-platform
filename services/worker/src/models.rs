@@ -200,6 +200,10 @@ pub enum WorkerMessage {
     /// merging, or a person said the fix was outside the code.
     #[serde(rename = "lesson")]
     Lesson(LessonMessage),
+    /// People pushed back on a CoderHelm review (a reply, a dismissal, a close
+    /// over its change request): judge whether the reviewer was wrong.
+    #[serde(rename = "review_lesson")]
+    ReviewLesson(ReviewLessonMessage),
     /// A person commented on a ticket CoderHelm worked on: read what the
     /// comment is before anything runs.
     #[serde(rename = "jira_comment")]
@@ -256,6 +260,23 @@ pub struct LessonMessage {
     pub attempts: u32,
 }
 
+/// A judgment of people's pushback on a CoderHelm review (gateway → worker,
+/// after a quiet period). Only the job for the PR's latest event judges.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ReviewLessonMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    /// What started it (`common::review_lessons::TRIGGER_*`).
+    #[serde(default)]
+    pub trigger: String,
+    /// The event's time (ms) on the PR's pending record.
+    #[serde(default)]
+    pub event_at: i64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct UsageReconcileMessage {
     /// `YYYY-MM-DD` (UTC) to compare; empty = yesterday.
@@ -279,6 +300,7 @@ impl WorkerMessage {
             WorkerMessage::PlanExecute(_) | WorkerMessage::PlanTaskContinue(_) => f::PLAN,
             WorkerMessage::InfraAnalyze(_) => f::INFRA,
             WorkerMessage::Review(_)
+            | WorkerMessage::ReviewLesson(_)
             | WorkerMessage::ReviewReminder
             | WorkerMessage::ReviewSweep => f::REVIEW,
             WorkerMessage::SkillSync(_) => f::SKILL_SYNC,

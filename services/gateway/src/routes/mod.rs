@@ -19,6 +19,7 @@ pub mod paging;
 pub mod plan_chat_tools;
 pub mod plans;
 pub mod plugins;
+pub mod review_lessons;
 pub mod reviewer;
 pub mod run_search;
 pub mod skills;

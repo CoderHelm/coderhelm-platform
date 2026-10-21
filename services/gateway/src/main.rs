@@ -200,6 +200,11 @@ async fn main() -> Result<(), Error> {
         .route("/reviewer/live", get(routes::reviewer::live_prs))
         .route("/reviewer/review/rate", post(routes::reviewer::rate_review))
         .route("/reviewer/re-review", post(routes::reviewer::re_review))
+        // What the reviewer learned from the team's pushback
+        .route(
+            "/reviewer/lessons",
+            get(routes::review_lessons::list_lessons).delete(routes::review_lessons::delete_lesson),
+        )
         .route("/releases", get(routes::reviewer::list_releases))
         .route("/releases/send", post(routes::reviewer::send_release))
         .route("/releases/pending", get(routes::reviewer::pending_releases))

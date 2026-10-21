@@ -180,6 +180,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Lesson failed: {e:?}");
             }
         }
+        models::WorkerMessage::ReviewLesson(msg) => {
+            info!(team_id = %msg.team_id, pr = msg.pr_number, trigger = %msg.trigger, "Judging pushback on a review");
+            if let Err(e) = passes::review_lessons::run(&state, msg).await {
+                error!("Review lesson failed: {e:?}");
+            }
+        }
         models::WorkerMessage::Onboard(msg) => {
             info!(team_id = %msg.team_id, repos = msg.repos.len(), "Processing onboard");
             let mut usage = models::TokenUsage::default();
