@@ -31,7 +31,8 @@ pub const CODER_RULES: &str = "
 - Never leave \"unconfirmed\", \"not verified\" or \"not measured\" for something a connected source could answer: look it up. When no connected source can reach it, say exactly which source is missing.
 
 ## Reading another system's data (every change that does)
-- Prefer the source system's structured fields and flags (booleans, type fields, numeric quantities, ids) over parsing names, titles or descriptions, which people can rename at any time. Parsing a name is a miss when the payload has a structured field that says the same thing.
+- Actual data first, always: before deciding how to read another system's records, read real ones (a payload, a row) for the ticket's records and a broad sample of others, and list every field on them. Decide from what you saw, never from names in the code, a schema or a guess.
+- Key logic on the source system's structured fields and flags (booleans, type fields, numeric quantities, ids), never on parsing names, titles or descriptions, which people rename at any time. Pattern matching or a regex on text is the last resort, only when the real records have no structured field that says the same thing. Then say so in the `Evidence:` section with the fields you checked, test the pattern against every live value (counts of matches and non-matches), and log a WARNING for records it doesn't match.
 - Survey a field across all live records, not only the ticket's. Group the records by shape, say what the field means in each group, and scope the rule with the source's own flag where meanings differ. Put the count per shape and one example id each in the `Evidence:` section.
 - When a record doesn't match the expected shape, don't silently fall back: log a WARNING with the record id and add a count to the run's summary. The INFO/DEBUG rule above is for expected records; an unexpected shape is a WARNING.
 - Tests: build fixtures from real payloads (trimmed, with the real field names and values), one per shape the survey found, and include a test that fails on the old code and passes on the new one.
@@ -178,8 +179,11 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      what values a field takes, uniqueness, ordering) that nothing in the lookups or the code \
      proves.\n\
      5. structured_field: a miss when the change reads another system's data by parsing a name, \
-     title or description while the payload has a structured field or flag (a boolean, a type, \
-     a quantity, an id) that says the same thing.\n\
+     title or description (a regex, a pattern, a substring) while the payload has a structured \
+     field or flag (a boolean, a type, a quantity, an id) that says the same thing, or when it \
+     parses text with no lookup of real records showing no such field exists. Parsing is \
+     acceptable only as a last resort: the lookups show the records have no structured field, \
+     the notes say so, and the pattern was checked against every live value.\n\
      6. survey: a miss when a rule about another system's field rests on the ticket's records \
      only, with no count of the live records per shape and one example id each, or applies one \
      meaning to records whose shapes differ without scoping it by the source's own flag.\n\
@@ -627,6 +631,10 @@ mod tests {
         assert!(CODER_RULES.contains("diagnostics go to DEBUG"));
         assert!(CODER_RULES.contains("say exactly which source is missing"));
         assert!(CODER_RULES.contains("structured fields and flags"));
+        // Real records come before any rule, and text matching is the last resort.
+        assert!(CODER_RULES.contains("Actual data first"));
+        assert!(CODER_RULES.contains("last resort"));
+        assert!(JUDGE_SYSTEM.contains("last resort"));
         assert!(CODER_RULES.contains("Survey a field across all live records"));
         assert!(CODER_RULES.contains("log a WARNING with the record id"));
         assert!(CODER_RULES.contains("fixtures from real payloads"));

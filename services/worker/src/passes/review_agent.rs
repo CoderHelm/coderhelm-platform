@@ -232,8 +232,10 @@ pub const PROOF_RULE: &str = "PROOF BEHIND THE CHANGE: check these things. (1) U
      field takes, uniqueness, ordering) that nothing in the PR proves. Check it with your tools \
      when you can; otherwise one \"question\" saying exactly what has to be confirmed. \
      (5) NAME PARSING: the logic reads another system's data by parsing a name, title or \
-     description while the payload has a structured field or flag (a boolean, a type, a \
-     quantity, an id) that says the same thing; people rename things. A \"correctness\" finding \
+     description (a regex, a pattern, a substring) while the payload has a structured field or \
+     flag (a boolean, a type, a quantity, an id) that says the same thing; people rename \
+     things. Parsing text is a last resort, acceptable only when real records show no such \
+     field exists and the PR says so with the pattern checked against every live value. A \"correctness\" finding \
      naming the field to use (confirm it with a live source when you can). (6) UNSURVEYED \
      FIELD: a rule about another system's field rests on the ticket's records only. With a live \
      source, group the live records by shape and report the count per shape with one example id \
