@@ -29,6 +29,14 @@ pub const CODER_RULES: &str = "
 - Measure the impact when the data is in a connected source: count the records the change affects, with a query, and note a few concrete examples (ids or names).
 - Logging: INFO only for actual changes and decisions; diagnostics go to DEBUG. Never add an INFO log that fires for every record or on every scheduled run.
 - Never leave \"unconfirmed\", \"not verified\" or \"not measured\" for something a connected source could answer: look it up. When no connected source can reach it, say exactly which source is missing.
+
+## Reading another system's data (every change that does)
+- Prefer the source system's structured fields and flags (booleans, type fields, numeric quantities, ids) over parsing names, titles or descriptions, which people can rename at any time. Parsing a name is a miss when the payload has a structured field that says the same thing.
+- Survey a field across all live records, not only the ticket's. Group the records by shape, say what the field means in each group, and scope the rule with the source's own flag where meanings differ. Put the count per shape and one example id each in the `Evidence:` section.
+- When a record doesn't match the expected shape, don't silently fall back: log a WARNING with the record id and add a count to the run's summary. The INFO/DEBUG rule above is for expected records; an unexpected shape is a WARNING.
+- Tests: build fixtures from real payloads (trimmed, with the real field names and values), one per shape the survey found, and include a test that fails on the old code and passes on the new one.
+- Existing bad records are corrected by the normal pipeline or job on its next run. No manual backfills or one-off scripts unless unavoidable; then list them in the verification steps.
+- Fix the rule, never the one record: no hard-coded ids, names, seasons or prices.
 ";
 
 /// How the coder ends: its evidence becomes the PR description's.
@@ -106,10 +114,12 @@ impl RunEvidence {
     }
 }
 
-/// One of the four things the gate judges.
+/// One of the things the gate judges.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Finding {
-    /// `external_fact`, `impact`, `logging` or `assumption`.
+    /// One of the judge's points: `external_fact`, `impact`, `logging`,
+    /// `assumption`, `structured_field`, `survey`, `silent_fallback`,
+    /// `fixtures`, `one_record` or `team_rule`.
     pub point: String,
     /// What is missing and what would prove or fix it.
     pub detail: String,
@@ -122,6 +132,12 @@ impl Finding {
             "impact" => "Impact not measured",
             "logging" => "Noisy logging",
             "assumption" => "Unproven assumption",
+            "structured_field" => "Name parsed where a structured field exists",
+            "survey" => "Field not surveyed across live records",
+            "silent_fallback" => "Unexpected data handled silently",
+            "fixtures" => "Tests not built from real payloads",
+            "one_record" => "Fixes one record, not the rule",
+            "team_rule" => "Breaks the team's instructions",
             other => other,
         }
     }
@@ -143,7 +159,7 @@ struct Judged {
 
 /// The judge's system prompt.
 pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request opens. You judge \
-     four points from the evidence you are given: the diff, the plan, the data sources the team \
+     the points below from the evidence you are given: the diff, the plan, the data sources the team \
      connected, every lookup the run made with what came back, and the coder's evidence notes \
      (they become the PR description's evidence).\n\
      1. external_fact: the change relies on a field, value or behaviour of a system it does not \
@@ -161,22 +177,47 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      4. assumption: a miss when the change rests on an assumption (what another system sends, \
      what values a field takes, uniqueness, ordering) that nothing in the lookups or the code \
      proves.\n\
+     5. structured_field: a miss when the change reads another system's data by parsing a name, \
+     title or description while the payload has a structured field or flag (a boolean, a type, \
+     a quantity, an id) that says the same thing.\n\
+     6. survey: a miss when a rule about another system's field rests on the ticket's records \
+     only, with no count of the live records per shape and one example id each, or applies one \
+     meaning to records whose shapes differ without scoping it by the source's own flag.\n\
+     7. silent_fallback: a miss when the change quietly falls back (a default, a skip) on data \
+     that doesn't match the expected shape, instead of a WARNING log with the record id and a \
+     count in the run's summary. A WARNING for an unexpected shape is not noisy logging.\n\
+     8. fixtures: a miss when the change alters how another system's data is handled and its \
+     tests use invented payloads instead of trimmed real ones (one per shape found), or no test \
+     fails on the old code.\n\
+     9. one_record: a miss when the change hard-codes ids, names, seasons or prices to fix the \
+     ticket's records, or corrects existing records with a manual backfill or one-off script \
+     the normal pipeline could do on its next run (an unavoidable one must be in the \
+     verification steps).\n\
+     10. team_rule: when the team's instructions are given, a miss when the change breaks one \
+     of them (name the rule). Where they conflict with the points above, the team's win.\n\
      Many changes touch none of these: a change that relies on nothing outside its own code, \
-     changes no stored records and adds no logs passes all four. Judge only what the evidence \
+     changes no stored records and adds no logs passes all of them. Judge only what the evidence \
      shows and do not invent concerns. A fact the lookups confirm is proven even when the notes \
      are short. Each finding names the exact field, records, log line or assumption, and what \
      would settle it (which connected source to read, what to count, which log to lower).\n\
-     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption\",\"detail\":\"...\"}]}. \
-     An empty list when all four pass.";
+     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule\",\"detail\":\"...\"}]}. \
+     An empty list when all pass.";
 
 /// The judge's prompt: the change and everything the run gathered.
-pub fn judge_prompt(title: &str, plan_context: &str, diff: &str, evidence: &RunEvidence) -> String {
+pub fn judge_prompt(
+    title: &str,
+    plan_context: &str,
+    diff: &str,
+    evidence: &RunEvidence,
+    team_instructions: &str,
+) -> String {
     format!(
-        "# Change for: {title}\n\n## Plan\n{plan}\n\n{evidence}\n## The diff\n{diff}\n",
+        "# Change for: {title}\n\n## Plan\n{plan}{team}\n\n{evidence}\n## The diff\n{diff}\n",
         plan = match plan_context.trim() {
             "" => "(no plan carried into this check)",
             p => p,
         },
+        team = super::team_instructions_block(team_instructions),
         evidence = evidence.for_judge(),
     )
 }
@@ -228,7 +269,10 @@ pub fn fix_feedback(findings: &[Finding]) -> String {
         "Before the pull request opens, the check of what this change rests on found these gaps. \
          Settle each one: look the fact up through a connected data source and quote what came \
          back, count the affected records and name a few, lower per-record or per-run INFO logs \
-         to DEBUG, or change the code so it no longer depends on what you can't prove. When no \
+         to DEBUG, read the structured field instead of a name, survey the live records by \
+         shape, warn on unexpected shapes, build fixtures from real payloads, fix the rule instead \
+         of the record, follow the team's instructions, or change the code so it no longer \
+         depends on what you can't prove. When no \
          connected source can answer, say which source is missing. Then write your `Evidence:` \
          section again in full.\n\n{}",
         lines.join("\n")
@@ -283,7 +327,13 @@ pub async fn judge(
             return None;
         }
     };
-    let prompt = judge_prompt(&msg.title, &plan_context(plan), &diff, evidence);
+    let prompt = judge_prompt(
+        &msg.title,
+        &plan_context(plan),
+        &diff,
+        evidence,
+        &msg.team_instructions,
+    );
     match provider::converse_simple(
         state,
         provider,
@@ -513,18 +563,40 @@ mod tests {
             lookups: vec!["- Asked warehouse: select count(*) ...\n  Came back: 42".into()],
             notes: "Evidence: 42 records affected".into(),
         };
-        let p = judge_prompt("Fix sync", "Use the vendor field", "+ x", &ev);
+        let p = judge_prompt("Fix sync", "Use the vendor field", "+ x", &ev, "");
         assert!(p.contains("warehouse (database)"));
         assert!(p.contains("Came back: 42"));
         assert!(p.contains("Evidence: 42 records affected"));
         assert!(p.contains("## The diff\n+ x"));
-        let empty = judge_prompt("t", "", "", &RunEvidence::default());
+        let empty = judge_prompt("t", "", "", &RunEvidence::default(), "");
+        assert!(!empty.contains("team's instructions"));
         assert!(empty.contains("(none connected)"));
         assert!(empty.contains("(no lookups were made)"));
         assert!(empty.contains("(the coder wrote none)"));
-        for point in ["external_fact", "impact", "logging", "assumption"] {
+        for point in [
+            "external_fact",
+            "impact",
+            "logging",
+            "assumption",
+            "structured_field",
+            "survey",
+            "silent_fallback",
+            "fixtures",
+            "one_record",
+            "team_rule",
+        ] {
             assert!(JUDGE_SYSTEM.contains(point), "{point}");
+            assert_ne!(finding(point, "x").label(), point, "{point} has a label");
         }
+        assert!(JUDGE_SYSTEM.contains("A WARNING for an unexpected shape is not noisy logging"));
+    }
+
+    #[test]
+    fn the_judge_holds_the_change_to_the_teams_instructions_when_set() {
+        let team = "Every PR description has a Rollback section.";
+        let p = judge_prompt("t", "plan", "+ x", &RunEvidence::default(), team);
+        assert!(p.contains("## Your team's instructions"));
+        assert!(p.contains(team));
     }
 
     #[test]
@@ -554,6 +626,12 @@ mod tests {
         assert!(CODER_RULES.contains("count the records the change affects"));
         assert!(CODER_RULES.contains("diagnostics go to DEBUG"));
         assert!(CODER_RULES.contains("say exactly which source is missing"));
+        assert!(CODER_RULES.contains("structured fields and flags"));
+        assert!(CODER_RULES.contains("Survey a field across all live records"));
+        assert!(CODER_RULES.contains("log a WARNING with the record id"));
+        assert!(CODER_RULES.contains("fixtures from real payloads"));
+        assert!(CODER_RULES.contains("No manual backfills or one-off scripts"));
+        assert!(CODER_RULES.contains("no hard-coded ids, names, seasons or prices"));
         assert!(EVIDENCE_OUTPUT.contains("`Evidence:`"));
     }
 }

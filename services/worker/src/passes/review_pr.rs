@@ -808,6 +808,14 @@ async fn run_once(
     } else {
         format!("\n\n## Org-wide review standards (apply to every repo)\n{org_instructions}")
     };
+    // The team's working rules for this repository are the standard every PR
+    // in it is held to, a person's or CoderHelm's. Loaded once per review.
+    let team_instructions =
+        super::load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    let org_block = format!(
+        "{org_block}{}",
+        review_agent::team_rules_block(&team_instructions)
+    );
 
     // No model key set up is the team's setup, not a service error: there
     // is nothing to retry.
@@ -1436,6 +1444,7 @@ async fn run_once(
             require_tests: cfg.require_tests,
             answered: &answered_context,
             live_evidence: &live_evidence,
+            team_instructions: &team_instructions,
         },
         &mut usage,
     )
@@ -3509,5 +3518,24 @@ mod reply_prompt_tests {
         assert!(p.contains("never tell a person you can't approve"));
         assert!(p.contains("auto-merge policy"));
         assert!(p.contains("test something by hand is a note"));
+    }
+
+    /// The team's instructions ride with the org standards into both the
+    /// reply and the formal review (`instructions_block`), for any PR.
+    #[test]
+    fn the_reviewer_prompt_carries_the_teams_instructions_when_set() {
+        let team = "Every test uses the fixtures helper in tests/support.";
+        let org = super::review_agent::team_rules_block(team);
+        let p = super::reply_system_prompt("acme", "web", "", &org, "");
+        assert!(p.contains("## Your team's instructions"));
+        assert!(p.contains(team));
+        let none = super::reply_system_prompt(
+            "acme",
+            "web",
+            "",
+            &super::review_agent::team_rules_block(""),
+            "",
+        );
+        assert!(!none.contains("team's instructions"));
     }
 }

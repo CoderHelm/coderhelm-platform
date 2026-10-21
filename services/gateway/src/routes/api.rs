@@ -3322,7 +3322,9 @@ fn attr_bool(val: bool) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::Bool(val)
 }
 
-const MAX_INSTRUCTIONS_BYTES: usize = 10_240; // 10KB limit
+/// Teams keep their working playbooks here (testing, logging, PR and commit
+/// conventions), which run past 10 KB; every agent in a run reads them.
+const MAX_INSTRUCTIONS_BYTES: usize = 32_768; // 32 KB limit
 
 /// GET /api/instructions/global — get global custom instructions.
 pub async fn get_global_instructions(

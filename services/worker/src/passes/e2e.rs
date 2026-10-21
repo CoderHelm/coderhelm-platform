@@ -1568,6 +1568,7 @@ async fn start_fix_ticket(
         ticket_update_note: None,
         ticket_history_note: None,
         plan_cache_key: None,
+        team_instructions: String::new(),
         person_direction: None,
     };
     match enqueue(state, crate::models::WorkerMessage::Ticket(ticket)).await {
@@ -1811,6 +1812,7 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
                 ticket_update_note: None,
                 ticket_history_note: None,
                 plan_cache_key: None,
+                team_instructions: String::new(),
                 person_direction: None,
             };
             enqueue(state, crate::models::WorkerMessage::Ticket(ticket)).await?;

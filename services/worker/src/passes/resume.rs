@@ -1145,6 +1145,15 @@ pub async fn run(
         ticket_update_note: None,
         ticket_history_note: None,
         plan_cache_key: None,
+        // Loaded once here; the fix and review rounds below read it from
+        // the message.
+        team_instructions: super::load_team_instructions(
+            state,
+            &msg.team_id,
+            &repo_owner,
+            &repo_name,
+        )
+        .await,
         person_direction: None,
     };
 

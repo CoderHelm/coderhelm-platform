@@ -12,7 +12,7 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-21.prove-assumptions";
+pub const PLANNER_VERSION: &str = "2026-10-21.team-rules-everywhere";
 
 /// The cached plan's file holding its key.
 pub const PLAN_KEY_FILE: &str = "plan_key.txt";
@@ -37,35 +37,6 @@ pub fn plan_cache_key(
         history_digest,
         &instructions,
     ])
-}
-
-/// The team's own instructions for this repository, as people wrote them in
-/// CoderHelm: the team-wide ones, then the repository's. Empty when none.
-pub async fn team_instructions(
-    state: &WorkerState,
-    team_id: &str,
-    owner: &str,
-    name: &str,
-) -> String {
-    let global = super::load_content(state, team_id, "INSTRUCTIONS#GLOBAL").await;
-    let repo =
-        super::load_content(state, team_id, &format!("INSTRUCTIONS#REPO#{owner}/{name}")).await;
-    [global.trim(), repo.trim()]
-        .iter()
-        .filter(|s| !s.is_empty())
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-/// The planner's section for the team's instructions.
-fn team_instructions_block(text: &str) -> String {
-    if text.trim().is_empty() {
-        return String::new();
-    }
-    format!(
-        "\n\n## Your team's instructions (follow them; they know this system better than the code shows)\n{text}"
-    )
 }
 
 /// Result of the plan pass: the four openspec files.
@@ -119,9 +90,7 @@ pub async fn run(
             .join("\n")
     };
 
-    let team_block = team_instructions_block(
-        &team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await,
-    );
+    let team_block = super::team_instructions_block(&msg.team_instructions);
     let instructions_block = if repo_instructions.is_empty() {
         String::new()
     } else {
