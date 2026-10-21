@@ -394,18 +394,24 @@ export class WorkerStack extends cdk.Stack {
     // short-lived credentials, so CI stores no model key and never touches a
     // team's key. Least privilege: GitHub's OIDC token from this repository's
     // main branch only (the nightly schedule and manual runs both run there),
-    // and the one permission to invoke the one eval model. Nothing else in the
-    // account is readable.
+    // and the one permission to invoke two models: the cheap eval model for
+    // the classification checks, and the model the reviewer runs on in
+    // production for the diff reviews (a small model passes cases the
+    // production reviewer fails). Nothing else in the account is readable.
     const githubOidc = iam.OpenIdConnectProvider.fromOpenIdConnectProviderArn(
       this,
       "GithubActionsOidc",
       `arn:aws:iam::${this.account}:oidc-provider/token.actions.githubusercontent.com`,
     );
     const evalModel = "anthropic.claude-haiku-4-5-20251001-v1:0";
+    // The reviewer's model (the worker's MODEL_ID default above, which
+    // generate_review and the critic run on). Keep EVAL_REVIEW_MODEL in
+    // .github/workflows/reviewer-evals.yml in step with it.
+    const evalReviewModel = "anthropic.claude-opus-5-5";
     const evalRole = new iam.Role(this, "ReviewerEvalsRole", {
       roleName: `${prefix}-reviewer-evals`,
       description:
-        "Nightly reviewer evals (GitHub Actions, main branch): invoke the eval model on Bedrock",
+        "Nightly reviewer evals (GitHub Actions, main branch): invoke the eval and reviewer models on Bedrock",
       maxSessionDuration: cdk.Duration.hours(1),
       assumedBy: new iam.WebIdentityPrincipal(githubOidc.openIdConnectProviderArn, {
         StringEquals: {
@@ -418,12 +424,12 @@ export class WorkerStack extends cdk.Stack {
     evalRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ["bedrock:InvokeModel"],
-        resources: [
-          // The US cross-region inference profile and the model it routes to
-          // (any of the profile's regions).
-          `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/us.${evalModel}`,
-          `arn:aws:bedrock:*::foundation-model/${evalModel}`,
-        ],
+        // For each model, the US cross-region inference profile and the
+        // model it routes to (any of the profile's regions).
+        resources: [evalModel, evalReviewModel].flatMap((model) => [
+          `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/us.${model}`,
+          `arn:aws:bedrock:*::foundation-model/${model}`,
+        ]),
       }),
     );
     new cdk.CfnOutput(this, "ReviewerEvalsRoleArn", { value: evalRole.roleArn });

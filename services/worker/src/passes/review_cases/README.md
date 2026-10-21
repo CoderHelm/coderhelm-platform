@@ -27,7 +27,9 @@ case, so the same class of mistake can't come back silently.
   when it fails. It holds no model key: GitHub's OIDC token becomes
   short-lived credentials for the `coderhelm-prod-reviewer-evals` role
   (`infra/lib/worker-stack.ts`), which only this repo's main branch can
-  assume and which may only invoke the eval model on Bedrock
+  assume and which may only invoke the eval model (Haiku, for the
+  classification checks) and the reviewer's production model (Opus, for the
+  diff reviews) on Bedrock
   (`EVAL_PROVIDER=bedrock`). Locally: `EVAL_PROVIDER=bedrock` with AWS
   credentials, or `ANTHROPIC_API_KEY` with your own key.
   A case with a `live_review` is also reviewed end to end (see
@@ -80,8 +82,9 @@ checks every `live_review` on every PR.
 
 The diff in `diff` is what `format_diff` produces; keep `files` to the
 files the case needs. `EVAL_REVIEW_MODEL` picks the reviewing model (default
-`EVAL_MODEL`). A small model can pass a case the production reviewer model
-fails, so check a new case against the model the reviewer runs on.
+`EVAL_MODEL`); the nightly run sets it to the reviewer's production model.
+A small model can pass a case the production reviewer model fails, so check
+a new case against the model the reviewer runs on.
 
 ## Add a case from a real PR (one step)
 

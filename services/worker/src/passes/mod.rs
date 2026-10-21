@@ -658,12 +658,13 @@ fn sanitize_error(msg: &str) -> String {
             break;
         }
     }
-    // Remove model IDs — any `claude-…` token, so new models never leak.
+    // Remove model IDs — any `claude-…` token, so new models never leak,
+    // including Bedrock ids (`us.anthropic.claude-…-v1:0`).
     s = s
         .split(' ')
         .filter(|w| {
-            !w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-')
-                .starts_with("claude-")
+            let w = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+            !common::usage::normalize_model(w).starts_with("claude-")
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -7631,6 +7632,16 @@ mod sanitize_error_tests {
             out.starts_with("An error occurred during processing"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn strips_bedrock_model_ids() {
+        let out = sanitize_error(
+            "Bedrock error on us.anthropic.claude-opus-5-5, fell back from \
+             global.anthropic.claude-haiku-4-5-20251001-v1:0.",
+        );
+        assert!(!out.contains("claude-"), "{out}");
+        assert!(!out.contains("anthropic."), "{out}");
     }
 }
 

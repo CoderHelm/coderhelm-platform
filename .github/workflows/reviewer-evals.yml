@@ -2,15 +2,17 @@ name: Reviewer evals (live)
 
 # The model-in-the-loop layer of the reviewer evals: the recorded comments
 # and replies in services/worker/src/passes/review_cases are read by the real
-# model, and each must land in its case's outcome class. The deterministic
+# model, and each must land in its case's outcome class; each case's diff
+# (live_review) is reviewed with the reviewer's own prompt and critic. The deterministic
 # layer runs on every PR in CI; this one costs model calls, so it runs
 # nightly. A failure opens an issue.
 #
 # Model access: no model key is stored in GitHub. The job exchanges GitHub's
 # OIDC token for short-lived AWS credentials of the `coderhelm-prod-reviewer-evals`
 # role (infra/lib/worker-stack.ts). That role trusts only this repository's
-# main branch and may only invoke the one eval model on Amazon Bedrock; the
-# evals send the same Messages requests the worker sends to Anthropic.
+# main branch and may only invoke the eval model and the reviewer's model on
+# Amazon Bedrock; the evals send the same Messages requests the worker sends
+# to Anthropic.
 
 on:
   schedule:
@@ -47,7 +49,11 @@ jobs:
       - name: Run the live evals
         env:
           EVAL_PROVIDER: bedrock
+          # Classification checks: the cheap model.
           EVAL_MODEL: us.anthropic.claude-haiku-4-5-20251001-v1:0
+          # Diff reviews: the model the reviewer runs on in production
+          # (infra/lib/worker-stack.ts evalReviewModel).
+          EVAL_REVIEW_MODEL: us.anthropic.claude-opus-5-5
         run: cargo test -p worker review_eval -- --ignored --nocapture 2>&1 | tee eval.log
         shell: bash -o pipefail {0}
       - name: Open an issue on failure
