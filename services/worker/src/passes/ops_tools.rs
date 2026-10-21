@@ -1015,7 +1015,7 @@ impl OpsTools {
                 }
                 .get(s("path").unwrap_or(""), input.get("query"))
                 .await?;
-                Ok((a.text, a.asked))
+                Ok((a.text, a.size))
             }
             // Handled above, through the AWS accounts.
             ConnKind::Metrics | ConnKind::Airflow => Err(StepError::new(

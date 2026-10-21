@@ -146,7 +146,27 @@ pub struct Answer {
     pub asked: String,
     pub text: String,
     pub hidden: usize,
+    /// How much came back, for the activity log ("12 items", "0 items").
+    pub size: String,
 }
+
+/// The records in a reply: a top-level list, or the list under a `data`,
+/// `items` or `results` key. `None` when the reply holds no such list.
+fn items(v: &Value) -> Option<usize> {
+    match v {
+        Value::Array(a) => Some(a.len()),
+        Value::Object(o) => ["data", "items", "results"]
+            .iter()
+            .find_map(|k| o.get(*k).and_then(Value::as_array).map(Vec::len)),
+        _ => None,
+    }
+}
+
+/// Said to the agent with an empty list: many APIs answer a path with a
+/// wrong parent id as an empty list, not a 404.
+const EMPTY_NOTE: &str = "\n\n(The API answered with an empty list. If you expected records \
+     here, an id in the path may belong to another record or parent: find where the team's \
+     code builds this path and which ids it puts in it, then read again.)";
 
 impl Rest<'_> {
     /// One GET of `path` (under an allowed prefix) with `query`.
@@ -205,19 +225,36 @@ impl Rest<'_> {
                 ))
             }
         }
-        let (text, hidden) = match reply.json() {
+        let (text, hidden, found) = match reply.json() {
             Some(mut v) => {
                 let mut terms: Vec<String> = DEFAULT_HIDDEN.iter().map(|s| s.to_string()).collect();
                 terms.extend(self.conn.hidden_fields.iter().cloned());
                 let n = redact_all(&mut v, &hidden_terms(&terms));
-                (serde_json::to_string_pretty(&v).unwrap_or_default(), n)
+                let found = items(&v);
+                (
+                    serde_json::to_string_pretty(&v).unwrap_or_default(),
+                    n,
+                    found,
+                )
             }
-            None => redact_text(&reply.body),
+            None => {
+                let (t, n) = redact_text(&reply.body);
+                (t, n, None)
+            }
         };
+        let size = match found {
+            Some(n) => crate::live::count(n, "item"),
+            None => crate::live::count(text.chars().count(), "character"),
+        };
+        let mut text = clip(&text, MAX_CHARS);
+        if found == Some(0) {
+            text.push_str(EMPTY_NOTE);
+        }
         Ok(Answer {
             asked,
-            text: clip(&text, MAX_CHARS),
+            text,
             hidden,
+            size,
         })
     }
 }
@@ -319,6 +356,29 @@ mod tests {
         assert!(a.text.contains("\"facility\": \"North\""), "{}", a.text);
         assert!(!a.text.contains("a@b.co"));
         assert!(!a.text.contains("k-123"), "the key never comes back");
+    }
+
+    #[tokio::test]
+    async fn an_empty_list_is_counted_and_flagged_to_the_agent() {
+        let http = Fake::answering(vec![
+            (200, r#"{"data":[],"meta":{"totalItems":0}}"#),
+            (200, r#"{"data":[{"id":1},{"id":2}]}"#),
+            (200, r#"{"id":12,"name":"Pottery 1"}"#),
+        ]);
+        let c = conn();
+        let r = Rest {
+            conn: &c,
+            key: "k",
+            http: &http,
+        };
+        let empty = r.get("/v1/org/7/programs/1/sessions", None).await.unwrap();
+        assert_eq!(empty.size, "0 items");
+        assert!(empty.text.contains("empty list"), "{}", empty.text);
+        let two = r.get("/v1/org/7/programs/2/sessions", None).await.unwrap();
+        assert_eq!(two.size, "2 items");
+        assert!(!two.text.contains("empty list"));
+        let one = r.get("/v1/org/7/programs/12", None).await.unwrap();
+        assert!(one.size.ends_with("characters"), "{}", one.size);
     }
 
     #[tokio::test]

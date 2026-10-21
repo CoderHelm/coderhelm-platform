@@ -1032,7 +1032,7 @@ impl LiveSources {
                     a.text,
                     a.hidden,
                     started.elapsed().as_millis(),
-                    String::new(),
+                    a.size,
                 ))
             }
             Kind::Search => {
