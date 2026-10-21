@@ -20,6 +20,7 @@ pub mod plan_chat_tools;
 pub mod plans;
 pub mod plugins;
 pub mod reviewer;
+pub mod run_search;
 pub mod skills;
 pub mod sns;
 pub mod tests;
