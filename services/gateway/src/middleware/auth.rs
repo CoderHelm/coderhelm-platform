@@ -4,13 +4,20 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::auth::jwt;
 use crate::AppState;
 
 /// Session TTL: 7 days. Used by both token creation and cookie Max-Age.
 pub const SESSION_TTL_SECS: u64 = 604_800;
+
+/// How often a member's "last seen" is written while they use the app. A
+/// session renews itself, so people who stay signed in never sign in again:
+/// activity, not sign-ins, says who uses CoderHelm.
+const SEEN_EVERY: Duration = Duration::from_secs(3600);
 
 /// Extract and validate JWT from cookie, inject Claims into request extensions.
 /// Implements a sliding session: if the token is past 50% of its lifetime,
@@ -37,6 +44,7 @@ pub async fn require_auth(
     let token_age = now.saturating_sub(claims.iat);
     let needs_refresh = token_age > SESSION_TTL_SECS / 2;
 
+    note_activity(&state, &claims.team_id, &claims.sub).await;
     req.extensions_mut().insert(claims.clone());
     let mut response = next.run(req).await;
 
@@ -69,6 +77,62 @@ pub async fn require_auth(
     }
 
     Ok(response)
+}
+
+/// Whether to write `last_seen_at` for this member now: at most once per
+/// [`SEEN_EVERY`] per member in this instance (each instance writes on its own,
+/// so it's at most once an hour per instance).
+fn due_to_note(
+    seen: &mut HashMap<(String, String), Instant>,
+    key: (String, String),
+    now: Instant,
+) -> bool {
+    match seen.get(&key) {
+        Some(at) if now.duration_since(*at) < SEEN_EVERY => false,
+        _ => {
+            // Keep the map small in a long-lived instance.
+            if seen.len() > 10_000 {
+                seen.retain(|_, at| now.duration_since(*at) < SEEN_EVERY);
+            }
+            seen.insert(key, now);
+            true
+        }
+    }
+}
+
+/// Records that the member is using the app (shown on the team page). One
+/// attribute, only on a record that exists; a failure is ignored.
+async fn note_activity(state: &AppState, team_id: &str, user_id: &str) {
+    static SEEN: OnceLock<Mutex<HashMap<(String, String), Instant>>> = OnceLock::new();
+    if team_id.is_empty() || user_id.is_empty() {
+        return;
+    }
+    let due = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut m| {
+            due_to_note(
+                &mut m,
+                (team_id.to_string(), user_id.to_string()),
+                Instant::now(),
+            )
+        })
+        .unwrap_or(false);
+    if !due {
+        return;
+    }
+    use aws_sdk_dynamodb::types::AttributeValue;
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(user_id.to_string()))
+        .update_expression("SET last_seen_at = :now")
+        .condition_expression("attribute_exists(pk)")
+        .expression_attribute_values(":now", AttributeValue::S(chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await;
 }
 
 /// The member's role on their record now; `None` when they are no longer on
@@ -118,6 +182,21 @@ fn extract_cookie<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_is_noted_once_an_hour_per_member() {
+        let mut seen = HashMap::new();
+        let t0 = Instant::now();
+        let a = || ("TEAM#1".to_string(), "u1".to_string());
+        assert!(due_to_note(&mut seen, a(), t0));
+        assert!(!due_to_note(&mut seen, a(), t0 + Duration::from_secs(60)));
+        assert!(due_to_note(&mut seen, ("TEAM#1".into(), "u2".into()), t0));
+        assert!(due_to_note(
+            &mut seen,
+            a(),
+            t0 + SEEN_EVERY + Duration::from_secs(1)
+        ));
+    }
 
     #[test]
     fn test_extract_cookie() {
