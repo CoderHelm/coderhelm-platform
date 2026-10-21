@@ -165,12 +165,13 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "reviews",
-        label: "Ask for a re-review, rate reviews and send release notes",
+        label: "Ask for a re-review, rate reviews, send release notes and release now",
         min_role: "member",
         handlers: &[
             "reviewer::re_review",
             "reviewer::rate_review",
             "reviewer::send_release",
+            "reviewer::release_now",
         ],
     },
     Capability {

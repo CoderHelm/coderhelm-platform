@@ -167,6 +167,7 @@ pub async fn after_tag(
             sha: sha.to_string(),
             resend: String::new(),
             check_branch: false,
+            attempt: 0,
         },
     )
     .await;
@@ -192,6 +193,11 @@ pub fn tag_on_branch(compare_status_branch_vs_tag: &str) -> bool {
 }
 
 pub async fn enqueue(state: &WorkerState, msg: &ReleaseNotesMessage) -> bool {
+    enqueue_after(state, msg, 0).await
+}
+
+/// Enqueue `msg` to run after `delay_secs` (at most 900).
+async fn enqueue_after(state: &WorkerState, msg: &ReleaseNotesMessage, delay_secs: i32) -> bool {
     if state.config.ticket_queue_url.is_empty() {
         return false;
     }
@@ -209,6 +215,7 @@ pub async fn enqueue(state: &WorkerState, msg: &ReleaseNotesMessage) -> bool {
         .send_message()
         .queue_url(&state.config.ticket_queue_url)
         .message_body(body)
+        .delay_seconds(delay_secs)
         .send()
         .await
     {
@@ -630,11 +637,70 @@ pub async fn run(
         .key("sk", attr_s(&lock))
         .send()
         .await;
-    if let Err(e) = &result {
-        warn!(%msg.tag, error = %e, "Release notes failed");
-        alert_teams(state, &cfg, owner, repo, &msg.tag, &e.to_string()).await;
+    let record_sk = format!("RELEASE#{owner}/{repo}#{}", msg.tag);
+    match &result {
+        Ok(()) => note_failure(state, &msg.team_id, &record_sk, None).await,
+        Err(e) => {
+            warn!(%msg.tag, attempt = msg.attempt, error = %e, "Release notes failed");
+            note_failure(state, &msg.team_id, &record_sk, Some(&e.to_string())).await;
+            // Try again (finishing only what's missing) before alerting: most
+            // failures are a service that was briefly down or rate limited.
+            let retried = msg.attempt + 1 < MAX_NOTES_ATTEMPTS && {
+                let next = ReleaseNotesMessage {
+                    attempt: msg.attempt + 1,
+                    // A full rewrite that failed halfway finishes the rest;
+                    // redoing it would send the email twice.
+                    resend: if msg.resend == "all" {
+                        String::new()
+                    } else {
+                        msg.resend.clone()
+                    },
+                    ..msg.clone()
+                };
+                enqueue_after(state, &next, notes_retry_delay(next.attempt)).await
+            };
+            if !retried {
+                alert_teams(state, &cfg, owner, repo, &msg.tag, &e.to_string()).await;
+            }
+        }
     }
     result
+}
+
+/// Runs of one tag's notes before a failure is alerted.
+const MAX_NOTES_ATTEMPTS: u32 = 3;
+
+/// Wait before retry `attempt` (1-based): 2, then 10 minutes.
+fn notes_retry_delay(attempt: u32) -> i32 {
+    if attempt <= 1 {
+        120
+    } else {
+        600
+    }
+}
+
+/// Keeps the latest failure on the release's record for the Releases page
+/// (`None` clears it after a run that finished).
+async fn note_failure(state: &WorkerState, team_id: &str, record_sk: &str, error: Option<&str>) {
+    let table = &state.config.settings_table_name;
+    let req = state
+        .dynamo
+        .update_item()
+        .table_name(table)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(record_sk));
+    let req = match error {
+        Some(e) => req
+            .update_expression(
+                "SET last_error = :e, failed_at = :t, updated_at = if_not_exists(updated_at, :t)",
+            )
+            .expression_attribute_values(":e", attr_s(common::truncate_str(e, 1_000)))
+            .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339())),
+        None => req
+            .update_expression("REMOVE last_error, failed_at")
+            .condition_expression("attribute_exists(last_error)"),
+    };
+    let _ = req.send().await;
 }
 
 async fn run_locked(

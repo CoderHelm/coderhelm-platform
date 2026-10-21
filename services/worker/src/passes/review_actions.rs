@@ -501,8 +501,14 @@ async fn schedule_tag_sweep(
     base_branch: &str,
 ) -> bool {
     let marker = format!("TAGSWEEP#{owner}/{repo}");
+    let now = chrono::Utc::now().timestamp() as u64;
+    let window = cfg.tag_batch_minutes as u64 * 60;
     // TTL past the window so a crashed sweep can't wedge the marker for long.
-    let ttl = chrono::Utc::now().timestamp() as u64 + (cfg.tag_batch_minutes as u64 * 60) + 3_600;
+    let ttl = now + window + 3_600;
+    let sweep_id = ulid::Ulid::new().to_string();
+    // The marker also describes the waiting release for the dashboard (when
+    // it fires, how many merges it holds) and carries what "Release now"
+    // needs to cut it early.
     let claimed = match state
         .dynamo
         .put_item()
@@ -510,6 +516,11 @@ async fn schedule_tag_sweep(
         .item("pk", super::attr_s(team_id))
         .item("sk", super::attr_s(&marker))
         .item("ttl", super::attr_n(ttl))
+        .item("sweep_id", super::attr_s(&sweep_id))
+        .item("fires_at", super::attr_n(now + window))
+        .item("base_branch", super::attr_s(base_branch))
+        .item("pr_number", super::attr_n(pr_number))
+        .item("merges", super::attr_n(1))
         .condition_expression("attribute_not_exists(pk)")
         .send()
         .await
@@ -521,7 +532,19 @@ async fn schedule_tag_sweep(
                 .map(|se| se.is_conditional_check_failed_exception())
                 .unwrap_or(false);
             if conflict {
-                return false; // a sweep is already armed — fold in silently
+                // A sweep is already armed — fold in, and count the merge.
+                let _ = state
+                    .dynamo
+                    .update_item()
+                    .table_name(&state.config.settings_table_name)
+                    .key("pk", super::attr_s(team_id))
+                    .key("sk", super::attr_s(&marker))
+                    .update_expression("ADD merges :one")
+                    .condition_expression("attribute_exists(pk)")
+                    .expression_attribute_values(":one", super::attr_n(1))
+                    .send()
+                    .await;
+                return false;
             }
             warn!(error = %e, "Tag sweep claim errored — arming anyway (fail-open)");
             true
@@ -535,7 +558,11 @@ async fn schedule_tag_sweep(
             repo_name: repo.to_string(),
             base_branch: base_branch.to_string(),
             pr_number,
-            delay_remaining_secs: cfg.tag_batch_minutes as u64 * 60,
+            delay_remaining_secs: window,
+            sweep_id,
+            manual: false,
+            claimed: false,
+            attempt: 0,
         };
         enqueue_tag_sweep(state, &msg).await;
     }
@@ -584,7 +611,7 @@ async fn enqueue_tag_sweep(state: &WorkerState, msg: &crate::models::TagSweepMes
 /// — and, when enabled, schedules the post-deploy health guard against that tag.
 pub async fn run_tag_sweep(
     state: &WorkerState,
-    msg: crate::models::TagSweepMessage,
+    mut msg: crate::models::TagSweepMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Still inside the window — wait another hop (a single SQS delay is capped).
     if msg.delay_remaining_secs > SQS_MAX_DELAY_SECS {
@@ -600,19 +627,16 @@ pub async fn run_tag_sweep(
 
     // Open the NEXT window BEFORE reading HEAD/tagging: any merge that lands from
     // here on must arm a fresh sweep rather than be silently folded into this one
-    // (which is about to finish). The worst case is a second sweep at the same
-    // HEAD, which `cut_tag_if_new` no-ops.
-    let _ = state
-        .dynamo
-        .delete_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", super::attr_s(&msg.team_id))
-        .key("sk", super::attr_s(&marker))
-        .send()
-        .await;
+    // (which is about to finish). Removing the marker by this window's id is
+    // also the claim: when "Release now" already released the window, the
+    // delayed sweep finds it gone and stops.
+    if !msg.claimed && !claim_window(state, &msg.team_id, &marker, &msg.sweep_id).await {
+        info!(repo = %format!("{owner}/{repo}"), "Tag sweep: window already released — skipped");
+        return Ok(());
+    }
 
     let cfg = OnApproveConfig::load(state, &msg.team_id, owner, repo).await;
-    if !cfg.auto_tag {
+    if !cfg.auto_tag && !msg.manual {
         info!(repo = %format!("{owner}/{repo}"), "Tag sweep: auto_tag disabled mid-window — nothing to cut");
         return Ok(());
     }
@@ -624,16 +648,45 @@ pub async fn run_tag_sweep(
         &state.http,
     )?;
 
+    // "Release now" with nothing waiting doesn't know the branch yet.
+    if msg.base_branch.is_empty() {
+        match github
+            .get_default_branch(&msg.repo_owner, &msg.repo_name)
+            .await
+        {
+            Ok(b) => msg.base_branch = b,
+            Err(e) => {
+                retry_or_record(
+                    state,
+                    &msg,
+                    &format!("Couldn't read the default branch: {e}"),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    }
+
     // Tag the branch's CURRENT head — every merge in the window is included.
     let head = match github.get_ref(owner, repo, &msg.base_branch).await {
         Ok(sha) => sha,
         Err(e) => {
             warn!(error = %e, base = %msg.base_branch, "Tag sweep: could not resolve base-branch head");
+            retry_or_record(
+                state,
+                &msg,
+                &format!("Couldn't read the head of {}: {e}", msg.base_branch),
+            )
+            .await;
             return Ok(());
         }
     };
 
-    match cut_tag_if_new(&github, &cfg, owner, repo, &head).await {
+    let cut = cut_tag_if_new(&github, &cfg, owner, repo, &head).await;
+    if cut.is_ok() {
+        clear_failure(state, &msg.team_id, owner, repo).await;
+    }
+    match cut {
         Ok(Some(tag)) => {
             info!(%tag, repo = %format!("{owner}/{repo}"), "Batched release tag cut");
             super::release_notes::after_tag(
@@ -671,15 +724,114 @@ pub async fn run_tag_sweep(
             info!(repo = %format!("{owner}/{repo}"), "Tag sweep: HEAD already tagged — skipped")
         }
         Err(e) => {
-            warn!(error = %e, repo = %format!("{owner}/{repo}"), "Tag sweep: create tag failed")
+            warn!(error = %e, repo = %format!("{owner}/{repo}"), "Tag sweep: create tag failed");
+            retry_or_record(state, &msg, &format!("GitHub refused the release tag: {e}")).await;
         }
     }
     Ok(())
 }
 
+/// Failed cuts retried before the failure is shown on the Releases page.
+const MAX_TAG_ATTEMPTS: u32 = 3;
+
+/// Wait before retry `attempt` (1-based): 1, 5, then 15 minutes.
+fn tag_retry_delay(attempt: u32) -> u64 {
+    match attempt {
+        0 | 1 => 60,
+        2 => 300,
+        _ => SQS_MAX_DELAY_SECS,
+    }
+}
+
+/// Removes the repo's waiting-release marker when it still belongs to
+/// `sweep_id` (any marker for a sweep without an id). False when another
+/// sweep already released this window. A failed call claims anyway: a second
+/// sweep at the same HEAD cuts nothing.
+async fn claim_window(state: &WorkerState, team_id: &str, marker: &str, sweep_id: &str) -> bool {
+    let mut del = state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", super::attr_s(team_id))
+        .key("sk", super::attr_s(marker));
+    if !sweep_id.is_empty() {
+        del = del
+            .condition_expression("sweep_id = :id")
+            .expression_attribute_values(":id", super::attr_s(sweep_id));
+    }
+    match del.send().await {
+        Ok(_) => true,
+        Err(e) => !e
+            .as_service_error()
+            .map(|se| se.is_conditional_check_failed_exception())
+            .unwrap_or(false),
+    }
+}
+
+/// A cut that failed (GitHub down, a ruleset refusing the tag): try again
+/// with a backoff, and after the last try record it for the Releases page,
+/// where "Release now" retries it.
+async fn retry_or_record(state: &WorkerState, msg: &crate::models::TagSweepMessage, error: &str) {
+    let owner = &msg.repo_owner;
+    let repo = &msg.repo_name;
+    if msg.attempt + 1 < MAX_TAG_ATTEMPTS {
+        let mut next = msg.clone();
+        next.claimed = true;
+        next.attempt += 1;
+        next.delay_remaining_secs = tag_retry_delay(next.attempt);
+        info!(repo = %format!("{owner}/{repo}"), attempt = next.attempt, "Tag sweep: retrying the release");
+        if enqueue_tag_sweep(state, &next).await {
+            return;
+        }
+    }
+    warn!(repo = %format!("{owner}/{repo}"), error, "Tag sweep: release blocked — recorded");
+    let _ = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", super::attr_s(&msg.team_id))
+        .item("sk", super::attr_s(&format!("TAGFAIL#{owner}/{repo}")))
+        .item("error", super::attr_s(common::truncate_str(error, 1_000)))
+        .item("failed_at", super::attr_s(&chrono::Utc::now().to_rfc3339()))
+        .item("base_branch", super::attr_s(&msg.base_branch))
+        .item("pr_number", super::attr_n(msg.pr_number))
+        .item("attempts", super::attr_n(msg.attempt + 1))
+        .send()
+        .await;
+}
+
+async fn clear_failure(state: &WorkerState, team_id: &str, owner: &str, repo: &str) {
+    let _ = state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", super::attr_s(team_id))
+        .key("sk", super::attr_s(&format!("TAGFAIL#{owner}/{repo}")))
+        .send()
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_release_backs_off_then_is_recorded() {
+        assert_eq!(tag_retry_delay(1), 60);
+        assert_eq!(tag_retry_delay(2), 300);
+        assert_eq!(tag_retry_delay(9), SQS_MAX_DELAY_SECS);
+        assert_eq!(MAX_TAG_ATTEMPTS, 3);
+    }
+
+    #[test]
+    fn sweeps_armed_before_ids_still_parse() {
+        let m: crate::models::TagSweepMessage = serde_json::from_value(serde_json::json!({
+            "team_id": "T", "installation_id": 1, "repo_owner": "o", "repo_name": "r",
+            "base_branch": "main", "pr_number": 3, "delay_remaining_secs": 0
+        }))
+        .unwrap();
+        assert!(m.sweep_id.is_empty() && !m.manual && !m.claimed && m.attempt == 0);
+    }
 
     fn rv(login: &str, state: &str, commit: &str) -> serde_json::Value {
         serde_json::json!({"user": {"login": login}, "state": state, "commit_id": commit})
