@@ -704,6 +704,7 @@ pub mod plan_chat;
 pub mod plan_execute;
 mod pr;
 pub mod pr_outcomes;
+mod proof;
 pub mod quarantine;
 pub mod release_notes;
 pub(crate) mod repo_pick;
@@ -2108,6 +2109,14 @@ async fn run_passes(
         implement::ImplementResult {
             files_modified,
             conversation_log: vec![],
+            // The first attempt's lookups weren't kept; the proof check's
+            // fix round can make them again.
+            evidence: proof::RunEvidence {
+                notes: "(This run resumed from a checkpoint: the first attempt's lookups and \
+                        notes are not available.)"
+                    .to_string(),
+                ..Default::default()
+            },
         }
     } else {
         check_cancelled(state, &msg.team_id, run_id).await?;
@@ -3618,6 +3627,29 @@ async fn run_passes(
     // Security findings are already posted as PR review comments and stored in the
     // run record — no need to duplicate the full audit text into long-term memory.
 
+    // --- Proof check (before PR — what the change rests on is proven) ---
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "review").await?;
+    let mut evidence = impl_result.evidence.clone();
+    let gaps = proof::prove(
+        &proof::Work {
+            state,
+            msg,
+            github: &github,
+            plan: &plan_result,
+            branch: &branch_name,
+            rules: &rules,
+            repo_instructions: &repo_instructions,
+            provider: &provider,
+            file_cache: &file_cache,
+            run_id,
+        },
+        &mut evidence,
+        usage,
+        || has_time_for_remediation(start),
+    )
+    .await;
+
     // --- Create Draft PR (triggers CI) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "pr").await?;
@@ -3638,6 +3670,10 @@ async fn run_passes(
         &branch_name,
         &plan_result,
         &voice,
+        &pr::Proof {
+            evidence: &evidence.for_pr(),
+            gaps: &proof::gaps_section(&gaps),
+        },
         &provider,
         usage,
         run_id,
@@ -4093,6 +4129,29 @@ async fn run_repo_pipeline(
     // Security findings are already posted as PR review comments and stored in the
     // run record — no need to duplicate the full audit text into long-term memory.
 
+    // --- Proof check ---
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    update_pass(state, &msg.team_id, run_id, "review").await?;
+    let mut evidence = impl_result.evidence.clone();
+    let gaps = proof::prove(
+        &proof::Work {
+            state,
+            msg,
+            github,
+            plan: &repo_plan,
+            branch: branch_name,
+            rules,
+            repo_instructions,
+            provider,
+            file_cache,
+            run_id,
+        },
+        &mut evidence,
+        usage,
+        || has_time_for_remediation(start),
+    )
+    .await;
+
     // --- Create Draft PR ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "pr").await?;
@@ -4112,6 +4171,10 @@ async fn run_repo_pipeline(
         branch_name,
         &repo_plan,
         voice,
+        &pr::Proof {
+            evidence: &evidence.for_pr(),
+            gaps: &proof::gaps_section(&gaps),
+        },
         provider,
         usage,
         run_id,

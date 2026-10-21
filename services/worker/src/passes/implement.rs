@@ -20,6 +20,8 @@ const MAX_CHECKS_PER_RUN: usize = 6;
 pub struct ImplementResult {
     pub files_modified: Vec<String>,
     pub conversation_log: Vec<serde_json::Value>,
+    /// What the pass could read, looked up, and wrote as its evidence.
+    pub evidence: super::proof::RunEvidence,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -152,56 +154,17 @@ pub async fn run(
         )
     };
 
-    let prompt = if complexity == "simple" {
-        format!(
-            r#"Implement for issue #{number}: {title}
-{design}{continuation}{openspec}{files_hint}{feedback}{issue}
-
-## Instructions — SIMPLE CHANGE
-Go DIRECTLY to the target files listed in the OpenSpec.
-- Use `read_file_lines` on the exact section, make the change with `edit_file`, done.
-- Use `edit_file` for modifying existing files (search/replace). Only use `write_file` for new files.
-- You should need 2-5 tool calls total.
-- Only implement the listed tasks. Do not add extras.
-- NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
-- After implementing, output a one-line summary."#,
-            number = msg.issue_number,
-            title = msg.title,
-            design = design_note,
-            continuation = continuation_note,
-            openspec = openspec_block,
-            files_hint = files_hint,
-            feedback = feedback_section,
-            issue = issue_source_block,
-        )
-    } else {
-        format!(
-            r#"Implement the following tasks for issue #{number}: {title}
-{design}{continuation}{openspec}{feedback}{issue}
-
-## Instructions
-- Use `search_code` to find exact files and lines before reading. Prefer `read_file_lines` over `read_file`.
-- Use `edit_file` for modifying existing files (search/replace edits). Only use `write_file` for creating new files.
-- Implement each unchecked task (`- [ ]`) in the Tasks section, one at a time, in order.
-- Refer to the Design section for which files to modify and patterns to follow.
-- Validate your changes against the Acceptance Criteria.
-- Use `batch_write` for atomic multi-file changes (new files or when edit_file won't work).
-- Follow existing code patterns exactly (imports, naming, structure, test style).
-- NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
-- NEVER delete existing functions, methods, or logic unless the task explicitly requires removing them. Modify code, don't gut it.
-- After implementing all tasks, output a one-line summary (e.g. "Implemented auth middleware and updated 3 route files"). Do NOT describe each change in detail.
-- Only implement the listed tasks. Do not add extras.
-{schema_rules}"#,
-            number = msg.issue_number,
-            title = msg.title,
-            design = design_note,
-            continuation = continuation_note,
-            openspec = openspec_block,
-            feedback = feedback_section,
-            issue = issue_source_block,
-            schema_rules = SCHEMA_CHANGE_RULES,
-        )
-    };
+    let prompt = task_prompt(&TaskPrompt {
+        simple: complexity == "simple",
+        number: msg.issue_number,
+        title: &msg.title,
+        design: design_note,
+        continuation: continuation_note,
+        openspec: &openspec_block,
+        files_hint: &files_hint,
+        feedback: &feedback_section,
+        issue: &issue_source_block,
+    });
 
     // Execution sandbox: construct the driver (if configured) and derive the
     // repo's real check command ONCE, up front, so the agent can verify against
@@ -698,7 +661,8 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 
     let mut conv_log: Vec<serde_json::Value> = Vec::new();
 
-    provider::converse(
+    // The coder's closing reply: its summary and `Evidence:` section.
+    let closing = provider::converse(
         state,
         provider,
         model_id,
@@ -858,10 +822,101 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         .cloned()
         .collect();
 
+    // What this pass could read and what it looked up, for the check before
+    // the PR opens and for the PR description.
+    let mut sources = Vec::new();
+    let mut lookups = Vec::new();
+    if let Some(l) = &live {
+        sources.extend(l.connected());
+        lookups.extend(l.lookups());
+    }
+    if let Some(o) = &ops {
+        sources.extend(o.connected());
+        lookups.extend(o.lookups());
+    }
     Ok(ImplementResult {
         files_modified: files,
         conversation_log: conv_log,
+        evidence: super::proof::RunEvidence {
+            sources,
+            lookups,
+            notes: closing.trim().to_string(),
+        },
     })
+}
+
+/// The parts of the coder's task prompt.
+struct TaskPrompt<'a> {
+    simple: bool,
+    number: u64,
+    title: &'a str,
+    design: &'a str,
+    continuation: &'a str,
+    openspec: &'a str,
+    files_hint: &'a str,
+    feedback: &'a str,
+    issue: &'a str,
+}
+
+/// The coder's task prompt. Every change, simple or not, carries the rules
+/// for proving what it rests on and ends with an `Evidence:` section, which
+/// the check before the PR judges and the PR description reports.
+fn task_prompt(p: &TaskPrompt) -> String {
+    if p.simple {
+        format!(
+            r#"Implement for issue #{number}: {title}
+{design}{continuation}{openspec}{files_hint}{feedback}{issue}
+
+## Instructions — SIMPLE CHANGE
+Go DIRECTLY to the target files listed in the OpenSpec.
+- Use `read_file_lines` on the exact section, make the change with `edit_file`, done.
+- Use `edit_file` for modifying existing files (search/replace). Only use `write_file` for new files.
+- You should need 2-5 tool calls total, plus any lookups the rules below call for.
+- Only implement the listed tasks. Do not add extras.
+- NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
+- {evidence_output}
+{proof_rules}"#,
+            number = p.number,
+            title = p.title,
+            design = p.design,
+            continuation = p.continuation,
+            openspec = p.openspec,
+            files_hint = p.files_hint,
+            feedback = p.feedback,
+            issue = p.issue,
+            evidence_output = super::proof::EVIDENCE_OUTPUT,
+            proof_rules = super::proof::CODER_RULES,
+        )
+    } else {
+        format!(
+            r#"Implement the following tasks for issue #{number}: {title}
+{design}{continuation}{openspec}{feedback}{issue}
+
+## Instructions
+- Use `search_code` to find exact files and lines before reading. Prefer `read_file_lines` over `read_file`.
+- Use `edit_file` for modifying existing files (search/replace edits). Only use `write_file` for creating new files.
+- Implement each unchecked task (`- [ ]`) in the Tasks section, one at a time, in order.
+- Refer to the Design section for which files to modify and patterns to follow.
+- Validate your changes against the Acceptance Criteria.
+- Use `batch_write` for atomic multi-file changes (new files or when edit_file won't work).
+- Follow existing code patterns exactly (imports, naming, structure, test style).
+- NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
+- NEVER delete existing functions, methods, or logic unless the task explicitly requires removing them. Modify code, don't gut it.
+- {evidence_output}
+- Only implement the listed tasks. Do not add extras.
+{proof_rules}{schema_rules}"#,
+            number = p.number,
+            title = p.title,
+            design = p.design,
+            continuation = p.continuation,
+            openspec = p.openspec,
+            feedback = p.feedback,
+            issue = p.issue,
+            evidence_output = super::proof::EVIDENCE_OUTPUT,
+            proof_rules = super::proof::CODER_RULES,
+            schema_rules = SCHEMA_CHANGE_RULES,
+        )
+    }
 }
 
 /// What a change to a table's schema, constraints, ids or stored data must
@@ -2482,5 +2537,41 @@ mod migration_registry_tests {
         assert!(unregistered_migrations(&changed, &[registered]).is_empty());
         // No registry in the directory (e.g. migrations found by glob): nothing to check.
         assert!(unregistered_migrations(&changed, &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod task_prompt_tests {
+    use super::{task_prompt, TaskPrompt, SCHEMA_CHANGE_RULES};
+    use crate::passes::proof::{CODER_RULES, EVIDENCE_OUTPUT};
+
+    fn prompt(simple: bool) -> String {
+        task_prompt(&TaskPrompt {
+            simple,
+            number: 7,
+            title: "Show the product's display name",
+            design: "",
+            continuation: "",
+            openspec: "\n\n## Tasks\n- [ ] Read the display name in the sync mapper",
+            files_hint: "",
+            feedback: "",
+            issue: "",
+        })
+    }
+
+    #[test]
+    fn every_change_carries_the_proof_rules_and_ends_with_evidence() {
+        // A change that touches no schema still gets the rules for proving
+        // what it rests on, at both sizes.
+        for simple in [true, false] {
+            let p = prompt(simple);
+            assert!(p.contains(CODER_RULES), "simple={simple}");
+            assert!(p.contains(EVIDENCE_OUTPUT), "simple={simple}");
+            assert!(p.contains("confirm it from the real thing first"));
+            assert!(p.contains("diagnostics go to DEBUG"));
+            assert!(p.contains("Read the display name in the sync mapper"));
+        }
+        assert!(!prompt(true).contains(SCHEMA_CHANGE_RULES));
+        assert!(prompt(false).contains(SCHEMA_CHANGE_RULES));
     }
 }
