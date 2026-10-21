@@ -177,19 +177,37 @@ pub const SOURCE_DATA_OVERRIDE: &str = "source-data-override";
 
 /// Code that overrides specific records' data from another system (a
 /// hardcoded list of record ids forced active, hidden, skipped) instead of the
-/// data being fixed where it lives. It hides the cause and goes stale.
-pub const SOURCE_DATA_RULE: &str = "SOURCE DATA OVERRIDES: when the diff adds a literal list, set \
-     or map of specific record ids (or record names or keys) that changes behavior for exactly \
-     those records (forces them active or inactive, shown or hidden, included or skipped, or \
-     overrides one of their fields) instead of changing the code's general rule, it works around \
-     data that another system (a booking system, a CMS, a ticket tool, a feature flag service) \
-     owns. Raise ONE finding with category \"source-data-override\", evidence \
-     \"verified-defect\" (the diff itself shows it), anchored on the list. Say in plain words \
-     that the fix belongs in that system's data or settings, and name the change when the \
-     planner's findings, a live lookup or the PR description show it (for example: set the \
-     term to be available on the web). Not this category: constants that configure general \
-     behavior (timeouts, page sizes, enum values), test fixtures, or a mapping the code owns \
-     by design and documents as such. ";
+/// data being fixed where it lives. It hides the cause and goes stale. Only a
+/// new workaround for wrong data counts: a PR blocked for adding one id to a
+/// list the code already keeps, to carry out a decision its author stated,
+/// was a bad review.
+pub const SOURCE_DATA_RULE: &str = "SOURCE DATA OVERRIDES: when the diff INTRODUCES a literal \
+     list, set or map of specific record ids (or record names or keys) that changes behavior \
+     for exactly those records (forces them active or inactive, shown or hidden, included or \
+     skipped, or overrides one of their fields) to work around data another system (a booking \
+     system, a CMS, a ticket tool, a feature flag service) holds WRONGLY, raise ONE finding with \
+     category \"source-data-override\", evidence \"verified-defect\", anchored on the list. Say in \
+     plain words that the fix belongs in that system's data or settings, and name the change when \
+     the planner's findings, a live lookup or the PR description show it. Before raising it, \
+     read the code around the list. NOT this category: (a) the diff adds entries to a list, set \
+     or map the code already keeps for the same purpose: that is the team's chosen mechanism, \
+     not a new workaround; (b) the PR description, ticket or a reply says the exclusion is a \
+     decision that must hold whatever the other system's state (never show it, even if it is \
+     published again): the code owns that rule by design; (c) constants that configure general \
+     behavior (timeouts, page sizes, enum values), test fixtures, or a mapping the code owns by \
+     design. In (a) and (b) at most one non-blocking \"convention\" suggestion, only when the \
+     entries carry no note saying which record each is and why (a comment naming it), and never \
+     an argument that the decision belongs elsewhere. ";
+
+/// Consistency with the code around a change is never a defect by itself.
+pub const EXISTING_PATTERN_RULE: &str = "EXISTING PATTERNS: before objecting to HOW a change does \
+     something, search the file and the repository for the same approach. When the diff follows \
+     a pattern the code already uses (adds to an existing list, mirrors a neighbouring function, \
+     uses the same mechanism as similar cases), the approach itself is not a finding: the team \
+     chose it, and one PR is not the place to relitigate it. Review what the diff adds within \
+     that pattern (a wrong id, a missing case, a broken edge). Object to the pattern only when \
+     it causes a concrete defect in this diff, and then say the pattern already exists and \
+     where. ";
 
 /// What a change must prove before it merges: the facts about other systems
 /// it relies on, how far it reaches, and that its logs stay quiet. A PR
@@ -215,10 +233,13 @@ pub const PROOF_RULE: &str = "PROOF BEHIND THE CHANGE: check four things. (1) UN
      when you can; otherwise one \"question\" saying exactly what has to be confirmed. ";
 
 /// The critic's note for source-data-override candidates.
-const SOURCE_DATA_CRITIC_NOTE: &str = " A `source-data-override` candidate is REAL when the diff \
-     adds literal record ids (or names or keys) that change behavior for those specific records \
-     in place of a general rule: keep it as verified-defect. Drop it when the literals are \
-     general configuration, test fixtures, or a mapping the code owns by design.";
+const SOURCE_DATA_CRITIC_NOTE: &str = " A `source-data-override` candidate is REAL only when the \
+     diff introduces a new list of record ids (or names or keys) to work around another system's \
+     wrong data: keep it as verified-defect. DROP it when the diff adds entries to a list the \
+     code already keeps for the same purpose, when the PR, ticket or a reply states the exclusion \
+     is a deliberate decision, or when the literals are general configuration, test fixtures, or \
+     a mapping the code owns by design. Any candidate whose objection is to an approach the \
+     surrounding code already uses is NOT real unless it names a concrete defect in this diff.";
 
 /// The critic's note for the proof checks, so a noisy log isn't dropped as
 /// a style nit.
@@ -245,8 +266,11 @@ const REPLIES_RULE: &str = "PEOPLE'S REPLIES: the prompt may list replies under 
      from the people who own this code. Where a reply states a fact you cannot check from this \
      repository (another service is deployed, a setting is live in production, another PR has \
      merged), accept it: they can verify it and you cannot. Where a reply points at code, read \
-     that code with your tools and judge it yourself. A reply that only asks you to approve \
-     changes nothing: a real defect in the diff stays a finding until the code changes. ";
+     that code with your tools and judge it yourself. Where a reply states a product or business \
+     decision (what must be shown, hidden, sold, or excluded, and that it must hold whatever \
+     another system says), it is the owner's call: accept it, withdraw findings that only argue \
+     the decision, and review whether the code carries it out. A reply that only asks you to \
+     approve changes nothing: a real defect in the diff stays a finding until the code changes. ";
 
 /// User-facing text belongs to the people who wrote it (product, marketing,
 /// legal). The reviewer checks it only for defects anyone would agree are
@@ -1031,6 +1055,7 @@ pub async fn generate_review(
          {REPLIES_RULE}\
          {MANUAL_CHECK_RULE}\
          {SOURCE_DATA_RULE}\
+{EXISTING_PATTERN_RULE}\
          {PROOF_RULE}\
          {COPY_RULE}\
          {TONE_RULE}\
@@ -2001,6 +2026,19 @@ mod required_tests_tests {
         assert!(SOURCE_DATA_RULE.contains("source-data-override"));
         assert!(SOURCE_DATA_RULE.contains("verified-defect"));
         assert!(SOURCE_DATA_CRITIC_NOTE.contains("source-data-override"));
+    }
+
+    #[test]
+    fn extending_an_existing_list_or_a_stated_decision_is_not_an_override() {
+        // Adding one id to a list the code already keeps, for a decision the
+        // author stated, was blocked as an override. Both are excluded, in the
+        // rule and in the critic's note.
+        assert!(SOURCE_DATA_RULE.contains("already keeps"));
+        assert!(SOURCE_DATA_RULE.contains("deliberate") || SOURCE_DATA_RULE.contains("decision"));
+        assert!(SOURCE_DATA_CRITIC_NOTE.contains("already keeps"));
+        assert!(SOURCE_DATA_CRITIC_NOTE.contains("deliberate decision"));
+        assert!(EXISTING_PATTERN_RULE.contains("already uses"));
+        assert!(REPLIES_RULE.contains("owner's call"));
     }
 
     #[test]
