@@ -15,8 +15,14 @@ pub struct LinkInstallationRequest {
 /// POST /api/github/link-installation
 ///
 /// Called after the user returns from the GitHub App install flow with
-/// `?installation_id=<id>&setup_action=install`. Verifies the installation
-/// exists via the GitHub API, then writes the link into both DynamoDB tables.
+/// `?installation_id=<id>&setup_action=install`.
+///
+/// An installation id from the browser proves nothing: anyone can read one
+/// off a webhook, a URL or a log. A new link is made only by the GitHub
+/// sign-in step (`/auth/github`), where GitHub confirms with the user's own
+/// token that they can access the installation, and links it then. This
+/// endpoint confirms an installation that step already linked to the team,
+/// and otherwise tells the dashboard to send the user through it.
 pub async fn link_installation(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -33,110 +39,71 @@ pub async fn link_installation(
     // Verify the installation belongs to this GitHub App by calling the GitHub API
     let (org_login, _account_id) = verify_installation(&state, installation_id).await?;
 
-    // Check that no other team already owns this installation (via GSI)
-    if let Some(existing_team) =
-        super::github_webhook::resolve_team_by_installation(&state, installation_id).await
-    {
-        if existing_team != claims.team_id {
-            warn!(
-                installation_id,
-                existing_team,
-                requesting_team = %claims.team_id,
-                "Installation already linked to another team"
-            );
-            return Ok(Json(
-                json!({ "error": "This GitHub installation is already linked to another team." }),
-            ));
-        }
-        // Already linked to this team — idempotent success
-        return Ok(Json(json!({
+    let owner = super::github_webhook::resolve_team_by_installation(&state, installation_id).await;
+    match link_decision(owner.as_deref(), &claims.team_id) {
+        LinkDecision::Linked => Ok(Json(json!({
             "status": "connected",
             "github_org": org_login,
             "installation_id": installation_id,
-        })));
+        }))),
+        LinkDecision::OtherTeam => {
+            warn!(
+                installation_id,
+                existing_team = owner.as_deref().unwrap_or(""),
+                requesting_team = %claims.team_id,
+                "Installation already linked to another team"
+            );
+            Ok(Json(
+                json!({ "error": "This GitHub installation is already linked to another team." }),
+            ))
+        }
+        LinkDecision::NeedsGithubSignIn => {
+            let auth_url = github_connect_url(&state.config.stage);
+            info!(
+                installation_id,
+                team_id = %claims.team_id,
+                "Installation not linked yet — the user must confirm access through GitHub sign-in"
+            );
+            Ok(Json(json!({
+                "error": format!(
+                    "One more step: connect your GitHub account so CoderHelm can confirm with \
+                     GitHub that you have access to {org_login}. Open {auth_url} and the \
+                     installation is linked when you come back."
+                ),
+                "code": "github_auth_required",
+                "auth_url": auth_url,
+                "github_org": org_login,
+                "installation_id": installation_id,
+            })))
+        }
     }
+}
 
-    let now = chrono::Utc::now().to_rfc3339();
+/// What link-installation does with an installation, given the team that
+/// owns it now (if any).
+#[derive(Debug, PartialEq, Eq)]
+enum LinkDecision {
+    /// Already this team's: nothing to do.
+    Linked,
+    /// Another team's: refused.
+    OtherTeam,
+    /// Nobody's yet: only a verified GitHub sign-in may link it.
+    NeedsGithubSignIn,
+}
 
-    // Write to teams table (github_installation_id + github_org)
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.teams_table_name)
-        .key("team_id", attr_s(&claims.team_id))
-        .key("sk", attr_s("META"))
-        .update_expression(
-            "SET github_installation_id = :iid, github_org = :org, updated_at = :now",
-        )
-        .expression_attribute_values(
-            ":iid",
-            aws_sdk_dynamodb::types::AttributeValue::N(installation_id.to_string()),
-        )
-        .expression_attribute_values(":org", attr_s(&org_login))
-        .expression_attribute_values(":now", attr_s(&now))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to update teams table: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Write to main table (github_install_id + github_org) for sync_repos compatibility
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s("META"))
-        .update_expression("SET github_install_id = :iid, github_org = :org, updated_at = :now")
-        .expression_attribute_values(
-            ":iid",
-            aws_sdk_dynamodb::types::AttributeValue::N(installation_id.to_string()),
-        )
-        .expression_attribute_values(":org", attr_s(&org_login))
-        .expression_attribute_values(":now", attr_s(&now))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to update main table: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    info!(
-        installation_id,
-        org = org_login.as_str(),
-        team_id = %claims.team_id,
-        linked_by = %claims.email,
-        "GitHub installation linked to team via dashboard"
-    );
-
-    // Sync repos from the newly linked installation
-    let repos = super::github_webhook::fetch_installation_repos(&state, installation_id).await;
-    for repo in &repos {
-        let full = format!("{}/{}", repo.owner, repo.name);
-        let _ = state
-            .dynamo
-            .put_item()
-            .table_name(&state.config.repos_table_name)
-            .item("pk", attr_s(&claims.team_id))
-            .item("sk", attr_s(&format!("REPO#{full}")))
-            .item("repo_name", attr_s(&full))
-            .item(
-                "enabled",
-                aws_sdk_dynamodb::types::AttributeValue::Bool(false),
-            )
-            .item("ticket_source", attr_s("github"))
-            .item("created_at", attr_s(&now))
-            .send()
-            .await;
+fn link_decision(owner: Option<&str>, team_id: &str) -> LinkDecision {
+    match owner {
+        Some(o) if o == team_id => LinkDecision::Linked,
+        Some(_) => LinkDecision::OtherTeam,
+        None => LinkDecision::NeedsGithubSignIn,
     }
+}
 
-    Ok(Json(json!({
-        "status": "connected",
-        "github_org": org_login,
-        "installation_id": installation_id,
-        "repos_synced": repos.len(),
-    })))
+/// The GitHub sign-in that connects the user's GitHub account and links the
+/// installations GitHub confirms they can access.
+/// It is on this deployment's API (a self-hosted install has its own).
+fn github_connect_url(stage: &str) -> String {
+    format!("{}/auth/github", common::public_urls::api_url(stage))
 }
 
 /// GET /api/github/installation-status
@@ -269,4 +236,38 @@ fn role_to_level(role: &str) -> u8 {
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_installation_already_linked_here_is_confirmed() {
+        assert_eq!(
+            link_decision(Some("TEAM#a"), "TEAM#a"),
+            LinkDecision::Linked
+        );
+        assert_eq!(
+            link_decision(Some("TEAM#b"), "TEAM#a"),
+            LinkDecision::OtherTeam
+        );
+        // An unlinked id from the browser is never linked from here.
+        assert_eq!(
+            link_decision(None, "TEAM#a"),
+            LinkDecision::NeedsGithubSignIn
+        );
+    }
+
+    #[test]
+    fn sign_in_url_follows_the_stage() {
+        assert_eq!(
+            github_connect_url("prod"),
+            "https://api.coderhelm.com/auth/github"
+        );
+        assert_eq!(
+            github_connect_url("dev"),
+            format!("{}/auth/github", common::public_urls::stage_api_url("dev"))
+        );
+    }
 }

@@ -3,8 +3,12 @@
 //! the agent can iterate against ground truth instead of guessing blind at CI.
 //!
 //! Flow: the worker (which holds the GitHub token) downloads the branch tarball
-//! and uploads it to S3; CodeBuild pulls ONLY that S3 object (no GitHub token,
-//! no DynamoDB, no KMS in its role) and runs the pre-derived check commands.
+//! and uploads it to S3; CodeBuild fetches ONLY that S3 object through a
+//! presigned GET URL and runs the pre-derived check commands. The build role
+//! has no S3 access at all (no GitHub token, no DynamoDB, no KMS either): the
+//! customer's build scripts run with that role, so the only objects a build
+//! can touch are the ones whose URLs it was handed — its own input, and for
+//! codegen its own output key (presigned PUT).
 //! The verdict is read from a log marker the buildspec emits, NOT from the
 //! CodeBuild build status — that cleanly separates "checks ran and failed"
 //! (build SUCCEEDED, marker exit!=0) from "the sandbox itself broke" (no
@@ -16,6 +20,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use aws_sdk_codebuild::types::{EnvironmentVariable, EnvironmentVariableType, StatusType};
+use aws_sdk_s3::presigning::PresigningConfig;
 
 const MARKER_END: &str = "CODERHELM_CHECKS_END exit=";
 const MARKER_START: &str = "===CODERHELM_CHECKS_START===";
@@ -78,6 +83,29 @@ fn current_build_estimate() -> Duration {
 fn enough_runway(remaining: Duration, estimate: Duration) -> bool {
     remaining >= DEADLINE_BUFFER + estimate
 }
+
+/// How long the presigned input/output URLs handed to a build stay valid:
+/// the CodeBuild project timeout (15 min) plus time for the build to be
+/// provisioned. Past this a leaked URL is useless.
+const PRESIGNED_URL_TTL: Duration = Duration::from_secs(20 * 60);
+
+/// Build env vars the worker sets; a repo's codegen env can't override them.
+const RESERVED_ENV: [&str; 11] = [
+    "SANDBOX_GET_URL",
+    "SANDBOX_PUT_URL",
+    "CHECKS_CMD",
+    "CODEGEN_CMD",
+    "NODE_VERSION",
+    "TERRAFORM_VERSION",
+    // The team's network allowlist and its proxy: a repo's env must not
+    // widen or replace them.
+    "EGRESS_ALLOW",
+    "EGRESS_PROXY_B64",
+    // Names the buildspec used before presigned URLs; still never settable.
+    "SANDBOX_BUCKET",
+    "SANDBOX_KEY",
+    "CODEGEN_OUT_KEY",
+];
 
 /// Cap on how much real output we hand back to the model (char-safe tail).
 const MAX_OUTPUT_CHARS: usize = 6000;
@@ -189,6 +217,7 @@ impl NoResults {
 
 const MARKER_CODEGEN_END: &str = "CODERHELM_CODEGEN_END exit=";
 const MARKER_CODEGEN_UPLOADED: &str = "CODERHELM_CODEGEN_UPLOADED";
+const MARKER_CODEGEN_UPLOAD_FAILED: &str = "CODERHELM_CODEGEN_UPLOAD_FAILED";
 /// Caps on captured codegen output (regenerated files are large but bounded).
 const MAX_CODEGEN_FILES: usize = 40;
 const MAX_CODEGEN_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -438,10 +467,9 @@ impl<'a> SandboxClient<'a> {
         deadline: Option<Instant>,
     ) -> Result<CodegenOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let mut env = vec![
-            env_var("SANDBOX_BUCKET", self.bucket)?,
-            env_var("SANDBOX_KEY", key)?,
+            env_var("SANDBOX_GET_URL", &self.presigned_get(key).await?)?,
+            env_var("SANDBOX_PUT_URL", &self.presigned_put(out_key).await?)?,
             env_var("CODEGEN_CMD", codegen_cmd)?,
-            env_var("CODEGEN_OUT_KEY", out_key)?,
         ];
         env.extend(self.egress_env()?);
         if let Some(v) = node_version {
@@ -450,18 +478,8 @@ impl<'a> SandboxClient<'a> {
         // Repo's public codegen env (e.g. Sanity projectId/dataset). Reserved
         // build vars are protected — an env entry can't hijack the tarball or
         // output location.
-        const RESERVED: [&str; 8] = [
-            "EGRESS_ALLOW",
-            "EGRESS_PROXY_B64",
-            "SANDBOX_BUCKET",
-            "SANDBOX_KEY",
-            "CODEGEN_CMD",
-            "CODEGEN_OUT_KEY",
-            "NODE_VERSION",
-            "TERRAFORM_VERSION",
-        ];
         for (k, v) in extra_env {
-            if RESERVED.contains(&k.as_str()) {
+            if is_reserved_env(k) {
                 continue;
             }
             env.push(env_var(k, v)?);
@@ -570,6 +588,13 @@ impl<'a> SandboxClient<'a> {
             }
         }
         let output = common::tail_str(&full, MAX_OUTPUT_CHARS).to_string();
+        // Codegen changed files but could not hand them back: that is not
+        // "nothing to regenerate", and must not be reported as a clean pass.
+        if full.contains(MARKER_CODEGEN_UPLOAD_FAILED) {
+            return Ok(CodegenOutcome::not_run(format!(
+                "codegen ran but its changed files could not be uploaded\n{output}"
+            )));
+        }
         // If the build logged an upload but the first artifact read came back empty
         // (a transient S3 read), try once more — those changes are real and must
         // not be dropped as "nothing to regenerate".
@@ -648,8 +673,7 @@ impl<'a> SandboxClient<'a> {
         deadline: Option<Instant>,
     ) -> Result<CheckOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let mut env = vec![
-            env_var("SANDBOX_BUCKET", self.bucket)?,
-            env_var("SANDBOX_KEY", key)?,
+            env_var("SANDBOX_GET_URL", &self.presigned_get(key).await?)?,
             env_var("CHECKS_CMD", checks_cmd)?,
         ];
         env.extend(self.egress_env()?);
@@ -755,6 +779,38 @@ impl<'a> SandboxClient<'a> {
         Ok(outcome_from_log(&full, status_str, phases))
     }
 
+    /// A short-lived URL that downloads exactly `key` and nothing else.
+    async fn presigned_get(
+        &self,
+        key: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let req = self
+            .s3
+            .get_object()
+            .bucket(self.bucket)
+            .key(key)
+            .presigned(PresigningConfig::expires_in(PRESIGNED_URL_TTL)?)
+            .await
+            .map_err(|e| format!("sandbox: presigning the input URL failed: {e}"))?;
+        Ok(req.uri().to_string())
+    }
+
+    /// A short-lived URL that uploads to exactly `key` and nothing else.
+    async fn presigned_put(
+        &self,
+        key: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let req = self
+            .s3
+            .put_object()
+            .bucket(self.bucket)
+            .key(key)
+            .presigned(PresigningConfig::expires_in(PRESIGNED_URL_TTL)?)
+            .await
+            .map_err(|e| format!("sandbox: presigning the output URL failed: {e}"))?;
+        Ok(req.uri().to_string())
+    }
+
     /// Fetch the build's CloudWatch log stream, oldest-first, bounded.
     async fn fetch_log(
         &self,
@@ -797,6 +853,10 @@ impl<'a> SandboxClient<'a> {
         }
         Ok(all)
     }
+}
+
+fn is_reserved_env(name: &str) -> bool {
+    RESERVED_ENV.contains(&name)
 }
 
 fn env_var(
@@ -997,7 +1057,7 @@ mod tests {
     fn build_log(result: &str) -> String {
         format!(
             "[Container] 2026/10/22 20:38:58.014835 Running command set +e\n\
-             aws s3 cp \"s3://$SANDBOX_BUCKET/$SANDBOX_KEY\" /tmp/src.tgz\n\
+             curl -fsS --retry 3 -o /tmp/src.tgz \"$SANDBOX_GET_URL\"\n\
              if [ -n \"$CODEGEN_CMD\" ]; then\n\
              \x20 echo \"===CODERHELM_CODEGEN_START===\"; node --version\n\
              \x20 echo \"===CODERHELM_CODEGEN_END exit=$CODE===\"\n\
@@ -1125,6 +1185,64 @@ mod tests {
         assert_eq!(build_estimate_from(&fast), Duration::from_secs(90));
         let slow = vec![Duration::from_secs(3600); 10];
         assert_eq!(build_estimate_from(&slow), MAX_WAIT);
+    }
+
+    #[test]
+    fn repo_env_cannot_replace_the_build_locations() {
+        for k in [
+            "SANDBOX_GET_URL",
+            "SANDBOX_PUT_URL",
+            "CODEGEN_CMD",
+            "CHECKS_CMD",
+            "NODE_VERSION",
+            "TERRAFORM_VERSION",
+            "EGRESS_ALLOW",
+            "EGRESS_PROXY_B64",
+            "SANDBOX_BUCKET",
+            "SANDBOX_KEY",
+            "CODEGEN_OUT_KEY",
+        ] {
+            assert!(is_reserved_env(k), "{k}");
+        }
+        assert!(!is_reserved_env("SANITY_PROJECT_ID"));
+    }
+
+    #[tokio::test]
+    async fn presigned_urls_name_one_key_and_expire() {
+        let s3 = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "AKIDEXAMPLE",
+                    "secret",
+                    None,
+                    None,
+                    "test",
+                ))
+                .build(),
+        );
+        let c = aws_sdk_codebuild::Client::from_conf(
+            aws_sdk_codebuild::Config::builder()
+                .behavior_version(aws_sdk_codebuild::config::BehaviorVersion::latest())
+                .build(),
+        );
+        let logs = aws_sdk_cloudwatchlogs::Client::from_conf(
+            aws_sdk_cloudwatchlogs::Config::builder()
+                .behavior_version(aws_sdk_cloudwatchlogs::config::BehaviorVersion::latest())
+                .build(),
+        );
+        let sb = SandboxClient::new(&c, &s3, &logs, "sandbox-bucket", "p");
+        let get = sb.presigned_get("sandbox/run-1/0.tgz").await.unwrap();
+        let put = sb.presigned_put("codegen-out/run-1/0.tgz").await.unwrap();
+        assert!(get.starts_with("https://"), "{get}");
+        assert!(get.contains("sandbox/run-1/0.tgz"), "{get}");
+        assert!(put.contains("codegen-out/run-1/0.tgz"), "{put}");
+        // Plain curl sends no extra headers: only `host` may be signed.
+        assert!(put.contains("X-Amz-SignedHeaders=host&"), "{put}");
+        assert!(get.contains("X-Amz-SignedHeaders=host&"), "{get}");
+        let ttl = format!("X-Amz-Expires={}", PRESIGNED_URL_TTL.as_secs());
+        assert!(get.contains(&ttl) && put.contains(&ttl), "{get}");
     }
 
     #[test]
