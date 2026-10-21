@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use super::run_search;
 use crate::auth::jwt;
 use crate::middleware::auth::SESSION_TTL_SECS;
 use crate::models::{
@@ -465,56 +466,91 @@ pub struct RunsQuery {
     limit: Option<i32>,
     /// `next` from the previous page (the last run id it covered).
     cursor: Option<String>,
+    /// Search words: ticket key or number, title, repo, PR number, status.
+    q: Option<String>,
+    /// Comma-separated exact statuses, e.g. `failed,cancelled`.
+    status: Option<String>,
 }
 
 /// GET /api/runs — list runs for the team (from runs table).
+///
+/// Reads the team's runs newest first and keeps the ones that pass the search
+/// and filters (see `run_search`), until the page is full or `SCAN_BUDGET`
+/// runs are read. A page can be short or empty while `next` is set: older
+/// runs are still unread.
 pub async fn list_runs(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Query(params): Query<RunsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let query_limit = params.limit.unwrap_or(50).min(100);
-    let result = state
-        .dynamo
-        .query()
-        .table_name(&state.config.runs_table_name)
-        .key_condition_expression("team_id = :tid")
-        .expression_attribute_values(":tid", attr_s(&claims.team_id))
-        .scan_index_forward(false) // newest first (ULID sorts lexicographically)
-        .limit(query_limit)
-        .set_exclusive_start_key(params.cursor.as_deref().filter(|c| c.len() <= 64).map(|c| {
-            std::collections::HashMap::from([
-                ("team_id".to_string(), attr_s(&claims.team_id)),
-                ("run_id".to_string(), attr_s(c)),
-            ])
-        }))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to query runs: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let runs: Vec<Value> = result
-        .items()
+    let want = params.limit.unwrap_or(50).clamp(1, 100) as usize;
+    let filter = run_search::RunFilter::new(
+        params.q.as_deref(),
+        params.status.as_deref(),
+        params.source.as_deref(),
+    );
+    let mut start = params.cursor.as_deref().filter(|c| c.len() <= 64).map(|c| {
+        std::collections::HashMap::from([
+            ("team_id".to_string(), attr_s(&claims.team_id)),
+            ("run_id".to_string(), attr_s(c)),
+        ])
+    });
+    let mut matched: Vec<run_search::Item> = Vec::new();
+    let mut read = 0;
+    let mut next: Option<String> = None;
+    let names: Vec<(String, String)> = run_search::LIST_ATTRS
         .iter()
-        .filter(|item| {
-            // Exclude archived runs from the list
-            item.get("status")
-                .and_then(|v| v.as_s().ok())
-                .map(|s| s.as_str() != "archived")
-                .unwrap_or(true)
-        })
-        .filter(|item| {
-            if let Some(ref source) = params.source {
-                item.get("ticket_source")
-                    .and_then(|v| v.as_s().ok())
-                    .map(|s| s == source)
-                    .unwrap_or(false)
-            } else {
-                true
+        .enumerate()
+        .map(|(i, a)| (format!("#a{i}"), a.to_string()))
+        .collect();
+    let projection = names
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    loop {
+        let budget = run_search::SCAN_BUDGET - read;
+        let result = state
+            .dynamo
+            .query()
+            .table_name(&state.config.runs_table_name)
+            .key_condition_expression("team_id = :tid")
+            .expression_attribute_values(":tid", attr_s(&claims.team_id))
+            .projection_expression(&projection)
+            .set_expression_attribute_names(Some(names.iter().cloned().collect()))
+            .scan_index_forward(false) // newest first (ULID sorts lexicographically)
+            .limit(budget.min(200) as i32)
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to query runs: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let items = result.items();
+        let (found, n) = run_search::take_matches(items, &filter, want - matched.len(), budget);
+        read += n;
+        matched.extend(found.into_iter().cloned());
+        let last_read = n.checked_sub(1).and_then(|i| item_s(&items[i], "run_id"));
+        if n < items.len() {
+            // Stopped inside this page: carry on after the last run read.
+            next = last_read.map(str::to_string);
+            break;
+        }
+        match result.last_evaluated_key().filter(|k| !k.is_empty()) {
+            Some(key) if matched.len() < want && read < run_search::SCAN_BUDGET => {
+                start = Some(key.clone())
             }
-        })
+            Some(_) => {
+                next = last_read.map(str::to_string);
+                break;
+            }
+            None => break,
+        }
+    }
+
+    let runs: Vec<Value> = matched
+        .iter()
         .map(|item| {
             json!({
                 "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
@@ -524,6 +560,7 @@ pub async fn list_runs(
                 "title": item.get("title").and_then(|v| v.as_s().ok()),
                 "repo": item.get("repo").and_then(|v| v.as_s().ok()),
                 "pr_url": item.get("pr_url").and_then(|v| v.as_s().ok()),
+                "pr_number": item.get("pr_number").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
                 "cost_usd": item.get("cost_usd").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<f64>().ok()),
                 "tokens_in": item.get("tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
                 "tokens_out": item.get("tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
@@ -533,14 +570,8 @@ pub async fn list_runs(
             })
         })
         .collect();
-    // Archived and source-filtered runs are dropped after the read, so a page
-    // can be short; `next` still continues where the read stopped.
-    let next = result
-        .last_evaluated_key()
-        .and_then(|k| k.get("run_id"))
-        .and_then(|v| v.as_s().ok());
 
-    Ok(Json(json!({ "runs": runs, "next": next })))
+    Ok(Json(json!({ "runs": runs, "next": next, "scanned": read })))
 }
 
 /// GET /api/runs/:run_id — get single run detail (from runs table).
