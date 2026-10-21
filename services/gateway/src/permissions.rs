@@ -299,6 +299,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "data_sources::probe",
             "data_sources::check",
             "data_sources::create",
+            "data_sources::create_rest",
+            "data_sources::create_search",
             "data_sources::update",
             "data_sources::remove",
             "data_sources::replace_key",

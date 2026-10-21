@@ -27,6 +27,10 @@ pub enum Kind {
     Logs,
     /// A PostgreSQL database in the team's AWS account.
     Database,
+    /// A REST API, read with GET requests under the paths the team allows.
+    Rest,
+    /// An OpenSearch (or Elasticsearch) cluster, searched read only.
+    Search,
 }
 
 impl Kind {
@@ -35,12 +39,16 @@ impl Kind {
             Kind::Api => "api",
             Kind::Logs => "logs",
             Kind::Database => "database",
+            Kind::Rest => "rest",
+            Kind::Search => "search",
         }
     }
     pub fn parse(s: &str) -> Kind {
         match s {
             "logs" => Kind::Logs,
             "database" => Kind::Database,
+            "rest" => Kind::Rest,
+            "search" => Kind::Search,
             _ => Kind::Api,
         }
     }
@@ -74,7 +82,22 @@ pub struct Source {
     pub created_by: String,
     /// Where in the team's AWS account a logs or database source reads.
     pub aws: Option<AwsTarget>,
+    /// REST: the header the key is sent in (e.g. `X-Api-Key`).
+    pub header_name: String,
+    /// REST: path prefixes agents may GET. Nothing outside them is read.
+    pub paths: Vec<String>,
+    /// Search: the cluster user the key (its password) belongs to.
+    pub user: String,
+    /// Search: index names or patterns agents may read. Empty: every index
+    /// the user sees.
+    pub indexes: Vec<String>,
+    /// What agents should know when using it (what the system is, what its
+    /// fields mean, where else its data lives). Given to them with it.
+    pub instructions: String,
 }
+
+/// Characters of a source's guide for agents.
+pub const MAX_INSTRUCTIONS: usize = 4000;
 
 fn s(item: &Item, k: &str) -> String {
     item.get(k)
@@ -146,6 +169,11 @@ impl Source {
             ("last_checked_at".to_string(), av_s(&self.last_checked_at)),
             ("created_at".to_string(), av_s(&self.created_at)),
             ("created_by".to_string(), av_s(&self.created_by)),
+            ("header_name".to_string(), av_s(&self.header_name)),
+            ("paths".to_string(), av_list(&self.paths)),
+            ("user".to_string(), av_s(&self.user)),
+            ("indexes".to_string(), av_list(&self.indexes)),
+            ("instructions".to_string(), av_s(&self.instructions)),
         ]);
         if let Some(k) = self.kinds {
             item.insert("kinds".to_string(), AttributeValue::N(k.to_string()));
@@ -186,6 +214,86 @@ impl Source {
             created_at: s(item, "created_at"),
             created_by: s(item, "created_by"),
             aws: serde_json::from_str(&s(item, "aws")).ok(),
+            header_name: s(item, "header_name"),
+            paths: list(item, "paths"),
+            user: s(item, "user"),
+            indexes: list(item, "indexes"),
+            instructions: s(item, "instructions"),
+        })
+    }
+
+    /// A REST or Search source as the client that reads it expects it (the
+    /// address, key header, allowed paths or indexes, and hidden fields).
+    pub fn reader(&self) -> super::connectors::Connector {
+        use super::connectors::{ConnKind, Connector};
+        let kind = if self.kind == Kind::Search {
+            ConnKind::OpenSearch
+        } else {
+            ConnKind::Rest
+        };
+        Connector {
+            enabled: self.enabled,
+            status: self.status.clone(),
+            site: self.url.clone(),
+            header_name: self.header_name.clone(),
+            paths: self.paths.clone(),
+            email: self.user.clone(),
+            indexes: self.indexes.clone(),
+            hidden_fields: self.hidden_fields.clone(),
+            ..Connector::new(kind)
+        }
+    }
+
+    /// A data source holding what a REST API or OpenSearch connection made in
+    /// Settings → Integrations held, under `id`. The sealed key moves as it
+    /// is: both are sealed for the team with the same purpose.
+    pub fn from_connection(c: &super::connectors::Connector, id: &str) -> Option<Source> {
+        use super::connectors::ConnKind;
+        let kind = match c.kind() {
+            ConnKind::Rest => Kind::Rest,
+            ConnKind::OpenSearch => Kind::Search,
+            _ => return None,
+        };
+        let name = if !c.name.is_empty() {
+            c.name.clone()
+        } else if kind == Kind::Search {
+            "OpenSearch".to_string()
+        } else {
+            "REST API".to_string()
+        };
+        let mut hidden = default_hidden_fields();
+        for h in &c.hidden_fields {
+            if !hidden.iter().any(|x| x.eq_ignore_ascii_case(h)) {
+                hidden.push(h.clone());
+            }
+        }
+        Some(Source {
+            id: id.to_string(),
+            kind,
+            name,
+            url: c.site.clone(),
+            auth: AuthStyle::parse(""),
+            key_sealed: c.key_sealed.clone(),
+            key_hint: c.key_hint.clone(),
+            enabled: c.enabled,
+            setup_complete: true,
+            status: c.status.clone(),
+            status_message: c.status_message.clone(),
+            has_mutations: false,
+            kinds: None,
+            schema_available: false,
+            samples: Vec::new(),
+            hidden_fields: hidden,
+            repos: c.repos.clone(),
+            last_checked_at: c.updated_at.clone(),
+            created_at: c.updated_at.clone(),
+            created_by: c.updated_by.clone(),
+            aws: None,
+            header_name: c.header_name.clone(),
+            paths: c.paths.clone(),
+            user: c.email.clone(),
+            indexes: c.indexes.clone(),
+            instructions: c.instructions.clone(),
         })
     }
 
@@ -222,6 +330,11 @@ impl Source {
             "last_checked_at": self.last_checked_at,
             "created_at": self.created_at,
             "created_by": self.created_by,
+            "header_name": self.header_name,
+            "paths": self.paths,
+            "user": self.user,
+            "indexes": self.indexes,
+            "instructions": self.instructions,
         })
     }
 
@@ -281,6 +394,70 @@ pub async fn put_source(
         .await
         .map(|_| ())
         .map_err(|e| format!("save data source: {e}"))
+}
+
+/// The data source id a moved connection gets: fixed, so moving it twice
+/// (a retry, two processes at once) never makes two.
+pub fn moved_id(c: &super::connectors::Connector) -> String {
+    let name = if c.name.is_empty() {
+        "default"
+    } else {
+        c.name.as_str()
+    };
+    format!("moved-{}-{name}", c.kind().as_str())
+}
+
+/// Moves the REST API and OpenSearch connections a team made in Settings →
+/// Integrations into its data sources, where every other system agents read
+/// lives, then removes them there. Safe to run any number of times: a source
+/// is written only if it isn't there yet, and the connection is removed
+/// after. Returns how many moved.
+pub async fn adopt_connections(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+) -> Result<usize, String> {
+    use super::connectors::{self, ConnKind};
+    let conns = connectors::list(dynamo, table, team_id).await?;
+    let movable: Vec<_> = conns
+        .iter()
+        .filter(|c| matches!(c.kind(), ConnKind::Rest | ConnKind::OpenSearch))
+        .collect();
+    if movable.is_empty() {
+        return Ok(0);
+    }
+    let taken: Vec<String> = list_sources(dynamo, table, team_id)
+        .await?
+        .into_iter()
+        .map(|s| s.name.to_lowercase())
+        .collect();
+    let mut moved = 0;
+    for c in movable {
+        let Some(mut source) = Source::from_connection(c, &moved_id(c)) else {
+            continue;
+        };
+        if taken.contains(&source.name.to_lowercase()) {
+            source.name = format!("{} ({})", source.name, source.kind.as_str());
+        }
+        let put = dynamo
+            .put_item()
+            .table_name(table)
+            .set_item(Some(source.to_item(team_id)))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await;
+        if let Err(e) = put {
+            let exists = e
+                .as_service_error()
+                .is_some_and(|se| se.is_conditional_check_failed_exception());
+            if !exists {
+                return Err(format!("move connection {}: {e}", c.id()));
+            }
+        }
+        connectors::delete(dynamo, table, team_id, c.kind(), &c.name).await?;
+        moved += 1;
+    }
+    Ok(moved)
 }
 
 pub async fn delete_source(
@@ -698,6 +875,11 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             created_by: "a@example.com".into(),
             aws: None,
+            header_name: String::new(),
+            paths: Vec::new(),
+            user: String::new(),
+            indexes: Vec::new(),
+            instructions: String::new(),
         }
     }
 
@@ -759,5 +941,110 @@ mod tests {
         src.enabled = true;
         src.status = "error".into();
         assert!(!src.usable_for("acme/api"));
+    }
+
+    #[test]
+    fn a_connection_becomes_a_data_source_with_its_key_and_guide() {
+        use super::super::connectors::{ConnKind, Connector};
+        let c = Connector {
+            name: "billing".into(),
+            enabled: true,
+            status: "ready".into(),
+            site: "https://api.example.com".into(),
+            header_name: "X-Api-Key".into(),
+            paths: vec!["/v1/invoices".into()],
+            key_sealed: "sealed".into(),
+            key_hint: "AB12".into(),
+            hidden_fields: vec!["notes".into()],
+            instructions: "amount is in cents.".into(),
+            ..Connector::new(ConnKind::Rest)
+        };
+        assert_eq!(moved_id(&c), "moved-rest-billing");
+        let s = Source::from_connection(&c, &moved_id(&c)).unwrap();
+        assert_eq!(s.kind, Kind::Rest);
+        assert_eq!(
+            (s.name.as_str(), s.url.as_str()),
+            ("billing", "https://api.example.com")
+        );
+        assert_eq!(
+            (s.key_sealed.as_str(), s.key_hint.as_str()),
+            ("sealed", "AB12")
+        );
+        assert!(s.enabled && s.setup_complete && s.status == "ready");
+        assert_eq!(s.paths, vec!["/v1/invoices".to_string()]);
+        assert!(s.hidden_fields.contains(&"notes".to_string()) && s.hidden_fields.len() > 1);
+        assert_eq!(s.instructions, "amount is in cents.");
+        // It round-trips through the table, and reads back as the client expects.
+        let back = Source::from_item(&s.to_item("TEAM#1")).unwrap();
+        assert_eq!(back, s);
+        let r = back.reader();
+        assert_eq!(r.kind(), ConnKind::Rest);
+        assert_eq!(
+            (r.site.as_str(), r.header_name.as_str()),
+            ("https://api.example.com", "X-Api-Key")
+        );
+
+        let os = Connector {
+            email: "reader".into(),
+            indexes: vec!["orders-*".into()],
+            ..Connector::new(ConnKind::OpenSearch)
+        };
+        assert_eq!(moved_id(&os), "moved-opensearch-default");
+        let s = Source::from_connection(&os, "x").unwrap();
+        assert_eq!(
+            (s.kind, s.name.as_str(), s.user.as_str()),
+            (Kind::Search, "OpenSearch", "reader")
+        );
+        assert_eq!(s.reader().kind(), ConnKind::OpenSearch);
+        assert!(Source::from_connection(&Connector::new(ConnKind::NewRelic), "x").is_none());
+    }
+
+    /// Against a real team's saved connections, without writing anything.
+    /// Set LIVE_TEAM and LIVE_TABLE, then run
+    /// `cargo test -- --ignored moved_connections`. Each REST API and
+    /// OpenSearch connection is turned into the data source the move would
+    /// save, its sealed key is opened, and one real read is made through it.
+    #[tokio::test]
+    #[ignore = "needs a real AWS account"]
+    async fn moved_connections_read_like_before() {
+        use super::super::connectors::{self, ConnKind};
+        use super::super::http::Https;
+        use super::super::opensearch::OpenSearch;
+        use super::super::rest::Rest;
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
+        let (team, table) = (env("LIVE_TEAM"), env("LIVE_TABLE"));
+        let conf = aws_config::load_from_env().await;
+        let dynamo = aws_sdk_dynamodb::Client::new(&conf);
+        let kms = aws_sdk_kms::Client::new(&conf);
+        let conns = connectors::list(&dynamo, &table, &team).await.unwrap();
+        let movable: Vec<_> = conns
+            .iter()
+            .filter(|c| matches!(c.kind(), ConnKind::Rest | ConnKind::OpenSearch))
+            .collect();
+        assert!(!movable.is_empty(), "no REST or OpenSearch connections to move");
+        for c in movable {
+            let s = Source::from_connection(c, &moved_id(c)).unwrap();
+            assert_eq!(Source::from_item(&s.to_item(&team)).unwrap(), s);
+            let key = super::super::secret::open(&kms, &team, &s.key_sealed).await.unwrap();
+            let r = s.reader();
+            let read = match s.kind {
+                Kind::Rest => Rest { conn: &r, key: &key, http: &Https }
+                    .get(&s.paths[0], None)
+                    .await
+                    .map(|a| format!("{} -> {} characters", a.asked, a.text.len())),
+                _ => OpenSearch { conn: &r, password: &key, http: &Https }
+                    .indexes()
+                    .await
+                    .map(|a| format!("{} -> {}", a.asked, a.text.lines().count())),
+            };
+            println!(
+                "{} ({}) as data source {:?}: {:?}",
+                c.id(),
+                s.kind.as_str(),
+                s.name,
+                read.as_ref().map_err(|e| &e.message)
+            );
+            assert!(read.is_ok(), "{} didn't read after the move", c.id());
+        }
     }
 }

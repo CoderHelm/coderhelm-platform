@@ -377,7 +377,23 @@ impl OpsTools {
         let mut legacy = Vec::new();
         match connectors::list(&state.dynamo, table, team_id).await {
             Ok(list) => {
-                for conn in list.into_iter().filter(|c| c.usable_for(repo)) {
+                // REST APIs and OpenSearch are data sources now: move any
+                // still saved here, and read them only through data sources.
+                if list
+                    .iter()
+                    .any(|c| matches!(c.kind(), ConnKind::Rest | ConnKind::OpenSearch))
+                {
+                    match store::adopt_connections(&state.dynamo, table, team_id).await {
+                        Ok(n) => info!(
+                            moved = n,
+                            "Moved REST and OpenSearch connections to data sources"
+                        ),
+                        Err(e) => warn!(error = %e, "Could not move connections to data sources"),
+                    }
+                }
+                for conn in list.into_iter().filter(|c| {
+                    c.usable_for(repo) && !matches!(c.kind(), ConnKind::Rest | ConnKind::OpenSearch)
+                }) {
                     if conn.kind().uses_aws() {
                         legacy.push(conn);
                         continue;

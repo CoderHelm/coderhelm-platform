@@ -13,8 +13,11 @@ use axum::{
 use common::live::api::{self, ApiSource, Check, ConnectReport};
 use common::live::aws::{self as live_aws, AwsTarget};
 use common::live::graphql::check_read_only;
+use common::live::http::Https;
 use common::live::net::parse_endpoint;
+use common::live::opensearch::{check_endpoint, check_index, OpenSearch};
 use common::live::redact::{hidden_terms, is_hidden};
+use common::live::rest::{check_base, check_header, check_path, Rest, MAX_PATHS};
 use common::live::store::{self, Activity, Kind, Source};
 use common::live::{db, logs, redshift};
 use common::live::{secret, StepError};
@@ -142,6 +145,10 @@ pub async fn list(
     Extension(claims): Extension<Claims>,
 ) -> Reply {
     admin(&claims)?;
+    // REST APIs and OpenSearch connected in Settings → Integrations live here now.
+    if let Err(e) = store::adopt_connections(&state.dynamo, table(&state), &claims.team_id).await {
+        warn!(error = %e, "Could not move connections to data sources");
+    }
     let mut sources = store::list_sources(&state.dynamo, table(&state), &claims.team_id)
         .await
         .map_err(|e| internal("list data sources", e))?;
@@ -396,6 +403,11 @@ pub async fn create(
         created_at: now,
         created_by: claims.email.clone(),
         aws: None,
+        header_name: String::new(),
+        paths: Vec::new(),
+        user: String::new(),
+        indexes: Vec::new(),
+        instructions: String::new(),
     };
     apply_report(&mut source, &report);
     save_schema(&state, &claims.team_id, &source.id, &report).await;
@@ -404,6 +416,267 @@ pub async fn create(
     Ok(Json(
         json!({ "source": source.public_json(), "checks": report.checks }),
     ))
+}
+
+/// Characters of a REST API's or cluster's name.
+const MAX_NAME: usize = 80;
+
+/// The REST or Search settings in `body`, checked, onto `source`: the
+/// address, then the key header and paths (REST) or the user and indexes
+/// (Search). Fields left out keep what is saved.
+fn apply_reader_fields(source: &mut Source, body: &Value) -> Result<(), (StatusCode, Json<Value>)> {
+    let step = |e: StepError| fail(StatusCode::BAD_REQUEST, &format!("{} {}", e.message, e.fix));
+    if let Some(u) = body["url"].as_str() {
+        source.url = match source.kind {
+            Kind::Search => check_endpoint(u).map_err(step)?,
+            _ => check_base(u).map_err(step)?,
+        };
+    }
+    match source.kind {
+        Kind::Rest => {
+            if let Some(h) = body["header_name"].as_str() {
+                source.header_name = check_header(h).map_err(step)?;
+            }
+            if let Some(paths) = string_list(&body["paths"], MAX_PATHS + 1) {
+                if paths.len() > MAX_PATHS {
+                    return Err(fail(
+                        StatusCode::BAD_REQUEST,
+                        &format!("At most {MAX_PATHS} paths."),
+                    ));
+                }
+                source.paths = paths
+                    .iter()
+                    .map(|p| check_path(p))
+                    .collect::<Result<_, _>>()
+                    .map_err(step)?;
+            }
+        }
+        Kind::Search => {
+            if let Some(u) = body["user"].as_str() {
+                let u = u.trim();
+                if u.is_empty() || u.len() > 200 || u.chars().any(char::is_control) {
+                    return Err(fail(
+                        StatusCode::BAD_REQUEST,
+                        "Enter the cluster user Coderhelm signs in as.",
+                    ));
+                }
+                source.user = u.to_string();
+            }
+            if let Some(indexes) = string_list(&body["indexes"], 50) {
+                source.indexes = indexes
+                    .iter()
+                    .map(|i| check_index(i).map(|_| i.clone()))
+                    .collect::<Result<_, _>>()
+                    .map_err(step)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Whether a REST API or cluster answers with `key`: one GET of the first
+/// allowed path, or signing in and listing the indexes the user may read.
+async fn reader_checks(source: &Source, key: &str) -> (bool, Vec<Check>) {
+    let conn = source.reader();
+    let res: Result<String, StepError> = match source.kind {
+        Kind::Rest => {
+            let first = source.paths.first().cloned().unwrap_or_default();
+            Rest {
+                conn: &conn,
+                key,
+                http: &Https,
+            }
+            .get(&first, None)
+            .await
+            .map(|a| format!("{} answered", a.asked))
+        }
+        _ => {
+            let os = OpenSearch {
+                conn: &conn,
+                password: key,
+                http: &Https,
+            };
+            match os.whoami().await {
+                Err(e) => Err(e),
+                Ok(who) => match os.indexes().await {
+                    Err(e) => Err(e),
+                    Ok(a) if a.text == "No shared indexes." => Err(StepError::new(
+                        "read",
+                        "Signed in, but the user sees none of the indexes you listed.",
+                        "Check the index names, or leave the list empty to allow every index the user sees.",
+                    )),
+                    Ok(_) => Ok(who),
+                },
+            }
+        }
+    };
+    let check = match res {
+        Ok(detail) => Check {
+            id: "read",
+            label: "Read with the key",
+            ok: true,
+            detail,
+            fix: None,
+        },
+        Err(e) => Check {
+            id: "read",
+            label: "Read with the key",
+            ok: false,
+            detail: e.message,
+            fix: Some(e.fix),
+        },
+    };
+    (check.ok, vec![check])
+}
+
+/// POST /api/data-sources/rest  { name, url, header_name, paths, key, hidden_fields?, instructions? }
+pub async fn create_rest(
+    state: State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    body: Json<Value>,
+) -> Reply {
+    admin(&claims)?;
+    create_reader(state, Extension(claims), body, Kind::Rest).await
+}
+
+/// POST /api/data-sources/search  { name, url, user, key, indexes?, hidden_fields?, instructions? }
+pub async fn create_search(
+    state: State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    body: Json<Value>,
+) -> Reply {
+    admin(&claims)?;
+    create_reader(state, Extension(claims), body, Kind::Search).await
+}
+
+/// Checks, then saves a REST API or OpenSearch cluster, switched off like
+/// every new source until a person turns it on.
+async fn create_reader(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+    kind: Kind,
+) -> Reply {
+    admin(&claims)?;
+    let key = key_from(&body)?;
+    let name = text(&body, "name").trim();
+    if name.is_empty() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "Give it a name, like Bookings.",
+        ));
+    }
+    let existing = store::list_sources(&state.dynamo, table(&state), &claims.team_id)
+        .await
+        .map_err(|e| internal("list data sources", e))?;
+    if existing.len() >= store::MAX_SOURCES {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "You've reached the limit of connected sources. Remove one first.",
+        ));
+    }
+    if existing.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "A source already has that name.",
+        ));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut source = Source {
+        id: ulid::Ulid::new().to_string(),
+        kind,
+        name: common::truncate_str(name, MAX_NAME).to_string(),
+        url: String::new(),
+        auth: common::live::api::AuthStyle::parse(""),
+        key_sealed: String::new(),
+        key_hint: secret::hint(key),
+        // Off until a person turns it on; set up in one step, with no
+        // further setup screens to finish.
+        enabled: body["enabled"].as_bool().unwrap_or(false),
+        setup_complete: true,
+        status: String::new(),
+        status_message: String::new(),
+        has_mutations: false,
+        kinds: None,
+        schema_available: false,
+        samples: Vec::new(),
+        hidden_fields: store::default_hidden_fields(),
+        repos: Vec::new(),
+        last_checked_at: now.clone(),
+        created_at: now,
+        created_by: claims.email.clone(),
+        aws: None,
+        header_name: if kind == Kind::Rest {
+            "X-Api-Key".to_string()
+        } else {
+            String::new()
+        },
+        paths: Vec::new(),
+        user: String::new(),
+        indexes: Vec::new(),
+        instructions: String::new(),
+    };
+    apply_reader_fields(&mut source, &body)?;
+    apply_guide(&mut source, &body)?;
+    if let Some(hidden) = string_list(&body["hidden_fields"], MAX_HIDDEN_FIELDS) {
+        source.hidden_fields = checked_hidden(hidden)?;
+    }
+    let missing = match kind {
+        Kind::Rest => source.url.is_empty() || source.paths.is_empty(),
+        _ => source.url.is_empty() || source.user.is_empty(),
+    };
+    if missing {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            if kind == Kind::Rest {
+                "Enter the API address, the key and at least one path agents may read."
+            } else {
+                "Enter the cluster address, a read-only user and its password."
+            },
+        ));
+    }
+    let (ok, checks) = reader_checks(&source, key).await;
+    if !ok {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "ok": false, "checks": checks, "error": "The connection checks didn't pass." }),
+            ),
+        ));
+    }
+    source.key_sealed = secret::seal(
+        &state.kms,
+        &state.config.secrets_key_id,
+        &claims.team_id,
+        key,
+    )
+    .await
+    .map_err(|e| internal("seal data source key", e))?;
+    source.status = "ready".to_string();
+    save(&state, &claims.team_id, &source).await?;
+    info!(team = %claims.team_id, source = %source.id, kind = kind.as_str(), "Data source connected");
+    Ok(Json(
+        json!({ "source": source.public_json(), "checks": checks }),
+    ))
+}
+
+/// The guide for agents in `body`, when sent.
+fn apply_guide(source: &mut Source, body: &Value) -> Result<(), (StatusCode, Json<Value>)> {
+    if let Some(g) = body["instructions"].as_str() {
+        let g = g.trim();
+        if g.chars().count() > store::MAX_INSTRUCTIONS {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Keep the guide under {} characters.",
+                    store::MAX_INSTRUCTIONS
+                ),
+            ));
+        }
+        source.instructions = g.to_string();
+    }
+    Ok(())
 }
 
 fn string_list(v: &Value, max: usize) -> Option<Vec<String>> {
@@ -479,6 +752,37 @@ pub async fn update(
         "" => {}
         n => source.name = common::truncate_str(n, 80).to_string(),
     }
+    apply_guide(&mut source, &body)?;
+    if matches!(source.kind, Kind::Rest | Kind::Search) {
+        let before = (
+            source.url.clone(),
+            source.paths.clone(),
+            source.header_name.clone(),
+            source.user.clone(),
+            source.indexes.clone(),
+        );
+        apply_reader_fields(&mut source, &body)?;
+        let after = (
+            source.url.clone(),
+            source.paths.clone(),
+            source.header_name.clone(),
+            source.user.clone(),
+            source.indexes.clone(),
+        );
+        // Where it reads changed: check it reads there before saving.
+        if before != after {
+            let key = open_key(&state, &claims.team_id, &source).await?;
+            let (ok, checks) = reader_checks(&source, &key).await;
+            if !ok {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        json!({ "ok": false, "checks": checks, "error": "The connection checks didn't pass. Nothing was changed." }),
+                    ),
+                ));
+            }
+        }
+    }
     save(&state, &claims.team_id, &source).await?;
     info!(team = %claims.team_id, source = %id, enabled = source.enabled, "Data source updated");
     Ok(Json(json!({ "source": source.public_json() })))
@@ -517,6 +821,33 @@ pub async fn replace_key(
     admin(&claims)?;
     let key = key_from(&body)?;
     let mut source = load(&state, &claims.team_id, &id).await?;
+    if matches!(source.kind, Kind::Rest | Kind::Search) {
+        let (ok, checks) = reader_checks(&source, key).await;
+        if !ok {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({ "ok": false, "checks": checks, "error": "The connection checks didn't pass. The old key is still in place." }),
+                ),
+            ));
+        }
+        source.key_sealed = secret::seal(
+            &state.kms,
+            &state.config.secrets_key_id,
+            &claims.team_id,
+            key,
+        )
+        .await
+        .map_err(|e| internal("seal data source key", e))?;
+        source.key_hint = secret::hint(key);
+        source.status = "ready".to_string();
+        source.status_message.clear();
+        source.last_checked_at = chrono::Utc::now().to_rfc3339();
+        save(&state, &claims.team_id, &source).await?;
+        return Ok(Json(
+            json!({ "source": source.public_json(), "checks": checks }),
+        ));
+    }
     if source.kind != Kind::Api {
         return Err(fail(
             StatusCode::BAD_REQUEST,
@@ -565,6 +896,11 @@ pub async fn test(
     admin(&claims)?;
     let mut source = load(&state, &claims.team_id, &id).await?;
     let (ok, checks, mut out) = match source.kind {
+        Kind::Rest | Kind::Search => {
+            let key = open_key(&state, &claims.team_id, &source).await?;
+            let (ok, checks) = reader_checks(&source, &key).await;
+            (ok, checks.clone(), json!({ "ok": ok, "checks": checks }))
+        }
         Kind::Api => {
             let key = open_key(&state, &claims.team_id, &source).await?;
             let report = api::connect_checks(&source.url, &key).await;
@@ -661,6 +997,19 @@ pub async fn samples(
     let source = load(&state, &claims.team_id, &id).await?;
     match source.kind {
         Kind::Api => {}
+        Kind::Rest => {
+            let samples: Vec<Value> = source
+                .paths
+                .iter()
+                .map(|p| json!({ "label": format!("GET {p}"), "query": p }))
+                .collect();
+            return Ok(Json(json!({ "samples": samples })));
+        }
+        Kind::Search => {
+            return Ok(Json(json!({ "samples": [
+                { "label": "Indexes it can read", "query": "indexes" },
+            ] })));
+        }
         Kind::Logs => {
             let group = source
                 .aws
@@ -771,7 +1120,7 @@ async fn unknown_names(
             common::live::sql::check_read_only_sql(query, &source.hidden_fields).is_ok()
         }
         Kind::Api => check_read_only(query).is_ok(),
-        Kind::Logs => false,
+        Kind::Logs | Kind::Rest | Kind::Search => false,
     };
     if !readable || !source.schema_available {
         return Vec::new();
@@ -801,7 +1150,7 @@ async fn unknown_names(
             catalog::unknown_sql_names_in(&c, db, query, &source.hidden_fields)
         }
         Kind::Api => catalog::unknown_graphql_names(&c, query, &source.hidden_fields),
-        Kind::Logs => Vec::new(),
+        Kind::Logs | Kind::Rest | Kind::Search => Vec::new(),
     }
 }
 
@@ -871,6 +1220,62 @@ pub async fn try_lookup(
     }
 
     let outcome: Result<Tried, StepError> = match source.kind {
+        // REST: `query` is the path to GET.
+        Kind::Rest => {
+            let key = open_key(&state, &claims.team_id, &source).await?;
+            let conn = source.reader();
+            let started = std::time::Instant::now();
+            Rest {
+                conn: &conn,
+                key: &key,
+                http: &Https,
+            }
+            .get(query, body.get("params").filter(|p| p.is_object()))
+            .await
+            .map(|a| Tried {
+                text: a.asked,
+                fields: Vec::new(),
+                result: a.text,
+                hidden_count: a.hidden,
+                ms: started.elapsed().as_millis(),
+                note: String::new(),
+            })
+        }
+        // Search: `query` is the action (indexes, mapping, search, count);
+        // `index` and `body` say what it reads.
+        Kind::Search => {
+            let key = open_key(&state, &claims.team_id, &source).await?;
+            let conn = source.reader();
+            let os = OpenSearch {
+                conn: &conn,
+                password: &key,
+                http: &Https,
+            };
+            let index = body["index"].as_str().unwrap_or("");
+            let started = std::time::Instant::now();
+            let read = match query {
+                "indexes" | "" => os.indexes().await,
+                "mapping" => os.mapping(index).await,
+                "count" => {
+                    os.count(index, body.get("body").filter(|b| b.is_object()))
+                        .await
+                }
+                "search" => os.search(index, &body["body"]).await,
+                other => Err(StepError::new(
+                    "read_only",
+                    format!("{other:?} isn't something this cluster can be asked."),
+                    "Use indexes, mapping, search or count.",
+                )),
+            };
+            read.map(|a| Tried {
+                text: a.asked,
+                fields: Vec::new(),
+                result: a.text,
+                hidden_count: 0,
+                ms: started.elapsed().as_millis(),
+                note: String::new(),
+            })
+        }
         Kind::Api => {
             let key = open_key(&state, &claims.team_id, &source).await?;
             let src = ApiSource {
@@ -1258,6 +1663,11 @@ fn new_aws_source(kind: Kind, name: String, t: AwsTarget, email: &str) -> Source
         created_at: now,
         created_by: email.to_string(),
         aws: Some(t),
+        header_name: String::new(),
+        paths: Vec::new(),
+        user: String::new(),
+        indexes: Vec::new(),
+        instructions: String::new(),
     }
 }
 

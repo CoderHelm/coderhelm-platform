@@ -657,6 +657,24 @@ pub fn source(s: &common::live::store::Source) -> Source {
                 "logs_search",
             )
         }
+        Kind::Rest => (
+            "rest",
+            format!("A REST API at {}, GET under {}", s.url, s.paths.join(", ")),
+            "api_get",
+        ),
+        Kind::Search => (
+            "search",
+            format!(
+                "An OpenSearch cluster at {}, read only{}",
+                s.url,
+                if s.indexes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (indexes: {})", s.indexes.join(", "))
+                }
+            ),
+            "search_read",
+        ),
     };
     Source {
         kind: kind.into(),

@@ -494,6 +494,14 @@ async fn main() -> Result<(), Error> {
         .route("/data-sources/api/check", post(routes::data_sources::check))
         .route("/data-sources/api", post(routes::data_sources::create))
         .route(
+            "/data-sources/rest",
+            post(routes::data_sources::create_rest),
+        )
+        .route(
+            "/data-sources/search",
+            post(routes::data_sources::create_search),
+        )
+        .route(
             "/data-sources/aws/setup",
             get(routes::data_sources::aws_setup),
         )
