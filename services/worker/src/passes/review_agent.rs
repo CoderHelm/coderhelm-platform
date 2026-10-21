@@ -1003,40 +1003,23 @@ pub fn format_diff(compare: &serde_json::Value, cap: usize) -> String {
     common::head_tail_str(&diff, cap)
 }
 
-/// Generation pass: agentic, high-recall. Returns the parsed output, or why
-/// the review didn't finish (the model call failed, or its answer couldn't be
-/// read). A review that didn't finish has no verdict: the caller retries it
-/// and never posts it as a block.
-#[allow(clippy::too_many_arguments)]
-pub async fn generate_review(
-    state: &WorkerState,
-    provider: &ModelProvider,
-    github: &GitHubClient,
+/// What the reviewer is told: its job, the rules a finding must meet, and the
+/// answer format. One builder, so the live evals judge the same prompt the
+/// reviewer runs with.
+pub fn review_system_prompt(
     owner: &str,
     repo: &str,
-    head_sha: &str,
-    title: &str,
-    pr_body: &str,
-    diff: &str,
     instructions_block: &str,
-    graph: Option<&super::code_graph::Graph>,
-    graph_context: &str,
-    prior_context: &str,
-    history: Option<&super::github_history::GithubHistory>,
-    ops: Option<&super::ops_tools::OpsTools>,
-    live: Option<&super::live_sources::LiveSources>,
-    skills: Option<&super::skills::TeamSkills>,
-    web: Option<&super::web_check::WebCheck>,
-    usage: &mut TokenUsage,
-) -> Result<ReviewOutput, String> {
-    let graph_note = if graph.is_some() {
+    has_graph: bool,
+) -> String {
+    let graph_note = if has_graph {
         "\nThis repo has a CODE GRAPH: prefer graph_definition/graph_callers/graph_impact for \
          exact structural lookups (where is X defined, who calls X, what a change reaches); use \
          search_code for text and unindexed languages."
     } else {
         ""
     };
-    let system = format!(
+    format!(
         "You are a senior code reviewer for {owner}/{repo}. You have READ-ONLY tools to walk the \
          repository at the PR head — use them: from the diff, search for CALLERS of changed \
          symbols and read impacted files, contracts, and the tests that cover the changed paths. \
@@ -1102,7 +1085,45 @@ pub async fn generate_review(
          nothing. Give every remaining item now, in this review: do not hold back non-blocking \
          notes (wording of the PR description, counts in it) for a later round. If you are unsure whether something is a real problem, read more code until you \
          know.{graph_note}"
-    );
+    )
+}
+
+/// The user message of a review: the PR, its diff and what is known around it
+/// (`context`: the graph, earlier threads, live sources, skills).
+pub fn review_user_prompt(title: &str, pr_body: &str, diff: &str, context: &str) -> String {
+    format!(
+        "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{context}\n\
+         Explore with the tools as needed, then emit the JSON review."
+    )
+}
+
+/// Generation pass: agentic, high-recall. Returns the parsed output, or why
+/// the review didn't finish (the model call failed, or its answer couldn't be
+/// read). A review that didn't finish has no verdict: the caller retries it
+/// and never posts it as a block.
+#[allow(clippy::too_many_arguments)]
+pub async fn generate_review(
+    state: &WorkerState,
+    provider: &ModelProvider,
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    head_sha: &str,
+    title: &str,
+    pr_body: &str,
+    diff: &str,
+    instructions_block: &str,
+    graph: Option<&super::code_graph::Graph>,
+    graph_context: &str,
+    prior_context: &str,
+    history: Option<&super::github_history::GithubHistory>,
+    ops: Option<&super::ops_tools::OpsTools>,
+    live: Option<&super::live_sources::LiveSources>,
+    skills: Option<&super::skills::TeamSkills>,
+    web: Option<&super::web_check::WebCheck>,
+    usage: &mut TokenUsage,
+) -> Result<ReviewOutput, String> {
+    let system = review_system_prompt(owner, repo, instructions_block, graph.is_some());
     let live_context = format!(
         "{}{}",
         history
@@ -1112,9 +1133,11 @@ pub async fn generate_review(
     ) + &ops.map(|o| o.prompt_section()).unwrap_or_default();
     let skills_context = skills.map(|s| s.prompt_section()).unwrap_or_default()
         + &web.map(|w| w.prompt_section()).unwrap_or_default();
-    let prompt = format!(
-        "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{graph_context}{prior_context}{live_context}{skills_context}\n\
-         Explore with the tools as needed, then emit the JSON review."
+    let prompt = review_user_prompt(
+        title,
+        pr_body,
+        diff,
+        &format!("{graph_context}{prior_context}{live_context}{skills_context}"),
     );
     let mut messages = vec![(
         "user".to_string(),
@@ -1265,28 +1288,47 @@ const LESSONS_CRITIC_NOTE: &str = " The prompt lists lessons learned from this t
      corrections of earlier reviews. A candidate that a lesson says is not a problem here is \
      wrong for this team: DROP it, unless it is a real security or data-loss defect.";
 
-/// Critic pass: score each finding against the diff with claim-only context and
-/// DROP the weak/unsupported ones, and the ones people already settled on the
-/// PR (`answered_context`: the resolved threads and the conversation). Fail-open
-/// (keep all) if the critic errors.
-pub async fn critique_findings(
-    state: &WorkerState,
-    provider: &ModelProvider,
-    diff: &str,
-    findings: Vec<Finding>,
-    ctx: CriticContext<'_>,
-    usage: &mut TokenUsage,
-) -> Vec<Finding> {
-    let CriticContext {
-        require_tests,
-        answered: answered_context,
-        live_evidence,
-        team_instructions,
-        lessons,
-    } = ctx;
-    if findings.is_empty() {
-        return findings;
+/// What the critic is told: the base audit, plus the notes that apply to this
+/// review (required tests, settled concerns, live evidence, the team's
+/// instructions) and the ones that always do.
+pub fn critic_system_prompt(ctx: &CriticContext<'_>) -> String {
+    let mut system = String::from(
+        "You are a strict code-review auditor. For each candidate finding, decide if it is \
+         a REAL, correct problem grounded in the diff — not a hallucination, not a style \
+         nit dressed as a bug, not a false claim about code that isn't shown. Default to \
+         DROP when uncertain. A `question` finding asks a person to confirm something \
+         outside the repository: keep it when the diff really creates that dependency. \
+         For each kept finding also judge its evidence: \"verified-defect\" only when the \
+         diff, a quoted tool result or CI shows the defect; \"unverified-concern\" when it \
+         only might be wrong; \"question\" when it asks a person to confirm something \
+         (\"please confirm X works\") without evidence that X is broken. \
+         Output ONLY a fenced ```json block: \
+         {\"verdicts\":[{\"index\":<int>,\"keep\":<bool>,\"evidence\":\"verified-defect|unverified-concern|question\"}]} for every index.",
+    );
+    if ctx.require_tests {
+        system.push_str(REQUIRE_TESTS_CRITIC_NOTE);
     }
+    if !ctx.answered.is_empty() {
+        system.push_str(ANSWERED_CRITIC_NOTE);
+    }
+    if !ctx.live_evidence.is_empty() {
+        system.push_str(LIVE_CRITIC_NOTE);
+    }
+    if !super::team_instructions_block(ctx.team_instructions).is_empty() {
+        system.push_str(TEAM_CRITIC_NOTE);
+    }
+    if !ctx.lessons.is_empty() {
+        system.push_str(LESSONS_CRITIC_NOTE);
+    }
+    system.push_str(SOURCE_DATA_CRITIC_NOTE);
+    system.push_str(PROOF_CRITIC_NOTE);
+    system.push_str(COPY_CRITIC_NOTE);
+    system
+}
+
+/// The critic's user message: the diff, what is settled or looked up, the
+/// team's instructions, and the candidates by index.
+pub fn critic_user_prompt(diff: &str, findings: &[Finding], ctx: &CriticContext<'_>) -> String {
     let list = findings
         .iter()
         .enumerate()
@@ -1303,76 +1345,62 @@ pub async fn critique_findings(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let base_system =
-        "You are a strict code-review auditor. For each candidate finding, decide if it is \
-                  a REAL, correct problem grounded in the diff — not a hallucination, not a style \
-                  nit dressed as a bug, not a false claim about code that isn't shown. Default to \
-                  DROP when uncertain. A `question` finding asks a person to confirm something \
-                  outside the repository: keep it when the diff really creates that dependency. \
-                  For each kept finding also judge its evidence: \"verified-defect\" only when the \
-                  diff, a quoted tool result or CI shows the defect; \"unverified-concern\" when it \
-                  only might be wrong; \"question\" when it asks a person to confirm something \
-                  (\"please confirm X works\") without evidence that X is broken. \
-                  Output ONLY a fenced ```json block: \
-                  {\"verdicts\":[{\"index\":<int>,\"keep\":<bool>,\"evidence\":\"verified-defect|unverified-concern|question\"}]} for every index.";
-    let mut system = base_system.to_string();
-    if require_tests {
-        system.push_str(REQUIRE_TESTS_CRITIC_NOTE);
+    let team = super::team_instructions_block(ctx.team_instructions);
+    format!(
+        "## Diff\n{diff}\n{answered}{live}{team}{lessons}\n\n## Candidate findings\n{list}",
+        answered = ctx.answered,
+        live = ctx.live_evidence,
+        lessons = ctx.lessons,
+    )
+}
+
+/// The critic's answer: the kept indexes with its reading of their evidence.
+/// None when it can't be read (the caller keeps every finding).
+pub fn parse_critic(text: &str) -> Option<HashMap<usize, Option<Evidence>>> {
+    let block = if let Some(s) = text.rfind("```json") {
+        let after = &text[s + 7..];
+        after.find("```").map(|e| after[..e].trim().to_string())
+    } else {
+        Some(text.to_string())
+    };
+    block
+        .and_then(|b| serde_json::from_str::<Verdicts>(&b).ok())
+        .map(|v| {
+            v.verdicts
+                .into_iter()
+                .filter(|c| c.keep)
+                .map(|c| (c.index, c.evidence.as_deref().and_then(Evidence::parse)))
+                .collect()
+        })
+}
+
+/// Critic pass: score each finding against the diff with claim-only context and
+/// DROP the weak/unsupported ones, and the ones people already settled on the
+/// PR (`answered_context`: the resolved threads and the conversation). Fail-open
+/// (keep all) if the critic errors.
+pub async fn critique_findings(
+    state: &WorkerState,
+    provider: &ModelProvider,
+    diff: &str,
+    findings: Vec<Finding>,
+    ctx: CriticContext<'_>,
+    usage: &mut TokenUsage,
+) -> Vec<Finding> {
+    if findings.is_empty() {
+        return findings;
     }
-    if !answered_context.is_empty() {
-        system.push_str(ANSWERED_CRITIC_NOTE);
-    }
-    if !live_evidence.is_empty() {
-        system.push_str(LIVE_CRITIC_NOTE);
-    }
-    let team = super::team_instructions_block(team_instructions);
-    if !team.is_empty() {
-        system.push_str(TEAM_CRITIC_NOTE);
-    }
-    if !lessons.is_empty() {
-        system.push_str(LESSONS_CRITIC_NOTE);
-    }
-    system.push_str(SOURCE_DATA_CRITIC_NOTE);
-    system.push_str(PROOF_CRITIC_NOTE);
-    system.push_str(COPY_CRITIC_NOTE);
-    let system = system.as_str();
-    let prompt = format!(
-        "## Diff\n{diff}\n{answered_context}{live_evidence}{team}{lessons}\n\n## Candidate findings\n{list}"
-    );
-    let mut messages = vec![(
-        "user".to_string(),
-        vec![json!({"type": "text", "text": prompt})],
-    )];
+    let system = critic_system_prompt(&ctx);
+    let prompt = critic_user_prompt(diff, &findings, &ctx);
     let reply = provider::converse_simple(
         state,
         provider,
         provider.heavy_model_id(),
-        system,
+        &system,
         &prompt,
         usage,
     )
     .await;
-    // (converse_simple takes user_message; messages var unused — keep call simple)
-    let _ = &mut messages;
-
-    let keep: Option<HashMap<usize, Option<Evidence>>> = reply.ok().and_then(|text| {
-        let block = if let Some(s) = text.rfind("```json") {
-            let after = &text[s + 7..];
-            after.find("```").map(|e| after[..e].trim().to_string())
-        } else {
-            Some(text.clone())
-        };
-        block
-            .and_then(|b| serde_json::from_str::<Verdicts>(&b).ok())
-            .map(|v| {
-                v.verdicts
-                    .into_iter()
-                    .filter(|c| c.keep)
-                    .map(|c| (c.index, c.evidence.as_deref().and_then(Evidence::parse)))
-                    .collect()
-            })
-    });
-
+    let keep = reply.ok().and_then(|text| parse_critic(&text));
     match keep {
         Some(kept) => apply_critic(findings, &kept),
         None => findings, // fail-open
@@ -1381,7 +1409,10 @@ pub async fn critique_findings(
 
 /// Keeps the findings the critic kept, each weakened to the critic's reading
 /// of its evidence when that is weaker.
-fn apply_critic(findings: Vec<Finding>, kept: &HashMap<usize, Option<Evidence>>) -> Vec<Finding> {
+pub fn apply_critic(
+    findings: Vec<Finding>,
+    kept: &HashMap<usize, Option<Evidence>>,
+) -> Vec<Finding> {
     findings
         .into_iter()
         .enumerate()

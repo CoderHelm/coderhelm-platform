@@ -23,7 +23,9 @@
 //!
 //! Live layer (`cargo test -p worker review_eval -- --ignored`, nightly): the
 //! model reads each recorded comment and reply, and its classification must
-//! land in the case's outcome class.
+//! land in the case's outcome class; a case's `live_review` diff is reviewed
+//! with the reviewer's own prompt, tools (answered from the case's files) and
+//! critic, and its findings must meet the case's constraints.
 
 use super::await_merge::{classify_check_runs, decide_gate, Action, GateView};
 use super::review_actions::approval_state;
@@ -52,6 +54,63 @@ struct Case {
     auto_merge: Option<AutoMerge>,
     steps: Vec<Step>,
     expect: Expect,
+    /// A diff the live layer reviews with the real reviewer prompt and critic.
+    #[serde(default)]
+    live_review: Option<LiveReview>,
+}
+
+/// A small anonymized PR the live layer reviews end to end: the reviewer's
+/// own system prompt, its repository tools answered from `files`, the critic
+/// pass and the enforcement rules, then `expect` on what is left.
+#[derive(Deserialize)]
+struct LiveReview {
+    title: String,
+    #[serde(default)]
+    body: String,
+    /// The diff as the reviewer sees it (`format_diff`'s shape).
+    diff: String,
+    /// The files at the PR head the tools can read, by path.
+    #[serde(default)]
+    files: std::collections::BTreeMap<String, String>,
+    expect: LiveExpect,
+    /// The same PR re-reviewed after a person replied under an earlier
+    /// CoderHelm comment.
+    #[serde(default)]
+    after_reply: Option<AfterReply>,
+}
+
+#[derive(Deserialize)]
+struct AfterReply {
+    /// The earlier CoderHelm comment, as posted.
+    thread: PriorThread,
+    /// What the person wrote under it.
+    author: String,
+    reply: String,
+    expect: LiveExpect,
+}
+
+#[derive(Deserialize)]
+struct PriorThread {
+    path: String,
+    line: u64,
+    body: String,
+}
+
+/// What must hold for the findings left after the critic and enforcement.
+#[derive(Deserialize, Default)]
+struct LiveExpect {
+    /// Nothing holds the merge (the verdict isn't REQUEST_CHANGES).
+    #[serde(default)]
+    no_blocking: bool,
+    /// No finding of these categories survives.
+    #[serde(default)]
+    no_category: Vec<String>,
+    /// A finding of this category survives and holds the merge.
+    #[serde(default)]
+    require_category: Option<String>,
+    /// Every earlier thread is reported settled (fixed, answered, accepted).
+    #[serde(default)]
+    prior_settled: bool,
 }
 
 #[derive(Deserialize, Clone)]
@@ -784,14 +843,12 @@ fn review_eval_replays_every_case() {
     );
 }
 
-/// Live layer: the model reads each recorded comment and reply; run nightly.
-/// `EVAL_PROVIDER=bedrock` sends the same requests through Amazon Bedrock
-/// with the ambient AWS credentials (the nightly workflow's narrow OIDC
-/// role, no API key); otherwise ANTHROPIC_API_KEY is used. EVAL_MODEL picks
-/// the model (a Bedrock model or inference profile id on Bedrock).
-#[tokio::test]
-#[ignore]
-async fn review_eval_live_classification() {
+/// The model the live evals call, and its id. `EVAL_PROVIDER=bedrock` sends
+/// the same requests through Amazon Bedrock with the ambient AWS credentials
+/// (the nightly workflow's narrow OIDC role, no API key); otherwise
+/// ANTHROPIC_API_KEY is used. EVAL_MODEL picks the model (a Bedrock model or
+/// inference profile id on Bedrock).
+async fn eval_client() -> (crate::agent::anthropic::AnthropicClient, String) {
     let meter = common::usage::UsageMeter::memory("").0;
     let bedrock = std::env::var("EVAL_PROVIDER").is_ok_and(|p| p == "bedrock");
     let (client, default_model) = if bedrock {
@@ -813,6 +870,18 @@ async fn review_eval_live_classification() {
         )
     };
     let model = std::env::var("EVAL_MODEL").unwrap_or_else(|_| default_model.into());
+    (client, model)
+}
+
+/// Live layer: the model reads each recorded comment and reply; run nightly.
+/// `EVAL_PROVIDER=bedrock` sends the same requests through Amazon Bedrock
+/// with the ambient AWS credentials (the nightly workflow's narrow OIDC
+/// role, no API key); otherwise ANTHROPIC_API_KEY is used. EVAL_MODEL picks
+/// the model (a Bedrock model or inference profile id on Bedrock).
+#[tokio::test]
+#[ignore]
+async fn review_eval_live_classification() {
+    let (client, model) = eval_client().await;
     let mut usage = crate::models::TokenUsage::default();
     let mut failures = vec![];
     for (file, case) in cases() {
@@ -867,6 +936,380 @@ async fn review_eval_live_classification() {
     assert!(
         failures.is_empty(),
         "live reviewer eval failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+// ── Live diff reviews ────────────────────────────────────────────────────
+//
+// A case's `live_review` is a small PR the model reviews the way production
+// does: `review_agent::review_system_prompt` (every rule the reviewer runs
+// with), the reviewer's tool list answered from the case's files instead of
+// GitHub, the critic (`critic_system_prompt` / `parse_critic` /
+// `apply_critic`), the enforcement rules and `decide_verdict`.
+
+/// The reviewer's repository tools, answered from a case's files. Anything
+/// outside them (org search, registries, the web) is not available here.
+struct CaseFiles<'a>(&'a std::collections::BTreeMap<String, String>);
+
+impl CaseFiles<'_> {
+    fn answer(&self, name: &str, input: &Value) -> String {
+        let path = input["path"]
+            .as_str()
+            .unwrap_or("")
+            .trim_start_matches("./");
+        match name {
+            "read_file" => self
+                .0
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| format!("{path}: no such file at the PR head")),
+            "read_file_lines" => {
+                let Some(text) = self.0.get(path) else {
+                    return format!("{path}: no such file at the PR head");
+                };
+                let start = input["start_line"].as_u64().unwrap_or(1).max(1) as usize;
+                let end = input["end_line"].as_u64().unwrap_or(u64::MAX) as usize;
+                text.lines()
+                    .enumerate()
+                    .filter(|(i, _)| *i + 1 >= start && *i < end)
+                    .map(|(i, l)| format!("{}: {l}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            "list_directory" => {
+                let dir = path.trim_end_matches('/');
+                let entries: Vec<&str> = self
+                    .0
+                    .keys()
+                    .filter(|p| dir.is_empty() || p.starts_with(&format!("{dir}/")))
+                    .map(String::as_str)
+                    .collect();
+                if entries.is_empty() {
+                    format!("{path}: no such directory")
+                } else {
+                    entries.join("\n")
+                }
+            }
+            "search_code" => {
+                let q = input["query"].as_str().unwrap_or("");
+                let hits: Vec<String> = self
+                    .0
+                    .iter()
+                    .flat_map(|(p, text)| {
+                        text.lines()
+                            .enumerate()
+                            .filter(|(_, l)| !q.is_empty() && l.contains(q))
+                            .map(move |(i, l)| format!("{p}:{}: {}", i + 1, l.trim()))
+                    })
+                    .collect();
+                if hits.is_empty() {
+                    format!("no matches for {q:?}")
+                } else {
+                    hits.join("\n")
+                }
+            }
+            _ => format!("{name} is not available in this review"),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::agent::llm::ToolExecutor for CaseFiles<'_> {
+    async fn execute(
+        &self,
+        name: &str,
+        input: &Value,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Value::String(self.answer(name, input)))
+    }
+}
+
+/// What a live review left: the findings after the critic and enforcement,
+/// its verdict, and its report on earlier threads.
+struct LiveOutcome {
+    findings: Vec<Finding>,
+    verdict: &'static str,
+    prior: Vec<review_agent::PriorStatus>,
+}
+
+/// Reviews `lr` with the real prompts; `prior` is the earlier-threads section.
+async fn live_review(
+    client: &crate::agent::anthropic::AnthropicClient,
+    model: &str,
+    lr: &LiveReview,
+    prior: &str,
+    usage: &mut crate::models::TokenUsage,
+) -> Result<LiveOutcome, String> {
+    // Built as production builds it (`review_pr::run_once`); the cases carry
+    // no repo or team instructions, so both blocks are empty.
+    let team_instructions = "";
+    let instructions_block = format!(
+        "{}{}",
+        super::format_instructions_block(""),
+        review_agent::team_rules_block(team_instructions)
+    );
+    let system = review_agent::review_system_prompt("acme", "app", &instructions_block, false);
+    let prompt = review_agent::review_user_prompt(&lr.title, &lr.body, &lr.diff, prior);
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![serde_json::json!({"type": "text", "text": prompt})],
+    )];
+    let text = crate::agent::anthropic::converse_tool_loop(
+        client,
+        model,
+        &system,
+        &mut messages,
+        &review_agent::review_tools(),
+        &CaseFiles(&lr.files),
+        usage,
+        16,
+        8192,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .map_err(|e| format!("the review call failed: {e}"))?;
+    let out = review_agent::parse_review(&text)?;
+    let mut findings = if out.findings.is_empty() {
+        out.findings
+    } else {
+        // As in production, the critic sees settled threads and the PR
+        // conversation (none here), not the open threads the review just
+        // reported on.
+        let ctx = review_agent::CriticContext {
+            require_tests: false,
+            answered: "",
+            live_evidence: "",
+            team_instructions,
+            lessons: "",
+        };
+        let critic = crate::agent::anthropic::converse_simple(
+            client,
+            model,
+            &review_agent::critic_system_prompt(&ctx),
+            &review_agent::critic_user_prompt(&lr.diff, &out.findings, &ctx),
+            usage,
+        )
+        .await
+        .ok()
+        .and_then(|t| review_agent::parse_critic(&t));
+        match critic {
+            Some(kept) => review_agent::apply_critic(out.findings, &kept),
+            None => out.findings,
+        }
+    };
+    review_agent::enforce_source_data_override(&mut findings);
+    review_agent::enforce_manual_checks_are_notes(&mut findings);
+    let verdict = review_agent::decide_verdict(&findings, 0, 0, false);
+    Ok(LiveOutcome {
+        findings,
+        verdict,
+        prior: out.prior,
+    })
+}
+
+/// Where `got` breaks `want`, one line each.
+fn live_violations(want: &LiveExpect, got: &LiveOutcome) -> Vec<String> {
+    let mut out = vec![];
+    let show = |f: &Finding| {
+        format!(
+            "[{} {} {}] {}:{} {}",
+            f.category,
+            f.severity,
+            f.evidence().as_str(),
+            f.file,
+            f.line,
+            f.title
+        )
+    };
+    if want.no_blocking {
+        for f in got.findings.iter().filter(|f| f.holds_merge()) {
+            out.push(format!("holds the merge ({}): {}", got.verdict, show(f)));
+        }
+    }
+    for cat in &want.no_category {
+        for f in got
+            .findings
+            .iter()
+            .filter(|f| f.category.eq_ignore_ascii_case(cat))
+        {
+            out.push(format!("raised {cat}: {}", show(f)));
+        }
+    }
+    if let Some(cat) = &want.require_category {
+        if !got
+            .findings
+            .iter()
+            .any(|f| f.category.eq_ignore_ascii_case(cat) && f.holds_merge())
+        {
+            let all: Vec<String> = got.findings.iter().map(show).collect();
+            out.push(format!(
+                "no blocking {cat} finding ({}); findings: {all:?}",
+                got.verdict
+            ));
+        }
+    }
+    if want.prior_settled && !got.prior.iter().any(|p| p.index == 0 && p.is_settled()) {
+        let statuses: Vec<String> = got
+            .prior
+            .iter()
+            .map(|p| format!("{}={}", p.index, p.status))
+            .collect();
+        out.push(format!("the earlier comment is not settled: {statuses:?}"));
+    }
+    out
+}
+
+/// The earlier-threads section for a re-review after `r`.
+fn prior_section(r: &AfterReply) -> String {
+    let thread = crate::clients::github::BotReviewThread {
+        id: "t1".into(),
+        path: r.thread.path.clone(),
+        line: r.thread.line,
+        outdated: false,
+        body: r.thread.body.clone(),
+        replies: vec![crate::clients::github::ThreadReply {
+            author: r.author.clone(),
+            by_bot: false,
+            body: r.reply.clone(),
+        }],
+        resolved: false,
+        resolved_by_person: false,
+    };
+    review_agent::format_prior_threads(&[&thread])
+}
+
+/// Every case's `live_review` is well formed, so a broken case fails here and
+/// not at night.
+#[test]
+fn review_eval_live_reviews_are_well_formed() {
+    let mut found = 0;
+    for (file, case) in cases() {
+        let Some(lr) = &case.live_review else {
+            continue;
+        };
+        found += 1;
+        assert!(lr.diff.contains("\n@@"), "{file}: the diff has a hunk");
+        for path in lr.files.keys() {
+            assert!(
+                lr.diff.contains(&format!("### {path} ")),
+                "{file}: {path} is in the diff"
+            );
+        }
+        let checks = |e: &LiveExpect| {
+            e.no_blocking || !e.no_category.is_empty() || e.require_category.is_some()
+        };
+        assert!(checks(&lr.expect), "{file}: live_review checks something");
+        assert!(
+            !(lr.expect.no_blocking && lr.expect.require_category.is_some()),
+            "{file}: a case can't require a block and forbid one"
+        );
+        if let Some(r) = &lr.after_reply {
+            assert!(checks(&r.expect), "{file}: after_reply checks something");
+            assert!(
+                prior_section(r).contains(&r.reply),
+                "{file}: the reply is shown"
+            );
+        }
+    }
+    assert!(found >= 2, "both directions have a live review case");
+}
+
+#[test]
+fn case_files_answer_the_reviewer_s_tools() {
+    let files: std::collections::BTreeMap<String, String> = [(
+        "sync/a.py".to_string(),
+        "X = {1, 2}\n\ndef f():\n    return X\n".to_string(),
+    )]
+    .into();
+    let t = CaseFiles(&files);
+    assert!(t
+        .answer("read_file", &serde_json::json!({"path": "sync/a.py"}))
+        .contains("X = {1, 2}"));
+    assert_eq!(
+        t.answer(
+            "read_file_lines",
+            &serde_json::json!({"path": "sync/a.py", "start_line": 3, "end_line": 4})
+        ),
+        "3: def f():\n4:     return X"
+    );
+    assert!(t
+        .answer("search_code", &serde_json::json!({"query": "X"}))
+        .contains("sync/a.py:4:"));
+    assert_eq!(
+        t.answer("list_directory", &serde_json::json!({"path": "sync"})),
+        "sync/a.py"
+    );
+    assert!(t
+        .answer("read_file", &serde_json::json!({"path": "nope"}))
+        .contains("no such file"));
+    assert!(t
+        .answer("search_org", &serde_json::json!({"query": "X"}))
+        .contains("not available"));
+}
+
+/// Live layer for diff cases: the model reviews each case's diff with the
+/// reviewer's own prompt, tools and critic, and what is left must meet the
+/// case's `expect`; then, with `after_reply`, re-reviews it with the person's
+/// reply under the earlier comment. EVAL_REVIEW_MODEL picks the reviewing
+/// model (default EVAL_MODEL): a small model can pass a case the production
+/// reviewer model fails, so judge the rules with the model that runs them.
+#[tokio::test]
+#[ignore]
+async fn review_eval_live_diff_reviews() {
+    let (client, model) = eval_client().await;
+    let model = std::env::var("EVAL_REVIEW_MODEL").unwrap_or(model);
+    let mut usage = crate::models::TokenUsage::default();
+    let mut failures = vec![];
+    for (file, case) in cases() {
+        let Some(lr) = &case.live_review else {
+            continue;
+        };
+        match live_review(&client, &model, lr, "", &mut usage).await {
+            Ok(got) => {
+                println!(
+                    "{file}: {} {:?}",
+                    got.verdict,
+                    got.findings
+                        .iter()
+                        .map(|f| format!("{}/{}", f.category, f.evidence().as_str()))
+                        .collect::<Vec<_>>()
+                );
+                for v in live_violations(&lr.expect, &got) {
+                    failures.push(format!("{file}: {v}"));
+                }
+            }
+            Err(e) => failures.push(format!("{file}: {e}")),
+        }
+        if let Some(r) = &lr.after_reply {
+            match live_review(&client, &model, lr, &prior_section(r), &mut usage).await {
+                Ok(got) => {
+                    println!(
+                        "{file} after the reply: {} {:?} prior {:?}",
+                        got.verdict,
+                        got.findings
+                            .iter()
+                            .map(|f| format!("{}/{}", f.category, f.evidence().as_str()))
+                            .collect::<Vec<_>>(),
+                        got.prior
+                            .iter()
+                            .map(|p| p.status.clone())
+                            .collect::<Vec<_>>()
+                    );
+                    for v in live_violations(&r.expect, &got) {
+                        failures.push(format!("{file} after the reply: {v}"));
+                    }
+                }
+                Err(e) => failures.push(format!("{file} after the reply: {e}")),
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "live diff eval failures:\n{}",
         failures.join("\n")
     );
 }
@@ -1111,27 +1554,7 @@ fn review_eval_replays_every_run_case() {
 #[tokio::test]
 #[ignore]
 async fn review_eval_live_ticket_comments() {
-    let meter = common::usage::UsageMeter::memory("").0;
-    let bedrock = std::env::var("EVAL_PROVIDER").is_ok_and(|p| p == "bedrock");
-    let (client, default_model) = if bedrock {
-        let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        (
-            crate::agent::anthropic::AnthropicClient::bedrock(
-                aws_sdk_bedrockruntime::Client::new(&cfg),
-                meter,
-            ),
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        )
-    } else {
-        let Ok(key) = std::env::var("ANTHROPIC_API_KEY") else {
-            panic!("set EVAL_PROVIDER=bedrock (AWS credentials) or ANTHROPIC_API_KEY for the live evals");
-        };
-        (
-            crate::agent::anthropic::AnthropicClient::new(key, meter),
-            "claude-haiku-4-5",
-        )
-    };
-    let model = std::env::var("EVAL_MODEL").unwrap_or_else(|_| default_model.into());
+    let (client, model) = eval_client().await;
     let mut usage = crate::models::TokenUsage::default();
     let mut failures = vec![];
     for (file, case) in run_cases() {

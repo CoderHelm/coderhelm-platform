@@ -1,0 +1,86 @@
+{
+  "name": "one more id in an exclusion list the code already keeps",
+  "description": "A one-line PR adds a program id to the sync's existing set of excluded programs (several ids already there, none commented). The reviewer called it a source-data override, argued the vendor's publish state already hides it and the fix belongs in the vendor system, and requested changes. The author replied that the program must stay hidden even once it is published. Adding to a list the code already keeps, for a decision the author states, is the team's mechanism: at most a non-blocking note to say which program each id is, and the PR is approved. After the author's reply, any such finding is withdrawn.",
+  "steps": [
+    {
+      "push": "h1"
+    },
+    {
+      "review": {
+        "head": "h1",
+        "model_output": {
+          "verdict": "APPROVE",
+          "summary": "Adds program 4188 to the programs the sync skips, the same way the three already there are excluded.",
+          "findings": [
+            {
+              "file": "sync/programs.py",
+              "line": 6,
+              "severity": "low",
+              "category": "convention",
+              "evidence": "unverified-concern",
+              "title": "Say which program each excluded id is",
+              "body": "None of the ids in EXCLUDED_PROGRAM_IDS say which program they are or why it is excluded. A short comment next to 4188 would help the next reader."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "comment": {
+        "id": 401,
+        "text": "@coderhelm I don't want this program to show even after it changes from an unpublished state to published state.",
+        "ask_kind": "other",
+        "reply": "Understood: program 4188 stays out of the catalog whatever its publish state, and adding it to EXCLUDED_PROGRAM_IDS does exactly that. Nothing here blocks the merge; the comment naming the program is optional.",
+        "conclusion": {
+          "verdict_change": "clear",
+          "reason": "Accepts the author's decision and says nothing blocks.",
+          "new_nonblocking_items": false,
+          "revised_reply": ""
+        }
+      }
+    }
+  ],
+  "expect": {
+    "final_formal": {
+      "head": "h1",
+      "event": "APPROVE"
+    },
+    "formal_events": [
+      [
+        "h1",
+        "APPROVE"
+      ]
+    ],
+    "first_approval_has_notes": true
+  },
+  "live_review": {
+    "title": "Exclude program 4188 from the program sync",
+    "body": "Adds program 4188 to the excluded programs.",
+    "diff": "\n### sync/programs.py (modified, +1/-1)\n@@ -3,7 +3,7 @@\n from app.vendor import client\n from app.catalog import remove_program, upsert_program\n\n-EXCLUDED_PROGRAM_IDS = {4101, 4117, 4123}\n+EXCLUDED_PROGRAM_IDS = {4101, 4117, 4123, 4188}\n\n\n def sync_programs():\n",
+    "files": {
+      "sync/programs.py": "\"\"\"Copies programs from the scheduling vendor into the site's catalog.\"\"\"\n\nfrom app.vendor import client\nfrom app.catalog import remove_program, upsert_program\n\nEXCLUDED_PROGRAM_IDS = {4101, 4117, 4123, 4188}\n\n\ndef sync_programs():\n    for program in client.list_programs():\n        if program[\"id\"] in EXCLUDED_PROGRAM_IDS:\n            remove_program(program[\"id\"])\n            continue\n        if not program[\"published\"]:\n            remove_program(program[\"id\"])\n            continue\n        upsert_program(program)\n"
+    },
+    "expect": {
+      "no_blocking": true,
+      "no_category": [
+        "source-data-override"
+      ]
+    },
+    "after_reply": {
+      "thread": {
+        "path": "sync/programs.py",
+        "line": 6,
+        "body": "**Program id hidden by a hardcoded list** (source-data-override)\n\nEXCLUDED_PROGRAM_IDS hides program 4188 by id. The vendor's publish state already keeps an unpublished program off the site (the `published` check below), so the fix belongs in the vendor system: leave the program unpublished there instead of hardcoding its id here."
+      },
+      "author": "dev-a",
+      "reply": "I don't want this program to show even after it changes from an unpublished state to published state.",
+      "expect": {
+        "no_blocking": true,
+        "no_category": [
+          "source-data-override"
+        ],
+        "prior_settled": true
+      }
+    }
+  }
+}

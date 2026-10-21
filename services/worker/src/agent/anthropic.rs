@@ -1060,6 +1060,19 @@ mod tests {
         assert_eq!(deterministic_temperature("claude-sonnet-4-6"), Some(0.0));
         assert_eq!(deterministic_temperature("claude-sonnet-5-5"), None);
         assert_eq!(deterministic_temperature("claude-opus-5-5"), None);
+        // Bedrock ids of the same models (the live evals' 400).
+        assert_eq!(
+            deterministic_temperature("us.anthropic.claude-opus-5-5"),
+            None
+        );
+        assert_eq!(
+            deterministic_temperature("global.anthropic.claude-sonnet-5-5"),
+            None
+        );
+        assert_eq!(
+            deterministic_temperature("us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+            Some(0.0)
+        );
         let mut r = request("claude-haiku-4-5");
         r.temperature = deterministic_temperature(&r.model);
         assert_eq!(serde_json::to_value(&r).unwrap()["temperature"], 0.0);

@@ -81,7 +81,10 @@ pub fn stateless_s2s_token_mode_from(v: Option<&str>) -> Option<&'static str> {
 /// Fable, Mythos). They reject non-default sampling params, `budget_tokens` and
 /// disabled thinking, lead responses with `thinking` blocks that must be echoed
 /// back unchanged, and default to effort "medium"/"high" per model — so callers
-/// set effort explicitly and never send `temperature`.
+/// set effort explicitly and never send `temperature`. Judged on the
+/// canonical id ([`usage::normalize_model`]), so a Bedrock id
+/// (`us.anthropic.claude-opus-5-5`, `global.…`, `anthropic.…-v1:0`) is the
+/// same model as its Anthropic API id.
 pub fn is_always_thinking_model(model_id: &str) -> bool {
     const PREFIXES: &[&str] = &[
         "claude-opus-5",
@@ -89,7 +92,8 @@ pub fn is_always_thinking_model(model_id: &str) -> bool {
         "claude-fable-",
         "claude-mythos-",
     ];
-    PREFIXES.iter().any(|p| model_id.starts_with(p))
+    let id = usage::normalize_model(model_id);
+    PREFIXES.iter().any(|p| id.starts_with(p))
 }
 
 use sha2::{Digest, Sha256};
@@ -371,6 +375,47 @@ mod tests {
         assert!(!is_always_thinking_model("claude-opus-4-8"));
         assert!(!is_always_thinking_model("claude-sonnet-4-6"));
         assert!(!is_always_thinking_model("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn always_thinking_models_by_their_bedrock_ids() {
+        // Bedrock ids carry a region or global prefix, the vendor prefix, and
+        // sometimes a version suffix; a miss sent `temperature` to a model
+        // that rejects it (400).
+        for base in [
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-mythos-1",
+        ] {
+            for id in [
+                format!("anthropic.{base}"),
+                format!("us.anthropic.{base}"),
+                format!("eu.anthropic.{base}"),
+                format!("apac.anthropic.{base}"),
+                format!("global.anthropic.{base}"),
+                format!("us.anthropic.{base}-v1:0"),
+                format!("anthropic.{base}-v1:0"),
+                format!("{base}[1m]"),
+                format!("US.Anthropic.{base}"),
+            ] {
+                assert!(is_always_thinking_model(&id), "{id}");
+            }
+        }
+        for id in [
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "us.anthropic.claude-sonnet-4-6",
+            "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.anthropic.claude-opus-4-8",
+            "us.anthropic.claude-opus-4-5-20251101-v1:0",
+            "anthropic.claude-3-sonnet-20240229-v1:0",
+        ] {
+            assert!(!is_always_thinking_model(id), "{id}");
+        }
     }
 
     #[test]
