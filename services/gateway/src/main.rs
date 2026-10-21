@@ -276,6 +276,11 @@ async fn main() -> Result<(), Error> {
             "/settings/workflow",
             get(routes::api::get_workflow_settings).put(routes::api::update_workflow_settings),
         )
+        // Branch, commit and PR title templates
+        .route(
+            "/settings/git-conventions",
+            get(routes::api::get_git_conventions).put(routes::api::update_git_conventions),
+        )
         // Model provider settings
         .route(
             "/settings/model-provider",

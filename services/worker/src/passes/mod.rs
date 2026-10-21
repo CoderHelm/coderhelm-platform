@@ -2075,10 +2075,22 @@ async fn run_passes(
     }
 
     // --- Pass 3: Implement ---
+    // The team's branch/commit/PR title templates, read once for the run.
+    let conventions = load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
+    let tokens = ticket_tokens(msg);
     let branch_name = if can_skip_implement {
         checkpoint.as_ref().unwrap().1.clone()
     } else {
-        format!("coderhelm/{}", msg.ticket_id.to_lowercase())
+        resolve_run_branch(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.ticket_id,
+            &conventions,
+            &tokens,
+            "",
+        )
+        .await
     };
 
     let impl_result = if can_skip_implement {
@@ -2617,7 +2629,10 @@ async fn run_passes(
                         &msg.repo_owner,
                         &msg.repo_name,
                         &branch_name,
-                        &format!("Add openspec for {}", msg.ticket_id),
+                        &conventions.commit_message(
+                            &tokens,
+                            &format!("Add openspec for {}", msg.ticket_id),
+                        ),
                         &spec_files,
                     )
                     .await
@@ -2719,7 +2734,10 @@ async fn run_passes(
                                     &msg.repo_owner,
                                     &msg.repo_name,
                                     &branch_name,
-                                    &format!("Narrow openspec for {}", msg.ticket_id),
+                                    &conventions.commit_message(
+                                        &tokens,
+                                        &format!("Narrow openspec for {}", msg.ticket_id),
+                                    ),
                                     &spec_files,
                                 )
                                 .await
@@ -2922,21 +2940,34 @@ async fn run_passes(
 
             let mut pr_results: Vec<RepoPrResult> = Vec::new();
 
+            // Each repo's branch: the team's pattern plus `-{repo}`, or the
+            // branch of the PR already open there for this ticket.
+            let mut repo_branches: Vec<String> = Vec::new();
+            for repo_task in &plan_result.repo_tasks {
+                repo_branches.push(
+                    resolve_run_branch(
+                        &github,
+                        &repo_task.owner,
+                        &repo_task.name,
+                        &msg.ticket_id,
+                        &conventions,
+                        &tokens,
+                        &repo_task.name.to_lowercase(),
+                    )
+                    .await,
+                );
+            }
+
             // A pull request for this ticket already open in any of the repos
             // (a person's, or an earlier run's): none is opened twice.
             if msg.person_direction.is_none() {
-                for repo_task in &plan_result.repo_tasks {
-                    let own = format!(
-                        "coderhelm/{}-{}",
-                        msg.ticket_id.to_lowercase(),
-                        repo_task.name.to_lowercase()
-                    );
+                for (repo_task, own) in plan_result.repo_tasks.iter().zip(&repo_branches) {
                     if let Some(other) = open_pr_for_ticket(
                         &github,
                         &repo_task.owner,
                         &repo_task.name,
                         &msg.ticket_id,
-                        &own,
+                        own,
                     )
                     .await
                     {
@@ -2949,13 +2980,7 @@ async fn run_passes(
                 }
             }
 
-            for repo_task in &plan_result.repo_tasks {
-                let repo_branch = format!(
-                    "coderhelm/{}-{}",
-                    msg.ticket_id.to_lowercase(),
-                    repo_task.name.to_lowercase()
-                );
-
+            for (repo_task, repo_branch) in plan_result.repo_tasks.iter().zip(repo_branches) {
                 // Override msg repo for this iteration
                 let mut repo_msg = msg.clone();
                 repo_msg.repo_owner = repo_task.owner.clone();
@@ -5236,6 +5261,95 @@ fn mentions_ticket(text: &str, key: &str) -> bool {
     false
 }
 
+/// The team's git conventions (branch, commit and PR title templates). The
+/// defaults when the team set none, the record can't be read, or the ticket
+/// is CoderHelm's own E2E work, whose branches and titles the E2E loop reads
+/// back by their fixed shape.
+pub async fn load_git_conventions(
+    state: &WorkerState,
+    team_id: &str,
+    ticket_id: &str,
+) -> common::git_conventions::GitConventions {
+    use common::git_conventions as gc;
+    if is_internal_ticket(ticket_id) {
+        return gc::GitConventions::default();
+    }
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(gc::SETTINGS_SK))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item.map(|i| gc::GitConventions::from_item(&i)))
+        .unwrap_or_default()
+}
+
+/// CoderHelm's own E2E tickets (a fix for a failing test, a generated test).
+fn is_internal_ticket(ticket_id: &str) -> bool {
+    ticket_id.starts_with(e2e::FIX_TICKET_PREFIX) || ticket_id.starts_with(e2e::GEN_TICKET_PREFIX)
+}
+
+/// The template tokens for this run's ticket. `{ticket}` is written the way
+/// the PR title always wrote it (`#42` for a GitHub issue).
+pub fn ticket_tokens(msg: &TicketMessage) -> common::git_conventions::Tokens {
+    let reference = match msg.source {
+        TicketSource::Github if msg.issue_number > 0 => format!("#{}", msg.issue_number),
+        _ => msg.ticket_id.clone(),
+    };
+    common::git_conventions::Tokens::new(&reference, &msg.ticket_id, &msg.title)
+}
+
+/// The branch this run works on in `owner/name`. A pull request already open
+/// for the ticket keeps its branch whatever the pattern is now: first the
+/// team's pattern and the default, then any open pull request CoderHelm
+/// opened for the ticket (an earlier pattern, an earlier title's slug). Only
+/// when there is none is a new branch named from the team's pattern.
+/// `suffix` is a multi-repo run's repository name.
+async fn resolve_run_branch(
+    github: &GitHubClient,
+    owner: &str,
+    name: &str,
+    ticket_id: &str,
+    conventions: &common::git_conventions::GitConventions,
+    tokens: &common::git_conventions::Tokens,
+    suffix: &str,
+) -> String {
+    let candidates = conventions.branch_candidates(tokens, suffix);
+    for c in &candidates {
+        if let Ok(Some(_)) = github.find_open_pr_for_branch(owner, name, c).await {
+            return c.clone();
+        }
+    }
+    if let Ok(prs) = github.list_open_pulls(owner, name).await {
+        if let Some(b) = own_pr_branch_for_ticket(&prs, ticket_id) {
+            return b;
+        }
+    }
+    candidates[0].clone()
+}
+
+/// The branch of an open pull request CoderHelm opened (its author is the
+/// app) that names the ticket in its branch or title.
+fn own_pr_branch_for_ticket(prs: &serde_json::Value, ticket_id: &str) -> Option<String> {
+    prs.as_array()?.iter().find_map(|p| {
+        let head = p["head"]["ref"].as_str().unwrap_or("");
+        let title = p["title"].as_str().unwrap_or("");
+        let author = p["user"]["login"].as_str().unwrap_or("");
+        (is_own_login(author)
+            && !head.is_empty()
+            && (mentions_ticket(head, ticket_id) || mentions_ticket(title, ticket_id)))
+        .then(|| head.to_string())
+    })
+}
+
+/// Whether a GitHub login is CoderHelm's app (it opens CoderHelm's PRs).
+pub fn is_own_login(login: &str) -> bool {
+    login.to_ascii_lowercase().contains("coderhelm")
+}
+
 /// An open pull request in `owner/name` that already names the ticket (in
 /// its title, branch or description), other than the one on `own_branch`:
 /// `(number, title, author)`. A failed lookup finds none.
@@ -6962,7 +7076,11 @@ async fn salvage_timeout_pr(
             .to_string();
         (n, u)
     } else {
-        let title = format!("⚠️ Partial: #{}: {}", msg.issue_number, msg.title);
+        let conventions = load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
+        let title = format!(
+            "⚠️ Partial: {}",
+            pr::pr_title(&conventions, &ticket_tokens(msg), msg)
+        );
         let body = format!(
             "Closes #{}\n\n\
              ⚠️ **This implementation is partial** — the agent ran out of time before finishing all tasks.\n\n\
@@ -7768,6 +7886,80 @@ mod plan_cap_tests {
     fn narrow_note_names_the_cap() {
         let n = narrow_scope_note(31, 25);
         assert!(n.contains("31 files") && n.contains("at most 25 files"));
+    }
+}
+
+#[cfg(test)]
+mod git_conventions_tests {
+    use super::{is_internal_ticket, is_own_login, own_pr_branch_for_ticket, ticket_tokens};
+    use crate::models::{TicketMessage, TicketSource};
+    use serde_json::json;
+
+    fn pr(head: &str, title: &str, author: &str) -> serde_json::Value {
+        json!({"head": {"ref": head}, "title": title, "user": {"login": author}})
+    }
+
+    /// A PR CoderHelm opened under the old default branch, or under an
+    /// earlier template (another slug), is found and its branch kept; a
+    /// person's PR naming the ticket is not taken for CoderHelm's.
+    #[test]
+    fn a_rerun_keeps_the_branch_of_its_open_pr_whatever_the_pattern_was() {
+        let prs = json!([
+            pr(
+                "feature/ABC-12-old-title",
+                "ABC-12: Old title",
+                "coderhelm[bot]"
+            ),
+            pr("someone/abc-12", "ABC-12 by hand", "a-person"),
+        ]);
+        assert_eq!(
+            own_pr_branch_for_ticket(&prs, "ABC-12").as_deref(),
+            Some("feature/ABC-12-old-title")
+        );
+        let old_default = json!([pr("coderhelm/abc-12", "ABC-12: Fix", "coderhelm[bot]")]);
+        assert_eq!(
+            own_pr_branch_for_ticket(&old_default, "ABC-12").as_deref(),
+            Some("coderhelm/abc-12")
+        );
+        let human_only = json!([pr("someone/abc-12", "ABC-12 by hand", "a-person")]);
+        assert_eq!(own_pr_branch_for_ticket(&human_only, "ABC-12"), None);
+        let other_ticket = json!([pr("fix/abc-13", "ABC-13: Other", "coderhelm[bot]")]);
+        assert_eq!(own_pr_branch_for_ticket(&other_ticket, "ABC-12"), None);
+    }
+
+    #[test]
+    fn coderhelm_is_known_by_its_app_login() {
+        assert!(is_own_login("coderhelm[bot]"));
+        assert!(is_own_login("CoderHelm-dev[bot]"));
+        assert!(!is_own_login("a-person"));
+        assert!(!is_own_login(""));
+    }
+
+    #[test]
+    fn e2e_tickets_keep_the_default_shapes_the_e2e_loop_reads_back() {
+        assert!(is_internal_ticket("E2E-FIX-abc"));
+        assert!(is_internal_ticket("E2E-GEN-abc"));
+        assert!(!is_internal_ticket("ABC-12"));
+    }
+
+    #[test]
+    fn a_github_issue_is_written_as_hash_number() {
+        let mut msg: TicketMessage = serde_json::from_value(json!({
+            "team_id": "t", "installation_id": 1, "source": "github",
+            "ticket_id": "GH-42", "title": "Fix the drawer", "body": "",
+            "repo_owner": "acme", "repo_name": "web", "issue_number": 42,
+            "sender": "", "base_branch": "main"
+        }))
+        .unwrap();
+        let t = ticket_tokens(&msg);
+        assert_eq!(
+            (t.ticket.as_str(), t.ticket_lower.as_str()),
+            ("#42", "gh-42")
+        );
+        msg.source = TicketSource::Jira;
+        msg.ticket_id = "ABC-7".into();
+        msg.issue_number = 0;
+        assert_eq!(ticket_tokens(&msg).ticket, "ABC-7");
     }
 }
 

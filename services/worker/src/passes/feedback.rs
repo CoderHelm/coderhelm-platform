@@ -142,6 +142,10 @@ pub async fn run(
     // The run's status as this feedback cycle found it; decides who owns CI.
     let mut run_status = String::new();
 
+    // The run's ticket (id, title, issue number): commit messages made in
+    // this round follow the team's commit template with its tokens.
+    let mut ticket = (String::new(), String::new(), 0u64);
+
     // Resolve merge conflicts before processing feedback (especially on re-review)
     {
         let run_record = state
@@ -166,6 +170,20 @@ pub async fn run(
                 .and_then(|v| v.as_s().ok())
                 .cloned()
                 .unwrap_or_default();
+            let text = |k: &str| {
+                item.get(k)
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            ticket = (
+                text("ticket_id"),
+                text("title"),
+                item.get("issue_number")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0),
+            );
             let branch = item
                 .get("branch")
                 .and_then(|v| v.as_s().ok())
@@ -305,6 +323,8 @@ pub async fn run(
         // Nothing left to do and CI is green — a salvaged DRAFT PR would
         // otherwise never be marked ready (only resume paths did that).
         crate::passes::resume::mark_pr_ready(
+            state,
+            &msg.team_id,
             &github,
             &msg.repo_owner,
             &msg.repo_name,
@@ -586,6 +606,18 @@ Rules:
         skills: skills.as_ref(),
         web: Some(&web),
         state,
+        commits: (
+            super::load_git_conventions(state, &msg.team_id, &ticket.0).await,
+            common::git_conventions::Tokens::new(
+                &if ticket.2 > 0 {
+                    format!("#{}", ticket.2)
+                } else {
+                    ticket.0.clone()
+                },
+                &ticket.0,
+                &ticket.1,
+            ),
+        ),
     };
 
     let mut messages = vec![(
@@ -782,6 +814,8 @@ Rules:
     // it, stranding the PR as a draft even though the run was done. Idempotent.
     if final_status == "completed" {
         crate::passes::resume::mark_pr_ready(
+            state,
+            &msg.team_id,
             &github,
             &msg.repo_owner,
             &msg.repo_name,
@@ -1431,6 +1465,20 @@ struct FeedbackToolExecutor<'a> {
     /// The team's written skills, read-only.
     skills: Option<&'a super::skills::TeamSkills>,
     state: &'a WorkerState,
+    /// The team's git conventions and the ticket's tokens: every commit
+    /// message follows the team's commit template.
+    commits: (
+        common::git_conventions::GitConventions,
+        common::git_conventions::Tokens,
+    ),
+}
+
+impl FeedbackToolExecutor<'_> {
+    /// The commit message for the agent's own `message`, in the team's
+    /// commit template when it set one.
+    fn commit_message(&self, message: &str) -> String {
+        self.commits.0.commit_message(&self.commits.1, message)
+    }
 }
 
 #[async_trait::async_trait]
@@ -1567,6 +1615,7 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing message")?;
+                let message: &str = &self.commit_message(message);
                 let original = self
                     .github
                     .read_file(self.owner, self.repo, path, self.branch)
@@ -1642,6 +1691,7 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing message")?;
+                let message: &str = &self.commit_message(message);
                 if let Err(problem) = super::syntax_check::validate_change(path, None, content) {
                     return Ok(json!(format!(
                         "Write REJECTED for {path} — content has syntax problems: {problem}. \
@@ -1690,6 +1740,7 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing message")?;
+                let message: &str = &self.commit_message(message);
                 let files_arr = input
                     .get("files")
                     .and_then(|v| v.as_array())
@@ -1787,6 +1838,7 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .and_then(|v| v.as_str())
                     .map(|m| m.to_string())
                     .unwrap_or_else(|| format!("Restore {path} from {from_ref}"));
+                let message = self.commit_message(&message);
                 // Worker-side copy: bytes never enter the LLM context.
                 let content = match self
                     .github
@@ -2136,10 +2188,11 @@ pub(crate) async fn close_own_pr_outside(
             Err(e) => warn!(run_id = %pr_ref.run_id, error = %e, "Could not close own PR"),
         }
     }
-    // CoderHelm's own branch only.
+    // CoderHelm's own branch only: the PR's author is CoderHelm's app (a
+    // team's branch pattern can be anything, so never the prefix alone).
     if let Some(branch) = pr["head"]["ref"]
         .as_str()
-        .filter(|b| b.starts_with("coderhelm/"))
+        .filter(|_| super::is_own_login(pr["user"]["login"].as_str().unwrap_or("")))
     {
         if let Err(e) = github
             .delete_branch(pr_ref.owner, pr_ref.repo, branch)
@@ -2395,8 +2448,15 @@ async fn hand_off_to_human(state: &WorkerState, github: &GitHubClient, msg: &Fee
     }
 
     // (1) Reliable signal: un-draft the PR. Idempotent (no-ops if already ready).
-    crate::passes::resume::mark_pr_ready(github, &msg.repo_owner, &msg.repo_name, msg.pr_number)
-        .await;
+    crate::passes::resume::mark_pr_ready(
+        state,
+        &msg.team_id,
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+    )
+    .await;
 
     // (2) Finalize the run — completed, stale error cleared, never clobbering a
     // cancel. Safe to repeat on redelivery.

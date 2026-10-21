@@ -518,6 +518,10 @@ pub async fn run(
             check_budget: std::sync::atomic::AtomicUsize::new(0),
             gen_edit_rejects: std::sync::Mutex::new(std::collections::HashMap::new()),
             deadline,
+            commits: (
+                super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await,
+                super::ticket_tokens(msg),
+            ),
         },
         mcp_plugins: &loaded_mcp_plugins,
         lambda: &state.lambda,
@@ -1300,6 +1304,12 @@ struct WriteToolExecutor<'a> {
     /// can never deadlock the agent.
     gen_edit_rejects: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     deadline: Option<std::time::Instant>,
+    /// The team's git conventions and this ticket's tokens: every commit
+    /// message follows the team's commit template.
+    commits: (
+        common::git_conventions::GitConventions,
+        common::git_conventions::Tokens,
+    ),
 }
 
 /// How many times the generated-file guard rejects edits to the SAME path
@@ -1356,6 +1366,12 @@ fn tool_write_paths(input: &serde_json::Value) -> Vec<String> {
 }
 
 impl<'a> WriteToolExecutor<'a> {
+    /// The commit message for the agent's own `message`, in the team's
+    /// commit template when it set one.
+    fn commit_message(&self, message: &str) -> String {
+        self.commits.0.commit_message(&self.commits.1, message)
+    }
+
     async fn execute_tool(
         &self,
         name: &str,
@@ -1472,6 +1488,7 @@ impl<'a> WriteToolExecutor<'a> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing message")?;
+                let message: &str = &self.commit_message(message);
                 // Full-content writes must be syntactically clean — there is
                 // no prior brokenness to inherit for a rewrite the agent
                 // authored end-to-end.
@@ -1564,6 +1581,7 @@ impl<'a> WriteToolExecutor<'a> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing message")?;
+                let message: &str = &self.commit_message(message);
 
                 // Fetch current file content
                 let cache_key = format!("{}:{}", self.branch, path);
@@ -1649,6 +1667,7 @@ impl<'a> WriteToolExecutor<'a> {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing message")?;
+                let message: &str = &self.commit_message(message);
                 let files_arr = input
                     .get("files")
                     .and_then(|v| v.as_array())
@@ -1819,6 +1838,7 @@ impl<'a> WriteToolExecutor<'a> {
                     .and_then(|v| v.as_str())
                     .map(|m| m.to_string())
                     .unwrap_or_else(|| format!("Restore {path} from {from_ref}"));
+                let message = self.commit_message(&message);
 
                 // Read the source content directly (worker-side, never enters
                 // the LLM context) and write it to the working branch.
@@ -2060,7 +2080,7 @@ impl<'a> WriteToolExecutor<'a> {
                         &self.owner,
                         &self.repo,
                         &self.branch,
-                        "chore: regenerate generated files (codegen)",
+                        &self.commit_message("chore: regenerate generated files (codegen)"),
                         &ops,
                     )
                     .await

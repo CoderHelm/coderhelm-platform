@@ -16,6 +16,8 @@ pub mod alert_notify;
 /// Read-only lookups against a team's own systems (their API today). Shared so
 /// the dashboard's test path and the reviewer's tool path enforce the same rules.
 pub mod e2e;
+/// A team's branch, commit and PR title templates, and how they render.
+pub mod git_conventions;
 pub mod live;
 /// Sealed credentials for a team's MCP servers (KMS, bound to team and server).
 pub mod mcp_credentials;
