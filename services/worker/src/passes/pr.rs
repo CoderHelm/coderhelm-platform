@@ -18,6 +18,14 @@ pub struct PrResult {
     pub node_id: String,
 }
 
+/// What the run proved about the change, for its description: what it
+/// looked up (`evidence`, the writer's source for an Evidence section) and
+/// the gaps the proof check still found (`gaps`, put at the very top).
+pub struct Proof<'a> {
+    pub evidence: &'a str,
+    pub gaps: &'a str,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     state: &WorkerState,
@@ -26,6 +34,7 @@ pub async fn run(
     branch: &str,
     plan: &PlanResult,
     voice: &str,
+    proof: &Proof<'_>,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
     run_id: &str,
@@ -107,6 +116,7 @@ pub async fn run(
          3. **Risk** — State risk level in bold (**Low**, **Medium**), then why it's safe.\n\
          4. **Verification** — Numbered steps to verify the change."
     };
+    let evidence_block = evidence_instructions(proof.evidence);
 
     let diff_patches = format_diff_patches(&diff);
     let prompt = format!(
@@ -119,7 +129,7 @@ pub async fn run(
 {diff_summary}
 
 ## The full diff (the source of truth — read all of it, describe THIS)
-{diff_patches}{template_block}
+{diff_patches}{template_block}{evidence_block}
 
 ## Instructions
 Describe what the DIFF actually does, after reading every file in it. Where the diff differs from the plan, the diff wins. Name every behavior change, including ones the plan didn't mention (a changed default, a renamed id, a new constraint, a migration).
@@ -197,8 +207,11 @@ Return ONLY the markdown body text."#,
     // Which team agents the planner and coder asked, where reviewers look.
     // A change needed outside the code too: the PR says so, so the reviewer
     // and whoever merges see the whole fix.
+    // Gaps the proof check still found lead the description, so nobody
+    // merges past them.
     let full_body = format!(
-        "{full_body}{}{}",
+        "{}{full_body}{}{}",
+        proof.gaps,
         super::fix_location::also_outside_section(plan.fix.as_ref()),
         super::skills::run_consulted(state, &msg.team_id, run_id).await
     );
@@ -786,6 +799,25 @@ fn strip_code_fences(s: &str) -> String {
     s.to_string()
 }
 
+/// What the writer is told about the run's evidence: report it, never call
+/// something unverified that a lookup answered. Empty when the run gathered
+/// none.
+fn evidence_instructions(evidence: &str) -> String {
+    if evidence.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n{evidence}\n\
+         Add an **Evidence** section after the changes: each fact about another system the change \
+         relies on, the lookup that confirmed it and what came back (the field and its value, as \
+         the lookup returned it); how many records the change affects, where they were counted, \
+         and the few examples named above. Take these only from the lookups and notes above, \
+         never from guesses. Never write that something was not verified, not measured or \
+         unconfirmed when the lookups above answer it; when the notes say no connected source \
+         could answer something, say which source is missing.\n"
+    )
+}
+
 fn format_diff_summary(diff: &serde_json::Value) -> String {
     let files = match diff.get("files").and_then(|v| v.as_array()) {
         Some(f) => f,
@@ -812,7 +844,7 @@ fn format_diff_summary(diff: &serde_json::Value) -> String {
 /// file, so descriptions were written from part of the change; now it reads
 /// every patch whole (lockfiles and generated files are named, not shown),
 /// and anything still left out is named so the writer knows it didn't see it.
-fn format_diff_patches(diff: &serde_json::Value) -> String {
+pub(super) fn format_diff_patches(diff: &serde_json::Value) -> String {
     const PER_FILE: usize = 40_000;
     const TOTAL: usize = 150_000;
     let files = match diff.get("files").and_then(|v| v.as_array()) {
@@ -916,6 +948,7 @@ pub async fn refresh_description(
 - Keep the description's structure, headings and tone.
 - Keep any line that starts with "Source ticket:", "Closes #", "Fixes #" or "Resolves #" exactly as it is, and keep any HTML comments and `<sub>` lines at the end exactly as they are.
 - Remove or correct anything the diff no longer bears out (a field name, a guess, a step, a file), and describe what the later commits changed.
+- Keep the Evidence section (what was looked up and what came back) and any "Not proven before this PR opened" note at the top, unless the diff no longer relies on what they describe.
 - Don't add filler. If the description is already true, return it unchanged.
 
 Return ONLY the markdown body text."#,
@@ -1022,7 +1055,18 @@ async fn fetch_pr_template(
 
 #[cfg(test)]
 mod refresh_tests {
-    use super::keeps_ticket_line;
+    use super::{evidence_instructions, keeps_ticket_line};
+
+    #[test]
+    fn the_writer_reports_the_runs_evidence() {
+        assert_eq!(evidence_instructions(""), "");
+        let block = evidence_instructions(
+            "- Ran rest_get: /v1/products/7\n  Came back: {\"title\": \"Swim\"}",
+        );
+        assert!(block.contains("Came back: {\"title\": \"Swim\"}"));
+        assert!(block.contains("Add an **Evidence** section"));
+        assert!(block.contains("Never write that something was not verified, not measured"));
+    }
 
     #[test]
     fn a_rewrite_must_keep_the_ticket_line() {

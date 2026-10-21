@@ -191,11 +191,42 @@ pub const SOURCE_DATA_RULE: &str = "SOURCE DATA OVERRIDES: when the diff adds a 
      behavior (timeouts, page sizes, enum values), test fixtures, or a mapping the code owns \
      by design and documents as such. ";
 
+/// What a change must prove before it merges: the facts about other systems
+/// it relies on, how far it reaches, and that its logs stay quiet. A PR
+/// shipped keyed on a vendor field nobody had read, saying its impact "was
+/// not measured" while a connected source could count it, with an INFO log
+/// per record on every sync.
+pub const PROOF_RULE: &str = "PROOF BEHIND THE CHANGE: check four things. (1) UNVERIFIED \
+     EXTERNAL FIELD: the diff relies on a field, value or behaviour of a system the repository \
+     doesn't own (a vendor API, another service, a table another system writes) and neither the \
+     PR description nor a lookup shows it in a real payload or row. When a live source can reach \
+     it, look it up yourself: a result that contradicts the code is a verified-defect \
+     \"correctness\" finding; one that confirms it is noted in the summary. Otherwise raise it as \
+     a \"question\" naming the field and the source that would settle it. (2) UNMEASURED IMPACT: \
+     the change alters behaviour for stored records and the description gives no count, or says \
+     the impact was not measured or not verified, while a connected source holds the data. Count \
+     it yourself with a live source and report the number and a few examples; raise a \
+     non-blocking note on the description only when you cannot. (3) NOISY LOGS: the diff adds an \
+     INFO (or louder) log that fires for every record or on every scheduled run without \
+     reporting an actual change or decision. That is a \"convention\" finding, verified-defect \
+     (the diff shows it), severity \"medium\": diagnostics belong at DEBUG. (4) UNPROVEN \
+     ASSUMPTION: the logic depends on an assumption (what another system sends, the values a \
+     field takes, uniqueness, ordering) that nothing in the PR proves. Check it with your tools \
+     when you can; otherwise one \"question\" saying exactly what has to be confirmed. ";
+
 /// The critic's note for source-data-override candidates.
 const SOURCE_DATA_CRITIC_NOTE: &str = " A `source-data-override` candidate is REAL when the diff \
      adds literal record ids (or names or keys) that change behavior for those specific records \
      in place of a general rule: keep it as verified-defect. Drop it when the literals are \
      general configuration, test fixtures, or a mapping the code owns by design.";
+
+/// The critic's note for the proof checks, so a noisy log isn't dropped as
+/// a style nit.
+const PROOF_CRITIC_NOTE: &str = " A candidate about an INFO (or louder) log the diff adds that \
+     fires for every record or on every scheduled run is REAL when the diff shows that loop or \
+     schedule: keep it. A candidate saying the change relies on another system's field or on an \
+     assumption nothing proves is REAL when neither the diff, the PR description nor a listed \
+     lookup shows it confirmed: keep it as a question unless a lookup contradicts the code.";
 
 /// A kept source-data-override finding holds the merge: the diff shows the
 /// override, and the fix belongs in the source system.
@@ -1000,6 +1031,7 @@ pub async fn generate_review(
          {REPLIES_RULE}\
          {MANUAL_CHECK_RULE}\
          {SOURCE_DATA_RULE}\
+         {PROOF_RULE}\
          {COPY_RULE}\
          {TONE_RULE}\
          CI EVIDENCE: this PR's current CI results are provided below. Never claim an install, \
@@ -1221,6 +1253,7 @@ pub async fn critique_findings(
         system.push_str(LIVE_CRITIC_NOTE);
     }
     system.push_str(SOURCE_DATA_CRITIC_NOTE);
+    system.push_str(PROOF_CRITIC_NOTE);
     system.push_str(COPY_CRITIC_NOTE);
     let system = system.as_str();
     let prompt = format!(
@@ -1968,6 +2001,21 @@ mod required_tests_tests {
         assert!(SOURCE_DATA_RULE.contains("source-data-override"));
         assert!(SOURCE_DATA_RULE.contains("verified-defect"));
         assert!(SOURCE_DATA_CRITIC_NOTE.contains("source-data-override"));
+    }
+
+    #[test]
+    fn the_reviewer_checks_what_the_change_rests_on() {
+        for point in [
+            "UNVERIFIED EXTERNAL FIELD",
+            "UNMEASURED IMPACT",
+            "NOISY LOGS",
+            "UNPROVEN ASSUMPTION",
+        ] {
+            assert!(PROOF_RULE.contains(point), "{point}");
+        }
+        assert!(PROOF_RULE.contains("diagnostics belong at DEBUG"));
+        assert!(PROOF_RULE.contains("look it up yourself"));
+        assert!(PROOF_CRITIC_NOTE.contains("every scheduled run"));
     }
 
     #[test]
