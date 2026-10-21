@@ -214,16 +214,10 @@ Return ONLY the markdown body text."#,
         super::skills::run_consulted(state, &msg.team_id, run_id).await
     );
 
-    // Create PR title
-    let mut title = match msg.source {
-        TicketSource::Github => format!("#{}: {}", msg.issue_number, msg.title),
-        TicketSource::Jira | TicketSource::Alert => format!("{}: {}", msg.ticket_id, msg.title),
-    };
-    if title.len() > 72 {
-        // char-boundary-safe: String::truncate panics mid-codepoint, and
-        // ticket titles routinely contain em-dashes/emoji.
-        title = format!("{}...", common::truncate_str(&title, 69));
-    }
+    // The PR title and squash commit follow the team's templates.
+    let conventions = super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
+    let tokens = super::ticket_tokens(msg);
+    let title = pr_title(&conventions, &tokens, msg);
 
     // Check if a PR already exists for this branch (e.g. from a re-run or retry)
     let existing_pr = github
@@ -279,14 +273,7 @@ Return ONLY the markdown body text."#,
         // only start after the PR exists). Best-effort — a failure just leaves
         // the noisier history. Skipped for existing/reopened PRs above to avoid
         // rewriting a PR a human may already be reviewing.
-        let squash_msg = format!(
-            "{}: {}",
-            match msg.source {
-                TicketSource::Github => format!("#{}", msg.issue_number),
-                TicketSource::Jira | TicketSource::Alert => msg.ticket_id.clone(),
-            },
-            msg.title
-        );
+        let squash_msg = squash_message(&conventions, &tokens, msg);
         if let Err(e) = github
             .squash_branch(
                 &msg.repo_owner,
@@ -807,6 +794,50 @@ fn writer_system(voice_block: &str, standards_block: &str, team_instructions: &s
     )
 }
 
+/// The PR's title: the team's template, or `{ticket}: {title}` (cut to 72
+/// characters) as always.
+pub(crate) fn pr_title(
+    conventions: &common::git_conventions::GitConventions,
+    tokens: &common::git_conventions::Tokens,
+    msg: &TicketMessage,
+) -> String {
+    if let Some(t) = &conventions.pr_title {
+        return common::git_conventions::pr_title(t, tokens);
+    }
+    let title = match msg.source {
+        TicketSource::Github => format!("#{}: {}", msg.issue_number, msg.title),
+        TicketSource::Jira | TicketSource::Alert => format!("{}: {}", msg.ticket_id, msg.title),
+    };
+    if title.len() > 72 {
+        // char-boundary-safe: String::truncate panics mid-codepoint, and
+        // ticket titles routinely contain em-dashes/emoji.
+        format!("{}...", common::truncate_str(&title, 69))
+    } else {
+        title
+    }
+}
+
+/// The message of the one commit a run's work is squashed into: the team's
+/// commit template (its `{summary}` from the ticket's title), or
+/// `{ticket}: {title}` as always.
+fn squash_message(
+    conventions: &common::git_conventions::GitConventions,
+    tokens: &common::git_conventions::Tokens,
+    msg: &TicketMessage,
+) -> String {
+    if let Some(t) = &conventions.commit {
+        return common::git_conventions::commit(t, tokens);
+    }
+    format!(
+        "{}: {}",
+        match msg.source {
+            TicketSource::Github => format!("#{}", msg.issue_number),
+            TicketSource::Jira | TicketSource::Alert => msg.ticket_id.clone(),
+        },
+        msg.title
+    )
+}
+
 /// What the writer is told about the run's evidence: report it, never call
 /// something unverified that a lookup answered. Empty when the run gathered
 /// none.
@@ -1068,7 +1099,9 @@ async fn fetch_pr_template(
 
 #[cfg(test)]
 mod refresh_tests {
-    use super::{evidence_instructions, keeps_ticket_line, writer_system};
+    use super::{
+        evidence_instructions, keeps_ticket_line, pr_title, squash_message, writer_system,
+    };
 
     #[test]
     fn the_writer_gets_the_teams_instructions_when_set() {
@@ -1077,6 +1110,36 @@ mod refresh_tests {
         assert!(with.contains("## Your team's instructions"));
         assert!(with.contains(team));
         assert!(!writer_system("", "", "").contains("team's instructions"));
+    }
+    use common::git_conventions::{GitConventions, Tokens};
+
+    fn msg(source: &str, id: &str, number: u64, title: &str) -> crate::models::TicketMessage {
+        serde_json::from_value(serde_json::json!({
+            "team_id": "t", "installation_id": 1, "source": source,
+            "ticket_id": id, "title": title, "body": "",
+            "repo_owner": "acme", "repo_name": "web", "issue_number": number,
+            "sender": "", "base_branch": "main"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn titles_and_squash_commits_follow_the_teams_templates() {
+        let m = msg("jira", "ABC-12", 0, "Fix the drawer.");
+        let t = Tokens::new("ABC-12", "ABC-12", &m.title);
+        let none = GitConventions::default();
+        assert_eq!(pr_title(&none, &t, &m), "ABC-12: Fix the drawer.");
+        assert_eq!(squash_message(&none, &t, &m), "ABC-12: Fix the drawer.");
+        let gh = msg("github", "GH-4", 4, "Fix bug");
+        let gt = Tokens::new("#4", "GH-4", "Fix bug");
+        assert_eq!(pr_title(&none, &gt, &gh), "#4: Fix bug");
+        let team = GitConventions {
+            branch: None,
+            commit: Some("{ticket_lower}: {summary}".into()),
+            pr_title: Some("[{ticket}] {title}".into()),
+        };
+        assert_eq!(pr_title(&team, &t, &m), "[ABC-12] Fix the drawer.");
+        assert_eq!(squash_message(&team, &t, &m), "abc-12: fix the drawer");
     }
 
     #[test]

@@ -237,7 +237,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "agent_settings",
-        label: "Edit instructions, rules, voice, agent context, workflow and reviewer settings, and remove what the reviewer learned",
+        label: "Edit instructions, rules, voice, agent context, workflow, git conventions and reviewer settings, and remove what the reviewer learned",
         min_role: "admin",
         handlers: &[
             "api::update_global_instructions",
@@ -249,6 +249,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "api::update_global_agents",
             "api::update_repo_agents",
             "api::update_workflow_settings",
+            "api::update_git_conventions",
             "reviewer::update_org_config",
             "reviewer::update_config",
             "review_lessons::delete_lesson",

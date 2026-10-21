@@ -6,7 +6,7 @@ use axum::{
 use common::pr_outcome::human_commit_count;
 use serde_json::Value;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::verify::verify_github_signature;
 use crate::models::{
@@ -1352,14 +1352,13 @@ async fn handle_check_run(
     let branch = payload["check_run"]["check_suite"]["head_branch"]
         .as_str()
         .unwrap_or("");
-    if !branch.starts_with("coderhelm/") {
-        return Ok(StatusCode::OK);
-    }
 
     // Individual check_run failures are logged but NOT acted on directly.
-    // The workflow_run completion event handles the aggregate CI result.
+    // The workflow_run completion event handles the aggregate CI result, and
+    // decides there whether the branch is CoderHelm's (a team's branch
+    // pattern can be anything, so no prefix check here).
     let check_name = payload["check_run"]["name"].as_str().unwrap_or("unknown");
-    info!(
+    debug!(
         team_id,
         branch, check_name, "check_run failed — will be handled by workflow_run completion"
     );
@@ -1719,14 +1718,12 @@ async fn handle_check_suite(
         .await?;
     }
 
-    if branch.starts_with("coderhelm/") {
-        // CI result handling for CoderHelm's own runs is done by the
-        // workflow_run handler; this is for observability.
-        info!(
-            branch,
-            conclusion, "check_suite completed — workflow_run handler will process"
-        );
-    }
+    // CI result handling for CoderHelm's own runs is done by the
+    // workflow_run handler; this is for observability.
+    debug!(
+        branch,
+        conclusion, "check_suite completed — workflow_run handler will process"
+    );
     Ok(StatusCode::OK)
 }
 
@@ -1829,7 +1826,10 @@ async fn handle_workflow_run(
 
     let wf = &payload["workflow_run"];
     let branch = wf["head_branch"].as_str().unwrap_or("");
-    if !branch.starts_with("coderhelm/") {
+    let repo = &payload["repository"];
+    let repo_owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let repo_name = repo["name"].as_str().unwrap_or("");
+    if !is_own_branch(state, team_id, repo_owner, repo_name, branch).await {
         return Ok(StatusCode::OK);
     }
 
@@ -1850,10 +1850,6 @@ async fn handle_workflow_run(
         );
         return Ok(StatusCode::OK);
     }
-
-    let repo = &payload["repository"];
-    let repo_owner = repo["owner"]["login"].as_str().unwrap_or("");
-    let repo_name = repo["name"].as_str().unwrap_or("");
 
     // Find the run_id for this branch
     let run_id = match find_run_by_branch(state, team_id, repo_owner, repo_name, branch).await {
@@ -1996,6 +1992,83 @@ async fn handle_workflow_run(
 
 /// Look up a run by branch name. Queries repo-index GSI and filters for matching branch
 /// with status "awaiting_ci" or "running".
+/// Whether `branch` is one CoderHelm made for a run. The default pattern's
+/// prefix is the fast path (every branch before teams could choose one); for
+/// a team with its own branch pattern, the run records are the marker: a
+/// branch is CoderHelm's when a run of this team was on it. A person's branch
+/// that happens to match the team's pattern is never taken for one.
+async fn is_own_branch(
+    state: &AppState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    branch: &str,
+) -> bool {
+    use common::git_conventions as gc;
+    if branch.is_empty() {
+        return false;
+    }
+    if branch.starts_with(gc::DEFAULT_BRANCH_PREFIX) {
+        return true;
+    }
+    let custom = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(gc::SETTINGS_SK))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item.map(|i| gc::GitConventions::from_item(&i)))
+        .is_some_and(|c| c.branch.is_some());
+    custom && run_on_branch_exists(state, team_id, owner, name, branch).await
+}
+
+/// Whether any run of this team (any status) worked on `branch` in
+/// `owner/name`: its primary branch, or one of a multi-repo run's branches.
+async fn run_on_branch_exists(
+    state: &AppState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    branch: &str,
+) -> bool {
+    let team_repo = format!("{team_id}#{owner}/{name}");
+    let primary = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .index_name("repo-index")
+        .key_condition_expression("team_repo = :tr")
+        .filter_expression("branch = :b")
+        .expression_attribute_values(":tr", attr_s(&team_repo))
+        .expression_attribute_values(":b", attr_s(branch))
+        .scan_index_forward(false)
+        .limit(200)
+        .send()
+        .await
+        .map(|r| !r.items().is_empty())
+        .unwrap_or(false);
+    if primary {
+        return true;
+    }
+    state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("team_id = :tid")
+        .filter_expression("contains(branches, :b)")
+        .expression_attribute_values(":tid", attr_s(team_id))
+        .expression_attribute_values(":b", attr_s(branch))
+        .scan_index_forward(false)
+        .limit(200)
+        .send()
+        .await
+        .map(|r| !r.items().is_empty())
+        .unwrap_or(false)
+}
+
 async fn find_run_by_branch(
     state: &AppState,
     team_id: &str,

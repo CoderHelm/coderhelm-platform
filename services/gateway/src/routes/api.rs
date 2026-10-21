@@ -3944,6 +3944,110 @@ pub async fn update_workflow_settings(
     Ok(StatusCode::OK)
 }
 
+/// The git conventions as the dashboard shows them: the team's templates
+/// (empty = default), the defaults and the tokens a template may use.
+fn git_conventions_json(c: &common::git_conventions::GitConventions) -> Value {
+    use common::git_conventions as gc;
+    json!({
+        "branch": c.branch.clone().unwrap_or_default(),
+        "commit": c.commit.clone().unwrap_or_default(),
+        "pr_title": c.pr_title.clone().unwrap_or_default(),
+        "defaults": {
+            "branch": gc::DEFAULT_BRANCH,
+            "commit": gc::DEFAULT_COMMIT,
+            "pr_title": gc::DEFAULT_PR_TITLE,
+        },
+        "tokens": gc::TOKENS,
+    })
+}
+
+/// GET /api/settings/git-conventions — the team's branch, commit and PR
+/// title templates.
+pub async fn get_git_conventions(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(common::git_conventions::SETTINGS_SK))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch git conventions: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let c = result
+        .item()
+        .map(common::git_conventions::GitConventions::from_item)
+        .unwrap_or_default();
+    Ok(Json(git_conventions_json(&c)))
+}
+
+/// The templates from a PUT body, each validated. An error names the field
+/// and what to change.
+fn parse_git_conventions(
+    body: &Value,
+) -> Result<common::git_conventions::GitConventions, (&'static str, String)> {
+    use common::git_conventions::{validate, GitConventions, Kind};
+    let field =
+        |name: &'static str, kind: Kind| -> Result<Option<String>, (&'static str, String)> {
+            let v = body[name].as_str().unwrap_or("").trim();
+            validate(kind, v).map_err(|e| (name, e))?;
+            Ok((!v.is_empty()).then(|| v.to_string()))
+        };
+    Ok(GitConventions {
+        branch: field("branch", Kind::Branch)?,
+        commit: field("commit", Kind::Commit)?,
+        pr_title: field("pr_title", Kind::PrTitle)?,
+    })
+}
+
+/// PUT /api/settings/git-conventions — save the templates. An empty field
+/// keeps CoderHelm's default; an invalid one is refused with the reason.
+pub async fn update_git_conventions(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // admin+
+    if let Err(s) = claims.require_role(3) {
+        return Err((s, Json(json!({ "error": "Only admins can change this." }))));
+    }
+    let c = parse_git_conventions(&body).map_err(|(field, error)| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": error, "field": field })),
+        )
+    })?;
+    let mut put = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(&claims.team_id))
+        .item("sk", attr_s(common::git_conventions::SETTINGS_SK))
+        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()));
+    for (k, v) in [
+        ("branch", &c.branch),
+        ("commit", &c.commit),
+        ("pr_title", &c.pr_title),
+    ] {
+        if let Some(v) = v {
+            put = put.item(k, attr_s(v));
+        }
+    }
+    put.send().await.map_err(|e| {
+        error!("Failed to save git conventions: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Could not save. Try again." })),
+        )
+    })?;
+    Ok(Json(git_conventions_json(&c)))
+}
+
 /// Allowed model IDs for the Anthropic provider.
 const ALLOWED_MODELS: &[&str] = &[
     "claude-fable-5-1",
@@ -4898,5 +5002,46 @@ mod tests {
         ] {
             assert!(reset_allowed(status), "{status} may be started over");
         }
+    }
+}
+
+#[cfg(test)]
+mod git_conventions_tests {
+    use super::{git_conventions_json, parse_git_conventions};
+    use serde_json::json;
+
+    #[test]
+    fn saves_valid_templates_and_blank_keeps_the_default() {
+        let c = parse_git_conventions(&json!({
+            "branch": " fix/{ticket_lower}-{slug} ",
+            "commit": "{ticket}: {summary}",
+            "pr_title": ""
+        }))
+        .unwrap();
+        assert_eq!(c.branch.as_deref(), Some("fix/{ticket_lower}-{slug}"));
+        assert_eq!(c.commit.as_deref(), Some("{ticket}: {summary}"));
+        assert_eq!(c.pr_title, None);
+        let shown = git_conventions_json(&c);
+        assert_eq!(shown["pr_title"], "");
+        assert_eq!(shown["defaults"]["branch"], "coderhelm/{ticket_lower}");
+        assert!(shown["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "slug"));
+    }
+
+    #[test]
+    fn refuses_an_invalid_template_naming_the_field() {
+        let (field, error) =
+            parse_git_conventions(&json!({ "branch": "fix it/{ticket}" })).unwrap_err();
+        assert_eq!(field, "branch");
+        assert!(error.contains("valid git branch name"), "{error}");
+        let (field, error) =
+            parse_git_conventions(&json!({ "pr_title": "{ticket} {owner}" })).unwrap_err();
+        assert_eq!(field, "pr_title");
+        assert!(error.contains("`{owner}` is not a token"), "{error}");
+        let (field, _) = parse_git_conventions(&json!({ "branch": "fix/{slug}" })).unwrap_err();
+        assert_eq!(field, "branch");
     }
 }

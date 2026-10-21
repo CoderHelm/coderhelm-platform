@@ -95,6 +95,29 @@ fn stall_decision(prev_sig: &str, prev_stall: u32, current_sig: &str) -> (u32, b
 }
 
 #[cfg(test)]
+mod final_squash_tests {
+    use super::first_own_commit_message;
+    use serde_json::json;
+
+    #[test]
+    fn the_final_squash_keeps_coderhelms_first_commit_message() {
+        let commits = vec![
+            json!({"committer": {"login": "web-flow"}, "author": {"login": "a-person"},
+                   "commit": {"message": "wip"}}),
+            json!({"committer": {"login": "coderhelm[bot]"}, "author": null,
+                   "commit": {"message": "abc-12: fix the drawer"}}),
+            json!({"committer": {"login": "coderhelm[bot]"},
+                   "commit": {"message": "abc-12: fix the lint"}}),
+        ];
+        assert_eq!(
+            first_own_commit_message(&commits).as_deref(),
+            Some("abc-12: fix the drawer")
+        );
+        assert_eq!(first_own_commit_message(&commits[..1]), None);
+    }
+}
+
+#[cfg(test)]
 mod stall_tests {
     use super::{ci_failure_signature, stall_decision, MAX_STALL_CYCLES};
 
@@ -787,7 +810,7 @@ pub async fn run(
                 msg.installation_id,
                 &state.http,
             ) {
-                mark_pr_ready(&github, owner, name, pr_number).await;
+                mark_pr_ready(state, &msg.team_id, &github, owner, name, pr_number).await;
             }
         }
         super::add_progress_note(
@@ -1290,7 +1313,15 @@ pub async fn run(
             .await?;
 
             // Still mark PR ready — let human review
-            mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+            mark_pr_ready(
+                state,
+                &msg.team_id,
+                &github,
+                &repo_owner,
+                &repo_name,
+                pr_number,
+            )
+            .await;
             return Ok(());
         }
 
@@ -1316,7 +1347,15 @@ pub async fn run(
             // only ever leaked before because a stall-blind run timed out and
             // never reached this handoff.
             mark_events_processed(state, &msg.run_id, &events).await;
-            mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+            mark_pr_ready(
+                state,
+                &msg.team_id,
+                &github,
+                &repo_owner,
+                &repo_name,
+                pr_number,
+            )
+            .await;
             complete_run_with_status(
                 state,
                 &ticket_msg,
@@ -1430,7 +1469,15 @@ pub async fn run(
                         wall_clock_secs(created_at, &start),
                     )
                     .await?;
-                    mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                    mark_pr_ready(
+                        state,
+                        &msg.team_id,
+                        &github,
+                        &repo_owner,
+                        &repo_name,
+                        pr_number,
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -1452,7 +1499,15 @@ pub async fn run(
                     wall_clock_secs(created_at, &start),
                 )
                 .await?;
-                mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                mark_pr_ready(
+                    state,
+                    &msg.team_id,
+                    &github,
+                    &repo_owner,
+                    &repo_name,
+                    pr_number,
+                )
+                .await;
                 return Ok(());
             }
         }
@@ -1772,7 +1827,15 @@ pub async fn run(
                     "Automated fix budget exhausted — PR handed off for human review",
                 )
                 .await;
-                mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                mark_pr_ready(
+                    state,
+                    &msg.team_id,
+                    &github,
+                    &repo_owner,
+                    &repo_name,
+                    pr_number,
+                )
+                .await;
                 complete_run_with_status(
                     state,
                     &ticket_msg,
@@ -1835,7 +1898,15 @@ pub async fn run(
                             run_id = msg.run_id,
                             "Review fix produced no changes — completing anyway"
                         );
-                        mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                        mark_pr_ready(
+                            state,
+                            &msg.team_id,
+                            &github,
+                            &repo_owner,
+                            &repo_name,
+                            pr_number,
+                        )
+                        .await;
                         complete_run_with_status(
                             state,
                             &ticket_msg,
@@ -1857,7 +1928,15 @@ pub async fn run(
                     }
                     error!(run_id = msg.run_id, error = %e, "Review fix implementation failed");
                     // Still mark PR ready, let human review
-                    mark_pr_ready(&github, &repo_owner, &repo_name, pr_number).await;
+                    mark_pr_ready(
+                        state,
+                        &msg.team_id,
+                        &github,
+                        &repo_owner,
+                        &repo_name,
+                        pr_number,
+                    )
+                    .await;
                     complete_run_with_status(
                         state,
                         &ticket_msg,
@@ -2223,12 +2302,20 @@ async fn set_run_awaiting_ci(
 }
 
 pub(crate) async fn mark_pr_ready(
+    state: &WorkerState,
+    team_id: &str,
     github: &GitHubClient,
     repo_owner: &str,
     repo_name: &str,
     pr_number: u64,
 ) {
-    mark_ready(github, repo_owner, repo_name, pr_number, false).await
+    // With a team commit template, the final squash keeps the message the
+    // run's first commit was given from it; otherwise the PR title, as always.
+    let keep_first = super::load_git_conventions(state, team_id, "")
+        .await
+        .commit
+        .is_some();
+    mark_ready(github, repo_owner, repo_name, pr_number, false, keep_first).await
 }
 
 /// Marks an E2E fix or generated-test PR ready once its repeat runs proved it.
@@ -2253,7 +2340,9 @@ pub(crate) async fn ready_or_prove(
             pr_number,
             "Flaky-test fix PR stays a draft while its proof runs or after it was refused"
         ),
-        Proof::NotAFix => mark_pr_ready(github, repo_owner, repo_name, pr_number).await,
+        Proof::NotAFix => {
+            mark_pr_ready(state, team_id, github, repo_owner, repo_name, pr_number).await
+        }
     }
 }
 
@@ -2263,7 +2352,7 @@ pub(crate) async fn mark_e2e_pr_ready(
     repo_name: &str,
     pr_number: u64,
 ) {
-    mark_ready(github, repo_owner, repo_name, pr_number, true).await
+    mark_ready(github, repo_owner, repo_name, pr_number, true, false).await
 }
 
 /// Whether a PR title belongs to an E2E fix or generated test, which waits for
@@ -2273,12 +2362,27 @@ pub(crate) fn is_e2e_proof_pr(title: &str) -> bool {
     t.starts_with(super::e2e::FIX_TICKET_PREFIX) || t.starts_with(super::e2e::GEN_TICKET_PREFIX)
 }
 
+/// The message of the PR's first commit CoderHelm made (the squash at PR
+/// open, written from the team's commit template).
+fn first_own_commit_message(commits: &[serde_json::Value]) -> Option<String> {
+    commits.iter().find_map(|c| {
+        let own = [&c["committer"]["login"], &c["author"]["login"]]
+            .iter()
+            .any(|l| super::is_own_login(l.as_str().unwrap_or("")));
+        let message = c["commit"]["message"].as_str().unwrap_or("").trim();
+        (own && !message.is_empty()).then(|| message.to_string())
+    })
+}
+
 async fn mark_ready(
     github: &GitHubClient,
     repo_owner: &str,
     repo_name: &str,
     pr_number: u64,
     proven: bool,
+    // The team has a commit template: squash under the first commit's
+    // message (CoderHelm wrote it from the template) instead of the title.
+    keep_first_message: bool,
 ) {
     if pr_number == 0 {
         return;
@@ -2366,9 +2470,22 @@ async fn mark_ready(
                         .get("title")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Apply changes");
-                    let squash_msg = title.strip_prefix("⚠️ Partial: ").unwrap_or(title);
+                    let mut squash_msg = title
+                        .strip_prefix("⚠️ Partial: ")
+                        .unwrap_or(title)
+                        .to_string();
+                    if keep_first_message {
+                        if let Ok(commits) = github
+                            .list_pr_commits(repo_owner, repo_name, pr_number)
+                            .await
+                        {
+                            if let Some(m) = first_own_commit_message(&commits) {
+                                squash_msg = m;
+                            }
+                        }
+                    }
                     if let Err(e) = github
-                        .squash_branch(repo_owner, repo_name, head, base, squash_msg)
+                        .squash_branch(repo_owner, repo_name, head, base, &squash_msg)
                         .await
                     {
                         warn!(pr_number, error = %e, "Final squash before mark-ready failed — proceeding with full history");
@@ -2536,7 +2653,7 @@ async fn resume_multi_repo(
             super::add_progress_note(state, &msg.team_id, &msg.run_id, &n).await;
         }
         for (o, n, num) in &open {
-            mark_pr_ready(&github, o, n, *num).await;
+            mark_pr_ready(state, &msg.team_id, &github, o, n, *num).await;
         }
         mark_events_processed(state, &msg.run_id, &events).await;
         set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
@@ -2616,7 +2733,7 @@ async fn hand_off_after_ci_wait(state: &WorkerState, msg: &ResumeMessage) {
     ) {
         for u in &urls {
             if let Some((o, n, num)) = common::pr_outcome::parse_pr_url(u) {
-                mark_pr_ready(&github, &o, &n, num).await;
+                mark_pr_ready(state, &msg.team_id, &github, &o, &n, num).await;
             }
         }
     }
