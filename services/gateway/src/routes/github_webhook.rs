@@ -500,6 +500,9 @@ async fn handle_review_comment(
     let Some(ask) = parse_reviewer_ask(body) else {
         return Ok(StatusCode::OK);
     };
+    if !may_start_work(state, team_id, &payload["comment"], "review thread reply").await {
+        return Ok(StatusCode::OK);
+    }
     let pr = &payload["pull_request"];
     let bot_pr = pr["user"]["login"]
         .as_str()
@@ -555,6 +558,56 @@ fn is_bot_comment(payload: &serde_json::Value) -> bool {
     payload["comment"]["user"]["type"].as_str() == Some("Bot")
 }
 
+/// Whether the author of a comment or review (`item` is the `comment` or
+/// `review` object) may start a run, re-run, review or fix pass. People with
+/// standing in the repository may, and so may a person whose GitHub account
+/// is linked to a member of this team. Bot accounts are apps the
+/// repository's owners installed (CI, other review tools) and keep working
+/// as before. Anyone else is ignored, with an info log.
+async fn may_start_work(state: &AppState, team_id: &str, item: &Value, surface: &str) -> bool {
+    if common::standing::shown_by_github(item) {
+        return true;
+    }
+    let association = item["author_association"].as_str().unwrap_or("");
+    let login = item["user"]["login"].as_str().unwrap_or("");
+    if let Some(github_id) = item["user"]["id"].as_u64() {
+        if is_linked_team_member(state, team_id, github_id).await {
+            return true;
+        }
+    }
+    info!(
+        team_id,
+        login,
+        association,
+        surface,
+        "Ignoring request from a person without standing in the repository"
+    );
+    false
+}
+
+/// Is this GitHub account linked to a user of `team_id`? A failed read counts
+/// as no (fail closed).
+async fn is_linked_team_member(state: &AppState, team_id: &str, github_id: u64) -> bool {
+    match state
+        .dynamo
+        .query()
+        .table_name(&state.config.users_table_name)
+        .index_name("gsi1")
+        .key_condition_expression("gsi1pk = :gpk AND gsi1sk = :team")
+        .expression_attribute_values(":gpk", attr_s(&format!("GHUSER#{github_id}")))
+        .expression_attribute_values(":team", attr_s(team_id))
+        .limit(1)
+        .send()
+        .await
+    {
+        Ok(r) => !r.items().is_empty(),
+        Err(e) => {
+            warn!(team_id, github_id, error = %e, "Could not check team membership — treating as not a member");
+            false
+        }
+    }
+}
+
 async fn handle_issue_comment(
     state: &AppState,
     payload: &Value,
@@ -581,7 +634,6 @@ async fn handle_issue_comment(
     if is_bot_comment(payload) {
         return Ok(StatusCode::OK);
     }
-
     let body = payload["comment"]["body"].as_str().unwrap_or("");
     let commenter = payload["comment"]["user"]["login"].as_str().unwrap_or("");
 
@@ -591,6 +643,26 @@ async fn handle_issue_comment(
     } else {
         parse_reviewer_ask(body)
     };
+
+    // Only a comment on CoderHelm's own PR, or one addressed to CoderHelm,
+    // can start work (a run, a review, a fix pass). Such a comment counts
+    // only from a person with standing in the repository or on the team.
+    let on_bot_pr = payload["issue"]["pull_request"].is_object()
+        && payload["issue"]["user"]["login"]
+            .as_str()
+            .unwrap_or("")
+            .contains("coderhelm")
+        && !commenter.contains("coderhelm");
+    let lower = body.to_ascii_lowercase();
+    let addressed = ask.is_some()
+        || lower.trim_start().starts_with("/coderhelm")
+        || lower.contains("@coderhelm");
+    if !on_bot_pr && !addressed {
+        return Ok(StatusCode::OK);
+    }
+    if !may_start_work(state, team_id, &payload["comment"], "comment").await {
+        return Ok(StatusCode::OK);
+    }
 
     // On a PR CoderHelm opened, every person's comment reaches it. One that
     // addresses CoderHelm (`@coderhelm …`) goes to the reviewer when review is
@@ -1171,6 +1243,9 @@ async fn handle_pr_review(
         let body = payload["review"]["body"].as_str().unwrap_or("");
         let review_id = payload["review"]["id"].as_u64().unwrap_or(0);
         if let Some(ask) = parse_reviewer_ask(body) {
+            if !may_start_work(state, team_id, &payload["review"], "review").await {
+                return Ok(StatusCode::OK);
+            }
             let cfg = load_review_config(state, team_id, owner, name).await?;
             if cfg.enabled && !cfg.killed && pr_number != 0 && review_id != 0 {
                 if let Some(reason) = check_run_budget(state, team_id).await {
@@ -1205,6 +1280,10 @@ async fn handle_pr_review(
         return Ok(StatusCode::OK);
     }
 
+    // A review on CoderHelm's own PR starts a fix pass.
+    if !may_start_work(state, team_id, &payload["review"], "review").await {
+        return Ok(StatusCode::OK);
+    }
     if let Some(reason) = check_run_budget(state, team_id).await {
         info!(team_id, "PR review skipped — token limit reached");
         post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
@@ -1376,111 +1455,19 @@ async fn handle_installation(
                 .unwrap_or("unknown");
             info!(installation_id, org, "GitHub App installed");
 
-            // Check if a team is already linked (reinstall scenario)
-            let team_id = if let Some(tid) =
-                resolve_team_by_installation(state, installation_id).await
-            {
-                Some(tid)
-            } else {
-                // Try to auto-link: look up the installing user's github_id in the users table
-                let sender_id = payload["sender"]["id"].as_u64();
-                let found_by_github = if let Some(github_id) = sender_id {
-                    state
-                        .dynamo
-                        .query()
-                        .table_name(&state.config.users_table_name)
-                        .index_name("gsi1")
-                        .key_condition_expression("gsi1pk = :gpk")
-                        .expression_attribute_values(":gpk", attr_s(&format!("GHUSER#{github_id}")))
-                        .limit(1)
-                        .send()
-                        .await
-                        .ok()
-                        .and_then(|r| r.items().first().cloned())
-                        .and_then(|item| {
-                            item.get("pk")
-                                .and_then(|v| v.as_s().ok())
-                                .map(|s| s.to_string())
-                        })
-                } else {
-                    None
-                };
-
-                // Fallback: find a team that has repos from this org
-                let tid = if let Some(tid) = found_by_github {
-                    Some(tid)
-                } else {
-                    // Scan repos table for any team that has a repo from this org
-                    let repo_prefix = format!("REPO#{org}/");
-                    state
-                        .dynamo
-                        .scan()
-                        .table_name(&state.config.repos_table_name)
-                        .filter_expression("begins_with(sk, :prefix)")
-                        .expression_attribute_values(":prefix", attr_s(&repo_prefix))
-                        .limit(1)
-                        .send()
-                        .await
-                        .ok()
-                        .and_then(|r| r.items().first().cloned())
-                        .and_then(|item| {
-                            item.get("pk")
-                                .and_then(|v| v.as_s().ok())
-                                .map(|s| s.to_string())
-                        })
-                };
-
-                if let Some(ref tid) = tid {
-                    let now = chrono::Utc::now().to_rfc3339();
-                    // Link in teams table
-                    let _ = state
-                        .dynamo
-                        .update_item()
-                        .table_name(&state.config.teams_table_name)
-                        .key("team_id", attr_s(tid))
-                        .key("sk", attr_s("META"))
-                        .update_expression(
-                            "SET github_installation_id = :iid, github_org = :org, updated_at = :now",
-                        )
-                        .expression_attribute_values(
-                            ":iid",
-                            aws_sdk_dynamodb::types::AttributeValue::N(
-                                installation_id.to_string(),
-                            ),
-                        )
-                        .expression_attribute_values(":org", attr_s(org))
-                        .expression_attribute_values(":now", attr_s(&now))
-                        .send()
-                        .await;
-
-                    // Link in main table
-                    let _ = state
-                        .dynamo
-                        .update_item()
-                        .table_name(&state.config.table_name)
-                        .key("pk", attr_s(tid))
-                        .key("sk", attr_s("META"))
-                        .update_expression(
-                            "SET github_install_id = :iid, github_org = :org, updated_at = :now",
-                        )
-                        .expression_attribute_values(
-                            ":iid",
-                            aws_sdk_dynamodb::types::AttributeValue::N(installation_id.to_string()),
-                        )
-                        .expression_attribute_values(":org", attr_s(org))
-                        .expression_attribute_values(":now", attr_s(&now))
-                        .send()
-                        .await;
-
-                    info!(
-                        installation_id,
-                        org,
-                        team_id = tid.as_str(),
-                        "Auto-linked GitHub installation via webhook"
-                    );
-                }
-                tid
-            };
+            // Only a team that already holds this installation (a reinstall)
+            // is synced here. A new installation is never linked from a
+            // webhook: who sent it, or which team once added a repo from the
+            // same org, says nothing about which team may have it. It is
+            // linked when an admin signs in with GitHub and GitHub confirms
+            // they can access it (auth::github_callback).
+            let team_id = resolve_team_by_installation(state, installation_id).await;
+            if team_id.is_none() {
+                info!(
+                    installation_id,
+                    org, "New installation not linked — waiting for an admin's GitHub sign-in"
+                );
+            }
 
             // Sync repos if we have a linked team
             if let Some(team_id) = team_id {
