@@ -1049,6 +1049,9 @@ async fn start_run(
         repo_name: name.to_string(),
         issue_number: 0,
         sender: "alert".to_string(),
+        requester: Some(common::requester::Requester::coderhelm(
+            common::requester::ALERT,
+        )),
         image_attachments: vec![],
     });
     let body = serde_json::to_string(&message).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

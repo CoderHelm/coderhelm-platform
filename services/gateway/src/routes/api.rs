@@ -1051,6 +1051,10 @@ pub async fn retry_run(
             .github_login
             .clone()
             .unwrap_or_else(|| claims.email.clone()),
+        requester: common::requester::Requester::member(
+            claims.github_login.as_deref(),
+            &claims.email,
+        ),
         image_attachments: item
             .get("image_attachments")
             .and_then(|v| v.as_s().ok())
@@ -1290,6 +1294,10 @@ pub async fn reset_and_rerun(
             .github_login
             .clone()
             .unwrap_or_else(|| claims.email.clone()),
+        requester: common::requester::Requester::member(
+            claims.github_login.as_deref(),
+            &claims.email,
+        ),
         image_attachments: item
             .get("image_attachments")
             .and_then(|v| v.as_s().ok())

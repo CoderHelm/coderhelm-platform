@@ -1135,6 +1135,7 @@ pub async fn run(
         repo_name: repo_name.clone(),
         issue_number,
         sender: String::new(),
+        requester: None,
         base_branch,
         image_attachments,
         continuation: 0,

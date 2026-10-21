@@ -189,6 +189,7 @@ pub async fn run(
                     repo_name: msg.repo_name.clone(),
                     issue_number: 0,
                     sender: String::new(),
+                    requester: None,
                     base_branch,
                     image_attachments: vec![],
                     continuation: 0,
@@ -1942,6 +1943,21 @@ async fn handle_wrong_repo(
         .and_then(|v| v.as_s().ok())
         .cloned()
         .unwrap_or_default();
+    // The new run is still for whoever asked for the first one.
+    let field = |k: &str| {
+        run_record
+            .get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let sender = field("sender");
+    let requester = common::requester::Requester::from_run(
+        &field("requester_key"),
+        &field("requester_name"),
+        &field("requester_email"),
+        &sender,
+    );
 
     let source = match ticket_source.as_str() {
         "jira" => TicketSource::Jira,
@@ -1967,7 +1983,8 @@ async fn handle_wrong_repo(
         repo_owner: target_owner.to_string(),
         repo_name: target_name.to_string(),
         issue_number,
-        sender: String::new(),
+        sender,
+        requester,
         base_branch: "main".to_string(),
         image_attachments,
         continuation: 0,

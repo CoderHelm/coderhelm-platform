@@ -359,6 +359,9 @@ pub struct TicketMessage {
     pub repo_name: String,
     pub issue_number: u64,
     pub sender: String,
+    /// Who asked for the work, as one identity per person (analytics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<common::requester::Requester>,
     #[serde(default)]
     pub image_attachments: Vec<ImageAttachment>,
 }
@@ -546,6 +549,7 @@ mod tests {
             repo_name: "repo".into(),
             issue_number: 42,
             sender: "user".into(),
+            requester: None,
             image_attachments: vec![],
         });
         let json = serde_json::to_string(&msg).unwrap();
