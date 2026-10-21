@@ -230,6 +230,20 @@ async fn record(
 
 /// Sends the prepared action: a run (under the ticket lock, so two
 /// comments can't start two runs) or feedback on the open PR.
+/// The comment's action carrying the person's direction onto the ticket
+/// run it starts (see `TicketMessage::person_direction`); `None` when there
+/// is no direction or the action isn't a ticket run.
+fn with_direction(action: &WorkerMessage, direction: Option<String>) -> Option<WorkerMessage> {
+    match (action, direction) {
+        (WorkerMessage::Ticket(t), Some(d)) => {
+            let mut t = t.clone();
+            t.person_direction = Some(d);
+            Some(WorkerMessage::Ticket(t))
+        }
+        _ => None,
+    }
+}
+
 async fn dispatch(state: &WorkerState, msg: &JiraCommentMessage, action: &WorkerMessage) -> bool {
     let queue = match action {
         WorkerMessage::Feedback(_) => &state.config.feedback_queue_url,
@@ -295,11 +309,14 @@ pub async fn run(
         intent: intent.unwrap_or(Intent::Other),
         at: chrono::Utc::now().to_rfc3339(),
     };
+    let direction = (intent == Some(Intent::NewRequirement))
+        .then(|| format!("{}: {}", note.author, common::truncate_str(&note.text, 600)));
     match act {
         Act::Dispatch => {
             record(state, &msg, note, None).await;
             if let Some(a) = msg.action.as_deref() {
-                dispatch(state, &msg, a).await;
+                let directed = with_direction(a, direction);
+                dispatch(state, &msg, directed.as_ref().unwrap_or(a)).await;
             }
         }
         Act::Elsewhere { and_feedback } => {

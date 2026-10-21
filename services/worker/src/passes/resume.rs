@@ -1128,6 +1128,7 @@ pub async fn run(
         ticket_update_note: None,
         ticket_history_note: None,
         plan_cache_key: None,
+        person_direction: None,
     };
 
     let provider = ModelProvider::load_for_team(

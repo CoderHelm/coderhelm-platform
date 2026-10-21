@@ -82,6 +82,11 @@ pub struct FixEvidence {
     /// What the data or settings show.
     #[serde(default)]
     pub data_shows: String,
+    /// What the decision rests on: `code` (a bug in code the planner read),
+    /// `data` (stored records or a source system) or `feature` (new work,
+    /// nothing wrong to trace). Decides what the trace must show.
+    #[serde(default)]
+    pub basis: String,
     /// What writes the wrong value, when the ticket is about one.
     #[serde(default)]
     pub producer: Producer,
@@ -189,17 +194,36 @@ impl FixDecision {
     }
 }
 
-/// Whether a decision rests on data the planner never looked at: it could
-/// look things up, made no lookup, and still says what the data shows.
-pub fn unchecked_data(d: Option<&FixDecision>, can_look_up: bool, lookups: usize) -> bool {
-    can_look_up && lookups == 0 && d.is_some_and(|d| !d.evidence.data_shows.trim().is_empty())
-}
-
 /// What a settled decision about data still lacks, in plain instructions
 /// (empty when nothing is missing): a lookup at all, what writes the wrong
 /// value, that code named as the writer was actually opened in this run
 /// (`read_paths`: `owner/repo:path` of every file the planner read), and how
 /// many records share the defect.
+/// Whether the decision traces the problem to code the planner opened in
+/// this run: a bug in the code itself (a style, a branch, a mapping) rests on
+/// that code, and no data lookup could add to it.
+fn rests_on_opened_code(d: &FixDecision, read_paths: &[String]) -> bool {
+    let p = &d.evidence.producer;
+    let cited = p.where_.trim();
+    p.kind.trim() == "code"
+        && !cited.is_empty()
+        && read_paths.iter().any(|r| {
+            let file = r.split_once(':').map_or(r.as_str(), |(_, f)| f);
+            !file.is_empty() && cited.contains(file)
+        })
+}
+
+/// Whether the decision rests on data it never looked up: its basis is
+/// data, it could look things up and it made no lookup.
+pub fn needs_lookup(
+    d: Option<&FixDecision>,
+    can_look_up: bool,
+    lookups: usize,
+    _read_paths: &[String],
+) -> bool {
+    can_look_up && lookups == 0 && d.is_some_and(|d| basis_of(d) == "data")
+}
+
 pub fn gaps(
     d: Option<&FixDecision>,
     can_look_up: bool,
@@ -207,18 +231,20 @@ pub fn gaps(
     read_paths: &[String],
 ) -> Vec<String> {
     let Some(d) = d else { return Vec::new() };
-    if d.evidence.data_shows.trim().is_empty() {
-        return Vec::new();
-    }
     let mut out = Vec::new();
-    if unchecked_data(Some(d), can_look_up, lookups) {
-        out.push("You describe what the data shows but made no lookups. Check the records the ticket and the comments name against the connected data (stored values by id, and the sync or pipeline that writes them); what people wrote are leads, not facts.".to_string());
-    }
+    let basis = basis_of(d);
     let settled = matches!(
         d.fix_location,
         FixLocation::Code | FixLocation::OutsideCode | FixLocation::Both
     );
-    if !settled {
+    if basis == "data" && can_look_up && lookups == 0 {
+        out.push("Your decision rests on data, but you made no lookups. Check the records the ticket and the comments name against the connected data (stored values by id, and the sync or pipeline that writes them).".to_string());
+    }
+    if !settled || basis == "feature" {
+        return out;
+    }
+    if basis.is_empty() {
+        out.push("Say what your decision rests on (`basis`): `code` when the bug is in code you read, `data` when it depends on stored records or a source system, `feature` for new work.".to_string());
         return out;
     }
     let p = &d.evidence.producer;
@@ -228,13 +254,9 @@ pub fn gaps(
     match p.kind.trim() {
         "code" => {
             let cited = p.where_.trim();
-            let opened = read_paths.iter().any(|r| {
-                let file = r.split_once(':').map_or(r.as_str(), |(_, f)| f);
-                !file.is_empty() && cited.contains(file)
-            });
             if cited.is_empty() {
-                out.push("Name the file and function that write the wrong value (`producer.where`: owner/repo:path function).".to_string());
-            } else if !opened {
+                out.push("Name the file and function that write the wrong value (`producer.where`: owner/repo:path:line function).".to_string());
+            } else if !rests_on_opened_code(d, read_paths) {
                 out.push(format!(
                     "You named `{cited}` as what writes the wrong value but didn't open it in this run. Read the code that writes it (the write statement itself) before deciding."
                 ));
@@ -244,9 +266,27 @@ pub fn gaps(
         _ => out.push("Say what writes the wrong value (`producer`): the code (repository file and function) or the source record. Read it before deciding.".to_string()),
     }
     if d.evidence.scope.trim().is_empty() {
-        out.push("Say how many records have the same defect (`scope`), from a query.".to_string());
+        out.push("Say how widespread it is (`scope`): how many records have the same defect (from a query), or how many places in the code.".to_string());
     }
     out
+}
+
+/// The decision's basis as declared; for a decision without one, what its
+/// producer says (`code` or `data`), else `feature` when it claims nothing
+/// about data. Empty when it can't be told.
+fn basis_of(d: &FixDecision) -> &'static str {
+    match d.evidence.basis.trim() {
+        "code" => return "code",
+        "data" => return "data",
+        "feature" => return "feature",
+        _ => {}
+    }
+    match d.evidence.producer.kind.trim() {
+        "code" => "code",
+        "source" => "data",
+        _ if d.evidence.data_shows.trim().is_empty() => "feature",
+        _ => "",
+    }
 }
 
 /// The message that sends a planner back with what its decision lacks.
@@ -400,9 +440,10 @@ After the four openspec files, output this block (JSON, all fields required; `ou
   "evidence": {
     "looked_up": ["each lookup you made and a short summary of what came back"],
     "code_rule": "the rule the code is meant to follow for this case",
-    "data_shows": "what the data or settings show for the records in the ticket",
+    "data_shows": "what the data or settings show for the records in the ticket; empty when no stored data is involved (a bug in the code itself)",
+    "basis": "code | data | feature: code when the bug is in code you read (no data lookup needed), data when the decision depends on stored records or a source system (lookups needed), feature for new work",
     "producer": {"kind": "code | source", "where": "for code: owner/repo:path:line and the function that writes the wrong value (a file you opened); for source: the system, the record and the wrong value it holds"},
-    "scope": "how many records have the same defect, from a query (e.g. 50 groups, 530 classes)"
+    "scope": "how many records (from a query) or places in the code have the same defect"
   },
   "outside_change": {
     "system": "the system the change is made in",
@@ -768,15 +809,25 @@ mod unchecked_data_tests {
     }
 
     #[test]
-    fn a_claim_about_data_with_no_lookup_is_unchecked() {
-        let d = decision("Per the ticket: the parent record is overwritten on each sync.");
-        assert!(unchecked_data(Some(&d), true, 0));
+    fn a_decision_resting_on_data_needs_a_lookup() {
+        let mut d = decision("Per the ticket: the parent record is overwritten on each sync.");
+        d.evidence.basis = "data".into();
+        assert!(needs_lookup(Some(&d), true, 0, &[]));
         // It looked: fine. It couldn't look: nothing to send it back for.
-        assert!(!unchecked_data(Some(&d), true, 3));
-        assert!(!unchecked_data(Some(&d), false, 0));
-        // No claim about data (ordinary feature work): fine.
-        assert!(!unchecked_data(Some(&decision("")), true, 0));
-        assert!(!unchecked_data(None, true, 0));
+        assert!(!needs_lookup(Some(&d), true, 3, &[]));
+        assert!(!needs_lookup(Some(&d), false, 0, &[]));
+        // A bug in code, or new work: no lookup needed.
+        d.evidence.basis = "code".into();
+        assert!(!needs_lookup(Some(&d), true, 0, &[]));
+        d.evidence.basis = "feature".into();
+        assert!(!needs_lookup(Some(&d), true, 0, &[]));
+        // No basis and no producer: it has to say which (a gap), not a lookup.
+        d.evidence.basis.clear();
+        assert!(!needs_lookup(Some(&d), true, 0, &[]));
+        assert!(gaps(Some(&d), true, 0, &[])
+            .iter()
+            .any(|g| g.contains("`basis`")));
+        assert!(!needs_lookup(None, true, 0, &[]));
     }
 
     #[test]
@@ -830,9 +881,13 @@ mod gaps_tests {
         assert_eq!(g.len(), 1, "{g:?}");
         assert!(g[0].contains("didn't open it"), "{g:?}");
 
-        // No producer, no scope.
-        let bare = decision("outside_code", serde_json::json!({}), "");
+        // Resting on data with no producer and no scope: both are asked for.
+        let mut bare = decision("outside_code", serde_json::json!({}), "");
+        bare.evidence.basis = "data".into();
         assert_eq!(gaps(Some(&bare), true, 4, &[]).len(), 2);
+        // No basis at all: it has to say what the decision rests on.
+        bare.evidence.basis.clear();
+        assert_eq!(gaps(Some(&bare), true, 4, &[]).len(), 1);
 
         // A source record needs no file.
         let src = decision(
@@ -845,7 +900,8 @@ mod gaps_tests {
 
     #[test]
     fn only_settled_data_decisions_are_held_to_it() {
-        let open = decision("unknown", serde_json::json!({}), "");
+        let mut open = decision("unknown", serde_json::json!({}), "");
+        open.evidence.basis = "data".into();
         assert!(
             gaps(Some(&open), true, 4, &[]).is_empty(),
             "unknown says where it stopped"
@@ -943,5 +999,49 @@ mod our_bug_tests {
             &read
         )
         .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod code_only_tests {
+    use super::*;
+
+    /// A style bug in a component: the planner opened the file, made no data
+    /// lookups (there is no stored record), and said so in `data_shows`.
+    fn style_bug() -> FixDecision {
+        let block = format!(
+            "```fix_location.json\n{}\n```",
+            serde_json::json!({
+                "fix_location": "code",
+                "cause": "The question is a plain Text with no font family.",
+                "evidence": {
+                    "looked_up": ["[code] src/components/faq/index.tsx line 27"],
+                    "data_shows": "No stored record is involved; the text is a constant in the app.",
+                    "producer": {"kind": "code", "where": "acme/app:src/components/faq/index.tsx:27 FAQs render"},
+                    "scope": "1 component"
+                },
+                "outside_change": null,
+                "history_check": ""
+            })
+        );
+        parse(&block).expect("parses")
+    }
+
+    #[test]
+    fn a_bug_in_code_it_opened_needs_no_data_lookup() {
+        let read = vec!["acme/app:src/components/faq/index.tsx".to_string()];
+        let d = style_bug();
+        assert!(!needs_lookup(Some(&d), true, 0, &read));
+        assert!(
+            gaps(Some(&d), true, 0, &read).is_empty(),
+            "{:?}",
+            gaps(Some(&d), true, 0, &read)
+        );
+        // Not opened in this run: it still has to read it. A bug in code never
+        // needs a data lookup.
+        let g = gaps(Some(&d), true, 0, &[]);
+        assert!(g.iter().any(|x| x.contains("didn't open it")), "{g:?}");
+        assert!(!g.iter().any(|x| x.contains("made no lookups")), "{g:?}");
+        assert!(!needs_lookup(Some(&d), true, 0, &[]));
     }
 }

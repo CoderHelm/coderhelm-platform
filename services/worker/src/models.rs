@@ -545,6 +545,11 @@ pub struct TicketMessage {
     /// (see `plan::plan_cache_key`). Never serialized.
     #[serde(skip)]
     pub plan_cache_key: Option<String>,
+    /// A person's direction that started this run (a reply on the ticket
+    /// telling CoderHelm where the fix is and to go ahead), as
+    /// "author: words". The planner's trace checks then inform, not block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_direction: Option<String>,
 }
 
 fn default_branch() -> String {
@@ -729,6 +734,7 @@ mod tests {
             ticket_update_note: None,
             ticket_history_note: None,
             plan_cache_key: None,
+            person_direction: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();

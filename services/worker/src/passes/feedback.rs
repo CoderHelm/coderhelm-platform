@@ -198,6 +198,7 @@ pub async fn run(
                     ticket_update_note: None,
                     ticket_history_note: None,
                     plan_cache_key: None,
+                    person_direction: None,
                 };
                 match super::pr::resolve_conflicts(
                     state,
@@ -1976,6 +1977,7 @@ async fn handle_wrong_repo(
         ticket_update_note: None,
         ticket_history_note: None,
         plan_cache_key: None,
+        person_direction: None,
     });
 
     if state.config.ticket_queue_url.is_empty() {
