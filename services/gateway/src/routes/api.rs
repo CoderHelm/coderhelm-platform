@@ -4436,7 +4436,9 @@ pub async fn list_dlq_messages(
         .receive_message()
         .queue_url(&state.config.dlq_url)
         .max_number_of_messages(10)
-        .visibility_timeout(120) // Keep receipt handles valid for 2 min
+        // Visible again at once: redrive and delete look the message up by
+        // id, and a hidden message could not be found for two minutes.
+        .visibility_timeout(0)
         .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::All)
         .send()
         .await
@@ -4448,7 +4450,7 @@ pub async fn list_dlq_messages(
     // The DLQ is one queue shared by ALL tenants — without this filter any
     // team's admin could read every other team's failed messages (ticket
     // bodies, repo details). Receipt handles for other teams' messages are
-    // never returned, which implicitly scopes redrive/delete too.
+    // never returned; redrive/delete re-check the team on the stored body.
     let messages: Vec<Value> = resp
         .messages()
         .iter()
@@ -4506,7 +4508,13 @@ pub async fn list_dlq_messages(
     Ok(Json(json!({ "messages": messages, "count": count })))
 }
 
-/// POST /api/dlq/redrive — Redrive a specific message back to its source queue
+/// POST /api/dlq/redrive — Send one of the team's failed messages back to
+/// its source queue.
+///
+/// The request names the message by its SQS `message_id` only. The message
+/// itself is read again from the DLQ here: a body posted by the client is
+/// never sent anywhere, so a caller can't enqueue work it made up (another
+/// team's installation, a global job) by dressing it as a redrive.
 pub async fn redrive_dlq_message(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -4515,47 +4523,43 @@ pub async fn redrive_dlq_message(
     if claims.role != "owner" && claims.role != "admin" {
         return Err(StatusCode::FORBIDDEN);
     }
-
-    let receipt_handle = body["receipt_handle"]
-        .as_str()
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    let message_body = body.get("body").ok_or(StatusCode::BAD_REQUEST)?;
-    // Cross-tenant guard: only redrive messages belonging to the caller's team.
-    if message_body
-        .get("team_id")
-        .and_then(|t| t.as_str())
-        .is_none_or(|t| t != claims.team_id)
-    {
-        return Err(StatusCode::FORBIDDEN);
+    if state.config.dlq_url.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
     }
+    let message_id = body["message_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
 
-    // Determine which source queue to send to based on message content
-    let body_str = if message_body.is_string() {
-        message_body.as_str().unwrap_or("").to_string()
-    } else {
-        serde_json::to_string(message_body).unwrap_or_default()
+    let found = find_team_dlq_message(&state, &claims.team_id, message_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let queue = match redrive_queue(&found.body, &claims.team_id) {
+        Ok(q) => q,
+        Err(reason) => {
+            warn!(team_id = %claims.team_id, message_id, reason, "DLQ redrive refused");
+            release_dlq_message(&state, &found.receipt_handle).await;
+            return Err(StatusCode::FORBIDDEN);
+        }
     };
-
-    let target_queue =
-        if body_str.contains("\"type\":\"ci_fix\"") || body_str.contains("\"type\":\"resume\"") {
-            &state.config.ci_fix_queue_url
-        } else if body_str.contains("\"type\":\"feedback\"") {
-            &state.config.feedback_queue_url
-        } else {
-            &state.config.ticket_queue_url
-        };
-
+    let target_queue = match queue {
+        RedriveQueue::CiFix => &state.config.ci_fix_queue_url,
+        RedriveQueue::Feedback => &state.config.feedback_queue_url,
+        RedriveQueue::Ticket => &state.config.ticket_queue_url,
+    };
     if target_queue.is_empty() {
         error!("Cannot redrive — target queue URL is empty");
+        release_dlq_message(&state, &found.receipt_handle).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Send to source queue
+    // Send the stored body, byte for byte, to the source queue
     state
         .sqs
         .send_message()
         .queue_url(target_queue)
-        .message_body(&body_str)
+        .message_body(&found.body)
         .send()
         .await
         .map_err(|e| {
@@ -4568,7 +4572,7 @@ pub async fn redrive_dlq_message(
         .sqs
         .delete_message()
         .queue_url(&state.config.dlq_url)
-        .receipt_handle(receipt_handle)
+        .receipt_handle(&found.receipt_handle)
         .send()
         .await
         .map_err(|e| {
@@ -4576,11 +4580,15 @@ pub async fn redrive_dlq_message(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(team_id = %claims.team_id, "DLQ message redriven");
+    info!(team_id = %claims.team_id, message_id, "DLQ message redriven");
     Ok(StatusCode::OK)
 }
 
-/// DELETE /api/dlq/:message_id — Delete a single message from the DLQ
+/// POST /api/dlq/delete — Delete one of the team's messages from the DLQ.
+///
+/// Like redrive, the message is found by `message_id` and its team is read
+/// from the stored body before anything is deleted; a receipt handle from
+/// the client is not trusted.
 pub async fn delete_dlq_message(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -4589,16 +4597,23 @@ pub async fn delete_dlq_message(
     if claims.role != "owner" && claims.role != "admin" {
         return Err(StatusCode::FORBIDDEN);
     }
-
-    let receipt_handle = body["receipt_handle"]
+    if state.config.dlq_url.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let message_id = body["message_id"]
         .as_str()
+        .filter(|s| !s.is_empty())
         .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let found = find_team_dlq_message(&state, &claims.team_id, message_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     state
         .sqs
         .delete_message()
         .queue_url(&state.config.dlq_url)
-        .receipt_handle(receipt_handle)
+        .receipt_handle(&found.receipt_handle)
         .send()
         .await
         .map_err(|e| {
@@ -4606,8 +4621,155 @@ pub async fn delete_dlq_message(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!(team_id = %claims.team_id, "DLQ message deleted");
+    info!(team_id = %claims.team_id, message_id, "DLQ message deleted");
     Ok(StatusCode::OK)
+}
+
+/// A DLQ message read back from the queue, held invisible for a short while
+/// so it can be sent and deleted.
+struct HeldDlqMessage {
+    body: String,
+    receipt_handle: String,
+}
+
+/// Seconds a message found for redrive/delete stays hidden from other readers.
+const DLQ_HOLD_SECS: i32 = 30;
+
+/// Find `message_id` in the shared DLQ and return it only when its stored
+/// body belongs to `team_id`. Every other message received on the way is
+/// made visible again at once, so the sweep never hides other teams' work.
+async fn find_team_dlq_message(
+    state: &AppState,
+    team_id: &str,
+    message_id: &str,
+) -> Result<Option<HeldDlqMessage>, StatusCode> {
+    let mut passed: Vec<String> = Vec::new();
+    let mut found = None;
+    for _ in 0..20 {
+        let resp = state
+            .sqs
+            .receive_message()
+            .queue_url(&state.config.dlq_url)
+            .max_number_of_messages(10)
+            .visibility_timeout(DLQ_HOLD_SECS)
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to receive DLQ messages: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        let msgs = resp.messages();
+        if msgs.is_empty() {
+            break;
+        }
+        for m in msgs {
+            let Some(handle) = m.receipt_handle() else {
+                continue;
+            };
+            if found.is_none() && m.message_id() == Some(message_id) {
+                let body = m.body().unwrap_or("").to_string();
+                if dlq_body_team(&body).as_deref() == Some(team_id) {
+                    found = Some(HeldDlqMessage {
+                        body,
+                        receipt_handle: handle.to_string(),
+                    });
+                    continue;
+                }
+                // Another team's message: answered as not found, never named.
+                warn!(team_id, message_id, "DLQ message belongs to another team");
+            }
+            passed.push(handle.to_string());
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    for handle in &passed {
+        release_dlq_message(state, handle).await;
+    }
+    Ok(found)
+}
+
+/// Make a received DLQ message visible again right away.
+async fn release_dlq_message(state: &AppState, receipt_handle: &str) {
+    let _ = state
+        .sqs
+        .change_message_visibility()
+        .queue_url(&state.config.dlq_url)
+        .receipt_handle(receipt_handle)
+        .visibility_timeout(0)
+        .send()
+        .await;
+}
+
+/// The `team_id` a stored DLQ body carries, if any.
+fn dlq_body_team(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("team_id")?
+        .as_str()
+        .map(String::from)
+}
+
+/// Which source queue a redriven message goes back to.
+#[derive(Debug, PartialEq, Eq)]
+enum RedriveQueue {
+    Ticket,
+    Feedback,
+    CiFix,
+}
+
+/// Worker message types that are one team's work and may be redriven by that
+/// team. Global jobs (weekly_summary, usage_reconcile, review_reminder,
+/// review_sweep) are absent on purpose: they act on every team, so no team
+/// may start them, and any type not listed here is refused.
+const TEAM_WORK_TYPES: &[&str] = &[
+    "ticket",
+    "tool_proposals",
+    "hidden_suggest",
+    "feedback",
+    "onboard",
+    "mark_ready",
+    "plan_execute",
+    "plan_task_continue",
+    "infra_analyze",
+    "resume",
+    "ci_fix",
+    "review",
+    "health_check",
+    "await_merge",
+    "tag_sweep",
+    "release_notes",
+    "graph_index",
+    "test_ingest",
+    "test_action",
+    "skill_sync",
+    "SkillAsk",
+    "weekly_summary_test",
+    "lesson",
+    "jira_comment",
+];
+
+/// Decide whether a stored DLQ body may be redriven by `team_id`, and to
+/// which queue. The body must be a JSON object of a per-team type whose
+/// `team_id` is the caller's team.
+fn redrive_queue(body: &str, team_id: &str) -> Result<RedriveQueue, &'static str> {
+    let v: Value = serde_json::from_str(body).map_err(|_| "body is not JSON")?;
+    if v.get("team_id").and_then(|t| t.as_str()) != Some(team_id) {
+        return Err("message belongs to another team");
+    }
+    let kind = v
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or("message has no type")?;
+    if !TEAM_WORK_TYPES.contains(&kind) {
+        return Err("message type is not per-team work");
+    }
+    Ok(match kind {
+        "ci_fix" | "resume" => RedriveQueue::CiFix,
+        "feedback" => RedriveQueue::Feedback,
+        _ => RedriveQueue::Ticket,
+    })
 }
 
 /// POST /api/dlq/purge — Purge all messages from the DLQ
@@ -4672,7 +4834,62 @@ pub async fn purge_dlq(
 
 #[cfg(test)]
 mod tests {
-    use super::{platform_admin_listed, reset_allowed, usage_json};
+    use super::{
+        dlq_body_team, platform_admin_listed, redrive_queue, reset_allowed, usage_json,
+        RedriveQueue,
+    };
+
+    #[test]
+    fn redrive_sends_team_work_to_its_source_queue() {
+        let t = "TEAM#a";
+        let q = |b: &str| redrive_queue(b, t);
+        assert_eq!(
+            q(r#"{"type":"ticket","team_id":"TEAM#a","installation_id":1}"#),
+            Ok(RedriveQueue::Ticket)
+        );
+        assert_eq!(
+            q(r#"{"type":"feedback","team_id":"TEAM#a"}"#),
+            Ok(RedriveQueue::Feedback)
+        );
+        assert_eq!(
+            q(r#"{"type":"resume","team_id":"TEAM#a"}"#),
+            Ok(RedriveQueue::CiFix)
+        );
+        assert_eq!(
+            q(r#"{"type":"review","team_id":"TEAM#a"}"#),
+            Ok(RedriveQueue::Ticket)
+        );
+    }
+
+    #[test]
+    fn redrive_refuses_global_jobs_other_teams_and_junk() {
+        let t = "TEAM#a";
+        for global in [
+            r#"{"type":"weekly_summary","team_id":"TEAM#a"}"#,
+            r#"{"type":"usage_reconcile","team_id":"TEAM#a","day":"2026-01-01"}"#,
+            r#"{"type":"review_reminder","team_id":"TEAM#a"}"#,
+            r#"{"type":"review_sweep","team_id":"TEAM#a"}"#,
+            r#"{"type":"something_new","team_id":"TEAM#a"}"#,
+        ] {
+            assert!(redrive_queue(global, t).is_err(), "{global}");
+        }
+        // The type alone is not enough: the stored team must be the caller's.
+        assert!(redrive_queue(r#"{"type":"ticket","team_id":"TEAM#b"}"#, t).is_err());
+        assert!(redrive_queue(r#"{"type":"ticket"}"#, t).is_err());
+        assert!(redrive_queue(r#"{"team_id":"TEAM#a"}"#, t).is_err());
+        assert!(redrive_queue("not json", t).is_err());
+        assert!(redrive_queue(r#""{\"type\":\"ticket\"}""#, t).is_err());
+    }
+
+    #[test]
+    fn dlq_team_is_read_from_the_stored_body() {
+        assert_eq!(
+            dlq_body_team(r#"{"type":"ticket","team_id":"TEAM#a"}"#).as_deref(),
+            Some("TEAM#a")
+        );
+        assert_eq!(dlq_body_team(r#"{"type":"weekly_summary"}"#), None);
+        assert_eq!(dlq_body_team("garbage"), None);
+    }
 
     #[test]
     fn usage_shows_all_four_parts_tokens_only() {

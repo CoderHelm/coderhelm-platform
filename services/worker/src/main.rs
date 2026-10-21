@@ -1,7 +1,7 @@
 use aws_lambda_events::event::sqs::SqsEvent;
 use lambda_runtime::{service_fn, Error, LambdaEvent};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod agent;
@@ -9,6 +9,7 @@ mod clients;
 pub mod memory;
 mod models;
 mod passes;
+mod team_installation;
 
 pub struct WorkerState {
     pub dynamo: aws_sdk_dynamodb::Client,
@@ -97,7 +98,11 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
         let body = record.body.unwrap_or_default();
         info!("Processing SQS message");
 
-        let message: models::WorkerMessage = serde_json::from_str(&body)?;
+        let raw: serde_json::Value = serde_json::from_str(&body)?;
+        if !installation_is_teams_own(&state, &raw).await? {
+            continue;
+        }
+        let message: models::WorkerMessage = serde_json::from_value(raw)?;
         // Every model call made while handling this message is counted under
         // the message's feature (spawned tasks fall back to "other").
         let feature = message.usage_feature();
@@ -105,6 +110,46 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
     }
 
     Ok(())
+}
+
+/// A message that names a GitHub installation must name its team's stored
+/// one; anything else is dropped with a warning (see team_installation). A
+/// failed read of the team is returned as an error so SQS retries it.
+async fn installation_is_teams_own(
+    state: &WorkerState,
+    raw: &serde_json::Value,
+) -> Result<bool, Error> {
+    use team_installation::{claims, decide, single_team, stored_installation, Verdict};
+    let kind = raw.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let (claimed, teams) = claims(raw);
+    if claimed.is_empty() {
+        return Ok(true);
+    }
+    let team = match single_team(&teams) {
+        Ok(t) => t,
+        Err(reason) => {
+            warn!(kind, reason, "Refusing queued message");
+            return Ok(false);
+        }
+    };
+    let stored = match team {
+        Some(t) => stored_installation(&state.dynamo, &state.config.teams_table_name, t).await?,
+        None => None,
+    };
+    match decide(&claimed, team, stored) {
+        Verdict::Allow => Ok(true),
+        Verdict::Refuse(reason) => {
+            warn!(
+                kind,
+                team_id = team.unwrap_or(""),
+                claimed = ?claimed,
+                stored = ?stored,
+                reason,
+                "Refusing queued message: installation does not belong to the team"
+            );
+            Ok(false)
+        }
+    }
 }
 
 async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage) {

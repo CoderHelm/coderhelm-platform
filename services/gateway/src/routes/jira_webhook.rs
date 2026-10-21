@@ -548,8 +548,9 @@ async fn process_jira_payload(
 
 /// Forge app handler — `/webhooks/jira` (no token).
 ///
-/// Authenticates via `coderhelm.installation_id` in the JSON body. The Forge
-/// app always includes this field because it reads it from Forge storage.
+/// Authenticates with `coderhelm.forge_secret` in the JSON body, checked
+/// against the team's stored secret. `coderhelm.team_id` (or, for older Forge
+/// installs, `coderhelm.installation_id`) only names the team to check.
 pub async fn handle_forge(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -559,7 +560,10 @@ pub async fn handle_forge(
         StatusCode::BAD_REQUEST
     })?;
 
-    let installation_id = payload
+    // The installation in the payload only helps find the team when the Forge
+    // app sends no team_id. It never chooses which installation the work runs
+    // under: that is always the one stored for the team (below).
+    let payload_installation_id = payload
         .pointer("/coderhelm/installation_id")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
@@ -580,16 +584,20 @@ pub async fn handle_forge(
         }
         _ => {
             // Fallback: resolve team via GitHub installation GSI
-            if installation_id == 0 {
+            if payload_installation_id == 0 {
                 warn!("Forge Jira webhook: missing both team_id and installation_id");
                 return Err(StatusCode::BAD_REQUEST);
             }
-            match super::github_webhook::resolve_team_by_installation(&state, installation_id).await
+            match super::github_webhook::resolve_team_by_installation(
+                &state,
+                payload_installation_id,
+            )
+            .await
             {
                 Some(tid) => tid,
                 None => {
                     warn!(
-                        installation_id,
+                        installation_id = payload_installation_id,
                         "Forge Jira webhook: no team linked to installation"
                     );
                     return Err(StatusCode::UNAUTHORIZED);
@@ -626,7 +634,7 @@ pub async fn handle_forge(
         .and_then(|v| v.as_s().ok())
         .map(|s| s.as_str())
         .unwrap_or("");
-    if stored_secret.is_empty() || request_secret != stored_secret {
+    if !forge_secret_matches(stored_secret, request_secret) {
         warn!(
             team_id,
             "Forge Jira webhook: invalid or missing forge_secret"
@@ -634,31 +642,47 @@ pub async fn handle_forge(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Resolve GitHub installation_id from team record if not provided by Forge
-    let installation_id = if installation_id == 0 {
-        state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.teams_table_name)
-            .key("team_id", attr_s(&team_id))
-            .key("sk", attr_s("META"))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| r.item().cloned())
-            .and_then(|item| {
-                item.get("github_installation_id")
-                    .and_then(|v| v.as_n().ok())
-                    .and_then(|n| n.parse::<u64>().ok())
-            })
-            .unwrap_or(0)
-    } else {
-        installation_id
-    };
+    // The team's own GitHub installation, always from its record.
+    let installation_id = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.teams_table_name)
+        .key("team_id", attr_s(&team_id))
+        .key("sk", attr_s("META"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!(
+                team_id,
+                "Forge Jira webhook: could not read team record: {e}"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item()
+        .and_then(|item| {
+            item.get("github_installation_id")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    if payload_installation_id != 0 && payload_installation_id != installation_id {
+        warn!(
+            team_id,
+            payload_installation_id,
+            installation_id,
+            "Forge Jira webhook: payload installation differs from the team's — using the team's"
+        );
+    }
 
     info!(team_id, installation_id, "Forge Jira webhook received");
 
     process_jira_payload(&state, &team_id, installation_id, &payload).await
+}
+
+/// The Forge secret check, in constant time so the comparison doesn't leak
+/// how much of a guess was right. An unset stored secret never matches.
+fn forge_secret_matches(stored: &str, given: &str) -> bool {
+    !stored.is_empty() && bool::from(stored.as_bytes().ct_eq(given.as_bytes()))
 }
 
 /// Handle a Jira comment event — retry failed runs or send feedback for completed runs with PRs.
@@ -1160,6 +1184,22 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn forge_secret_must_match_exactly() {
+        assert!(forge_secret_matches("s3cret-value", "s3cret-value"));
+        assert!(!forge_secret_matches("s3cret-value", "s3cret-valuX"));
+        assert!(!forge_secret_matches("s3cret-value", "s3cret"));
+        assert!(!forge_secret_matches(
+            "s3cret-value",
+            "s3cret-value-and-more"
+        ));
+        assert!(!forge_secret_matches("s3cret-value", ""));
+        // A team with no secret stored is never authenticated, even by an
+        // empty secret in the payload.
+        assert!(!forge_secret_matches("", ""));
+        assert!(!forge_secret_matches("", "anything"));
+    }
 
     #[test]
     fn every_named_jira_user_in_a_payload_is_kept_once() {

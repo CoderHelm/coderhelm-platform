@@ -1174,8 +1174,10 @@ async fn fetch_review_comments(github: &GitHubClient, msg: &FeedbackMessage) -> 
 }
 
 /// Fetch ALL non-bot review comments from a PR (used by re-review path).
-/// Returns every human-authored comment; filter_unanswered will then remove
-/// ones the bot has already replied to.
+/// Returns every comment from an author with standing in the repository
+/// (see common::standing); an outsider's inline comment is never taken as an
+/// instruction just because someone else started this pass. filter_unanswered
+/// will then remove ones the bot has already replied to.
 async fn fetch_all_human_comments(
     github: &GitHubClient,
     msg: &FeedbackMessage,
@@ -1193,6 +1195,7 @@ async fn fetch_all_human_comments(
                     .map(|l| l.contains("coderhelm"))
                     .unwrap_or(false)
             })
+            .filter(|c| common::standing::shown_by_github(c))
             .map(|c| ReviewComment {
                 path: c["path"].as_str().unwrap_or("").to_string(),
                 line: c["line"].as_u64(),

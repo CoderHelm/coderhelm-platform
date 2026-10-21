@@ -234,9 +234,12 @@ export class WorkerStack extends cdk.Stack {
     // Runs each repo's REAL build/lint/tests in an isolated container so the
     // agent iterates against ground truth instead of guessing at CI. The
     // sandbox runs untrusted customer build scripts, so its role is minimal by
-    // design: read ONE ephemeral S3 bucket + write its own logs. No GitHub
-    // token, no DynamoDB, no KMS. SSE-S3 (not the account CMK) on the bucket is
-    // what keeps the CodeBuild role KMS-free.
+    // design: write its own logs, nothing else. No S3, no GitHub token, no
+    // DynamoDB, no KMS. The worker hands each build presigned URLs for exactly
+    // its own input tarball (GET) and, for codegen, its own output key (PUT),
+    // so a build script can never read or overwrite another build's objects.
+    // SSE-S3 (not the account CMK) on the bucket is what lets those URLs work
+    // without KMS.
     const sandboxLogGroup = new logs.LogGroup(this, "SandboxLogGroup", {
       logGroupName: `/aws/codebuild/${prefix}-sandbox`,
       retention: logs.RetentionDays.ONE_WEEK,
@@ -269,8 +272,8 @@ export class WorkerStack extends cdk.Stack {
         },
       },
       logging: { cloudWatch: { logGroup: sandboxLogGroup } },
-      // NO_SOURCE: the worker passes the tarball location + the derived check
-      // command as env overrides. The buildspec fetches, extracts, runs the
+      // NO_SOURCE: the worker passes a presigned URL for the tarball + the
+      // derived check command as env overrides. The buildspec fetches, extracts, runs the
       // checks, and emits a parseable verdict marker. The verdict is read from
       // the marker (not the build status), so "checks failed" is cleanly
       // distinguishable from "the sandbox itself broke".
@@ -278,8 +281,8 @@ export class WorkerStack extends cdk.Stack {
       //  - CHECKS  (default): run the repo's build/type-check, emit a verdict
       //    marker read by the worker (not the build status).
       //  - CODEGEN (when $CODEGEN_CMD is set): run the repo's codegen, capture
-      //    ONLY the files it changed (find -newer), and upload them to S3 so the
-      //    worker can commit them back — making the sandbox bidirectional so the
+      //    ONLY the files it changed (find -newer), and upload them through the
+      //    presigned PUT URL so the worker can commit them back — making the sandbox bidirectional so the
       //    agent can regenerate generated files (Sanity types, GraphQL, etc.).
       // `n` switches Node to the repo's version; the cd is gated so a bad
       // extract fails the build (no marker) instead of running in the wrong dir.
@@ -290,7 +293,7 @@ export class WorkerStack extends cdk.Stack {
             commands: [
               [
                 "set +e",
-                'aws s3 cp "s3://$SANDBOX_BUCKET/$SANDBOX_KEY" /tmp/src.tgz',
+                'curl -fsS --retry 3 -o /tmp/src.tgz "$SANDBOX_GET_URL"',
                 "mkdir -p /tmp/src && tar xzf /tmp/src.tgz -C /tmp/src",
                 "cd /tmp/src/$(ls /tmp/src) || exit 1",
                 'n "${NODE_VERSION:-20}" >/dev/null 2>&1 || true; hash -r 2>/dev/null || true',
@@ -312,7 +315,9 @@ export class WorkerStack extends cdk.Stack {
                 '  find . -type f -newer "$MARK" -not -path "*/node_modules/*" -not -path "*/.git/*" | sort > /tmp/newer.txt',
                 "  comm -12 /tmp/newer.txt /tmp/before.txt | sed 's|^\\./||' > /tmp/changed.txt",
                 '  echo "CHANGED:"; cat /tmp/changed.txt',
-                '  if [ -s /tmp/changed.txt ] && [ -n "$CODEGEN_OUT_KEY" ]; then tar czf /tmp/out.tgz -T /tmp/changed.txt && aws s3 cp /tmp/out.tgz "s3://$SANDBOX_BUCKET/$CODEGEN_OUT_KEY" && echo "===CODERHELM_CODEGEN_UPLOADED==="; fi',
+                '  if [ -s /tmp/changed.txt ] && [ -n "$SANDBOX_PUT_URL" ]; then',
+                '    if tar czf /tmp/out.tgz -T /tmp/changed.txt && curl -fsS --retry 3 -T /tmp/out.tgz "$SANDBOX_PUT_URL"; then echo "===CODERHELM_CODEGEN_UPLOADED==="; else echo "===CODERHELM_CODEGEN_UPLOAD_FAILED==="; fi',
+                "  fi",
                 "else",
                 '  echo "===CODERHELM_CHECKS_START==="; node --version',
                 '  (eval "$CHECKS_CMD"); CODE=$?',
@@ -325,11 +330,11 @@ export class WorkerStack extends cdk.Stack {
       }),
     });
 
-    // CodeBuild reads the source tarball AND writes captured codegen output —
-    // both scoped to this ephemeral bucket only (no other creds).
-    sandboxBucket.grantReadWrite(sandboxProject);
+    // No bucket grant for the CodeBuild role: builds reach S3 only through
+    // the presigned URLs the worker signs (with its own role) per build.
 
-    // Worker: upload tarballs, drive builds, read their logs.
+    // Worker: upload tarballs, sign each build's URLs, drive builds, read
+    // their logs.
     sandboxBucket.grantReadWrite(this.workerFunction);
     this.workerFunction.addToRolePolicy(
       new iam.PolicyStatement({
