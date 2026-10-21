@@ -62,9 +62,11 @@ const RECORD_TTL_SECS: u64 = 30 * 86_400;
 /// Hidden marker that identifies the gate's status comment.
 pub const STATUS_MARKER: &str = "<!-- coderhelm:merge-status -->";
 
-/// Starts the small print under the checklist (the commit and branch). Notes
-/// are added above it.
-const FOOTER_START: &str = "\n<sub>";
+/// Starts the line under the checklist (the commit and branch), in the same
+/// size as the rest of the comment. Notes are added above it.
+const FOOTER_START: &str = "\n<!-- coderhelm:merge-footer -->\n";
+/// How comments before that marked their footer (as small print).
+const OLD_FOOTER_START: &str = "\n<sub>";
 
 // ─── CI ─────────────────────────────────────────────────────────────────────
 
@@ -468,7 +470,7 @@ pub(crate) fn render_status(
         body.push_str(&format!("\n{note}\n"));
     }
     body.push_str(&format!(
-        "{FOOTER_START}Commit {} into {base}. Merges on its own once every item is done.</sub>",
+        "{FOOTER_START}Commit {} into {base}. Merges on its own once every item is done.",
         short(head)
     ));
     body
@@ -478,7 +480,10 @@ pub(crate) fn render_status(
 /// when the gate pauses, so the checklist of what it was waiting on stays
 /// visible).
 fn with_note(last_body: &str, head: &str, base: &str, note: &str) -> String {
-    match last_body.rfind(FOOTER_START) {
+    let footer_at = last_body
+        .rfind(FOOTER_START)
+        .or_else(|| last_body.rfind(OLD_FOOTER_START));
+    match footer_at {
         Some(i) if last_body.starts_with(STATUS_MARKER) => {
             let (main, footer) = last_body.split_at(i);
             format!("{}\n\n{note}\n{footer}", main.trim_end())
@@ -1532,7 +1537,14 @@ mod ci_tests {
         let paused = with_note(&last, "abc1234", "main", "Paused.");
         assert!(paused.contains("CI running: `Deploy`"));
         assert!(paused.find("Paused.") < paused.find("Commit abc1234 into main."));
-        assert!(paused.ends_with("</sub>"));
+        assert!(paused.ends_with("every item is done."));
+        assert!(!last.contains("<sub>"), "one size: no small print");
+        // A comment written before keeps its footer below the note too.
+        let old = format!(
+            "{STATUS_MARKER}\n**Auto-merge**\n\n- ⏳ x\n\n<sub>Commit abc1234 into main.</sub>"
+        );
+        let n = with_note(&old, "abc1234", "main", "Paused.");
+        assert!(n.find("Paused.") < n.find("Commit abc1234"));
         let fresh = with_note("", "abc1234", "main", "Paused.");
         assert!(fresh.starts_with(STATUS_MARKER) && fresh.contains("Paused."));
     }

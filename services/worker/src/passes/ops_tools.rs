@@ -308,9 +308,11 @@ pub fn describe(c: &Connector) -> String {
             if c.indexes.is_empty() { String::new() } else { format!("; indexes {}", c.indexes.join(", ")) }
         ),
         ConnKind::Rest => format!(
-            "REST API at {}: GET under {}",
+            "{} at {}: GET under {}{}",
+            c.label(),
             c.site,
-            c.paths.join(", ")
+            c.paths.join(", "),
+            if c.name.is_empty() { String::new() } else { format!(" (`rest_get` with api \"{}\")", c.name) }
         ),
         ConnKind::Metrics => format!(
             "CloudWatch metrics in account {} ({}): ECS, RDS, Lambda, CloudFront, load balancers, SQS, DynamoDB",
@@ -441,6 +443,14 @@ impl OpsTools {
         self.loaded.iter().find(|l| l.conn.kind() == kind)
     }
 
+    /// The team's REST APIs this work may read.
+    fn rest_apis(&self) -> Vec<&Loaded> {
+        self.loaded
+            .iter()
+            .filter(|l| l.conn.kind() == ConnKind::Rest)
+            .collect()
+    }
+
     pub fn tools(&self) -> Vec<ToolDefinition> {
         let since = json!({ "type": "string", "description": "how far back (2h, 3d) or a start time (2026-01-31T14:00:00Z)" });
         let until = json!({ "type": "string", "description": "end time (2026-01-31T15:00:00Z); default now" });
@@ -537,18 +547,43 @@ impl OpsTools {
                 json!({ "type": "object", "properties": { "index": index, "query": { "type": "object" } }, "required": ["index"] }),
             ));
         }
-        if let Some(l) = self.get(ConnKind::Rest) {
+        let apis = self.rest_apis();
+        if !apis.is_empty() {
+            let listed: Vec<String> = apis
+                .iter()
+                .map(|l| {
+                    format!(
+                        "{}{} (paths under {})",
+                        if l.conn.name.is_empty() {
+                            String::new()
+                        } else {
+                            format!("`{}` at ", l.conn.name)
+                        },
+                        l.conn.site,
+                        l.conn.paths.join(", ")
+                    )
+                })
+                .collect();
+            let names: Vec<&str> = apis
+                .iter()
+                .map(|l| l.conn.name.as_str())
+                .filter(|n| !n.is_empty())
+                .collect();
+            let mut props = json!({
+                "path": { "type": "string", "description": "a path under an allowed prefix, e.g. the prefix plus /42" },
+                "query": { "type": "object", "description": "query parameters as names and plain values" }
+            });
+            if !names.is_empty() {
+                props["api"] =
+                    json!({ "type": "string", "enum": names, "description": "which API to read" });
+            }
             out.push(tool(
                 "rest_get",
                 &format!(
-                    "GET a path on the team's REST API at {} and read the JSON it returns (the source system's own record). Only paths under {} can be read; pass ids in the path and filters in `query`. Read only.",
-                    l.conn.site,
-                    l.conn.paths.join(", ")
+                    "GET a path on one of the team's REST APIs and read the JSON it returns (the source system's own record): {}. Only paths under an API's prefixes can be read; pass ids in the path and filters in `query`. Read only.",
+                    listed.join("; ")
                 ),
-                json!({ "type": "object", "properties": {
-                    "path": { "type": "string", "description": "a path under an allowed prefix, e.g. the prefix plus /42" },
-                    "query": { "type": "object", "description": "query parameters as names and plain values" }
-                }, "required": ["path"] }),
+                json!({ "type": "object", "properties": props, "required": ["path"] }),
             ));
         }
         if !self.aws.metrics.is_empty() {
@@ -769,7 +804,12 @@ impl OpsTools {
             let n = lines.len();
             return Ok((lines.join("\n"), common::live::count(n, "role")));
         };
-        let l = self.get(kind).ok_or_else(|| {
+        let picked = if kind == ConnKind::Rest {
+            pick_api(&self.rest_apis(), input["api"].as_str().unwrap_or(""))?
+        } else {
+            self.get(kind)
+        };
+        let l = picked.ok_or_else(|| {
             StepError::new(
                 "read_only",
                 "That connection isn't on.",
@@ -891,6 +931,31 @@ impl OpsTools {
     }
 }
 
+/// The REST API `name` names, or the only one when there's one and no name
+/// was given. An unknown name, or no name among several, is refused with the
+/// names to pick from.
+fn pick_api<'a>(apis: &[&'a Loaded], name: &str) -> Result<Option<&'a Loaded>, StepError> {
+    if name.is_empty() && apis.len() == 1 {
+        return Ok(apis.first().copied());
+    }
+    if let Some(l) = apis
+        .iter()
+        .find(|l| !name.is_empty() && l.conn.name == name)
+    {
+        return Ok(Some(*l));
+    }
+    let names: Vec<&str> = apis.iter().map(|l| l.conn.name.as_str()).collect();
+    Err(StepError::new(
+        "read_only",
+        if name.is_empty() {
+            "Say which API to read.".to_string()
+        } else {
+            format!("There's no API called {name}.")
+        },
+        format!("Pass `api` as one of: {}.", names.join(", ")),
+    ))
+}
+
 /// The connections the team can set up in Settings → Integrations but
 /// hasn't turned on and made ready, for the skill check (`id: what it
 /// reads`).
@@ -976,7 +1041,7 @@ pub fn inventory_from(
         let tools = tool_names(c.kind(), c);
         out.push(common::skill_compat::Source {
             kind: c.kind().as_str().to_string(),
-            name: c.kind().label().to_string(),
+            name: c.label(),
             detail: describe(c),
             writes: tools
                 .iter()

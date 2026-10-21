@@ -2,7 +2,9 @@
 //! New Relic, Confluence, OpenSearch, a REST API, CloudWatch metrics and
 //! Airflow (MWAA).
 //!
-//! One record per kind per team (`CONNECTOR#<kind>` in the settings table).
+//! One record per kind per team (`CONNECTOR#<kind>` in the settings table),
+//! except REST APIs: a team connects as many as it uses, each under its own
+//! name (`CONNECTOR#rest#<name>`).
 //! Each is off until an admin turns it on, reads only, and every call it makes
 //! is written to the same activity log as a data-source lookup. The one write
 //! (appending to a Confluence page) needs its own admin switch and a list of
@@ -84,10 +86,31 @@ impl ConnKind {
     }
 }
 
+/// Checks a REST API's name: 1–40 lowercase letters, digits, `-` and `_`,
+/// starting with a letter (it is how agents pick the API and part of its key).
+pub fn check_name(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 40
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} isn't a name an API can have: use lowercase letters, digits, - and _, starting with a letter."
+        ))
+    }
+}
+
 /// One connection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Connector {
     pub kind: Option<ConnKind>,
+    /// REST: the API's name, unique in the team (agents pick it by name).
+    /// Empty for every other kind, and for a REST API saved before names.
+    pub name: String,
     /// Agents may use it. Off until an admin turns it on.
     pub enabled: bool,
     /// `ready` once a test passed; `error` when the last test failed.
@@ -170,13 +193,27 @@ impl Connector {
         self.kind.unwrap_or(ConnKind::NewRelic)
     }
 
+    /// The connection's id in routes and on the page: `rest:<name>` for a
+    /// named REST API, else the kind.
+    pub fn id(&self) -> String {
+        match self.name.as_str() {
+            "" => self.kind().as_str().to_string(),
+            n => format!("{}:{n}", self.kind().as_str()),
+        }
+    }
+
+    /// The name people see: `REST API (name)` for a named API.
+    pub fn label(&self) -> String {
+        match self.name.as_str() {
+            "" => self.kind().label().to_string(),
+            n => format!("{} ({n})", self.kind().label()),
+        }
+    }
+
     pub fn to_item(&self, team_id: &str) -> Item {
         let mut item: Item = HashMap::from([
             ("pk".to_string(), av_s(team_id)),
-            (
-                "sk".to_string(),
-                av_s(&format!("{PREFIX}{}", self.kind().as_str())),
-            ),
+            ("sk".to_string(), av_s(&sort_key(self.kind(), &self.name))),
             ("record_type".to_string(), av_s("connector")),
             ("enabled".to_string(), AttributeValue::Bool(self.enabled)),
             ("status".to_string(), av_s(&self.status)),
@@ -212,9 +249,13 @@ impl Connector {
     }
 
     pub fn from_item(item: &Item) -> Option<Connector> {
-        let kind = ConnKind::parse(s(item, "sk").strip_prefix(PREFIX)?)?;
+        let sk = s(item, "sk");
+        let rest = sk.strip_prefix(PREFIX)?;
+        let (kind, name) = rest.split_once('#').unwrap_or((rest, ""));
+        let kind = ConnKind::parse(kind)?;
         Some(Connector {
             kind: Some(kind),
+            name: name.to_string(),
             enabled: b(item, "enabled"),
             status: s(item, "status"),
             status_message: s(item, "status_message"),
@@ -251,7 +292,9 @@ impl Connector {
         });
         json!({
             "kind": self.kind().as_str(),
-            "label": self.kind().label(),
+            "id": self.id(),
+            "name": self.name,
+            "label": self.label(),
             "connected": true,
             "enabled": self.enabled,
             "status": self.status,
@@ -309,6 +352,14 @@ pub fn check_page_ids(ids: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The settings-table sort key of a connection.
+fn sort_key(kind: ConnKind, name: &str) -> String {
+    match name {
+        "" => format!("{PREFIX}{}", kind.as_str()),
+        n => format!("{PREFIX}{}#{n}", kind.as_str()),
+    }
+}
+
 pub async fn list(
     dynamo: &aws_sdk_dynamodb::Client,
     table: &str,
@@ -335,12 +386,13 @@ pub async fn get(
     table: &str,
     team_id: &str,
     kind: ConnKind,
+    name: &str,
 ) -> Result<Option<Connector>, String> {
     let out = dynamo
         .get_item()
         .table_name(table)
         .key("pk", av_s(team_id))
-        .key("sk", av_s(&format!("{PREFIX}{}", kind.as_str())))
+        .key("sk", av_s(&sort_key(kind, name)))
         .consistent_read(true)
         .send()
         .await
@@ -369,12 +421,13 @@ pub async fn delete(
     table: &str,
     team_id: &str,
     kind: ConnKind,
+    name: &str,
 ) -> Result<(), String> {
     dynamo
         .delete_item()
         .table_name(table)
         .key("pk", av_s(team_id))
-        .key("sk", av_s(&format!("{PREFIX}{}", kind.as_str())))
+        .key("sk", av_s(&sort_key(kind, name)))
         .send()
         .await
         .map(|_| ())
@@ -473,6 +526,28 @@ mod tests {
         c.repos.clear();
         c.status = "error".into();
         assert!(!c.usable_for("o/r"));
+    }
+
+    #[test]
+    fn rest_apis_are_kept_apart_by_name() {
+        let named = Connector {
+            name: "billing".into(),
+            site: "https://api.example.com".into(),
+            ..Connector::new(ConnKind::Rest)
+        };
+        let item = named.to_item("TEAM#1");
+        assert_eq!(item["sk"].as_s().unwrap(), "CONNECTOR#rest#billing");
+        let back = Connector::from_item(&item).unwrap();
+        assert_eq!(back, named);
+        assert_eq!(back.id(), "rest:billing");
+        assert_eq!(back.label(), "REST API (billing)");
+        // A REST API saved before names still reads back, with no name.
+        let old = Connector::from_item(&Connector::new(ConnKind::Rest).to_item("TEAM#1")).unwrap();
+        assert_eq!((old.name.as_str(), old.id().as_str()), ("", "rest"));
+        assert!(check_name("billing-v2").is_ok());
+        for bad in ["", "Billing", "2fa", "a b", "a#b", &"x".repeat(41)] {
+            assert!(check_name(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
