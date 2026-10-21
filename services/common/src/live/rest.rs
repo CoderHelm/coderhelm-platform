@@ -194,7 +194,7 @@ impl Rest<'_> {
                 return Err(StepError::new(
                     "read",
                     "The API has nothing at that path.",
-                    "Check the path and the ids in it.",
+                    "Paths can't be guessed. Find where the team's code calls this API (search the repos for its address or a path segment) and copy that exact path, with every parent id in it, before trying again.",
                 ))
             }
             s => {

@@ -635,7 +635,7 @@ impl OpsTools {
             out.push(tool(
                 "rest_get",
                 &format!(
-                    "GET a path on one of the team's REST APIs and read the JSON it returns (the source system's own record): {}. Only paths under an API's prefixes can be read; pass ids in the path and filters in `query`. Read only.",
+                    "GET a path on one of the team's REST APIs and read the JSON it returns (the source system's own record): {}. Only paths under an API's prefixes can be read; pass ids in the path and filters in `query`. Read only. Never guess a path: first find where the team's code calls the API (search the repos for its address or a path segment) and copy that exact shape, including every parent id.",
                     listed.join("; ")
                 ),
                 json!({ "type": "object", "properties": props, "required": ["path"] }),

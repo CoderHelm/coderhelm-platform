@@ -391,7 +391,9 @@ impl LiveSources {
                     "GET a path on one of the team's REST APIs and read the JSON it returns (the \
                      source system's own record): {}. Only paths under a source's allowed \
                      prefixes can be read; pass ids in the path and filters in `query`. Read only. \
-                     At most {MAX_LOOKUPS} lookups in all.",
+                     Never guess a path: first find where the team's code calls the API (search \
+                     the repos for its address or a path segment) and copy that exact shape, \
+                     including every parent id. At most {MAX_LOOKUPS} lookups in all.",
                     apis.join("; ")
                 ),
                 input_schema: json!({
@@ -1998,6 +2000,8 @@ mod tests {
         assert!(api
             .description
             .contains("Bookings at https://api.example.com (paths under /v1/org/7/programs)"));
+        // A wrong guess (a parent id left out) is a 404 the agent can't learn from.
+        assert!(api.description.contains("Never guess a path"));
         let prompt = l.prompt_section();
         assert!(
             prompt.contains(
