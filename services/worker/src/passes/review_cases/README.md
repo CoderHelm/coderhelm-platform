@@ -30,6 +30,58 @@ case, so the same class of mistake can't come back silently.
   assume and which may only invoke the eval model on Bedrock
   (`EVAL_PROVIDER=bedrock`). Locally: `EVAL_PROVIDER=bedrock` with AWS
   credentials, or `ANTHROPIC_API_KEY` with your own key.
+  A case with a `live_review` is also reviewed end to end (see
+  [Diff cases](#diff-cases-live_review)).
+
+## Diff cases (`live_review`)
+
+Classifying comments can't catch a reviewer that raises the wrong finding. A
+case may carry a small anonymized PR that the live layer reviews the way
+production does (`review_eval_live_diff_reviews`):
+
+1. the reviewer's own system prompt (`review_agent::review_system_prompt`,
+   every rule it runs with) and user prompt (`review_user_prompt`);
+2. its repository tools (`review_tools`), answered from the case's `files`
+   instead of GitHub (`read_file`, `read_file_lines`, `list_directory`,
+   `search_code`; anything else says it is not available);
+3. the critic (`critic_system_prompt`, `critic_user_prompt`, `parse_critic`,
+   `apply_critic`), the enforcement rules and `decide_verdict`;
+4. then the case's `expect` on what is left.
+
+```json
+"live_review": {
+  "title": "PR title",
+  "body": "PR description",
+  "diff": "\n### path (modified, +1/-1)\n@@ -3,7 +3,7 @@\n ...",
+  "files": {"path": "the file at the PR head"},
+  "expect": {"no_blocking": true, "no_category": ["source-data-override"]},
+  "after_reply": {
+    "thread": {"path": "path", "line": 6, "body": "the earlier comment as posted"},
+    "author": "dev-a",
+    "reply": "what the person wrote under it",
+    "expect": {"no_blocking": true, "prior_settled": true}
+  }
+}
+```
+
+| `expect` key | holds when |
+|---|---|
+| `no_blocking` | no finding left holds the merge (the verdict isn't `REQUEST_CHANGES`) |
+| `no_category` | no finding of these categories is left |
+| `require_category` | a finding of this category is left and holds the merge |
+| `prior_settled` | (`after_reply`) the earlier comment is reported `fixed`, `answered` or `accepted` |
+
+`after_reply` reviews the same PR again with the earlier comment and the
+person's reply listed under it, as production does on the next review.
+Guard both directions: a case that must not block has a mirror that must
+(`existing_exclusion_list_is_not_an_override.json` and
+`hardcoded_record_override.json`). `review_eval_live_reviews_are_well_formed`
+checks every `live_review` on every PR.
+
+The diff in `diff` is what `format_diff` produces; keep `files` to the
+files the case needs. `EVAL_REVIEW_MODEL` picks the reviewing model (default
+`EVAL_MODEL`). A small model can pass a case the production reviewer model
+fails, so check a new case against the model the reviewer runs on.
 
 ## Add a case from a real PR (one step)
 

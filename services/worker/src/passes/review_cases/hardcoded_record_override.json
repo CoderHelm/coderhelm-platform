@@ -13,5 +13,16 @@
   "expect": {
     "final_formal": {"head": "h1", "event": "REQUEST_CHANGES"},
     "formal_events": [["h1", "REQUEST_CHANGES"]]
+  },
+  "live_review": {
+    "title": "Show the spring terms on the website",
+    "body": "Members can't book the spring terms online: the booking system has them marked as not available on the web, which is wrong. This forces them visible.",
+    "diff": "\n### src/terms.ts (modified, +5/-1)\n@@ -1,5 +1,9 @@\n import { Term } from './types';\n\n+// The booking system marks the spring terms as not bookable on the web by\n+// mistake; show them anyway until it is fixed there.\n+const ALWAYS_VISIBLE = ['T-101', 'T-102', 'T-103'];\n+\n export function visibleTerms(terms: Term[]): Term[] {\n-  return terms.filter((t) => t.availableOnWeb);\n+  return terms.filter((t) => t.availableOnWeb || ALWAYS_VISIBLE.includes(t.id));\n }\n",
+    "files": {
+      "src/terms.ts": "import { Term } from './types';\n\n// The booking system marks the spring terms as not bookable on the web by\n// mistake; show them anyway until it is fixed there.\nconst ALWAYS_VISIBLE = ['T-101', 'T-102', 'T-103'];\n\nexport function visibleTerms(terms: Term[]): Term[] {\n  return terms.filter((t) => t.availableOnWeb || ALWAYS_VISIBLE.includes(t.id));\n}\n"
+    },
+    "expect": {
+      "require_category": "source-data-override"
+    }
   }
 }
