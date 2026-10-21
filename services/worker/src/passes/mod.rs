@@ -4179,7 +4179,7 @@ async fn create_run_record(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
-    state
+    let mut put = state
         .dynamo
         .put_item()
         .table_name(&state.config.runs_table_name)
@@ -4232,9 +4232,18 @@ async fn create_run_record(
             attr_s(&plan::compute_ticket_context_hash(msg)),
         )
         .item("created_at", attr_s(&now))
-        .item("updated_at", attr_s(&now))
-        .send()
-        .await?;
+        .item("updated_at", attr_s(&now));
+    // The same person, however each source names them (see common::requester).
+    if let Some(r) = &msg.requester {
+        put = put.item("requester_key", attr_s(&r.key));
+        if !r.name.is_empty() {
+            put = put.item("requester_name", attr_s(&r.name));
+        }
+        if !r.email.is_empty() {
+            put = put.item("requester_email", attr_s(&r.email));
+        }
+    }
+    put.send().await?;
 
     // Increment analytics counters (current month + all-time)
     let month = chrono::Utc::now().format("%Y-%m").to_string();

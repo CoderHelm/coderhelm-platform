@@ -3,6 +3,24 @@ const { fetch } = api;
 const { storage } = api;
 const { route } = api;
 
+/** The parts of a Jira user CoderHelm keeps: account id, name, email. */
+function jiraUser(u) {
+  return { accountId: u.accountId, displayName: u.displayName, emailAddress: u.emailAddress };
+}
+
+/**
+ * Who asked for the work: the person whose change sent the event (Forge gives
+ * their account id), named from the ticket when they are its reporter,
+ * creator or assignee. Without an actor, the ticket's reporter.
+ */
+function requester(actorId, fields) {
+  const people = [fields.reporter, fields.creator, fields.assignee].filter(Boolean);
+  const named = actorId && people.find((u) => u.accountId === actorId);
+  if (named) return jiraUser(named);
+  if (actorId) return { accountId: actorId };
+  return fields.reporter ? jiraUser(fields.reporter) : {};
+}
+
 exports.handler = async (event, context) => {
   const issue = event.issue || {};
   const eventType = event.eventType || "unknown";
@@ -59,7 +77,8 @@ exports.handler = async (event, context) => {
       return;
     }
 
-    const authorName = (comment.author && (comment.author.displayName || comment.author.accountId)) || "";
+    const author = comment.author || {};
+    const authorName = author.displayName || author.accountId || "";
 
     // Skip comments by the app itself to avoid loops
     if (authorName.toLowerCase().includes("coderhelm")) {
@@ -73,7 +92,7 @@ exports.handler = async (event, context) => {
     let fields = {};
     if (issue.id) {
       try {
-        const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,project,attachment`);
+        const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,reporter,creator,project,attachment`);
         if (res.ok) {
           const full = await res.json();
           fields = full.fields || {};
@@ -105,13 +124,15 @@ exports.handler = async (event, context) => {
           description: fields.description,
           labels: labels,
           assignee: fields.assignee,
+          reporter: fields.reporter,
+          creator: fields.creator,
           project: fields.project,
         },
       },
       comment: {
         id: comment.id,
         body: commentBody,
-        author: { displayName: authorName },
+        author: { ...jiraUser(author), displayName: authorName },
       },
       image_attachments: imageAttachments,
       coderhelm: {
@@ -136,7 +157,7 @@ exports.handler = async (event, context) => {
   let fields = {};
   if (issue.id) {
     try {
-      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,project,attachment`);
+      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,reporter,creator,project,attachment`);
       if (res.ok) {
         const full = await res.json();
         fields = full.fields || {};
@@ -176,11 +197,13 @@ exports.handler = async (event, context) => {
         description: fields.description,
         labels: labels,
         assignee: fields.assignee,
+        reporter: fields.reporter,
+        creator: fields.creator,
         project: fields.project,
       },
     },
     image_attachments: imageAttachments,
-    user: { displayName: (fields.assignee && fields.assignee.displayName) || fields.reporter?.displayName || "jira" },
+    user: requester(event.atlassianId, fields),
     coderhelm: {
       repo_owner: repoOwner || undefined,
       repo_name: repoName || undefined,

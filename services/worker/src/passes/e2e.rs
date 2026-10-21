@@ -1556,6 +1556,9 @@ async fn start_fix_ticket(
         repo_name: msg.repo_name.clone(),
         issue_number: 0,
         sender: "e2e".into(),
+        requester: Some(common::requester::Requester::coderhelm(
+            common::requester::E2E,
+        )),
         base_branch: msg.default_branch.clone(),
         image_attachments: vec![],
         continuation: 0,
@@ -1796,6 +1799,9 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
                 repo_name: name.to_string(),
                 issue_number: 0,
                 sender: "e2e".into(),
+                requester: Some(common::requester::Requester::coderhelm(
+                    common::requester::E2E,
+                )),
                 base_branch: default_branch.clone(),
                 image_attachments: vec![],
                 continuation: 0,

@@ -317,6 +317,9 @@ async fn handle_issue_event(
             .as_str()
             .unwrap_or("")
             .to_string(),
+        requester: common::requester::Requester::github(
+            payload["sender"]["login"].as_str().unwrap_or(""),
+        ),
         image_attachments: vec![],
     });
 
@@ -746,6 +749,9 @@ async fn handle_issue_comment(
             .as_str()
             .unwrap_or("")
             .to_string(),
+        requester: common::requester::Requester::github(
+            payload["sender"]["login"].as_str().unwrap_or(""),
+        ),
         image_attachments: vec![],
     });
 

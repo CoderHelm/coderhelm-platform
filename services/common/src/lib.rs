@@ -31,6 +31,8 @@ pub mod paged;
 pub mod pr_outcome;
 // review_stats: time-ordered review records for analytics
 pub mod jira_text;
+/// Who asked for a run: one identity per person, for per-person analytics.
+pub mod requester;
 pub mod review_stats;
 pub mod skill_apply;
 pub mod skill_compat;

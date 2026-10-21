@@ -16,6 +16,7 @@ use axum::{
     Extension, Json,
 };
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use common::requester::{Known, Requester};
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
@@ -62,6 +63,9 @@ pub struct RunRow {
     pub repo: String,
     pub source: String,
     pub sender: String,
+    pub requester_key: String,
+    pub requester_name: String,
+    pub requester_email: String,
     pub title: String,
     pub cost_usd: f64,
     pub tokens_in: f64,
@@ -95,6 +99,9 @@ impl RunRow {
             repo: s(i, "repo"),
             source: s(i, "ticket_source"),
             sender: s(i, "sender"),
+            requester_key: s(i, "requester_key"),
+            requester_name: s(i, "requester_name"),
+            requester_email: s(i, "requester_email"),
             title: s(i, "title"),
             cost_usd: n(i, "cost_usd"),
             tokens_in: n(i, "tokens_in"),
@@ -116,6 +123,15 @@ impl RunRow {
     }
     fn merged(&self) -> bool {
         self.status == "merged" || self.pr_outcome == "merged"
+    }
+    /// Who asked for the run; older runs only have the free-text sender.
+    fn requester(&self) -> Option<Requester> {
+        Requester::from_run(
+            &self.requester_key,
+            &self.requester_name,
+            &self.requester_email,
+            &self.sender,
+        )
     }
     fn has_pr(&self) -> bool {
         self.pr_number > 0
@@ -353,6 +369,7 @@ fn day(ts: &str) -> Option<String> {
 }
 
 /// Everything the page shows, for one period and the one before it.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     window: Window,
     prev: Window,
@@ -360,6 +377,7 @@ pub fn build(
     reviews: &[ReviewRow],
     lookups: &[LookupRow],
     traces: &[TraceRow],
+    known: &[Known],
     repo: Option<&str>,
 ) -> Value {
     let repo_ok = |r: &str| repo.is_none_or(|want| r.eq_ignore_ascii_case(want));
@@ -428,7 +446,6 @@ pub fn build(
     // Breakdowns.
     let mut by_source: BTreeMap<String, [f64; 3]> = BTreeMap::new();
     let mut by_repo: BTreeMap<String, [f64; 6]> = BTreeMap::new();
-    let mut by_person: BTreeMap<String, [f64; 2]> = BTreeMap::new();
     for r in &cur_runs {
         let src = if r.source.is_empty() {
             "other".to_string()
@@ -456,15 +473,15 @@ pub fn build(
         }
         e[4] += r.cost_usd;
         e[5] += r.tokens();
-        let who = if r.sender.is_empty() {
-            String::new()
-        } else {
-            r.sender.clone()
-        };
-        let e = by_person.entry(who).or_default();
-        e[0] += 1.0;
+    }
+    // Who asks: one row per person, however each source named them.
+    let requesters: Vec<Option<Requester>> = cur_runs.iter().map(|r| r.requester()).collect();
+    let (groups, at) = common::requester::group(&requesters, known);
+    let mut by_person = vec![[0.0f64; 2]; groups.len()];
+    for (r, &g) in cur_runs.iter().zip(&at) {
+        by_person[g][0] += 1.0;
         if r.merged() {
-            e[1] += 1.0;
+            by_person[g][1] += 1.0;
         }
     }
     let mut reviews_by_repo: HashMap<String, usize> = HashMap::new();
@@ -495,15 +512,17 @@ pub fn build(
         .iter()
         .map(|(src, v)| json!({"source": src, "runs": v[0], "prs": v[1], "merged": v[2], "merge_rate": ratio(v[2], v[1])}))
         .collect();
-    let mut people: Vec<Value> = by_person
+    let mut people: Vec<Value> = groups
         .iter()
-        .map(|(who, v)| json!({"person": who, "runs": v[0], "merged": v[1]}))
+        .zip(&by_person)
+        .map(|(g, v)| json!({"person": g.label, "kind": g.kind, "runs": v[0], "merged": v[1]}))
         .collect();
     people.sort_by(|a, b| {
         b["runs"]
             .as_f64()
             .partial_cmp(&a["runs"].as_f64())
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a["person"].as_str().cmp(&b["person"].as_str()))
     });
 
     // Failures, grouped by reason.
@@ -684,7 +703,8 @@ async fn load_runs(state: &AppState, team: &str, w: Window) -> Result<Vec<RunRow
             .expression_attribute_values(":lo", av(&lo))
             .expression_attribute_values(":hi", av(&hi))
             .projection_expression(
-                "run_id, created_at, #s, repo, ticket_source, sender, title, cost_usd, tokens_in, tokens_out, \
+                "run_id, created_at, #s, repo, ticket_source, sender, requester_key, requester_name, \
+                 requester_email, title, cost_usd, tokens_in, tokens_out, \
                  cache_read_tokens, cache_write_tokens, \
                  duration_s, pr_number, pr_url, error_message, ci_fix_attempts, ci_fix_commits, ci_last, \
                  pr_outcome, merged_at, pr_opened_at, human_commits",
@@ -732,6 +752,54 @@ async fn load_settings_range(
         }
     }
     Ok(out)
+}
+
+/// The people a run's requester can be matched to: the team's members, and
+/// the Jira users the gateway has seen on webhooks. Best effort: without
+/// them, rows are still grouped by what each run recorded.
+async fn load_known(state: &AppState, team: &str) -> Vec<Known> {
+    let mut out = Vec::new();
+    let mut start: Option<Item> = None;
+    for _ in 0..MAX_PAGES {
+        let resp = state
+            .dynamo
+            .query()
+            .table_name(&state.config.users_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :u)")
+            .expression_attribute_values(":pk", av(team))
+            .expression_attribute_values(":u", av("USER#"))
+            .projection_expression("email, #n, github_login")
+            .expression_attribute_names("#n", "name")
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await;
+        let Ok(resp) = resp else {
+            warn!("Could not read team members for analytics");
+            break;
+        };
+        out.extend(resp.items().iter().map(|i| Known {
+            name: s(i, "name"),
+            email: s(i, "email"),
+            github_login: s(i, "github_login"),
+            member: true,
+            ..Default::default()
+        }));
+        match resp.last_evaluated_key() {
+            Some(k) => start = Some(k.clone()),
+            None => break,
+        }
+    }
+    let prefix = common::requester::JIRA_USER_PREFIX;
+    match load_settings_range(state, team, prefix, &format!("{prefix}~")).await {
+        Ok(items) => out.extend(items.iter().map(|i| Known {
+            name: s(i, "name"),
+            email: s(i, "email"),
+            jira_id: s(i, "sk").trim_start_matches(prefix).to_string(),
+            ..Default::default()
+        })),
+        Err(e) => warn!(error = %e, "Could not read Jira users for analytics"),
+    }
+    out
 }
 
 async fn load_traces(state: &AppState, team: &str) -> Vec<TraceRow> {
@@ -930,11 +998,12 @@ pub async fn get_analytics(
         hi(common::review_stats::PREFIX),
     );
     let (log_lo, log_hi) = (lo("DSLOG#"), hi("DSLOG#"));
-    let (runs, reviews, lookups, traces) = tokio::join!(
+    let (runs, reviews, lookups, traces, known) = tokio::join!(
         load_runs(&state, &team, whole),
         load_settings_range(&state, &team, &stat_lo, &stat_hi),
         load_settings_range(&state, &team, &log_lo, &log_hi),
         load_traces(&state, &team),
+        load_known(&state, &team),
     );
     let runs = runs.map_err(|e| {
         error!(error = %e, "Analytics: runs");
@@ -954,7 +1023,9 @@ pub async fn get_analytics(
         .map(LookupRow::from_item)
         .collect();
 
-    let mut out = build(window, prev, &runs, &reviews, &lookups, &traces, repo);
+    let mut out = build(
+        window, prev, &runs, &reviews, &lookups, &traces, &known, repo,
+    );
     out["days"] = json!(days);
     Ok(Json(out))
 }
@@ -1013,7 +1084,16 @@ mod tests {
             ..run("4", 6, "failed")
         };
         let (w, p) = windows();
-        let out = build(w, p, &[merged, closed, open, failed], &[], &[], &[], None);
+        let out = build(
+            w,
+            p,
+            &[merged, closed, open, failed],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        );
         let sm = &out["summary"];
         assert_eq!(sm["runs"], 4);
         assert_eq!(sm["prs_opened"], 3);
@@ -1048,11 +1128,21 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
         );
         assert_eq!(out["summary"]["runs"], 2);
         assert_eq!(out["previous"]["runs"], 1);
-        let only = build(w, p, &[cur, old, other], &[], &[], &[], Some("ACME/web"));
+        let only = build(
+            w,
+            p,
+            &[cur, old, other],
+            &[],
+            &[],
+            &[],
+            &[],
+            Some("ACME/web"),
+        );
         assert_eq!(only["summary"]["runs"], 1);
         assert_eq!(only["repo_names"].as_array().unwrap().len(), 2);
     }
@@ -1072,7 +1162,7 @@ mod tests {
         };
         let clean = run("3", 2, "completed");
         let (w, p) = windows();
-        let out = build(w, p, &[fixed, stuck, clean], &[], &[], &[], None);
+        let out = build(w, p, &[fixed, stuck, clean], &[], &[], &[], &[], None);
         assert_eq!(out["ci"]["runs_with_red_ci"], 2);
         assert_eq!(out["ci"]["fixed_by_coderhelm"], 1);
         assert_eq!(out["ci"]["fix_rate"], 0.5);
@@ -1103,7 +1193,7 @@ mod tests {
             },
         ];
         let (w, p) = windows();
-        let out = build(w, p, &[], &reviews, &[], &[], None);
+        let out = build(w, p, &[], &reviews, &[], &[], &[], None);
         let rv = &out["reviews"];
         assert_eq!(rv["posted"], 2);
         assert_eq!(rv["questions"], 1);
@@ -1135,6 +1225,7 @@ mod tests {
                 l("db", "a@example.com", "refused"),
                 l("logs", "coder", "failed"),
             ],
+            &[],
             &[],
             None,
         );
@@ -1178,13 +1269,71 @@ mod tests {
                 duration_ms: 3000.0,
             },
         ];
-        let out = build(w, p, &[run("1", 2, "completed")], &[], &[], &traces, None);
+        let out = build(
+            w,
+            p,
+            &[run("1", 2, "completed")],
+            &[],
+            &[],
+            &traces,
+            &[],
+            None,
+        );
         assert_eq!(out["daily"].as_array().unwrap().len(), 30);
         let steps = out["steps"].as_array().unwrap();
         assert_eq!(steps[0]["step"], "implement");
         assert_eq!(steps[1]["step"], "ci_fix");
         assert_eq!(steps[1]["count"], 2);
         assert_eq!(steps[1]["avg_seconds"], 2.0);
+    }
+
+    #[test]
+    fn people_are_one_row_each_and_coderhelm_work_is_labelled() {
+        let by = |id: &str, sender: &str| RunRow {
+            sender: sender.into(),
+            ..run(id, 2, "completed")
+        };
+        let mut merged = by("1", "ada@example.com");
+        merged.status = "merged".into();
+        let recorded = RunRow {
+            sender: "Ada L.".into(),
+            requester_key: "jira:557058:0a1b2c3d-4e5f-6789-abcd-ef0123456789".into(),
+            requester_name: "Ada L.".into(),
+            ..run("2", 2, "completed")
+        };
+        let runs = vec![
+            merged,
+            by("3", "Ada Lovelace"),
+            by("4", "557058:0a1b2c3d-4e5f-6789-abcd-ef0123456789"),
+            recorded,
+            by("5", "e2e"),
+            by("6", ""),
+        ];
+        // A member, and the same person as a Jira user seen on a webhook.
+        let known = vec![
+            Known {
+                name: "Ada Lovelace".into(),
+                email: "ada@example.com".into(),
+                member: true,
+                ..Default::default()
+            },
+            Known {
+                name: "Ada L.".into(),
+                email: "ada@example.com".into(),
+                jira_id: "557058:0a1b2c3d-4e5f-6789-abcd-ef0123456789".into(),
+                ..Default::default()
+            },
+        ];
+        let (w, p) = windows();
+        let out = build(w, p, &runs, &[], &[], &[], &known, None);
+        assert_eq!(
+            out["people"],
+            json!([
+                {"person": "Ada Lovelace", "kind": "person", "runs": 4.0, "merged": 1.0},
+                {"person": "", "kind": "not_recorded", "runs": 1.0, "merged": 0.0},
+                {"person": "CoderHelm (E2E tests)", "kind": "coderhelm", "runs": 1.0, "merged": 0.0},
+            ])
+        );
     }
 
     #[test]

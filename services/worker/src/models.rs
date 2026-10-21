@@ -530,6 +530,9 @@ pub struct TicketMessage {
     pub repo_name: String,
     pub issue_number: u64,
     pub sender: String,
+    /// Who asked for the work, as one identity per person (analytics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<common::requester::Requester>,
     #[serde(default = "default_branch")]
     pub base_branch: String,
     #[serde(default)]
@@ -743,6 +746,7 @@ mod tests {
             repo_name: "repo".into(),
             issue_number: 42,
             sender: "user".into(),
+            requester: None,
             base_branch: "main".into(),
             image_attachments: vec![],
             continuation: 0,

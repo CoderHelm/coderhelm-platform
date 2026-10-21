@@ -382,6 +382,10 @@ async fn process_jira_payload(
         })
         .unwrap_or("jira")
         .to_string();
+    let requester = payload
+        .get("user")
+        .and_then(common::requester::Requester::jira_user);
+    remember_jira_users(state, team_id, payload).await;
 
     info!(
         team_id,
@@ -516,6 +520,7 @@ async fn process_jira_payload(
         repo_name: repo_name.clone(),
         issue_number: 0,
         sender,
+        requester,
         image_attachments,
     });
 
@@ -693,6 +698,10 @@ async fn handle_jira_comment(
     }
 
     info!(team_id, ticket_key, comment_author, "Jira comment received");
+    let requester = payload
+        .pointer("/comment/author")
+        .and_then(common::requester::Requester::jira_user);
+    remember_jira_users(state, team_id, payload).await;
 
     // Upload image attachments from the Forge payload (if any)
     let fresh_images = upload_image_attachments(state, team_id, ticket_key, payload).await;
@@ -864,6 +873,7 @@ async fn handle_jira_comment(
             repo_name: String::new(),
             issue_number: 0,
             sender: comment_author.to_string(),
+            requester,
             image_attachments: if !fresh_images.is_empty() {
                 fresh_images.clone()
             } else {
@@ -933,6 +943,53 @@ async fn send_to_queue(
         })?;
 
     Ok(StatusCode::ACCEPTED)
+}
+
+/// The Jira users a payload names with both an account id and a name (who
+/// acted, the comment's author, the ticket's reporter, creator and assignee).
+fn named_jira_users(payload: &Value) -> Vec<common::requester::Requester> {
+    let mut out: Vec<common::requester::Requester> = Vec::new();
+    for at in [
+        "/user",
+        "/comment/author",
+        "/issue/fields/reporter",
+        "/issue/fields/creator",
+        "/issue/fields/assignee",
+    ] {
+        let Some(r) = payload
+            .pointer(at)
+            .and_then(common::requester::Requester::jira_user)
+        else {
+            continue;
+        };
+        if r.jira_id().is_some() && !r.name.is_empty() && !out.iter().any(|o| o.key == r.key) {
+            out.push(r);
+        }
+    }
+    out
+}
+
+/// Keeps the name and email of every Jira user a payload names, by account
+/// id, so runs that recorded only the account id can show the person's name.
+async fn remember_jira_users(state: &AppState, team_id: &str, payload: &Value) {
+    let now = chrono::Utc::now().to_rfc3339();
+    for r in named_jira_users(payload) {
+        let Some(id) = r.jira_id() else { continue };
+        let mut put = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.settings_table_name)
+            .item("pk", attr_s(team_id))
+            .item("sk", attr_s(&common::requester::jira_user_sk(id)))
+            .item("name", attr_s(&r.name))
+            .item("seen_at", attr_s(&now));
+        if !r.email.is_empty() {
+            put = put.item("email", attr_s(&r.email));
+        }
+        if let Err(e) = put.send().await {
+            warn!(team_id, error = %e, "Could not keep a Jira user's name");
+        }
+    }
 }
 
 /// Log a Jira webhook event to the jira-events table.
@@ -1097,4 +1154,42 @@ async fn upload_image_attachments(
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(input).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn every_named_jira_user_in_a_payload_is_kept_once() {
+        let ada = json!({"accountId": "557058:0a1b2c3d-4e5f-6789-abcd-ef0123456789",
+                         "displayName": "Ada Lovelace", "emailAddress": "ada@example.com"});
+        let payload = json!({
+            "user": ada,
+            "comment": {"author": {"displayName": "Grace Hopper"}},
+            "issue": {"fields": {
+                "reporter": ada,
+                "creator": {"accountId": "5b10ac8d82e05b22cc7d4ef5", "displayName": "Grace Hopper"},
+                "assignee": {"accountId": "5b10ac8d82e05b22cc7d4ef6"},
+            }},
+        });
+        let kept: Vec<(String, String)> = named_jira_users(&payload)
+            .into_iter()
+            .map(|r| (r.key, r.name))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                (
+                    "jira:557058:0a1b2c3d-4e5f-6789-abcd-ef0123456789".to_string(),
+                    "Ada Lovelace".to_string()
+                ),
+                (
+                    "jira:5b10ac8d82e05b22cc7d4ef5".to_string(),
+                    "Grace Hopper".to_string()
+                ),
+            ]
+        );
+    }
 }
