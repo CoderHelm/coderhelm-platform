@@ -339,13 +339,151 @@ pub async fn rename_team(
     Ok(Json(json!({ "status": "renamed", "name": new_name })))
 }
 
-/// The signup allowlist is platform-wide (one `ALLOWLIST` partition for
-/// every team), so only the platform admin may read or change it. A team
-/// owner role is not enough: anyone who signs up owns their own team.
-fn is_platform_admin(email: &str) -> bool {
+/// The signup allowlist and the teams overview are platform-wide, so only the
+/// platform admin may read or change them. A team owner role is not enough:
+/// anyone who signs up owns their own team. The session's email must be on
+/// the list AND have been verified by CoderHelm itself (Google or an email
+/// code): a GitHub-only identity carries whatever email its profile shows,
+/// so it never counts.
+fn is_platform_admin(claims: &Claims) -> bool {
     let admins = std::env::var("PLATFORM_ADMIN_EMAILS")
         .unwrap_or_else(|_| "admin@coderhelm.com".to_string());
-    platform_admin_listed(&admins, email)
+    verified_identity(&claims.sub) && platform_admin_listed(&admins, &claims.email)
+}
+
+/// Whether a session's user id is one whose email CoderHelm verified: not a
+/// GitHub-only identity (`USER#<github numeric id>`).
+fn verified_identity(sub: &str) -> bool {
+    let id = sub.strip_prefix("USER#").unwrap_or(sub);
+    !id.is_empty() && !id.chars().all(|c| c.is_ascii_digit())
+}
+
+/// GET /api/admin/teams — every team with its runs (all time and this
+/// month), cost this month, members and when it started. Platform admin only.
+pub async fn admin_teams(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    if !is_platform_admin(&claims) {
+        warn!(email = %claims.email, "Teams overview refused: not a platform admin");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    // Every team has a META record in the teams table.
+    let mut teams: Vec<(String, String)> = Vec::new();
+    let mut start: Option<std::collections::HashMap<String, AttributeValue>> = None;
+    loop {
+        let page = state
+            .dynamo
+            .scan()
+            .table_name(&state.config.teams_table_name)
+            .filter_expression("sk = :meta")
+            .expression_attribute_values(":meta", attr_s("META"))
+            .projection_expression("team_id, created_at")
+            .set_exclusive_start_key(start)
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Teams overview: scan failed: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        for i in page.items() {
+            let s = |k: &str| {
+                i.get(k)
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            teams.push((s("team_id"), s("created_at")));
+        }
+        start = page.last_evaluated_key().cloned();
+        if start.is_none() || teams.len() >= 2000 {
+            break;
+        }
+    }
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    let rows = futures::future::join_all(teams.into_iter().map(|(team_id, created_at)| {
+        let state = state.clone();
+        let month = month.clone();
+        async move { admin_team_row(&state, &team_id, &created_at, &month).await }
+    }))
+    .await;
+    let mut rows: Vec<Value> = rows.into_iter().collect();
+    rows.sort_by(|a, b| {
+        b["runs_month"]
+            .as_u64()
+            .cmp(&a["runs_month"].as_u64())
+            .then(b["runs_total"].as_u64().cmp(&a["runs_total"].as_u64()))
+    });
+    Ok(Json(json!({ "teams": rows, "month": month })))
+}
+
+/// One team's line in the overview. Missing numbers read as 0.
+async fn admin_team_row(state: &AppState, team_id: &str, created_at: &str, month: &str) -> Value {
+    let get = |table: String, key: [(&'static str, String); 2]| {
+        let dynamo = state.dynamo.clone();
+        async move {
+            let mut req = dynamo.get_item().table_name(table);
+            for (k, v) in key {
+                req = req.key(k, AttributeValue::S(v));
+            }
+            req.send().await.ok().and_then(|r| r.item)
+        }
+    };
+    let (meta, all, this_month, members) = tokio::join!(
+        get(
+            state.config.table_name.clone(),
+            [("pk", team_id.to_string()), ("sk", "META".to_string())]
+        ),
+        get(
+            state.config.analytics_table_name.clone(),
+            [
+                ("team_id", team_id.to_string()),
+                ("period", "ALL_TIME".to_string())
+            ]
+        ),
+        get(
+            state.config.analytics_table_name.clone(),
+            [
+                ("team_id", team_id.to_string()),
+                ("period", month.to_string())
+            ]
+        ),
+        state
+            .dynamo
+            .query()
+            .table_name(&state.config.users_table_name)
+            .key_condition_expression("pk = :pk")
+            .expression_attribute_values(":pk", attr_s(team_id))
+            .select(aws_sdk_dynamodb::types::Select::Count)
+            .send(),
+    );
+    let text = |i: &Option<std::collections::HashMap<String, AttributeValue>>, k: &str| {
+        i.as_ref()
+            .and_then(|i| i.get(k))
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let num = |i: &Option<std::collections::HashMap<String, AttributeValue>>, k: &str| {
+        i.as_ref()
+            .and_then(|i| i.get(k))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    json!({
+        "team_id": team_id,
+        "name": text(&meta, "github_org"),
+        "status": match text(&meta, "status") { s if s.is_empty() => "active".to_string(), s => s },
+        "created_at": created_at,
+        "members": members.map(|r| r.count()).unwrap_or(0),
+        "runs_total": num(&all, "total_runs") as u64,
+        "completed_total": num(&all, "completed") as u64,
+        "runs_month": num(&this_month, "total_runs") as u64,
+        "reviews_month": num(&this_month, "reviews") as u64,
+        "cost_month_usd": (num(&this_month, "total_cost_usd") * 100.0).round() / 100.0,
+        "tokens_month": num(&this_month, "total_tokens") as u64,
+    })
 }
 
 fn platform_admin_listed(admins: &str, email: &str) -> bool {
@@ -362,7 +500,7 @@ pub async fn list_allowlist(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    if !is_platform_admin(&claims.email) {
+    if !is_platform_admin(&claims) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -395,7 +533,7 @@ pub async fn add_to_allowlist(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    if !is_platform_admin(&claims.email) {
+    if !is_platform_admin(&claims) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -433,7 +571,7 @@ pub async fn remove_from_allowlist(
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    if !is_platform_admin(&claims.email) {
+    if !is_platform_admin(&claims) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -4672,7 +4810,18 @@ pub async fn purge_dlq(
 
 #[cfg(test)]
 mod tests {
-    use super::{platform_admin_listed, reset_allowed, usage_json};
+    use super::{platform_admin_listed, reset_allowed, usage_json, verified_identity};
+
+    #[test]
+    fn github_only_identities_are_never_platform_admins() {
+        assert!(verified_identity("USER#Google_1234567890"));
+        assert!(verified_identity(
+            "USER#2f1c9a4e-1b2c-4d5e-8f90-123456789abc"
+        ));
+        assert!(!verified_identity("USER#123456"));
+        assert!(!verified_identity("USER#"));
+        assert!(!verified_identity(""));
+    }
 
     #[test]
     fn usage_shows_all_four_parts_tokens_only() {
