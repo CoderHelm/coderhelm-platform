@@ -127,6 +127,18 @@ fn opt(v: &str) -> Value {
     }
 }
 
+/// When the member last signed in or used the app, whichever is later
+/// (both are UTC RFC 3339, so they compare as text).
+fn last_active(item: &Item) -> &str {
+    let login = s(item, "last_login_at");
+    let seen = s(item, "last_seen_at");
+    if seen > login {
+        seen
+    } else {
+        login
+    }
+}
+
 /// What the team page shows for one record.
 fn member_view(item: &Item, self_id: &str) -> Value {
     let user_id = bare_id(s(item, "sk"));
@@ -141,7 +153,7 @@ fn member_view(item: &Item, self_id: &str) -> Value {
         "status": status_of(item),
         "sign_in": sign_in_of(item),
         "invited_by": opt(bare_id(s(item, "invited_by"))),
-        "last_active_at": opt(s(item, "last_login_at")),
+        "last_active_at": opt(last_active(item)),
         "updated_at": opt(s(item, "updated_at")),
         "is_self": !user_id.is_empty() && user_id == bare_id(self_id),
     })
@@ -1064,6 +1076,16 @@ async fn send_invite_email(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_active_is_the_later_of_sign_in_and_use() {
+        let mut item: Item = HashMap::new();
+        assert_eq!(last_active(&item), "");
+        item.insert("last_login_at".into(), attr_s("2026-10-01T09:00:00+00:00"));
+        assert_eq!(last_active(&item), "2026-10-01T09:00:00+00:00");
+        item.insert("last_seen_at".into(), attr_s("2026-10-21T08:30:00+00:00"));
+        assert_eq!(last_active(&item), "2026-10-21T08:30:00+00:00");
+    }
 
     fn claims(sub: &str, role: &str) -> Claims {
         Claims {
