@@ -2137,6 +2137,25 @@ async fn run_passes(
                 None
             }
         };
+        // Someone else's open pull request for this ticket (a person's, or an
+        // earlier run's on another branch): don't open a second one unless a
+        // person said to go ahead.
+        if existing_pr.is_none() && msg.person_direction.is_none() {
+            if let Some(other) = open_pr_for_ticket(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                &msg.ticket_id,
+                &branch_name,
+            )
+            .await
+            {
+                let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+                stop_for_open_pr(state, msg, &github, run_id, usage, start, &repo, &other).await;
+                close_memory(state, agent_memory.take()).await;
+                return Ok(());
+            }
+        }
 
         if let Some(ref pr) = existing_pr {
             let pr_number = pr["number"].as_u64().unwrap_or(0);
@@ -2891,6 +2910,33 @@ async fn run_passes(
             .await;
 
             let mut pr_results: Vec<RepoPrResult> = Vec::new();
+
+            // A pull request for this ticket already open in any of the repos
+            // (a person's, or an earlier run's): none is opened twice.
+            if msg.person_direction.is_none() {
+                for repo_task in &plan_result.repo_tasks {
+                    let own = format!(
+                        "coderhelm/{}-{}",
+                        msg.ticket_id.to_lowercase(),
+                        repo_task.name.to_lowercase()
+                    );
+                    if let Some(other) = open_pr_for_ticket(
+                        &github,
+                        &repo_task.owner,
+                        &repo_task.name,
+                        &msg.ticket_id,
+                        &own,
+                    )
+                    .await
+                    {
+                        let repo = format!("{}/{}", repo_task.owner, repo_task.name);
+                        stop_for_open_pr(state, msg, &github, run_id, usage, start, &repo, &other)
+                            .await;
+                        close_memory(state, agent_memory.take()).await;
+                        return Ok(());
+                    }
+                }
+            }
 
             for repo_task in &plan_result.repo_tasks {
                 let repo_branch = format!(
@@ -5087,6 +5133,99 @@ async fn lookup_team_installation_id(
 }
 
 /// Post a comment on a Jira ticket via the Forge web trigger.
+/// Whether `text` names the ticket key `key` (case-insensitive, as a whole
+/// token: `ABC-12` isn't `ABC-123`).
+fn mentions_ticket(text: &str, key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    let t = text.to_ascii_lowercase();
+    let k = key.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(i) = t[from..].find(&k) {
+        let at = from + i;
+        let before = t[..at].chars().next_back();
+        let after = t[at + k.len()..].chars().next();
+        let edge = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
+        if edge(before) && edge(after) {
+            return true;
+        }
+        from = at + k.len();
+    }
+    false
+}
+
+/// An open pull request in `owner/name` that already names the ticket (in
+/// its title, branch or description), other than the one on `own_branch`:
+/// `(number, title, author)`. A failed lookup finds none.
+async fn open_pr_for_ticket(
+    github: &GitHubClient,
+    owner: &str,
+    name: &str,
+    ticket: &str,
+    own_branch: &str,
+) -> Option<(u64, String, String)> {
+    let prs = github.list_open_pulls(owner, name).await.ok()?;
+    prs.as_array()?.iter().find_map(|p| {
+        let head = p["head"]["ref"].as_str().unwrap_or("");
+        let title = p["title"].as_str().unwrap_or("");
+        let body = p["body"].as_str().unwrap_or("");
+        (head != own_branch
+            && (mentions_ticket(title, ticket)
+                || mentions_ticket(head, ticket)
+                || mentions_ticket(body, ticket)))
+        .then(|| {
+            (
+                p["number"].as_u64().unwrap_or(0),
+                title.to_string(),
+                p["user"]["login"].as_str().unwrap_or("").to_string(),
+            )
+        })
+    })
+}
+
+/// Stops a run because a pull request for its ticket is already open: says
+/// so on the ticket and the run, and waits for a person to say what to do.
+#[allow(clippy::too_many_arguments)]
+async fn stop_for_open_pr(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    github: &GitHubClient,
+    run_id: &str,
+    usage: &TokenUsage,
+    start: &std::time::Instant,
+    repo: &str,
+    pr: &(u64, String, String),
+) {
+    let note = format!(
+        "An open pull request for {} already exists in {repo}: #{} \"{}\" by {}. I didn't open another. Reply here to have me work on that pull request, or to go ahead with my own.",
+        msg.ticket_id, pr.0, pr.1, pr.2
+    );
+    info!(
+        run_id,
+        repo,
+        pr = pr.0,
+        "Open pull request for the ticket exists — not opening another"
+    );
+    add_progress_note(state, &msg.team_id, run_id, &note).await;
+    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+        let _ = github
+            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &note)
+            .await;
+    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+        let _ = post_jira_comment(
+            state,
+            &msg.team_id,
+            &msg.ticket_id,
+            &note,
+            "clarification",
+            "A pull request is already open",
+        )
+        .await;
+    }
+    mark_run_needs_input(state, msg, run_id, usage, start, &[]).await;
+}
+
 async fn post_jira_comment(
     state: &WorkerState,
     team_id: &str,
@@ -7486,5 +7625,20 @@ mod plan_cap_tests {
     fn narrow_note_names_the_cap() {
         let n = narrow_scope_note(31, 25);
         assert!(n.contains("31 files") && n.contains("at most 25 files"));
+    }
+}
+
+#[cfg(test)]
+mod open_pr_tests {
+    use super::mentions_ticket;
+
+    #[test]
+    fn a_ticket_key_is_matched_as_a_whole_token() {
+        assert!(mentions_ticket("ABC-12: fix the drawer", "ABC-12"));
+        assert!(mentions_ticket("coderhelm/abc-12-api", "ABC-12"));
+        assert!(mentions_ticket("Fixes [ABC-12]", "abc-12"));
+        assert!(!mentions_ticket("ABC-123 something else", "ABC-12"));
+        assert!(!mentions_ticket("XABC-12", "ABC-12"));
+        assert!(!mentions_ticket("anything", ""));
     }
 }

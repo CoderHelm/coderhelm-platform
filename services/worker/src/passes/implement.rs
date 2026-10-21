@@ -190,7 +190,8 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
 - NEVER delete existing functions, methods, or logic unless the task explicitly requires removing them. Modify code, don't gut it.
 - After implementing all tasks, output a one-line summary (e.g. "Implemented auth middleware and updated 3 route files"). Do NOT describe each change in detail.
-- Only implement the listed tasks. Do not add extras."#,
+- Only implement the listed tasks. Do not add extras.
+{schema_rules}"#,
             number = msg.issue_number,
             title = msg.title,
             design = design_note,
@@ -198,6 +199,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             openspec = openspec_block,
             feedback = feedback_section,
             issue = issue_source_block,
+            schema_rules = SCHEMA_CHANGE_RULES,
         )
     };
 
@@ -776,6 +778,77 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         }
     }
 
+    // Gate: a migration file the change added must be listed in the index
+    // that registers its siblings, or it never runs (a migration shipped that
+    // way, unregistered, so its schema change silently never happened).
+    let changed: Vec<String> = executor
+        .write_executor
+        .files_modified
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
+    let mut registries: Vec<(String, String)> = Vec::new();
+    for idx in migration_registries_for(&changed) {
+        if let Ok(text) = github
+            .read_file(&msg.repo_owner, &msg.repo_name, &idx, branch)
+            .await
+        {
+            registries.push((idx, text));
+        }
+    }
+    let missing = unregistered_migrations(&changed, &registries);
+    if !missing.is_empty() {
+        warn!(
+            run_id = run_id.unwrap_or("?"),
+            ?missing,
+            "Implement added migrations its index doesn't register — one remediation pass"
+        );
+        let list = missing
+            .iter()
+            .map(|(m, idx)| format!("- `{m}` is not listed in `{idx}`"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        messages.push((
+            "user".to_string(),
+            vec![serde_json::json!({
+                "type": "text",
+                "text": format!(
+                    "These migrations you added would never run:\n{list}\n\
+                     Register each one in that index the same way its siblings are (import and \
+                     list entry, in order), then call run_checks."
+                )
+            })],
+        ));
+        let opts = llm::ConverseOptions {
+            max_turns: 12,
+            max_tokens: 16384,
+            deadline,
+            effort: None,
+        };
+        if let Err(e) = provider::converse(
+            state,
+            provider,
+            model_id,
+            &full_system,
+            &mut messages,
+            &tools,
+            &executor,
+            usage,
+            opts,
+            on_tool.as_ref().map(|b| b.as_ref()),
+            Some(&mut conv_log),
+        )
+        .await
+        {
+            warn!(error = %e, "Migration-registration pass errored — proceeding with current state");
+        }
+        if let Some(s) = &skills {
+            s.drain_usage_into(usage);
+        }
+    }
+
     let files = executor
         .write_executor
         .files_modified
@@ -789,6 +862,70 @@ Go DIRECTLY to the target files listed in the OpenSpec.
         files_modified: files,
         conversation_log: conv_log,
     })
+}
+
+/// What a change to a table's schema, constraints, ids or stored data must
+/// do before it is written. Each rule is a way such a change shipped broken.
+const SCHEMA_CHANGE_RULES: &str = "
+## When the change touches a table's schema, constraints, ids or stored rows
+- Before changing a unique key or constraint, find EVERY writer of that table across all the repos you can search (`ON CONFLICT`, inserts, upserts, ORM `save`/`upsert`, raw SQL in pipelines and scripts) and update each one that names the old key in the same change. A writer you didn't update fails at runtime.
+- Register a new migration wherever the repo registers its siblings (an index or list of migrations) and keep the order; an unregistered migration never runs.
+- Tables written on a schedule (every minute, every sync) are being written while the migration runs: set a short lock timeout inside the migration (`SET LOCAL lock_timeout`), take locks in one fixed table order, and keep each statement small.
+- Scope a new unique key to the rows it is about: a partial unique index (`WHERE` the source or type it applies to), and state how NULLs compare (`NULLS NOT DISTINCT` or a `COALESCE` key) instead of relying on the default.
+- A data migration that moves or merges rows: never point rows at a target row whose insert could have been skipped (`ON CONFLICT DO NOTHING`, a filtered insert); point only at rows you know exist, and make it safe to run twice.
+- When two repos change together, each side must work whatever order they deploy in: the reader detects the new column or key at runtime, or the change ships in two steps (add, then use). Say the order in the summary.
+- Before changing or merging ids that leave the database (links, shared URLs, emails, caches, search indexes, other services), find where those ids are used and keep the old ones working (a redirect or alias), or say why none are used.
+- Say what you measured: how many rows the migration changes, and where you counted them.
+";
+
+/// Index files that register migrations next to a changed file under a
+/// `migrations` directory (`index.ts`, `index.js`, `__init__.py`).
+fn migration_registries_for(changed: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for f in changed {
+        let Some((dir, _)) = f.rsplit_once('/') else {
+            continue;
+        };
+        if !dir.split('/').any(|seg| seg == "migrations") {
+            continue;
+        }
+        for name in ["index.ts", "index.js", "__init__.py"] {
+            let idx = format!("{dir}/{name}");
+            if idx != *f && !out.contains(&idx) {
+                out.push(idx);
+            }
+        }
+    }
+    out
+}
+
+/// Changed migration files that an existing registry in their directory
+/// doesn't mention: `(file, registry)`. A registry counts only when it
+/// imports or lists things (an empty index registers nothing by name).
+fn unregistered_migrations(
+    changed: &[String],
+    registries: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for f in changed {
+        let Some((dir, file)) = f.rsplit_once('/') else {
+            continue;
+        };
+        let stem = file.split('.').next().unwrap_or(file);
+        if matches!(stem, "index" | "__init__") || stem.is_empty() {
+            continue;
+        }
+        let listing = |t: &str| t.contains("import") || t.contains("require(");
+        if let Some((idx, text)) = registries
+            .iter()
+            .find(|(idx, text)| idx.rsplit_once('/').map(|(d, _)| d) == Some(dir) && listing(text))
+        {
+            if !text.contains(stem) {
+                out.push((f.clone(), idx.clone()));
+            }
+        }
+    }
+    out
 }
 
 // ─── Full tool set for implement pass ───────────────────────
@@ -2304,5 +2441,45 @@ mod write_tool_tests {
             tool_write_paths(&batch),
             vec!["a.ts".to_string(), "b.ts".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod migration_registry_tests {
+    use super::{migration_registries_for, unregistered_migrations};
+
+    #[test]
+    fn a_new_migration_its_index_doesnt_list_is_named() {
+        let dir = "src/database/migrations";
+        let changed = vec![
+            format!("{dir}/1700000000000-AddFacilityKey.ts"),
+            "src/app.ts".to_string(),
+        ];
+        assert_eq!(
+            migration_registries_for(&changed),
+            vec![
+                format!("{dir}/index.ts"),
+                format!("{dir}/index.js"),
+                format!("{dir}/__init__.py")
+            ]
+        );
+        let index = (
+            format!("{dir}/index.ts"),
+            "import { Init1600 } from './1600-Init';\nexport default [Init1600];".to_string(),
+        );
+        let missing = unregistered_migrations(&changed, std::slice::from_ref(&index));
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, changed[0]);
+
+        let registered = (
+            index.0.clone(),
+            format!(
+                "{}\nimport {{ X }} from './1700000000000-AddFacilityKey';",
+                index.1
+            ),
+        );
+        assert!(unregistered_migrations(&changed, &[registered]).is_empty());
+        // No registry in the directory (e.g. migrations found by glob): nothing to check.
+        assert!(unregistered_migrations(&changed, &[]).is_empty());
     }
 }

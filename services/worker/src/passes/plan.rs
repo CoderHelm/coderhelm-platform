@@ -12,7 +12,7 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-21.basis-and-direction";
+pub const PLANNER_VERSION: &str = "2026-10-21.schema-writers";
 
 /// The cached plan's file holding its key.
 pub const PLAN_KEY_FILE: &str = "plan_key.txt";

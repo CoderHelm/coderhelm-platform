@@ -118,11 +118,11 @@ pub async fn run(
 ## Files Changed
 {diff_summary}
 
-## Actual diff excerpts (the source of truth — describe THIS)
+## The full diff (the source of truth — read all of it, describe THIS)
 {diff_patches}{template_block}
 
 ## Instructions
-Describe what the DIFF actually does. Where the diff differs from the plan, the diff wins.
+Describe what the DIFF actually does, after reading every file in it. Where the diff differs from the plan, the diff wins. Name every behavior change, including ones the plan didn't mention (a changed default, a renamed id, a new constraint, a migration).
 {instructions}
 
 Rules:
@@ -800,36 +800,69 @@ fn format_diff_summary(diff: &serde_json::Value) -> String {
         .join("\n")
 }
 
-/// Real patch excerpts for the PR body writer. It previously saw only the
-/// plan and a filename list — when implement deviated from plan, the PR
-/// description confidently described a change that wasn't in the diff.
-/// Caps: per-file and total, char-boundary-safe.
+/// The diff the PR body writer reads. It previously saw a 1.2k excerpt per
+/// file, so descriptions were written from part of the change; now it reads
+/// every patch whole (lockfiles and generated files are named, not shown),
+/// and anything still left out is named so the writer knows it didn't see it.
 fn format_diff_patches(diff: &serde_json::Value) -> String {
-    const PER_FILE: usize = 1200;
-    const TOTAL: usize = 12_000;
+    const PER_FILE: usize = 40_000;
+    const TOTAL: usize = 150_000;
     let files = match diff.get("files").and_then(|v| v.as_array()) {
         Some(f) => f,
         None => return String::new(),
     };
     let mut out = String::new();
+    let mut named_only: Vec<String> = Vec::new();
     for f in files {
-        if out.len() >= TOTAL {
-            out.push_str("\n[… more files omitted …]\n");
-            break;
-        }
         let path = f.get("filename").and_then(|v| v.as_str()).unwrap_or("");
         let Some(patch) = f.get("patch").and_then(|v| v.as_str()) else {
-            continue; // binary or too-large-for-API files have no patch
+            // Binary, or too large for the API to return a patch.
+            named_only.push(format!("{path} (no patch from GitHub)"));
+            continue;
         };
+        if is_lockfile(path) {
+            named_only.push(format!("{path} (lockfile)"));
+            continue;
+        }
+        if out.len() + patch.len().min(PER_FILE) > TOTAL {
+            named_only.push(format!("{path} (over the size budget)"));
+            continue;
+        }
         let excerpt = common::truncate_str(patch, PER_FILE);
         let marker = if excerpt.len() < patch.len() {
-            "\n[… truncated …]"
+            format!("\n[… cut at {PER_FILE} characters of {} …]", patch.len())
         } else {
-            ""
+            String::new()
         };
         out.push_str(&format!("\n### {path}\n```diff\n{excerpt}{marker}\n```\n"));
     }
+    if !named_only.is_empty() {
+        out.push_str(
+            "\nChanged but not shown above (don't describe what's in them beyond the name):\n",
+        );
+        for n in named_only {
+            out.push_str(&format!("- {n}\n"));
+        }
+    }
     out
+}
+
+fn is_lockfile(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        name,
+        "package-lock.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "Cargo.lock"
+            | "poetry.lock"
+            | "Pipfile.lock"
+            | "uv.lock"
+            | "Gemfile.lock"
+            | "composer.lock"
+            | "go.sum"
+            | "bun.lockb"
+    )
 }
 
 /// Try to fetch a PR template from common locations in the repo.
@@ -856,4 +889,25 @@ async fn fetch_pr_template(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::format_diff_patches;
+    use serde_json::json;
+
+    #[test]
+    fn the_writer_sees_whole_patches_and_is_told_what_it_didnt_see() {
+        let long = "+x\n".repeat(2_000); // 6k: was cut at 1.2k before
+        let d = json!({"files": [
+            {"filename": "src/a.ts", "patch": long},
+            {"filename": "package-lock.json", "patch": "+lots"},
+            {"filename": "img.png"},
+        ]});
+        let out = format_diff_patches(&d);
+        assert!(out.contains(&long), "the whole patch is shown");
+        assert!(!out.contains("+lots"));
+        assert!(out.contains("- package-lock.json (lockfile)"));
+        assert!(out.contains("- img.png (no patch from GitHub)"));
+    }
 }
