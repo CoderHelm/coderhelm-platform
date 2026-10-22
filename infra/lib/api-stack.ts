@@ -367,6 +367,8 @@ export class ApiStack extends cdk.Stack {
         DLQ_URL: dlq.queueUrl,
         SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
         SES_FROM_ADDRESS: "noreply@coderhelm.com",
+        // Where new support tickets and customer replies are emailed.
+        SUPPORT_INBOX: "support@coderhelm.com",
         SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
         MODEL_ID: "claude-sonnet-5-5",
         COGNITO_USER_POOL_ID: userPool.userPoolId,

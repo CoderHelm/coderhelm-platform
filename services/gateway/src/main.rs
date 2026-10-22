@@ -116,6 +116,30 @@ async fn main() -> Result<(), Error> {
                 .delete(routes::api::remove_from_allowlist),
         )
         .route("/admin/teams", get(routes::api::admin_teams))
+        // Support tickets: the team's own, and the platform admin's queue
+        .route(
+            "/support/tickets",
+            get(routes::support::list).post(routes::support::create_handler),
+        )
+        .route("/support/tickets/:id", get(routes::support::get))
+        .route("/support/tickets/:id/reply", post(routes::support::reply))
+        .route("/support/badge", get(routes::support::badge))
+        .route(
+            "/admin/support/tickets",
+            get(routes::support::admin_list_handler),
+        )
+        .route(
+            "/admin/support/tickets/:id",
+            get(routes::support::admin_get),
+        )
+        .route(
+            "/admin/support/tickets/:id/reply",
+            post(routes::support::admin_reply_handler),
+        )
+        .route(
+            "/admin/support/tickets/:id/status",
+            post(routes::support::admin_status),
+        )
         .route("/search", get(routes::search::search))
         .route("/runs", get(routes::api::list_runs))
         .route("/runs/:run_id", get(routes::api::get_run))

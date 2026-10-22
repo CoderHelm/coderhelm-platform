@@ -345,7 +345,7 @@ pub async fn rename_team(
 /// the list AND have been verified by CoderHelm itself (Google or an email
 /// code): a GitHub-only identity carries whatever email its profile shows,
 /// so it never counts.
-fn is_platform_admin(claims: &Claims) -> bool {
+pub(crate) fn is_platform_admin(claims: &Claims) -> bool {
     let admins = std::env::var("PLATFORM_ADMIN_EMAILS")
         .unwrap_or_else(|_| "admin@coderhelm.com".to_string());
     verified_identity(&claims.sub) && platform_admin_listed(&admins, &claims.email)
