@@ -2776,6 +2776,7 @@ async fn store_review_record(
         &repo,
         msg.pr_number,
         verdict,
+        posted_as,
         risk,
         &msg.trigger,
         counts,

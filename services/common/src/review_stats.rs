@@ -10,8 +10,11 @@ use std::collections::HashMap;
 use aws_sdk_dynamodb::types::AttributeValue;
 
 pub const PREFIX: &str = "RSTAT#";
-/// Set on a team once its older reviews have been copied into stats records.
-pub const BACKFILL_MARKER_SK: &str = "ANALYTICS#review-stats-backfilled";
+/// Set on a team once every review record has a stats record carrying what
+/// was posted on GitHub. The first copy (`ANALYTICS#review-stats-backfilled`)
+/// dropped writes DynamoDB throttled and never recorded `posted_as`, so the
+/// repair runs again under this key.
+pub const REPAIR_MARKER_SK: &str = "ANALYTICS#review-stats-repaired#v2";
 /// Stats records outlive the 90-day analytics window by a wide margin.
 const KEEP_DAYS: i64 = 400;
 
@@ -68,6 +71,7 @@ pub fn stat_item(
     repo: &str,
     pr: u64,
     verdict: &str,
+    posted_as: &str,
     risk: &str,
     trigger: &str,
     counts: &ReviewCounts,
@@ -92,6 +96,11 @@ pub fn stat_item(
         ("thumbs_down".to_string(), n(0)),
         ("ttl".to_string(), n(ttl)),
     ]);
+    // What GitHub shows: an approval, changes requested, or a plain comment
+    // (the verdict can be an approval posted as a comment).
+    if !posted_as.is_empty() {
+        item.insert("posted_as".to_string(), s(posted_as));
+    }
     if counts.priors_known {
         item.insert("prior_open".to_string(), n(counts.prior_open));
         item.insert("prior_fixed".to_string(), n(counts.prior_fixed));
@@ -144,12 +153,15 @@ mod tests {
             "2026-01-01T00:00:00Z",
             "a/b",
             7,
+            "APPROVE",
             "COMMENT",
             "low",
             "labeled",
             &known,
         );
         assert_eq!(item["prior_fixed"], AttributeValue::N("1".into()));
+        assert_eq!(item["verdict"], AttributeValue::S("APPROVE".into()));
+        assert_eq!(item["posted_as"], AttributeValue::S("COMMENT".into()));
         let unknown = ReviewCounts {
             findings: 2,
             ..Default::default()
@@ -160,11 +172,13 @@ mod tests {
             "a/b",
             7,
             "COMMENT",
+            "",
             "low",
             "labeled",
             &unknown,
         );
         assert!(!item.contains_key("prior_fixed"));
+        assert!(!item.contains_key("posted_as"));
         assert_eq!(item["findings"], AttributeValue::N("2".into()));
     }
 }
