@@ -14,7 +14,7 @@ use crate::agent::provider;
 use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
-use crate::passes::checks::CheckKind;
+use crate::passes::checks::{classify_command, CheckKind, CiCommand};
 use crate::passes::plan::PlanResult;
 use crate::passes::FileCache;
 use crate::WorkerState;
@@ -114,6 +114,10 @@ pub struct RunEvidence {
     pub checks: Vec<String>,
     /// The kinds of check the repository's CI runs on the pull request.
     pub ci_gates: Vec<CheckKind>,
+    /// Each check command the repository's CI runs on the pull request, with
+    /// its id (`C1`): what the judge maps a finding to, and what the PR's
+    /// Verification section says CI runs.
+    pub ci_commands: Vec<CiCommand>,
 }
 
 /// Starts a fix round's notes inside [`RunEvidence::notes`].
@@ -148,6 +152,11 @@ impl RunEvidence {
             }
         }
         self.ci_gates.sort();
+        // CI's commands come from the same workflows each pass: the first
+        // list keeps the ids the judge has already seen.
+        if self.ci_commands.is_empty() {
+            self.ci_commands = later.ci_commands;
+        }
         let notes = later.notes.trim();
         if !notes.is_empty() {
             if self.notes.trim().is_empty() {
@@ -155,6 +164,34 @@ impl RunEvidence {
             } else {
                 self.notes = format!("{}\n\n{FIX_ROUND_MARK}\n{notes}", self.notes.trim());
             }
+        }
+    }
+
+    /// The CI command `id` names (`C2`, `[C2]`), when CI runs one by that id.
+    pub fn ci_command(&self, id: &str) -> Option<&CiCommand> {
+        let id = id.trim().trim_matches(|c| c == '[' || c == ']').trim();
+        if id.is_empty() {
+            return None;
+        }
+        self.ci_commands
+            .iter()
+            .find(|c| c.id.eq_ignore_ascii_case(id))
+    }
+
+    /// What the judge reads about the checks CI runs on the PR: each command
+    /// with its id, or the kinds when only those are known.
+    fn ci_for_judge(&self) -> String {
+        if !self.ci_commands.is_empty() {
+            return self
+                .ci_commands
+                .iter()
+                .map(CiCommand::judge_line)
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        match self.ci_gates.as_slice() {
+            [] => "(none found: nothing checks this PR after it opens)".to_string(),
+            g => g.iter().map(|k| k.name()).collect::<Vec<_>>().join(", "),
         }
     }
 
@@ -182,10 +219,7 @@ impl RunEvidence {
             list(&sources, "(none connected)"),
             list(&lookups, "(no lookups were made)"),
             list(&checks, "(no sandbox checks ran)"),
-            match self.ci_gates.as_slice() {
-                [] => "(none found: nothing checks this PR after it opens)".to_string(),
-                g => g.iter().map(|k| k.name()).collect::<Vec<_>>().join(", "),
-            },
+            self.ci_for_judge(),
             match self.notes.trim() {
                 "" => "(the coder wrote none)",
                 n => n,
@@ -223,10 +257,23 @@ pub struct Finding {
     /// How to settle it, in one sentence.
     #[serde(default)]
     pub settle: String,
-    /// The kind of check (`lint`, `typecheck`, `build`, `tests`) when the
-    /// finding is only that a check didn't run (or failed) before the PR.
+    /// The kind of check (`format`, `lint`, `typecheck`, `build`, `tests`,
+    /// `plan`, `security`) when the finding is only that a check didn't run
+    /// (or failed) before the PR.
     #[serde(default)]
     pub check: String,
+    /// The command the finding asks to run (`terraform fmt -check`), as the
+    /// judge wrote it: matched to CI's commands through the tool table.
+    #[serde(default)]
+    pub command: String,
+    /// The id of the CI command (`C1`) the judge says runs this check.
+    /// [`classify`] keeps it only when CI runs a command by that id.
+    #[serde(default)]
+    pub ci: String,
+    /// The CI command that settles this finding, as people read it, set by
+    /// [`classify`]; never read from the judge.
+    #[serde(skip)]
+    pub ci_cmd: String,
 }
 
 /// What settles a finding.
@@ -280,6 +327,12 @@ impl Finding {
     fn line(&self) -> String {
         let what = sentence(&self.detail, MAX_WHAT);
         let settle = match (self.settler(), sentence(&self.settle, MAX_SETTLE)) {
+            (Settler::Ci, _) if !self.ci_cmd.is_empty() => {
+                format!(
+                    " CI runs {} on this PR; this settles when it passes.",
+                    self.ci_cmd
+                )
+            }
             (_, s) if !s.is_empty() => format!(" Settle: {s}"),
             (Settler::Ci, _) => " Settles when this PR's CI passes.".to_string(),
             _ => String::new(),
@@ -317,32 +370,100 @@ fn sentence(text: &str, max: usize) -> String {
     format!("{}…", at_word.trim_end_matches([',', ';', ':']))
 }
 
+/// How a finding was tied to the CI command that settles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tie {
+    /// The command the finding asks for runs the same tool as CI's command
+    /// (through the tool table).
+    Tool,
+    /// The judge named the CI command's id, and CI runs a command by it.
+    Id,
+    /// Only the kind of check matches.
+    Kind,
+}
+
+/// The CI command that settles a finding, and how it was tied: the command
+/// the finding asks for matched through the tool table to a CI command of
+/// the same tool; else the CI command the judge named, when CI runs one by
+/// that id and it is of the kind the finding names; else a CI command of the
+/// kind the finding (or its command) names.
+fn covering<'a>(f: &Finding, ev: &'a RunEvidence) -> Option<(&'a CiCommand, Tie)> {
+    let asked = classify_command(&f.command);
+    if let Some(m) = &asked {
+        if let Some(c) = ev.ci_commands.iter().find(|c| c.tool == m.tool) {
+            return Some((c, Tie::Tool));
+        }
+    }
+    let kind = CheckKind::parse(&f.check).or(asked.map(|m| m.kind));
+    if let Some(c) = ev.ci_command(&f.ci) {
+        if kind.is_none_or(|k| k == c.kind) {
+            return Some((c, Tie::Id));
+        }
+    }
+    let kind = kind?;
+    ev.ci_commands
+        .iter()
+        .find(|c| c.kind == kind)
+        .map(|c| (c, Tie::Kind))
+}
+
 /// Holds the judge's findings to the run's facts. A finding that is only
-/// "this check didn't run before the PR" (its `check` names the kind) is not a
-/// proof gap when the repository's CI runs that check on the PR: it becomes a
-/// `ci_pending` item CI's result settles, whatever point the judge gave it.
-/// When CI doesn't run that check, nothing will settle it after the PR opens,
-/// so it is a gap (`unrun_check`). A `ci_pending` that names no kind waits on
-/// CI only when CI runs any check at all.
+/// "this check didn't run before the PR" is not a proof gap when the
+/// repository's CI runs that check on the PR: it becomes a `ci_pending` item
+/// CI's result settles, whatever point the judge gave it, naming the CI
+/// command that runs it. The tie is structured: the finding's `command`
+/// matched to CI's through the tool table, else the CI command id the judge
+/// gave (kept only when CI runs a command by it), else the kind. When CI
+/// doesn't run that check, nothing will settle it after the PR opens, so it
+/// is a gap (`unrun_check`); a plan or preview, which needs credentials the
+/// sandbox never has, is a step for a person instead. A `ci_pending` that
+/// names no check waits on CI only when CI runs any check at all. A
+/// `manual_check` becomes `ci_pending` only when tied to a CI command by its
+/// command or id, or by a kind other than tests (a person's click-through is
+/// not CI's test suite).
 pub fn classify(findings: Vec<Finding>, evidence: &RunEvidence) -> Vec<Finding> {
     findings
         .into_iter()
         .map(|mut f| {
-            if f.point.trim() == "manual_check" {
+            let manual = f.point.trim() == "manual_check";
+            let kind =
+                CheckKind::parse(&f.check).or_else(|| classify_command(&f.command).map(|m| m.kind));
+            f.ci_cmd.clear();
+            // A finding about something else (an unconfirmed field) never
+            // waits on CI because the judge put an id on it.
+            let about_a_check = kind.is_some() || manual || f.point.trim() == "ci_pending";
+            if let Some((c, tie)) = covering(&f, evidence).filter(|_| about_a_check) {
+                if !manual || tie != Tie::Kind || c.kind != CheckKind::Tests {
+                    f.point = "ci_pending".into();
+                    f.check = c.kind.name().into();
+                    f.ci = c.id.clone();
+                    f.ci_cmd = c.display();
+                    return f;
+                }
+            }
+            f.ci.clear();
+            if manual {
                 return f;
             }
-            let ci_settles = match CheckKind::parse(&f.check) {
-                Some(k) => Some(evidence.ci_gates.contains(&k)),
-                None if f.point.trim() == "ci_pending" => Some(!evidence.ci_gates.is_empty()),
-                None => None,
-            };
-            match ci_settles {
-                Some(true) => f.point = "ci_pending".into(),
-                Some(false) => f.point = "unrun_check".into(),
+            match kind {
+                Some(k) if evidence.ci_gates.contains(&k) => f.point = "ci_pending".into(),
+                Some(CheckKind::Plan) => f.point = "manual_check".into(),
+                Some(_) => f.point = "unrun_check".into(),
+                None if f.point.trim() == "ci_pending" && evidence.ci_gates.is_empty() => {
+                    f.point = "unrun_check".into();
+                }
                 None => {}
             }
             f
         })
+        .collect()
+}
+
+/// What the repository's CI runs on the pull request, one line per
+/// command, for the PR writer. Empty when CI runs no check.
+pub fn ci_runs(ci: &[CiCommand]) -> String {
+    ci.iter()
+        .map(|c| format!("- {} ({})\n", c.display(), c.kind.name()))
         .collect()
 }
 
@@ -393,15 +514,19 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      verification steps).\n\
      10. team_rule: when the team's instructions are given, a miss when the change breaks one \
      of them (name the rule). Where they conflict with the points above, the team's win. A rule \
-     to run lint, a type-check, a build or tests before pushing is not a team_rule miss: report \
-     a check that didn't run or failed as ci_pending (point 11).\n\
-     11. ci_pending: a check (lint, typecheck, build or tests) that the sandbox checks listed did \
-     not run, or ran and failed, before the PR opened. When the repository's CI runs that check \
-     on the pull request, its result settles it, so it is not a proof gap. Set `check` to the \
-     kind. A check the sandbox list shows as PASS is not a finding.\n\
+     to run lint, formatting, a type-check, a build, tests or a plan before pushing is not a \
+     team_rule miss: report a check that didn't run or failed as ci_pending (point 11).\n\
+     11. ci_pending: a check (format, lint, typecheck or validate, build, tests, plan or preview, \
+     security scan) that the sandbox checks listed did not run, or ran and failed, before the PR \
+     opened. When the repository's CI runs that check on the pull request (the CI list gives each \
+     command it runs, with an id like C1), its result settles it, so it is not a proof gap. Set \
+     `check` to the kind, `command` to the command the check needs (e.g. `terraform fmt -check`), \
+     and `ci` to the id of the CI command that runs it, or empty when CI runs none. A check the \
+     sandbox list shows as PASS is not a finding.\n\
      12. manual_check: something only a person can verify (in a real browser, on a device, a \
      manual click-through). Never a gap; it becomes a numbered step in the PR's Verification \
-     section.\n\
+     section. Never a command the CI list shows: running that is CI's job, so it is ci_pending \
+     with its `ci` id.\n\
      Many changes touch none of these: a change that relies on nothing outside its own code, \
      changes no stored records and adds no logs passes all of them. Judge only what the evidence \
      shows and do not invent concerns. A fact the lookups confirm is proven even when the notes \
@@ -410,7 +535,7 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      exact field, records, log line, assumption or check); `settle` is ONE sentence on how to \
      settle it (which connected source to read, what to count, which log to lower, which check \
      result). No lists, no preamble, no repeating the rule's text.\n\
-     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule|ci_pending|manual_check\",\"detail\":\"one sentence\",\"settle\":\"one sentence\",\"check\":\"lint|typecheck|build|tests, or empty\"}]}. \
+     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule|ci_pending|manual_check\",\"detail\":\"one sentence\",\"settle\":\"one sentence\",\"check\":\"format|lint|typecheck|build|tests|plan|security, or empty\",\"command\":\"the command the check needs, or empty\",\"ci\":\"the CI command id (C1), or empty\"}]}. \
      An empty list when all pass.";
 
 /// The judge's prompt: the change and everything the run gathered.
@@ -1378,6 +1503,134 @@ mod tests {
             ev.ci_gates,
             vec![CheckKind::Typecheck, CheckKind::Lint, CheckKind::Tests]
         );
+    }
+
+    /// An invented Terraform repository whose PR workflows format-check
+    /// every PR and plan each environment, read the way `implement` reads
+    /// them.
+    fn terraform_ci() -> RunEvidence {
+        use crate::passes::checks::{kinds_from, pr_commands, Workflow};
+        let lint = Workflow {
+            path: ".github/workflows/lint.yml".into(),
+            text: "on:\n  pull_request:\n    types: [opened, synchronize, reopened, labeled]\njobs:\n  fmt:\n    steps:\n      - uses: hashicorp/setup-terraform@v3\n      - run: terraform fmt -recursive -check\n".into(),
+        };
+        let plan = Workflow {
+            path: ".github/workflows/plan.yml".into(),
+            text: "on: pull_request\njobs:\n  plan:\n    strategy:\n      matrix:\n        env: [staging, prod]\n    defaults:\n      run:\n        working-directory: envs/${{ matrix.env }}\n    steps:\n      - run: |\n          terraform init -input=false\n          terraform plan -input=false -no-color\n".into(),
+        };
+        let ci = pr_commands(&[lint, plan], "main");
+        RunEvidence {
+            ci_gates: kinds_from(&ci),
+            ci_commands: ci,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn terraform_checks_ci_runs_wait_on_ci_and_clear_when_it_passes() {
+        // The incident: the judge told a person to run `terraform fmt -check`
+        // and `terraform plan`, which the repo's PR workflows already run.
+        let ev = terraform_ci();
+        let judged = vec![
+            Finding {
+                point: "manual_check".into(),
+                detail: "Formatting of the changed .tf files was not checked.".into(),
+                settle: "Run terraform fmt -check.".into(),
+                command: "terraform fmt -check".into(),
+                ..Default::default()
+            },
+            Finding {
+                point: "assumption".into(),
+                detail: "The plan for staging and prod was not reviewed.".into(),
+                settle: "Run terraform plan for staging and prod.".into(),
+                check: "plan".into(),
+                command: "terraform plan".into(),
+                ..Default::default()
+            },
+            // Tied only by the CI id the judge gave: code checks it exists.
+            Finding {
+                point: "ci_pending".into(),
+                detail: "Formatting did not run in the sandbox.".into(),
+                ci: "[C1]".into(),
+                ..Default::default()
+            },
+            // An id CI doesn't have ties nothing.
+            Finding {
+                point: "ci_pending".into(),
+                detail: "tflint did not run.".into(),
+                command: "tflint".into(),
+                ci: "C9".into(),
+                ..Default::default()
+            },
+            Finding {
+                point: "impact".into(),
+                detail: "Affected buckets were not counted.".into(),
+                ci: "C1".into(),
+                ..Default::default()
+            },
+        ];
+        let f = classify(judged, &ev);
+        let got: Vec<(&str, &str, &str)> = f
+            .iter()
+            .map(|f| (f.point.as_str(), f.check.as_str(), f.ci.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("ci_pending", "format", "C1"),
+                ("ci_pending", "plan", "C2"),
+                ("ci_pending", "format", "C1"),
+                ("unrun_check", "", ""),
+                ("impact", "", ""),
+            ]
+        );
+        // Neither CI-run check is a gap or a step for a person.
+        assert_eq!(manual_steps(&f[..3]), "");
+        assert_eq!(next(Some(&f[..3]), 0, true), Next::Open);
+        let top = gaps_section(&f[..3]);
+        assert!(top.contains("> [!NOTE]"));
+        assert!(top.contains(
+            "CI runs `terraform fmt -recursive -check` on this PR; this settles when it passes."
+        ));
+        assert!(top.contains("CI runs `terraform plan -input=false -no-color` (in `envs/${{ matrix.env }}`) on this PR"));
+        assert!(!top.contains("Run terraform"));
+        // A green CI clears them, and the section with them.
+        let rest = "Source ticket: OPS-1\n\n**Problem** x";
+        let body = format!("{top}{rest}");
+        assert_eq!(settle_by_ci(&body).as_deref(), Some(rest));
+
+        // Without CI running them: formatting is a gap, a plan is for a
+        // person (the sandbox never has credentials).
+        let none = classify(
+            vec![
+                check_finding("ci_pending", "format"),
+                check_finding("ci_pending", "plan"),
+            ],
+            &RunEvidence::default(),
+        );
+        assert_eq!(none[0].point, "unrun_check");
+        assert_eq!(none[1].point, "manual_check");
+    }
+
+    #[test]
+    fn the_judge_reads_each_command_ci_runs_with_its_id() {
+        let ev = terraform_ci();
+        let p = judge_prompt("t", "", "", &ev, "");
+        assert!(p.contains(
+            "runs on this pull request\n- [C1] format (terraform fmt): `terraform fmt -recursive -check` (workflow `lint.yml`, job `fmt`)\n- [C2] plan (terraform plan):"
+        ));
+        assert!(JUDGE_SYSTEM.contains("\"ci\":\"the CI command id (C1), or empty\""));
+        assert!(JUDGE_SYSTEM.contains("Never a command the CI list shows"));
+        let reply = "```json\n{\"findings\":[{\"point\":\"ci_pending\",\"detail\":\"fmt did not run\",\"check\":\"format\",\"command\":\"terraform fmt -check\",\"ci\":\"C1\"}]}\n```";
+        let f = parse_findings(reply).unwrap();
+        assert_eq!(
+            (f[0].command.as_str(), f[0].ci.as_str()),
+            ("terraform fmt -check", "C1")
+        );
+        // The ids stay those the judge saw when a fix round adds evidence.
+        let mut merged = ev.clone();
+        merged.merge(terraform_ci());
+        assert_eq!(merged.ci_commands, ev.ci_commands);
     }
 
     #[test]

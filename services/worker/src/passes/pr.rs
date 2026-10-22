@@ -5,6 +5,7 @@ use crate::agent::provider::ModelProvider;
 use crate::agent::{llm, provider};
 use crate::clients::github::{FileOp, GitHubClient};
 use crate::models::{TicketMessage, TicketSource, TokenUsage};
+use crate::passes::checks::CiCommand;
 use crate::passes::plan::PlanResult;
 use crate::passes::syntax_check;
 use crate::WorkerState;
@@ -22,11 +23,129 @@ pub struct PrResult {
 /// looked up (`evidence`, the writer's source for an Evidence section) and
 /// the gaps the proof check still found (`gaps`, put at the very top), and
 /// what only a person can check (`manual`, steps for the Verification
-/// section).
+/// section), and the check commands the repository's CI runs on the PR
+/// (`ci`), which the Verification section never asks a person to run.
 pub struct Proof<'a> {
     pub evidence: &'a str,
     pub gaps: &'a str,
     pub manual: &'a str,
+    pub ci: &'a [CiCommand],
+}
+
+/// What the writer is told about the checks CI runs on the PR: never a
+/// Verification step asking a person to run one; say CI runs it. Empty when
+/// CI runs none.
+fn ci_instructions(ci: &[CiCommand]) -> String {
+    if ci.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## Checks the repository's CI runs on this pull request\nCI runs each of these on \
+         this PR and its result shows there. In the Verification section, never tell a person to \
+         run any of them (or the same tool another way). Where verifying the change needs one, \
+         write that CI runs it, e.g. \"CI runs `<command>` on this PR.\"; for a plan or preview, \
+         \"CI runs `<command>` on this PR; read its output in the PR's checks.\"\n{}",
+        super::proof::ci_runs(ci).trim_end()
+    )
+}
+
+/// Whether a description line is a section heading: a `#` heading, or a
+/// line that is only bold text (`**Verification**`, `4. **Verification**:`).
+fn is_heading(line: &str) -> bool {
+    let t = line.trim();
+    if t.starts_with('#') {
+        return true;
+    }
+    let t = t.trim_start_matches(|c: char| c.is_ascii_digit());
+    let t = t.strip_prefix(". ").unwrap_or(t).trim_start();
+    let Some(rest) = t.strip_prefix("**") else {
+        return false;
+    };
+    match rest.find("**") {
+        Some(end) => {
+            let after = rest[end + 2..].trim();
+            after.is_empty() || after == ":" || after.starts_with('—') || after.starts_with("- ")
+        }
+        None => false,
+    }
+}
+
+/// Whether a heading names the Verification section.
+fn is_verification_heading(line: &str) -> bool {
+    let l = line.to_lowercase();
+    l.contains("verif") || l.contains("how to test") || l.contains("test plan")
+}
+
+/// The list marker a line starts with (`1. `, `* `, `- `), with its indent.
+fn list_marker(line: &str) -> &str {
+    let indent = line.len() - line.trim_start().len();
+    let t = &line[indent..];
+    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let marker = if digits > 0 && t[digits..].starts_with(". ") {
+        digits + 2
+    } else if t.starts_with("* ") || t.starts_with("- ") {
+        2
+    } else {
+        0
+    };
+    &line[..indent + marker]
+}
+
+/// The CI command a line asks a person to run: a command in backticks that
+/// runs the same tool (by the tool table) as a command CI runs on the PR.
+fn ci_command_in<'a>(line: &str, ci: &'a [CiCommand]) -> Option<&'a CiCommand> {
+    line.split('`').skip(1).step_by(2).find_map(|code| {
+        let m = super::checks::classify_command(code)?;
+        ci.iter().find(|c| c.tool == m.tool)
+    })
+}
+
+/// What a Verification step says about a check CI runs on the PR.
+fn ci_step(c: &CiCommand) -> String {
+    if c.kind == super::checks::CheckKind::Plan {
+        format!(
+            "CI runs {} on this PR; read its output in the PR's checks.",
+            c.display()
+        )
+    } else {
+        format!("CI runs {} on this PR.", c.display())
+    }
+}
+
+/// The description with each Verification step that tells a person to run a
+/// check CI already runs on the PR said as what it is: "CI runs `X` on this
+/// PR". A second step for the same CI command is dropped. Only commands in
+/// backticks are read, through the tool table; the rest of the description
+/// is left as it is.
+pub fn ci_verification(body: &str, ci: &[CiCommand]) -> String {
+    if ci.is_empty() {
+        return body.to_string();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut in_verification = false;
+    let mut said: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        if is_heading(line) {
+            in_verification = is_verification_heading(line);
+            out.push(line.to_string());
+            continue;
+        }
+        if in_verification {
+            if let Some(c) = ci_command_in(line, ci) {
+                if !said.contains(&c.id.as_str()) {
+                    said.push(&c.id);
+                    out.push(format!("{}{}", list_marker(line), ci_step(c)));
+                }
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    let mut joined = out.join("\n");
+    if body.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
 }
 
 /// What the writer is told about the checks only a person can do: each one
@@ -132,9 +251,10 @@ pub async fn run(
          4. **Verification** — Numbered steps to verify the change."
     };
     let evidence_block = format!(
-        "{}{}",
+        "{}{}{}",
         evidence_instructions(proof.evidence),
-        manual_instructions(proof.manual)
+        manual_instructions(proof.manual),
+        ci_instructions(proof.ci)
     );
 
     let diff_patches = format_diff_patches(&diff);
@@ -284,6 +404,9 @@ Return ONLY the markdown body text."#,
         )
         .await;
     }
+
+    // A Verification step never asks a person to run what CI runs on the PR.
+    let body_text = ci_verification(&body_text, proof.ci);
 
     // Add issue link for GitHub tickets.
     // Strip any "Closes #N" the model may have included to avoid duplication.
@@ -1327,6 +1450,48 @@ mod refresh_tests {
         assert!(!keeps_ticket_line(old, "**Problem** y"));
         assert!(!keeps_ticket_line(old, "   "));
         assert!(keeps_ticket_line("no link here", "rewritten"));
+    }
+}
+
+#[cfg(test)]
+mod ci_verification_tests {
+    use super::{ci_instructions, ci_verification};
+    use crate::passes::checks::{pr_commands, Workflow};
+
+    fn terraform_ci() -> Vec<crate::passes::checks::CiCommand> {
+        pr_commands(
+            &[Workflow {
+                path: ".github/workflows/ci.yml".into(),
+                text: "on: pull_request\njobs:\n  tf:\n    steps:\n      - run: terraform fmt -recursive -check\n      - run: |\n          terraform init\n          terraform plan -input=false\n".into(),
+            }],
+            "main",
+        )
+    }
+
+    #[test]
+    fn verification_says_ci_runs_what_ci_runs_on_the_pr() {
+        let ci = terraform_ci();
+        let body = "**Problem**\nTag the buckets.\n\n**Verification**\n1. Run `terraform fmt -check` in the repo root.\n2. Run `terraform plan` for staging and prod and confirm only tags change.\n3. Run `terraform plan -var-file=prod.tfvars` again.\n4. Open the console and check the bucket's tags.\n\n**Risk**\nRun `terraform plan` locally if unsure.\n";
+        assert_eq!(
+            ci_verification(body, &ci),
+            "**Problem**\nTag the buckets.\n\n**Verification**\n1. CI runs `terraform fmt -recursive -check` on this PR.\n2. CI runs `terraform plan -input=false` on this PR; read its output in the PR's checks.\n4. Open the console and check the bucket's tags.\n\n**Risk**\nRun `terraform plan` locally if unsure.\n"
+        );
+        // A heading in markdown form, and nothing CI runs: left alone.
+        let other = "## Verification\n* Run `pnpm test`.\n";
+        assert_eq!(ci_verification(other, &ci), other);
+        assert_eq!(ci_verification(body, &[]), body);
+    }
+
+    #[test]
+    fn the_writer_is_told_never_to_ask_a_person_to_run_a_ci_check() {
+        let ci = terraform_ci();
+        let block = ci_instructions(&ci);
+        assert!(block.contains("never tell a person to run any of them"));
+        assert!(block.contains("\"CI runs `<command>` on this PR.\""));
+        assert!(block.ends_with(
+            "- `terraform fmt -recursive -check` (format)\n- `terraform plan -input=false` (plan)"
+        ));
+        assert_eq!(ci_instructions(&[]), "");
     }
 }
 

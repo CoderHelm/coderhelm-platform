@@ -248,6 +248,7 @@ impl<'a> SandboxClient<'a> {
         source_key: &str,
         checks_cmd: &str,
         node_version: Option<&str>,
+        terraform_version: Option<&str>,
         deadline: Option<Instant>,
     ) -> Result<CheckOutcome, Box<dyn std::error::Error + Send + Sync>> {
         if !self.is_enabled() {
@@ -259,8 +260,14 @@ impl<'a> SandboxClient<'a> {
             ));
         }
         // The source stays for the run's next check of the same commit.
-        self.build_and_read(source_key, checks_cmd, node_version, deadline)
-            .await
+        self.build_and_read(
+            source_key,
+            checks_cmd,
+            node_version,
+            terraform_version,
+            deadline,
+        )
+        .await
     }
 
     /// Run the repo's codegen in the sandbox and return the files it CHANGED,
@@ -330,12 +337,13 @@ impl<'a> SandboxClient<'a> {
         // Repo's public codegen env (e.g. Sanity projectId/dataset). Reserved
         // build vars are protected — an env entry can't hijack the tarball or
         // output location.
-        const RESERVED: [&str; 5] = [
+        const RESERVED: [&str; 6] = [
             "SANDBOX_BUCKET",
             "SANDBOX_KEY",
             "CODEGEN_CMD",
             "CODEGEN_OUT_KEY",
             "NODE_VERSION",
+            "TERRAFORM_VERSION",
         ];
         for (k, v) in extra_env {
             if RESERVED.contains(&k.as_str()) {
@@ -521,6 +529,7 @@ impl<'a> SandboxClient<'a> {
         key: &str,
         checks_cmd: &str,
         node_version: Option<&str>,
+        terraform_version: Option<&str>,
         deadline: Option<Instant>,
     ) -> Result<CheckOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let mut env = vec![
@@ -534,6 +543,12 @@ impl<'a> SandboxClient<'a> {
         // >=20.9 failing on the image's default Node 18.
         if let Some(v) = node_version {
             env.push(env_var("NODE_VERSION", v)?);
+        }
+        // The buildspec installs this exact Terraform release (signature and
+        // checksum verified) before the checks, for a repository with `.tf`
+        // files. Only an exact `x.y.z` reaches the shell.
+        if let Some(v) = terraform_version.filter(|v| crate::passes::terraform::is_exact(v)) {
+            env.push(env_var("TERRAFORM_VERSION", v)?);
         }
         let started = self
             .codebuild

@@ -731,6 +731,7 @@ pub mod skill_compat;
 pub mod skill_suggest;
 pub mod skills;
 pub mod syntax_check;
+pub(crate) mod terraform;
 #[allow(dead_code)]
 mod test;
 pub mod ticket_history;
@@ -2209,6 +2210,10 @@ async fn run_passes(
             files = files_modified.len(),
             "Reconstructed files_modified from branch diff"
         );
+        // What CI runs on the PR is read again: it doesn't depend on the
+        // first attempt.
+        let ci_commands =
+            checks::detect_ci(&github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await;
         implement::ImplementResult {
             files_modified,
             conversation_log: vec![],
@@ -2218,6 +2223,8 @@ async fn run_passes(
                 notes: "(This run resumed from a checkpoint: the first attempt's lookups and \
                         notes are not available.)"
                     .to_string(),
+                ci_gates: checks::kinds_from(&ci_commands),
+                ci_commands,
                 ..Default::default()
             },
         }
@@ -3798,6 +3805,7 @@ async fn run_passes(
             evidence: &evidence.for_pr(),
             gaps: &proof::gaps_section(&gaps),
             manual: &proof::manual_steps(&gaps),
+            ci: &evidence.ci_commands,
         },
         &provider,
         usage,
@@ -4300,6 +4308,7 @@ async fn run_repo_pipeline(
             evidence: &evidence.for_pr(),
             gaps: &proof::gaps_section(&gaps),
             manual: &proof::manual_steps(&gaps),
+            ci: &evidence.ci_commands,
         },
         provider,
         usage,
@@ -5953,6 +5962,13 @@ pub(crate) async fn detect_check_commands(
         .is_ok()
     {
         return Some("pip install -e . && python -m compileall -q .".to_string());
+    }
+    // ---- Terraform ----
+    // Validates each root module (`init -backend=false`, no state, no
+    // credentials). Never `plan` or `apply`. The format check and a mixed
+    // repository's Terraform are separate steps (see `implement::run`).
+    if let Some(tf) = terraform::detect(github, owner, repo, git_ref, &[]).await {
+        return Some(tf.validate_cmd());
     }
     None
 }
