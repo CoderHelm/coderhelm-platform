@@ -22,6 +22,7 @@ pub mod plugins;
 pub mod review_lessons;
 pub mod reviewer;
 pub mod run_search;
+pub mod search;
 pub mod skills;
 pub mod sns;
 pub mod tests;
