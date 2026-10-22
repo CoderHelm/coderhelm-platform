@@ -458,6 +458,8 @@ pub struct FileCache {
 
 /// Result of a per-repo implement→security→PR cycle (multi-repo support).
 struct RepoPrResult {
+    /// The repository's owner and name.
+    repo: (String, String),
     branch: String,
     pr_number: u64,
     pr_url: String,
@@ -687,6 +689,7 @@ pub mod agent_tools;
 pub mod await_merge;
 mod checks;
 pub mod code_graph;
+mod completeness;
 pub mod e2e;
 pub mod feedback;
 pub mod fix_location;
@@ -3146,6 +3149,14 @@ async fn run_passes(
                 return Err("Multi-repo pipeline produced no PRs".into());
             }
 
+            // Each PR names its siblings and the order they merge in (the
+            // plan's repository order).
+            let siblings: Vec<(String, String, u64)> = pr_results
+                .iter()
+                .map(|p| (p.repo.0.clone(), p.repo.1.clone(), p.pr_number))
+                .collect();
+            pr::link_siblings(&github, &siblings).await;
+
             // Save checkpoint + set awaiting_ci with all PRs
             save_checkpoint(
                 state,
@@ -3806,6 +3817,7 @@ async fn run_passes(
             gaps: &proof::gaps_section(&gaps),
             manual: &proof::manual_steps(&gaps),
             ci: &evidence.ci_commands,
+            mirrors: &completeness::parse_mirrors(&evidence.notes),
         },
         &provider,
         usage,
@@ -4309,6 +4321,7 @@ async fn run_repo_pipeline(
             gaps: &proof::gaps_section(&gaps),
             manual: &proof::manual_steps(&gaps),
             ci: &evidence.ci_commands,
+            mirrors: &completeness::parse_mirrors(&evidence.notes),
         },
         provider,
         usage,
@@ -4340,6 +4353,7 @@ async fn run_repo_pipeline(
     .await;
 
     Ok(RepoPrResult {
+        repo: (repo_owner.to_string(), repo_name.to_string()),
         branch: branch_name.to_string(),
         pr_number: pr_result.pr_number,
         pr_url: pr_result.pr_url,

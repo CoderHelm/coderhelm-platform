@@ -1816,6 +1816,27 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// Whether `login` has write access or higher to the repository, from
+    /// GitHub's collaborator permission (the same check the comment commands
+    /// make, `common::merge_gate::has_write_access`). False when the login
+    /// isn't a plain GitHub login or the answer can't be read.
+    pub async fn has_write_access(&self, owner: &str, repo: &str, login: &str) -> bool {
+        let valid = !login.is_empty()
+            && login.len() <= 39
+            && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if !valid {
+            return false;
+        }
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/collaborators/{login}/permission");
+        match self.get(&url).await {
+            Ok(v) => common::merge_gate::has_write_access(&v),
+            Err(e) => {
+                tracing::info!(owner, repo, login, error = %e, "No permission answer for the commenter");
+                false
+            }
+        }
+    }
+
     /// The commits on a pull request (first 100).
     pub async fn list_pr_commits(
         &self,

@@ -20,16 +20,19 @@ pub struct PrResult {
 }
 
 /// What the run proved about the change, for its description: what it
-/// looked up (`evidence`, the writer's source for an Evidence section) and
-/// the gaps the proof check still found (`gaps`, put at the very top), and
-/// what only a person can check (`manual`, steps for the Verification
-/// section), and the check commands the repository's CI runs on the PR
-/// (`ci`), which the Verification section never asks a person to run.
+/// looked up (`evidence`, the writer's source for an Evidence list), what is
+/// still open (`gaps`, the Open items section at the bottom), what only a
+/// person can check (`manual`, steps for the Verification section), the
+/// check commands the repository's CI runs on the PR (`ci`), which the
+/// Verification section never asks a person to run, and the existing blocks
+/// the change copied (`mirrors`, from the coder's notes, rendered under
+/// Changes).
 pub struct Proof<'a> {
     pub evidence: &'a str,
     pub gaps: &'a str,
     pub manual: &'a str,
     pub ci: &'a [CiCommand],
+    pub mirrors: &'a [super::completeness::Mirror],
 }
 
 /// What the writer is told about the checks CI runs on the PR: never a
@@ -148,6 +151,19 @@ pub fn ci_verification(body: &str, ci: &[CiCommand]) -> String {
     joined
 }
 
+/// The shape every description follows, and what the writer must not write
+/// because CoderHelm adds it from the plan and the coder's notes.
+const SHAPE_RULES: &str = "\
+- CoderHelm adds these sections itself, from the plan and the coder's notes: the existing block \
+the change copies, the merge order of a multi-repo change, **Not in this PR** and **Open items**. \
+Don't write them, and don't add a warning or note banner anywhere.
+- Write real values: every path, name and id in full, with its environment filled in \
+(`/app/prod/db-password`, never `/app//db-password`), never a template left as `${env}`, `<env>`, \
+`{}` or empty backticks.
+- When the change touches more than one environment, the Evidence list has one bullet per \
+environment: what confirmed it, or exactly which environment couldn't be checked and what access \
+is missing.";
+
 /// What the writer is told about the checks only a person can do: each one
 /// a numbered Verification step, and nowhere else. Empty when there are none.
 fn manual_instructions(manual: &str) -> String {
@@ -244,8 +260,8 @@ pub async fn run(
     let instructions = if pr_template.is_some() {
         "Follow the PR template above. Fill in every section with relevant content from this change. Remove any placeholder/instruction text."
     } else {
-        "Write a PR description following this structure:\n\n\
-         1. **Problem** — One sentence: what the issue asks for.\n\
+        "Write a PR description following this structure, and nothing else:\n\n\
+         1. **Summary** — One sentence: the problem and what this change does about it.\n\
          2. **Changes** — Bolded per-area headers with bullet details. Keep it tight.\n\
          3. **Risk** — State risk level in bold (**Low**, **Medium**), then why it's safe.\n\
          4. **Verification** — Numbered steps to verify the change."
@@ -280,6 +296,7 @@ Rules:
 - Backticks for file paths, function names, env vars, CLI commands.
 - Bold for emphasis on key concepts.
 - Use asterisks (*) for bullet lists, never dashes (-).
+{shape_rules}
 
 Return ONLY the markdown body text."#,
         ticket_ref = ticket_ref,
@@ -288,6 +305,7 @@ Return ONLY the markdown body text."#,
         diff_summary = diff_summary,
         template_block = template_block,
         instructions = instructions,
+        shape_rules = SHAPE_RULES,
     );
 
     let mut messages = vec![(
@@ -435,15 +453,15 @@ Return ONLY the markdown body text."#,
             format!("Source ticket: {}\n\n{clean_body}", msg.ticket_id)
         }
     };
-    // Which team agents the planner and coder asked, where reviewers look.
-    // A change needed outside the code too: the PR says so, so the reviewer
-    // and whoever merges see the whole fix.
-    // Gaps the proof check still found lead the description, so nobody
-    // merges past them.
+    // CoderHelm's own sections go in their places around the writer's: the
+    // blocks the change copied (under Changes), every step outside this PR
+    // with its owner (the plan's checklist, and a change outside the code),
+    // then Open items at the bottom. Which team agents the planner and coder
+    // asked closes it, where reviewers look.
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let full_body = format!(
-        "{}{full_body}{}{}",
-        proof.gaps,
-        super::fix_location::also_outside_section(plan.fix.as_ref()),
+        "{}{}",
+        super::completeness::assemble(&full_body, &owned_sections(plan, proof, &repo)),
         super::skills::run_consulted(state, &msg.team_id, run_id).await
     );
 
@@ -597,6 +615,20 @@ Return ONLY the markdown body text."#,
             Err(e) => warn!(pr_number, error = %e, "Could not label own PR (non-fatal)"),
         }
     }
+
+    // What GitHub has is what people read: holes a template or Markdown
+    // left in it are filled once.
+    fill_placeholders_once(
+        state,
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        pr_number,
+        &diff_patches,
+        provider,
+        usage,
+    )
+    .await;
 
     Ok(PrResult {
         pr_number,
@@ -1081,7 +1113,7 @@ fn evidence_instructions(evidence: &str) -> String {
     }
     format!(
         "\n{evidence}\n\
-         Add an **Evidence** section after the changes: each fact about another system the change \
+         Add an **Evidence** list at the end of the Verification section: each fact about another system the change \
          relies on, on its own line that starts `- Confirmed:` (the lookup that confirmed it and \
          what came back: the field and its value, as the lookup returned it) or `- Unconfirmed:` \
          (what nothing confirmed, and why: a missing source, or a lookup marked FAILED or EMPTY, \
@@ -1180,11 +1212,83 @@ fn is_lockfile(path: &str) -> bool {
     )
 }
 
+/// CoderHelm's own sections for a new description: the blocks the change
+/// copied, every step outside this PR with its owner, and Open items. The
+/// merge order is added once every PR of a multi-repo run exists
+/// ([`link_siblings`]).
+fn owned_sections(plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> super::completeness::Owned {
+    super::completeness::Owned {
+        mirrors: super::completeness::mirrors_section(proof.mirrors),
+        merge_order: String::new(),
+        not_in_pr: super::completeness::not_in_pr_section(&super::fix_location::not_in_pr_steps(
+            plan.fix.as_ref(),
+            repo,
+        )),
+        open_items: proof.gaps.to_string(),
+    }
+}
+
+/// Where a rewrite's account of what it changed starts.
+const CHANGES_MARK: &str = "---CHANGES---";
+
+/// Splits a rewrite into the description and its list of what changed (one
+/// item per bullet after [`CHANGES_MARK`]).
+fn split_changes(text: &str) -> (String, Vec<String>) {
+    let Some(at) = text.find(CHANGES_MARK) else {
+        return (text.trim().to_string(), Vec::new());
+    };
+    let changes = text[at + CHANGES_MARK.len()..]
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['-', '*']).trim())
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    (text[..at].trim().to_string(), changes)
+}
+
+/// Whether `new` keeps every CoderHelm marker `old` has: a rewrite that lost
+/// one would lose the section it wraps, or CI's mark on an item.
+fn keeps_markers(old: &str, new: &str) -> bool {
+    old.lines()
+        .flat_map(|l| l.match_indices("<!-- ").map(move |(i, _)| &l[i..]))
+        .filter_map(|m| m.find("-->").map(|e| &m[..e + 3]))
+        .filter(|m| m.contains("coderhelm:"))
+        .all(|m| new.matches(m).count() >= old.matches(m).count())
+}
+
+/// The instructions for a rewrite a person asked for.
+fn request_block(requests: &[String]) -> String {
+    if requests.is_empty() {
+        return String::new();
+    }
+    let asks: String = requests
+        .iter()
+        .map(|r| format!("- {}\n", r.split_whitespace().collect::<Vec<_>>().join(" ")))
+        .collect();
+    format!(
+        "\n## What a person with write access asked to change in the description\n{asks}\
+         Apply exactly these changes, whether or not the code changed. Where they ask for a \
+         section with an owner per item, every item names its owner.\n\
+         - Keep this shape: Summary, Changes (with the block the change copies), Merge order, \
+         Not in this PR (one bullet per step, each with its owner), Risk, Verification, and Open \
+         items at the bottom (each item, then what settles it). No warning or note banner \
+         anywhere.\n\
+         - Keep each `<!-- coderhelm:... -->` line with the section it wraps, and the \
+         `<!-- coderhelm:ci -->` mark on any item CI settles. Put a new Not in this PR section \
+         between `<!-- coderhelm:not-in-pr -->` and `<!-- /coderhelm:not-in-pr -->` lines, and a \
+         new open item inside the `<!-- coderhelm:unverified -->` section under `## Open items`.\n"
+    )
+}
+
 /// Rewrites an open pull request's description from its current full diff
 /// after later commits (review feedback, CI fixes), so it never describes an
-/// earlier version of the change. Keeps the description's structure and its
-/// ticket line; anything it says that the diff no longer bears out goes.
-/// Leaves the description alone when anything fails.
+/// earlier version of the change, and applies what a person with write
+/// access asked to change in it (`requests`, empty when nobody asked).
+/// Keeps the description's structure and its ticket line, and CoderHelm's
+/// own sections in their places (Open items at the bottom); anything it says
+/// that the diff no longer bears out goes. Returns what changed when a new
+/// description was saved (one entry per change a person asked for), `None`
+/// when it was left alone, whether nothing changed or anything failed.
 #[allow(clippy::too_many_arguments)]
 pub async fn refresh_description(
     state: &WorkerState,
@@ -1193,33 +1297,41 @@ pub async fn refresh_description(
     repo: &str,
     pr_number: u64,
     team_instructions: &str,
+    requests: &[String],
     provider: &ModelProvider,
     usage: &mut TokenUsage,
-) {
-    let Ok(pr) = github.get_pull_request(owner, repo, pr_number).await else {
-        return;
-    };
-    let (Some(base), Some(head)) = (pr["base"]["ref"].as_str(), pr["head"]["ref"].as_str()) else {
-        return;
-    };
+) -> Option<Vec<String>> {
+    let pr = github.get_pull_request(owner, repo, pr_number).await.ok()?;
+    let base = pr["base"]["ref"].as_str()?.to_string();
+    let head = pr["head"]["ref"].as_str()?.to_string();
     let current = pr["body"].as_str().unwrap_or("").trim().to_string();
-    // The "Not yet verified" section is CoderHelm's own record, kept word for
-    // word (only CI's result changes it, see `settle_unverified_by_ci`): the
-    // writer rewrites the rest.
-    let (unverified, old) = super::proof::split_unverified(&current);
-    let old = old.trim().to_string();
-    if old.is_empty() {
-        return;
+    // CoderHelm's own sections (Open items above all) are its record, kept
+    // word for word (only CI's result changes Open items, see
+    // `settle_unverified_by_ci`): the writer rewrites the rest. A person's
+    // request may change them too, so then the writer sees the whole body.
+    let (owned, rest) = super::completeness::take_owned(&current);
+    let shaped = super::completeness::assemble(&rest, &owned);
+    let old = if requests.is_empty() {
+        rest.trim().to_string()
+    } else {
+        shaped.clone()
+    };
+    if old.is_empty() && requests.is_empty() {
+        return None;
     }
-    let Ok(diff) = github.get_diff(owner, repo, base, head).await else {
-        return;
+    let diff = github.get_diff(owner, repo, &base, &head).await.ok()?;
+    let patches = format_diff_patches(&diff);
+    let lead = if requests.is_empty() {
+        "This pull request got more commits after its description was written. Rewrite the description so every statement in it is true of the diff below, which is the whole change as it stands now."
+    } else {
+        "A person asked for changes to this pull request's description. Make them, and keep every statement true of the diff below, which is the whole change as it stands now."
     };
     let prompt = format!(
-        r#"This pull request got more commits after its description was written. Rewrite the description so every statement in it is true of the diff below, which is the whole change as it stands now.
+        r#"{lead}
 
 ## Current description
 {old}
-
+{requests}
 ## Files changed
 {files}
 
@@ -1230,18 +1342,20 @@ pub async fn refresh_description(
 - Keep the description's structure, headings and tone.
 - Keep any line that starts with "Source ticket:", "Closes #", "Fixes #" or "Resolves #" exactly as it is, and keep any HTML comments and `<sub>` lines at the end exactly as they are.
 - Remove or correct anything the diff no longer bears out (a field name, a guess, a step, a file), and describe what the later commits changed.
-- Keep the Evidence section (what was looked up and what came back), unless the diff no longer relies on what it describes.
-- Don't add filler. If the description is already true, return it unchanged.
+- Keep the Evidence list (what was looked up and what came back), unless the diff no longer relies on what it describes.
+{shape_rules}
+- Don't add filler. If the description is already true and nothing was asked, return it unchanged.
 
-Return ONLY the markdown body text."#,
+Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet per change you made to the description, in a few words each."#,
+        requests = request_block(requests),
         files = format_diff_summary(&diff),
-        patches = format_diff_patches(&diff),
+        shape_rules = SHAPE_RULES,
     );
     let mut messages = vec![(
         "user".to_string(),
         vec![serde_json::json!({"type": "text", "text": prompt})],
     )];
-    let body = match provider::converse(
+    let text = match provider::converse(
         state,
         provider,
         provider.primary_model_id(),
@@ -1264,32 +1378,165 @@ Return ONLY the markdown body text."#,
     )
     .await
     {
-        Ok(b) => b.trim().to_string(),
+        Ok(b) => b,
         Err(e) => {
             warn!(pr_number, error = %e, "Could not rewrite the PR description");
-            return;
+            return None;
         }
     };
-    if !keeps_ticket_line(&old, &body) {
+    let (written, changes) = split_changes(&text);
+    if !keeps_ticket_line(&old, &written) {
         warn!(
             pr_number,
             "Rewritten PR description dropped its ticket line; keeping the old one"
         );
+        return None;
+    }
+    let body = if requests.is_empty() {
+        super::completeness::assemble(&written, &owned)
+    } else {
+        // The sections the person kept go back in their places.
+        let (kept, rest) = super::completeness::take_owned(&written);
+        super::completeness::assemble(&rest, &kept)
+    };
+    if body == current {
+        return None;
+    }
+    if let Err(e) = github.update_pr_body(owner, repo, pr_number, &body).await {
+        warn!(pr_number, error = %e, "Could not save the rewritten PR description");
+        return None;
+    }
+    info!(
+        pr_number,
+        asked = requests.len(),
+        "PR description rewritten to match the latest diff"
+    );
+    fill_placeholders_once(
+        state, github, owner, repo, pr_number, &patches, provider, usage,
+    )
+    .await;
+    Some(changes)
+}
+
+/// Reads the description back from GitHub, which is what people see, and
+/// fills the holes a template or Markdown left in it (see
+/// `completeness::placeholder_holes`) once: the writer is given each hole
+/// and the change, and writes the real value. Nothing is saved when the fix
+/// drops the ticket line or a CoderHelm marker; holes still there after the
+/// one fix are logged, never retried.
+#[allow(clippy::too_many_arguments)]
+async fn fill_placeholders_once(
+    state: &WorkerState,
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    change: &str,
+    provider: &ModelProvider,
+    usage: &mut TokenUsage,
+) {
+    let Ok(pr) = github.get_pull_request(owner, repo, pr_number).await else {
+        return;
+    };
+    let body = pr["body"].as_str().unwrap_or("").to_string();
+    let holes = super::completeness::placeholder_holes(&body);
+    if holes.is_empty() {
         return;
     }
-    let body = format!("{unverified}{body}");
-    if body != current {
-        match github.update_pr_body(owner, repo, pr_number, &body).await {
+    warn!(pr_number, holes = ?holes, "PR description has empty placeholders; filling them once");
+    let prompt = format!(
+        "The pull request description below, as GitHub has it, has holes where a value should \
+         be:\n{}\n\nReplace each with the real value, from the change below and the rest of the \
+         description (a path with its environment filled in, a real name). Where the value \
+         can't be known, say it in words instead of a placeholder. Change nothing else, and keep \
+         every line that starts with `<!--` or `<sub>` exactly as it is. Return ONLY the full \
+         description.\n\n## The change\n{change}\n\n## The description\n{body}",
+        holes
+            .iter()
+            .map(|h| format!("- {h}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let fixed = match provider::converse_simple(
+        state,
+        provider,
+        provider.primary_model_id(),
+        "You fix pull request descriptions. Return only markdown.",
+        &prompt,
+        usage,
+    )
+    .await
+    {
+        Ok(t) => strip_code_fences(&t).trim().to_string(),
+        Err(e) => {
+            warn!(pr_number, error = %e, "Could not fill the PR description's placeholders");
+            return;
+        }
+    };
+    if !keeps_ticket_line(&body, &fixed) || !keeps_markers(&body, &fixed) {
+        warn!(
+            pr_number,
+            "Placeholder fix dropped the ticket line or a section marker; keeping the description"
+        );
+        return;
+    }
+    if fixed == body.trim() {
+        return;
+    }
+    match github.update_pr_body(owner, repo, pr_number, &fixed).await {
+        Ok(()) => {
+            let left = super::completeness::placeholder_holes(&fixed);
+            if left.is_empty() {
+                info!(
+                    pr_number,
+                    filled = holes.len(),
+                    "Filled the PR description's placeholders"
+                );
+            } else {
+                warn!(pr_number, holes = ?left, "PR description still has placeholders after one fix");
+            }
+        }
+        Err(e) => warn!(pr_number, error = %e, "Could not save the filled PR description"),
+    }
+}
+
+/// Every PR of a multi-repo run names its siblings and the order they merge
+/// in (the plan's repository order). Best effort per PR.
+pub async fn link_siblings(github: &GitHubClient, prs: &[(String, String, u64)]) {
+    if prs.len() < 2 {
+        return;
+    }
+    let siblings: Vec<super::completeness::Sibling> = prs
+        .iter()
+        .map(|(o, n, num)| super::completeness::Sibling {
+            repo: format!("{o}/{n}"),
+            number: *num,
+        })
+        .collect();
+    for (i, (owner, name, number)) in prs.iter().enumerate() {
+        let Ok(pr) = github.get_pull_request(owner, name, *number).await else {
+            continue;
+        };
+        let body = pr["body"].as_str().unwrap_or("");
+        let new = super::completeness::with_section(
+            body,
+            super::completeness::Section::MergeOrder,
+            super::completeness::merge_order_section(&siblings, i),
+        );
+        if new == body {
+            continue;
+        }
+        match github.update_pr_body(owner, name, *number, &new).await {
             Ok(()) => info!(
-                pr_number,
-                "PR description rewritten to match the latest diff"
+                pr_number = number,
+                "Named the run's sibling PRs and merge order"
             ),
-            Err(e) => warn!(pr_number, error = %e, "Could not save the rewritten PR description"),
+            Err(e) => warn!(pr_number = number, error = %e, "Could not add the merge order"),
         }
     }
 }
 
-/// The PR's CI passed on its head: the "Not yet verified" items CI settles
+/// The PR's CI passed on its head: the Open items CI settles
 /// (lint, type-check, build or tests that hadn't run before the PR opened)
 /// come out of the description, and the whole section when none is left. A
 /// warning that stayed after CI passed those checks told reviewers the PR was
@@ -1313,7 +1560,7 @@ pub async fn settle_unverified_by_ci(
     match github.update_pr_body(owner, repo, pr_number, &body).await {
         Ok(()) => info!(
             pr_number,
-            "CI passed: removed the checks it settled from the PR's Not yet verified section"
+            "CI passed: removed the checks it settled from the PR's Open items"
         ),
         Err(e) => {
             warn!(pr_number, error = %e, "Could not update the PR description after CI passed")
@@ -1433,11 +1680,114 @@ mod refresh_tests {
             "- Ran rest_get: /v1/products/7\n  Came back: {\"title\": \"Swim\"}",
         );
         assert!(block.contains("Came back: {\"title\": \"Swim\"}"));
-        assert!(block.contains("Add an **Evidence** section"));
+        assert!(block.contains("Add an **Evidence** list at the end of the Verification section"));
         assert!(block.contains("Never write that something was not verified, not measured"));
         // The reviewer reads these markers back: an `Unconfirmed:` line holds
         // its approval.
         assert!(block.contains("`- Confirmed:`") && block.contains("`- Unconfirmed:`"));
+    }
+
+    #[test]
+    fn the_writer_leaves_coderhelms_sections_to_it_and_writes_real_values() {
+        use super::SHAPE_RULES;
+        assert!(SHAPE_RULES.contains("**Not in this PR** and **Open items**"));
+        assert!(SHAPE_RULES.contains("don't add a warning or note banner"));
+        assert!(SHAPE_RULES.contains("`/app/prod/db-password`, never `/app//db-password`"));
+        assert!(SHAPE_RULES.contains("one bullet per environment"));
+    }
+
+    #[test]
+    fn a_pr_gets_its_mirrors_steps_outside_it_and_open_items_in_order() {
+        use crate::passes::completeness::{assemble, Mirror};
+        use crate::passes::fix_location::{EndToEndStep, FixDecision};
+        let plan = crate::passes::plan::PlanResult {
+            proposal: String::new(),
+            design: String::new(),
+            tasks: String::new(),
+            spec: String::new(),
+            repo_tasks: vec![],
+            fix: Some(FixDecision {
+                end_to_end: vec![
+                    EndToEndStep {
+                        step: "Create the reporting user".into(),
+                        by: "this_pr".into(),
+                        ..Default::default()
+                    },
+                    EndToEndStep {
+                        step: "Allow the vendor's IP range".into(),
+                        by: "person".into(),
+                        owner: "the network team".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+        };
+        let mirrors = [Mirror {
+            path: "envs/prod/users.tf".into(),
+            name: "billing_reader".into(),
+            differences: vec!["read-only, because it only reads reports".into()],
+        }];
+        let gaps = crate::passes::proof::gaps_section(&[crate::passes::proof::Finding {
+            point: "ci_pending".into(),
+            detail: "tests did not run".into(),
+            ..Default::default()
+        }]);
+        let proof = super::Proof {
+            evidence: "",
+            gaps: &gaps,
+            manual: "",
+            ci: &[],
+            mirrors: &mirrors,
+        };
+        let owned = super::owned_sections(&plan, &proof, "acme/infra");
+        let body = assemble(
+            "Source ticket: OPS-7\n\n**Summary** x\n\n**Changes**\n* y\n\n**Risk** **Low**\n\n**Verification**\n1. z",
+            &owned,
+        );
+        let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("{s}:\n{body}"));
+        assert!(at("**Changes**") < at("mirrors `billing_reader` in `envs/prod/users.tf`"));
+        assert!(at("mirrors `billing_reader`") < at("## Not in this PR"));
+        assert!(at("* Allow the vendor's IP range (owner: the network team)") < at("**Risk**"));
+        assert!(!body.contains("Create the reporting user"), "in this PR");
+        assert!(at("**Verification**") < at("## Open items"));
+        assert!(body.trim_end().ends_with("<!-- /coderhelm:unverified -->"));
+        assert!(
+            crate::passes::completeness::placeholder_holes(&body).is_empty(),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_reports_what_it_changed_and_keeps_every_marker() {
+        use super::{keeps_markers, request_block, split_changes};
+        let (body, changes) = split_changes(
+            "**Summary** x\n\n---CHANGES---\n- Removed the warning banner\n* Added Not in this PR\n\n",
+        );
+        assert_eq!(body, "**Summary** x");
+        assert_eq!(
+            changes,
+            vec!["Removed the warning banner", "Added Not in this PR"]
+        );
+        assert_eq!(
+            split_changes("just a body\n"),
+            ("just a body".to_string(), vec![])
+        );
+
+        let old = "x\n<!-- coderhelm:unverified -->\n## Open items\n- a <!-- coderhelm:ci -->\n<!-- /coderhelm:unverified -->";
+        assert!(keeps_markers(old, old));
+        assert!(!keeps_markers(
+            old,
+            "x\n<!-- coderhelm:unverified -->\n## Open items\n- a\n<!-- /coderhelm:unverified -->"
+        ));
+        assert!(keeps_markers("no markers <!-- other -->", "anything"));
+
+        assert_eq!(request_block(&[]), "");
+        let r = request_block(&["drop the   banner".to_string()]);
+        assert!(r.contains("asked to change in the description\n- drop the banner\n"));
+        assert!(r.contains("every item names its owner"));
+        assert!(r.contains("and Open items at the bottom (each item, then what settles it)"));
+        assert!(r.contains("<!-- coderhelm:not-in-pr -->"));
     }
 
     #[test]

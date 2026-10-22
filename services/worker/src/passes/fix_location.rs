@@ -149,9 +149,58 @@ pub struct FixDecision {
     /// the ticket has none.
     #[serde(default)]
     pub history_check: String,
+    /// Every step the ticket needs to work in production, and who does each
+    /// one: this PR, another repository's PR, a person or team, a vendor.
+    /// The PR lists the steps outside it under "Not in this PR".
+    #[serde(default)]
+    pub end_to_end: Vec<EndToEndStep>,
 }
 
-fn string_or_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+/// One step of the whole job, and who does it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndToEndStep {
+    /// What has to happen, in plain words.
+    #[serde(default)]
+    pub step: String,
+    /// `this_pr`, `other_repo`, `person` or `vendor`.
+    #[serde(default)]
+    pub by: String,
+    /// Who does it: a repository's PR, a team or person, the vendor.
+    #[serde(default)]
+    pub owner: String,
+    /// `owner/repo` for a step that is code (`this_pr`, `other_repo`).
+    #[serde(default)]
+    pub repo: String,
+}
+
+impl EndToEndStep {
+    /// Whether this step is done by the pull request in `repo`
+    /// (`owner/name`). A `this_pr` step that names no repository belongs to
+    /// every PR of the run.
+    pub fn in_pr(&self, repo: &str) -> bool {
+        let named = self.repo.trim();
+        match self.by.trim() {
+            "this_pr" => named.is_empty() || named.eq_ignore_ascii_case(repo),
+            "other_repo" => !named.is_empty() && named.eq_ignore_ascii_case(repo),
+            _ => false,
+        }
+    }
+
+    /// Who does it, as the PR names them: the owner given, else the
+    /// repository whose PR does it, else a plain "not named yet".
+    pub fn owner_label(&self) -> String {
+        let owner = one_line(&self.owner);
+        if !owner.is_empty() {
+            return owner;
+        }
+        match self.repo.trim() {
+            "" => "not named yet".to_string(),
+            r => format!("a pull request in {r}"),
+        }
+    }
+}
+
+pub(crate) fn string_or_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum OneOrMany {
@@ -437,6 +486,17 @@ Before writing tasks, decide whether the fix belongs in this code at all.
 - Quote values only as the tools returned them; a value shown as `[hidden]` stays hidden.
 - If the prompt has a "This ticket's history" section (an earlier pull request for this ticket closed without merging, a lesson, or a person saying the fix is elsewhere), read it first. The default then is NOT to plan code again: use `outside_code` or `unknown`. Plan code only when you can say why a code change is right despite that history, in `history_check`; a change like the one already closed is never right.
 
+## The whole job, end to end (every plan)
+
+List every step the ticket needs to work in production, not only this repository's half, and who does each one. Think through, for this kind of change:
+- credentials and secrets, and who or what reads them;
+- the resource itself (the user, bucket, queue, certificate, route or entry);
+- network access and allowlists (IP ranges, security groups, firewall rules);
+- permissions and read grants (roles, policies, grants on tables or schemas);
+- the handoff to whoever uses it (who is told, what they get, where it is written down);
+- the deploy and merge order (which repository merges first, what deploys when).
+Each step says who does it: `this_pr` (this change), `other_repo` (a pull request in another repository, named in `repo`), `person` (a person or team, named in `owner`) or `vendor` (an outside company, named in `owner`). When the plan spans several repositories, order the `## owner/repo` groups in tasks.md in the order they must merge.
+
 After the four openspec files, output this block (JSON, all fields required; `outside_change` is null for `code`):
 
 ```fix_location.json
@@ -457,7 +517,10 @@ After the four openspec files, output this block (JSON, all fields required; `ou
     "where": "who can make it, or where in that system",
     "verify": "how to confirm afterwards (for example: after the next sync, the item shows on the site)"
   },
-  "history_check": "only when the prompt has a ticket history: why a code change is right despite it; otherwise empty"
+  "history_check": "only when the prompt has a ticket history: why a code change is right despite it; otherwise empty",
+  "end_to_end": [
+    {"step": "each step the ticket needs to work in production", "by": "this_pr | other_repo | person | vendor", "owner": "who does it (a team, a role, the vendor); empty for this_pr", "repo": "owner/repo for this_pr and other_repo steps"}
+  ]
 }
 ```"#;
 
@@ -616,6 +679,58 @@ pub fn reviewer_context(d: &FixDecision) -> String {
                 c.system.trim(),
                 c.change.trim()
             ));
+        }
+    }
+    out.push_str(&end_to_end_markdown(d));
+    out
+}
+
+/// The plan's end-to-end checklist, one line per step with who does it,
+/// for the judge, the reviewer and the openspec files. Says so when the plan
+/// has none.
+pub fn end_to_end_markdown(d: &FixDecision) -> String {
+    if d.end_to_end.is_empty() {
+        return "\n## End-to-end checklist\n(the plan wrote none)\n".to_string();
+    }
+    let mut out = String::from("\n## End-to-end checklist\n");
+    for s in &d.end_to_end {
+        let by = match s.by.trim() {
+            "" => "unassigned",
+            b => b,
+        };
+        let who = match (by, s.repo.trim()) {
+            ("this_pr", "") => "this PR".to_string(),
+            ("this_pr", r) => format!("the PR in {r}"),
+            _ => s.owner_label(),
+        };
+        out.push_str(&format!("- [{by}] {} (by: {who})\n", one_line(&s.step)));
+    }
+    out
+}
+
+/// The steps a pull request in `repo` doesn't do, each with its owner: the
+/// plan's checklist steps outside it, and the change outside the code when
+/// the fix is `both`.
+pub fn not_in_pr_steps(d: Option<&FixDecision>, repo: &str) -> Vec<(String, String)> {
+    let Some(d) = d else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = d
+        .end_to_end
+        .iter()
+        .filter(|s| !s.step.trim().is_empty() && !s.in_pr(repo))
+        .map(|s| (one_line(&s.step), s.owner_label()))
+        .collect();
+    if d.effective_location() == FixLocation::Both {
+        if let Some(c) = d.outside_change.as_ref().filter(|c| c.is_usable()) {
+            let step = one_line(&format!("{}: {}", c.system.trim(), c.change.trim()));
+            if !out.iter().any(|(s, _)| s == &step) {
+                let owner = match c.where_.trim() {
+                    "" => format!("someone who manages {}", c.system.trim()),
+                    w => one_line(w),
+                };
+                out.push((step, owner));
+            }
         }
     }
     out
@@ -783,6 +898,57 @@ mod tests {
         assert!(jira.contains("\n\n• terms where id = 678: available_on_web = false\n\n"));
         assert!(jira.starts_with("Cause: The class's term"));
         assert!(jira.contains("• How to confirm: After the next sync runs"));
+    }
+
+    #[test]
+    fn the_planner_writes_the_whole_job_with_an_owner_per_step() {
+        for kind in [
+            "credentials and secrets, and who or what reads them",
+            "the resource itself",
+            "network access and allowlists",
+            "permissions and read grants",
+            "the handoff to whoever uses it",
+            "the deploy and merge order",
+        ] {
+            assert!(PLANNER_GUIDANCE.contains(kind), "{kind}");
+        }
+        assert!(PLANNER_GUIDANCE.contains("\"end_to_end\": ["));
+        assert!(PLANNER_GUIDANCE.contains("order the `## owner/repo` groups"));
+        // Invented two-repo job: an infra repo makes the queue, a pipeline
+        // repo reads it, a person allows the network path.
+        let reply = r#"```fix_location.json
+{"fix_location": "code", "cause": "New feed.", "evidence": {"basis": "feature"},
+ "outside_change": null, "history_check": "",
+ "end_to_end": [
+   {"step": "Create the queue and its read policy", "by": "this_pr", "owner": "", "repo": "acme/infra"},
+   {"step": "Read the queue in the nightly job", "by": "other_repo", "owner": "", "repo": "acme/pipeline"},
+   {"step": "Allow the job's subnet on the queue endpoint", "by": "person", "owner": "the network team", "repo": ""}
+ ]}
+```"#;
+        let d = parse(reply).expect("parses");
+        assert_eq!(d.end_to_end.len(), 3);
+        assert!(d.end_to_end[0].in_pr("acme/infra"));
+        assert!(!d.end_to_end[0].in_pr("acme/pipeline"));
+        assert!(d.end_to_end[1].in_pr("acme/pipeline"));
+        let md = end_to_end_markdown(&d);
+        assert!(md.contains(
+            "- [this_pr] Create the queue and its read policy (by: the PR in acme/infra)"
+        ));
+        assert!(md.contains(
+            "- [person] Allow the job's subnet on the queue endpoint (by: the network team)"
+        ));
+        assert!(reviewer_context(&d).contains("## End-to-end checklist"));
+        assert!(end_to_end_markdown(&FixDecision::default()).contains("(the plan wrote none)"));
+        // A decision from before the checklist still reads.
+        let old = parse(fixture::PLANNER_REPLY).unwrap();
+        assert!(old.end_to_end.is_empty());
+        // Both: the change outside the code is a step outside the PR too.
+        let mut both = old.clone();
+        both.fix_location = FixLocation::Both;
+        let steps = not_in_pr_steps(Some(&both), "acme/web");
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].0.starts_with("the booking system: Set term 678"));
+        assert!(steps[0].1.contains("someone who manages the schedule"));
     }
 
     #[test]

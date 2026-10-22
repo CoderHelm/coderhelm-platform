@@ -994,6 +994,8 @@ pub async fn run(
             checks,
             ci_gates,
             ci_commands: ci,
+            // Read from the diff when the change is judged.
+            environments: Vec::new(),
         },
     })
 }
@@ -2777,6 +2779,30 @@ mod task_prompt_tests {
         }
         assert!(!prompt(true).contains(SCHEMA_CHANGE_RULES));
         assert!(prompt(false).contains(SCHEMA_CHANGE_RULES));
+    }
+
+    #[test]
+    fn every_change_copies_the_existing_block_names_it_and_checks_each_environment() {
+        for simple in [true, false] {
+            let p = prompt(simple);
+            assert!(
+                p.contains("## Copy the existing pattern, and say which"),
+                "simple={simple}"
+            );
+            assert!(p.contains("```mirrors.json"), "simple={simple}");
+            assert!(
+                p.contains("## Every environment the change touches"),
+                "simple={simple}"
+            );
+            assert!(
+                p.contains("one `- Confirmed:` line per environment"),
+                "simple={simple}"
+            );
+            assert!(
+                p.contains("never a template left as `${env}`"),
+                "simple={simple}"
+            );
+        }
     }
 
     #[test]

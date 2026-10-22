@@ -5,7 +5,8 @@
 //! these before it opened. This gate does: a judge reads the change, the plan,
 //! the sources the team connected and every lookup the run made, and names
 //! each gap. A gap sends the work back for one fix round with the finding;
-//! what is still unproven after it is put at the top of the PR description.
+//! what is still unproven after it is listed under Open items at the bottom
+//! of the PR description.
 
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -40,10 +41,19 @@ pub const CODER_RULES: &str = "
 - Tests: build fixtures from real payloads (trimmed, with the real field names and values), one per shape the survey found, and include a test that fails on the old code and passes on the new one.
 - Existing bad records are corrected by the normal pipeline or job on its next run. No manual backfills or one-off scripts unless unavoidable; then list them in the verification steps.
 - Fix the rule, never the one record: no hard-coded ids, names, seasons or prices.
+
+## Copy the existing pattern, and say which (every change that adds a case)
+- When the change adds something that already exists for another case (another user, secret, certificate, route, config entry, job, permission), find that block and copy it: same structure, same naming, same order. Change only what must differ for the new case.
+- Name the block you copied and every intentional difference, with its reason, in the `mirrors.json` block of your closing notes (see below). A copy nobody can trace to its original is reviewed as new design.
+
+## Every environment the change touches
+- When the change edits more than one environment (`envs/*`, `staging` and `prod` directories, per-environment config files), confirm each one with a read-only lookup where a connected source can reach it (the resource, name or path exists as the change expects there): one `- Confirmed:` line per environment, naming it.
+- When an environment can't be checked, write one `- Unconfirmed:` line naming that environment and exactly what access is missing. Never let one environment's lookup stand for another.
+- Write real values everywhere: a path with its environment filled in (`/app/prod/db-password`), never a template left as `${env}`, `<env>`, `{}` or an empty segment (`/app//db-password`).
 ";
 
 /// How the coder ends: its evidence becomes the PR description's.
-pub const EVIDENCE_OUTPUT: &str = "When you finish, output a one-line summary, then a section that starts with `Evidence:` listing: each fact about a system this code doesn't own that the change relies on, on its own line that starts `- Confirmed:` (the fact, the lookup that confirmed it and what came back: quote the field and its value) or `- Unconfirmed:` (the fact, and why nothing confirmed it: the source that is missing, or the lookup that failed or came back empty); how many records the change affects, where you counted them, and a few examples (ids or names); and anything no connected source could answer, naming the source that is missing. Write `Evidence: none needed` when the change relies on nothing outside the code and changes no stored records. Do NOT describe each code change in detail.";
+pub const EVIDENCE_OUTPUT: &str = "When you finish, output a one-line summary, then a section that starts with `Evidence:` listing: each fact about a system this code doesn't own that the change relies on, on its own line that starts `- Confirmed:` (the fact, the lookup that confirmed it and what came back: quote the field and its value) or `- Unconfirmed:` (the fact, and why nothing confirmed it: the source that is missing, or the lookup that failed or came back empty); how many records the change affects, where you counted them, and a few examples (ids or names); and anything no connected source could answer, naming the source that is missing. Write `Evidence: none needed` when the change relies on nothing outside the code and changes no stored records. Do NOT describe each code change in detail. Last, when the change copies an existing block, a fenced ```mirrors.json block: `[{\"path\": \"the file of the block you copied\", \"name\": \"the block (resource, function, key)\", \"differences\": [\"each intentional difference, and why\"]}]`; `[]` when it copies none.";
 
 /// How one lookup ended, as recorded when it ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +128,9 @@ pub struct RunEvidence {
     /// its id (`C1`): what the judge maps a finding to, and what the PR's
     /// Verification section says CI runs.
     pub ci_commands: Vec<CiCommand>,
+    /// The environments the diff changes, read from its paths when the
+    /// change is judged (see `completeness::changed_environments`).
+    pub environments: Vec<String>,
 }
 
 /// Starts a fix round's notes inside [`RunEvidence::notes`].
@@ -156,6 +169,9 @@ impl RunEvidence {
         // list keeps the ids the judge has already seen.
         if self.ci_commands.is_empty() {
             self.ci_commands = later.ci_commands;
+        }
+        if !later.environments.is_empty() {
+            self.environments = later.environments;
         }
         let notes = later.notes.trim();
         if !notes.is_empty() {
@@ -215,11 +231,16 @@ impl RunEvidence {
              ## Lookups the run made, and what came back\n{}\n\
              ## Checks run in the sandbox before the PR opened (recorded by CoderHelm, not the coder)\n{}\n\
              ## Checks the repository's CI runs on this pull request\n{}\n\n\
+             ## Environments the diff changes (read from its file paths)\n{}\n\n\
              ## The coder's evidence notes (they become the PR description's evidence)\n{}\n",
             list(&sources, "(none connected)"),
             list(&lookups, "(no lookups were made)"),
             list(&checks, "(no sandbox checks ran)"),
             self.ci_for_judge(),
+            match self.environments.as_slice() {
+                [] => "(none)".to_string(),
+                e => e.join(", "),
+            },
             match self.notes.trim() {
                 "" => "(the coder wrote none)",
                 n => n,
@@ -249,8 +270,9 @@ impl RunEvidence {
 pub struct Finding {
     /// One of the judge's points: `external_fact`, `impact`, `logging`,
     /// `assumption`, `structured_field`, `survey`, `silent_fallback`,
-    /// `fixtures`, `one_record`, `team_rule`, `ci_pending` or
-    /// `manual_check`; or `unrun_check`, which only [`classify`] sets.
+    /// `fixtures`, `one_record`, `team_rule`, `ci_pending`,
+    /// `manual_check`, `pattern_cited`, `end_to_end` or `environment`; or
+    /// `unrun_check`, which only [`classify`] sets.
     pub point: String,
     /// What is unverified, in one sentence.
     pub detail: String,
@@ -284,8 +306,12 @@ pub enum Settler {
     /// A check the PR's CI runs: a pending item its green result removes.
     Ci,
     /// Only a person can check it (a real browser, a device): a step in the
-    /// PR's Verification section, never in the warning.
+    /// PR's Verification section, never in Open items.
     Person,
+    /// Something outside the code the plan left open (a step of the whole
+    /// job nobody owns): an Open item for a person, never a fix round, since
+    /// the coder can't change the plan.
+    Owner,
 }
 
 /// The most a warning bullet says about what's unverified, and about how to
@@ -299,6 +325,7 @@ impl Finding {
         match self.point.trim() {
             "ci_pending" => Settler::Ci,
             "manual_check" => Settler::Person,
+            "end_to_end" => Settler::Owner,
             _ => Settler::Proof,
         }
     }
@@ -318,6 +345,9 @@ impl Finding {
             "fixtures" => "Tests not built from real payloads",
             "one_record" => "Fixes one record, not the rule",
             "team_rule" => "Team instruction not met",
+            "pattern_cited" => "Copied block not named",
+            "end_to_end" => "Missing from the end-to-end checklist",
+            "environment" => "Environment not confirmed",
             other => other,
         }
     }
@@ -527,6 +557,21 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      manual click-through). Never a gap; it becomes a numbered step in the PR's Verification \
      section. Never a command the CI list shows: running that is CI's job, so it is ci_pending \
      with its `ci` id.\n\
+     13. pattern_cited: the diff adds a block (a user, secret, certificate, route, config entry, \
+     job, permission) that closely resembles one the repository already has for another case. A \
+     miss when the coder's notes have no `mirrors.json` entry naming that existing block (its \
+     path and name), or when the new block differs from it in ways the entry doesn't list with a \
+     reason. Name the existing block.\n\
+     14. end_to_end: the plan's end-to-end checklist (every step the ticket needs to work in \
+     production, each with who does it). A miss when it leaves out an obvious step for this kind \
+     of change: credentials and who reads them, the resource itself, network access and \
+     allowlists, permissions and read grants, the handoff to whoever uses it, the deploy and \
+     merge order. Name the missing step and who would own it. It is listed in the PR's Open \
+     items for a person, not sent back to the coder.\n\
+     15. environment: when the diff changes more than one environment (listed below), a miss for \
+     each one that no evidence line names: a `- Confirmed:` line from a read-only lookup, or one \
+     `- Unconfirmed:` line saying exactly what access is missing. One environment's lookup never \
+     stands for another's.\n\
      Many changes touch none of these: a change that relies on nothing outside its own code, \
      changes no stored records and adds no logs passes all of them. Judge only what the evidence \
      shows and do not invent concerns. A fact the lookups confirm is proven even when the notes \
@@ -535,7 +580,7 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      exact field, records, log line, assumption or check); `settle` is ONE sentence on how to \
      settle it (which connected source to read, what to count, which log to lower, which check \
      result). No lists, no preamble, no repeating the rule's text.\n\
-     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule|ci_pending|manual_check\",\"detail\":\"one sentence\",\"settle\":\"one sentence\",\"check\":\"format|lint|typecheck|build|tests|plan|security, or empty\",\"command\":\"the command the check needs, or empty\",\"ci\":\"the CI command id (C1), or empty\"}]}. \
+     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule|ci_pending|manual_check|pattern_cited|end_to_end|environment\",\"detail\":\"one sentence\",\"settle\":\"one sentence\",\"check\":\"format|lint|typecheck|build|tests|plan|security, or empty\",\"command\":\"the command the check needs, or empty\",\"ci\":\"the CI command id (C1), or empty\"}]}. \
      An empty list when all pass.";
 
 /// The judge's prompt: the change and everything the run gathered.
@@ -583,7 +628,7 @@ pub enum Next {
     Open,
     /// Send the findings back to the coder for a fix round.
     FixRound,
-    /// Gaps remain and no round is left: open the PR with them at the top.
+    /// Gaps remain and no round is left: open the PR with them listed under Open items.
     OpenWithGaps,
 }
 
@@ -609,7 +654,7 @@ fn proof_gaps(findings: &[Finding]) -> usize {
 /// How an evidence line that names a fact nothing confirmed starts (after
 /// any `>` quote and `-` bullet). `- Unconfirmed:` is what the coder is told
 /// to write ([`EVIDENCE_OUTPUT`]); the last is how [`gaps_section`] names an
-/// open `external_fact` gap at the top of a PR.
+/// open `external_fact` gap in a PR's Open items.
 const UNCONFIRMED_MARKERS: &[&str] = &[
     "unconfirmed:",
     "unverified:",
@@ -697,6 +742,11 @@ pub fn recorded_gaps(evidence: &RunEvidence) -> Vec<Finding> {
             ..Default::default()
         });
     }
+    // Each environment the diff changes needs its own evidence line.
+    out.extend(super::completeness::env_gaps(
+        &evidence.environments,
+        evidence.latest_notes(),
+    ));
     out
 }
 
@@ -709,7 +759,40 @@ pub fn with_recorded(judged: Option<Vec<Finding>>, evidence: &RunEvidence) -> Op
         return judged;
     }
     let mut all = judged.unwrap_or_default();
+    // Which environments lack evidence is read from the paths and notes in
+    // code; the judge's own account of it would only repeat that.
+    if recorded.iter().any(|g| g.point == "environment") {
+        all.retain(|f| f.point.trim() != "environment");
+    }
     for g in recorded {
+        if !all.contains(&g) {
+            all.push(g);
+        }
+    }
+    Some(all)
+}
+
+/// The findings with what the plan's end-to-end checklist leaves open added
+/// (see `completeness::checklist_gaps`): Open items for a person, never a
+/// fix round. A plan with no decision carries no checklist to hold.
+pub fn with_checklist(
+    findings: Option<Vec<Finding>>,
+    decision: Option<&super::fix_location::FixDecision>,
+    repo: &str,
+) -> Option<Vec<Finding>> {
+    let open = super::completeness::checklist_gaps(decision, repo);
+    if open.is_empty() {
+        return findings;
+    }
+    let mut all = findings.unwrap_or_default();
+    // The judge may name the same missing checklist; the code's account stands.
+    if open
+        .iter()
+        .any(|g| g.detail.contains("no end-to-end checklist"))
+    {
+        all.retain(|f| f.point.trim() != "end_to_end");
+    }
+    for g in open {
         if !all.contains(&g) {
             all.push(g);
         }
@@ -738,39 +821,32 @@ pub fn fix_feedback(findings: &[Finding]) -> String {
     )
 }
 
-/// Where the "Not yet verified" section starts and ends in a PR description,
-/// and the mark on each item the PR's CI settles. They let the section be
-/// found and rewritten when CI finishes, and kept whole when the description
-/// is rewritten.
-const UNVERIFIED_START: &str = "<!-- coderhelm:unverified -->";
-const UNVERIFIED_END: &str = "<!-- /coderhelm:unverified -->";
+/// Where the Open items section (once "Not yet verified", at the top) starts
+/// and ends in a PR description, and the mark on each item the PR's CI
+/// settles. They let the section be found and rewritten when CI finishes,
+/// kept whole when the description is rewritten, and read by the reviewer.
+pub const UNVERIFIED_START: &str = "<!-- coderhelm:unverified -->";
+pub const UNVERIFIED_END: &str = "<!-- /coderhelm:unverified -->";
 const CI_MARK: &str = "<!-- coderhelm:ci -->";
 
-/// The section put at the top of the PR description: one bullet per proof
-/// gap and per check the PR's CI still has to settle. What only a person can
-/// check never goes here (see [`manual_steps`]). A WARNING when a proof gap
-/// remains, a NOTE when only CI's result is awaited; empty when neither.
+/// The Open items section, put at the bottom of the PR description: one
+/// bullet per proof gap, per step the plan left without an owner, and per
+/// check the PR's CI still has to settle, each saying what settles it. What
+/// only a person can check never goes here (see [`manual_steps`]). No
+/// callout banner. Empty when there is nothing open.
 pub fn gaps_section(findings: &[Finding]) -> String {
-    let gaps: Vec<String> = findings
-        .iter()
-        .filter(|f| f.settler() == Settler::Proof)
-        .map(|f| format!("> {}", f.line()))
+    let of = |s: Settler| findings.iter().filter(move |f| f.settler() == s);
+    let items: Vec<String> = of(Settler::Proof)
+        .chain(of(Settler::Owner))
+        .map(Finding::line)
+        .chain(of(Settler::Ci).map(|f| format!("{} {CI_MARK}", f.line())))
         .collect();
-    let pending: Vec<String> = findings
-        .iter()
-        .filter(|f| f.settler() == Settler::Ci)
-        .map(|f| format!("> {} {CI_MARK}", f.line()))
-        .collect();
-    if gaps.is_empty() && pending.is_empty() {
+    if items.is_empty() {
         return String::new();
     }
-    let callout = if gaps.is_empty() { "NOTE" } else { "WARNING" };
     format!(
-        "{UNVERIFIED_START}\n> [!{callout}]\n> **Not yet verified**\n{}\n{UNVERIFIED_END}\n\n",
-        gaps.into_iter()
-            .chain(pending)
-            .collect::<Vec<_>>()
-            .join("\n")
+        "{UNVERIFIED_START}\n## Open items\n{}\n{UNVERIFIED_END}",
+        items.join("\n")
     )
 }
 
@@ -790,45 +866,31 @@ pub fn manual_steps(findings: &[Finding]) -> String {
         .collect()
 }
 
-/// Splits a PR description into its "Not yet verified" section (with the
-/// blank line after it) and the rest. The section is empty when there is
-/// none.
-pub fn split_unverified(body: &str) -> (String, String) {
-    let Some(start) = body.find(UNVERIFIED_START) else {
-        return (String::new(), body.to_string());
-    };
-    let Some(end) = body[start..].find(UNVERIFIED_END).map(|e| start + e) else {
-        return (String::new(), body.to_string());
-    };
-    let mut close = end + UNVERIFIED_END.len();
-    while body[close..].starts_with('\n') {
-        close += 1;
-    }
-    (
-        body[start..close].to_string(),
-        format!("{}{}", &body[..start], &body[close..]),
-    )
-}
-
 /// The description once the PR's CI passed: the items CI settled are gone,
-/// and so is the whole section when nothing is left in it. `None` when there
-/// is nothing to change.
+/// and so is the whole section when nothing is left in it. What stays is
+/// Open items at the bottom, whether the section was written there or at
+/// the top as before. `None` when there is nothing to change.
 pub fn settle_by_ci(body: &str) -> Option<String> {
-    let (section, rest) = split_unverified(body);
-    if !section.contains(CI_MARK) {
+    let (mut owned, rest) = super::completeness::take_owned(body);
+    if !owned.open_items.contains(CI_MARK) {
         return None;
     }
-    let start = body.find(UNVERIFIED_START)?;
-    let kept: Vec<&str> = section
-        .trim_end_matches('\n')
+    let kept: Vec<&str> = owned
+        .open_items
         .lines()
         .filter(|l| !l.contains(CI_MARK))
         .collect();
-    if !kept.iter().any(|l| l.starts_with("> - ")) {
-        return Some(rest);
-    }
-    let section = format!("{}\n\n", kept.join("\n"));
-    Some(format!("{}{section}{}", &rest[..start], &rest[start..]))
+    let any_item = kept.iter().any(|l| {
+        let l = l.trim_start_matches('>').trim_start();
+        l.starts_with("- ") || l.starts_with("* ")
+    });
+    let section = if any_item {
+        kept.join("\n")
+    } else {
+        String::new()
+    };
+    owned.set(super::completeness::Section::OpenItems, section);
+    Some(super::completeness::assemble(&rest, &owned))
 }
 
 /// What the plan says the change is for, for the judge.
@@ -841,7 +903,8 @@ fn plan_context(plan: &PlanResult) -> String {
 }
 
 /// The judge's reading of the change on `branch`. `None` when it couldn't
-/// judge (an API or model failure, an unreadable reply).
+/// judge (an API or model failure, an unreadable reply). `evidence` gains
+/// the environments the diff changes, read from its paths.
 #[allow(clippy::too_many_arguments)]
 pub async fn judge(
     state: &WorkerState,
@@ -849,7 +912,7 @@ pub async fn judge(
     github: &GitHubClient,
     branch: &str,
     plan: &PlanResult,
-    evidence: &RunEvidence,
+    evidence: &mut RunEvidence,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Option<Vec<Finding>> {
@@ -857,12 +920,24 @@ pub async fn judge(
         .get_diff(&msg.repo_owner, &msg.repo_name, &msg.base_branch, branch)
         .await
     {
-        Ok(d) => super::pr::format_diff_patches(&d),
+        Ok(d) => {
+            let paths: Vec<String> = d["files"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|f| f["filename"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            evidence.environments = super::completeness::changed_environments(&paths);
+            super::pr::format_diff_patches(&d)
+        }
         Err(e) => {
             warn!(error = %e, "Proof check could not read the diff");
             return None;
         }
     };
+    let evidence = &*evidence;
     let prompt = judge_prompt(
         &msg.title,
         &plan_context(plan),
@@ -931,7 +1006,11 @@ pub async fn prove(
         )
         .await;
         let recorded = recorded_gaps(evidence).len();
-        let findings = with_recorded(judged, evidence);
+        let findings = with_checklist(
+            with_recorded(judged, evidence),
+            w.plan.fix.as_ref(),
+            &format!("{}/{}", w.msg.repo_owner, w.msg.repo_name),
+        );
         super::write_pass_trace(
             w.state,
             &w.msg.team_id,
@@ -972,7 +1051,7 @@ pub async fn prove(
                     &w.msg.team_id,
                     w.run_id,
                     &format!(
-                        "Proof check: {} gap(s) remain, named at the top of the PR",
+                        "Proof check: {} gap(s) remain, listed under Open items in the PR",
                         proof_gaps(&gaps)
                     ),
                 )
@@ -1106,16 +1185,17 @@ mod tests {
         assert_eq!(next(Some(&judged), 0, true), Next::FixRound);
         // A judge that couldn't answer doesn't wave it through either.
         assert_eq!(with_recorded(None, &ev), Some(gaps.clone()));
-        // A real proof gap: never waiting on CI, and it leads the PR as a
-        // WARNING in the "Not yet verified" section, with how to settle it.
+        // A real proof gap: never waiting on CI, and it is an Open item in
+        // the PR, with how to settle it.
         assert!(judged.iter().all(|f| f.settler() == Settler::Proof));
         let with_ci = with_recorded(Some(vec![check_finding("ci_pending", "tests")]), &ev).unwrap();
         assert_eq!(proof_gaps(&with_ci), 1);
         let top = gaps_section(&judged);
         assert!(top.starts_with(UNVERIFIED_START), "{top}");
-        assert!(top.contains("> [!WARNING]"));
+        assert!(top.contains("## Open items"));
+        assert!(!top.contains("[!WARNING]"));
         assert!(top
-            .contains("> - **Unconfirmed external field or behaviour:** No lookup against vendor"));
+            .contains("\n- **Unconfirmed external field or behaviour:** No lookup against vendor"));
         assert!(top.contains("Settle: Read one real record from vendor"));
         assert!(!top.contains(CI_MARK));
         assert_eq!(settle_by_ci(&format!("{top}Body")), None);
@@ -1215,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn gaps_lead_the_pr_description_and_the_fix_round_gets_them() {
+    fn gaps_are_open_items_and_the_fix_round_gets_them() {
         let gaps = [
             finding(
                 "external_fact",
@@ -1224,11 +1304,11 @@ mod tests {
             finding("logging", "INFO log per record in the sync loop"),
         ];
         let top = gaps_section(&gaps);
-        assert!(top
-            .starts_with("<!-- coderhelm:unverified -->\n> [!WARNING]\n> **Not yet verified**\n"));
-        assert!(top.ends_with("<!-- /coderhelm:unverified -->\n\n"));
-        assert!(top.contains("> - **Unconfirmed external field or behaviour:** confirm `name`"));
-        assert!(top.contains("> - **Noisy logging:** INFO log per record"));
+        assert!(top.starts_with("<!-- coderhelm:unverified -->\n## Open items\n- "));
+        assert!(top.ends_with("<!-- /coderhelm:unverified -->"));
+        assert!(!top.contains("[!"), "no banner: {top}");
+        assert!(top.contains("\n- **Unconfirmed external field or behaviour:** confirm `name`"));
+        assert!(top.contains("\n- **Noisy logging:** INFO log per record"));
         assert_eq!(gaps_section(&[]), "");
         let fb = fix_feedback(&gaps);
         assert!(fb.contains("- **Noisy logging:** INFO log per record in the sync loop"));
@@ -1266,6 +1346,9 @@ mod tests {
             "team_rule",
             "ci_pending",
             "manual_check",
+            "pattern_cited",
+            "end_to_end",
+            "environment",
         ] {
             assert!(JUDGE_SYSTEM.contains(point), "{point}");
             assert_ne!(finding(point, "x").label(), point, "{point} has a label");
@@ -1323,6 +1406,76 @@ mod tests {
         assert!(CODER_RULES.contains("No manual backfills or one-off scripts"));
         assert!(CODER_RULES.contains("no hard-coded ids, names, seasons or prices"));
         assert!(EVIDENCE_OUTPUT.contains("`Evidence:`"));
+    }
+
+    #[test]
+    fn the_coder_copies_the_existing_block_names_it_and_confirms_each_environment() {
+        assert!(CODER_RULES.contains("find that block and copy it"));
+        assert!(CODER_RULES.contains("another user, secret, certificate, route, config entry"));
+        assert!(CODER_RULES.contains("one `- Confirmed:` line per environment"));
+        assert!(CODER_RULES.contains("exactly what access is missing"));
+        assert!(CODER_RULES.contains("never a template left as `${env}`"));
+        assert!(EVIDENCE_OUTPUT.contains("```mirrors.json"));
+        assert!(
+            EVIDENCE_OUTPUT.contains("\"differences\": [\"each intentional difference, and why\"]")
+        );
+        // The judge holds each one, and names the missing pieces.
+        assert!(JUDGE_SYSTEM.contains("13. pattern_cited"));
+        assert!(JUDGE_SYSTEM.contains("no `mirrors.json` entry naming that existing block"));
+        assert!(JUDGE_SYSTEM.contains("14. end_to_end"));
+        assert!(JUDGE_SYSTEM.contains("network access and allowlists"));
+        assert!(JUDGE_SYSTEM.contains("15. environment"));
+        assert_eq!(finding("pattern_cited", "x").settler(), Settler::Proof);
+        assert_eq!(finding("environment", "x").settler(), Settler::Proof);
+        assert_eq!(finding("end_to_end", "x").settler(), Settler::Owner);
+    }
+
+    #[test]
+    fn an_unconfirmed_environment_is_a_gap_whatever_the_judge_says() {
+        let mut ev = RunEvidence {
+            notes: "Evidence:\n- Confirmed: the prod secret exists (L1)".into(),
+            environments: vec!["prod".into(), "staging".into()],
+            ..Default::default()
+        };
+        assert!(ev
+            .for_judge()
+            .contains("Environments the diff changes (read from its file paths)\nprod, staging\n"));
+        // The judge named it too: one account, the code's.
+        let judged = Some(vec![finding("environment", "staging unchecked")]);
+        let all = with_recorded(judged, &ev).unwrap();
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert!(all[0].detail.contains("changes the staging environment"));
+        assert_eq!(next(Some(&all), 0, true), Next::FixRound);
+        // Saying exactly what access is missing is an Open item, not silence.
+        ev.merge(RunEvidence {
+            notes: "Evidence:\n- Confirmed: the prod secret exists (L1)\n- Unconfirmed: staging, no read role in the staging account".into(),
+            ..Default::default()
+        });
+        let left = recorded_gaps(&ev);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0]
+            .detail
+            .contains("no read role in the staging account"));
+        assert!(gaps_section(&left).contains("staging, no read role"));
+    }
+
+    #[test]
+    fn an_unowned_step_is_an_open_item_never_a_fix_round() {
+        let d = crate::passes::fix_location::FixDecision {
+            end_to_end: vec![crate::passes::fix_location::EndToEndStep {
+                step: "Allow the vendor's IP range".into(),
+                by: "person".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let all = with_checklist(Some(vec![]), Some(&d), "acme/infra").unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(next(Some(&all), 0, true), Next::Open);
+        let open = gaps_section(&all);
+        assert!(open.contains("- **Missing from the end-to-end checklist:** No owner is named for: Allow the vendor's IP range"));
+        assert!(!fix_feedback(&all).contains("No owner"));
+        assert_eq!(with_checklist(None, None, "acme/infra"), None);
     }
 
     fn gated(kinds: &[CheckKind]) -> RunEvidence {
@@ -1427,8 +1580,9 @@ mod tests {
             &ev,
         );
         let top = gaps_section(&f);
-        assert!(top.contains("> [!NOTE]"));
-        assert!(top.contains("> - **Waiting on CI:** lint did not run"));
+        assert!(top.contains("## Open items"));
+        assert!(!top.contains("[!NOTE]"));
+        assert!(top.contains("\n- **Waiting on CI:** lint did not run"));
         assert!(top.contains("<!-- coderhelm:ci -->"));
         assert!(!top.contains("browser"));
         assert_eq!(
@@ -1441,37 +1595,57 @@ mod tests {
     }
 
     #[test]
-    fn ci_passing_removes_what_it_settled_and_the_warning_when_nothing_is_left() {
+    fn ci_passing_removes_what_it_settled_and_the_section_when_nothing_is_left() {
         let ev = gated(&[CheckKind::Lint]);
         let pending = classify(vec![check_finding("team_rule", "lint")], &ev);
-        let rest = "Closes #4\n\n**Problem** x";
-        let body = format!("{}{rest}", gaps_section(&pending));
-        assert_eq!(settle_by_ci(&body).as_deref(), Some(rest));
+        let rest = "Closes #4\n\n**Problem** x\n\n**Verification**\n1. y";
+        let footer = "\n\n<sub>Consulted team agents: a</sub>";
+        let body = format!("{rest}\n\n{}{footer}", gaps_section(&pending));
+        assert_eq!(
+            settle_by_ci(&body).as_deref(),
+            Some(format!("{rest}{footer}").as_str())
+        );
 
-        // A proof gap stays, under its heading; only the CI item goes.
+        // A proof gap stays, under its heading at the bottom; only the CI
+        // item goes.
         let mut mixed = pending.clone();
         mixed.insert(0, finding("impact", "affected records not counted"));
-        let body = format!("{}{rest}", gaps_section(&mixed));
+        let body = format!("{rest}\n\n{}{footer}", gaps_section(&mixed));
         let settled = settle_by_ci(&body).unwrap();
-        assert!(settled.starts_with("<!-- coderhelm:unverified -->\n> [!WARNING]\n> **Not yet verified**\n> - **Impact not measured:**"));
+        assert!(settled.starts_with(rest));
+        assert!(settled.contains(
+            "\n\n<!-- coderhelm:unverified -->\n## Open items\n- **Impact not measured:**"
+        ));
         assert!(!settled.contains("Waiting on CI"));
-        assert!(settled.ends_with(&format!("<!-- /coderhelm:unverified -->\n\n{rest}")));
+        assert!(settled.ends_with(&format!("<!-- /coderhelm:unverified -->{footer}")));
         // Nothing left for CI to settle: the description is left alone.
         assert_eq!(settle_by_ci(&settled), None);
         assert_eq!(settle_by_ci(rest), None);
+
+        // A PR from before, with the banner at the top: the CI item goes and
+        // what's left moves to the bottom as Open items.
+        let old = format!(
+            "<!-- coderhelm:unverified -->\n> [!WARNING]\n> **Not yet verified**\n> - **Impact not measured:** x\n> - **Waiting on CI:** lint <!-- coderhelm:ci -->\n<!-- /coderhelm:unverified -->\n\n{rest}"
+        );
+        let moved = settle_by_ci(&old).unwrap();
+        assert!(moved.starts_with("Closes #4"), "{moved}");
+        assert!(moved.ends_with(
+            "## Open items\n- **Impact not measured:** x\n<!-- /coderhelm:unverified -->"
+        ));
+        assert!(!moved.contains("[!WARNING]"));
     }
 
     #[test]
     fn the_section_splits_off_whole_for_a_description_rewrite() {
         let gaps = gaps_section(&[finding("impact", "affected records not counted")]);
-        let body = format!("{gaps}Closes #4\n\nx");
-        let (section, rest) = split_unverified(&body);
-        assert_eq!(section, gaps);
-        assert_eq!(rest, "Closes #4\n\nx");
-        assert_eq!(
-            split_unverified("Closes #4"),
-            (String::new(), "Closes #4".to_string())
-        );
+        let body = format!("Closes #4\n\nx\n\n{gaps}\n");
+        let split = |b: &str| {
+            super::super::completeness::split_section(b, UNVERIFIED_START, UNVERIFIED_END)
+        };
+        let (section, rest) = split(&body);
+        assert_eq!(section, format!("{gaps}\n"));
+        assert_eq!(rest, "Closes #4\n\nx\n\n");
+        assert_eq!(split("Closes #4"), (String::new(), "Closes #4".to_string()));
     }
 
     #[test]
@@ -1588,16 +1762,31 @@ mod tests {
         assert_eq!(manual_steps(&f[..3]), "");
         assert_eq!(next(Some(&f[..3]), 0, true), Next::Open);
         let top = gaps_section(&f[..3]);
-        assert!(top.contains("> [!NOTE]"));
+        assert!(top.contains("## Open items"));
+        assert!(!top.contains("[!NOTE]"));
         assert!(top.contains(
             "CI runs `terraform fmt -recursive -check` on this PR; this settles when it passes."
         ));
         assert!(top.contains("CI runs `terraform plan -input=false -no-color` (in `envs/${{ matrix.env }}`) on this PR"));
         assert!(!top.contains("Run terraform"));
-        // A green CI clears them, and the section with them.
+        // A green CI clears them, and the section with them, from the
+        // bottom of the description.
         let rest = "Source ticket: OPS-1\n\n**Problem** x";
-        let body = format!("{top}{rest}");
+        let body = crate::passes::completeness::assemble(
+            rest,
+            &crate::passes::completeness::Owned {
+                open_items: top.clone(),
+                ..Default::default()
+            },
+        );
+        assert!(body.ends_with("<!-- /coderhelm:unverified -->"), "{body}");
         assert_eq!(settle_by_ci(&body).as_deref(), Some(rest));
+        // A workflow expression in a CI command is not an unfilled template.
+        assert!(
+            crate::passes::completeness::placeholder_holes(&body).is_empty(),
+            "{:?}",
+            crate::passes::completeness::placeholder_holes(&body)
+        );
 
         // Without CI running them: formatting is a gap, a plan is for a
         // person (the sandbox never has credentials).
