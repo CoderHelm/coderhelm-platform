@@ -101,16 +101,22 @@ pub struct Discussion {
     pub changes_requested: bool,
     /// A person dismissed CoderHelm's review.
     pub dismissed: bool,
+    /// A person approved the PR after CoderHelm's latest change request.
+    pub approved_over_block: bool,
+    /// The PR was merged.
+    pub merged: bool,
 }
 
 impl Discussion {
     /// Is there anything people did against the review? Without it there is
-    /// nothing to judge.
+    /// nothing to judge. Approving or merging over CoderHelm's standing
+    /// change request is the strongest of these.
     pub fn has_pushback(&self) -> bool {
         self.findings.iter().any(|f| !f.replies.is_empty())
             || !self.conversation.is_empty()
             || self.dismissed
-            || (self.closed_unmerged && self.changes_requested)
+            || (self.changes_requested
+                && (self.closed_unmerged || self.approved_over_block || self.merged))
     }
 }
 
@@ -147,6 +153,16 @@ pub fn discussion_from(
         .map(|r| r["state"].as_str().unwrap_or(""))
         .find(|s| matches!(*s, "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED"))
         .unwrap_or("");
+    // A person's approval submitted after CoderHelm's latest change request
+    // (reviews come oldest first).
+    let last_request = reviews.iter().rposition(|r| {
+        is_coderhelm(&r["user"]) && r["state"].as_str() == Some("CHANGES_REQUESTED")
+    });
+    let approved_over_block = last_request.is_some_and(|i| {
+        reviews[i + 1..]
+            .iter()
+            .any(|r| is_person(&r["user"]) && r["state"].as_str() == Some("APPROVED"))
+    });
     let review_bodies: Vec<(String, String)> = mine
         .iter()
         .filter_map(|r| {
@@ -241,13 +257,18 @@ pub fn discussion_from(
             && !pr["merged"].as_bool().unwrap_or(false),
         changes_requested: latest_formal == "CHANGES_REQUESTED",
         dismissed: latest_formal == "DISMISSED",
+        approved_over_block,
+        merged: pr["merged"].as_bool().unwrap_or(false),
     }
 }
 
 const JUDGE_SYSTEM: &str = "You read a code review that an automated reviewer (CoderHelm) left on \
      a pull request, and what people did about it, and decide whether the reviewer was wrong. \
      Judge each finding people pushed back on: a reply under it, a PR comment about it, \
-     dismissing the review, or closing the PR while the review requested changes. Verdicts: \
+     dismissing the review, or closing, approving or merging the PR while the review requested \
+     changes. A person approving or merging over the request is the strongest sign: judge each \
+     blocking finding against the code and the diff to see whether it held the merge for a real \
+     defect. Verdicts: \
      \"reviewer_wrong\" — not a defect: the code does what the team intends, it uses a mechanism \
      the code base already has for exactly this (for example adding an entry to a list or set \
      the code keeps for that purpose), or the reviewer misread the code or the intent the PR \
@@ -287,6 +308,13 @@ pub fn judge_prompt(d: &Discussion) -> String {
     }
     if d.closed_unmerged {
         state.push("The pull request was closed without being merged.");
+    }
+    if d.changes_requested && d.approved_over_block {
+        state
+            .push("A person approved the pull request while CoderHelm's review requested changes.");
+    }
+    if d.changes_requested && d.merged {
+        state.push("A person merged the pull request while CoderHelm's review requested changes.");
     }
     if !state.is_empty() {
         out.push_str(&format!("\n{}\n", state.join(" ")));
@@ -950,6 +978,45 @@ mod tests {
             .push(json!({"user": user("coderhelm[bot]", "Bot"), "state": "DISMISSED", "body": ""}));
         let d = discussion_from(&pr, &reviews, &comments, &[]);
         assert!(d.dismissed && d.has_pushback());
+    }
+
+    #[test]
+    fn approving_or_merging_over_changes_requested_is_pushback() {
+        let (mut pr, mut reviews, mut comments, _) = incident();
+        pr["state"] = json!("open");
+        comments.retain(|c| c["user"]["login"] != "dev-one");
+        // Open, nobody said anything: nothing to judge yet.
+        assert!(!discussion_from(&pr, &reviews, &comments, &[]).has_pushback());
+        // A person approves, without a word, over the block.
+        reviews.push(json!({"user": user("lead", "User"), "state": "APPROVED", "body": ""}));
+        let d = discussion_from(&pr, &reviews, &comments, &[]);
+        assert!(d.approved_over_block && d.changes_requested && d.has_pushback());
+        assert!(judge_prompt(&d).contains(
+            "A person approved the pull request while CoderHelm's review requested changes."
+        ));
+        // An approval from before CoderHelm's latest request doesn't count.
+        let earlier = vec![reviews[1].clone(), reviews[0].clone()];
+        assert!(!discussion_from(&pr, &earlier, &comments, &[]).approved_over_block);
+        // A bot's approval isn't a person's.
+        let by_bot = vec![
+            reviews[0].clone(),
+            json!({"user": user("release-bot[bot]", "Bot"), "state": "APPROVED", "body": ""}),
+        ];
+        assert!(!discussion_from(&pr, &by_bot, &comments, &[]).has_pushback());
+        // Merged over the block.
+        pr["state"] = json!("closed");
+        pr["merged"] = json!(true);
+        let d = discussion_from(&pr, &reviews[..1], &comments, &[]);
+        assert!(d.merged && !d.closed_unmerged && d.has_pushback());
+        assert!(judge_prompt(&d).contains(
+            "A person merged the pull request while CoderHelm's review requested changes."
+        ));
+        // Merged after CoderHelm approved: nothing against the review.
+        let mut approved = reviews[..1].to_vec();
+        approved
+            .push(json!({"user": user("coderhelm[bot]", "Bot"), "state": "APPROVED", "body": ""}));
+        assert!(!discussion_from(&pr, &approved, &comments, &[]).has_pushback());
+        assert!(JUDGE_SYSTEM.contains("approving or merging over the request"));
     }
 
     #[test]

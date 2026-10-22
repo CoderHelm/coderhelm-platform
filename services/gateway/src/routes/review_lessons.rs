@@ -1,9 +1,9 @@
 //! The reviewer learns from people's pushback (see `common::review_lessons`).
 //!
 //! Webhooks: a person replying under a review comment, commenting on a PR
-//! CoderHelm reviewed, dismissing its review, or closing the PR while its
-//! "changes requested" stands queues one judgment per PR after a quiet
-//! period. Whether any of it disputes a finding is decided by the worker's
+//! CoderHelm reviewed, dismissing its review, or approving, merging or
+//! closing the PR while its "changes requested" stands queues one judgment
+//! per PR after a quiet period. Whether any of it disputes a finding is decided by the worker's
 //! model, never here.
 //!
 //! Dashboard: the team's lessons are listed (anyone on the team) and a wrong
@@ -94,6 +94,16 @@ pub fn detect(event_type: &str, payload: &Value) -> Option<LessonTrigger> {
                 );
             }
             let state = r["state"].as_str().unwrap_or("");
+            // A person approving over CoderHelm's standing block, words or
+            // not: the strongest sign the block was wrong.
+            if action == "submitted" && state == "approved" {
+                is_person(&r["user"]).then_some(())?;
+                return make(
+                    &payload["pull_request"]["number"],
+                    rl::TRIGGER_APPROVED_OVER_BLOCK,
+                    true,
+                );
+            }
             (action == "submitted"
                 && is_person(&r["user"])
                 && matches!(state, "commented" | "changes_requested")
@@ -107,11 +117,13 @@ pub fn detect(event_type: &str, payload: &Value) -> Option<LessonTrigger> {
         }
         "pull_request" => {
             let pr = &payload["pull_request"];
-            (action == "closed"
-                && !pr["merged"].as_bool().unwrap_or(false)
-                && is_person(&payload["sender"]))
-            .then_some(())?;
-            make(&pr["number"], rl::TRIGGER_CLOSED, true)
+            (action == "closed" && is_person(&payload["sender"])).then_some(())?;
+            if pr["merged"].as_bool().unwrap_or(false) {
+                // A person merged over CoderHelm's standing block.
+                make(&pr["number"], rl::TRIGGER_MERGED_OVER_BLOCK, true)
+            } else {
+                make(&pr["number"], rl::TRIGGER_CLOSED, true)
+            }
         }
         _ => None,
     }
@@ -414,9 +426,60 @@ mod tests {
         );
         p["review"]["body"] = json!("");
         assert_eq!(detect("pull_request_review", &p), None);
+    }
+
+    #[test]
+    fn a_person_approving_needs_a_standing_change_request() {
+        let mut p = json!({
+            "action": "submitted",
+            "repository": repo(),
+            "pull_request": {"number": 5},
+            "review": {"user": person("lead"), "state": "approved", "body": ""},
+        });
+        // Words or not: approving over the block is the pushback.
+        let t = detect("pull_request_review", &p).unwrap();
+        assert_eq!(t.trigger, rl::TRIGGER_APPROVED_OVER_BLOCK);
+        assert!(t.needs_changes_requested);
         p["review"]["body"] = json!("LGTM");
-        p["review"]["state"] = json!("approved");
+        assert_eq!(
+            detect("pull_request_review", &p).unwrap().trigger,
+            rl::TRIGGER_APPROVED_OVER_BLOCK
+        );
+        // CoderHelm's own approval, or a bot's, is not a person's.
+        p["review"]["user"] = bot("coderhelm[bot]");
         assert_eq!(detect("pull_request_review", &p), None);
+        p["review"]["user"] = bot("release-bot[bot]");
+        assert_eq!(detect("pull_request_review", &p), None);
+        // It counts only while CoderHelm's latest verdict requests changes.
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(qualifies(
+            &v(&["REQUEST_CHANGES"]),
+            t.needs_changes_requested
+        ));
+        assert!(!qualifies(
+            &v(&["APPROVE", "REQUEST_CHANGES"]),
+            t.needs_changes_requested
+        ));
+    }
+
+    #[test]
+    fn a_person_merging_needs_a_standing_change_request() {
+        let mut p = json!({
+            "action": "closed",
+            "repository": repo(),
+            "pull_request": {"number": 9, "merged": true},
+            "sender": person("lead"),
+        });
+        let t = detect("pull_request", &p).unwrap();
+        assert_eq!(t.trigger, rl::TRIGGER_MERGED_OVER_BLOCK);
+        assert!(t.needs_changes_requested);
+        // CoderHelm's own auto-merge is not pushback.
+        p["sender"] = bot("coderhelm[bot]");
+        assert_eq!(detect("pull_request", &p), None);
+        // Opening or editing a merged-looking payload isn't a merge.
+        p["sender"] = person("lead");
+        p["action"] = json!("edited");
+        assert_eq!(detect("pull_request", &p), None);
     }
 
     #[test]
@@ -431,7 +494,10 @@ mod tests {
         assert_eq!(t.trigger, rl::TRIGGER_CLOSED);
         assert!(t.needs_changes_requested);
         p["pull_request"]["merged"] = json!(true);
-        assert_eq!(detect("pull_request", &p), None);
+        assert_eq!(
+            detect("pull_request", &p).unwrap().trigger,
+            rl::TRIGGER_MERGED_OVER_BLOCK
+        );
         p["pull_request"]["merged"] = json!(false);
         p["sender"] = bot("coderhelm[bot]");
         assert_eq!(detect("pull_request", &p), None);

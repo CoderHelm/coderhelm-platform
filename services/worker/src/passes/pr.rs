@@ -870,8 +870,10 @@ fn evidence_instructions(evidence: &str) -> String {
     format!(
         "\n{evidence}\n\
          Add an **Evidence** section after the changes: each fact about another system the change \
-         relies on, the lookup that confirmed it and what came back (the field and its value, as \
-         the lookup returned it); how many records the change affects, where they were counted, \
+         relies on, on its own line that starts `- Confirmed:` (the lookup that confirmed it and \
+         what came back: the field and its value, as the lookup returned it) or `- Unconfirmed:` \
+         (what nothing confirmed, and why: a missing source, or a lookup marked FAILED or EMPTY, \
+         which confirms nothing); how many records the change affects, where they were counted, \
          and the few examples named above. Take these only from the lookups and notes above, \
          never from guesses. Never write that something was not verified, not measured or \
          unconfirmed when the lookups above answer it; when the notes say no connected source \
@@ -1221,6 +1223,9 @@ mod refresh_tests {
         assert!(block.contains("Came back: {\"title\": \"Swim\"}"));
         assert!(block.contains("Add an **Evidence** section"));
         assert!(block.contains("Never write that something was not verified, not measured"));
+        // The reviewer reads these markers back: an `Unconfirmed:` line holds
+        // its approval.
+        assert!(block.contains("`- Confirmed:`") && block.contains("`- Unconfirmed:`"));
     }
 
     #[test]

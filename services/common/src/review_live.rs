@@ -33,6 +33,9 @@ pub const PHASE_RETRYING: &str = "retrying";
 pub const PHASE_FAILED: &str = "failed";
 /// The last job finished (with a review, an answer, or nothing to do).
 pub const PHASE_DONE: &str = "done";
+/// The last job looked at a new commit and didn't review it on purpose (it
+/// changed no code or data since CoderHelm approved); `reason` says so.
+pub const PHASE_SKIPPED: &str = "skipped";
 /// Read side only: an in-flight phase past its `expires_at`.
 pub const PHASE_STALLED: &str = "stalled";
 
@@ -96,6 +99,7 @@ pub fn pr_status(review_phase: &str, gate_state: &str) -> PrStatus {
     match review_phase {
         PHASE_FAILED => st("failed", GROUP_WAITING),
         PHASE_STALLED => st("stalled", GROUP_WAITING),
+        PHASE_SKIPPED => st("skipped", GROUP_DONE),
         // A new commit after the gate's review, with no review queued for
         // it: the gate re-arms when that commit is reviewed.
         _ if gate_state == g::STATE_HEAD_MOVED => st("new_commits", GROUP_DONE),
@@ -285,6 +289,9 @@ pub enum Finished<'a> {
     },
     /// Failed for good.
     Failed { reason: &'a str },
+    /// Not reviewed on purpose: `reason` says why (a push after an approval
+    /// that changed no code or data). The earlier verdict stands.
+    Skipped { reason: &'a str },
 }
 
 /// Only the job that owns the record may end it. Not ended by this job: a
@@ -345,6 +352,7 @@ pub async fn mark_finished(
             Some(now + retry_in_secs.max(0) + budget_secs.max(60) + QUEUED_FOR_SECS),
         ),
         Finished::Failed { reason } => (PHASE_FAILED, Some(reason), None),
+        Finished::Skipped { reason } => (PHASE_SKIPPED, Some(reason), None),
     };
     let update = finish_update(reason.is_some(), expires_at.is_some());
     let mut req = dynamo
@@ -461,6 +469,24 @@ mod tests {
         assert_eq!(pr_status("", "").status, "reviewed");
         assert_eq!(pr_status(PHASE_FAILED, "").status, "failed");
         assert_eq!(pr_status(PHASE_STALLED, "").status, "stalled");
+        // A push skipped on purpose shows as skipped, and never stalls.
+        assert_eq!(
+            pr_status(PHASE_SKIPPED, ""),
+            PrStatus {
+                status: "skipped",
+                group: GROUP_DONE
+            }
+        );
+        assert_eq!(
+            effective_phase(PHASE_SKIPPED, Some(100), 101),
+            PHASE_SKIPPED
+        );
+        assert!(!in_flight(PHASE_SKIPPED));
+        // The gate's state still outranks it once a gate is armed.
+        assert_eq!(
+            pr_status(PHASE_SKIPPED, g::STATE_WAITING_CI).status,
+            "waiting_ci"
+        );
         // A gate that merged outranks an older failure.
         assert_eq!(pr_status(PHASE_FAILED, g::STATE_MERGED).status, "merged");
     }

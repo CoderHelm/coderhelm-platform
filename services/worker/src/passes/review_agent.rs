@@ -40,6 +40,11 @@ pub struct Finding {
     /// `question` (see [`Evidence`]). Only a verified defect holds the merge.
     #[serde(default)]
     pub evidence: Option<String>,
+    /// The live lookups (`L1`, `T2`) the finding rests on, as each result was
+    /// labelled. A blocking finding whose lookups all failed or came back
+    /// empty rests on nothing (see [`enforce_failed_lookups`]).
+    #[serde(default)]
+    pub lookups: Vec<String>,
 }
 
 /// What a finding rests on. The verdict depends on it: only a defect the
@@ -129,6 +134,12 @@ pub struct ReviewOutput {
     /// none are needed (only when the repo turned label picking on).
     #[serde(default)]
     pub tests_note: String,
+    /// Facts about a system the repository doesn't own that the PR's own
+    /// description or evidence says are unconfirmed, unverified or never
+    /// read. Any one keeps the review from approving
+    /// ([`hold_for_unconfirmed`]).
+    #[serde(default)]
+    pub unconfirmed_facts: Vec<String>,
 }
 
 /// The model's judgment of one earlier CoderHelm thread at the new head.
@@ -436,6 +447,97 @@ impl Finding {
             self.evidence = Some(to.as_str().to_string());
         }
     }
+}
+
+/// A blocking finding that rests only on live lookups that failed or came
+/// back empty rests on nothing: it becomes a non-blocking concern, and its
+/// body says the lookup failed. An id no lookup of this review carries counts
+/// as nothing too. Returns how many were changed.
+pub fn enforce_failed_lookups(findings: &mut [Finding], lookups: &[super::proof::Lookup]) -> usize {
+    let mut changed = 0;
+    for f in findings.iter_mut() {
+        if f.lookups.is_empty() || !(f.is_blocking() || f.holds_merge()) {
+            continue;
+        }
+        let cited: Vec<Option<&super::proof::Lookup>> = f
+            .lookups
+            .iter()
+            .map(|id| {
+                lookups
+                    .iter()
+                    .find(|l| l.id.eq_ignore_ascii_case(id.trim()))
+            })
+            .collect();
+        if cited.iter().any(|l| l.is_some_and(|l| l.gave_data())) {
+            continue;
+        }
+        let why: Vec<String> = f
+            .lookups
+            .iter()
+            .zip(&cited)
+            .map(|(id, l)| match l.map(|l| l.outcome) {
+                Some(super::proof::LookupOutcome::Empty) => format!("{id} came back empty"),
+                Some(_) => format!("{id} failed"),
+                None => format!("{id} isn't a lookup this review made"),
+            })
+            .collect();
+        f.severity = "medium".to_string();
+        f.weaken_to(Evidence::UnverifiedConcern);
+        f.body = format!(
+            "{}\n\nThe live lookup this rests on didn't return data ({}), so it is not evidence \
+             either way and this isn't blocking.",
+            f.body.trim_end(),
+            why.join(", ")
+        );
+        changed += 1;
+    }
+    changed
+}
+
+/// The facts the PR's own evidence says are unconfirmed: the lines its
+/// description marks so (as CoderHelm's PRs write them, see
+/// `proof::unconfirmed_facts`), and those the reviewer read in it. Each once.
+pub fn unconfirmed_external_facts(pr_body: &str, read: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for f in super::proof::unconfirmed_facts(pr_body)
+        .into_iter()
+        .chain(read.iter().map(|f| f.trim().to_string()))
+    {
+        if !f.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&f)) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// An approval never stands on facts the PR itself says are unconfirmed:
+/// it becomes a COMMENT with a question (which also never arms auto-merge).
+/// A request for changes stays one.
+pub fn hold_for_unconfirmed(verdict: &'static str, unconfirmed: &[String]) -> &'static str {
+    if verdict == "APPROVE" && !unconfirmed.is_empty() {
+        "COMMENT"
+    } else {
+        verdict
+    }
+}
+
+/// The question a review asks about the facts the PR says are unconfirmed.
+pub fn unconfirmed_markdown(unconfirmed: &[String]) -> String {
+    if unconfirmed.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "\n\n#### Unconfirmed in the PR's own evidence\nThe description says these facts about \
+         another system weren't confirmed, so this isn't approved yet. Could you confirm each \
+         from the real system (a payload or a row) and add what came back to the description?\n",
+    );
+    for f in unconfirmed {
+        s.push_str(&format!(
+            "- {}\n",
+            f.split_whitespace().collect::<Vec<_>>().join(" ")
+        ));
+    }
+    s
 }
 
 /// The verdict of a review that finished. (A review that didn't finish has
@@ -1070,7 +1172,9 @@ pub fn review_system_prompt(
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
          \"category\": \"bug|security|correctness|perf|convention|scope|tests|source-data-override|manual-check|question\", \"title\": \"short\",\n    \
          \"evidence\": \"verified-defect|unverified-concern|question\",\n    \
+         \"lookups\": [\"L1\"]  (ids of the live lookups the finding rests on, if any),\n    \
          \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}],\n  \
+         \"unconfirmed_facts\": [\"...\"]  (each fact about a system the repository doesn't own that the PR's OWN description or evidence says is unconfirmed, unverified, not measured or never read from a real payload, in a few words; empty when it says none),\n  \
          \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"answered\" | \"open\"}}]  (one per earlier unresolved comment listed, if any),\n  \
          \"labels\": [{{\"name\": \"label\", \"reason\": \"changed file(s) that need it\"}}]  (only if a PR-labels section is given),\n  \
          \"tests_note\": \"which tests will run and where, or why none are needed\"  (only if a PR-labels section is given)\n}}\n\
@@ -1951,6 +2055,7 @@ mod tests {
                 body: "boom".into(),
                 suggestion: Some("let x = y?;".into()),
                 evidence: None,
+                lookups: Vec::new(),
             },
             Finding {
                 file: "a.rs".into(),
@@ -1962,6 +2067,7 @@ mod tests {
                 body: "meh".into(),
                 suggestion: None,
                 evidence: None,
+                lookups: Vec::new(),
             },
         ];
         let mut changed = HashMap::new();
@@ -1991,6 +2097,7 @@ mod anchoring_tests {
             body: "b".into(),
             suggestion: suggestion.map(String::from),
             evidence: None,
+            lookups: Vec::new(),
         }
     }
 
@@ -2099,6 +2206,7 @@ mod required_tests_tests {
             body: "b".into(),
             suggestion: None,
             evidence: None,
+            lookups: Vec::new(),
         }
     }
 
@@ -2190,6 +2298,7 @@ mod required_tests_tests {
             body: "b".into(),
             suggestion: Some(s.into()),
             evidence: None,
+            lookups: Vec::new(),
         }
     }
 
@@ -2308,5 +2417,108 @@ mod evidence_tests {
         let mut v = vec![f("tests", Some("question"))];
         enforce_required_tests(&mut v);
         assert!(v[0].holds_merge());
+    }
+
+    fn lookup(
+        id: &str,
+        outcome: crate::passes::proof::LookupOutcome,
+    ) -> crate::passes::proof::Lookup {
+        crate::passes::proof::Lookup::new(id.into(), "vendor", outcome, "GET /v1/orders/7", "x")
+    }
+
+    fn blocking(lookups: &[&str]) -> Finding {
+        Finding {
+            file: "src/sync.rs".into(),
+            line: 3,
+            severity: "blocking".into(),
+            category: "correctness".into(),
+            title: "Orders have no `status`".into(),
+            body: "The vendor's orders carry no `status` field.".into(),
+            evidence: Some("verified-defect".into()),
+            lookups: lookups.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_blocking_finding_on_a_failed_or_empty_lookup_is_a_note_that_says_so() {
+        use crate::passes::proof::LookupOutcome::{Answered, Empty, Failed};
+        let lookups = [
+            lookup("L1", Failed),
+            lookup("L2", Empty),
+            lookup("T1", Answered),
+        ];
+        let mut v = vec![
+            blocking(&["L1"]),
+            blocking(&["L1", "L2"]),
+            blocking(&["L9"]),
+            // One lookup that brought data back is evidence.
+            blocking(&["L1", "T1"]),
+            // A finding resting on the code, not a lookup, is untouched.
+            blocking(&[]),
+        ];
+        assert_eq!(enforce_failed_lookups(&mut v, &lookups), 3);
+        for f in &v[..3] {
+            assert!(!f.holds_merge() && !f.is_blocking(), "{f:?}");
+            assert_eq!(f.evidence(), Evidence::UnverifiedConcern);
+            assert!(f.body.contains("didn't return data"), "{}", f.body);
+        }
+        assert!(v[0].body.contains("(L1 failed)"));
+        assert!(v[1].body.contains("(L1 failed, L2 came back empty)"));
+        assert!(v[2].body.contains("L9 isn't a lookup this review made"));
+        assert!(v[3].holds_merge() && v[4].holds_merge());
+        // The posted comment says it doesn't hold the merge.
+        let changed: HashMap<String, HashSet<u64>> =
+            [("src/sync.rs".to_string(), [3u64].into_iter().collect())]
+                .into_iter()
+                .collect();
+        let p = to_postable(&v[..1], &changed, &HashMap::new());
+        assert_eq!(p.blocking_count, 0);
+        assert!(!thread_holds_merge(&p.inline[0].body));
+        assert_eq!(decide_verdict(&v[..3], 0, 0, false), "APPROVE");
+    }
+
+    #[test]
+    fn the_review_reads_finding_lookups_and_unconfirmed_facts() {
+        let out = parse_review(
+            "```json\n{\"verdict\":\"APPROVE\",\"findings\":[{\"file\":\"a.rs\",\"line\":1,\"lookups\":[\"L2\"]}],\"unconfirmed_facts\":[\"refund lines carry `amount`\"]}\n```",
+        )
+        .unwrap();
+        assert_eq!(out.findings[0].lookups, vec!["L2".to_string()]);
+        assert_eq!(
+            out.unconfirmed_facts,
+            vec!["refund lines carry `amount`".to_string()]
+        );
+        let p = review_system_prompt("acme", "app", "", false);
+        assert!(p.contains("\"lookups\""));
+        assert!(p.contains("\"unconfirmed_facts\""));
+    }
+
+    #[test]
+    fn an_unconfirmed_external_fact_holds_the_approval_as_a_question() {
+        let body = "Fixes the sync.\n\n**Evidence**\n- Confirmed: `id` is numeric (7)\n- Unconfirmed: the vendor's `line_type` on refunds; the payload was never read";
+        let facts = unconfirmed_external_facts(
+            body,
+            &["The vendor's `LINE_TYPE` on refunds; the payload was never read".into()],
+        );
+        // Read from the description and from the reviewer's reading, once.
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert_eq!(hold_for_unconfirmed("APPROVE", &facts), "COMMENT");
+        assert_eq!(
+            hold_for_unconfirmed("REQUEST_CHANGES", &facts),
+            "REQUEST_CHANGES"
+        );
+        assert_eq!(hold_for_unconfirmed("APPROVE", &[]), "APPROVE");
+        // A human PR that says so in words: the reviewer's reading counts.
+        let read = unconfirmed_external_facts(
+            "We didn't check the vendor field.",
+            &["the vendor's `status` field".into()],
+        );
+        assert_eq!(hold_for_unconfirmed("APPROVE", &read), "COMMENT");
+        let md = unconfirmed_markdown(&facts);
+        assert!(md.contains("isn't approved yet"));
+        assert!(md.contains("Could you confirm each"));
+        assert!(md.contains("- the vendor's `line_type` on refunds"));
+        assert_eq!(unconfirmed_markdown(&[]), "");
     }
 }
