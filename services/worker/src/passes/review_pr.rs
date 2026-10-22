@@ -1979,6 +1979,7 @@ async fn run_once(
     if let Some(s) = &skills {
         note_review_standards(state, &msg.team_id, &record_sk, &s.applied_names()).await;
     }
+    note_review_details(state, &msg.team_id, &record_sk, title, &findings).await;
     info!(
         pr = msg.pr_number,
         verdict = verdict,
@@ -2824,6 +2825,59 @@ async fn note_review_standards(
     }
 }
 
+/// The review's findings as the dashboard shows them: one object per
+/// finding with its severity, what it rests on (`defect`, `concern` or
+/// `question`), whether it holds the merge, and where it points. Bodies are
+/// cut so the list stays well under the item limit.
+fn findings_record(findings: &[review_agent::Finding]) -> String {
+    let list: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            let kind = match f.evidence() {
+                review_agent::Evidence::VerifiedDefect => "defect",
+                review_agent::Evidence::UnverifiedConcern => "concern",
+                review_agent::Evidence::Question => "question",
+            };
+            serde_json::json!({
+                "severity": f.severity.trim().to_ascii_lowercase(),
+                "kind": kind,
+                "blocks": f.holds_merge(),
+                "file": f.file,
+                "line": f.line,
+                "title": f.title,
+                "body": common::head_tail_str(&f.body, 4_000),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(list).to_string()
+}
+
+/// Puts the PR's title and the structured findings on the review record, for
+/// its page. Best-effort, like the record itself.
+async fn note_review_details(
+    state: &WorkerState,
+    team_id: &str,
+    record_sk: &str,
+    pr_title: &str,
+    findings: &[review_agent::Finding],
+) {
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(record_sk))
+        .condition_expression("attribute_exists(sk)")
+        .update_expression("SET pr_title = :t, findings = :f")
+        .expression_attribute_values(":t", attr_s(&common::head_tail_str(pr_title, 500)))
+        .expression_attribute_values(":f", attr_s(&findings_record(findings)))
+        .send()
+        .await
+    {
+        warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Failed to note the review's title and findings (non-fatal)");
+    }
+}
+
 /// Cost of a review as stored (4 decimals, like run records).
 fn review_cost_str(usage: &TokenUsage) -> String {
     format!("{:.4}", usage.estimated_cost())
@@ -3418,6 +3472,34 @@ mod verdict_tests {
             evidence: evidence.map(String::from),
             ..Default::default()
         }
+    }
+
+    /// The record's findings carry what the page shows: severity, kind,
+    /// whether it holds the merge, and where it points.
+    #[test]
+    fn the_findings_record_says_what_each_finding_is_and_where() {
+        let mut q = finding("question", None, "Is the field ever null?");
+        q.blocks = Some(true);
+        let list = vec![
+            finding("bug", None, "The handler reads `id` before the check."),
+            finding("bug", Some("unverified-concern"), "Might time out."),
+            q,
+        ];
+        let v: serde_json::Value = serde_json::from_str(&super::findings_record(&list)).unwrap();
+        let a = v.as_array().unwrap();
+        assert_eq!(a.len(), 3);
+        assert_eq!(a[0]["kind"], "defect");
+        assert_eq!(a[0]["blocks"], true);
+        assert_eq!(a[0]["severity"], "medium");
+        assert_eq!(a[0]["file"], "infra/redirects.tf");
+        assert_eq!(a[0]["line"], 12);
+        assert_eq!(a[0]["title"], "Redirect targets");
+        assert_eq!(a[0]["body"], "The handler reads `id` before the check.");
+        assert_eq!(a[1]["kind"], "concern");
+        assert_eq!(a[1]["blocks"], false);
+        assert_eq!(a[2]["kind"], "question");
+        assert_eq!(a[2]["blocks"], true);
+        assert_eq!(super::findings_record(&[]), "[]");
     }
 
     /// A carried approval says it is one, and why, in its one line.
