@@ -148,6 +148,9 @@ pub struct Answer {
     pub hidden: usize,
     /// How much came back, for the activity log ("12 items", "0 items").
     pub size: String,
+    /// The reply held a list of records and it was empty: nothing about the
+    /// system was read, so this is not evidence of what its records hold.
+    pub empty: bool,
 }
 
 /// The records in a reply: a top-level list, or the list under a `data`,
@@ -255,6 +258,7 @@ impl Rest<'_> {
             text,
             hidden,
             size,
+            empty: found == Some(0),
         })
     }
 }
@@ -374,11 +378,17 @@ mod tests {
         let empty = r.get("/v1/org/7/programs/1/sessions", None).await.unwrap();
         assert_eq!(empty.size, "0 items");
         assert!(empty.text.contains("empty list"), "{}", empty.text);
+        assert!(
+            empty.empty,
+            "an empty list is not evidence of what records hold"
+        );
         let two = r.get("/v1/org/7/programs/2/sessions", None).await.unwrap();
         assert_eq!(two.size, "2 items");
         assert!(!two.text.contains("empty list"));
+        assert!(!two.empty);
         let one = r.get("/v1/org/7/programs/12", None).await.unwrap();
         assert!(one.size.ends_with("characters"), "{}", one.size);
+        assert!(!one.empty, "a single record is not an empty list");
     }
 
     #[tokio::test]

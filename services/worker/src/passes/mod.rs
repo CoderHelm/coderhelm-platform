@@ -722,6 +722,7 @@ pub mod review_lessons;
 pub mod review_pr;
 pub mod review_reminder;
 pub mod review_risk;
+pub mod review_scope;
 pub mod review_sweep;
 pub mod review_verdict;
 mod security;

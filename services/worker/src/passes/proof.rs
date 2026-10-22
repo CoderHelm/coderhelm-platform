@@ -30,6 +30,7 @@ pub const CODER_RULES: &str = "
 - Measure the impact when the data is in a connected source: count the records the change affects, with a query, and note a few concrete examples (ids or names).
 - Logging: INFO only for actual changes and decisions; diagnostics go to DEBUG. Never add an INFO log that fires for every record or on every scheduled run.
 - Never leave \"unconfirmed\", \"not verified\" or \"not measured\" for something a connected source could answer: look it up. When no connected source can reach it, say exactly which source is missing.
+- A lookup that failed or came back empty (an empty list, no rows) confirms nothing about the system: it is not a payload. Find out why (a wrong path, a parent id from another record, a wrong table) and read again until a real record comes back.
 
 ## Reading another system's data (every change that does)
 - Actual data first, always: before deciding how to read another system's records, read real ones (a payload, a row) for the ticket's records and a broad sample of others, and list every field on them. Decide from what you saw, never from names in the code, a schema or a guess.
@@ -42,15 +43,70 @@ pub const CODER_RULES: &str = "
 ";
 
 /// How the coder ends: its evidence becomes the PR description's.
-pub const EVIDENCE_OUTPUT: &str = "When you finish, output a one-line summary, then a section that starts with `Evidence:` listing: each fact about a system this code doesn't own that the change relies on, the lookup that confirmed it and what came back (quote the field and its value); how many records the change affects, where you counted them, and a few examples (ids or names); and anything no connected source could answer, naming the source that is missing. Write `Evidence: none needed` when the change relies on nothing outside the code and changes no stored records. Do NOT describe each code change in detail.";
+pub const EVIDENCE_OUTPUT: &str = "When you finish, output a one-line summary, then a section that starts with `Evidence:` listing: each fact about a system this code doesn't own that the change relies on, on its own line that starts `- Confirmed:` (the fact, the lookup that confirmed it and what came back: quote the field and its value) or `- Unconfirmed:` (the fact, and why nothing confirmed it: the source that is missing, or the lookup that failed or came back empty); how many records the change affects, where you counted them, and a few examples (ids or names); and anything no connected source could answer, naming the source that is missing. Write `Evidence: none needed` when the change relies on nothing outside the code and changes no stored records. Do NOT describe each code change in detail.";
+
+/// How one lookup ended, as recorded when it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupOutcome {
+    /// Data came back.
+    Answered,
+    /// The system answered with no records (an empty list, no rows): nothing
+    /// about what its records hold was read.
+    Empty,
+    /// It failed or was refused: nothing came back.
+    Failed,
+}
+
+/// One lookup a run or a review made, as recorded when it ran.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lookup {
+    /// Its id in this work (`L3`), as the agent was told; findings cite it.
+    pub id: String,
+    /// The source it asked, by name.
+    pub source: String,
+    pub outcome: LookupOutcome,
+    /// What was asked and what came back, as one entry.
+    pub line: String,
+}
+
+impl Lookup {
+    /// The entry for a lookup: `- [id] asked` and what came back, by outcome.
+    pub fn new(id: String, source: &str, outcome: LookupOutcome, asked: &str, got: &str) -> Self {
+        let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let got = flat(got);
+        let got = common::truncate_str(&got, 500);
+        let came_back = match outcome {
+            LookupOutcome::Answered => format!("Came back: {got}"),
+            LookupOutcome::Empty => {
+                format!("Came back EMPTY (no records, so it confirms nothing): {got}")
+            }
+            LookupOutcome::Failed => format!("FAILED (nothing came back): {got}"),
+        };
+        let asked = flat(asked);
+        Self {
+            line: format!(
+                "- [{id}] {}\n  {came_back}",
+                common::truncate_str(&asked, 300)
+            ),
+            id,
+            source: source.to_string(),
+            outcome,
+        }
+    }
+
+    /// Something about the system came back.
+    pub fn gave_data(&self) -> bool {
+        self.outcome == LookupOutcome::Answered
+    }
+}
 
 /// What the run gathered that the change rests on.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunEvidence {
     /// The data sources this work could read, one line each.
     pub sources: Vec<String>,
-    /// Each lookup made and what came back.
-    pub lookups: Vec<String>,
+    /// Each lookup made and how it ended.
+    pub lookups: Vec<Lookup>,
     /// The coder's own account: its closing summary and `Evidence:` section.
     pub notes: String,
     /// What the last sandbox check run came to, one line per step (kind,
@@ -60,7 +116,20 @@ pub struct RunEvidence {
     pub ci_gates: Vec<CheckKind>,
 }
 
+/// Starts a fix round's notes inside [`RunEvidence::notes`].
+const FIX_ROUND_MARK: &str = "After a fix round:";
+
 impl RunEvidence {
+    /// The coder's latest account: the last fix round's notes, or the first
+    /// pass's when no round wrote any. A fact a fix round confirmed is no
+    /// longer held against the change by what the first pass wrote.
+    pub fn latest_notes(&self) -> &str {
+        match self.notes.rfind(FIX_ROUND_MARK) {
+            Some(i) => &self.notes[i + FIX_ROUND_MARK.len()..],
+            None => &self.notes,
+        }
+    }
+
     /// Adds a later pass's evidence (a fix round) to this run's.
     pub fn merge(&mut self, later: RunEvidence) {
         for s in later.sources {
@@ -84,14 +153,14 @@ impl RunEvidence {
             if self.notes.trim().is_empty() {
                 self.notes = notes.to_string();
             } else {
-                self.notes = format!("{}\n\nAfter a fix round:\n{notes}", self.notes.trim());
+                self.notes = format!("{}\n\n{FIX_ROUND_MARK}\n{notes}", self.notes.trim());
             }
         }
     }
 
     /// What the judge reads about the run's evidence.
     pub fn for_judge(&self) -> String {
-        let list = |items: &[String], none: &str| {
+        let list = |items: &[&str], none: &str| {
             if items.is_empty() {
                 format!("{none}\n")
             } else {
@@ -101,15 +170,18 @@ impl RunEvidence {
                     .collect()
             }
         };
+        let sources: Vec<&str> = self.sources.iter().map(String::as_str).collect();
+        let lookups: Vec<&str> = self.lookups.iter().map(|l| l.line.as_str()).collect();
+        let checks: Vec<&str> = self.checks.iter().map(String::as_str).collect();
         format!(
             "## Data sources this team connected for this repository\n{}\n\
              ## Lookups the run made, and what came back\n{}\n\
              ## Checks run in the sandbox before the PR opened (recorded by CoderHelm, not the coder)\n{}\n\
              ## Checks the repository's CI runs on this pull request\n{}\n\n\
              ## The coder's evidence notes (they become the PR description's evidence)\n{}\n",
-            list(&self.sources, "(none connected)"),
-            list(&self.lookups, "(no lookups were made)"),
-            list(&self.checks, "(no sandbox checks ran)"),
+            list(&sources, "(none connected)"),
+            list(&lookups, "(no lookups were made)"),
+            list(&checks, "(no sandbox checks ran)"),
             match self.ci_gates.as_slice() {
                 [] => "(none found: nothing checks this PR after it opens)".to_string(),
                 g => g.iter().map(|k| k.name()).collect::<Vec<_>>().join(", "),
@@ -129,7 +201,7 @@ impl RunEvidence {
         let mut out =
             String::from("\n## What the run looked up (the source for the Evidence section)\n");
         for l in &self.lookups {
-            out.push_str(&format!("{}\n", l.trim_end()));
+            out.push_str(&format!("{}\n", l.line.trim_end()));
         }
         if !self.notes.trim().is_empty() {
             out.push_str(&format!("\nThe coder's notes:\n{}\n", self.notes.trim()));
@@ -333,7 +405,8 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      Many changes touch none of these: a change that relies on nothing outside its own code, \
      changes no stored records and adds no logs passes all of them. Judge only what the evidence \
      shows and do not invent concerns. A fact the lookups confirm is proven even when the notes \
-     are short. Each finding is short: `detail` is ONE sentence naming what is unverified (the \
+     are short. A lookup marked FAILED or EMPTY confirms nothing, and a fact the notes mark \
+     `Unconfirmed:` is not proven. Each finding is short: `detail` is ONE sentence naming what is unverified (the \
      exact field, records, log line, assumption or check); `settle` is ONE sentence on how to \
      settle it (which connected source to read, what to count, which log to lower, which check \
      result). No lists, no preamble, no repeating the rule's text.\n\
@@ -406,6 +479,117 @@ fn proof_gaps(findings: &[Finding]) -> usize {
         .iter()
         .filter(|f| f.settler() == Settler::Proof)
         .count()
+}
+
+/// How an evidence line that names a fact nothing confirmed starts (after
+/// any `>` quote and `-` bullet). `- Unconfirmed:` is what the coder is told
+/// to write ([`EVIDENCE_OUTPUT`]); the last is how [`gaps_section`] names an
+/// open `external_fact` gap at the top of a PR.
+const UNCONFIRMED_MARKERS: &[&str] = &[
+    "unconfirmed:",
+    "unverified:",
+    "not confirmed:",
+    "not verified:",
+    "unconfirmed external field or behaviour:",
+];
+
+/// The facts an evidence text itself marks as unconfirmed: each line that
+/// starts with one of [`UNCONFIRMED_MARKERS`], with the marker taken off.
+/// Reads the coder's notes before a PR opens and a PR description in review.
+pub fn unconfirmed_facts(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let mut l = line.trim();
+            loop {
+                let before = l;
+                l = l.trim_start_matches('>').trim_start();
+                if let Some(rest) = l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")) {
+                    l = rest.trim_start();
+                }
+                if l == before {
+                    break;
+                }
+            }
+            let l = l.trim_start_matches("**");
+            let lower = l.to_ascii_lowercase();
+            let marker = UNCONFIRMED_MARKERS.iter().find(|m| lower.starts_with(*m))?;
+            let fact = l[marker.len()..].trim_start_matches("**").trim();
+            (!fact.is_empty()).then(|| fact.to_string())
+        })
+        .collect()
+}
+
+/// Gaps the run's own record shows, whatever the judge says: a source the
+/// run looked up where no lookup brought a record back (each failed or came
+/// back empty), and each fact the coder's notes mark unconfirmed. Either way
+/// nothing the change relies on from that system was read from a real
+/// payload.
+pub fn recorded_gaps(evidence: &RunEvidence) -> Vec<Finding> {
+    let mut sources: Vec<&str> = Vec::new();
+    for l in &evidence.lookups {
+        if !sources.contains(&l.source.as_str()) {
+            sources.push(&l.source);
+        }
+    }
+    let mut out = Vec::new();
+    for source in sources {
+        let of: Vec<&Lookup> = evidence
+            .lookups
+            .iter()
+            .filter(|l| l.source == source)
+            .collect();
+        if of.iter().any(|l| l.gave_data()) {
+            continue;
+        }
+        let empty = of
+            .iter()
+            .filter(|l| l.outcome == LookupOutcome::Empty)
+            .count();
+        let failed = of.len() - empty;
+        let ids: Vec<&str> = of.iter().map(|l| l.id.as_str()).collect();
+        out.push(Finding {
+            point: "external_fact".into(),
+            detail: format!(
+                "No lookup against {source} brought a record back ({failed} failed, {empty} came \
+                 back empty: {}), so nothing the change relies on from it was read from a real \
+                 payload.",
+                ids.join(", ")
+            ),
+            settle: format!(
+                "Read one real record from {source}, checking the path, table and every id in it \
+                 against where the code builds them, and quote what came back."
+            ),
+            ..Default::default()
+        });
+    }
+    for fact in unconfirmed_facts(evidence.latest_notes()) {
+        out.push(Finding {
+            point: "external_fact".into(),
+            detail: format!("The evidence notes mark this unconfirmed: {fact}"),
+            settle: "Confirm it through a connected source and quote what came back, or change \
+                     the code so it no longer depends on it."
+                .into(),
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// The judge's findings with the [`recorded_gaps`] added. A recorded gap
+/// stands even when the judge passed the change or couldn't answer, and it is
+/// added after [`classify`], so it is always a proof gap (never `ci_pending`).
+pub fn with_recorded(judged: Option<Vec<Finding>>, evidence: &RunEvidence) -> Option<Vec<Finding>> {
+    let recorded = recorded_gaps(evidence);
+    if recorded.is_empty() {
+        return judged;
+    }
+    let mut all = judged.unwrap_or_default();
+    for g in recorded {
+        if !all.contains(&g) {
+            all.push(g);
+        }
+    }
+    Some(all)
 }
 
 /// What the coder is told in a fix round: the proof gaps only.
@@ -617,10 +801,12 @@ pub async fn prove(
     loop {
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
-        let findings = judge(
+        let judged = judge(
             w.state, w.msg, w.github, w.branch, w.plan, evidence, w.provider, usage,
         )
         .await;
+        let recorded = recorded_gaps(evidence).len();
+        let findings = with_recorded(judged, evidence);
         super::write_pass_trace(
             w.state,
             &w.msg.team_id,
@@ -636,6 +822,7 @@ pub async fn prove(
             run_id = w.run_id,
             judged = findings.is_some(),
             gaps = findings.as_ref().map_or(0, Vec::len),
+            recorded,
             rounds,
             "Proof check complete"
         );
@@ -749,6 +936,132 @@ mod tests {
         }
     }
 
+    fn answered(id: &str, source: &str, asked: &str, got: &str) -> Lookup {
+        Lookup::new(id.into(), source, LookupOutcome::Answered, asked, got)
+    }
+
+    fn ended(id: &str, source: &str, outcome: LookupOutcome) -> Lookup {
+        Lookup::new(
+            id.into(),
+            source,
+            outcome,
+            "GET /v1/orders/7/lines",
+            "0 items",
+        )
+    }
+
+    #[test]
+    fn a_source_no_lookup_read_is_a_gap_whatever_the_judge_says() {
+        // The run asked the vendor API twice: one empty list, one failure.
+        // The judge passed the change; the record still holds it.
+        let ev = RunEvidence {
+            sources: vec!["vendor (api)".into(), "warehouse (database)".into()],
+            lookups: vec![
+                ended("T1", "vendor", LookupOutcome::Empty),
+                ended("T2", "vendor", LookupOutcome::Failed),
+                answered("L1", "warehouse", "select count(*)", "42"),
+            ],
+            notes: "Evidence: relies on `line_type` from the vendor's order lines.".into(),
+            // CI runs every check: still nothing CI settles.
+            ci_gates: ["lint", "typecheck", "build", "tests"]
+                .iter()
+                .filter_map(|k| CheckKind::parse(k))
+                .collect(),
+            ..Default::default()
+        };
+        let gaps = recorded_gaps(&ev);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].point, "external_fact");
+        assert!(gaps[0].detail.contains("No lookup against vendor"));
+        assert!(gaps[0]
+            .detail
+            .contains("1 failed, 1 came back empty: T1, T2"));
+        let judged = with_recorded(Some(vec![]), &ev).unwrap();
+        assert_eq!(judged, gaps);
+        assert_eq!(next(Some(&judged), 0, true), Next::FixRound);
+        // A judge that couldn't answer doesn't wave it through either.
+        assert_eq!(with_recorded(None, &ev), Some(gaps.clone()));
+        // A real proof gap: never waiting on CI, and it leads the PR as a
+        // WARNING in the "Not yet verified" section, with how to settle it.
+        assert!(judged.iter().all(|f| f.settler() == Settler::Proof));
+        let with_ci = with_recorded(Some(vec![check_finding("ci_pending", "tests")]), &ev).unwrap();
+        assert_eq!(proof_gaps(&with_ci), 1);
+        let top = gaps_section(&judged);
+        assert!(top.starts_with(UNVERIFIED_START), "{top}");
+        assert!(top.contains("> [!WARNING]"));
+        assert!(top
+            .contains("> - **Unconfirmed external field or behaviour:** No lookup against vendor"));
+        assert!(top.contains("Settle: Read one real record from vendor"));
+        assert!(!top.contains(CI_MARK));
+        assert_eq!(settle_by_ci(&format!("{top}Body")), None);
+        assert_eq!(unconfirmed_facts(&top).len(), 1);
+        // The entries say so to the judge and the PR writer.
+        assert!(ev
+            .for_judge()
+            .contains("[T1] GET /v1/orders/7/lines\n  Came back EMPTY"));
+        assert!(ev
+            .for_judge()
+            .contains("[T2] GET /v1/orders/7/lines\n  FAILED"));
+
+        // One real record from the vendor settles it.
+        let mut fixed = ev.clone();
+        fixed.merge(RunEvidence {
+            lookups: vec![answered(
+                "T1",
+                "vendor",
+                "GET /v1/orders/8/lines",
+                "[{\"line_type\": \"fee\"}]",
+            )],
+            ..Default::default()
+        });
+        assert!(recorded_gaps(&fixed).is_empty());
+        assert_eq!(with_recorded(None, &fixed), None);
+        assert_eq!(with_recorded(Some(vec![]), &fixed), Some(vec![]));
+    }
+
+    #[test]
+    fn a_fact_the_notes_mark_unconfirmed_is_a_gap_until_a_round_confirms_it() {
+        let mut ev = RunEvidence {
+            notes: "Fixed the sync.\n\nEvidence:\n- Confirmed: `id` is numeric (L1 came back 7)\n- Unconfirmed: `line_type` values on refunds; the payload was never read".into(),
+            ..Default::default()
+        };
+        let gaps = recorded_gaps(&ev);
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0]
+            .detail
+            .contains("`line_type` values on refunds; the payload was never read"));
+        ev.merge(RunEvidence {
+            notes: "Evidence:\n- Confirmed: `line_type` is `refund` on refunds (T3)".into(),
+            ..Default::default()
+        });
+        assert!(recorded_gaps(&ev).is_empty(), "{:?}", recorded_gaps(&ev));
+    }
+
+    #[test]
+    fn unconfirmed_lines_are_read_in_every_form_they_take() {
+        let text = "Evidence:\n- Confirmed: a\n- Unconfirmed: the vendor's `status` field\n* **Not verified:** refunds carry `amount`\n> - **Unconfirmed external field or behaviour:** confirm `name` from the vendor API\nunverified:   \nThe payload is unconfirmed: prose isn't a marker";
+        assert_eq!(
+            unconfirmed_facts(text),
+            vec![
+                "the vendor's `status` field".to_string(),
+                "refunds carry `amount`".to_string(),
+                "confirm `name` from the vendor API".to_string(),
+            ]
+        );
+        // What the PR's top note says about an open gap reads back the same.
+        let top = gaps_section(&[finding(
+            "external_fact",
+            "confirm `name` from the vendor API",
+        )]);
+        assert_eq!(
+            unconfirmed_facts(&top),
+            vec!["confirm `name` from the vendor API".to_string()]
+        );
+        assert!(unconfirmed_facts(&gaps_section(&[finding("logging", "x")])).is_empty());
+        assert!(EVIDENCE_OUTPUT.contains("`- Unconfirmed:`"));
+        assert!(JUDGE_SYSTEM.contains("FAILED or EMPTY confirms nothing"));
+    }
+
     #[test]
     fn reads_the_judges_findings() {
         let reply = "Looked at it.\n```json\n{\"findings\":[{\"point\":\"external_fact\",\"detail\":\"`name` on products is never read from a real payload\"},{\"point\":\"logging\",\"detail\":\"\"}]}\n```";
@@ -801,7 +1114,7 @@ mod tests {
     fn the_judge_sees_sources_lookups_and_notes() {
         let ev = RunEvidence {
             sources: vec!["warehouse (database)".into()],
-            lookups: vec!["- Asked warehouse: select count(*) ...\n  Came back: 42".into()],
+            lookups: vec![answered("L1", "warehouse", "select count(*) ...", "42")],
             notes: "Evidence: 42 records affected".into(),
             ..Default::default()
         };
@@ -845,24 +1158,26 @@ mod tests {
 
     #[test]
     fn a_fix_round_adds_to_the_runs_evidence() {
+        let one = answered("L1", "vendor", "GET /v1/one", "{}");
+        let two = answered("L1", "vendor", "GET /v1/two", "{}");
         let mut ev = RunEvidence {
             sources: vec!["vendor (api)".into()],
-            lookups: vec!["- one".into()],
+            lookups: vec![one.clone()],
             notes: "Evidence: none needed".into(),
             ..Default::default()
         };
         ev.merge(RunEvidence {
             sources: vec!["vendor (api)".into()],
-            lookups: vec!["- two".into()],
+            lookups: vec![two.clone()],
             notes: "Evidence: field confirmed".into(),
             ..Default::default()
         });
         assert_eq!(ev.sources, vec!["vendor (api)".to_string()]);
-        assert_eq!(ev.lookups, vec!["- one".to_string(), "- two".to_string()]);
+        assert_eq!(ev.lookups, vec![one, two]);
         assert!(ev
             .notes
             .ends_with("After a fix round:\nEvidence: field confirmed"));
-        assert!(ev.for_pr().contains("- two"));
+        assert!(ev.for_pr().contains("GET /v1/two"));
         assert_eq!(RunEvidence::default().for_pr(), "");
     }
 

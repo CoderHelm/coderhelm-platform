@@ -1,8 +1,8 @@
 //! Lessons the reviewer learns from people's pushback.
 //!
 //! When a person disputes one of CoderHelm's review findings (a reply under
-//! its comment, a PR comment, dismissing its review) or closes the PR while
-//! its "changes requested" stands, the gateway marks the PR's discussion as
+//! its comment, a PR comment, dismissing its review) or closes, approves or
+//! merges the PR while its "changes requested" stands, the gateway marks the PR's discussion as
 //! having news ([`mark_event`]) and queues one judgment after a quiet period.
 //! Only the job for the latest event judges ([`debounce`]), so one discussion
 //! yields one judgment. The worker's model decides whether the reviewer was
@@ -43,6 +43,11 @@ pub const TRIGGER_PR_COMMENT: &str = "pr_comment";
 pub const TRIGGER_REVIEW_BODY: &str = "review_body";
 pub const TRIGGER_DISMISSED: &str = "dismissed";
 pub const TRIGGER_CLOSED: &str = "closed_unmerged";
+/// A person approved the PR while CoderHelm's latest verdict requested
+/// changes: the strongest sign its block was wrong.
+pub const TRIGGER_APPROVED_OVER_BLOCK: &str = "approved_over_block";
+/// A person merged the PR while CoderHelm's latest verdict requested changes.
+pub const TRIGGER_MERGED_OVER_BLOCK: &str = "merged_over_block";
 
 /// The sort-key prefix of one scope's lessons (`owner/name` or `*`).
 pub fn scope_prefix(scope: &str) -> String {

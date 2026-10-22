@@ -409,6 +409,15 @@ pub async fn run(
                 .await;
             Ok(())
         }
+        Ok(Outcome::Skipped { reason }) => {
+            job.finished(
+                state,
+                &msg,
+                common::review_live::Finished::Skipped { reason: &reason },
+            )
+            .await;
+            Ok(())
+        }
         // A reply that disagrees with the standing formal verdict: the formal
         // review runs first, in this job, and the reply is posted after it so
         // the two never contradict each other.
@@ -416,7 +425,9 @@ pub async fn run(
             let mut head = review.head_sha.clone();
             let formal = match run_budgeted(state, (*review).clone(), &mut head, &job).await {
                 Ok(Outcome::Done { posted, .. }) => FormalResult::Posted(posted),
-                Ok(Outcome::ReviewThenReply { .. }) => FormalResult::Posted(None),
+                Ok(Outcome::ReviewThenReply { .. }) | Ok(Outcome::Skipped { .. }) => {
+                    FormalResult::Posted(None)
+                }
                 Err(e) => {
                     review_failed(state, &review, &head, &e.to_string(), &job).await;
                     FormalResult::Failed
@@ -445,6 +456,9 @@ pub(crate) enum Outcome {
         posted: Option<&'static str>,
         run_review: Option<RunReview>,
     },
+    /// Nothing to review: a push after CoderHelm approved changed no code or
+    /// data. The approval stands; `reason` is shown in the live status.
+    Skipped { reason: String },
     /// A reply is ready, but its conclusion disagrees with CoderHelm's
     /// standing formal verdict: run `review` first, then post `reply`.
     ReviewThenReply {
@@ -1108,6 +1122,64 @@ async fn run_once(
     }
 
     // ── Verdict mode (agentic: walk the repo, structured findings, self-critique) ──
+
+    // A push after CoderHelm approved an earlier commit is reviewed from that
+    // commit: only what changed since. One that changed no code or data is
+    // not reviewed at all and the approval stands. A push after a request
+    // for changes (or questions) gets a full review.
+    let mut review_diff = diff.clone();
+    if let Some(approved) = super::review_scope::approved_base(
+        &msg.trigger,
+        msg.question.is_some(),
+        &records,
+        &head_sha,
+    ) {
+        match github
+            .get_diff(&msg.repo_owner, &msg.repo_name, &approved, &head_sha)
+            .await
+        {
+            Ok(since) if super::review_scope::builds_on(&since) => {
+                let short = &approved[..approved.len().min(7)];
+                let unconfirmed = review_agent::unconfirmed_external_facts(pr_body, &[]);
+                if !super::review_scope::touches_code(&since) && unconfirmed.is_empty() {
+                    info!(pr = msg.pr_number, approved = %approved, head = %head_sha, "Push changed no code or data since the approval — review skipped");
+                    // The auto-merge gate is bound to a head: carry the
+                    // approval to this one, as a review of it would.
+                    let _ = super::review_actions::run_on_approve(
+                        state,
+                        &github,
+                        &msg.team_id,
+                        msg.installation_id,
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        msg.pr_number,
+                        &head_sha,
+                        base_branch,
+                        self_authored,
+                    )
+                    .await;
+                    return Ok(Outcome::Skipped {
+                        reason: format!(
+                            "Not reviewed: nothing but docs, comments or whitespace changed \
+                             since CoderHelm approved {short}, so that approval stands."
+                        ),
+                    });
+                }
+                info!(pr = msg.pr_number, approved = %approved, head = %head_sha, files = ?super::review_scope::code_files(&since), "Reviewing only what changed since the approval");
+                review_diff = format!(
+                    "(CoderHelm approved {short} earlier. This review covers only what changed \
+                     since then; the rest of the PR was reviewed and approved.)\n{}",
+                    review_agent::format_diff(&since, 40_000)
+                );
+            }
+            Ok(_) => {
+                info!(pr = msg.pr_number, approved = %approved, "Approved commit isn't an ancestor of the head (rebased) — full review");
+            }
+            Err(e) => {
+                warn!(pr = msg.pr_number, error = %e, "Could not read the diff since the approval — full review");
+            }
+        }
+    }
     // Fold this team's past 👎 feedback into the prompt so the reviewer learns and
     // stops repeating rejected comment styles ("leave comments to learn").
     // People's pushback on this PR still waiting out its quiet period is
@@ -1371,7 +1443,7 @@ async fn run_once(
         &head_sha,
         title,
         pr_body,
-        &diff,
+        &review_diff,
         &instructions_block,
         graph.as_ref(),
         &extra_context,
@@ -1445,7 +1517,7 @@ async fn run_once(
     let mut findings = review_agent::critique_findings(
         state,
         &provider,
-        &diff,
+        &review_diff,
         output.findings,
         review_agent::CriticContext {
             require_tests: cfg.require_tests,
@@ -1478,6 +1550,23 @@ async fn run_once(
         info!(
             pr = msg.pr_number,
             dropped, "Reviewer dropped unsafe suggestions"
+        );
+    }
+
+    // 2c) A blocking finding that rests only on a live lookup that failed or
+    // came back empty rests on nothing: it is kept as a note saying so.
+    let lookups: Vec<super::proof::Lookup> = live
+        .as_ref()
+        .map(|l| l.lookups())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(ops.as_ref().map(|o| o.lookups()).unwrap_or_default())
+        .collect();
+    let on_failed_lookups = review_agent::enforce_failed_lookups(&mut findings, &lookups);
+    if on_failed_lookups > 0 {
+        info!(
+            pr = msg.pr_number,
+            on_failed_lookups, "Blocking findings resting on failed lookups made non-blocking"
         );
     }
 
@@ -1561,6 +1650,18 @@ async fn run_once(
         still_open_questions,
         verify_failed,
     );
+    // Never an approval (nor an armed auto-merge) on facts the PR's own
+    // evidence says are unconfirmed: a COMMENT that asks for them instead.
+    let unconfirmed = review_agent::unconfirmed_external_facts(pr_body, &output.unconfirmed_facts);
+    let held_for_unconfirmed = review_agent::hold_for_unconfirmed(verdict, &unconfirmed);
+    if held_for_unconfirmed != verdict {
+        info!(
+            pr = msg.pr_number,
+            unconfirmed = unconfirmed.len(),
+            "Approval held: the PR's evidence leaves external facts unconfirmed"
+        );
+    }
+    let verdict = held_for_unconfirmed;
     // Computed, explainable risk (blast-radius-weighted) — overrides the model's
     // guess and drives the displayed level.
     let risk_report = review_risk::assess(
@@ -1599,6 +1700,7 @@ async fn run_once(
             ));
         }
     }
+    full_body.push_str(&review_agent::unconfirmed_markdown(&unconfirmed));
     if !verify_md.is_empty() {
         full_body.push_str(&format!("\n\n{verify_md}"));
     }
@@ -2023,6 +2125,12 @@ pub async fn review_for_run(
         Ok(Ok(Outcome::ReviewThenReply { .. })) => {
             settle_job_claim(state, &msg, true).await;
             job.finished(state, &msg, Finished::Done).await;
+            None
+        }
+        Ok(Ok(Outcome::Skipped { reason })) => {
+            settle_job_claim(state, &msg, true).await;
+            job.finished(state, &msg, Finished::Skipped { reason: &reason })
+                .await;
             None
         }
         Ok(Err(e)) => {
