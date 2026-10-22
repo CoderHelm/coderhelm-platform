@@ -496,6 +496,16 @@ fn truncate_on_boundary(body: &mut String, max: usize) {
     body.push_str("\n… (truncated — open the review for the full text)");
 }
 
+/// The structured findings kept on a review record (a JSON list), or null
+/// when the record has none or they can't be read.
+fn review_findings(item: &HashMap<String, AttributeValue>) -> Value {
+    item.get("findings")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .filter(Value::is_array)
+        .unwrap_or(Value::Null)
+}
+
 fn review_item_to_json(item: &HashMap<String, AttributeValue>, truncate_body: bool) -> Value {
     let mut body = item_str(item, "body", "");
     if truncate_body {
@@ -526,6 +536,10 @@ fn review_item_to_json(item: &HashMap<String, AttributeValue>, truncate_body: bo
         "thumbs_down": item_num(item, "thumbs_down", 0),
         "rating_comments": comments,
         "created_at": item_str(item, "created_at", ""),
+        // The PR's title and the structured findings, on reviews written
+        // since they were kept; older records have neither.
+        "pr_title": item_str(item, "pr_title", ""),
+        "findings": if truncate_body { Value::Null } else { review_findings(item) },
         // Team standards the review was given in full ("always apply").
         "applied_standards": item
             .get("applied_standards")
@@ -1189,6 +1203,38 @@ mod tests {
         // No gate yet: still a page, nothing stopped.
         let d = gate_detail("your-team/web", 8, true, None, None, now);
         assert_eq!(d["gate"], Value::Null);
+    }
+
+    #[test]
+    fn a_review_shows_its_pr_title_and_structured_findings() {
+        let mut item: HashMap<String, AttributeValue> = HashMap::from([
+            (
+                "sk".into(),
+                attr_s("REVIEW#example-org/web#000007#2026-10-01T00:00:00Z"),
+            ),
+            ("repo".into(), attr_s("example-org/web")),
+            ("pr_title".into(), attr_s("Add login page")),
+            (
+                "findings".into(),
+                attr_s(
+                    r#"[{"severity":"high","kind":"defect","blocks":true,"file":"a.ts","line":3,"title":"T","body":"B"}]"#,
+                ),
+            ),
+        ]);
+        let full = review_item_to_json(&item, false);
+        assert_eq!(full["pr_title"], "Add login page");
+        assert_eq!(full["findings"][0]["file"], "a.ts");
+        assert_eq!(full["findings"][0]["blocks"], true);
+        // The list page leaves them out.
+        assert!(review_item_to_json(&item, true)["findings"].is_null());
+        // Older records, and unreadable ones, have none.
+        item.insert("findings".into(), attr_s("not json"));
+        assert!(review_item_to_json(&item, false)["findings"].is_null());
+        item.remove("findings");
+        item.remove("pr_title");
+        let old = review_item_to_json(&item, false);
+        assert!(old["findings"].is_null());
+        assert_eq!(old["pr_title"], "");
     }
 
     #[test]
