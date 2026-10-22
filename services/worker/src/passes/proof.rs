@@ -14,6 +14,7 @@ use crate::agent::provider;
 use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TokenUsage};
+use crate::passes::checks::CheckKind;
 use crate::passes::plan::PlanResult;
 use crate::passes::FileCache;
 use crate::WorkerState;
@@ -52,6 +53,11 @@ pub struct RunEvidence {
     pub lookups: Vec<String>,
     /// The coder's own account: its closing summary and `Evidence:` section.
     pub notes: String,
+    /// What the last sandbox check run came to, one line per step (kind,
+    /// command, PASS or FAIL), as run_checks recorded it. Empty when none ran.
+    pub checks: Vec<String>,
+    /// The kinds of check the repository's CI runs on the pull request.
+    pub ci_gates: Vec<CheckKind>,
 }
 
 impl RunEvidence {
@@ -63,6 +69,16 @@ impl RunEvidence {
             }
         }
         self.lookups.extend(later.lookups);
+        // The latest check run is what the branch now stands on.
+        if !later.checks.is_empty() {
+            self.checks = later.checks;
+        }
+        for k in later.ci_gates {
+            if !self.ci_gates.contains(&k) {
+                self.ci_gates.push(k);
+            }
+        }
+        self.ci_gates.sort();
         let notes = later.notes.trim();
         if !notes.is_empty() {
             if self.notes.trim().is_empty() {
@@ -88,9 +104,16 @@ impl RunEvidence {
         format!(
             "## Data sources this team connected for this repository\n{}\n\
              ## Lookups the run made, and what came back\n{}\n\
+             ## Checks run in the sandbox before the PR opened (recorded by CoderHelm, not the coder)\n{}\n\
+             ## Checks the repository's CI runs on this pull request\n{}\n\n\
              ## The coder's evidence notes (they become the PR description's evidence)\n{}\n",
             list(&self.sources, "(none connected)"),
             list(&self.lookups, "(no lookups were made)"),
+            list(&self.checks, "(no sandbox checks ran)"),
+            match self.ci_gates.as_slice() {
+                [] => "(none found: nothing checks this PR after it opens)".to_string(),
+                g => g.iter().map(|k| k.name()).collect::<Vec<_>>().join(", "),
+            },
             match self.notes.trim() {
                 "" => "(the coder wrote none)",
                 n => n,
@@ -116,19 +139,56 @@ impl RunEvidence {
 }
 
 /// One of the things the gate judges.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Finding {
     /// One of the judge's points: `external_fact`, `impact`, `logging`,
     /// `assumption`, `structured_field`, `survey`, `silent_fallback`,
-    /// `fixtures`, `one_record` or `team_rule`.
+    /// `fixtures`, `one_record`, `team_rule`, `ci_pending` or
+    /// `manual_check`; or `unrun_check`, which only [`classify`] sets.
     pub point: String,
-    /// What is missing and what would prove or fix it.
+    /// What is unverified, in one sentence.
     pub detail: String,
+    /// How to settle it, in one sentence.
+    #[serde(default)]
+    pub settle: String,
+    /// The kind of check (`lint`, `typecheck`, `build`, `tests`) when the
+    /// finding is only that a check didn't run (or failed) before the PR.
+    #[serde(default)]
+    pub check: String,
 }
 
+/// What settles a finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settler {
+    /// A gap in what the change rests on: a fix round, then the warning.
+    Proof,
+    /// A check the PR's CI runs: a pending item its green result removes.
+    Ci,
+    /// Only a person can check it (a real browser, a device): a step in the
+    /// PR's Verification section, never in the warning.
+    Person,
+}
+
+/// The most a warning bullet says about what's unverified, and about how to
+/// settle it, in characters.
+const MAX_WHAT: usize = 220;
+const MAX_SETTLE: usize = 160;
+
 impl Finding {
+    /// What settles this finding, by its point.
+    pub fn settler(&self) -> Settler {
+        match self.point.trim() {
+            "ci_pending" => Settler::Ci,
+            "manual_check" => Settler::Person,
+            _ => Settler::Proof,
+        }
+    }
+
     fn label(&self) -> &str {
         match self.point.trim() {
+            "ci_pending" => "Waiting on CI",
+            "manual_check" => "Check by hand",
+            "unrun_check" => "Check not run",
             "external_fact" => "Unconfirmed external field or behaviour",
             "impact" => "Impact not measured",
             "logging" => "Noisy logging",
@@ -138,18 +198,80 @@ impl Finding {
             "silent_fallback" => "Unexpected data handled silently",
             "fixtures" => "Tests not built from real payloads",
             "one_record" => "Fixes one record, not the rule",
-            "team_rule" => "Breaks the team's instructions",
+            "team_rule" => "Team instruction not met",
             other => other,
         }
     }
 
+    /// One bullet: what's unverified, then how to settle it, each cut to one
+    /// sentence and a length cap at a word boundary.
     fn line(&self) -> String {
-        format!(
-            "- **{}:** {}",
-            self.label(),
-            self.detail.split_whitespace().collect::<Vec<_>>().join(" ")
-        )
+        let what = sentence(&self.detail, MAX_WHAT);
+        let settle = match (self.settler(), sentence(&self.settle, MAX_SETTLE)) {
+            (_, s) if !s.is_empty() => format!(" Settle: {s}"),
+            (Settler::Ci, _) => " Settles when this PR's CI passes.".to_string(),
+            _ => String::new(),
+        };
+        format!("- **{}:** {what}{settle}", self.label())
     }
+}
+
+/// The first sentence of `text`, whitespace collapsed, cut to `max`
+/// characters at a word boundary (with an ellipsis) when longer.
+fn sentence(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A sentence ends at `.`, `!` or `?` followed by a space and a capital
+    // letter, so `e.g. this` and `v1.2` stay whole.
+    let chars: Vec<char> = flat.chars().collect();
+    let mut end = chars.len();
+    for i in 0..chars.len() {
+        if matches!(chars[i], '.' | '!' | '?')
+            && chars.get(i + 1) == Some(&' ')
+            && chars.get(i + 2).is_some_and(|c| c.is_uppercase())
+        {
+            end = i + 1;
+            break;
+        }
+    }
+    let first: String = chars[..end].iter().collect();
+    if first.chars().count() <= max {
+        return first;
+    }
+    let cut: String = first.chars().take(max).collect();
+    let at_word = match cut.rfind(' ') {
+        Some(i) if i > 0 => &cut[..i],
+        _ => cut.as_str(),
+    };
+    format!("{}…", at_word.trim_end_matches([',', ';', ':']))
+}
+
+/// Holds the judge's findings to the run's facts. A finding that is only
+/// "this check didn't run before the PR" (its `check` names the kind) is not a
+/// proof gap when the repository's CI runs that check on the PR: it becomes a
+/// `ci_pending` item CI's result settles, whatever point the judge gave it.
+/// When CI doesn't run that check, nothing will settle it after the PR opens,
+/// so it is a gap (`unrun_check`). A `ci_pending` that names no kind waits on
+/// CI only when CI runs any check at all.
+pub fn classify(findings: Vec<Finding>, evidence: &RunEvidence) -> Vec<Finding> {
+    findings
+        .into_iter()
+        .map(|mut f| {
+            if f.point.trim() == "manual_check" {
+                return f;
+            }
+            let ci_settles = match CheckKind::parse(&f.check) {
+                Some(k) => Some(evidence.ci_gates.contains(&k)),
+                None if f.point.trim() == "ci_pending" => Some(!evidence.ci_gates.is_empty()),
+                None => None,
+            };
+            match ci_settles {
+                Some(true) => f.point = "ci_pending".into(),
+                Some(false) => f.point = "unrun_check".into(),
+                None => {}
+            }
+            f
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -198,13 +320,24 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      the normal pipeline could do on its next run (an unavoidable one must be in the \
      verification steps).\n\
      10. team_rule: when the team's instructions are given, a miss when the change breaks one \
-     of them (name the rule). Where they conflict with the points above, the team's win.\n\
+     of them (name the rule). Where they conflict with the points above, the team's win. A rule \
+     to run lint, a type-check, a build or tests before pushing is not a team_rule miss: report \
+     a check that didn't run or failed as ci_pending (point 11).\n\
+     11. ci_pending: a check (lint, typecheck, build or tests) that the sandbox checks listed did \
+     not run, or ran and failed, before the PR opened. When the repository's CI runs that check \
+     on the pull request, its result settles it, so it is not a proof gap. Set `check` to the \
+     kind. A check the sandbox list shows as PASS is not a finding.\n\
+     12. manual_check: something only a person can verify (in a real browser, on a device, a \
+     manual click-through). Never a gap; it becomes a numbered step in the PR's Verification \
+     section.\n\
      Many changes touch none of these: a change that relies on nothing outside its own code, \
      changes no stored records and adds no logs passes all of them. Judge only what the evidence \
      shows and do not invent concerns. A fact the lookups confirm is proven even when the notes \
-     are short. Each finding names the exact field, records, log line or assumption, and what \
-     would settle it (which connected source to read, what to count, which log to lower).\n\
-     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule\",\"detail\":\"...\"}]}. \
+     are short. Each finding is short: `detail` is ONE sentence naming what is unverified (the \
+     exact field, records, log line, assumption or check); `settle` is ONE sentence on how to \
+     settle it (which connected source to read, what to count, which log to lower, which check \
+     result). No lists, no preamble, no repeating the rule's text.\n\
+     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule|ci_pending|manual_check\",\"detail\":\"one sentence\",\"settle\":\"one sentence\",\"check\":\"lint|typecheck|build|tests, or empty\"}]}. \
      An empty list when all pass.";
 
 /// The judge's prompt: the change and everything the run gathered.
@@ -257,18 +390,31 @@ pub enum Next {
 }
 
 /// Decides what follows a judgment. `None` is a judge that couldn't answer:
-/// it never holds a PR.
+/// it never holds a PR. Only proof gaps earn a fix round: what CI or a person
+/// settles opens the PR as it is.
 pub fn next(findings: Option<&[Finding]>, rounds_done: u32, has_time: bool) -> Next {
-    match findings {
-        None | Some([]) => Next::Open,
-        Some(_) if rounds_done < MAX_FIX_ROUNDS && has_time => Next::FixRound,
-        Some(_) => Next::OpenWithGaps,
+    match findings.map_or(0, proof_gaps) {
+        0 => Next::Open,
+        _ if rounds_done < MAX_FIX_ROUNDS && has_time => Next::FixRound,
+        _ => Next::OpenWithGaps,
     }
 }
 
-/// What the coder is told in a fix round.
+/// How many of `findings` are proof gaps.
+fn proof_gaps(findings: &[Finding]) -> usize {
+    findings
+        .iter()
+        .filter(|f| f.settler() == Settler::Proof)
+        .count()
+}
+
+/// What the coder is told in a fix round: the proof gaps only.
 pub fn fix_feedback(findings: &[Finding]) -> String {
-    let lines: Vec<String> = findings.iter().map(Finding::line).collect();
+    let lines: Vec<String> = findings
+        .iter()
+        .filter(|f| f.settler() == Settler::Proof)
+        .map(Finding::line)
+        .collect();
     format!(
         "Before the pull request opens, the check of what this change rests on found these gaps. \
          Settle each one: look the fact up through a connected data source and quote what came \
@@ -283,20 +429,97 @@ pub fn fix_feedback(findings: &[Finding]) -> String {
     )
 }
 
-/// The section put at the top of the PR description when gaps remain.
+/// Where the "Not yet verified" section starts and ends in a PR description,
+/// and the mark on each item the PR's CI settles. They let the section be
+/// found and rewritten when CI finishes, and kept whole when the description
+/// is rewritten.
+const UNVERIFIED_START: &str = "<!-- coderhelm:unverified -->";
+const UNVERIFIED_END: &str = "<!-- /coderhelm:unverified -->";
+const CI_MARK: &str = "<!-- coderhelm:ci -->";
+
+/// The section put at the top of the PR description: one bullet per proof
+/// gap and per check the PR's CI still has to settle. What only a person can
+/// check never goes here (see [`manual_steps`]). A WARNING when a proof gap
+/// remains, a NOTE when only CI's result is awaited; empty when neither.
 pub fn gaps_section(findings: &[Finding]) -> String {
-    if findings.is_empty() {
+    let gaps: Vec<String> = findings
+        .iter()
+        .filter(|f| f.settler() == Settler::Proof)
+        .map(|f| format!("> {}", f.line()))
+        .collect();
+    let pending: Vec<String> = findings
+        .iter()
+        .filter(|f| f.settler() == Settler::Ci)
+        .map(|f| format!("> {} {CI_MARK}", f.line()))
+        .collect();
+    if gaps.is_empty() && pending.is_empty() {
         return String::new();
     }
-    let lines: Vec<String> = findings.iter().map(Finding::line).collect();
+    let callout = if gaps.is_empty() { "NOTE" } else { "WARNING" };
     format!(
-        "> [!WARNING]\n> **Not proven before this PR opened.** CoderHelm's check of what this change rests on still finds:\n{}\n\n",
-        lines
-            .iter()
-            .map(|l| format!("> {l}"))
+        "{UNVERIFIED_START}\n> [!{callout}]\n> **Not yet verified**\n{}\n{UNVERIFIED_END}\n\n",
+        gaps.into_iter()
+            .chain(pending)
             .collect::<Vec<_>>()
             .join("\n")
     )
+}
+
+/// What only a person can check, for the PR writer to put as numbered steps
+/// in the Verification section. Empty when there is none.
+pub fn manual_steps(findings: &[Finding]) -> String {
+    findings
+        .iter()
+        .filter(|f| f.settler() == Settler::Person)
+        .map(|f| {
+            let what = sentence(&f.detail, MAX_WHAT);
+            match sentence(&f.settle, MAX_SETTLE) {
+                s if s.is_empty() => format!("- {what}\n"),
+                s => format!("- {what} {s}\n"),
+            }
+        })
+        .collect()
+}
+
+/// Splits a PR description into its "Not yet verified" section (with the
+/// blank line after it) and the rest. The section is empty when there is
+/// none.
+pub fn split_unverified(body: &str) -> (String, String) {
+    let Some(start) = body.find(UNVERIFIED_START) else {
+        return (String::new(), body.to_string());
+    };
+    let Some(end) = body[start..].find(UNVERIFIED_END).map(|e| start + e) else {
+        return (String::new(), body.to_string());
+    };
+    let mut close = end + UNVERIFIED_END.len();
+    while body[close..].starts_with('\n') {
+        close += 1;
+    }
+    (
+        body[start..close].to_string(),
+        format!("{}{}", &body[..start], &body[close..]),
+    )
+}
+
+/// The description once the PR's CI passed: the items CI settled are gone,
+/// and so is the whole section when nothing is left in it. `None` when there
+/// is nothing to change.
+pub fn settle_by_ci(body: &str) -> Option<String> {
+    let (section, rest) = split_unverified(body);
+    if !section.contains(CI_MARK) {
+        return None;
+    }
+    let start = body.find(UNVERIFIED_START)?;
+    let kept: Vec<&str> = section
+        .trim_end_matches('\n')
+        .lines()
+        .filter(|l| !l.contains(CI_MARK))
+        .collect();
+    if !kept.iter().any(|l| l.starts_with("> - ")) {
+        return Some(rest);
+    }
+    let section = format!("{}\n\n", kept.join("\n"));
+    Some(format!("{}{section}{}", &rest[..start], &rest[start..]))
 }
 
 /// What the plan says the change is for, for the judge.
@@ -349,7 +572,7 @@ pub async fn judge(
     .await
     {
         Ok(reply) => {
-            let parsed = parse_findings(&reply);
+            let parsed = parse_findings(&reply).map(|f| classify(f, evidence));
             if parsed.is_none() {
                 warn!(
                     reply = common::truncate_str(&reply, 300),
@@ -380,9 +603,10 @@ pub struct Work<'a> {
 }
 
 /// Judges the change, runs the fix round a gap earns, and judges again.
-/// Returns the gaps still open when the PR is about to open (empty when
-/// everything is proven or the judge couldn't answer). `evidence` gains what
-/// the fix round looked up.
+/// Returns what is still open when the PR is about to open: proof gaps,
+/// checks the PR's CI will settle, and checks only a person can do (empty
+/// when everything is proven or the judge couldn't answer). `evidence` gains
+/// what the fix round looked up.
 pub async fn prove(
     w: &Work<'_>,
     evidence: &mut RunEvidence,
@@ -426,7 +650,8 @@ pub async fn prove(
                     )
                     .await;
                 }
-                return Vec::new();
+                // What CI or a person settles still reaches the PR.
+                return findings.unwrap_or_default();
             }
             Next::OpenWithGaps => {
                 let gaps = findings.unwrap_or_default();
@@ -436,7 +661,7 @@ pub async fn prove(
                     w.run_id,
                     &format!(
                         "Proof check: {} gap(s) remain, named at the top of the PR",
-                        gaps.len()
+                        proof_gaps(&gaps)
                     ),
                 )
                 .await;
@@ -449,7 +674,7 @@ pub async fn prove(
                     w.state,
                     &w.msg.team_id,
                     w.run_id,
-                    &format!("Proof check found {} gap(s), fixing", gaps.len()),
+                    &format!("Proof check found {} gap(s), fixing", proof_gaps(&gaps)),
                 )
                 .await;
                 if super::check_cancelled(w.state, &w.msg.team_id, w.run_id)
@@ -511,6 +736,16 @@ mod tests {
         Finding {
             point: point.into(),
             detail: detail.into(),
+            ..Default::default()
+        }
+    }
+
+    fn check_finding(point: &str, check: &str) -> Finding {
+        Finding {
+            point: point.into(),
+            detail: format!("{check} did not run before the PR opened"),
+            check: check.into(),
+            ..Default::default()
         }
     }
 
@@ -551,7 +786,9 @@ mod tests {
             finding("logging", "INFO log per record in the sync loop"),
         ];
         let top = gaps_section(&gaps);
-        assert!(top.starts_with("> [!WARNING]"));
+        assert!(top
+            .starts_with("<!-- coderhelm:unverified -->\n> [!WARNING]\n> **Not yet verified**\n"));
+        assert!(top.ends_with("<!-- /coderhelm:unverified -->\n\n"));
         assert!(top.contains("> - **Unconfirmed external field or behaviour:** confirm `name`"));
         assert!(top.contains("> - **Noisy logging:** INFO log per record"));
         assert_eq!(gaps_section(&[]), "");
@@ -566,6 +803,7 @@ mod tests {
             sources: vec!["warehouse (database)".into()],
             lookups: vec!["- Asked warehouse: select count(*) ...\n  Came back: 42".into()],
             notes: "Evidence: 42 records affected".into(),
+            ..Default::default()
         };
         let p = judge_prompt("Fix sync", "Use the vendor field", "+ x", &ev, "");
         assert!(p.contains("warehouse (database)"));
@@ -588,6 +826,8 @@ mod tests {
             "fixtures",
             "one_record",
             "team_rule",
+            "ci_pending",
+            "manual_check",
         ] {
             assert!(JUDGE_SYSTEM.contains(point), "{point}");
             assert_ne!(finding(point, "x").label(), point, "{point} has a label");
@@ -609,11 +849,13 @@ mod tests {
             sources: vec!["vendor (api)".into()],
             lookups: vec!["- one".into()],
             notes: "Evidence: none needed".into(),
+            ..Default::default()
         };
         ev.merge(RunEvidence {
             sources: vec!["vendor (api)".into()],
             lookups: vec!["- two".into()],
             notes: "Evidence: field confirmed".into(),
+            ..Default::default()
         });
         assert_eq!(ev.sources, vec!["vendor (api)".to_string()]);
         assert_eq!(ev.lookups, vec!["- one".to_string(), "- two".to_string()]);
@@ -641,5 +883,196 @@ mod tests {
         assert!(CODER_RULES.contains("No manual backfills or one-off scripts"));
         assert!(CODER_RULES.contains("no hard-coded ids, names, seasons or prices"));
         assert!(EVIDENCE_OUTPUT.contains("`Evidence:`"));
+    }
+
+    fn gated(kinds: &[CheckKind]) -> RunEvidence {
+        RunEvidence {
+            ci_gates: kinds.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_check_ci_runs_on_the_pr_is_pending_not_a_gap_whatever_the_judge_called_it() {
+        let ev = gated(&[CheckKind::Lint, CheckKind::Tests]);
+        // The incident: the team rule "run lint and tests before pushing"
+        // came back as team_rule; CI runs both on the PR, so CI settles them.
+        let f = classify(
+            vec![
+                check_finding("team_rule", "lint"),
+                check_finding("ci_pending", "tests"),
+                check_finding("ci_pending", "build"),
+                finding("external_fact", "`name` never read from a payload"),
+                finding("manual_check", "open the drawer in a real browser"),
+            ],
+            &ev,
+        );
+        let points: Vec<&str> = f.iter().map(|f| f.point.as_str()).collect();
+        assert_eq!(
+            points,
+            [
+                "ci_pending",
+                "ci_pending",
+                // CI doesn't build: nothing settles it after the PR opens.
+                "unrun_check",
+                "external_fact",
+                "manual_check"
+            ]
+        );
+        assert_eq!(f[0].settler(), Settler::Ci);
+        assert_eq!(f[2].settler(), Settler::Proof);
+        assert_eq!(f[4].settler(), Settler::Person);
+        // A pending item naming no kind waits on CI only when CI runs anything.
+        let unnamed = || vec![finding("ci_pending", "checks did not run")];
+        assert_eq!(classify(unnamed(), &ev)[0].point, "ci_pending");
+        assert_eq!(classify(unnamed(), &gated(&[]))[0].point, "unrun_check");
+    }
+
+    #[test]
+    fn only_proof_gaps_earn_a_fix_round() {
+        let ev = gated(&[CheckKind::Lint]);
+        let open = classify(
+            vec![
+                check_finding("team_rule", "lint"),
+                finding("manual_check", "click through checkout on a phone"),
+            ],
+            &ev,
+        );
+        assert_eq!(next(Some(&open), 0, true), Next::Open);
+        let fb = fix_feedback(&[
+            finding("impact", "affected records not counted"),
+            open[0].clone(),
+        ]);
+        assert!(fb.contains("Impact not measured"));
+        assert!(!fb.contains("Waiting on CI"));
+    }
+
+    #[test]
+    fn a_warning_bullet_is_one_short_sentence_on_what_and_one_on_how() {
+        let f = Finding {
+            point: "impact".into(),
+            detail: "Affected bookings were not counted. The notes say \"not measured\" and \
+                     list nothing else at all."
+                .into(),
+            settle: format!(
+                "Count them in the warehouse, e.g. by season. Then {}",
+                "x ".repeat(200)
+            ),
+            ..Default::default()
+        };
+        let line = f.line();
+        assert_eq!(
+            line,
+            "- **Impact not measured:** Affected bookings were not counted. Settle: Count them \
+             in the warehouse, e.g. by season."
+        );
+        // A run-on sentence is cut at a word boundary.
+        let long = sentence(&"word ".repeat(100), 30);
+        assert_eq!(long, "word word word word word word…");
+        assert!(long.chars().count() <= 31);
+        // A pending item says what settles it even when the judge didn't.
+        let p = check_finding("ci_pending", "lint");
+        assert!(p.line().ends_with("Settles when this PR's CI passes."));
+        assert!(!JUDGE_SYSTEM.contains("Breaks the team's instructions"));
+    }
+
+    #[test]
+    fn only_ci_pending_items_make_a_note_and_hand_checks_never_reach_it() {
+        let ev = gated(&[CheckKind::Lint, CheckKind::Tests]);
+        let f = classify(
+            vec![
+                check_finding("team_rule", "lint"),
+                finding("manual_check", "open the page in a real browser"),
+            ],
+            &ev,
+        );
+        let top = gaps_section(&f);
+        assert!(top.contains("> [!NOTE]"));
+        assert!(top.contains("> - **Waiting on CI:** lint did not run"));
+        assert!(top.contains("<!-- coderhelm:ci -->"));
+        assert!(!top.contains("browser"));
+        assert_eq!(
+            manual_steps(&f),
+            "- open the page in a real browser\n",
+            "a hand check is a Verification step"
+        );
+        assert_eq!(gaps_section(&[finding("manual_check", "on a device")]), "");
+        assert_eq!(manual_steps(&[]), "");
+    }
+
+    #[test]
+    fn ci_passing_removes_what_it_settled_and_the_warning_when_nothing_is_left() {
+        let ev = gated(&[CheckKind::Lint]);
+        let pending = classify(vec![check_finding("team_rule", "lint")], &ev);
+        let rest = "Closes #4\n\n**Problem** x";
+        let body = format!("{}{rest}", gaps_section(&pending));
+        assert_eq!(settle_by_ci(&body).as_deref(), Some(rest));
+
+        // A proof gap stays, under its heading; only the CI item goes.
+        let mut mixed = pending.clone();
+        mixed.insert(0, finding("impact", "affected records not counted"));
+        let body = format!("{}{rest}", gaps_section(&mixed));
+        let settled = settle_by_ci(&body).unwrap();
+        assert!(settled.starts_with("<!-- coderhelm:unverified -->\n> [!WARNING]\n> **Not yet verified**\n> - **Impact not measured:**"));
+        assert!(!settled.contains("Waiting on CI"));
+        assert!(settled.ends_with(&format!("<!-- /coderhelm:unverified -->\n\n{rest}")));
+        // Nothing left for CI to settle: the description is left alone.
+        assert_eq!(settle_by_ci(&settled), None);
+        assert_eq!(settle_by_ci(rest), None);
+    }
+
+    #[test]
+    fn the_section_splits_off_whole_for_a_description_rewrite() {
+        let gaps = gaps_section(&[finding("impact", "affected records not counted")]);
+        let body = format!("{gaps}Closes #4\n\nx");
+        let (section, rest) = split_unverified(&body);
+        assert_eq!(section, gaps);
+        assert_eq!(rest, "Closes #4\n\nx");
+        assert_eq!(
+            split_unverified("Closes #4"),
+            (String::new(), "Closes #4".to_string())
+        );
+    }
+
+    #[test]
+    fn the_judge_reads_which_checks_ran_and_which_ci_runs() {
+        let ev = RunEvidence {
+            checks: vec!["- typecheck: PASS, `pnpm check-types`".into()],
+            ci_gates: vec![CheckKind::Lint, CheckKind::Tests],
+            ..Default::default()
+        };
+        let p = judge_prompt("t", "", "", &ev, "");
+        assert!(p.contains("recorded by CoderHelm, not the coder)\n- typecheck: PASS"));
+        assert!(p.contains("runs on this pull request\nlint, tests\n"));
+        let none = judge_prompt("t", "", "", &RunEvidence::default(), "");
+        assert!(none.contains("(no sandbox checks ran)"));
+        assert!(none.contains("(none found: nothing checks this PR after it opens)"));
+
+        // A later run's checks replace the earlier ones; CI's kinds add up.
+        let mut ev = ev;
+        ev.merge(RunEvidence {
+            checks: vec!["- lint: FAIL (exit 1), `pnpm lint`".into()],
+            ci_gates: vec![CheckKind::Typecheck],
+            ..Default::default()
+        });
+        assert_eq!(
+            ev.checks,
+            vec!["- lint: FAIL (exit 1), `pnpm lint`".to_string()]
+        );
+        assert_eq!(
+            ev.ci_gates,
+            vec![CheckKind::Typecheck, CheckKind::Lint, CheckKind::Tests]
+        );
+    }
+
+    #[test]
+    fn the_judge_writes_short_findings_with_how_to_settle_and_the_check_kind() {
+        let reply = "```json\n{\"findings\":[{\"point\":\"ci_pending\",\"detail\":\"lint did not run\",\"settle\":\"The PR's lint check.\",\"check\":\"lint\"}]}\n```";
+        let f = parse_findings(reply).unwrap();
+        assert_eq!(f[0].settle, "The PR's lint check.");
+        assert_eq!(f[0].check, "lint");
+        assert!(JUDGE_SYSTEM.contains("`detail` is ONE sentence"));
+        assert!(JUDGE_SYSTEM.contains("\"settle\":\"one sentence\""));
+        assert!(JUDGE_SYSTEM.contains("is not a team_rule miss"));
     }
 }
