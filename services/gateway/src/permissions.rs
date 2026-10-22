@@ -339,6 +339,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "skills::recheck",
             "skills::set_use_translated",
             "skills::set_always_apply",
+            "skills::set_reviews",
         ],
     },
     Capability {

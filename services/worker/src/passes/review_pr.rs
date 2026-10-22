@@ -1433,6 +1433,39 @@ async fn run_once(
     )
     .await;
 
+    // 0) The team's code-review agents read the diff first (at most two, in
+    // parallel, each with a time limit). Their notes reach the reviewer as
+    // advice it checks; a note blocks nothing unless the reviewer agrees.
+    let agent_notes = match &skills {
+        Some(s) if !s.reviewers_for("code").is_empty() => {
+            let host = super::agent_tools::Host {
+                reads: Some(super::agent_tools::RepoReads {
+                    github: &github,
+                    owner: &msg.repo_owner,
+                    repo: &msg.repo_name,
+                    git_ref: &head_sha,
+                    http: &state.http,
+                }),
+                parent: None,
+                offered: &[],
+            };
+            let draft = format!("## Pull request: {title}\n\n{review_diff}");
+            let reviews = s
+                .review(state, "code", "pull request's code change", &draft, &host)
+                .await;
+            info!(
+                pr = msg.pr_number,
+                reviewers = reviews.len(),
+                with_gaps = reviews.iter().filter(|r| r.gaps.is_some()).count(),
+                cost_usd = super::skills::reviews_cost(&reviews),
+                "Code reviewed by team agents"
+            );
+            super::skills::reviewer_advice(&reviews)
+        }
+        _ => String::new(),
+    };
+    let extra_context = format!("{extra_context}{agent_notes}");
+
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(
         state,

@@ -483,6 +483,7 @@ async fn main() -> Result<(), Error> {
         .route("/skills/stats", get(routes::skills::stats))
         .route("/skills/recheck", post(routes::skills::recheck))
         .route("/skills/always", put(routes::skills::set_always_apply))
+        .route("/skills/reviews", put(routes::skills::set_reviews))
         .route(
             "/skills/translated",
             put(routes::skills::set_use_translated),

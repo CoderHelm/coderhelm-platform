@@ -32,7 +32,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::skill_apply::{AlwaysApply, Suggestion};
+use crate::skill_apply::{AlwaysApply, ReviewSteps, Suggestion};
 
 type Item = HashMap<String, AttributeValue>;
 
@@ -412,6 +412,7 @@ pub const AGENT_READ_TOOLS: &[&str] = &[
     "graph_impact",
     "check_package",
     "check_url",
+    "count_lines",
     "live_describe",
     "live_lookup",
     "db_query",
@@ -480,6 +481,10 @@ const AGENT_GIT_READS: &[&str] = &[
     "gh run list",
     "gh run view",
 ];
+
+/// Line-count commands a `Bash(...)` pattern may be limited to; such a
+/// pattern gives `count_lines` (and only that).
+const AGENT_COUNT_READS: &[&str] = &["cloc", "tokei", "scc"];
 
 /// MCP servers an agent file may list (`mcp__<server>__...`) whose reads a
 /// Coderhelm connection does, by a word in the server's name.
@@ -595,6 +600,14 @@ pub fn agent_toolset(text: &str) -> AgentToolset {
                 .map(|(_, r)| r.trim_end_matches(')').to_ascii_lowercase())
                 .unwrap_or_default();
             let cmd = inner.split(':').next().unwrap_or("").trim().to_string();
+            if !cmd.is_empty()
+                && AGENT_COUNT_READS
+                    .iter()
+                    .any(|g| cmd == *g || cmd.starts_with(&format!("{g} ")))
+            {
+                grant(&mut out, &["count_lines"]);
+                continue;
+            }
             if !cmd.is_empty()
                 && AGENT_GIT_READS
                     .iter()
@@ -961,6 +974,9 @@ pub struct SkillMeta {
     /// A suggested "always apply" setting, worked out at sync. Never applied
     /// by itself.
     pub suggestion: Suggestion,
+    /// For a team agent: the review steps it runs in (see
+    /// `skill_apply::ReviewSteps`).
+    pub reviews: ReviewSteps,
 }
 
 /// An item waiting for a check: what's kept on it, its text, and its last
@@ -978,8 +994,8 @@ pub struct CompatMeta {
     /// "ready", "translated" or "needs_tools"; empty before the first check.
     pub status: String,
     pub summary: String,
-    /// Names of what it needs that the team hasn't connected.
-    pub needs: Vec<String>,
+    /// What it needs that the team hasn't connected, each with what to do.
+    pub needs: Vec<NeedRef>,
     /// The item's text hash and the team's inventory fingerprint it was
     /// checked against.
     pub hash: String,
@@ -993,6 +1009,78 @@ pub struct CompatMeta {
     pub translated_at: String,
 }
 
+/// One thing an item needs, in the short form kept for lists: its name and
+/// what to do about it (`skill_compat::Requirement::action`: "connect",
+/// "credentials" or "none"). `local` marks one that assumes a person's own
+/// machine, with what Coderhelm does `instead`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NeedRef {
+    pub name: String,
+    /// Empty when kept before actions were (the bare-name shape).
+    pub action: String,
+    pub local: bool,
+    pub instead: String,
+}
+
+impl NeedRef {
+    /// Reads either shape: a map `{name, action, local, instead}`, or the
+    /// bare name kept before.
+    fn from_attr(v: &AttributeValue) -> Option<NeedRef> {
+        if let Ok(name) = v.as_s() {
+            return Some(NeedRef {
+                name: name.clone(),
+                ..Default::default()
+            });
+        }
+        let m = v.as_m().ok()?;
+        let get = |k: &str| {
+            m.get(k)
+                .and_then(|x| x.as_s().ok())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let name = get("name");
+        (!name.is_empty()).then(|| NeedRef {
+            name,
+            action: get("action"),
+            local: m
+                .get("local")
+                .and_then(|x| x.as_bool().ok())
+                .copied()
+                .unwrap_or(false),
+            instead: get("instead"),
+        })
+    }
+
+    fn attr(&self) -> AttributeValue {
+        let mut m = std::collections::HashMap::from([
+            ("name".to_string(), av(&self.name)),
+            ("action".to_string(), av(&self.action)),
+        ]);
+        if self.local {
+            m.insert("local".into(), AttributeValue::Bool(true));
+            m.insert("instead".into(), av(&self.instead));
+        }
+        AttributeValue::M(m)
+    }
+
+    fn of(n: &crate::skill_compat::Need) -> NeedRef {
+        NeedRef {
+            name: n.name.clone(),
+            action: n.action.clone(),
+            local: n.local,
+            instead: n.instead.clone(),
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "name": self.name, "action": self.action,
+            "local": self.local, "instead": self.instead,
+        })
+    }
+}
+
 impl CompatMeta {
     fn from_item(i: &Item) -> Self {
         Self {
@@ -1001,7 +1089,7 @@ impl CompatMeta {
             needs: i
                 .get("compat_needs")
                 .and_then(|v| v.as_l().ok())
-                .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
+                .map(|l| l.iter().filter_map(NeedRef::from_attr).collect())
                 .unwrap_or_default(),
             hash: s(i, "compat_hash"),
             fingerprint: s(i, "compat_fp"),
@@ -1029,9 +1117,12 @@ impl SkillMeta {
         if self.compat.at.is_empty() {
             return Value::Null;
         }
+        // `needs` stays the names; `need_items` says what to do about each.
+        let names: Vec<&str> = self.compat.needs.iter().map(|n| n.name.as_str()).collect();
+        let items: Vec<Value> = self.compat.needs.iter().map(NeedRef::json).collect();
         json!({
             "status": self.compat.status, "summary": self.compat.summary,
-            "needs": self.compat.needs, "at": self.compat.at,
+            "needs": names, "need_items": items, "at": self.compat.at,
             "error": self.compat.error, "current": self.compat_current(),
         })
     }
@@ -1092,6 +1183,17 @@ impl SkillMeta {
                 hash: s(i, "sugg_key"),
                 at: s(i, "sugg_at"),
             },
+            reviews: ReviewSteps {
+                auto: list(i, "compat_reviews"),
+                set: i
+                    .get("rv_set")
+                    .and_then(|v| v.as_bool().ok())
+                    .copied()
+                    .unwrap_or(false),
+                steps: list(i, "rv_steps"),
+                by: s(i, "rv_by"),
+                at: s(i, "rv_at"),
+            },
         })
         .filter(|m| !rest.is_empty() && !m.repo.is_empty() && !m.path.is_empty())
     }
@@ -1112,6 +1214,7 @@ impl SkillMeta {
             "translated_at": self.compat.translated_at,
             "always_apply": self.always.json(),
             "suggestion": self.suggestion.json(),
+            "reviews": self.reviews.json(),
         })
     }
 }
@@ -1618,7 +1721,8 @@ impl SkillStore<'_> {
                      compat_needs, compat_hash, compat_fp, compat_at, compat_error, \
                      use_translated, translated_by, translated_at, always_apply, aa_repos, \
                      aa_passes, aa_paths, aa_by, aa_at, sugg_repos, sugg_passes, sugg_paths, \
-                     sugg_reason, sugg_key, sugg_at",
+                     sugg_reason, sugg_key, sugg_at, compat_reviews, rv_set, rv_steps, rv_by, \
+                     rv_at",
                 ),
             )
             .await?
@@ -1745,7 +1849,7 @@ impl SkillStore<'_> {
                 .update_expression(
                     "SET compat = :c, compat_status = :st, compat_summary = :su, \
                      compat_needs = :n, translated = :t, compat_hash = :h, compat_fp = :fp, \
-                     compat_at = :at, compat_error = :e",
+                     compat_at = :at, compat_error = :e, compat_reviews = :rv",
                 )
                 .expression_attribute_values(
                     ":c",
@@ -1755,14 +1859,16 @@ impl SkillStore<'_> {
                 .expression_attribute_values(":su", av(&a.summary))
                 .expression_attribute_values(
                     ":n",
-                    AttributeValue::L(a.needs.iter().map(|n| av(&n.name)).collect()),
+                    AttributeValue::L(a.needs.iter().map(|n| NeedRef::of(n).attr()).collect()),
                 )
+                .expression_attribute_values(":rv", av_list(&a.reviews))
                 .expression_attribute_values(":t", av(translated))
                 .expression_attribute_values(":e", av("")),
             Err((error, drop_old)) => req
                 .update_expression(if drop_old {
                     "SET compat_error = :e, compat_hash = :h, compat_fp = :fp, compat_at = :at \
-                     REMOVE compat, compat_status, compat_summary, compat_needs, translated"
+                     REMOVE compat, compat_status, compat_summary, compat_needs, translated, \
+                     compat_reviews"
                 } else {
                     "SET compat_error = :e, compat_hash = :h, compat_fp = :fp, compat_at = :at"
                 })
@@ -1850,6 +1956,42 @@ impl SkillStore<'_> {
                 Ok(false)
             }
             Err(e) => Err(format!("skill store always apply: {e}")),
+        }
+    }
+
+    /// An admin's choice of review steps for a team agent: `Some(steps)`
+    /// sets them (empty runs it in none), `None` goes back to what the
+    /// check says. Kept across syncs. The caller checks the kind.
+    pub async fn set_reviews(
+        &self,
+        repo: &str,
+        path: &str,
+        steps: Option<&[String]>,
+        by: &str,
+    ) -> Result<bool, String> {
+        let r = self
+            .dynamo
+            .update_item()
+            .table_name(self.table)
+            .key("pk", av(self.team))
+            .key("sk", av(&format!("{SKILL}{repo}#{path}")))
+            .update_expression("SET rv_set = :on, rv_steps = :s, rv_by = :by, rv_at = :at")
+            .condition_expression("attribute_exists(sk)")
+            .expression_attribute_values(":on", AttributeValue::Bool(steps.is_some()))
+            .expression_attribute_values(":s", av_list(steps.unwrap_or_default()))
+            .expression_attribute_values(":by", av(by))
+            .expression_attribute_values(":at", av(&now()))
+            .send()
+            .await;
+        match r {
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(format!("skill store reviews: {e}")),
         }
     }
 
@@ -3198,7 +3340,51 @@ mod tests {
             compat: Default::default(),
             always: Default::default(),
             suggestion: Default::default(),
+            reviews: Default::default(),
         }
+    }
+
+    #[test]
+    fn needs_read_back_in_either_shape_and_review_steps_too() {
+        let mut i: Item = HashMap::new();
+        for (k, v) in [
+            ("sk", "SKILL#acme/playbook#agents/spec.md"),
+            ("repo", "acme/playbook"),
+            ("path", "agents/spec.md"),
+            ("kind", "agent"),
+            ("name", "spec"),
+            ("compat_at", "2026-10-01T00:00:00Z"),
+        ] {
+            i.insert(k.into(), av(v));
+        }
+        // The bare names kept before, and the new maps, side by side.
+        let new = NeedRef {
+            name: "Local files".into(),
+            action: "none".into(),
+            local: true,
+            instead: "Reads the repository".into(),
+        };
+        i.insert(
+            "compat_needs".into(),
+            AttributeValue::L(vec![av("Monitoring"), new.attr()]),
+        );
+        i.insert("compat_reviews".into(), av_list(&["plan".to_string()]));
+        let m = SkillMeta::from_item(&i).unwrap();
+        assert_eq!(m.compat.needs[0].name, "Monitoring");
+        assert_eq!(m.compat.needs[0].action, "", "unknown in the old shape");
+        assert_eq!(m.compat.needs[1], new);
+        let j = m.json();
+        assert_eq!(j["compat"]["needs"], json!(["Monitoring", "Local files"]));
+        assert_eq!(j["compat"]["need_items"][1]["action"], "none");
+        assert_eq!(j["compat"]["need_items"][1]["local"], true);
+        assert_eq!(j["reviews"]["effective"], json!(["plan"]));
+        assert_eq!(j["reviews"]["set"], false);
+
+        i.insert("rv_set".into(), AttributeValue::Bool(true));
+        i.insert("rv_steps".into(), av_list(&["code".to_string()]));
+        let m = SkillMeta::from_item(&i).unwrap();
+        assert_eq!(m.reviews.effective(), ["code"]);
+        assert!(!m.reviews.runs_in("plan"));
     }
 
     #[test]
@@ -3248,6 +3434,7 @@ mod tests {
             "always_apply",
             "aa_",
             "sugg_",
+            "rv_",
             "compat",
             "use_translated",
             "uses",
@@ -3298,6 +3485,10 @@ mod tests {
         let g = agent_toolset("---\nallowed-tools: Bash(git log:*), Bash(npm test:*), github_history, logs_search\n---\nx");
         assert_eq!(g.granted, ["github_history", "logs_search"]);
         assert_eq!(g.missing, ["Bash"]);
+        // One limited to a line count gives the read-only line counter.
+        let c = agent_toolset("---\ntools: Read, Bash(cloc:*), Bash(tokei src)\n---\nx");
+        assert_eq!(c.granted, ["read_file", "read_file_lines", "count_lines"]);
+        assert!(c.missing.is_empty());
         // An MCP server Coderhelm has a connection for maps to its reads.
         let m = agent_toolset("---\ntools: mcp__newrelic__run_nrql, mcp__slack__post\n---\nx");
         assert!(m.granted.contains(&"newrelic_nrql".to_string()));

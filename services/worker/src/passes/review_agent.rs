@@ -648,6 +648,7 @@ pub fn review_tools() -> Vec<ToolDefinition> {
                 "required": ["registry", "name"]
             }),
         },
+        super::line_count::tool(),
     ]
 }
 
@@ -930,6 +931,10 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
                 let out = check_package_registry(&self.state.http, registry, pkg, version).await;
                 Ok(json!(common::head_tail_str(&out, 4_000)))
             }
+            super::line_count::TOOL => Ok(json!(
+                super::line_count::run(self.github, self.owner, self.repo, self.head_sha, input)
+                    .await
+            )),
             other => Ok(json!(format!("Unknown tool: {other}"))),
         }
     }

@@ -698,6 +698,7 @@ mod implement;
 pub mod infra_analyze;
 pub mod jira_comment;
 pub mod lessons;
+pub mod line_count;
 pub mod live_sources;
 pub mod onboard;
 pub mod ops_tools;
@@ -1609,12 +1610,14 @@ async fn run_passes(
     }
     // The cached plan is reused only when nothing that can change it has
     // changed: the ticket, what memory recalled (lessons), the history, and
-    // the planner itself.
+    // the planner itself, and the team agents that review plans.
+    let review_key = skills::plan_review_key(state, &msg.team_id).await;
     let plan_key = plan::plan_cache_key(
         &context_hash,
         &memory_context,
         &history.digest(),
         &msg.team_instructions,
+        &review_key,
     );
     msg.plan_cache_key = Some(plan_key.clone());
 
@@ -1766,6 +1769,7 @@ async fn run_passes(
                         &format!("{memory_context}{ctx}"),
                         &history.digest(),
                         &msg.team_instructions,
+                        &review_key,
                     ));
                 }
                 plan_result = plan::run(
@@ -7078,6 +7082,35 @@ pub(crate) async fn write_pass_trace(
     usage_after: &TokenUsage,
     error: Option<&str>,
 ) {
+    write_pass_trace_with(
+        state,
+        team_id,
+        run_id,
+        pass_name,
+        start_time,
+        usage_before,
+        usage_after,
+        error,
+        None,
+    )
+    .await
+}
+
+/// [`write_pass_trace`], with what the pass did kept as `detail` (JSON) for
+/// the run's page, e.g. which team agents reviewed a plan and what they
+/// found.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_pass_trace_with(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    pass_name: &str,
+    start_time: std::time::Instant,
+    usage_before: &TokenUsage,
+    usage_after: &TokenUsage,
+    error: Option<&str>,
+    detail: Option<&serde_json::Value>,
+) {
     if state.config.traces_table_name.is_empty() {
         return;
     }
@@ -7153,6 +7186,12 @@ pub(crate) async fn write_pass_trace(
 
         if let Some(err) = error {
             req = req.item("error", AttributeValue::S(err.to_string()));
+        }
+        if let Some(d) = detail {
+            req = req.item(
+                "detail",
+                AttributeValue::S(common::truncate_str(&d.to_string(), 32_000).to_string()),
+            );
         }
 
         match req.send().await {

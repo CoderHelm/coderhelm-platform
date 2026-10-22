@@ -70,6 +70,11 @@ const EXTRA_TOOLS: &[(&str, &str)] = &[
          final URL, content type and page title, no page content (reviews, coding, planning)",
     ),
     (
+        super::line_count::TOOL,
+        "Count lines of code per language for the repository or one folder, like cloc, \
+         read-only (reviews, team agents)",
+    ),
+    (
         super::github_history::TOOL,
         "Read the repository's history on GitHub (git log, git blame, gh pr list, gh release): \
          commits, blame, pull requests, releases, tags, deployments and Actions runs",
@@ -116,6 +121,11 @@ const TRANSLATIONS: &[(&str, &[&str], &str)] = &[
         "Looks the package up on its registry",
     ),
     (
+        "cloc, tokei, scc, counting lines of code per language",
+        &[super::line_count::TOOL],
+        "Counts lines per language with count_lines, from the repository snapshot, no shell",
+    ),
+    (
         "curl -I, curl -sL -o /dev/null -w '%{http_code}', wget --spider, opening a link to see that it loads",
         &[super::web_check::TOOL],
         "Checks the page with check_url: status of each redirect, final URL and title, on the team's own sites only",
@@ -151,6 +161,7 @@ const PASSES: &[(&str, &[&str])] = &[
     ("graph_impact", &["coder", "reviewer"]),
     ("search_org", &["reviewer"]),
     ("check_package", &["reviewer"]),
+    (super::line_count::TOOL, &["reviewer"]),
 ];
 
 fn passes_of(name: &str) -> Vec<String> {
@@ -760,7 +771,10 @@ mod tests {
             assert!(system.contains("Read the WHOLE text"));
             assert!(user.contains("## Coderhelm inventory"));
             assert!(user.contains("skill `triage`"));
-            assert_eq!(schema["required"], json!(["steps", "translated"]));
+            assert_eq!(
+                schema["required"],
+                json!(["steps", "translated", "reviews"])
+            );
             let usage = TokenUsage {
                 input_tokens: 1000,
                 output_tokens: 500,
@@ -798,6 +812,7 @@ mod tests {
             },
             always: Default::default(),
             suggestion: Default::default(),
+            reviews: Default::default(),
         }
     }
 
@@ -1012,6 +1027,77 @@ mod tests {
             "nothing to connect for a shell"
         );
         assert!(translated.contains("instead of git clone"));
+    }
+
+    /// Answers with what it was given, whatever it was asked.
+    struct Plain(Value);
+
+    #[async_trait::async_trait]
+    impl Checker for Plain {
+        fn model(&self) -> &str {
+            "fake-light"
+        }
+        async fn check(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Value,
+            _: usize,
+        ) -> (Result<Value, String>, TokenUsage) {
+            (Ok(self.0.clone()), TokenUsage::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cloc_step_is_translated_to_the_line_counter() {
+        let i = inv();
+        assert!(i
+            .translations
+            .iter()
+            .any(|t| t.commands.starts_with("cloc") && t.uses == [super::super::line_count::TOOL]));
+        let tool = i
+            .builtin
+            .iter()
+            .find(|t| t.name == super::super::line_count::TOOL)
+            .expect("count_lines in the inventory");
+        assert_eq!(tool.passes, ["reviewer"]);
+        assert!(!tool.writes_repo);
+        let answer = json!({
+            "steps": [{ "title": "Size the change", "does": "Count lines per language", "dropped": false,
+                "requirements": [{ "asks": "cloc --by-file src", "kind": "command", "status": "missing",
+                    "uses": [], "write": "none", "needs": "Shell access", "fix": "No terminal.",
+                    "connect": "none", "server": "", "connection": "" }] }],
+            "translated": "1. Count lines per language with `count_lines` on src.",
+            "reviews": []
+        });
+        let m = meta("skills/triage/SKILL.md", "h1", "", "");
+        let (a, _) = check_item(&Plain(answer), &i, &m, "Run cloc on src.")
+            .await
+            .unwrap();
+        assert_eq!(a.steps[0].status, "translated");
+        assert_eq!(a.steps[0].requirements[0].uses, ["count_lines"]);
+    }
+
+    #[tokio::test]
+    async fn a_team_agents_check_says_which_reviews_it_is_for() {
+        let base = inv();
+        let mut m = meta("agents/spec-review.md", "h1", "", "");
+        m.kind = Kind::Agent;
+        m.name = "triage".into();
+        let body = "---\nname: spec-review\ndescription: Reviews a proposal against the spec rubric\n---\nCheck each section.";
+        let agent_inv = inventory_for(&base, &m, body);
+        let answer = json!({
+            "steps": [{ "title": "Check each section", "does": "Compare the proposal to the rubric",
+                "dropped": false, "requirements": [] }],
+            "translated": "Check each section of the proposal against the rubric, one by one.",
+            "reviews": ["plan"]
+        });
+        let (a, _) = check_item(&Plain(answer), &agent_inv, &m, body)
+            .await
+            .unwrap();
+        assert_eq!(a.reviews, ["plan"]);
+        let (a, _) = skill_compat::enforce(a, String::new(), &agent_inv);
+        assert_eq!(a.reviews, ["plan"], "kept through enforce");
     }
 
     #[test]

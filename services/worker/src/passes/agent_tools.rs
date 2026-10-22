@@ -35,6 +35,7 @@ pub const OWN: &[&str] = &[
     "read_tree",
     "list_directory",
     "check_package",
+    super::line_count::TOOL,
 ];
 
 /// The repository the asking agent is on, for the agent's reads.
@@ -89,7 +90,7 @@ fn own_defs() -> Vec<ToolDefinition> {
     out.extend(
         super::review_agent::review_tools()
             .into_iter()
-            .filter(|t| t.name == "check_package"),
+            .filter(|t| t.name == "check_package" || t.name == super::line_count::TOOL),
     );
     out
 }
@@ -312,6 +313,9 @@ async fn own_read(
                 .map(|e| format!("{}: {}", e.entry_type, e.name))
                 .collect::<Vec<_>>()
                 .join("\n"))
+        }
+        super::line_count::TOOL => {
+            Ok(super::line_count::run(r.github, r.owner, r.repo, r.git_ref, input).await)
         }
         other => Err(format!("Unknown tool: {other}").into()),
     }

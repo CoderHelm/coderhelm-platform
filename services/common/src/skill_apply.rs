@@ -185,6 +185,88 @@ impl AlwaysApply {
     }
 }
 
+/// The review steps a team agent can be run in, in order: the plan before
+/// code is written, the pull request's code, and the prose Coderhelm writes
+/// (a pull request description).
+pub const REVIEW_STEPS: [&str; 3] = ["plan", "code", "prose"];
+
+/// Which review steps a team agent runs in. The item's check works it out
+/// from the agent's name and description (`auto`); an admin can set it
+/// instead (`set`), the same way as "always apply". Kept on the item's
+/// `SKILL#` record and across syncs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewSteps {
+    /// What the last check said, some of [`REVIEW_STEPS`].
+    pub auto: Vec<String>,
+    /// An admin chose the steps; `steps` holds them (empty: none).
+    pub set: bool,
+    pub steps: Vec<String>,
+    /// Who last set it and when. Empty if never.
+    pub by: String,
+    pub at: String,
+}
+
+impl ReviewSteps {
+    /// The steps it runs in: the admin's choice when there is one, else the
+    /// check's.
+    pub fn effective(&self) -> &[String] {
+        if self.set {
+            &self.steps
+        } else {
+            &self.auto
+        }
+    }
+
+    /// Whether it runs in `step`.
+    pub fn runs_in(&self, step: &str) -> bool {
+        self.effective().iter().any(|s| s == step)
+    }
+
+    /// Checks and tidies the steps an admin sent: each one of
+    /// [`REVIEW_STEPS`], kept in that order, once.
+    pub fn validate(steps: &[String]) -> Result<Vec<String>, String> {
+        let mut out: Vec<String> = Vec::new();
+        for s in steps {
+            let s = s.trim().to_ascii_lowercase();
+            if !REVIEW_STEPS.contains(&s.as_str()) {
+                return Err(format!(
+                    "{s} isn't a review step. Use any of: {}.",
+                    REVIEW_STEPS.join(", ")
+                ));
+            }
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out.sort_by_key(|s| REVIEW_STEPS.iter().position(|x| x == s).unwrap_or(9));
+        Ok(out)
+    }
+
+    /// The steps a check answered with: the known ones only, in order. An
+    /// answer is never trusted to name anything else.
+    pub fn from_answer(v: &Value) -> Vec<String> {
+        let mut out: Vec<String> = v
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| REVIEW_STEPS.contains(&s.as_str()))
+            .collect();
+        out.dedup();
+        out.sort_by_key(|s| REVIEW_STEPS.iter().position(|x| x == s).unwrap_or(9));
+        out.dedup();
+        out
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "auto": self.auto, "set": self.set, "steps": self.steps,
+            "effective": self.effective(), "by": self.by, "at": self.at,
+        })
+    }
+}
+
 /// A suggested setting, worked out at sync. Shown to admins only.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Suggestion {
@@ -717,5 +799,38 @@ mod tests {
         assert_eq!(a, suggestion_key("h1", &s(&["ACME/api", "acme/web"])));
         assert_ne!(a, suggestion_key("h2", &s(&["acme/web", "acme/api"])));
         assert_ne!(a, suggestion_key("h1", &s(&["acme/web"])));
+    }
+
+    #[test]
+    fn an_admins_review_steps_win_over_the_checks() {
+        let mut r = ReviewSteps {
+            auto: s(&["plan"]),
+            ..Default::default()
+        };
+        assert!(r.runs_in("plan") && !r.runs_in("code"));
+        r.set = true;
+        r.steps = s(&["code", "prose"]);
+        assert_eq!(r.effective(), s(&["code", "prose"]));
+        assert!(!r.runs_in("plan"));
+        // Set to none: runs in none, whatever the check said.
+        r.steps.clear();
+        assert!(r.effective().is_empty());
+        assert_eq!(r.json()["effective"], json!([]));
+        assert_eq!(r.json()["auto"], json!(["plan"]));
+    }
+
+    #[test]
+    fn review_steps_are_only_the_known_ones_in_order() {
+        assert_eq!(
+            ReviewSteps::validate(&s(&["prose", " Plan", "plan"])).unwrap(),
+            s(&["plan", "prose"])
+        );
+        assert!(ReviewSteps::validate(&s(&["deploy"])).is_err());
+        assert!(ReviewSteps::validate(&[]).unwrap().is_empty());
+        assert_eq!(
+            ReviewSteps::from_answer(&json!(["code", "x", "plan", "code", 3])),
+            s(&["plan", "code"])
+        );
+        assert!(ReviewSteps::from_answer(&json!("plan")).is_empty());
     }
 }

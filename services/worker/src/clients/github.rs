@@ -831,6 +831,25 @@ impl GitHubClient {
         self.search_code_api(owner, repo, query).await
     }
 
+    /// Lines of code per language under `under` ("" for the whole
+    /// repository), counted from the repository snapshot: one tarball
+    /// download, no shell. See `passes::line_count`.
+    pub async fn count_lines(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        under: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let snap = self
+            .snapshot(owner, repo, git_ref)
+            .await
+            .ok_or("the repository's snapshot isn't available (too large, or GitHub refused)")?;
+        let mut counter = crate::passes::line_count::Counter::new(under);
+        snap.visit(&mut |path, text| counter.add(path, text)).await;
+        Ok(counter.report())
+    }
+
     /// Cross-repo code search across a whole ORG (code search API + `org:`
     /// qualifier). One call surfaces consumers of a symbol in sibling repos
     /// without downloading them — the basis for cross-repo blast radius.
