@@ -64,6 +64,7 @@ permissions:
     - storage:app
     - read:attachment:jira
     - read:page:confluence
+    - read:space:confluence
     - write:page:confluence
   external:
     fetch:
