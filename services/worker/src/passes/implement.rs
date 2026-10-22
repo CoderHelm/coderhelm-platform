@@ -8,6 +8,7 @@ use crate::agent::provider;
 use crate::agent::provider::ModelProvider;
 use crate::clients::github::{FileOp, GitHubClient};
 use crate::models::{TicketMessage, TokenUsage};
+use crate::passes::checks::CheckKind;
 use crate::passes::plan::PlanResult;
 use crate::passes::syntax_check;
 use crate::passes::FileCache;
@@ -16,6 +17,84 @@ use crate::WorkerState;
 /// Cap on sandbox check runs per implement pass — bounds cost/time and forces
 /// the agent to converge within a handful of real verifications.
 const MAX_CHECKS_PER_RUN: usize = 6;
+
+/// The steps run_checks runs, each on its own: the derived type-check/build
+/// command (with the install), the repo's CI lint command, and the repo's
+/// unit tests scoped to the test files THIS change touched. run_checks used
+/// to run only typecheck+build, so a broken test the agent wrote passed the
+/// sandbox gate and shipped a red PR; scoped + --passWithNoTests keeps it fast
+/// and avoids false-REDs from unrelated/service-dependent suites. Lint runs
+/// because CI gates on it; as its own step, a lint failure is reported without
+/// hiding the type-check or test result.
+fn check_steps(
+    checks_cmd: &str,
+    lint_cmd: Option<&str>,
+    test_cmd: Option<&str>,
+    changed: &[String],
+) -> Vec<super::checks::Step> {
+    use super::checks::{kinds_of, Step};
+    let mut steps = vec![Step {
+        kinds: kinds_of(checks_cmd),
+        cmd: checks_cmd.to_string(),
+        scope: None,
+    }];
+    if let Some(lint) = lint_cmd {
+        steps.push(Step {
+            kinds: vec![CheckKind::Lint],
+            cmd: lint.to_string(),
+            scope: Some("the repo's CI lint command".into()),
+        });
+    }
+    if let Some(tests) = test_cmd.and_then(|tc| super::build_scoped_test_cmd(tc, changed)) {
+        steps.push(Step {
+            kinds: vec![CheckKind::Tests],
+            cmd: tests,
+            scope: Some("only the test files this change touched; CI runs the full suite".into()),
+        });
+    }
+    steps
+}
+
+/// Whether the build, type-check and test steps passed: the verdict the
+/// finish path holds the agent to. A lint step's result is reported but not
+/// part of it. With no per-step result (the run stopped early), the run's own
+/// exit code decides.
+fn gate_passed(steps: &[super::checks::Step], codes: &[Option<i32>], run_passed: bool) -> bool {
+    if codes.iter().all(Option::is_none) {
+        return run_passed;
+    }
+    steps
+        .iter()
+        .zip(codes)
+        .all(|(s, c)| s.kinds.as_slice() == [CheckKind::Lint] || matches!(c, Some(0)))
+}
+
+/// What run_checks tells the agent: the verdict, each command that ran with
+/// its result, why the full test suite didn't run, then the real output.
+fn checks_report(
+    lines: &[String],
+    passed: bool,
+    exit_code: Option<i32>,
+    no_tests_ran: bool,
+    output: &str,
+) -> String {
+    let verdict = if passed {
+        "PASSED ✅ — every check below passed"
+    } else {
+        "FAILED ❌ — fix the errors below (build, types, lint OR a failing test), then run_checks again"
+    };
+    let tests_note = if no_tests_ran {
+        "\nNo tests ran: this change touched no test files (or the repo's CI runs no unit tests). \
+         The full app suite needs services the sandbox lacks, so CI runs it on the PR.\n"
+    } else {
+        ""
+    };
+    format!(
+        "Sandbox checks {verdict} (exit {exit_code:?}).\nEach check ran on its own, as follows:\n{}\n{tests_note}\n\
+         --- real output (tail) ---\n{output}",
+        lines.join("\n"),
+    )
+}
 
 pub struct ImplementResult {
     pub files_modified: Vec<String>,
@@ -196,6 +275,15 @@ pub async fn run(
     // wrote sailed through the sandbox gate and only failed once CI ran vitest.
     let test_cmd = if sandbox.is_some() {
         super::detect_ci_test(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await
+    } else {
+        None
+    };
+    // The repo's own CI lint command: run_checks runs it as its own step so the
+    // sandbox runs what CI gates on, without a lint failure hiding the
+    // type-check or test result.
+    let lint_cmd = if sandbox.is_some() {
+        super::checks::detect_ci_lint(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch)
+            .await
     } else {
         None
     };
@@ -509,6 +597,8 @@ pub async fn run(
             sandbox,
             checks_cmd,
             test_cmd,
+            lint_cmd,
+            check_results: std::sync::Mutex::new(Vec::new()),
             last_checks_passed: std::sync::atomic::AtomicBool::new(true),
             codegen_cmd,
             codegen_env,
@@ -840,6 +930,18 @@ pub async fn run(
         sources.extend(o.connected());
         lookups.extend(o.lookups());
     }
+    // Which checks ran and what they came to, as recorded by run_checks, and
+    // which ones the repo's CI runs on the PR: facts the proof check reads
+    // instead of the coder's account.
+    let checks = executor
+        .write_executor
+        .check_results
+        .lock()
+        .unwrap()
+        .clone();
+    let ci_gates =
+        super::checks::detect_ci_gates(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch)
+            .await;
     Ok(ImplementResult {
         files_modified: files,
         conversation_log: conv_log,
@@ -847,6 +949,8 @@ pub async fn run(
             sources,
             lookups,
             notes: closing.trim().to_string(),
+            checks,
+            ci_gates,
         },
     })
 }
@@ -1281,6 +1385,13 @@ struct WriteToolExecutor<'a> {
     /// The repo's unit-test command (faithful CI replica); run_checks scopes it
     /// to the changed test files. None when not testable / no sandbox.
     test_cmd: Option<String>,
+    /// The repo's CI lint command; run_checks runs it as its own step. None
+    /// when CI runs no lint / no sandbox.
+    lint_cmd: Option<String>,
+    /// What the most recent run_checks came to, one line per step (which
+    /// command, which kind of check, PASS or FAIL). The run's evidence, so
+    /// the proof check reads facts instead of the coder's account.
+    check_results: std::sync::Mutex<Vec<String>>,
     /// Verdict of the most recent run_checks (incl. tests). Starts true (nothing
     /// run yet ⇒ no red seen); set on every run_checks so the finish path can
     /// warn when the agent stops on a red result.
@@ -1937,11 +2048,6 @@ impl<'a> WriteToolExecutor<'a> {
             ));
         }
 
-        // Extend the check command with the repo's unit tests, scoped to the
-        // test files THIS change touched. run_checks used to run only
-        // typecheck+build, so a broken test the agent wrote passed the sandbox
-        // gate and shipped a red PR. Scoped + --passWithNoTests keeps
-        // it fast and avoids false-REDs from unrelated/service-dependent suites.
         let changed: Vec<String> = self
             .files_modified
             .lock()
@@ -1949,14 +2055,13 @@ impl<'a> WriteToolExecutor<'a> {
             .iter()
             .cloned()
             .collect();
-        let effective_cmd = match self
-            .test_cmd
-            .as_deref()
-            .and_then(|tc| super::build_scoped_test_cmd(tc, &changed))
-        {
-            Some(test_step) => format!("{cmd} && {test_step}"),
-            None => cmd.clone(),
-        };
+        let steps = check_steps(
+            cmd,
+            self.lint_cmd.as_deref(),
+            self.test_cmd.as_deref(),
+            &changed,
+        );
+        let effective_cmd = super::checks::script(&steps);
 
         let tarball = match self
             .github
@@ -1983,18 +2088,26 @@ impl<'a> WriteToolExecutor<'a> {
             .await
         {
             Ok(o) if o.ran => {
+                let codes = super::checks::step_results(&o.output, steps.len());
+                let lines: Vec<String> = steps
+                    .iter()
+                    .zip(&codes)
+                    .map(|(s, c)| super::checks::result_line(s, *c))
+                    .collect();
                 // Record the verdict so the finish path can catch a stop-on-red.
-                self.last_checks_passed
-                    .store(o.passed, std::sync::atomic::Ordering::SeqCst);
-                let verdict = if o.passed {
-                    "PASSED ✅ — your changes build, type-check, and the affected tests pass"
-                } else {
-                    "FAILED ❌ — fix the errors below (build, types, OR a failing test), then run_checks again"
-                };
-                Ok(json!(format!(
-                    "Sandbox checks {verdict} (exit {:?}).\nCommands: {effective_cmd}\n\n\
-                     --- real output (tail) ---\n{}",
-                    o.exit_code, o.output
+                // Lint is reported, not part of it: a lint-config quirk in the
+                // sandbox must not force a remediation pass.
+                self.last_checks_passed.store(
+                    gate_passed(&steps, &codes, o.passed),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                *self.check_results.lock().unwrap() = lines.clone();
+                Ok(json!(checks_report(
+                    &lines,
+                    o.passed,
+                    o.exit_code,
+                    !steps.iter().any(|s| s.kinds.contains(&CheckKind::Tests)),
+                    &o.output
                 )))
             }
             Ok(o) => Ok(json!(format!(
@@ -2626,5 +2739,67 @@ mod task_prompt_tests {
         assert!(with.find("## Repository Instructions") < with.find("## Your team's instructions"));
         let without = coder_system("acme", "web", "", "  \n", "");
         assert!(!without.contains("team's instructions"));
+    }
+}
+
+#[cfg(test)]
+mod run_checks_tests {
+    use super::{check_steps, checks_report, gate_passed, CheckKind};
+
+    const TYPECHECK: &str = "pnpm install --frozen-lockfile && pnpm --filter web check-types";
+
+    #[test]
+    fn runs_what_ci_gates_on_each_as_its_own_step() {
+        let steps = check_steps(
+            TYPECHECK,
+            Some("pnpm lint"),
+            Some("pnpm test:run"),
+            &["src/a.ts".into(), "src/a.test.ts".into()],
+        );
+        let kinds: Vec<_> = steps.iter().map(|s| s.kinds.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                vec![CheckKind::Typecheck],
+                vec![CheckKind::Lint],
+                vec![CheckKind::Tests]
+            ]
+        );
+        assert_eq!(steps[2].cmd, "pnpm test:run -- --passWithNoTests a.test.ts");
+        assert!(steps[2]
+            .scope
+            .as_deref()
+            .unwrap()
+            .contains("only the test files"));
+        // No lint in CI and no test file touched: the type-check alone.
+        assert_eq!(
+            check_steps(TYPECHECK, None, Some("pnpm test"), &["src/a.ts".into()]).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_lint_failure_is_reported_but_never_masks_the_gate() {
+        let steps = check_steps(TYPECHECK, Some("pnpm lint"), None, &[]);
+        assert!(gate_passed(&steps, &[Some(0), Some(1)], false));
+        assert!(!gate_passed(&steps, &[Some(2), Some(0)], false));
+        // No per-step result (the run stopped early): the run's exit decides.
+        assert!(!gate_passed(&steps, &[None, None], false));
+        assert!(gate_passed(&steps, &[None, None], true));
+    }
+
+    #[test]
+    fn the_report_lists_each_command_and_its_result() {
+        let lines = vec![
+            "- typecheck: PASS, `pnpm check-types`".to_string(),
+            "- lint: FAIL (exit 1), `pnpm lint`".to_string(),
+        ];
+        let r = checks_report(&lines, false, Some(1), true, "tail");
+        assert!(r.starts_with("Sandbox checks FAILED"));
+        assert!(r.contains("Each check ran on its own, as follows:\n- typecheck: PASS"));
+        assert!(r.contains("- lint: FAIL (exit 1), `pnpm lint`"));
+        assert!(r.contains("No tests ran: this change touched no test files"));
+        assert!(r.ends_with("--- real output (tail) ---\ntail"));
+        assert!(!checks_report(&lines, true, Some(0), false, "").contains("No tests ran"));
     }
 }

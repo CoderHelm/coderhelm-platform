@@ -20,10 +20,27 @@ pub struct PrResult {
 
 /// What the run proved about the change, for its description: what it
 /// looked up (`evidence`, the writer's source for an Evidence section) and
-/// the gaps the proof check still found (`gaps`, put at the very top).
+/// the gaps the proof check still found (`gaps`, put at the very top), and
+/// what only a person can check (`manual`, steps for the Verification
+/// section).
 pub struct Proof<'a> {
     pub evidence: &'a str,
     pub gaps: &'a str,
+    pub manual: &'a str,
+}
+
+/// What the writer is told about the checks only a person can do: each one
+/// a numbered Verification step, and nowhere else. Empty when there are none.
+fn manual_instructions(manual: &str) -> String {
+    if manual.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## Checks only a person can do\nAdd each of these as a numbered step in the \
+         Verification section (and nowhere else in the description), saying what to do and what \
+         to look for:\n{}",
+        manual.trim_end()
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -114,7 +131,11 @@ pub async fn run(
          3. **Risk** — State risk level in bold (**Low**, **Medium**), then why it's safe.\n\
          4. **Verification** — Numbered steps to verify the change."
     };
-    let evidence_block = evidence_instructions(proof.evidence);
+    let evidence_block = format!(
+        "{}{}",
+        evidence_instructions(proof.evidence),
+        manual_instructions(proof.manual)
+    );
 
     let diff_patches = format_diff_patches(&diff);
     let prompt = format!(
@@ -966,7 +987,12 @@ pub async fn refresh_description(
     let (Some(base), Some(head)) = (pr["base"]["ref"].as_str(), pr["head"]["ref"].as_str()) else {
         return;
     };
-    let old = pr["body"].as_str().unwrap_or("").trim().to_string();
+    let current = pr["body"].as_str().unwrap_or("").trim().to_string();
+    // The "Not yet verified" section is CoderHelm's own record, kept word for
+    // word (only CI's result changes it, see `settle_unverified_by_ci`): the
+    // writer rewrites the rest.
+    let (unverified, old) = super::proof::split_unverified(&current);
+    let old = old.trim().to_string();
     if old.is_empty() {
         return;
     }
@@ -989,7 +1015,7 @@ pub async fn refresh_description(
 - Keep the description's structure, headings and tone.
 - Keep any line that starts with "Source ticket:", "Closes #", "Fixes #" or "Resolves #" exactly as it is, and keep any HTML comments and `<sub>` lines at the end exactly as they are.
 - Remove or correct anything the diff no longer bears out (a field name, a guess, a step, a file), and describe what the later commits changed.
-- Keep the Evidence section (what was looked up and what came back) and any "Not proven before this PR opened" note at the top, unless the diff no longer relies on what they describe.
+- Keep the Evidence section (what was looked up and what came back), unless the diff no longer relies on what it describes.
 - Don't add filler. If the description is already true, return it unchanged.
 
 Return ONLY the markdown body text."#,
@@ -1036,13 +1062,46 @@ Return ONLY the markdown body text."#,
         );
         return;
     }
-    if body != old {
+    let body = format!("{unverified}{body}");
+    if body != current {
         match github.update_pr_body(owner, repo, pr_number, &body).await {
             Ok(()) => info!(
                 pr_number,
                 "PR description rewritten to match the latest diff"
             ),
             Err(e) => warn!(pr_number, error = %e, "Could not save the rewritten PR description"),
+        }
+    }
+}
+
+/// The PR's CI passed on its head: the "Not yet verified" items CI settles
+/// (lint, type-check, build or tests that hadn't run before the PR opened)
+/// come out of the description, and the whole section when none is left. A
+/// warning that stayed after CI passed those checks told reviewers the PR was
+/// unverified when it wasn't. Leaves the description alone when there is
+/// nothing to settle or anything fails.
+pub async fn settle_unverified_by_ci(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) {
+    if pr_number == 0 {
+        return;
+    }
+    let Ok(pr) = github.get_pull_request(owner, repo, pr_number).await else {
+        return;
+    };
+    let Some(body) = super::proof::settle_by_ci(pr["body"].as_str().unwrap_or("")) else {
+        return;
+    };
+    match github.update_pr_body(owner, repo, pr_number, &body).await {
+        Ok(()) => info!(
+            pr_number,
+            "CI passed: removed the checks it settled from the PR's Not yet verified section"
+        ),
+        Err(e) => {
+            warn!(pr_number, error = %e, "Could not update the PR description after CI passed")
         }
     }
 }
@@ -1100,8 +1159,18 @@ async fn fetch_pr_template(
 #[cfg(test)]
 mod refresh_tests {
     use super::{
-        evidence_instructions, keeps_ticket_line, pr_title, squash_message, writer_system,
+        evidence_instructions, keeps_ticket_line, manual_instructions, pr_title, squash_message,
+        writer_system,
     };
+
+    #[test]
+    fn checks_only_a_person_can_do_become_verification_steps() {
+        assert_eq!(manual_instructions(""), "");
+        let block = manual_instructions("- open the drawer in a real browser\n");
+        assert!(block.contains("numbered step in the Verification section"));
+        assert!(block.contains("and nowhere else"));
+        assert!(block.ends_with("- open the drawer in a real browser"));
+    }
 
     #[test]
     fn the_writer_gets_the_teams_instructions_when_set() {

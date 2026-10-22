@@ -986,6 +986,8 @@ pub async fn run(
                     )
                     .await;
                 }
+                super::pr::settle_unverified_by_ci(&github, &repo_owner, &repo_name, pr_number)
+                    .await;
                 ready_or_prove(
                     state,
                     &github,
@@ -1659,6 +1661,10 @@ pub async fn run(
             .await;
         }
         super::record_ci_outcome(state, &msg.team_id, &msg.run_id, super::CiOutcome::Passed).await;
+        // CI's green result settles the checks the PR opened without.
+        if verdict == CiVerdict::Green {
+            super::pr::settle_unverified_by_ci(&github, &repo_owner, &repo_name, pr_number).await;
+        }
         super::update_pass(state, &msg.team_id, &msg.run_id, "review").await?;
 
         let plan_result = plan::PlanResult {
@@ -2640,7 +2646,11 @@ async fn resume_multi_repo(
         match evaluate_ci_verdict(&github, &owner, &name, &head).await {
             CiVerdict::Failed => failed.push(url.clone()),
             CiVerdict::Pending => waiting.push(url.clone()),
-            CiVerdict::Green | CiVerdict::NoChecks => {}
+            // CI's green result settles the checks the PR opened without.
+            CiVerdict::Green => {
+                super::pr::settle_unverified_by_ci(&github, &owner, &name, number).await
+            }
+            CiVerdict::NoChecks => {}
         }
         open.push((owner, name, number));
     }

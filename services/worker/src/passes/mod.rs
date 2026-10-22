@@ -685,6 +685,7 @@ fn has_time_for_remediation(start: &Instant) -> bool {
 
 pub mod agent_tools;
 pub mod await_merge;
+mod checks;
 pub mod code_graph;
 pub mod e2e;
 pub mod feedback;
@@ -3708,6 +3709,7 @@ async fn run_passes(
         &pr::Proof {
             evidence: &evidence.for_pr(),
             gaps: &proof::gaps_section(&gaps),
+            manual: &proof::manual_steps(&gaps),
         },
         &provider,
         usage,
@@ -4209,6 +4211,7 @@ async fn run_repo_pipeline(
         &pr::Proof {
             evidence: &evidence.for_pr(),
             gaps: &proof::gaps_section(&gaps),
+            manual: &proof::manual_steps(&gaps),
         },
         provider,
         usage,
@@ -5762,14 +5765,18 @@ pub(crate) async fn detect_check_commands(
             }
 
             let mut steps = vec![install.to_string()];
-            // Gate ONLY on typecheck + build — the reliable, self-contained
-            // correctness signals. Deliberately NOT lint or test:
-            //   - lint is style, and in monorepos `pnpm run lint` -> `turbo lint`
-            //     can hard-fail on a task-config quirk ("Could not find task
-            //     lint") that has nothing to do with the change — a false RED
-            //     that, with `&&`, would also mask the build result.
+            // This command is typecheck + build only — the reliable,
+            // self-contained correctness signals. Lint and tests are NOT
+            // chained on here:
+            //   - lint can hard-fail on a task-config quirk ("Could not find
+            //     task lint") that has nothing to do with the change; with `&&`
+            //     that would mask the build result. run_checks runs the CI's
+            //     own lint command as a separate step instead (`checks::script`),
+            //     so its result is reported without hiding this one.
             //   - a full app test suite needs services/env the sandbox lacks, so
-            //     it false-REDs; that verification stays CI's job.
+            //     it false-REDs; that verification stays CI's job. run_checks
+            //     runs only the unit tests the change touched, also as its own
+            //     step.
             // typecheck first (fast) so a type error fails before the slower build.
             for script in ["typecheck", "type-check", "build"] {
                 if has(script) {
@@ -5964,7 +5971,9 @@ fn is_test_cmd(line: &str) -> bool {
         || low.contains("jest")
         || line.split_whitespace().any(|t| {
             let t = t.trim_matches(|c| c == '"' || c == '\'');
-            t == "test" || t == "test:unit" || t == "unit" || t.ends_with(":unit")
+            // `test:run`, `test:ci`: a package's own unit-test script (the
+            // e2e/integration ones are already turned away above).
+            t == "test" || t.starts_with("test:") || t == "unit" || t.ends_with(":unit")
         });
     looks_test && is_cmd
 }
@@ -6047,6 +6056,7 @@ mod test_gate_tests {
         assert!(is_test_cmd("pnpm exec vitest run"));
         assert!(is_test_cmd("npx jest"));
         assert!(is_test_cmd("yarn test:unit"));
+        assert!(is_test_cmd("pnpm test:run"));
     }
 
     #[test]
