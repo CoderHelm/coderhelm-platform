@@ -8,9 +8,12 @@
 //! - A review that didn't finish never posts a formal verdict.
 //! - A reply that concludes nothing blocks never stands next to CoderHelm's
 //!   own "changes requested": the formal review is re-run in the same job.
+//! - A finished review's formal verdict is APPROVE or REQUEST_CHANGES, never
+//!   a bare COMMENT ([`binary`]). Only GitHub's rule against verdicts on the
+//!   bot's own PR makes it a COMMENT there; answers to a person's question
+//!   are comments, not formal reviews.
 //! - A finished review that holds nothing never leaves an older "changes
-//!   requested" of CoderHelm's standing (a COMMENT review doesn't clear it
-//!   on GitHub, so it is dismissed).
+//!   requested" of CoderHelm's standing: its APPROVE replaces it.
 //!
 //! A test fails if any other module calls the GitHub review endpoints.
 
@@ -56,6 +59,11 @@ pub enum Input {
     },
     /// A review that didn't finish (model API, unreadable answer, GitHub).
     Failed,
+    /// A push after CoderHelm's approval that changed none of the PR's own
+    /// code (only docs, or only merges of the base branch): the approval is
+    /// posted again on the new head, since many repos dismiss approvals
+    /// when commits are pushed.
+    Carried,
     /// A reply CoderHelm is about to post, and what it concludes.
     Reply { change: VerdictChange },
 }
@@ -83,12 +91,34 @@ pub enum Decision {
     Nothing,
 }
 
+/// The formal event for a verdict: `APPROVE`, or `REQUEST_CHANGES` for
+/// anything else. A formal review never posts a bare `COMMENT` as its
+/// verdict (only answers to a person's question are comments, and those are
+/// not formal reviews).
+pub fn binary(verdict: &str) -> &'static str {
+    if verdict == "APPROVE" {
+        "APPROVE"
+    } else {
+        "REQUEST_CHANGES"
+    }
+}
+
 /// The decision. Pure: every rule about what CoderHelm posts formally is here.
 pub fn decide(input: Input, ctx: &Context) -> Decision {
     let standing_blocks = ctx.standing.as_ref().is_some_and(StandingReview::blocks);
     match input {
         // No verdict from a review that didn't finish; the previous one stays.
         Input::Failed => Decision::Nothing,
+        // Always posted: a head without a visible verdict is what a carried
+        // approval exists to prevent.
+        Input::Carried => Decision::Post {
+            event: if ctx.self_authored {
+                "COMMENT"
+            } else {
+                "APPROVE"
+            },
+            dismiss_stale: false,
+        },
         Input::Reply { change } => {
             if ctx.self_authored {
                 return Decision::Nothing;
@@ -114,23 +144,28 @@ pub fn decide(input: Input, ctx: &Context) -> Decision {
             explicit,
             already_answered,
         } => {
+            // A formal verdict is APPROVE or REQUEST_CHANGES, never a bare
+            // comment: anything that isn't an approval holds the merge.
+            let verdict = binary(verdict);
             // A verdict that no longer blocks must replace a standing block,
             // news or not.
-            let clears_a_block = standing_blocks && verdict != "REQUEST_CHANGES";
+            let clears_a_block = standing_blocks && verdict == "APPROVE";
             if already_answered || !(explicit || has_news || clears_a_block) {
                 return Decision::Nothing;
             }
             if ctx.self_authored {
+                // GitHub refuses either verdict on the bot's own PR; the body
+                // still carries it.
                 return Decision::Post {
                     event: "COMMENT",
                     dismiss_stale: false,
                 };
             }
+            // APPROVE replaces a standing request for changes on GitHub by
+            // itself.
             Decision::Post {
                 event: verdict,
-                // APPROVE replaces the state on GitHub by itself; a COMMENT
-                // review doesn't.
-                dismiss_stale: verdict == "COMMENT" && standing_blocks,
+                dismiss_stale: false,
             }
         }
     }
@@ -342,12 +377,10 @@ mod tests {
                 dismiss_stale: false
             }
         );
+        // Anything but an approval doesn't clear it.
         assert_eq!(
             decide(review("COMMENT", false, false), &blocked),
-            Decision::Post {
-                event: "COMMENT",
-                dismiss_stale: true
-            }
+            Decision::Nothing
         );
         // Same verdict, nothing new, nothing asked: quiet.
         let approved = Context {
@@ -385,6 +418,73 @@ mod tests {
                 dismiss_stale: false
             }
         );
+    }
+
+    /// A push that changed none of the PR's own code after an approval posts
+    /// the approval again on the new head, whatever stands (repos that
+    /// dismiss stale approvals would otherwise leave it without one); on
+    /// CoderHelm's own PR it is a COMMENT.
+    #[test]
+    fn a_carried_approval_is_posted_on_the_new_head() {
+        for s in [
+            None,
+            standing("APPROVE", false),
+            standing("REQUEST_CHANGES", true),
+        ] {
+            let ctx = Context {
+                standing: s,
+                self_authored: false,
+            };
+            assert_eq!(
+                decide(Input::Carried, &ctx),
+                Decision::Post {
+                    event: "APPROVE",
+                    dismiss_stale: false
+                }
+            );
+        }
+        let own = Context {
+            standing: None,
+            self_authored: true,
+        };
+        assert_eq!(
+            decide(Input::Carried, &own),
+            Decision::Post {
+                event: "COMMENT",
+                dismiss_stale: false
+            }
+        );
+    }
+
+    /// A formal review is APPROVE or REQUEST_CHANGES on a person's PR,
+    /// never a bare COMMENT, whatever verdict string reaches it.
+    #[test]
+    fn a_formal_review_is_never_a_bare_comment() {
+        for standing_review in [
+            None,
+            standing("APPROVE", false),
+            standing("REQUEST_CHANGES", false),
+            standing("REQUEST_CHANGES", true),
+        ] {
+            let ctx = Context {
+                standing: standing_review,
+                self_authored: false,
+            };
+            for verdict in ["APPROVE", "REQUEST_CHANGES", "COMMENT", ""] {
+                for (news, asked) in [(true, false), (false, true), (true, true), (false, false)] {
+                    if let Decision::Post { event, .. } = decide(review(verdict, news, asked), &ctx)
+                    {
+                        assert!(
+                            event == "APPROVE" || event == "REQUEST_CHANGES",
+                            "{verdict} posted as {event}"
+                        );
+                        assert_eq!(event == "APPROVE", verdict == "APPROVE", "{verdict}");
+                    }
+                }
+            }
+        }
+        assert_eq!(binary("COMMENT"), "REQUEST_CHANGES");
+        assert_eq!(binary("APPROVE"), "APPROVE");
     }
 
     #[test]

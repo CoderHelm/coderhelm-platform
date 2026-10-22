@@ -2,7 +2,8 @@
 //! human replies to the bot) → gateway enqueues a `Review` job → this pass
 //! fetches the diff, asks the model for a verdict + risk + findings against the
 //! repo's rules/instructions, posts a GitHub review (APPROVE / REQUEST_CHANGES,
-//! or COMMENT when GitHub forbids a self-review), persists a review record for
+//! never a bare COMMENT; GitHub forbids either verdict on the bot's own PR, so
+//! there it posts as a COMMENT whose body carries the verdict), persists a review record for
 //! the dashboard, and — only when the repo opts in — runs post-approval actions.
 //!
 //! Never approves on an error. A review that didn't finish (a model API
@@ -1128,6 +1129,9 @@ async fn run_once(
     // not reviewed at all and the approval stands. A push after a request
     // for changes (or questions) gets a full review.
     let mut review_diff = diff.clone();
+    // The PR's own change is the one CoderHelm approved: every commit since
+    // brought in only the base branch (merges of work already merged there).
+    let mut own_change_unchanged = false;
     if let Some(approved) = super::review_scope::approved_base(
         &msg.trigger,
         msg.question.is_some(),
@@ -1141,8 +1145,36 @@ async fn run_once(
             Ok(since) if super::review_scope::builds_on(&since) => {
                 let short = &approved[..approved.len().min(7)];
                 let unconfirmed = review_agent::unconfirmed_external_facts(pr_body, &[]);
-                if !super::review_scope::touches_code(&since) && unconfirmed.is_empty() {
-                    info!(pr = msg.pr_number, approved = %approved, head = %head_sha, "Push changed no code or data since the approval — review skipped");
+                // Merges of the base branch change code, but not the PR's:
+                // compare the PR's own change now with the one approved.
+                own_change_unchanged = match github
+                    .get_diff(&msg.repo_owner, &msg.repo_name, base, &approved)
+                    .await
+                {
+                    Ok(at_approval) => super::review_scope::same_own_change(&at_approval, &compare),
+                    Err(e) => {
+                        warn!(pr = msg.pr_number, error = %e, "Could not read the PR's change at the approval — reviewing what changed since");
+                        false
+                    }
+                };
+                let nothing_new =
+                    !super::review_scope::touches_code(&since) || own_change_unchanged;
+                if nothing_new && unconfirmed.is_empty() {
+                    info!(pr = msg.pr_number, approved = %approved, head = %head_sha, own_change_unchanged, "Push changed none of the PR's code or data since the approval — review skipped, approval carried");
+                    // Many repos dismiss approvals when commits are pushed:
+                    // post the approval again on this head, so the PR never
+                    // sits without a visible verdict.
+                    carry_approval(
+                        state,
+                        &github,
+                        &msg,
+                        &head_sha,
+                        &approved,
+                        own_change_unchanged,
+                        standing.clone(),
+                        self_authored,
+                    )
+                    .await;
                     // The auto-merge gate is bound to a head: carry the
                     // approval to this one, as a review of it would.
                     let _ = super::review_actions::run_on_approve(
@@ -1158,19 +1190,38 @@ async fn run_once(
                         self_authored,
                     )
                     .await;
-                    return Ok(Outcome::Skipped {
-                        reason: format!(
+                    let reason = if own_change_unchanged {
+                        format!(
+                            "Not reviewed: the commits since CoderHelm approved {short} only \
+                             bring in the base branch, and the PR's own change is the one \
+                             approved, so that approval stands."
+                        )
+                    } else {
+                        format!(
                             "Not reviewed: nothing but docs, comments or whitespace changed \
                              since CoderHelm approved {short}, so that approval stands."
-                        ),
-                    });
+                        )
+                    };
+                    return Ok(Outcome::Skipped { reason });
                 }
-                info!(pr = msg.pr_number, approved = %approved, head = %head_sha, files = ?super::review_scope::code_files(&since), "Reviewing only what changed since the approval");
-                review_diff = format!(
-                    "(CoderHelm approved {short} earlier. This review covers only what changed \
-                     since then; the rest of the PR was reviewed and approved.)\n{}",
-                    review_agent::format_diff(&since, 40_000)
-                );
+                if own_change_unchanged {
+                    // Reviewed again only to triage the facts the description
+                    // marks unconfirmed: the change itself is the approved one.
+                    info!(pr = msg.pr_number, approved = %approved, head = %head_sha, "Only the base branch came in since the approval — re-checking the PR's unconfirmed facts");
+                    review_diff = format!(
+                        "(CoderHelm approved {short} earlier. Every commit since only merges the \
+                         base branch: the PR's own change below is the one approved. Review \
+                         nothing new in it; triage the facts the description marks \
+                         unconfirmed.)\n{diff}"
+                    );
+                } else {
+                    info!(pr = msg.pr_number, approved = %approved, head = %head_sha, files = ?super::review_scope::code_files(&since), "Reviewing only what changed since the approval");
+                    review_diff = format!(
+                        "(CoderHelm approved {short} earlier. This review covers only what \
+                         changed since then; the rest of the PR was reviewed and approved.)\n{}",
+                        review_agent::format_diff(&since, 40_000)
+                    );
+                }
             }
             Ok(_) => {
                 info!(pr = msg.pr_number, approved = %approved, "Approved commit isn't an ancestor of the head (rebased) — full review");
@@ -1501,21 +1552,13 @@ async fn run_once(
     let fixed_threads: Vec<&crate::clients::github::BotReviewThread> =
         settled_prior_threads(&prior_threads, &output.prior);
     let still_open = prior_threads.len() - fixed_threads.len();
-    // Of those, the ones that hold the merge: a question or an unverified
-    // concern left open is still shown, but doesn't request changes.
+    // Of those, the ones that hold the merge: a question the change doesn't
+    // rest on, or an unverified concern, left open is still shown, but
+    // doesn't request changes.
     let still_open_holding = prior_threads
         .iter()
         .filter(|t| !fixed_threads.iter().any(|f| f.id == t.id))
         .filter(|t| review_agent::thread_holds_merge(&t.body))
-        .count();
-    // Open questions nobody answered keep it from approving; an open note or
-    // unverified concern doesn't.
-    let still_open_questions = prior_threads
-        .iter()
-        .filter(|t| !fixed_threads.iter().any(|f| f.id == t.id))
-        .filter(|t| {
-            !review_agent::thread_holds_merge(&t.body) && review_agent::thread_is_question(&t.body)
-        })
         .count();
     // Label picking is live when there's something to pick: existing allowed
     // labels, or an allowed family whose labels may not exist yet.
@@ -1627,7 +1670,14 @@ async fn run_once(
             .get_diff(&msg.repo_owner, &msg.repo_name, &prev.head_sha, &head_sha)
             .await
         {
-            let touched = changed_files(&since);
+            // When the PR's own change is the one approved (only the base
+            // branch came in), nothing of the PR's changed: every finding is
+            // about approved code.
+            let touched = if own_change_unchanged {
+                std::collections::HashSet::new()
+            } else {
+                changed_files(&since)
+            };
             let (keep, held) = hold_unchanged(std::mem::take(&mut findings), &touched);
             findings = keep;
             if !held.is_empty() {
@@ -1671,30 +1721,25 @@ async fn run_once(
         }
     }
 
-    // Verdict: CoderHelm approves exactly when it has nothing left to ask for.
-    // Changes are requested only for what holds the merge: a verified defect
-    // (or a policy like required tests), an earlier requested change still
-    // open, a failed verification, or a review that didn't finish. Questions
-    // and concerns it couldn't verify are posted as a COMMENT review: not an
-    // approval (which would arm auto-merge), not a block.
-    let verdict: &'static str = review_agent::decide_verdict(
-        &findings,
-        still_open_holding,
-        still_open_questions,
-        verify_failed,
-    );
-    // Never an approval (nor an armed auto-merge) on facts the PR's own
-    // evidence says are unconfirmed: a COMMENT that asks for them instead.
+    // Verdict: always APPROVE or REQUEST_CHANGES. Changes are requested for
+    // what holds the merge: a verified defect (or a policy like required
+    // tests), a question or an unconfirmed fact the change's correctness
+    // rests on, an earlier requested change still open, or a failed
+    // verification. Everything else (notes, concerns it couldn't verify,
+    // environment notes such as a staging system without data) is posted
+    // with the approval.
     let unconfirmed = review_agent::unconfirmed_external_facts(pr_body, &output.unconfirmed_facts);
-    let held_for_unconfirmed = review_agent::hold_for_unconfirmed(verdict, &unconfirmed);
-    if held_for_unconfirmed != verdict {
+    let verdict: &'static str =
+        review_agent::decide_verdict(&findings, still_open_holding, &unconfirmed, verify_failed);
+    let blocking_facts = unconfirmed.iter().filter(|f| f.blocks).count();
+    if !unconfirmed.is_empty() {
         info!(
             pr = msg.pr_number,
             unconfirmed = unconfirmed.len(),
-            "Approval held: the PR's evidence leaves external facts unconfirmed"
+            blocking = blocking_facts,
+            "Unconfirmed facts in the PR's evidence triaged"
         );
     }
-    let verdict = held_for_unconfirmed;
     // Computed, explainable risk (blast-radius-weighted) — overrides the model's
     // guess and drives the displayed level.
     let risk_report = review_risk::assess(
@@ -1710,29 +1755,31 @@ async fn run_once(
     // GitHub forbids APPROVE / REQUEST_CHANGES on your OWN PR → downgrade to COMMENT.
     let self_authored = pr_author.contains("coderhelm");
     let effective_event = if self_authored { "COMMENT" } else { verdict };
-    let verdict_line = match verdict {
-        "APPROVE" if !findings.is_empty() => "✅ **Approved**, with a few notes that don't block",
-        "APPROVE" => "✅ **Approved**",
-        "COMMENT" => "💬 **Questions, nothing blocking**",
-        _ => "🔴 **Changes requested**",
-    };
+    let verdict_line = review_agent::verdict_heading(
+        verdict,
+        &review_agent::HeadingCounts {
+            defects: findings
+                .iter()
+                .filter(|f| f.evidence() == review_agent::Evidence::VerifiedDefect)
+                .count(),
+            blocking_questions: findings
+                .iter()
+                .filter(|f| f.evidence() == review_agent::Evidence::Question && f.holds_merge())
+                .count(),
+            blocking_facts,
+            prior_open: still_open_holding,
+            verify_failed,
+            notes: findings.iter().filter(|f| !f.holds_merge()).count()
+                + (unconfirmed.len() - blocking_facts)
+                + held_since_approval.len(),
+        },
+    );
     let summary = if output.summary.trim().is_empty() {
         "Automated review complete.".to_string()
     } else {
         short_overview(&output.summary)
     };
     let mut full_body = format!("{verdict_line}\n\n{summary}\n\n{}", risk_report.markdown());
-    // "Approve with notes" no longer exists: say plainly why changes are
-    // requested when nothing on its own is blocking.
-    if verdict == "REQUEST_CHANGES" && postable.blocking_count == 0 && !verify_failed {
-        let open = findings.iter().filter(|f| f.holds_merge()).count() + still_open_holding;
-        if open > 0 {
-            full_body.push_str(&format!(
-                "\n\n> Nothing here is blocking on its own, but {open} requested change(s) are still open — \
-                 CoderHelm approves (and auto-merge proceeds) once they're addressed or their threads resolved."
-            ));
-        }
-    }
     full_body.push_str(&review_agent::unconfirmed_markdown(&unconfirmed));
     if !verify_md.is_empty() {
         full_body.push_str(&format!("\n\n{verify_md}"));
@@ -2080,6 +2127,78 @@ async fn run_once(
 /// The trigger of a review a ticket run asks for on its own PR before it
 /// completes (see [`review_for_run`]).
 pub(crate) const TRIGGER_RUN: &str = "run";
+
+/// The body of an approval carried to a new head without a review: the
+/// verdict and why in one line.
+pub(crate) fn carried_approval_body(approved: &str, only_base_merged: bool) -> String {
+    let short = &approved[..approved.len().min(7)];
+    let why = if only_base_merged {
+        format!(
+            "the new commits only bring in the base branch; the PR's own change is the same as \
+             the approved `{short}`."
+        )
+    } else {
+        format!(
+            "the new commits change only docs, comments or whitespace since the approved \
+             `{short}`."
+        )
+    };
+    format!("✅ **Approved**: {why}")
+}
+
+/// Posts the approval of `approved` again on `head` (a COMMENT on
+/// CoderHelm's own PR, where GitHub refuses a verdict) and records it, so
+/// the head carries a visible verdict and later pushes are reviewed from it.
+/// Best-effort: a failure is logged and the auto-merge gate still runs.
+#[allow(clippy::too_many_arguments)]
+async fn carry_approval(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &ReviewMessage,
+    head: &str,
+    approved: &str,
+    only_base_merged: bool,
+    standing: Option<super::review_verdict::StandingReview>,
+    self_authored: bool,
+) {
+    let super::review_verdict::Decision::Post {
+        event,
+        dismiss_stale,
+    } = super::review_verdict::decide(
+        super::review_verdict::Input::Carried,
+        &super::review_verdict::Context {
+            standing,
+            self_authored,
+        },
+    )
+    else {
+        return;
+    };
+    let heading = carried_approval_body(approved, only_base_merged);
+    let body = format!("{heading}{RATING_FOOTER}");
+    if let Err(e) =
+        super::review_verdict::post(github, msg, head, event, dismiss_stale, &body, &[]).await
+    {
+        warn!(pr = msg.pr_number, head = %head, error = %e, "Could not post the carried approval");
+        return;
+    }
+    store_review_record(
+        state,
+        msg,
+        head,
+        "APPROVE",
+        "N/A",
+        &heading,
+        event,
+        "",
+        &common::review_stats::ReviewCounts {
+            posted: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    info!(pr = msg.pr_number, head = %head, approved = %approved, event, "Approval carried to the new head");
+}
 
 /// The PR reviewer's verdict on a run's own PR, for the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3300,18 +3419,35 @@ mod verdict_tests {
         }
     }
 
+    /// A carried approval says it is one, and why, in its one line.
+    #[test]
+    fn a_carried_approval_names_the_approved_commit_and_why() {
+        let merged = super::carried_approval_body("abc1234def", true);
+        assert_eq!(
+            merged,
+            "✅ **Approved**: the new commits only bring in the base branch; the PR's own \
+             change is the same as the approved `abc1234`."
+        );
+        let docs = super::carried_approval_body("abc1234def", false);
+        assert!(docs.starts_with("✅ **Approved**: "), "{docs}");
+        assert!(docs.contains("only docs, comments or whitespace"));
+        for b in [merged, docs] {
+            assert_eq!(b.lines().count(), 1);
+        }
+    }
+
     #[test]
     fn approves_only_with_nothing_left_to_change() {
-        assert_eq!(decide_verdict(&[], 0, 0, false), "APPROVE");
+        assert_eq!(decide_verdict(&[], 0, &[], false), "APPROVE");
         // A low + a nit, both shown in the code
         let defects = [
             finding("bug", Some("verified-defect"), "off by one"),
             finding("convention", None, "nit"),
         ];
-        assert_eq!(decide_verdict(&defects, 0, 0, false), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&defects, 0, &[], false), "REQUEST_CHANGES");
         // an earlier requested change still open
-        assert_eq!(decide_verdict(&[], 1, 0, false), "REQUEST_CHANGES");
-        assert_eq!(decide_verdict(&[], 0, 0, true), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[], 1, &[], false), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[], 0, &[], true), "REQUEST_CHANGES");
     }
 
     /// The case that held a PR for three pushes: six 301 targets changed in a
@@ -3327,12 +3463,13 @@ mod verdict_tests {
             finding("correctness", Some("question"), ask),
         ] {
             assert!(!f.holds_merge(), "{:?}", f.evidence);
-            assert_eq!(decide_verdict(&[f], 0, 0, false), "COMMENT");
+            // A question the change doesn't rest on is a note on an approval.
+            assert_eq!(decide_verdict(&[f], 0, &[], false), "APPROVE");
         }
         // A concern the reviewer couldn't verify is said with the approval.
         let concern = finding("correctness", Some("unverified-concern"), ask);
         assert!(!concern.holds_merge());
-        assert_eq!(decide_verdict(&[concern], 0, 0, false), "APPROVE");
+        assert_eq!(decide_verdict(&[concern], 0, &[], false), "APPROVE");
         // Its open thread from the earlier push doesn't hold the next one.
         let old_thread = "💬 **Confirm redirect targets** (question)\n\nPlease confirm …";
         assert!(!thread_holds_merge(old_thread));
@@ -3342,16 +3479,15 @@ mod verdict_tests {
         assert!(thread_holds_merge(
             "🔴 **Wrong target** (bug)\n\n/docs → 404"
         ));
-        assert_eq!(decide_verdict(&[], 0, 1, false), "COMMENT");
     }
 
     /// Questions and suggestions the author answered or accepted are settled,
     /// and non-blocking notes (a line count in the description) ride along
     /// with the approval: only verified defects, required tests, failed
-    /// checks and unanswered questions hold it back.
+    /// checks and questions the change rests on hold it back.
     #[test]
     fn answered_or_accepted_items_and_notes_do_not_block_approval() {
-        use super::review_agent::{thread_is_question, PriorStatus};
+        use super::review_agent::PriorStatus;
         for status in ["fixed", "answered", "accepted", "ACCEPTED"] {
             let p = PriorStatus {
                 index: 0,
@@ -3373,18 +3509,8 @@ mod verdict_tests {
             ..Default::default()
         };
         assert_eq!(
-            decide_verdict(std::slice::from_ref(&nit), 0, 0, false),
+            decide_verdict(std::slice::from_ref(&nit), 0, &[], false),
             "APPROVE"
-        );
-        // An open question nobody answered still keeps it a comment.
-        let q = "💬 **Which pods ship?** (question)\n\nbody";
-        assert!(thread_is_question(q));
-        assert!(!thread_is_question(
-            "💬 **X** (correctness, not verified)\n\nbody"
-        ));
-        assert_eq!(
-            decide_verdict(std::slice::from_ref(&nit), 0, 1, false),
-            "COMMENT"
         );
         // A required test or a failed check still blocks.
         let mut tests = Finding {
@@ -3393,10 +3519,10 @@ mod verdict_tests {
         };
         super::review_agent::enforce_required_tests(std::slice::from_mut(&mut tests));
         assert_eq!(
-            decide_verdict(&[nit, tests], 0, 0, false),
+            decide_verdict(&[nit, tests], 0, &[], false),
             "REQUEST_CHANGES"
         );
-        assert_eq!(decide_verdict(&[], 0, 0, true), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[], 0, &[], true), "REQUEST_CHANGES");
     }
 
     /// check_url ran: all six targets returned 200 → nothing to ask, the
@@ -3413,7 +3539,7 @@ mod verdict_tests {
             let c = check(u, &gate, &fake).await.unwrap();
             assert_eq!(c.status(), Some(200), "{u}");
         }
-        assert_eq!(decide_verdict(&[], 0, 0, false), "APPROVE");
+        assert_eq!(decide_verdict(&[], 0, &[], false), "APPROVE");
     }
 
     /// check_url ran and a target is a 404: that is a verified defect with
@@ -3436,7 +3562,7 @@ mod verdict_tests {
         );
         assert!(f.holds_merge());
         assert!(f.body.contains("404"));
-        assert_eq!(decide_verdict(&[f], 0, 0, false), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[f], 0, &[], false), "REQUEST_CHANGES");
     }
 
     mod fixture {

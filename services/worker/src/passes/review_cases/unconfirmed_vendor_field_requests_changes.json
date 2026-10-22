@@ -1,0 +1,29 @@
+{
+  "name": "an unconfirmed field the code reads requests changes with the ask",
+  "description": "The change sums a refund field of another system that the PR's own evidence says nobody read from a real payload, next to a staging note that doesn't matter. The field holds the merge as a request for changes (never a bare comment); the staging note rides along. Once the author confirms the field from a real payload, the review approves.",
+  "steps": [
+    {"push": "h1"},
+    {"review": {"head": "h1", "model_output": {
+      "verdict": "APPROVE",
+      "summary": "Adds refunds to the daily totals.",
+      "findings": [],
+      "unconfirmed_facts": [
+        {"fact": "refund lines carry `refund_total`", "blocks": true, "why": "the totals sum it; confirm `refund_total` from a real refund payload"},
+        {"fact": "the staging ledger has no refunds", "blocks": false, "why": "staging data, not the change"}
+      ]
+    }}},
+    {"push": "h2"},
+    {"review": {"head": "h2", "model_output": {
+      "verdict": "APPROVE",
+      "summary": "The description now shows `refund_total` in a real refund payload.",
+      "findings": [],
+      "unconfirmed_facts": [
+        {"fact": "the staging ledger has no refunds", "blocks": false, "why": "staging data, not the change"}
+      ]
+    }}}
+  ],
+  "expect": {
+    "final_formal": {"head": "h2", "event": "APPROVE"},
+    "formal_events": [["h1", "REQUEST_CHANGES"], ["h2", "APPROVE"]]
+  }
+}

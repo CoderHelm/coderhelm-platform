@@ -1,0 +1,37 @@
+{
+  "name": "staging gaps in the PR's evidence: approved with notes, never a bare comment",
+  "description": "A PR was approved, then the base branch was merged in. The re-review posted 'Questions, nothing blocking' because the description listed two unconfirmed facts, both about staging: the carrier's staging API returns errors the vendor has to fix, and the staging backend has no shipment rows. Neither is about the change, so the re-review approves and lists them as notes.",
+  "steps": [
+    {"push": "h1"},
+    {"review": {"head": "h1", "model_output": {
+      "verdict": "APPROVE",
+      "summary": "Shows delivery estimates on the order page.",
+      "findings": []
+    }}},
+    {"push": "h2"},
+    {"review": {"head": "h2", "model_output": {
+      "verdict": "APPROVE",
+      "summary": "The new commits only merge the base branch; the change is the one approved.",
+      "findings": [],
+      "unconfirmed_facts": [
+        {"fact": "the carrier's staging API returns 502 on tracking lookups; the vendor has to fix it", "blocks": false, "why": "a vendor sandbox outage, not the change"},
+        {"fact": "the staging backend has no shipment rows to check the page against", "blocks": false, "why": "staging data differs from production by design"}
+      ]
+    }}}
+  ],
+  "expect": {
+    "final_formal": {"head": "h2", "event": "APPROVE"},
+    "formal_events": [["h1", "APPROVE"], ["h2", "APPROVE"]]
+  },
+  "live_review": {
+    "title": "Show delivery estimates on the order page",
+    "body": "Customers see a delivery estimate on the order page.\n\n**Evidence**\n- Confirmed: `eta_days` read from a real production payload (order 1001 returned 3)\n- Unconfirmed: the carrier's staging API returns 502 on tracking lookups; the vendor has to fix it\n- Unconfirmed: the staging backend has no shipment rows to check the page against",
+    "diff": "\n### src/orders/estimates.ts (modified, +6/-1)\n@@ -1,6 +1,11 @@\n import { vendor } from '../vendor';\n\n-export async function orderEstimates(orderId: string) {\n-  return vendor.shipments(orderId);\n+export async function orderEstimates(orderId: string) {\n+  const shipments = await vendor.shipments(orderId);\n+  return shipments.map((s) => ({\n+    ...s,\n+    etaDays: s.eta_days,\n+  }));\n }\n",
+    "files": {
+      "src/orders/estimates.ts": "import { vendor } from '../vendor';\n\nexport async function orderEstimates(orderId: string) {\n  const shipments = await vendor.shipments(orderId);\n  return shipments.map((s) => ({\n    ...s,\n    etaDays: s.eta_days,\n  }));\n}\n"
+    },
+    "expect": {
+      "no_blocking": true
+    }
+  }
+}
