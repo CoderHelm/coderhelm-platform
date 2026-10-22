@@ -43,6 +43,8 @@ pub struct RunFilter {
     /// Exact statuses to keep; empty keeps every status but `archived`.
     statuses: Vec<String>,
     source: Option<String>,
+    /// One repo to keep, lowercased (exact match).
+    repo: Option<String>,
 }
 
 impl RunFilter {
@@ -68,7 +70,16 @@ impl RunFilter {
             terms,
             statuses,
             source,
+            repo: None,
         }
+    }
+
+    /// Keep only runs of one repo (`owner/name`, any case). Empty keeps all.
+    pub fn with_repo(mut self, repo: Option<&str>) -> Self {
+        self.repo = repo
+            .map(|r| r.trim().to_lowercase())
+            .filter(|r| !r.is_empty() && r.len() <= 200);
+        self
     }
 
     pub fn matches(&self, item: &Item) -> bool {
@@ -83,6 +94,11 @@ impl RunFilter {
         }
         if let Some(source) = &self.source {
             if s(item, "ticket_source") != source {
+                return false;
+            }
+        }
+        if let Some(repo) = &self.repo {
+            if s(item, "repo").to_lowercase() != *repo {
                 return false;
             }
         }
@@ -285,6 +301,19 @@ mod tests {
         assert!(!RunFilter::new(Some("login"), Some("completed"), None).matches(&r));
         assert!(RunFilter::new(Some("login"), None, Some("jira")).matches(&r));
         assert!(!RunFilter::new(Some("login"), None, Some("github")).matches(&r));
+    }
+
+    #[test]
+    fn the_repo_filter_keeps_one_repo_exactly() {
+        let web = run("1", "failed", "ABC-1", "Login", "acme/web", None);
+        let web2 = run("2", "failed", "ABC-2", "Login", "acme/web2", None);
+        let f = RunFilter::new(None, None, None).with_repo(Some("Acme/Web"));
+        assert!(f.matches(&web));
+        assert!(!f.matches(&web2));
+        let all = RunFilter::new(None, None, None).with_repo(Some(""));
+        assert!(all.matches(&web2));
+        let both = RunFilter::new(Some("login"), Some("failed"), None).with_repo(Some("acme/web"));
+        assert!(both.matches(&web));
     }
 
     #[test]

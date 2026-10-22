@@ -608,6 +608,8 @@ pub struct RunsQuery {
     q: Option<String>,
     /// Comma-separated exact statuses, e.g. `failed,cancelled`.
     status: Option<String>,
+    /// One repo, `owner/name` (exact, case-insensitive).
+    repo: Option<String>,
 }
 
 /// GET /api/runs — list runs for the team (from runs table).
@@ -626,7 +628,8 @@ pub async fn list_runs(
         params.q.as_deref(),
         params.status.as_deref(),
         params.source.as_deref(),
-    );
+    )
+    .with_repo(params.repo.as_deref());
     let mut start = params.cursor.as_deref().filter(|c| c.len() <= 64).map(|c| {
         std::collections::HashMap::from([
             ("team_id".to_string(), attr_s(&claims.team_id)),

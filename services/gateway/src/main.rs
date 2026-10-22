@@ -116,6 +116,7 @@ async fn main() -> Result<(), Error> {
                 .delete(routes::api::remove_from_allowlist),
         )
         .route("/admin/teams", get(routes::api::admin_teams))
+        .route("/search", get(routes::search::search))
         .route("/runs", get(routes::api::list_runs))
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/runs/:run_id/traces", get(routes::api::get_run_traces))

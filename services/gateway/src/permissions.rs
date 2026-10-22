@@ -91,10 +91,11 @@ pub const CAPABILITIES: &[Capability] = &[
     // ── Everyone on the team (viewer and up) ────────────────────────
     Capability {
         key: "view",
-        label: "See runs, plans, reviews, analytics, repos, tests and settings",
+        label: "See and search runs, plans, reviews, analytics, repos, tests and settings",
         min_role: "viewer",
         handlers: &[
             "api::list_runs",
+            "search::search",
             "api::get_run",
             "api::get_run_traces",
             "api::get_agent_log",
