@@ -857,6 +857,23 @@ const PSEUDO_COLUMNS: &[&str] = &[
     "tableoid",
 ];
 
+/// Functions whose first argument is a date part (`dateadd(day, -30, x)`),
+/// a keyword the database reads, never a column.
+const DATE_PART_FUNCTIONS: &[&str] = &[
+    "dateadd",
+    "datediff",
+    "date_add",
+    "date_diff",
+    "datepart",
+    "date_part",
+    "datetrunc",
+    "date_trunc",
+    "datename",
+    "timestampadd",
+    "timestampdiff",
+    "time_slice",
+];
+
 /// What a SQL lookup names, read from its parsed form.
 #[derive(Default)]
 struct SqlNames {
@@ -871,6 +888,8 @@ struct SqlNames {
     qualified: Vec<(String, String)>,
     /// Every bare name used in an expression.
     bare: Vec<String>,
+    /// Bare names given as a date part (see [`DATE_PART_FUNCTIONS`]).
+    date_parts: std::collections::HashSet<String>,
     /// Names a SELECT gives its own output columns.
     output: std::collections::HashSet<String>,
     /// A factor that isn't a plain table (subquery, function, VALUES).
@@ -972,6 +991,28 @@ impl sqlparser::ast::Visitor for SqlNames {
             Expr::CompoundIdentifier(parts) if parts.len() == 2 => self
                 .qualified
                 .push((ident_name(&parts[0]), ident_name(&parts[1]))),
+            Expr::Function(f) => {
+                use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+                let name = f
+                    .name
+                    .0
+                    .last()
+                    .and_then(|p| p.as_ident())
+                    .map(|i| i.value.to_ascii_lowercase())
+                    .unwrap_or_default();
+                if DATE_PART_FUNCTIONS.contains(&name.as_str()) {
+                    if let FunctionArguments::List(list) = &f.args {
+                        if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                            Expr::Identifier(i),
+                        ))) = list.args.first()
+                        {
+                            if i.quote_style.is_none() {
+                                self.date_parts.insert(ident_name(i));
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         std::ops::ControlFlow::Continue(())
@@ -1125,6 +1166,7 @@ pub fn unknown_sql_names(catalog: &Catalog, sql: &str, hidden: &[String]) -> Vec
         let e = only[0];
         for column in &names.bare {
             if names.output.contains(column)
+                || names.date_parts.contains(column)
                 || PSEUDO_COLUMNS.contains(&column.as_str())
                 || called.contains_key(column)
             {
@@ -1713,6 +1755,15 @@ mod tests {
             "select id as n, title from order_shipment where current_date > sysdate order by n"
         )
         .is_empty());
+        // A date part is a keyword, not a column; the date's own column still is.
+        assert!(unknown(
+            "select id, count(*) from order_shipment where id > datediff(day, getdate(), getdate()) group by 1"
+        )
+        .is_empty());
+        let u =
+            unknown("select id from order_shipment where dateadd(month, -1, titel) > getdate()");
+        assert_eq!(u.len(), 1, "{u:?}");
+        assert!(u[0].contains("no column titel"), "{}", u[0]);
         // In a join, a bare column could be either table's: not checked.
         assert!(
             unknown("select title, nope from order_shipment c join orders o on o.id = c.id")
