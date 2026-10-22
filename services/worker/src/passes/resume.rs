@@ -85,12 +85,49 @@ fn ci_failure_signature(logs: &str) -> String {
 /// current signature, return the new count and whether to HALT. Halts when the
 /// exact same failure set has recurred MAX_STALL_CYCLES times — i.e. the fixes
 /// are making no progress.
-fn stall_decision(prev_sig: &str, prev_stall: u32, current_sig: &str) -> (u32, bool) {
-    if !prev_sig.is_empty() && prev_sig == current_sig {
+///
+/// `last_fix_noop`: the previous fix commit changed nothing (see
+/// `fix_made_no_progress`). That cycle was already counted when the fix
+/// landed, so a changed signature must not reset the count — the set of
+/// failing workflows can shift between cycles while the tree stands still
+/// (8 cycles once "restored" a lockfile to the same empty bytes this way).
+fn stall_decision(
+    prev_sig: &str,
+    prev_stall: u32,
+    current_sig: &str,
+    last_fix_noop: bool,
+) -> (u32, bool) {
+    if last_fix_noop {
+        (prev_stall, prev_stall >= MAX_STALL_CYCLES)
+    } else if !prev_sig.is_empty() && prev_sig == current_sig {
         let n = prev_stall + 1;
         (n, n >= MAX_STALL_CYCLES)
     } else {
         (0, false)
+    }
+}
+
+/// Did a fix cycle leave the code where it was? True when the tree after the
+/// fix equals the tree before it (no commit, or files rewritten with
+/// identical bytes) or equals a tree an earlier cycle already produced (a
+/// change undone, back where CI already failed). Trees are content-addressed,
+/// so this is exact. Unknown trees (a lookup failed) never count.
+fn fix_made_no_progress(before: Option<&str>, after: Option<&str>, seen: &[String]) -> bool {
+    let Some(after) = after.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    before == Some(after) || seen.iter().any(|t| t == after)
+}
+
+/// Pure decision for a fix that just landed: a no-progress fix counts as a
+/// stall cycle on its own, whatever CI says next. Returns the new count and
+/// whether to HALT now.
+fn noop_fix_decision(prev_stall: u32, noop: bool) -> (u32, bool) {
+    if noop {
+        let n = prev_stall + 1;
+        (n, n >= MAX_STALL_CYCLES)
+    } else {
+        (prev_stall, false)
     }
 }
 
@@ -119,7 +156,10 @@ mod final_squash_tests {
 
 #[cfg(test)]
 mod stall_tests {
-    use super::{ci_failure_signature, stall_decision, MAX_STALL_CYCLES};
+    use super::{
+        ci_failure_signature, fix_made_no_progress, noop_fix_decision, stall_decision,
+        MAX_STALL_CYCLES,
+    };
 
     #[test]
     fn signature_is_order_and_noise_independent() {
@@ -137,11 +177,11 @@ mod stall_tests {
 
     #[test]
     fn halts_after_the_same_failure_repeats() {
-        let (s1, h1) = stall_decision("", 0, "SIG"); // first sight
+        let (s1, h1) = stall_decision("", 0, "SIG", false); // first sight
         assert_eq!((s1, h1), (0, false));
-        let (s2, _) = stall_decision("SIG", 0, "SIG"); // 1st repeat
+        let (s2, _) = stall_decision("SIG", 0, "SIG", false); // 1st repeat
         assert_eq!(s2, 1);
-        let (s3, h3) = stall_decision("SIG", 1, "SIG"); // 2nd repeat → cap
+        let (s3, h3) = stall_decision("SIG", 1, "SIG", false); // 2nd repeat → cap
         assert_eq!(s3, MAX_STALL_CYCLES);
         assert!(h3);
     }
@@ -149,7 +189,44 @@ mod stall_tests {
     #[test]
     fn progress_resets_the_counter() {
         // errors changed → not stalled, count resets even if it was high.
-        assert_eq!(stall_decision("SIG_A", 5, "SIG_B"), (0, false));
+        assert_eq!(stall_decision("SIG_A", 5, "SIG_B", false), (0, false));
+    }
+
+    #[test]
+    fn a_noop_fix_is_not_reset_by_a_shifting_signature() {
+        // The prod loop: each cycle's failing workflow set differed, so the
+        // signature never repeated, while the fix rewrote the same bytes.
+        assert_eq!(stall_decision("SIG_A", 1, "SIG_B", true), (1, false));
+        assert_eq!(
+            stall_decision("SIG_A", MAX_STALL_CYCLES, "SIG_B", true),
+            (MAX_STALL_CYCLES, true)
+        );
+        // Counted once at the fix; the same signature after it adds nothing.
+        assert_eq!(stall_decision("SIG", 1, "SIG", true), (1, false));
+    }
+
+    #[test]
+    fn an_unchanged_or_revisited_tree_is_no_progress() {
+        let seen = vec!["t1".to_string(), "t2".to_string()];
+        // Identical bytes rewritten (or nothing committed): same tree.
+        assert!(fix_made_no_progress(Some("t3"), Some("t3"), &[]));
+        // Back to a tree an earlier cycle already had.
+        assert!(fix_made_no_progress(Some("t3"), Some("t1"), &seen));
+        // A new tree is progress.
+        assert!(!fix_made_no_progress(Some("t3"), Some("t4"), &seen));
+        // A failed lookup proves nothing.
+        assert!(!fix_made_no_progress(Some("t3"), None, &seen));
+        assert!(!fix_made_no_progress(None, Some(""), &[String::new()]));
+    }
+
+    #[test]
+    fn noop_fixes_halt_on_their_own() {
+        let (s1, h1) = noop_fix_decision(0, true);
+        assert_eq!((s1, h1), (1, false));
+        let (s2, h2) = noop_fix_decision(s1, true);
+        assert_eq!((s2, h2), (MAX_STALL_CYCLES, true));
+        // A fix that changed the tree leaves the count to the signature check.
+        assert_eq!(noop_fix_decision(1, false), (1, false));
     }
 
     #[test]
@@ -1411,6 +1488,13 @@ pub async fn run(
              Full logs:\n{logs}{review_context}"
         );
 
+        // The tree before the fix: compared with the tree after it to tell a
+        // fix that changed code from one that only rewrote the same bytes.
+        let tree_before = github
+            .get_tree_sha(&repo_owner, &repo_name, &branch)
+            .await
+            .ok();
+
         match implement::run(
             state,
             &ticket_msg,
@@ -1510,6 +1594,58 @@ pub async fn run(
                 .await;
                 return Ok(());
             }
+        }
+
+        // A fix that left the tree unchanged (or returned it to an earlier
+        // cycle's state) is a stall cycle in its own right; enough of them
+        // hand the PR to a human now rather than after the next CI run.
+        let tree_after = github
+            .get_tree_sha(&repo_owner, &repo_name, &branch)
+            .await
+            .ok();
+        if record_fix_progress(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            tree_before.as_deref(),
+            tree_after.as_deref(),
+        )
+        .await
+        {
+            warn!(
+                run_id = msg.run_id,
+                "CI fixes are not changing the code — handing PR to human review"
+            );
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                "Automated fixes stopped changing the code (same files, same bytes) — handed off for human review.",
+            )
+            .await;
+            mark_events_processed(state, &msg.run_id, &events).await;
+            mark_pr_ready(
+                state,
+                &msg.team_id,
+                &github,
+                &repo_owner,
+                &repo_name,
+                pr_number,
+            )
+            .await;
+            complete_run_with_status(
+                state,
+                &ticket_msg,
+                &msg.run_id,
+                "completed",
+                &pr_url,
+                pr_number,
+                &branch,
+                &usage,
+                wall_clock_secs(created_at, &start),
+            )
+            .await?;
+            return Ok(());
         }
 
         // The fix changed code: count it before going back to wait for CI.
@@ -2179,7 +2315,7 @@ async fn check_and_record_stall(
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
-        .projection_expression("last_error_sig, stall_count")
+        .projection_expression("last_error_sig, stall_count, last_fix_noop")
         .send()
         .await
         .ok()
@@ -2196,7 +2332,13 @@ async fn check_and_record_stall(
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse().ok())
         .unwrap_or(0u32);
-    let (new_stall, halt) = stall_decision(&prev_sig, prev_stall, &current_sig);
+    let last_fix_noop = item
+        .as_ref()
+        .and_then(|i| i.get("last_fix_noop"))
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false);
+    let (new_stall, halt) = stall_decision(&prev_sig, prev_stall, &current_sig, last_fix_noop);
     let _ = state
         .dynamo
         .update_item()
@@ -2208,6 +2350,76 @@ async fn check_and_record_stall(
         .expression_attribute_values(":c", attr_n(new_stall as u64))
         .send()
         .await;
+    halt
+}
+
+/// After a fix lands: decide whether it moved the code at all (tree before
+/// vs. after, and every tree earlier cycles produced), persist that, and
+/// return true if the run has STALLED. Signature checks alone miss a fix
+/// that rewrites the same bytes while the failing workflows shift. The pure
+/// decisions (`fix_made_no_progress` / `noop_fix_decision`) are unit-tested.
+async fn record_fix_progress(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    tree_before: Option<&str>,
+    tree_after: Option<&str>,
+) -> bool {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("stall_count, fix_trees")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item);
+    let prev_stall = item
+        .as_ref()
+        .and_then(|i| i.get("stall_count"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0u32);
+    let seen: Vec<String> = item
+        .as_ref()
+        .and_then(|i| i.get("fix_trees"))
+        .and_then(|v| v.as_ss().ok())
+        .cloned()
+        .unwrap_or_default();
+    let noop = fix_made_no_progress(tree_before, tree_after, &seen);
+    let (new_stall, halt) = noop_fix_decision(prev_stall, noop);
+    if noop {
+        warn!(
+            run_id,
+            tree = tree_after.unwrap_or(""),
+            stall_count = new_stall,
+            "CI fix left the tree unchanged or back at an earlier state — counted as a stall"
+        );
+    }
+    let trees: Vec<String> = [tree_before, tree_after]
+        .into_iter()
+        .flatten()
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect();
+    let mut update = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .expression_attribute_values(":c", attr_n(new_stall as u64))
+        .expression_attribute_values(":n", AttributeValue::Bool(noop));
+    update = if trees.is_empty() {
+        update.update_expression("SET stall_count = :c, last_fix_noop = :n")
+    } else {
+        update
+            .update_expression("SET stall_count = :c, last_fix_noop = :n ADD fix_trees :t")
+            .expression_attribute_values(":t", AttributeValue::Ss(trees))
+    };
+    let _ = update.send().await;
     halt
 }
 

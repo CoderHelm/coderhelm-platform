@@ -76,6 +76,90 @@ fn status_error_message(status: reqwest::StatusCode, url: &str, body: &str) -> S
     }
 }
 
+/// Did this request fail because the thing does not exist? Matches the
+/// status line `status_error_message` writes.
+pub fn is_not_found(e: &(dyn std::error::Error + Send + Sync)) -> bool {
+    e.to_string().contains("(404 Not Found)")
+}
+
+/// What a contents-API response says about a file's body.
+#[derive(Debug, PartialEq)]
+enum ContentsBody {
+    /// The body, decoded.
+    Text(String),
+    /// Too large for the contents API (over 1 MB it sends `encoding: none`
+    /// and no content): read the git blob with this sha instead.
+    Blob(String),
+}
+
+/// Decode a contents-API response for `path`. A file whose `size` says it
+/// has bytes never decodes to an empty string: it is either sent to the blob
+/// API or reported as an error.
+fn contents_body(path: &str, data: &serde_json::Value) -> Result<ContentsBody, String> {
+    if data.is_array() {
+        return Err(format!("'{path}' is a directory, not a file"));
+    }
+    let size = data.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+    let encoding = data.get("encoding").and_then(|e| e.as_str()).unwrap_or("");
+    let content = data.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let clean = content.replace(['\n', '\r'], "");
+    if size > 0 && (clean.is_empty() || encoding == "none") {
+        let sha = data
+            .get("sha")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "'{path}' is {size} bytes but GitHub sent neither its content nor a blob sha"
+                )
+            })?;
+        return Ok(ContentsBody::Blob(sha.to_string()));
+    }
+    Ok(ContentsBody::Text(decode_base64_text(path, &clean)?))
+}
+
+/// Decode a git-blob response for `path`. Errors rather than returning an
+/// empty string for a blob that has bytes.
+fn blob_text(path: &str, data: &serde_json::Value) -> Result<String, String> {
+    let size = data.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+    let content = data.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let text = match data.get("encoding").and_then(|e| e.as_str()) {
+        Some("utf-8") => content.to_string(),
+        _ => decode_base64_text(path, &content.replace(['\n', '\r'], ""))?,
+    };
+    if text.is_empty() && size > 0 {
+        return Err(format!(
+            "'{path}' is {size} bytes but GitHub returned no content for it, even from the blob API"
+        ));
+    }
+    Ok(text)
+}
+
+fn decode_base64_text(path: &str, clean: &str) -> Result<String, String> {
+    let bytes = B64
+        .decode(clean)
+        .map_err(|e| format!("'{path}': content is not valid base64 ({e})"))?;
+    String::from_utf8(bytes).map_err(|_| format!("'{path}' is not UTF-8 text"))
+}
+
+/// The refusal for writing `content` over a file of `existing_size` bytes
+/// (None = the file does not exist), or None when the write is allowed.
+/// Blank content over a file with bytes is refused: removal must be explicit.
+fn empty_overwrite_refusal(
+    path: &str,
+    content: &str,
+    existing_size: Option<u64>,
+) -> Option<String> {
+    let existing = existing_size.unwrap_or(0);
+    (content.trim().is_empty() && existing > 0).then(|| {
+        format!(
+            "refused: this write would replace '{path}' ({existing} bytes) with empty content. \
+             That usually means the source read came back empty, not that the file should be emptied. \
+             Re-read the file; if it really should go, delete it explicitly instead of writing nothing."
+        )
+    })
+}
+
 /// GitHub REST API client using installation token auth.
 pub struct GitHubClient {
     app_id: String,
@@ -568,17 +652,34 @@ impl GitHubClient {
                 return Ok(content);
             }
         }
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
-        let data = self.get(&url).await?;
-        let content = data.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        let clean = content.replace('\n', "");
-        let bytes = B64.decode(&clean)?;
-        Ok(String::from_utf8(bytes)?)
+        self.read_file_live(owner, repo, path, git_ref).await
+    }
+
+    /// Like `read_file`, but a file that does not exist at `git_ref` is
+    /// `Ok(None)`. Every other failure stays an error, so a caller deciding
+    /// "deleted vs. present" never reads a failed fetch as a deletion.
+    pub async fn read_file_if_exists(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        match self.read_file(owner, repo, path, git_ref).await {
+            Ok(content) => Ok(Some(content)),
+            Err(e) if is_not_found(&*e) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Read a file straight from the LIVE API, bypassing the snapshot cache.
     /// Used where staleness is dangerous — the 409 reconcile must compare
     /// against what is ACTUALLY on the branch, not our (possibly stale) mirror.
+    ///
+    /// The contents API carries no body for files over 1 MB (`encoding:
+    /// none`); those are read from their git blob. A file with bytes is never
+    /// returned as an empty string: callers write what they read back to the
+    /// branch, and an empty read once replaced a 28,915-line lockfile.
     async fn read_file_live(
         &self,
         owner: &str,
@@ -588,10 +689,77 @@ impl GitHubClient {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
         let data = self.get(&url).await?;
-        let content = data.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        let clean = content.replace('\n', "");
-        let bytes = B64.decode(&clean)?;
-        Ok(String::from_utf8(bytes)?)
+        match contents_body(path, &data)? {
+            ContentsBody::Text(text) => Ok(text),
+            ContentsBody::Blob(sha) => {
+                let url = format!("{API_BASE}/repos/{owner}/{repo}/git/blobs/{sha}");
+                let blob = self.get(&url).await?;
+                Ok(blob_text(path, &blob)?)
+            }
+        }
+    }
+
+    /// Size in bytes of `path` at `git_ref`, or None when it does not exist.
+    /// Metadata only: the contents API reports `size` even for files too
+    /// large to carry a body.
+    async fn existing_file_size(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        match self.get(&url).await {
+            Ok(data) => Ok(Some(data.get("size").and_then(|s| s.as_u64()).unwrap_or(0))),
+            Err(e) if is_not_found(&*e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Does `path` exist at `git_ref`? Metadata only, so a presence check on
+    /// a large lockfile does not download it.
+    pub async fn file_exists(&self, owner: &str, repo: &str, path: &str, git_ref: &str) -> bool {
+        if let Some(snap) = self.existing_snapshot(owner, repo, git_ref).await {
+            if snap.read_file(path).await.is_some() {
+                return true;
+            }
+        }
+        matches!(
+            self.existing_file_size(owner, repo, path, git_ref).await,
+            Ok(Some(_))
+        )
+    }
+
+    /// Refuse to write empty content over a file that has bytes. Emptying a
+    /// file is never what a write means here; it is what an empty or failed
+    /// read looks like by the time it reaches a write (8 fix cycles once kept
+    /// "restoring" a lockfile to nothing). Removing a file must be an explicit
+    /// delete. Only empty writes cost the extra lookup.
+    async fn guard_empty_overwrite(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+        content: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !content.trim().is_empty() {
+            return Ok(());
+        }
+        let existing = self
+            .existing_file_size(owner, repo, path, git_ref)
+            .await
+            .map_err(|e| {
+                format!(
+                    "refusing to write empty content to '{path}': could not confirm the file is \
+                     empty or absent on '{git_ref}' ({e}). Delete the file explicitly if that is the intent."
+                )
+            })?;
+        match empty_overwrite_refusal(path, content, existing) {
+            Some(msg) => Err(msg.into()),
+            None => Ok(()),
+        }
     }
 
     /// Get the SHA of a file at a given ref (for update operations).
@@ -805,6 +973,23 @@ impl GitHubClient {
             .and_then(|v| v.as_str())
             .ok_or("Missing sha in ref response")?;
         Ok(sha.to_string())
+    }
+
+    /// The tree SHA at `branch`'s tip. Trees are content-addressed: two equal
+    /// tree SHAs mean byte-identical file sets, whatever commits lie between.
+    pub async fn get_tree_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let sha = self.get_ref(owner, repo, branch).await?;
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/git/commits/{sha}");
+        let data = self.get(&url).await?;
+        data.pointer("/tree/sha")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "Missing tree sha in commit".into())
     }
 
     /// Fast-forward-only ref update (compare-and-swap): points `branch` at
@@ -1086,6 +1271,8 @@ impl GitHubClient {
         message: &str,
         sha: Option<&str>,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.guard_empty_overwrite(owner, repo, path, branch, content)
+            .await?;
         let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}");
         let encoded = B64.encode(content.as_bytes());
         // FRESHNESS CONTRACT (same as batch_write): if the branch tip moved
@@ -1194,6 +1381,14 @@ impl GitHubClient {
         message: &str,
         files: &[FileOp],
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // An empty Write over a file with bytes is refused before anything is
+        // created; a removal must come as FileOp::Delete.
+        for f in files {
+            if let FileOp::Write { path, content } = f {
+                self.guard_empty_overwrite(owner, repo, path, branch, content)
+                    .await?;
+            }
+        }
         // Blobs are content-addressed and immutable — create them once, reuse
         // across retries.
         let mut blob_entries = Vec::new();
@@ -1376,6 +1571,16 @@ impl GitHubClient {
             .pointer("/tree/sha")
             .and_then(|v| v.as_str())
             .ok_or("Missing tree sha in branch commit")?;
+
+        // The merge tree overlays these files on the branch's tree, so an
+        // empty resolution would empty the branch's copy. Same rule as
+        // batch_write: removal must be an explicit FileOp::Delete.
+        for f in resolved_files {
+            if let FileOp::Write { path, content } = f {
+                self.guard_empty_overwrite(owner, repo, path, branch_sha, content)
+                    .await?;
+            }
+        }
 
         let mut tree_entries = Vec::new();
         for f in resolved_files {
@@ -2962,6 +3167,109 @@ mod status_error_tests {
     fn empty_body_keeps_the_status_line() {
         let m = status_error_message(reqwest::StatusCode::BAD_GATEWAY, "u", "  ");
         assert_eq!(m, "HTTP status server error (502 Bad Gateway) for url (u)");
+    }
+
+    #[test]
+    fn only_a_404_reads_as_not_found() {
+        let missing: Box<dyn std::error::Error + Send + Sync> =
+            status_error_message(reqwest::StatusCode::NOT_FOUND, "u", "").into();
+        assert!(is_not_found(&*missing));
+        // A 403 (rate limit, file too large) is a failed read, never "deleted".
+        let forbidden: Box<dyn std::error::Error + Send + Sync> =
+            status_error_message(reqwest::StatusCode::FORBIDDEN, "u", "too_large").into();
+        assert!(!is_not_found(&*forbidden));
+    }
+}
+
+#[cfg(test)]
+mod file_body_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn small_file_decodes_from_the_contents_api() {
+        // GitHub wraps base64 at 60 columns.
+        let data = json!({"size": 11, "encoding": "base64", "sha": "abc",
+                          "content": "aGVsbG8g\nd29ybGQ=\n"});
+        assert_eq!(
+            contents_body("a.txt", &data),
+            Ok(ContentsBody::Text("hello world".into()))
+        );
+    }
+
+    #[test]
+    fn large_file_goes_to_the_blob_api_not_an_empty_string() {
+        // The prod shape: a 1.2 MB pnpm-lock.yaml comes back with
+        // `encoding: none` and an empty body.
+        let data = json!({"size": 1_200_000, "encoding": "none", "sha": "b10b", "content": ""});
+        assert_eq!(
+            contents_body("pnpm-lock.yaml", &data),
+            Ok(ContentsBody::Blob("b10b".into()))
+        );
+        // Same when the content key is missing outright.
+        let data = json!({"size": 5, "sha": "b10b"});
+        assert_eq!(
+            contents_body("x", &data),
+            Ok(ContentsBody::Blob("b10b".into()))
+        );
+        // No sha to fall back to: an error, never "".
+        let data = json!({"size": 5, "encoding": "none"});
+        assert!(contents_body("x", &data).is_err());
+    }
+
+    #[test]
+    fn a_genuinely_empty_file_reads_as_empty() {
+        let data = json!({"size": 0, "encoding": "base64", "sha": "e69d", "content": ""});
+        assert_eq!(
+            contents_body("x", &data),
+            Ok(ContentsBody::Text(String::new()))
+        );
+    }
+
+    #[test]
+    fn a_directory_is_an_error_not_an_empty_file() {
+        assert!(contents_body("src", &json!([{"name": "a.rs"}])).is_err());
+    }
+
+    #[test]
+    fn blob_decodes_and_refuses_to_come_back_empty() {
+        let data = json!({"size": 11, "encoding": "base64", "content": "aGVsbG8g\nd29ybGQ="});
+        assert_eq!(blob_text("x", &data).unwrap(), "hello world");
+        let data = json!({"size": 3, "encoding": "utf-8", "content": "abc"});
+        assert_eq!(blob_text("x", &data).unwrap(), "abc");
+        let data = json!({"size": 1_200_000, "encoding": "base64", "content": ""});
+        assert!(blob_text("pnpm-lock.yaml", &data).is_err());
+        let data = json!({"size": 0, "encoding": "base64", "content": ""});
+        assert_eq!(blob_text("x", &data).unwrap(), "");
+    }
+
+    #[test]
+    fn empty_content_never_replaces_a_file_with_bytes() {
+        let refusal = empty_overwrite_refusal("pnpm-lock.yaml", "", Some(1_200_000));
+        assert!(refusal
+            .as_deref()
+            .is_some_and(|m| m.contains("pnpm-lock.yaml") && m.contains("delete it explicitly")));
+        // Whitespace is as empty as nothing.
+        assert!(empty_overwrite_refusal("a", " \n", Some(10)).is_some());
+        // Allowed: real content, a new file, or an already-empty file.
+        assert!(empty_overwrite_refusal("a", "x", Some(10)).is_none());
+        assert!(empty_overwrite_refusal("a", "", None).is_none());
+        assert!(empty_overwrite_refusal("a", "", Some(0)).is_none());
+    }
+
+    #[tokio::test]
+    async fn non_empty_writes_skip_the_lookup() {
+        // No network and no credentials: a lookup here would error.
+        let client = GitHubClient::new("1", "", 0, &reqwest::Client::new()).unwrap();
+        assert!(client
+            .guard_empty_overwrite("o", "r", "a", "main", "content")
+            .await
+            .is_ok());
+        // An empty write that cannot verify the target is refused, not let through.
+        assert!(client
+            .guard_empty_overwrite("o", "r", "a", "main", "")
+            .await
+            .is_err());
     }
 }
 
