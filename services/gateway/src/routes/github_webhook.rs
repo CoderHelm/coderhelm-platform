@@ -530,6 +530,23 @@ async fn handle_review_comment(
         return Ok(StatusCode::OK);
     };
     let pr = &payload["pull_request"];
+    if let Some(control) = ask.question.as_deref().and_then(merge_gate::parse_control) {
+        let repo = &payload["repository"];
+        return super::merge_control::on_comment(
+            state,
+            team_id,
+            installation_id,
+            repo["owner"]["login"].as_str().unwrap_or(""),
+            repo["name"].as_str().unwrap_or(""),
+            pr["number"].as_u64().unwrap_or(0),
+            commenter,
+            control,
+            super::merge_control::CommentRef::ReviewThread(
+                payload["comment"]["id"].as_u64().unwrap_or(0),
+            ),
+        )
+        .await;
+    }
     let bot_pr = pr["user"]["login"]
         .as_str()
         .unwrap_or("")
@@ -620,6 +637,32 @@ async fn handle_issue_comment(
     } else {
         parse_reviewer_ask(body)
     };
+
+    // `@coderhelm stop auto-merge` / `@coderhelm resume auto-merge` on any PR
+    // (people's and CoderHelm's own): only from someone with write access.
+    if payload["issue"]["pull_request"].is_object() {
+        if let Some(control) = ask
+            .as_ref()
+            .and_then(|a| a.question.as_deref())
+            .and_then(merge_gate::parse_control)
+        {
+            let repo = &payload["repository"];
+            return super::merge_control::on_comment(
+                state,
+                team_id,
+                installation_id,
+                repo["owner"]["login"].as_str().unwrap_or(""),
+                repo["name"].as_str().unwrap_or(""),
+                payload["issue"]["number"].as_u64().unwrap_or(0),
+                commenter,
+                control,
+                super::merge_control::CommentRef::Issue(
+                    payload["comment"]["id"].as_u64().unwrap_or(0),
+                ),
+            )
+            .await;
+        }
+    }
 
     // On a PR CoderHelm opened, every person's comment reaches it. One that
     // addresses CoderHelm (`@coderhelm …`) goes to the reviewer when review is
@@ -903,6 +946,28 @@ async fn handle_pull_request(
     let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
     if action != "closed" {
         return Ok(StatusCode::OK);
+    }
+
+    // A stopped auto-merge has no loop running to see the PR close: record it
+    // here (any PR, not only CoderHelm's).
+    {
+        let repo = &payload["repository"];
+        let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
+        if pr_number != 0 {
+            if let Err(e) = merge_gate::finish_stopped(
+                &state.dynamo,
+                &state.config.settings_table_name,
+                team_id,
+                repo["owner"]["login"].as_str().unwrap_or(""),
+                repo["name"].as_str().unwrap_or(""),
+                pr_number,
+                merged,
+            )
+            .await
+            {
+                warn!(pr_number, error = %e, "Could not record a stopped auto-merge's PR as closed");
+            }
+        }
     }
 
     // Only track our PRs
@@ -2318,6 +2383,8 @@ pub(crate) struct ReviewConfig {
     pub(crate) label: String,
     /// Hard kill switch — blocks ALL reviewer action regardless of `enabled`.
     pub(crate) killed: bool,
+    /// Merge on its own once the gate's conditions hold (`await_merge`).
+    pub(crate) auto_merge: bool,
 }
 
 impl Default for ReviewConfig {
@@ -2326,6 +2393,7 @@ impl Default for ReviewConfig {
             enabled: false,
             label: "ch-review".to_string(),
             killed: false,
+            auto_merge: false,
         }
     }
 }
@@ -2375,6 +2443,11 @@ pub(crate) async fn load_review_config(
             .and_then(|v| v.as_bool().ok())
             .copied()
             .unwrap_or(d.killed),
+        auto_merge: item
+            .get("auto_merge")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(d.auto_merge),
     })
 }
 
@@ -3357,6 +3430,49 @@ mod reviewer_ask_tests {
                 question: Some("¿por qué? 🚀".into()),
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod merge_control_command_tests {
+    use super::*;
+    use common::merge_gate::{parse_control, Control};
+
+    fn control(body: &str) -> Option<Control> {
+        parse_reviewer_ask(body)?
+            .question
+            .as_deref()
+            .and_then(parse_control)
+    }
+
+    #[test]
+    fn stop_and_resume_comments_with_their_aliases() {
+        assert_eq!(control("@coderhelm stop auto-merge"), Some(Control::Stop));
+        assert_eq!(control("@CoderHelm pause auto-merge"), Some(Control::Stop));
+        assert_eq!(
+            control("@coderhelm[bot] cancel automerge"),
+            Some(Control::Stop)
+        );
+        assert_eq!(control("/coderhelm stop auto-merge"), Some(Control::Stop));
+        assert_eq!(
+            control("@coderhelm resume auto-merge"),
+            Some(Control::Rearm)
+        );
+        assert_eq!(
+            control("@coderhelm re-arm auto-merge"),
+            Some(Control::Rearm)
+        );
+        assert_eq!(control("@coderhelm arm auto merge"), Some(Control::Rearm));
+        // Reviews and questions are not commands, and a quoted or pasted
+        // command is not addressed to CoderHelm.
+        assert_eq!(control("@coderhelm re-review"), None);
+        assert_eq!(control("@coderhelm why did auto-merge stop?"), None);
+        assert_eq!(control("> @coderhelm stop auto-merge\nAgreed"), None);
+        assert_eq!(
+            control("Comment `@coderhelm stop auto-merge` to stop it"),
+            None
+        );
+        assert_eq!(control("stop auto-merge"), None);
     }
 }
 

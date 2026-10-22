@@ -22,6 +22,13 @@
 //! ONE status comment, edited in place, saying exactly what the gate waits on.
 //! Each arming starts a new chain; a tick from an older chain stops, so a PR
 //! never has two polling loops.
+//!
+//! A person can stop the gate (`@coderhelm stop auto-merge`, or the
+//! dashboard). The stop moves the record to a new chain, so a running loop
+//! stops; nothing but a person clears it, so an arming (the review of a new
+//! commit) finds it stopped and only says so on the PR. The record is read
+//! again right before merging, so a stop that lands mid-evaluation still
+//! wins.
 
 use crate::clients::github::{GitHubClient, MergeOutcome};
 use crate::models::AwaitMergeMessage;
@@ -32,8 +39,9 @@ use crate::passes::{attr_n, attr_s};
 use crate::WorkerState;
 use aws_sdk_dynamodb::types::AttributeValue;
 use common::merge_gate::{
-    record_sk as gate_sk, STATE_BLOCKED_CI, STATE_CLOSED, STATE_DECLINED, STATE_HEAD_MOVED,
-    STATE_MERGED, STATE_PAUSED, STATE_WAITING_APPROVAL, STATE_WAITING_CI,
+    record_sk as gate_sk, Control, Stopped, STATE_BLOCKED_CI, STATE_CLOSED, STATE_DECLINED,
+    STATE_HEAD_MOVED, STATE_MERGED, STATE_PAUSED, STATE_STOPPED, STATE_WAITING_APPROVAL,
+    STATE_WAITING_CI,
 };
 use std::collections::HashMap;
 use tracing::{info, warn};
@@ -455,6 +463,7 @@ pub(crate) fn render_status(
     base: &str,
     lines: &[(Mark, String)],
     note: Option<&str>,
+    stop_url: Option<&str>,
 ) -> String {
     let state = if lines.iter().any(|(m, _)| *m == Mark::Blocked) {
         " · blocked"
@@ -474,13 +483,71 @@ pub(crate) fn render_status(
         "{FOOTER_START}Commit {} into {base}. Merges on its own once every item is done.",
         short(head)
     ));
+    if let Some(url) = stop_url {
+        body.push_str(&stop_line(url));
+    }
+    body
+}
+
+/// The way to stop the gate, under the commit line of a gate that may still
+/// merge: the dashboard (asks a signed-in team member to confirm) or a
+/// comment (write access needed).
+fn stop_line(url: &str) -> String {
+    format!(
+        "\n\n[Stop auto-merge]({url}) or comment `{}`.",
+        common::merge_gate::STOP_COMMAND
+    )
+}
+
+/// Pure: the status comment of a stopped gate. Keeps the checklist the gate
+/// last showed for this commit, says who stopped it and how to re-arm it.
+pub(crate) fn render_stopped(
+    last_body: &str,
+    head: &str,
+    base: &str,
+    who: &str,
+    rearm_url: &str,
+) -> String {
+    let same_commit = last_body.contains(&format!("Commit {} into", short(head)));
+    let icons = [
+        common::merge_gate::ICON_DONE,
+        common::merge_gate::ICON_WAITING,
+        common::merge_gate::ICON_BLOCKED,
+    ];
+    let mut body = format!("{STATUS_MARKER}\n**Auto-merge** · stopped\n\n");
+    if same_commit {
+        for line in last_body.lines() {
+            let t = line.trim();
+            if t.strip_prefix("- ")
+                .is_some_and(|r| icons.iter().any(|i| r.starts_with(i)))
+            {
+                body.push_str(t);
+                body.push('\n');
+            }
+        }
+        body.push('\n');
+    }
+    body.push_str(&format!(
+        "Auto-merge stopped by {who} · re-arm: comment `{}` or [open in CoderHelm]({rearm_url})\n",
+        common::merge_gate::RESUME_COMMAND
+    ));
+    body.push_str(&format!(
+        "{FOOTER_START}Commit {} into {base}. Won't merge until someone re-arms it.",
+        short(head)
+    ));
     body
 }
 
 /// Pure: the last status body with `note` added above the small print (used
 /// when the gate pauses, so the checklist of what it was waiting on stays
 /// visible).
-fn with_note(last_body: &str, head: &str, base: &str, note: &str) -> String {
+fn with_note(
+    last_body: &str,
+    head: &str,
+    base: &str,
+    note: &str,
+    stop_url: Option<&str>,
+) -> String {
     let footer_at = last_body
         .rfind(FOOTER_START)
         .or_else(|| last_body.rfind(OLD_FOOTER_START));
@@ -489,7 +556,7 @@ fn with_note(last_body: &str, head: &str, base: &str, note: &str) -> String {
             let (main, footer) = last_body.split_at(i);
             format!("{}\n\n{note}\n{footer}", main.trim_end())
         }
-        _ => render_status(head, base, &[], Some(note)),
+        _ => render_status(head, base, &[], Some(note), stop_url),
     }
 }
 
@@ -520,6 +587,8 @@ struct GateRecord {
     status_body: String,
     labels_added_head: String,
     labels_added_at: Option<i64>,
+    /// A person's stop (see `common::merge_gate::stop`).
+    stopped: Option<Stopped>,
 }
 
 fn num(item: &HashMap<String, AttributeValue>, k: &str) -> Option<i64> {
@@ -558,6 +627,7 @@ async fn load_record(state: &WorkerState, msg: &AwaitMergeMessage) -> Result<Gat
         status_body: text(item, "status_body"),
         labels_added_head: text(item, "labels_added_head"),
         labels_added_at: num(item, "labels_added_at"),
+        stopped: common::merge_gate::stopped(item),
     })
 }
 
@@ -656,6 +726,17 @@ async fn publish_status(
     if record.status_hash == hash {
         return;
     }
+    // A chain's tick never writes over a newer arming's or a stop's status.
+    if !msg.chain_id.is_empty() {
+        match load_record(state, msg).await {
+            Ok(r) if r.chain_id == msg.chain_id && r.stopped.is_none() => {}
+            Ok(_) => return,
+            Err(e) => {
+                warn!(pr = msg.pr_number, error = %e, "await-merge: could not re-read the gate before the status edit");
+                return;
+            }
+        }
+    }
     let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
     if record.status_comment_id.is_none() {
         if let Ok(comments) = github.list_issue_comments(owner, repo, msg.pr_number).await {
@@ -730,48 +811,22 @@ async fn publish_status(
 /// CoderHelm's own latest verdict for this head, from the persisted review
 /// records (uniform across people's PRs, where the bot posts a real review,
 /// and its own PRs, where GitHub forbids self-approval so the verdict lives
-/// only in the record). Records are keyed `REVIEW#{owner}/{repo}#{pr:06}#{rfc3339}`,
-/// so a descending query yields newest-first. None = no verdict for this head
-/// yet. A failed read is an error (the gate retries; it never merges on it).
+/// only in the record). None = no verdict for this head yet. A failed read
+/// is an error (the gate retries; it never merges on it).
 async fn bot_verdict_at_head(
     state: &WorkerState,
     msg: &AwaitMergeMessage,
 ) -> Result<Option<String>, BoxError> {
-    let prefix = format!(
-        "REVIEW#{}/{}#{:0>6}#",
-        msg.repo_owner, msg.repo_name, msg.pr_number
-    );
-    let mut start: Option<HashMap<String, AttributeValue>> = None;
-    // Page through the newest records until one for this head is found; the
-    // records of other heads and question answers are skipped.
-    for _ in 0..5 {
-        let resp = state
-            .dynamo
-            .query()
-            .table_name(&state.config.settings_table_name)
-            .key_condition_expression("pk = :pk AND begins_with(sk, :sk)")
-            .expression_attribute_values(":pk", attr_s(&msg.team_id))
-            .expression_attribute_values(":sk", attr_s(&prefix))
-            .scan_index_forward(false)
-            .limit(25)
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await?;
-        for it in resp.items() {
-            let verdict = text(it, "verdict");
-            if verdict != "APPROVE" && verdict != "REQUEST_CHANGES" {
-                continue;
-            }
-            if text(it, "head_sha") == msg.head_sha {
-                return Ok(Some(verdict));
-            }
-        }
-        match resp.last_evaluated_key() {
-            Some(k) => start = Some(k.clone()),
-            None => break,
-        }
-    }
-    Ok(None)
+    common::merge_gate::bot_verdict_at_head(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+        &msg.head_sha,
+    )
+    .await
 }
 
 // ─── Gate ───────────────────────────────────────────────────────────────────
@@ -783,54 +838,106 @@ enum Next {
     Stop,
 }
 
+/// What a tick does with the gate record it read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tick {
+    /// A person stopped the gate: only say so on the PR.
+    Stopped,
+    /// A newer arming (or a stop) owns the gate: this tick ends.
+    Superseded,
+    /// A fresh arming: start a new chain and evaluate.
+    Start,
+    /// The current chain's next tick: evaluate.
+    Continue,
+}
+
+/// Pure: a tick's course from the record. A stop wins over everything, and
+/// an arming for any head (the review of a new commit, a re-run) never
+/// clears it: only a person does (`common::merge_gate::rearm`).
+pub(crate) fn tick(msg_chain: &str, record_chain: &str, stopped: bool) -> Tick {
+    if stopped {
+        Tick::Stopped
+    } else if msg_chain.is_empty() {
+        Tick::Start
+    } else if record_chain != msg_chain {
+        Tick::Superseded
+    } else {
+        Tick::Continue
+    }
+}
+
+/// The dashboard page that stops or re-arms this PR's gate.
+fn control_url(state: &WorkerState, msg: &AwaitMergeMessage, control: Control) -> String {
+    common::merge_gate::control_url(
+        crate::passes::skills::app_url(&state.config.stage),
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+        control,
+    )
+}
+
 pub async fn run(state: &WorkerState, mut msg: AwaitMergeMessage) -> Result<(), BoxError> {
     let now = chrono::Utc::now().timestamp();
-    let mut record = if msg.chain_id.is_empty() {
-        msg.chain_id = ulid::Ulid::new().to_string();
-        msg.attempts = 0;
-        if let Err(e) = start_chain(state, &msg, now).await {
-            // Without a chain the gate can't guard against a second loop;
-            // retry the arming instead of dropping it.
-            warn!(pr = msg.pr_number, error = %e, "await-merge: could not start chain — retrying");
-            msg.chain_id.clear();
-            retry_after_error(state, &msg, None, &e.to_string()).await;
-            return Ok(());
-        }
-        match load_record(state, &msg).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(pr = msg.pr_number, error = %e, "await-merge: could not read gate record — retrying");
-                retry_after_error(state, &msg, None, &e.to_string()).await;
-                return Ok(());
-            }
-        }
-    } else {
-        match load_record(state, &msg).await {
-            Ok(r) if r.chain_id != msg.chain_id => {
-                info!(
-                    pr = msg.pr_number,
-                    "await-merge: superseded by a newer arming — stopping"
-                );
-                return Ok(());
-            }
-            Ok(r) => r,
-            Err(e) => {
-                warn!(pr = msg.pr_number, error = %e, "await-merge: could not read gate record — retrying");
-                retry_after_error(state, &msg, None, &e.to_string()).await;
-                return Ok(());
-            }
-        }
-    };
-    if record.armed_at == 0 {
-        record.armed_at = now;
-    }
-
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
         &state.secrets.github_private_key,
         msg.installation_id,
         &state.http,
     )?;
+    let mut record = match load_record(state, &msg).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "await-merge: could not read gate record — retrying");
+            retry_after_error(state, &msg, None, &e.to_string()).await;
+            return Ok(());
+        }
+    };
+    match tick(&msg.chain_id, &record.chain_id, record.stopped.is_some()) {
+        Tick::Stopped => {
+            show_stopped(state, &github, &msg, &mut record).await;
+            return Ok(());
+        }
+        Tick::Superseded => {
+            info!(
+                pr = msg.pr_number,
+                "await-merge: superseded by a newer arming or a stop — stopping"
+            );
+            return Ok(());
+        }
+        Tick::Continue => {}
+        Tick::Start => {
+            msg.chain_id = ulid::Ulid::new().to_string();
+            msg.attempts = 0;
+            if let Err(e) = start_chain(state, &msg, now).await {
+                // Without a chain the gate can't guard against a second loop;
+                // retry the arming instead of dropping it.
+                warn!(pr = msg.pr_number, error = %e, "await-merge: could not start chain — retrying");
+                msg.chain_id.clear();
+                retry_after_error(state, &msg, None, &e.to_string()).await;
+                return Ok(());
+            }
+            record = match load_record(state, &msg).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(pr = msg.pr_number, error = %e, "await-merge: could not read gate record — retrying");
+                    retry_after_error(state, &msg, None, &e.to_string()).await;
+                    return Ok(());
+                }
+            };
+            // A stop (or another arming) that landed between the two reads.
+            if record.stopped.is_some() {
+                show_stopped(state, &github, &msg, &mut record).await;
+                return Ok(());
+            }
+            if record.chain_id != msg.chain_id {
+                return Ok(());
+            }
+        }
+    }
+    if record.armed_at == 0 {
+        record.armed_at = now;
+    }
 
     match evaluate(state, &github, &msg, &mut record, now).await {
         Ok(Next::Stop) => {}
@@ -846,6 +953,64 @@ pub async fn run(state: &WorkerState, mut msg: AwaitMergeMessage) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Say on the PR that a person stopped the gate, and keep its state
+/// `stopped` (only while the stop stands and the PR isn't merged).
+async fn show_stopped(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &AwaitMergeMessage,
+    record: &mut GateRecord,
+) {
+    let Some(stop) = record.stopped.clone() else {
+        return;
+    };
+    info!(pr = msg.pr_number, via = %stop.via, "await-merge: stopped by a person — not merging");
+    let res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&record_key(msg)))
+        .update_expression("SET #st = :st")
+        // A re-arm in between wins, and a merged PR stays merged.
+        .condition_expression("attribute_exists(stopped_by) AND #st <> :merged")
+        .expression_attribute_names("#st", "state")
+        .expression_attribute_values(":st", attr_s(STATE_STOPPED))
+        .expression_attribute_values(":merged", attr_s(STATE_MERGED))
+        .send()
+        .await;
+    if let Err(e) = res {
+        let rearmed = e
+            .as_service_error()
+            .map(|se| se.is_conditional_check_failed_exception())
+            .unwrap_or(false);
+        if rearmed {
+            return;
+        }
+        warn!(pr = msg.pr_number, error = %e, "await-merge: could not record the stop");
+    }
+    let who = common::merge_gate::public_name(&stop.by, stop.is_login);
+    let body = render_stopped(
+        &record.status_body,
+        &msg.head_sha,
+        &msg.base_branch,
+        &who,
+        &control_url(state, msg, Control::Rearm),
+    );
+    // Not bound to a chain: the stop owns the comment now.
+    let mut unbound = msg.clone();
+    unbound.chain_id.clear();
+    publish_status(state, github, &unbound, record, &body).await;
+}
+
+/// Right before merging: is this tick's chain still the current one, and
+/// not stopped? A stop moves the record to a new chain, so this catches one
+/// that landed while the gate was reading CI.
+async fn still_armed(state: &WorkerState, msg: &AwaitMergeMessage) -> Result<bool, BoxError> {
+    let r = load_record(state, msg).await?;
+    Ok(tick(&msg.chain_id, &r.chain_id, r.stopped.is_some()) == Tick::Continue)
 }
 
 /// Requeue after an error on the shared requeue schedule. Errors never end
@@ -912,7 +1077,13 @@ async fn pause(
             common::truncate_str(err, 300).replace('`', "'")
         ));
     }
-    let body = with_note(&record.status_body, &msg.head_sha, &msg.base_branch, &note);
+    let body = with_note(
+        &record.status_body,
+        &msg.head_sha,
+        &msg.base_branch,
+        &note,
+        Some(&control_url(state, msg, Control::Stop)),
+    );
     publish_status(state, github, msg, record, &body).await;
 }
 
@@ -958,7 +1129,7 @@ async fn evaluate(
             } else {
                 "PR closed. Nothing left to do."
             };
-            let body = render_status(&msg.head_sha, &msg.base_branch, &[], Some(note));
+            let body = render_status(&msg.head_sha, &msg.base_branch, &[], Some(note), None);
             publish_status(state, github, msg, record, &body).await;
         }
         return Ok(Next::Stop);
@@ -979,7 +1150,13 @@ async fn evaluate(
                 "New commit {}. Waiting for CoderHelm to review it before merging.",
                 short(cur_head)
             );
-            let body = render_status(&msg.head_sha, &msg.base_branch, &[], Some(&note));
+            let body = render_status(
+                &msg.head_sha,
+                &msg.base_branch,
+                &[],
+                Some(&note),
+                Some(&control_url(state, msg, Control::Stop)),
+            );
             publish_status(state, github, msg, record, &body).await;
         }
         return Ok(Next::Stop);
@@ -1051,6 +1228,7 @@ async fn evaluate(
         &msg.base_branch,
         &decision.lines,
         decision.note.as_deref(),
+        Some(&control_url(state, msg, Control::Stop)),
     );
     match decision.action {
         Action::WaitForPeople => {
@@ -1089,6 +1267,13 @@ async fn evaluate(
             Ok(Next::Stop)
         }
         Action::Merge => {
+            if !still_armed(state, msg).await? {
+                info!(
+                    pr = msg.pr_number,
+                    "await-merge: stopped or re-armed while reading CI — not merging"
+                );
+                return Ok(Next::Stop);
+            }
             merge(
                 state,
                 github,
@@ -1136,7 +1321,7 @@ async fn merge(
                 merged_lines.push(crate::passes::quarantine::passing_line(tests));
             }
             lines.push((Mark::Done, format!("Merged into `{}`", msg.base_branch)));
-            let mut body = render_status(&msg.head_sha, &msg.base_branch, &lines, None);
+            let mut body = render_status(&msg.head_sha, &msg.base_branch, &lines, None, None);
             if !merged_lines.is_empty() {
                 // The merge report lives in the same comment: one comment per PR.
                 body = with_note(
@@ -1144,6 +1329,7 @@ async fn merge(
                     &msg.head_sha,
                     &msg.base_branch,
                     &format!("**After merging**\n\n{}", merged_lines.join("\n")),
+                    None,
                 );
             }
             publish_status(state, github, msg, record, &body).await;
@@ -1163,7 +1349,13 @@ async fn merge(
                 ),
             ));
             set_state(state, msg, STATE_DECLINED, &reason).await;
-            let body = render_status(&msg.head_sha, &msg.base_branch, &lines, None);
+            let body = render_status(
+                &msg.head_sha,
+                &msg.base_branch,
+                &lines,
+                None,
+                Some(&control_url(state, msg, Control::Stop)),
+            );
             publish_status(state, github, msg, record, &body).await;
             Ok(Next::Poll)
         }
@@ -1520,8 +1712,8 @@ mod ci_tests {
             (Mark::Done, "CoderHelm approved".to_string()),
             (Mark::Waiting, "Waiting for a person's approval".to_string()),
         ];
-        let a = render_status("abc1234def", "main", &lines, None);
-        let b = render_status("abc1234def", "main", &lines, None);
+        let a = render_status("abc1234def", "main", &lines, None, None);
+        let b = render_status("abc1234def", "main", &lines, None, None);
         assert_eq!(a, b, "same state must render identically (no rewrite)");
         assert!(a.starts_with(STATUS_MARKER));
         assert!(a.contains("**Auto-merge** · waiting\n"));
@@ -1538,7 +1730,7 @@ mod ci_tests {
             (Mark::Blocked, "CI failing: `build`".to_string()),
             (Mark::Waiting, "Waiting for a person's approval".to_string()),
         ];
-        let body = render_status("abc1234", "main", &lines, Some("Not merging."));
+        let body = render_status("abc1234", "main", &lines, Some("Not merging."), None);
         let read: Vec<(&str, String)> = common::merge_gate::checklist(&body)
             .into_iter()
             .map(|l| (l.mark, l.text))
@@ -1556,8 +1748,8 @@ mod ci_tests {
     #[test]
     fn pause_note_keeps_the_checklist() {
         let lines = vec![(Mark::Waiting, "CI running: `Deploy`".to_string())];
-        let last = render_status("abc1234", "main", &lines, None);
-        let paused = with_note(&last, "abc1234", "main", "Paused.");
+        let last = render_status("abc1234", "main", &lines, None, None);
+        let paused = with_note(&last, "abc1234", "main", "Paused.", None);
         assert!(paused.contains("CI running: `Deploy`"));
         assert!(paused.find("Paused.") < paused.find("Commit abc1234 into main."));
         assert!(paused.ends_with("every item is done."));
@@ -1566,9 +1758,9 @@ mod ci_tests {
         let old = format!(
             "{STATUS_MARKER}\n**Auto-merge**\n\n- ⏳ x\n\n<sub>Commit abc1234 into main.</sub>"
         );
-        let n = with_note(&old, "abc1234", "main", "Paused.");
+        let n = with_note(&old, "abc1234", "main", "Paused.", None);
         assert!(n.find("Paused.") < n.find("Commit abc1234"));
-        let fresh = with_note("", "abc1234", "main", "Paused.");
+        let fresh = with_note("", "abc1234", "main", "Paused.", None);
         assert!(fresh.starts_with(STATUS_MARKER) && fresh.contains("Paused."));
     }
 
@@ -1577,7 +1769,7 @@ mod ci_tests {
         let old = format!(
             "{STATUS_MARKER}\n### 🚦 Auto-merge status — `abc1234` → `main`\n\n- ⏳ CI running: `Deploy`\n\n<sub>I merge automatically once every item is ✅. This comment updates in place.</sub>"
         );
-        let paused = with_note(&old, "abc1234", "main", "Paused.");
+        let paused = with_note(&old, "abc1234", "main", "Paused.", None);
         assert!(paused.contains("CI running: `Deploy`") && paused.contains("Paused."));
     }
 
@@ -1588,5 +1780,97 @@ mod ci_tests {
         assert!(out.contains("`c8`"));
         assert!(!out.contains("`c9`"));
         assert!(out.ends_with("and 2 more"));
+    }
+
+    #[test]
+    fn a_stop_survives_a_push_and_every_arming() {
+        // The review of a new commit arms the gate with an empty chain: a
+        // person's stop still holds, whatever the head.
+        assert_eq!(tick("", "stopped-01", true), Tick::Stopped);
+        // A tick of the loop that was running when the stop landed.
+        assert_eq!(tick("01OLD", "stopped-01", true), Tick::Stopped);
+        assert_eq!(tick("01OLD", "stopped-01", false), Tick::Superseded);
+        // Re-armed by a person: the next arming starts a fresh chain.
+        assert_eq!(tick("", "stopped-01", false), Tick::Start);
+        assert_eq!(tick("01NEW", "01NEW", false), Tick::Continue);
+        // A stopped gate is never woken by CI or reviews either.
+        assert!(!common::merge_gate::wakes_on_ci(STATE_STOPPED));
+        assert!(!common::merge_gate::wakes_on_review(STATE_STOPPED));
+    }
+
+    #[test]
+    fn a_rearm_rechecks_every_key_on_the_current_head() {
+        // Re-armed after a push: CoderHelm has no verdict on the new head
+        // yet, so the gate waits for its review even with CI green and a
+        // person's approval in.
+        let mut v = view();
+        v.bot_verdict = None;
+        v.ci = Some(green());
+        let d = decide_gate(&v);
+        assert_eq!(d.action, Action::WaitForPeople);
+        assert!(d
+            .lines
+            .iter()
+            .any(|(m, l)| *m == Mark::Waiting && l.contains("CoderHelm's review")));
+        // CoderHelm approved, but the person's approval is missing.
+        let mut v = view();
+        v.approvals = Approvals::default();
+        v.ci = Some(green());
+        assert_eq!(decide_gate(&v).action, Action::WaitForPeople);
+        // Both keys in but CI failing: blocked, not merged.
+        let mut v = view();
+        v.ci = Some(CheckSummary {
+            failing: vec!["build".into()],
+            ..Default::default()
+        });
+        assert_eq!(decide_gate(&v).action, Action::BlockedOnCi);
+        // Only everything in and green merges.
+        let mut v = view();
+        v.ci = Some(green());
+        assert_eq!(decide_gate(&v).action, Action::Merge);
+    }
+
+    #[test]
+    fn an_open_gate_shows_how_to_stop_it() {
+        let lines = vec![(Mark::Waiting, "CI running: `build`".to_string())];
+        let url = "https://app.example.com/reviewer/pr?repo=your-team/web&pr=7&do=stop";
+        let body = render_status("abc1234", "main", &lines, None, Some(url));
+        assert!(body.contains(&format!("[Stop auto-merge]({url})")));
+        assert!(body.contains("`@coderhelm stop auto-merge`"));
+        // The link is no checklist line, and a note still goes above it.
+        assert_eq!(common::merge_gate::checklist(&body).len(), 1);
+        let paused = with_note(&body, "abc1234", "main", "Paused.", None);
+        assert!(paused.find("Paused.") < paused.find("[Stop auto-merge]"));
+        // A merged or closed PR has nothing to stop.
+        assert!(!render_status("abc1234", "main", &lines, None, None).contains("Stop auto-merge"));
+    }
+
+    #[test]
+    fn a_stopped_gate_says_who_and_how_to_rearm() {
+        let lines = vec![
+            (Mark::Done, "CoderHelm approved".to_string()),
+            (Mark::Waiting, "CI running: `build`".to_string()),
+        ];
+        let last = render_status("abc1234", "main", &lines, None, Some("https://x/stop"));
+        let url = "https://app.example.com/reviewer/pr?repo=your-team/web&pr=7&do=rearm";
+        let body = render_stopped(&last, "abc1234", "main", "@a-reviewer", url);
+        assert!(body.starts_with(STATUS_MARKER));
+        assert!(body.contains("**Auto-merge** · stopped"));
+        assert!(body.contains(&format!(
+            "Auto-merge stopped by @a-reviewer · re-arm: comment `@coderhelm resume auto-merge` or [open in CoderHelm]({url})"
+        )));
+        assert!(!body.contains("Stop auto-merge"));
+        assert!(!body.contains("Merges on its own"));
+        // The checklist of this commit stays readable for the dashboard.
+        assert_eq!(common::merge_gate::checklist(&body).len(), 2);
+        // A stop carried to a new commit drops the old commit's checklist.
+        let moved = render_stopped(&last, "def5678", "main", "@a-reviewer", url);
+        assert!(common::merge_gate::checklist(&moved).is_empty());
+        assert!(moved.contains("Commit def5678 into main."));
+        // Same state, same bytes: the comment isn't rewritten.
+        assert_eq!(
+            body,
+            render_stopped(&last, "abc1234", "main", "@a-reviewer", url)
+        );
     }
 }

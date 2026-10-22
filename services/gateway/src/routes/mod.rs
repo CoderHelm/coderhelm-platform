@@ -15,6 +15,7 @@ pub mod integrations;
 pub mod jira_webhook;
 pub mod log_analyzer;
 pub mod memory;
+pub mod merge_control;
 pub mod paging;
 pub mod plan_chat_tools;
 pub mod plans;

@@ -663,6 +663,7 @@ fn live_rows(
                     "head_sha": item_str(g, "head_sha", ""),
                     "armed_at": rfc3339(item_i64(g, "armed_at")),
                     "checklist": checklist,
+                    "stopped": stopped_json(g),
                 })
             });
             // RFC 3339 in UTC from one writer each, so strings order by time.
@@ -731,6 +732,249 @@ pub async fn live_prs(
     .await?;
     let now = chrono::Utc::now().timestamp();
     Ok(Json(json!({ "prs": live_rows(&live, &gates, now) })))
+}
+
+/// A person's stop on a gate record, for the dashboard (null when none).
+fn stopped_json(g: &HashMap<String, AttributeValue>) -> Value {
+    match common::merge_gate::stopped(g) {
+        Some(st) => json!({
+            "by": st.by,
+            "is_login": st.is_login,
+            "via": st.via,
+            "at": rfc3339(Some(st.at)),
+        }),
+        None => Value::Null,
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct GateQuery {
+    /// "owner/name"
+    repo: String,
+    pr: u64,
+}
+
+/// `owner` and `name` of a validated "owner/name".
+fn split_repo(repo: &str) -> Result<(&str, &str), StatusCode> {
+    validate_repo(repo)?;
+    let (owner, name) = repo.split_once('/').ok_or(StatusCode::BAD_REQUEST)?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((owner, name))
+}
+
+/// The team's reviewer config of one repo, if the team has one. Keyed by the
+/// caller's own team: another team's repo is simply not there.
+async fn team_repo_config(
+    state: &AppState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> Result<Option<HashMap<String, AttributeValue>>, StatusCode> {
+    Ok(state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&format!("REVIEW_CONFIG#REPO#{owner}/{name}")))
+        .send()
+        .await
+        .map_err(|e| {
+            error!(owner, name, error = %e, "Reviewer config read failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item()
+        .cloned())
+}
+
+/// Pure: may this dashboard user stop or re-arm auto-merge on the repo? Only
+/// a member (or above; viewers only read) of the team whose config holds the
+/// repo. Another team's repo is "not found", never a 403 that confirms it
+/// exists.
+pub(crate) fn authorize_gate_control(
+    role_level: u8,
+    team_has_repo: bool,
+) -> Result<(), StatusCode> {
+    if !team_has_repo {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    if role_level < 1 {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
+/// Pure: one PR's auto-merge gate for the dashboard's PR page: its state,
+/// checklist, who stopped it, and every stop and re-arm (newest first).
+fn gate_detail(
+    repo: &str,
+    pr: u64,
+    auto_merge: bool,
+    gate: Option<&HashMap<String, AttributeValue>>,
+    live: Option<&HashMap<String, AttributeValue>>,
+    now: i64,
+) -> Value {
+    use common::review_live as rl;
+    let phase = live
+        .map(|l| {
+            rl::effective_phase(&item_str(l, "phase", ""), item_i64(l, "expires_at"), now)
+                .to_string()
+        })
+        .unwrap_or_default();
+    let gate_state = gate.map(|g| item_str(g, "state", "")).unwrap_or_default();
+    let st = rl::pr_status(&phase, &gate_state);
+    let gate = gate.map(|g| {
+        let checklist: Vec<Value> = common::merge_gate::checklist(&item_str(g, "status_body", ""))
+            .into_iter()
+            .map(|c| json!({ "mark": c.mark, "text": c.text }))
+            .collect();
+        let mut controls: Vec<Value> = common::merge_gate::controls(g)
+            .into_iter()
+            .map(|c| {
+                json!({
+                    "action": c.action,
+                    "by": c.by,
+                    "is_login": c.is_login,
+                    "via": c.via,
+                    "at": rfc3339(Some(c.at)),
+                    "outcome": c.outcome,
+                })
+            })
+            .collect();
+        controls.reverse();
+        json!({
+            "state": gate_state,
+            "detail": item_str(g, "detail", ""),
+            "head_sha": item_str(g, "head_sha", ""),
+            "armed_at": rfc3339(item_i64(g, "armed_at")),
+            "updated_at": item_str(g, "updated_at", ""),
+            "checklist": checklist,
+            "stopped": stopped_json(g),
+            "controls": controls,
+        })
+    });
+    json!({
+        "repo": repo,
+        "pr_number": pr,
+        "pr_title": live.map(|l| item_str(l, "pr_title", "")).unwrap_or_default(),
+        "auto_merge": auto_merge,
+        "status": st.status,
+        "group": st.group,
+        "gate": gate,
+    })
+}
+
+/// GET /api/reviewer/gate?repo=owner/name&pr=N — one PR's auto-merge gate:
+/// state, checklist, the stop if any and the audit log of stops and re-arms.
+pub async fn get_gate(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<GateQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let (owner, name) = split_repo(&q.repo)?;
+    if q.pr == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let cfg = team_repo_config(&state, &claims.team_id, owner, name)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let get = |sk: String| {
+        let state = state.clone();
+        let team = claims.team_id.clone();
+        async move {
+            state
+                .dynamo
+                .get_item()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", attr_s(&team))
+                .key("sk", attr_s(&sk))
+                .consistent_read(true)
+                .send()
+                .await
+                .map(|r| r.item().cloned())
+                .map_err(|e| {
+                    error!(error = %e, "Gate read failed");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })
+        }
+    };
+    let gate = get(common::merge_gate::record_sk(owner, name, q.pr)).await?;
+    let live = get(common::review_live::record_sk(owner, name, q.pr)).await?;
+    let now = chrono::Utc::now().timestamp();
+    let mut out = gate_detail(
+        &q.repo,
+        q.pr,
+        item_bool(&cfg, "auto_merge", false),
+        gate.as_ref(),
+        live.as_ref(),
+        now,
+    );
+    out["can_control"] = json!(claims.role_level() >= 1);
+    Ok(Json(out))
+}
+
+#[derive(serde::Deserialize)]
+pub struct GateControlBody {
+    /// "owner/name"
+    repo: String,
+    pr: u64,
+    /// "stop" or "rearm".
+    action: String,
+}
+
+/// POST /api/reviewer/gate — stop or re-arm one PR's auto-merge from the
+/// dashboard. Member or above of the team that owns the repo. A re-arm
+/// never merges by itself: the gate checks every condition again.
+pub async fn control_gate(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<GateControlBody>,
+) -> Result<Json<Value>, StatusCode> {
+    let (owner, name) = split_repo(&body.repo)?;
+    let control =
+        common::merge_gate::Control::from_action(&body.action).ok_or(StatusCode::BAD_REQUEST)?;
+    if body.pr == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let cfg = team_repo_config(&state, &claims.team_id, owner, name).await?;
+    authorize_gate_control(claims.role_level(), cfg.is_some())?;
+    let installation_id = super::api::get_team_installation_id(&state, &claims.team_id).await?;
+    let actor = common::merge_gate::Actor {
+        by: claims
+            .github_login
+            .clone()
+            .unwrap_or_else(|| claims.email.clone()),
+        is_login: claims.github_login.is_some(),
+        via: common::merge_gate::VIA_DASHBOARD,
+    };
+    let out = super::merge_control::apply(
+        &state,
+        &claims.team_id,
+        installation_id,
+        owner,
+        name,
+        body.pr,
+        control,
+        &actor,
+    )
+    .await?;
+    if out.status == "not_found" {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    info!(
+        owner,
+        name,
+        pr = body.pr,
+        action = control.as_str(),
+        status = out.status,
+        "Reviewer: dashboard auto-merge control"
+    );
+    Ok(Json(json!({
+        "status": out.status,
+        "ok": out.ok,
+        "message": out.message,
+    })))
 }
 
 #[derive(serde::Deserialize)]
@@ -886,6 +1130,66 @@ pub async fn rate_review(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_control_is_refused_to_other_teams_and_viewers() {
+        // Another team's repo has no config under the caller's team.
+        assert_eq!(authorize_gate_control(4, false), Err(StatusCode::NOT_FOUND));
+        assert_eq!(authorize_gate_control(0, false), Err(StatusCode::NOT_FOUND));
+        // A viewer of the owning team reads only.
+        assert_eq!(authorize_gate_control(0, true), Err(StatusCode::FORBIDDEN));
+        assert_eq!(authorize_gate_control(1, true), Ok(()));
+        assert_eq!(authorize_gate_control(3, true), Ok(()));
+    }
+
+    #[test]
+    fn gate_detail_shows_the_stop_and_the_audit_log_newest_first() {
+        let now = 1_000_000;
+        let entry = |action: &str, by: &str, via: &str, at: i64| {
+            attr_s(
+                &serde_json::to_string(&common::merge_gate::ControlEntry {
+                    action: action.into(),
+                    by: by.into(),
+                    is_login: true,
+                    via: via.into(),
+                    at,
+                    outcome: String::new(),
+                })
+                .unwrap(),
+            )
+        };
+        let gate = item(&[
+            ("sk", attr_s("MERGEGATE#your-team/web#000007")),
+            ("state", attr_s("stopped")),
+            ("stopped_by", attr_s("a-reviewer")),
+            ("stopped_login", AttributeValue::Bool(true)),
+            ("stopped_via", attr_s("comment")),
+            ("stopped_at", attr_n(now - 60)),
+            (
+                "controls",
+                AttributeValue::L(vec![
+                    entry("stop", "a-maintainer", "dashboard", now - 600),
+                    entry("rearm", "a-maintainer", "dashboard", now - 300),
+                    entry("stop", "a-reviewer", "comment", now - 60),
+                ]),
+            ),
+            ("status_body", attr_s("x\n- ✅ CoderHelm approved\n")),
+        ]);
+        let d = gate_detail("your-team/web", 7, true, Some(&gate), None, now);
+        assert_eq!(d["status"], "stopped");
+        assert_eq!(d["group"], "waiting");
+        assert_eq!(d["auto_merge"], true);
+        assert_eq!(d["gate"]["stopped"]["by"], "a-reviewer");
+        assert_eq!(d["gate"]["stopped"]["via"], "comment");
+        let log = d["gate"]["controls"].as_array().unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0]["by"], "a-reviewer");
+        assert_eq!(log[1]["action"], "rearm");
+        assert_eq!(d["gate"]["checklist"][0]["text"], "CoderHelm approved");
+        // No gate yet: still a page, nothing stopped.
+        let d = gate_detail("your-team/web", 8, true, None, None, now);
+        assert_eq!(d["gate"], Value::Null);
+    }
 
     #[test]
     fn validate_repo_accepts_normal_and_rejects_injection() {

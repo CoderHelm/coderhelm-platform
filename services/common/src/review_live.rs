@@ -94,6 +94,8 @@ pub fn pr_status(review_phase: &str, gate_state: &str) -> PrStatus {
         g::STATE_WAITING_APPROVAL => return st("waiting_people", GROUP_WAITING),
         g::STATE_DECLINED => return st("merge_blocked", GROUP_WAITING),
         g::STATE_PAUSED => return st("paused", GROUP_WAITING),
+        // Waits on a person to re-arm it.
+        g::STATE_STOPPED => return st("stopped", GROUP_WAITING),
         _ => {}
     }
     match review_phase {
@@ -450,6 +452,7 @@ mod tests {
             (g::STATE_WAITING_APPROVAL, "waiting_people", GROUP_WAITING),
             (g::STATE_DECLINED, "merge_blocked", GROUP_WAITING),
             (g::STATE_PAUSED, "paused", GROUP_WAITING),
+            (g::STATE_STOPPED, "stopped", GROUP_WAITING),
             (g::STATE_MERGED, "merged", GROUP_DONE),
             (g::STATE_CLOSED, "closed", GROUP_DONE),
             (g::STATE_HEAD_MOVED, "new_commits", GROUP_DONE),

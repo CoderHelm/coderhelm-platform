@@ -223,6 +223,10 @@ async fn main() -> Result<(), Error> {
         .route("/reviewer/reviews", get(routes::reviewer::list_reviews))
         .route("/reviewer/review", get(routes::reviewer::get_review))
         .route("/reviewer/live", get(routes::reviewer::live_prs))
+        .route(
+            "/reviewer/gate",
+            get(routes::reviewer::get_gate).post(routes::reviewer::control_gate),
+        )
         .route("/reviewer/review/rate", post(routes::reviewer::rate_review))
         .route("/reviewer/re-review", post(routes::reviewer::re_review))
         // What the reviewer learned from the team's pushback
