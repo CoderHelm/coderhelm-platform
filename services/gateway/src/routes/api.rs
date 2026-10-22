@@ -894,7 +894,7 @@ pub async fn get_run_traces(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let traces: Vec<Value> = result
+    let mut traces: Vec<Value> = result
         .items()
         .iter()
         .map(|item| {
@@ -910,6 +910,9 @@ pub async fn get_run_traces(
             })
         })
         .collect();
+    // In the order the passes ran: a repeated pass ("plan:2") sorts by key
+    // after every "plan…" name, not after the first plan.
+    traces.sort_by(|a, b| a["timestamp"].as_str().cmp(&b["timestamp"].as_str()));
 
     Ok(Json(json!({ "traces": traces })))
 }

@@ -192,15 +192,60 @@ impl<'a> SandboxClient<'a> {
         }
     }
 
-    /// Upload the tarball, run the checks in CodeBuild, and return the real
-    /// output. Never returns Err for an ordinary check failure — a failing
-    /// build is `CheckOutcome { ran: true, passed: false, .. }`. Err is
-    /// reserved for hard faults the caller should log and shrug off.
-    pub async fn run_checks(
+    /// The S3 key holding the source tarball, uploading it only when this run
+    /// hasn't already uploaded that commit. `fetch` downloads the tarball and
+    /// is called only on a miss. A repo's tarball runs to tens of MB, and
+    /// re-uploading it on every check of an unchanged head cost minutes per
+    /// check; the same commit is the same bytes, so one upload serves every
+    /// check (and codegen run) of it in the run, continuations included. The
+    /// bucket's 1-day lifecycle removes it.
+    pub async fn ensure_source<F, Fut>(
         &self,
         run_id: &str,
-        attempt: usize,
-        tarball: Vec<u8>,
+        head_sha: &str,
+        fetch: F,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: FnOnce() -> Fut,
+        Fut:
+            std::future::Future<Output = Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>>,
+    {
+        let key = source_key(run_id, head_sha);
+        if self
+            .s3
+            .head_object()
+            .bucket(self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .is_ok()
+        {
+            info!(key = %key, "sandbox: source for this commit already uploaded — reusing");
+            return Ok(key);
+        }
+        let tarball = fetch().await?;
+        let tarball_len = tarball.len();
+        self.s3
+            .put_object()
+            .bucket(self.bucket)
+            .key(&key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(tarball))
+            .content_type("application/gzip")
+            .send()
+            .await
+            .map_err(|e| format!("sandbox tarball upload failed: {e}"))?;
+        info!(key = %key, bytes = tarball_len, "sandbox: uploaded source tarball");
+        Ok(key)
+    }
+
+    /// Run the checks in CodeBuild against the source at `source_key` (from
+    /// [`Self::ensure_source`]) and return the real output. Never returns Err
+    /// for an ordinary check failure — a failing build is
+    /// `CheckOutcome { ran: true, passed: false, .. }`. Err is reserved for
+    /// hard faults the caller should log and shrug off.
+    pub async fn run_checks(
+        &self,
+        source_key: &str,
         checks_cmd: &str,
         node_version: Option<&str>,
         deadline: Option<Instant>,
@@ -213,37 +258,9 @@ impl<'a> SandboxClient<'a> {
                 "not enough time left before the pass deadline to run a sandbox build",
             ));
         }
-
-        // Unique per (run, attempt) so concurrent/retried checks never collide.
-        let key = format!("sandbox/{run_id}/{attempt}.tgz");
-        let tarball_len = tarball.len();
-        if let Err(e) = self
-            .s3
-            .put_object()
-            .bucket(self.bucket)
-            .key(&key)
-            .body(aws_sdk_s3::primitives::ByteStream::from(tarball))
-            .content_type("application/gzip")
-            .send()
+        // The source stays for the run's next check of the same commit.
+        self.build_and_read(source_key, checks_cmd, node_version, deadline)
             .await
-        {
-            return Err(format!("sandbox tarball upload failed: {e}").into());
-        }
-        info!(key = %key, bytes = tarball_len, "sandbox: uploaded source tarball");
-
-        // Drive the build, then ALWAYS clean up the tarball (it is transient;
-        // the bucket also has a 1-day lifecycle backstop).
-        let outcome = self
-            .build_and_read(&key, checks_cmd, node_version, deadline)
-            .await;
-        let _ = self
-            .s3
-            .delete_object()
-            .bucket(self.bucket)
-            .key(&key)
-            .send()
-            .await;
-        outcome
     }
 
     /// Run the repo's codegen in the sandbox and return the files it CHANGED,
@@ -254,7 +271,7 @@ impl<'a> SandboxClient<'a> {
         &self,
         run_id: &str,
         attempt: usize,
-        tarball: Vec<u8>,
+        source_key: &str,
         codegen_cmd: &str,
         node_version: Option<&str>,
         extra_env: &[(String, String)],
@@ -268,23 +285,10 @@ impl<'a> SandboxClient<'a> {
                 "not enough time left before the pass deadline to run codegen",
             ));
         }
-        let key = format!("sandbox/{run_id}/codegen-{attempt}.tgz");
         let out_key = format!("codegen-out/{run_id}/{attempt}.tgz");
-        if let Err(e) = self
-            .s3
-            .put_object()
-            .bucket(self.bucket)
-            .key(&key)
-            .body(aws_sdk_s3::primitives::ByteStream::from(tarball))
-            .content_type("application/gzip")
-            .send()
-            .await
-        {
-            return Err(format!("codegen tarball upload failed: {e}").into());
-        }
         let outcome = self
             .codegen_build_and_capture(
-                &key,
+                source_key,
                 &out_key,
                 codegen_cmd,
                 node_version,
@@ -292,14 +296,8 @@ impl<'a> SandboxClient<'a> {
                 deadline,
             )
             .await;
-        // Clean up both transient objects.
-        let _ = self
-            .s3
-            .delete_object()
-            .bucket(self.bucket)
-            .key(&key)
-            .send()
-            .await;
+        // The output is transient; the source stays for the run's next
+        // check of the same commit.
         let _ = self
             .s3
             .delete_object()
@@ -703,6 +701,24 @@ fn env_var(
         .map_err(|e| format!("bad codebuild env var {name}: {e}").into())
 }
 
+/// The S3 key of a run's source tarball at one commit. Keyed by the commit,
+/// so a check of an unchanged head finds the upload already there and a new
+/// commit never reuses an older one's source.
+pub fn source_key(run_id: &str, head_sha: &str) -> String {
+    let safe = |s: &str| {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+    };
+    format!("sandbox/{}/src-{}.tgz", safe(run_id), safe(head_sha))
+}
+
 /// Parse the exit code that follows a given end-marker.
 fn parse_marker_exit(log: &str, marker: &str) -> Option<i32> {
     let idx = log.find(marker)?;
@@ -740,6 +756,16 @@ impl<A: Default, B: Default> UnzipOrDefault<A, B> for Option<(A, B)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_commit_is_one_upload_per_run() {
+        let a = source_key("01RUN", "abc123");
+        assert_eq!(a, source_key("01RUN", "abc123"));
+        assert_ne!(a, source_key("01RUN", "def456"));
+        assert_ne!(a, source_key("01OTHER", "abc123"));
+        assert_eq!(a, "sandbox/01RUN/src-abc123.tgz");
+        assert!(!source_key("review-a/b", "x").contains("a/b"));
+    }
 
     #[test]
     fn a_build_needs_its_estimate_plus_the_buffer() {

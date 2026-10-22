@@ -354,10 +354,34 @@ async fn handle_issue_event(
         &ticket_id_str,
         Some(&context_hash),
         false,
+        false,
     )
     .await
     {
         super::trigger_gate::TicketGate::Enqueue => {}
+        super::trigger_gate::TicketGate::OpenPr(pr) => {
+            // The issue's PR is open: the edit is feedback on it, never a
+            // second run.
+            let note = super::trigger_gate::edit_note(
+                &pr,
+                issue["title"].as_str().unwrap_or(""),
+                issue["body"].as_str().unwrap_or(""),
+            );
+            info!(ticket_id = %ticket_id_str, pr = pr.pr_number, "Issue edited while its PR is open — sending to that PR");
+            let feedback = WorkerMessage::Feedback(crate::models::FeedbackMessage {
+                team_id: team_id.to_string(),
+                installation_id,
+                run_id: pr.run_id.clone(),
+                repo_owner: pr.repo_owner.clone(),
+                repo_name: pr.repo_name.clone(),
+                pr_number: pr.pr_number,
+                review_id: 0,
+                review_body: note,
+                comments: vec![],
+                trigger_author: String::new(),
+            });
+            return send_to_queue(state, &state.config.ticket_queue_url, &feedback).await;
+        }
         _ => {
             info!(ticket_id = %ticket_id_str, "Skipping — trigger gate blocked");
             return Ok(StatusCode::OK);
@@ -774,7 +798,8 @@ async fn handle_issue_comment(
     // enqueue a duplicate run with no dedup at all.
     let ticket_id_str = format!("GH-{}", issue["number"].as_u64().unwrap_or(0));
     if matches!(
-        super::trigger_gate::gate_ticket_trigger(state, team_id, &ticket_id_str, None, true).await,
+        super::trigger_gate::gate_ticket_trigger(state, team_id, &ticket_id_str, None, true, false)
+            .await,
         super::trigger_gate::TicketGate::SkipInFlight
     ) {
         info!(ticket_id = %ticket_id_str, "Skipping slash command — run already in flight");

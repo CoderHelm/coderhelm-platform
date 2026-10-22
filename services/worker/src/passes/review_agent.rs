@@ -1612,8 +1612,6 @@ pub async fn verify_in_sandbox(
         (None, None) => return None,
     };
     let node = super::detect_node_version(github, owner, repo, head_sha).await;
-    let tarball = github.download_tarball(owner, repo, head_sha).await.ok()?;
-
     let sandbox = crate::clients::sandbox::SandboxClient::new(
         &state.codebuild,
         &state.s3,
@@ -1627,8 +1625,16 @@ pub async fn verify_in_sandbox(
     )
     .replace('/', "-");
 
+    // A re-review of the same head reuses the source already uploaded.
+    let source = sandbox
+        .ensure_source(&run_id, head_sha, || {
+            github.download_tarball(owner, repo, head_sha)
+        })
+        .await
+        .ok()?;
+
     match sandbox
-        .run_checks(&run_id, 0, tarball, &cmd, node.as_deref(), None)
+        .run_checks(&source, &cmd, node.as_deref(), None)
         .await
     {
         Ok(o) if o.ran => {

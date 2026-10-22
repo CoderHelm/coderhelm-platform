@@ -1907,6 +1907,25 @@ impl<'a> WriteToolExecutor<'a> {
         }
     }
 
+    /// The sandbox's source for the branch's current head: resolved to its
+    /// commit first, downloaded by that commit (immutable), and uploaded once
+    /// per commit per run, so repeat checks of an unchanged head reuse it.
+    async fn sandbox_source(
+        &self,
+        sandbox: &crate::clients::sandbox::SandboxClient<'_>,
+        run_id: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let head = self
+            .github
+            .get_ref(&self.owner, &self.repo, &self.branch)
+            .await?;
+        sandbox
+            .ensure_source(run_id, &head, || {
+                self.github.download_tarball(&self.owner, &self.repo, &head)
+            })
+            .await
+    }
+
     /// Run the repo's real checks in the sandbox and return the actual output
     /// for the agent to iterate on. Returns Ok(...) even on a failing build — a
     /// red result is normal feedback, not a tool error.
@@ -1958,12 +1977,8 @@ impl<'a> WriteToolExecutor<'a> {
             None => cmd.clone(),
         };
 
-        let tarball = match self
-            .github
-            .download_tarball(&self.owner, &self.repo, &self.branch)
-            .await
-        {
-            Ok(t) => t,
+        let source = match self.sandbox_source(sandbox, run_id).await {
+            Ok(k) => k,
             Err(e) => {
                 return Ok(json!(format!(
                 "Could not snapshot the branch for checks: {e}. Proceed carefully; CI still runs."
@@ -1973,9 +1988,7 @@ impl<'a> WriteToolExecutor<'a> {
 
         match sandbox
             .run_checks(
-                run_id,
-                attempt,
-                tarball,
+                &source,
                 &effective_cmd,
                 self.node_version.as_deref(),
                 self.deadline,
@@ -2031,12 +2044,8 @@ impl<'a> WriteToolExecutor<'a> {
                 "Not enough time remains to run codegen; finalize your changes now."
             ));
         }
-        let tarball = match self
-            .github
-            .download_tarball(&self.owner, &self.repo, &self.branch)
-            .await
-        {
-            Ok(t) => t,
+        let source = match self.sandbox_source(sandbox, run_id).await {
+            Ok(k) => k,
             Err(e) => {
                 return Ok(json!(format!(
                     "Could not snapshot the branch for codegen: {e}."
@@ -2047,7 +2056,7 @@ impl<'a> WriteToolExecutor<'a> {
             .run_codegen(
                 run_id,
                 attempt,
-                tarball,
+                &source,
                 cmd,
                 self.node_version.as_deref(),
                 &self.codegen_env,

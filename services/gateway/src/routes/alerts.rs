@@ -1004,6 +1004,7 @@ async fn start_run(
         tid,
         Some(&context_hash),
         false,
+        false,
     )
     .await
     {

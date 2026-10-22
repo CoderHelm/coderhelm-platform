@@ -1181,9 +1181,18 @@ async fn run_passes(
         progress_comment_id = resp["id"].as_u64();
     }
 
+    // The ticket's history with CoderHelm: earlier runs, how their PRs
+    // ended, lessons, what people wrote on the ticket. Read before the repo
+    // is chosen (a ticket whose PR is already in a repo stays there), and
+    // the planner is shown it and held to it below.
+    let mut history = ticket_history::load(state, &msg.team_id, &msg.ticket_id, run_id).await;
+    ticket_history::add_pr_comments(&mut history, &github).await;
+
     // --- Resolve repo for Jira tickets ---
-    // For Jira: explicit pin on the message > project mapping > LLM
-    // select_repo > single repo. A repo the ticket names (pinned, or plainly
+    // For Jira: explicit pin on the message > the repo of the ticket's own
+    // pull request (CoderHelm's, merged or open, or one that names the
+    // ticket) > project mapping > LLM select_repo > single repo. A repo the
+    // ticket names (pinned, or plainly
     // written in the ticket) that is connected but not turned on for runs is
     // never swapped for another repo: the run stops as needs_input and says
     // so. validate_plan is the final safety net (tech-stack + plan-text checks).
@@ -1250,6 +1259,15 @@ async fn run_passes(
                         return Err("No enabled repos found for team — cannot auto-pick repo".into())
                     }
                 }
+            } else if let Some((repo, why)) =
+                repo_of_ticket_pr(&history, &repos, &github, &msg.ticket_id).await
+            {
+                // The ticket's work already lives in a repo: its pull request
+                // is there. Planning anywhere else only to switch back was
+                // three wasted plans on one ticket.
+                info!(run_id, repo = %repo, why = %why, "Repo from the ticket's own pull request");
+                auto_pick = Some((repo.clone(), why));
+                resolved = Some(repo);
             } else {
                 // Check for explicit Jira project → repo mapping
                 let project_key = msg.ticket_id.split('-').next().unwrap_or("");
@@ -1315,8 +1333,17 @@ async fn run_passes(
         }
         let repo = resolved.ok_or("Could not resolve a repo for this Jira ticket")?;
         let (owner, name) = repo.split_once('/').unwrap_or(("", ""));
+        let changed = msg.repo_owner != owner || msg.repo_name != name;
         msg.repo_owner = owner.to_string();
         msg.repo_name = name.to_string();
+        if changed {
+            // Loaded above before the repo was known: the repo's own
+            // instructions join the team-wide ones now.
+            repo_instructions =
+                load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
+            msg.team_instructions =
+                load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+        }
     } else if msg.repo_owner.is_empty() || msg.repo_name.is_empty() {
         return Err("repo_owner and repo_name are required for GitHub tickets".into());
     }
@@ -1466,34 +1493,87 @@ async fn run_passes(
         None => String::new(),
     };
 
-    // --- Pass 1: Triage ---
-    check_cancelled(state, &msg.team_id, run_id).await?;
-    update_pass(state, &msg.team_id, run_id, "triage").await?;
-    let pass_start = std::time::Instant::now();
-    let usage_before = usage.clone();
-    let triage_result = triage::run(state, msg, &github, &provider, usage).await?;
-    write_pass_trace(
-        state,
-        &msg.team_id,
-        run_id,
-        "triage",
-        pass_start,
-        &usage_before,
-        usage,
-        None,
-    )
-    .await;
-    save_checkpoint(state, &msg.team_id, run_id, "triage", "", 0, usage).await;
-    add_progress_note(
-        state,
-        &msg.team_id,
-        run_id,
-        &format!("Triaged as {} complexity", triage_result.complexity),
-    )
-    .await;
+    // --- A continuation of this same run (Lambda time limit, step budget,
+    // a transient model error) picks up this run's own triage and plan: the
+    // work on the branch was made against them. Triaging and planning again
+    // gave a different plan (memory and history read differently a few
+    // minutes later) for a branch built on the first one.
+    let same_run = msg.continuation > 0 || msg.model_retries > 0;
+    let own_plan = if same_run {
+        load_run_plan(state, msg, run_id).await
+    } else {
+        None
+    };
+    let resumed_plan = own_plan.is_some();
+
+    let mut used_mcp_ids: Vec<String> = Vec::new();
+    let (mut triage_result, own_plan) = match own_plan {
+        Some(saved) => {
+            info!(
+                run_id,
+                "Continuation: reusing this run's own triage and plan"
+            );
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                "Continued with this run's own plan",
+            )
+            .await;
+            used_mcp_ids = saved.used_mcp_ids;
+            (saved.triage, Some(saved.plan))
+        }
+        None => {
+            // --- Pass 1: Triage ---
+            check_cancelled(state, &msg.team_id, run_id).await?;
+            update_pass(state, &msg.team_id, run_id, "triage").await?;
+            let pass_start = std::time::Instant::now();
+            let usage_before = usage.clone();
+            let mut triage_result = triage::run(state, msg, &github, &provider, usage).await?;
+            write_pass_trace(
+                state,
+                &msg.team_id,
+                run_id,
+                "triage",
+                pass_start,
+                &usage_before,
+                usage,
+                None,
+            )
+            .await;
+            save_checkpoint(state, &msg.team_id, run_id, "triage", "", 0, usage).await;
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("Triaged as {} complexity", triage_result.complexity),
+            )
+            .await;
+            info!(run_id, "Triage complete");
+
+            // --- Resolve external references via MCP tools ---
+            if !mcp_plugins.is_empty() && !state.config.mcp_proxy_function_name.is_empty() {
+                let external_context =
+                    resolve::run(state, msg, &mcp_plugins, &provider, usage).await;
+                if !external_context.is_empty() {
+                    triage_result.summary.push_str(&external_context);
+                    used_mcp_ids = mcp_server_ids.clone();
+                    info!(run_id, "Resolved external references via MCP");
+                }
+            }
+
+            // Inject agent memory context into triage summary
+            if !memory_context.is_empty() {
+                triage_result.summary.push_str("\n\n");
+                triage_result.summary.push_str(&memory_context);
+                info!(run_id, "Injected agent memory context");
+            }
+            save_run_triage(state, msg, run_id, &triage_result, &used_mcp_ids).await;
+            (triage_result, None)
+        }
+    };
     // May be upgraded by the plan-size valve below — triage classifies blind.
     let mut effective_complexity = triage_result.complexity.clone();
-    info!(run_id, "Triage complete");
     update_progress_comment(
         &github,
         &msg.repo_owner,
@@ -1504,25 +1584,6 @@ async fn run_passes(
     )
     .await;
 
-    // --- Resolve external references via MCP tools ---
-    let mut triage_result = triage_result;
-    let mut used_mcp_ids: Vec<String> = Vec::new();
-    if !mcp_plugins.is_empty() && !state.config.mcp_proxy_function_name.is_empty() {
-        let external_context = resolve::run(state, msg, &mcp_plugins, &provider, usage).await;
-        if !external_context.is_empty() {
-            triage_result.summary.push_str(&external_context);
-            used_mcp_ids = mcp_server_ids.clone();
-            info!(run_id, "Resolved external references via MCP");
-        }
-    }
-
-    // Inject agent memory context into triage summary
-    if !memory_context.is_empty() {
-        triage_result.summary.push_str("\n\n");
-        triage_result.summary.push_str(&memory_context);
-        info!(run_id, "Injected agent memory context");
-    }
-
     // --- Pass 2: Plan ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "plan").await?;
@@ -1532,11 +1593,8 @@ async fn run_passes(
     // Compute context hash to detect ticket changes (body, images)
     let context_hash = plan::compute_ticket_context_hash(msg);
 
-    // The ticket's history with CoderHelm: earlier runs, how their PRs
-    // ended, lessons, what people wrote on the ticket. The planner is shown
-    // it, and the plan is held to it below.
-    let mut history = ticket_history::load(state, &msg.team_id, &msg.ticket_id, run_id).await;
-    ticket_history::add_pr_comments(&mut history, &github).await;
+    // The ticket's history (read before the repo was chosen) goes to the
+    // planner.
     if !history.is_empty() {
         msg.ticket_history_note = Some(history.planner_note());
         info!(
@@ -1558,17 +1616,26 @@ async fn run_passes(
     );
     msg.plan_cache_key = Some(plan_key.clone());
 
-    // Try to reuse existing plan from S3 (same ticket, repo, and content)
-    let lookup = load_existing_plan(
-        state,
-        &msg.team_id,
-        &msg.ticket_id,
-        &msg.repo_owner,
-        &msg.repo_name,
-        &context_hash,
-        &plan_key,
-    )
-    .await;
+    // Try to reuse existing plan from S3 (same ticket, repo, and content).
+    // A continuation already has its own plan and never looks it up by key.
+    let lookup = if resumed_plan {
+        PlanLookup {
+            plan: None,
+            hash_changed: false,
+            previous_ticket_text: None,
+        }
+    } else {
+        load_existing_plan(
+            state,
+            &msg.team_id,
+            &msg.ticket_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &context_hash,
+            &plan_key,
+        )
+        .await
+    };
     // The ticket changed ONLY when a stored hash exists and differs. A missing
     // plan (first run) or a finished plan (no unchecked tasks) is not a ticket
     // change; treating it as one sent untouched re-runs down the "ticket
@@ -1576,13 +1643,18 @@ async fn run_passes(
     let context_changed = lookup.hash_changed;
     let previous_ticket_text = lookup.previous_ticket_text;
     let mut plan_was_reused = false;
-    let mut plan_result = if let Some(plan) = lookup.plan {
+    let mut plan_result = if let Some(plan) = own_plan {
+        plan_was_reused = true;
+        plan
+    } else if let Some(plan) = lookup.plan {
         // Reuse if plan has content AND has unchecked tasks (not a completed plan from a previous run)
         let has_unchecked = plan.tasks.contains("- [ ]");
         if !plan.tasks.is_empty() && !plan.design.is_empty() && has_unchecked {
             plan_was_reused = true;
             info!(run_id, "Reusing existing plan from S3 — ticket unchanged");
             add_progress_note(state, &msg.team_id, run_id, "Reused existing plan").await;
+            // A continuation of this run picks this plan up as its own.
+            plan::mark_plan_run(state, msg, run_id).await;
             plan
         } else {
             plan::run(
@@ -1610,19 +1682,24 @@ async fn run_passes(
         )
         .await?
     };
-    write_pass_trace(
-        state,
-        &msg.team_id,
-        run_id,
-        "plan",
-        pass_start,
-        &usage_before,
-        usage,
-        None,
-    )
-    .await;
-    save_checkpoint(state, &msg.team_id, run_id, "plan", "", 0, usage).await;
-    add_progress_note(state, &msg.team_id, run_id, "Plan generated").await;
+    if !resumed_plan {
+        write_pass_trace(
+            state,
+            &msg.team_id,
+            run_id,
+            "plan",
+            pass_start,
+            &usage_before,
+            usage,
+            None,
+        )
+        .await;
+        // A continuation keeps the checkpoint it resumed from (its branch):
+        // overwriting it with "plan" would strand the work if it timed out
+        // again before implement saved a new one.
+        save_checkpoint(state, &msg.team_id, run_id, "plan", "", 0, usage).await;
+        add_progress_note(state, &msg.team_id, run_id, "Plan generated").await;
+    }
     info!(run_id, "Plan complete");
     update_progress_comment(
         &github,
@@ -1639,8 +1716,9 @@ async fn run_passes(
     // one) is planned again in the right repo before its decision counts or
     // a branch is made; a plan naming files that don't exist is planned
     // again once, and never implemented while they still don't.
+    // A continuation's plan passed this check when the run first made it.
     let mut early_validation: Option<PlanValidation> = None;
-    if !plan_result.tasks.trim().is_empty() {
+    if !resumed_plan && !plan_result.tasks.trim().is_empty() {
         let team_repos = plan::fetch_team_repos(state, &msg.team_id).await;
         let mut v = validate_plan(
             &plan_result,
@@ -1658,6 +1736,10 @@ async fn run_passes(
         if let Some(better_repo) = v.switch_repo.take() {
             if switch_run_repo(state, msg, run_id, &github, &better_repo, &v.switch_reason).await {
                 plan_was_reused = false;
+                // The repo the run uses now is the one CoderHelm picked; a
+                // note naming the repo it left would point people at the
+                // wrong place.
+                auto_pick = Some(repo_pick::switched_pick(&better_repo, &v.switch_reason));
                 // The new repo's own instructions and memory (its lessons)
                 // go into the plan made there.
                 repo_instructions =
@@ -2819,6 +2901,7 @@ async fn run_passes(
                     "tasks.md",
                     "spec.md",
                     "context_hash.txt",
+                    plan::PLAN_RUN_FILE,
                 ] {
                     let _ = state
                         .s3
@@ -5380,6 +5463,42 @@ async fn open_pr_for_ticket(
     })
 }
 
+/// The repo a Jira ticket's work already lives in, among the `enabled`
+/// repos, with why: CoderHelm's own pull request for the ticket (merged or
+/// open, from the ticket's history), else an open pull request in exactly
+/// one enabled repo that names the ticket (a linked PR). None when neither
+/// settles it; the usual pick runs then.
+async fn repo_of_ticket_pr(
+    history: &ticket_history::TicketHistory,
+    enabled: &[String],
+    github: &GitHubClient,
+    ticket_id: &str,
+) -> Option<(String, String)> {
+    if let Some((repo, pr, state)) = repo_pick::repo_of_own_pr(&history.runs, enabled) {
+        return Some((repo, repo_pick::ticket_pr_why(pr, state, true)));
+    }
+    // Bounded like the picker's code search: one list call per repo.
+    if ticket_id.is_empty() || enabled.len() > 10 {
+        return None;
+    }
+    let mut found: Vec<(String, u64)> = Vec::new();
+    for r in enabled {
+        let Some((owner, name)) = r.split_once('/') else {
+            continue;
+        };
+        if let Some((number, _, _)) = open_pr_for_ticket(github, owner, name, ticket_id, "").await {
+            found.push((r.clone(), number));
+        }
+    }
+    match found.as_slice() {
+        [(repo, number)] => Some((
+            repo.clone(),
+            repo_pick::ticket_pr_why(*number, "open", false),
+        )),
+        _ => None,
+    }
+}
+
 /// Stops a run because a pull request for its ticket is already open: says
 /// so on the ticket and the run, and waits for a person to say what to do.
 #[allow(clippy::too_many_arguments)]
@@ -6975,52 +7094,102 @@ pub(crate) async fn write_pass_trace(
         .cloned()
         .collect();
     let now = chrono::Utc::now().to_rfc3339();
-    let sk = format!("RUN#{run_id}#PASS#{pass_name}");
 
-    let mut req = state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.traces_table_name)
-        .item("team_id", AttributeValue::S(team_id.to_string()))
-        .item("sk", AttributeValue::S(sk))
-        .item("pass", AttributeValue::S(pass_name.to_string()))
-        .item("duration_ms", attr_n(duration_ms))
-        .item("input_tokens", attr_n(input_tokens))
-        .item("output_tokens", attr_n(output_tokens))
-        .item("cache_read_tokens", attr_n(cache_read))
-        .item("cache_write_tokens", attr_n(cache_write))
-        .item(
-            "cost_usd",
-            attr_n(format!(
-                "{:.6}",
-                (usage_after.cost_usd - usage_before.cost_usd).max(0.0)
-            )),
-        )
-        .item("tool_calls", attr_n(tool_calls))
-        .item("timestamp", AttributeValue::S(now))
-        .item(
-            "ttl",
-            attr_n(chrono::Utc::now().timestamp() as u64 + 30 * 86400),
-        );
+    // A pass that runs again in the same run (a second plan or implement,
+    // a continuation's) gets its own record, numbered like the CI fix
+    // passes ("plan:2"), instead of overwriting the first one.
+    for repeat in 1..=MAX_TRACE_REPEATS {
+        let pass = trace_pass_name(pass_name, repeat);
+        let sk = format!("RUN#{run_id}#PASS#{pass}");
+        let mut req = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.traces_table_name)
+            .condition_expression("attribute_not_exists(sk)")
+            .item("team_id", AttributeValue::S(team_id.to_string()))
+            .item("sk", AttributeValue::S(sk))
+            .item("pass", AttributeValue::S(pass))
+            .item("duration_ms", attr_n(duration_ms))
+            .item("input_tokens", attr_n(input_tokens))
+            .item("output_tokens", attr_n(output_tokens))
+            .item("cache_read_tokens", attr_n(cache_read))
+            .item("cache_write_tokens", attr_n(cache_write))
+            .item(
+                "cost_usd",
+                attr_n(format!(
+                    "{:.6}",
+                    (usage_after.cost_usd - usage_before.cost_usd).max(0.0)
+                )),
+            )
+            .item("tool_calls", attr_n(tool_calls))
+            .item("timestamp", AttributeValue::S(now.clone()))
+            .item(
+                "ttl",
+                attr_n(chrono::Utc::now().timestamp() as u64 + 30 * 86400),
+            );
 
-    if !tool_names.is_empty() {
-        req = req.item(
-            "tool_names",
-            AttributeValue::L(
-                tool_names
-                    .iter()
-                    .map(|s| AttributeValue::S(s.clone()))
-                    .collect(),
-            ),
-        );
+        if !tool_names.is_empty() {
+            req = req.item(
+                "tool_names",
+                AttributeValue::L(
+                    tool_names
+                        .iter()
+                        .map(|s| AttributeValue::S(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+
+        if let Some(err) = error {
+            req = req.item("error", AttributeValue::S(err.to_string()));
+        }
+
+        match req.send().await {
+            Ok(_) => return,
+            Err(e) => {
+                let taken = e
+                    .as_service_error()
+                    .map(|se| se.is_conditional_check_failed_exception())
+                    .unwrap_or(false);
+                if !taken {
+                    warn!(error = %e, "Failed to write pass trace for {pass_name}");
+                    return;
+                }
+            }
+        }
     }
+    warn!(
+        run_id,
+        "Pass {pass_name} ran more than {MAX_TRACE_REPEATS} times — later traces not kept"
+    );
+}
 
-    if let Some(err) = error {
-        req = req.item("error", AttributeValue::S(err.to_string()));
+/// How many records one pass name may have in one run.
+const MAX_TRACE_REPEATS: u32 = 50;
+
+/// The trace name of a pass's `repeat`-th run in a run: the first keeps its
+/// name, later ones are numbered ("plan:2"), as CI fix passes are. A name
+/// that already carries a number ("ci_fix:3") is numbered again only if it
+/// repeats.
+fn trace_pass_name(pass_name: &str, repeat: u32) -> String {
+    if repeat <= 1 {
+        pass_name.to_string()
+    } else {
+        format!("{pass_name}:{repeat}")
     }
+}
 
-    if let Err(e) = req.send().await {
-        warn!(error = %e, "Failed to write pass trace for {pass_name}");
+#[cfg(test)]
+mod trace_name_tests {
+    use super::trace_pass_name;
+
+    #[test]
+    fn a_repeated_pass_gets_its_own_numbered_trace() {
+        assert_eq!(trace_pass_name("plan", 1), "plan");
+        assert_eq!(trace_pass_name("plan", 2), "plan:2");
+        assert_eq!(trace_pass_name("implement", 3), "implement:3");
+        // Readers group by the name before ':' (analytics, the run page).
+        assert_eq!(trace_pass_name("plan", 2).split(':').next(), Some("plan"));
     }
 }
 
@@ -7493,6 +7662,87 @@ async fn load_existing_plan(
         hash_changed: false,
         previous_ticket_text: None,
     }
+}
+
+/// One run's triage, kept so a continuation of the run carries on with it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RunTriage {
+    triage: triage::TriageResult,
+    #[serde(default)]
+    used_mcp_ids: Vec<String>,
+}
+
+/// A run's own triage and plan, for its continuation.
+struct OwnPlan {
+    triage: triage::TriageResult,
+    used_mcp_ids: Vec<String>,
+    plan: plan::PlanResult,
+}
+
+/// Where a run's triage is kept: per run, so another run of the ticket
+/// never reads it.
+fn run_triage_key(team_id: &str, ticket_id: &str, run_id: &str) -> String {
+    format!(
+        "teams/{team_id}/runs/{}/run_state/{run_id}/triage.json",
+        ticket_id.to_lowercase()
+    )
+}
+
+async fn save_run_triage(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    triage: &triage::TriageResult,
+    used_mcp_ids: &[String],
+) {
+    let Ok(json) = serde_json::to_string(&serde_json::json!({
+        "triage": triage,
+        "used_mcp_ids": used_mcp_ids,
+    })) else {
+        return;
+    };
+    if let Err(e) = state
+        .s3
+        .put_object()
+        .bucket(&state.config.bucket_name)
+        .key(run_triage_key(&msg.team_id, &msg.ticket_id, run_id))
+        .body(json.into_bytes().into())
+        .content_type("application/json")
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not keep the run's triage for a continuation");
+    }
+}
+
+/// This run's own triage and plan, when the cached plan files in the run's
+/// repo were written (or taken up) by this very run. None otherwise: the
+/// continuation then triages and plans as a fresh run would.
+async fn load_run_plan(state: &WorkerState, msg: &TicketMessage, run_id: &str) -> Option<OwnPlan> {
+    let saved: RunTriage = serde_json::from_str(
+        &read_s3_text(state, &run_triage_key(&msg.team_id, &msg.ticket_id, run_id)).await?,
+    )
+    .ok()?;
+    let prefix = openspec_prefix(
+        &msg.team_id,
+        &msg.ticket_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+    );
+    let owner = read_s3_text(state, &format!("{prefix}/{}", plan::PLAN_RUN_FILE)).await?;
+    if owner.trim() != run_id {
+        info!(run_id, plan_run = %owner.trim(), "Cached plan belongs to another run — planning again");
+        return None;
+    }
+    let plan = load_cached_plan_files(state, &prefix).await?;
+    if plan.tasks.trim().is_empty() {
+        return None;
+    }
+    Some(OwnPlan {
+        triage: saved.triage,
+        used_mcp_ids: saved.used_mcp_ids,
+        plan,
+    })
 }
 
 /// Puts the real ticket's context hash back on the cached plan after a

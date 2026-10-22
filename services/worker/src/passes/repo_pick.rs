@@ -74,6 +74,56 @@ pub fn no_changes_repo_note(repo: &str, why: &str) -> String {
     }
 }
 
+/// The pick after a run moved to `repo` because its plan belongs there:
+/// `(repo, why)` for [`no_changes_repo_note`]. `reason` is the repo check's
+/// own (e.g. "3 of 4 plan files exist there but not here").
+pub fn switched_pick(repo: &str, reason: &str) -> (String, String) {
+    let reason = reason.trim().trim_end_matches('.');
+    let why = if reason.is_empty() {
+        "the plan's files live there, so the run moved to it.".to_string()
+    } else {
+        format!("the plan's files live there ({reason}), so the run moved to it.")
+    };
+    (repo.to_string(), why)
+}
+
+/// Why the ticket's own pull request decided the repo, for
+/// [`no_changes_repo_note`]. `state` is "merged" or "open"; `own` is false
+/// for a pull request someone else opened that names the ticket.
+pub fn ticket_pr_why(pr_number: u64, state: &str, own: bool) -> String {
+    if own {
+        format!("CoderHelm's pull request #{pr_number} for this ticket is in it ({state}).")
+    } else {
+        format!("pull request #{pr_number}, which names this ticket, is open in it.")
+    }
+}
+
+/// The repo of the ticket's own pull request, among `enabled` repos:
+/// CoderHelm's newest pull request for the ticket that merged or is still
+/// open, as `(repo, pr_number, "merged" | "open")`. One closed without
+/// merging doesn't count (people turned that work down), nor does one in a
+/// repo that isn't turned on for runs. The repo is spelled as `enabled`
+/// spells it.
+pub fn repo_of_own_pr(
+    runs: &[crate::passes::ticket_history::PriorRun],
+    enabled: &[String],
+) -> Option<(String, u64, &'static str)> {
+    runs.iter().rev().find_map(|r| {
+        if r.pr_number == 0 || r.pr_closed_unmerged() {
+            return None;
+        }
+        let repo = enabled
+            .iter()
+            .find(|e| e.eq_ignore_ascii_case(r.repo.trim()))?;
+        let state = if r.pr_outcome == "merged" || r.status == "merged" {
+            "merged"
+        } else {
+            "open"
+        };
+        Some((repo.clone(), r.pr_number, state))
+    })
+}
+
 fn is_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
@@ -311,5 +361,81 @@ mod tests {
         assert!(n.contains("Acme/api"));
         assert!(n.contains("billing endpoint"));
         assert!(n.contains("re-run"));
+    }
+
+    fn run(
+        id: &str,
+        repo: &str,
+        pr: u64,
+        outcome: &str,
+    ) -> crate::passes::ticket_history::PriorRun {
+        crate::passes::ticket_history::PriorRun {
+            run_id: id.into(),
+            status: "completed".into(),
+            repo: repo.into(),
+            pr_number: pr,
+            pr_outcome: outcome.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Three runs on one ticket each planned in the wrong repo first while
+    /// its PR sat in another: the PR's repo is the pick.
+    #[test]
+    fn the_tickets_own_pr_decides_the_repo() {
+        let enabled = vec!["Acme/api".to_string(), "Acme/web".to_string()];
+        let runs = vec![
+            run("01A", "acme/web", 0, ""),
+            run("01B", "acme/api", 7, "merged"),
+        ];
+        assert_eq!(
+            repo_of_own_pr(&runs, &enabled),
+            Some(("Acme/api".to_string(), 7, "merged"))
+        );
+        // The newest live PR wins; an open one counts.
+        let runs = vec![
+            run("01A", "acme/api", 7, "merged"),
+            run("01B", "acme/web", 9, ""),
+        ];
+        assert_eq!(
+            repo_of_own_pr(&runs, &enabled),
+            Some(("Acme/web".to_string(), 9, "open"))
+        );
+    }
+
+    #[test]
+    fn a_closed_pr_or_a_repo_not_turned_on_decides_nothing() {
+        let enabled = vec!["Acme/api".to_string()];
+        assert_eq!(
+            repo_of_own_pr(&[run("01A", "acme/api", 7, "closed")], &enabled),
+            None
+        );
+        assert_eq!(
+            repo_of_own_pr(&[run("01A", "acme/old", 7, "merged")], &enabled),
+            None
+        );
+        assert_eq!(
+            repo_of_own_pr(&[run("01A", "acme/api", 0, "")], &enabled),
+            None
+        );
+        // A closed one doesn't hide an earlier merged one.
+        let runs = vec![
+            run("01A", "acme/api", 7, "merged"),
+            run("01B", "acme/api", 8, "closed"),
+        ];
+        assert_eq!(
+            repo_of_own_pr(&runs, &enabled),
+            Some(("Acme/api".to_string(), 7, "merged"))
+        );
+    }
+
+    #[test]
+    fn the_note_names_the_repo_the_run_moved_to() {
+        let (repo, why) = switched_pick("Acme/api", "3 of 4 plan files exist there but not here");
+        assert_eq!(repo, "Acme/api");
+        let note = no_changes_repo_note(&repo, &why);
+        assert!(note.contains("picked Acme/api"), "{note}");
+        assert!(note.contains("3 of 4 plan files"), "{note}");
+        assert!(switched_pick("Acme/api", "").1.contains("plan's files"));
     }
 }

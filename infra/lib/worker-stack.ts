@@ -250,8 +250,9 @@ export class WorkerStack extends cdk.Stack {
       enforceSSL: true,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
-      // Source tarballs are transient — expire fast as a backstop to the
-      // worker's per-build cleanup.
+      // Source tarballs are transient: the worker uploads one per commit per
+      // run and reuses it for every check of that commit; this expiry is
+      // what removes them.
       lifecycleRules: [{ expiration: cdk.Duration.days(1) }],
     });
 
