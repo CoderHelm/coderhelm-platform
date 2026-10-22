@@ -128,7 +128,7 @@ pub fn plugin_state(
 pub fn connector_state(c: Option<&Connector>) -> CardState {
     match c {
         None => cs("not_connected", "", "connect"),
-        Some(c) if c.key_sealed.is_empty() => {
+        Some(c) if c.key_sealed.is_empty() && !c.via_jira_app() => {
             cs("needs_credentials", "No key is saved.", "add_credentials")
         }
         Some(c) if c.status != "ready" => cs(
@@ -142,9 +142,14 @@ pub fn connector_state(c: Option<&Connector>) -> CardState {
         ),
         Some(c) if !c.enabled => cs(
             "connected",
-            "Connected but paused: agents don't use it.",
+            if c.via_jira_app() {
+                "Connected through the Jira app but paused: agents don't use it."
+            } else {
+                "Connected but paused: agents don't use it."
+            },
             "manage",
         ),
+        Some(c) if c.via_jira_app() => cs("connected", "Connected through the Jira app.", "manage"),
         Some(_) => cs("connected", "", "manage"),
     }
 }
@@ -335,7 +340,14 @@ pub async fn list(
             .expression_attribute_values(":p", attr_s("PLUGIN#"))
             .send(),
     );
-    let saved = saved.map_err(|e| internal("list connectors", e))?;
+    // Confluence through the team's Jira app shows as connected on its own.
+    let saved = common::live::jira_app::with_jira_app(
+        saved.map_err(|e| internal("list connectors", e))?,
+        jira_config
+            .as_ref()
+            .and_then(common::live::jira_app::JiraApp::from_item)
+            .as_ref(),
+    );
     let plugin_items: Vec<Item> = plugins
         .map(|o| o.items().to_vec())
         .map_err(|e| internal("list plugins", e.to_string()))?;
@@ -761,6 +773,26 @@ mod tests {
         c.status = "ready".into();
         c.enabled = true;
         assert_eq!(connector_state(Some(&c)), cs("connected", "", "manage"));
+    }
+
+    #[test]
+    fn confluence_through_the_jira_app_is_connected_without_a_key() {
+        let app = common::live::jira_app::JiraApp {
+            site: "https://yourcompany.atlassian.net".into(),
+            confluence_url: "https://example.invalid/x1/confluence".into(),
+            secret: "s".into(),
+        };
+        let c = app.default_confluence();
+        let st = connector_state(Some(&c));
+        assert_eq!(
+            (st.status, st.reason.as_str()),
+            ("connected", "Connected through the Jira app.")
+        );
+        let paused = Connector {
+            enabled: false,
+            ..c
+        };
+        assert!(connector_state(Some(&paused)).reason.contains("paused"));
     }
 
     #[test]

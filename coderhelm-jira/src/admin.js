@@ -1,10 +1,7 @@
-const { storage, fetch: forgeFetch } = require("@forge/api");
+const { storage } = require("@forge/api");
 const { webTrigger } = require("@forge/api");
-const api = require("@forge/api");
-const { route } = require("@forge/api");
 const Resolver = require("@forge/resolver").default;
-
-const GATEWAY_URL = "https://api.coderhelm.com";
+const { registerWithGateway } = require("./register");
 
 const resolver = new Resolver();
 
@@ -24,46 +21,8 @@ resolver.define("saveConfig", async ({ payload }) => {
   await storage.set("coderhelm-config", { teamId, forgeSecret });
 
   // Auto-register web trigger URLs with the Coderhelm gateway
-  try {
-    const listProjectsUrl = await webTrigger.getUrl("list-projects-trigger");
-    const createTicketUrl = await webTrigger.getUrl("create-ticket-trigger");
-    const addCommentUrl = await webTrigger.getUrl("add-comment-trigger");
-    const publishReleaseUrl = await webTrigger.getUrl("publish-release-trigger");
-    const getIssuesUrl = await webTrigger.getUrl("get-issues-trigger");
-
-    // Get the Jira site URL (e.g. https://mysite.atlassian.net)
-    let siteUrl = "";
-    try {
-      const siteRes = await api.asApp().requestJira(route`/rest/api/3/serverInfo`);
-      if (siteRes.ok) {
-        const siteData = await siteRes.json();
-        siteUrl = siteData.baseUrl || "";
-      }
-    } catch (e) {
-      console.log("Failed to fetch site URL:", e);
-    }
-
-    const res = await forgeFetch(`${GATEWAY_URL}/integrations/jira/forge-register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        team_id: teamId,
-        forge_secret: forgeSecret,
-        list_projects_url: listProjectsUrl,
-        create_ticket_url: createTicketUrl,
-        add_comment_url: addCommentUrl,
-        publish_release_url: publishReleaseUrl,
-        get_issues_url: getIssuesUrl,
-        site_url: siteUrl,
-      }),
-    });
-    if (!res.ok) {
-      return { success: true, urlsRegistered: false, urlError: `Gateway returned ${res.status}` };
-    }
-    return { success: true, urlsRegistered: true };
-  } catch (e) {
-    return { success: true, urlsRegistered: false, urlError: String(e) };
-  }
+  const r = await registerWithGateway({ teamId, forgeSecret });
+  return { success: true, ...r };
 });
 
 resolver.define("getWebTriggerUrls", async () => {

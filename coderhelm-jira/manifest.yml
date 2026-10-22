@@ -7,6 +7,11 @@ modules:
         - avi:jira:assigned:issue
         - avi:jira:updated:issue
         - avi:jira:commented:issue
+    - key: coderhelm-lifecycle-trigger
+      function: lifecycleHandler
+      events:
+        - avi:forge:installed:app
+        - avi:forge:upgraded:app
   webtrigger:
     - key: list-projects-trigger
       function: listProjectsHandler
@@ -20,6 +25,8 @@ modules:
       function: publishReleaseHandler
     - key: get-issues-trigger
       function: getIssuesHandler
+    - key: confluence-trigger
+      function: confluenceHandler
   jira:adminPage:
     - key: coderhelm-admin-page
       resource: adminPage
@@ -43,6 +50,10 @@ modules:
       handler: release.publishReleaseHandler
     - key: getIssuesHandler
       handler: release.getIssuesHandler
+    - key: confluenceHandler
+      handler: confluence.confluenceHandler
+    - key: lifecycleHandler
+      handler: register.lifecycleHandler
 resources:
   - key: adminPage
     path: resources/admin/build

@@ -23,9 +23,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::live::aws::{assume, AwsTarget};
 use common::live::aws_account::{self, AwsAccount};
-use common::live::confluence::Confluence;
+use common::live::confluence::{Access, Confluence};
 use common::live::connectors::{self, ConnKind, Connector, MAX_CALLS_PER_RUN, MAX_WRITES_PER_RUN};
 use common::live::http::Https;
+use common::live::jira_app;
 use common::live::newrelic::NewRelic;
 use common::live::opensearch::OpenSearch;
 use common::live::rest::Rest;
@@ -42,8 +43,11 @@ const RESULT_CHARS: usize = 12_000;
 
 struct Loaded {
     conn: Connector,
-    /// The opened key (New Relic, Confluence); empty for AWS ones.
+    /// The opened key (New Relic, Confluence); empty for AWS ones. For
+    /// Confluence through the Jira app, the app's shared secret.
     key: String,
+    /// Confluence through the Jira app: the app's Confluence trigger.
+    app_url: String,
 }
 
 /// One AWS role Coderhelm uses for the team, and what uses it.
@@ -285,7 +289,11 @@ pub fn tool_names(kind: ConnKind, conn: &Connector) -> Vec<String> {
             "newrelic_deployment_impact",
             "newrelic_golden_metrics",
         ],
-        ConnKind::Confluence => &["confluence_search", "confluence_page"],
+        ConnKind::Confluence => &[
+            "confluence_search",
+            "confluence_page",
+            "confluence_children",
+        ],
         ConnKind::OpenSearch => &[
             "opensearch_indexes",
             "opensearch_mapping",
@@ -332,8 +340,9 @@ fn describe_line(c: &Connector) -> String {
             if c.account_ids.is_empty() { String::new() } else { format!(", accounts {}", c.account_ids.join(", ")) }
         ),
         ConnKind::Confluence => format!(
-            "Confluence at {}: search and read pages{}{}",
+            "Confluence at {}{}: search and read pages, list a page's children{}{}",
             c.site,
+            if c.via_jira_app() { " (through the Jira app)" } else { "" },
             if c.spaces.is_empty() { String::new() } else { format!(" in spaces {}", c.spaces.join(", ")) },
             if c.write_enabled && !c.write_pages.is_empty() {
                 format!("; may append to pages {}", c.write_pages.join(", "))
@@ -401,8 +410,15 @@ impl OpsTools {
         let table = &state.config.settings_table_name;
         let mut loaded = Vec::new();
         let mut legacy = Vec::new();
-        match connectors::list(&state.dynamo, table, team_id).await {
-            Ok(list) => {
+        match jira_app::list_connectors(
+            &state.dynamo,
+            table,
+            &state.config.jira_config_table_name,
+            team_id,
+        )
+        .await
+        {
+            Ok((list, app)) => {
                 // REST APIs and OpenSearch are data sources now: move any
                 // still saved here, and read them only through data sources.
                 if list
@@ -424,6 +440,17 @@ impl OpsTools {
                         legacy.push(conn);
                         continue;
                     }
+                    if conn.via_jira_app() {
+                        // Confluence through the team's Jira app: no key.
+                        if let Some(a) = &app {
+                            loaded.push(Loaded {
+                                conn,
+                                key: a.secret.clone(),
+                                app_url: a.confluence_url.clone(),
+                            });
+                        }
+                        continue;
+                    }
                     let key = match secret::open(&state.kms, team_id, &conn.key_sealed).await {
                         Ok(k) => k,
                         Err(e) => {
@@ -431,7 +458,11 @@ impl OpsTools {
                             continue;
                         }
                     };
-                    loaded.push(Loaded { conn, key });
+                    loaded.push(Loaded {
+                        conn,
+                        key,
+                        app_url: String::new(),
+                    });
                 }
             }
             Err(e) => warn!(error = %e, "Could not list connections; continuing without them"),
@@ -563,6 +594,11 @@ impl OpsTools {
             out.push(tool(
                 "confluence_page",
                 "Read one Confluence page as text, by its id.",
+                json!({ "type": "object", "properties": { "page_id": { "type": "string" } }, "required": ["page_id"] }),
+            ));
+            out.push(tool(
+                "confluence_children",
+                "List the pages directly under a Confluence page (titles and ids), to find a page in a tree.",
                 json!({ "type": "object", "properties": { "page_id": { "type": "string" } }, "required": ["page_id"] }),
             ));
             if l.conn.write_enabled && !l.conn.write_pages.is_empty() {
@@ -1006,7 +1042,14 @@ impl OpsTools {
             ConnKind::Confluence => {
                 let cf = Confluence {
                     conn: &l.conn,
-                    token: &l.key,
+                    access: if l.conn.via_jira_app() {
+                        Access::JiraApp {
+                            url: &l.app_url,
+                            secret: &l.key,
+                        }
+                    } else {
+                        Access::Token(&l.key)
+                    },
                     http: &Https,
                 };
                 let a = match name {
@@ -1019,6 +1062,7 @@ impl OpsTools {
                         .await?
                     }
                     "confluence_page" => cf.page(s("page_id").unwrap_or("")).await?,
+                    "confluence_children" => cf.children(s("page_id").unwrap_or("")).await?,
                     _ => {
                         if self.writes.fetch_add(1, Ordering::SeqCst) >= MAX_WRITES_PER_RUN {
                             return Err(StepError::new(
@@ -1115,13 +1159,24 @@ fn pick_named<'a>(
     ))
 }
 
+/// The team's connections, with Confluence through its Jira app folded in.
+async fn team_connections(state: &WorkerState, team_id: &str) -> Vec<Connector> {
+    jira_app::list_connectors(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &state.config.jira_config_table_name,
+        team_id,
+    )
+    .await
+    .map(|(c, _)| c)
+    .unwrap_or_default()
+}
+
 /// The connections the team can set up in Settings → Integrations but
 /// hasn't turned on and made ready, for the skill check (`id: what it
 /// reads`).
 pub async fn connectable(state: &WorkerState, team_id: &str) -> Vec<String> {
-    let conns = connectors::list(&state.dynamo, &state.config.settings_table_name, team_id)
-        .await
-        .unwrap_or_default();
+    let conns = team_connections(state, team_id).await;
     let legacy: Vec<Connector> = conns
         .iter()
         .filter(|c| c.kind().uses_aws() && c.enabled && c.status == "ready")
@@ -1167,9 +1222,7 @@ pub async fn inventory_sources(
     team_id: &str,
 ) -> Vec<common::skill_compat::Source> {
     let table = &state.config.settings_table_name;
-    let conns = connectors::list(&state.dynamo, table, team_id)
-        .await
-        .unwrap_or_default();
+    let conns = team_connections(state, team_id).await;
     let legacy: Vec<Connector> = conns
         .iter()
         .filter(|c| c.kind().uses_aws() && c.enabled && c.status == "ready")
@@ -1273,6 +1326,7 @@ mod tests {
                 .map(|conn| Loaded {
                     conn,
                     key: "k".into(),
+                    app_url: String::new(),
                 })
                 .collect(),
             aws: AwsAbilities::default(),
@@ -1522,6 +1576,38 @@ mod tests {
     }
 
     #[test]
+    fn confluence_through_the_jira_app_counts_as_connected_for_reading() {
+        let app = jira_app::JiraApp {
+            site: "https://yourcompany.atlassian.net".into(),
+            confluence_url: "https://example.invalid/x1/confluence".into(),
+            secret: "s".into(),
+        };
+        let conns = jira_app::with_jira_app(Vec::new(), Some(&app));
+        let src = inventory_from(&conns, &AwsAbilities::default(), false);
+        assert_eq!(src.len(), 1);
+        assert_eq!(src[0].kind, "confluence");
+        assert!(src[0].tools.contains(&"confluence_page".to_string()));
+        assert!(src[0].writes.is_empty(), "reads only until writes are on");
+        assert!(
+            src[0].detail.contains("through the Jira app"),
+            "{}",
+            src[0].detail
+        );
+        let open = connectable_from(&conns, &AwsAbilities::default());
+        assert!(
+            !open.iter().any(|l| l.starts_with("confluence:")),
+            "{open:?}"
+        );
+        let names: Vec<String> = ops(conns).tools().into_iter().map(|t| t.name).collect();
+        for n in tool_names(ConnKind::Confluence, &app.default_confluence()) {
+            assert!(
+                names.contains(&n),
+                "{n} is listed for the check but not given"
+            );
+        }
+    }
+
+    #[test]
     fn tools_follow_what_is_connected() {
         let mut o = ops(vec![conn(ConnKind::NewRelic)]);
         o.aws =
@@ -1589,6 +1675,7 @@ mod named_tests {
                 ..Connector::new(kind)
             },
             key: String::new(),
+            app_url: String::new(),
         }
     }
 

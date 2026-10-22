@@ -1,7 +1,8 @@
-//! Confluence Cloud through its REST API with an Atlassian API token.
+//! Confluence Cloud through its REST API, with an Atlassian API token or
+//! through the Coderhelm app the team installed in its Jira ([`Access`]).
 //!
-//! Reads are GETs to the team's own `*.atlassian.net` site: a page by id, a
-//! search, a page's children. The one write appends to the end of a page, and
+//! Reads are GETs to the team's own `*.atlassian.net` site (or the same calls
+//! made by the Jira app): a page by id, a search, a page's children. The one write appends to the end of a page, and
 //! only when the team turned writes on AND listed that page id; it reads the
 //! page first and sends the next version, so it can never replace someone
 //! else's newer edit. Nothing can create, move or delete a page.
@@ -189,11 +190,22 @@ pub fn text_to_storage(text: &str) -> String {
     out
 }
 
+/// How Coderhelm reaches Confluence.
+#[derive(Debug, Clone, Copy)]
+pub enum Access<'a> {
+    /// The connection's email and this API token (opened), straight to the
+    /// site.
+    Token(&'a str),
+    /// The team's Coderhelm Jira app: its Confluence web trigger and the
+    /// shared secret it checks. The app makes the same calls with its own
+    /// Confluence access (see `coderhelm-jira/src/confluence.js`).
+    JiraApp { url: &'a str, secret: &'a str },
+}
+
 /// A Confluence connection for one call.
 pub struct Confluence<'a> {
     pub conn: &'a Connector,
-    /// The API token, opened.
-    pub token: &'a str,
+    pub access: Access<'a>,
     pub http: &'a dyn Transport,
 }
 
@@ -205,33 +217,118 @@ pub struct Answer {
     pub hidden: usize,
 }
 
+/// The calls Coderhelm makes. Nothing else can be sent.
+enum Op<'b> {
+    WhoAmI,
+    Page(&'b str),
+    Space(&'b str),
+    Children(&'b str),
+    Search(&'b str),
+    /// Adds `html` to the end of page `id`, which was read at `version`.
+    Append {
+        id: &'b str,
+        html: &'b str,
+        version: i64,
+        /// The page as read: its title and body (the token path sends the
+        /// whole next version; the Jira app re-reads and appends itself).
+        title: &'b Value,
+        old: &'b str,
+    },
+}
+
 impl Confluence<'_> {
-    fn auth(&self) -> String {
-        format!(
-            "Basic {}",
-            STANDARD.encode(format!("{}:{}", self.conn.email, self.token))
-        )
+    fn request(&self, op: &Op) -> Result<Request, StepError> {
+        match self.access {
+            Access::Token(token) => {
+                let site = check_site(&self.conn.site)?;
+                let (method, path, body) = match op {
+                    Op::WhoAmI => (Method::Get, "/wiki/rest/api/user/current".to_string(), None),
+                    Op::Page(id) => (
+                        Method::Get,
+                        format!("/wiki/api/v2/pages/{id}?body-format=storage"),
+                        None,
+                    ),
+                    Op::Space(id) => (Method::Get, format!("/wiki/api/v2/spaces/{id}"), None),
+                    Op::Children(id) => (
+                        Method::Get,
+                        format!("/wiki/api/v2/pages/{id}/children?limit=50"),
+                        None,
+                    ),
+                    Op::Search(cql) => (
+                        Method::Get,
+                        format!(
+                            "/wiki/rest/api/search?limit=15&cql={}",
+                            url::form_urlencoded::byte_serialize(cql.as_bytes())
+                                .collect::<String>()
+                        ),
+                        None,
+                    ),
+                    Op::Append {
+                        id,
+                        html,
+                        version,
+                        title,
+                        old,
+                    } => (
+                        Method::Put,
+                        format!("/wiki/api/v2/pages/{id}"),
+                        Some(json!({
+                            "id": id,
+                            "status": "current",
+                            "title": title,
+                            "body": { "representation": "storage", "value": format!("{old}{html}") },
+                            "version": { "number": version + 1, "message": "Added by Coderhelm" }
+                        })),
+                    ),
+                };
+                Ok(Request {
+                    method,
+                    url: format!("{site}{path}"),
+                    headers: vec![
+                        (
+                            "Authorization".to_string(),
+                            format!(
+                                "Basic {}",
+                                STANDARD.encode(format!("{}:{token}", self.conn.email))
+                            ),
+                        ),
+                        ("Accept".to_string(), "application/json".to_string()),
+                    ],
+                    body,
+                })
+            }
+            Access::JiraApp { url, secret } => {
+                if !url.starts_with("https://") {
+                    return Err(StepError::new(
+                        "reach",
+                        "The Coderhelm app in Jira hasn't shared its Confluence address.",
+                        "Update the app in Jira, then open Coderhelm Settings there and save.",
+                    ));
+                }
+                let mut body = match op {
+                    Op::WhoAmI => json!({ "op": "whoami" }),
+                    Op::Page(id) => json!({ "op": "page", "id": id }),
+                    Op::Space(id) => json!({ "op": "space", "id": id }),
+                    Op::Children(id) => json!({ "op": "children", "id": id }),
+                    Op::Search(cql) => json!({ "op": "search", "cql": cql }),
+                    Op::Append {
+                        id, html, version, ..
+                    } => json!({ "op": "append", "id": id, "html": html, "version": version }),
+                };
+                body["forge_secret"] = json!(secret);
+                Ok(Request {
+                    method: Method::Post,
+                    url: url.to_string(),
+                    headers: vec![("Accept".to_string(), "application/json".to_string())],
+                    body: Some(body),
+                })
+            }
+        }
     }
 
-    async fn call(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<Value, StepError> {
-        let site = check_site(&self.conn.site)?;
-        let reply = self
-            .http
-            .send(Request {
-                method,
-                url: format!("{site}{path}"),
-                headers: vec![
-                    ("Authorization".to_string(), self.auth()),
-                    ("Accept".to_string(), "application/json".to_string()),
-                ],
-                body,
-            })
-            .await?;
+    async fn call(&self, op: Op<'_>) -> Result<Value, StepError> {
+        let app = matches!(self.access, Access::JiraApp { .. });
+        let reply = self.http.send(self.request(&op)?).await?;
         match reply.status {
             200..=299 => reply.json().ok_or_else(|| {
                 StepError::new(
@@ -240,10 +337,20 @@ impl Confluence<'_> {
                     "Try again.",
                 )
             }),
+            401 if app => Err(StepError::new(
+                "sign_in",
+                "The Coderhelm app in Jira didn't accept Coderhelm's secret.",
+                "Open Coderhelm Settings in Jira and save them again.",
+            )),
             401 => Err(StepError::new(
                 "sign_in",
                 "Confluence didn't accept the email and token.",
-                "Paste a new API token in Data sources.",
+                "Paste a new API token in Settings → Integrations → Confluence.",
+            )),
+            403 if app => Err(StepError::new(
+                "read",
+                "The Coderhelm app can't see this in Confluence.",
+                "Give the app access to the space (space permissions), or use a page it can see.",
             )),
             403 => Err(StepError::new(
                 "read",
@@ -273,25 +380,13 @@ impl Confluence<'_> {
         if !space_id.chars().all(|c| c.is_ascii_digit()) || space_id.is_empty() {
             return Ok(String::new());
         }
-        let v = self
-            .call(
-                Method::Get,
-                &format!("/wiki/api/v2/spaces/{space_id}"),
-                None,
-            )
-            .await?;
+        let v = self.call(Op::Space(space_id)).await?;
         Ok(v["key"].as_str().unwrap_or("").to_string())
     }
 
     async fn page_raw(&self, id: &str) -> Result<Value, StepError> {
         let id = check_page_id(id)?;
-        let page = self
-            .call(
-                Method::Get,
-                &format!("/wiki/api/v2/pages/{id}?body-format=storage"),
-                None,
-            )
-            .await?;
+        let page = self.call(Op::Page(id)).await?;
         if !self.conn.spaces.is_empty() {
             let key = self
                 .space_key(page["spaceId"].as_str().unwrap_or(""))
@@ -338,11 +433,7 @@ impl Confluence<'_> {
         space: Option<&str>,
     ) -> Result<Answer, StepError> {
         let cql = build_cql(query, title_only, space, &self.conn.spaces)?;
-        let path = format!(
-            "/wiki/rest/api/search?limit=15&cql={}",
-            url::form_urlencoded::byte_serialize(cql.as_bytes()).collect::<String>()
-        );
-        let v = self.call(Method::Get, &path, None).await?;
+        let v = self.call(Op::Search(&cql)).await?;
         let mut lines = Vec::new();
         for r in v["results"].as_array().cloned().unwrap_or_default() {
             let c = &r["content"];
@@ -368,6 +459,41 @@ impl Confluence<'_> {
         })
     }
 
+    /// The pages directly under page `id` (which must be in a shared space).
+    pub async fn children(&self, id: &str) -> Result<Answer, StepError> {
+        let id = check_page_id(id)?;
+        let parent = self.page_raw(id).await?;
+        let v = self.call(Op::Children(id)).await?;
+        let lines: Vec<String> = v["results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|p| {
+                format!(
+                    "- {} (page {})",
+                    p["title"].as_str().unwrap_or(""),
+                    p["id"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        let text = format!(
+            "Pages under {} (page {id}):\n{}",
+            parent["title"].as_str().unwrap_or(""),
+            if lines.is_empty() {
+                "none".to_string()
+            } else {
+                lines.join("\n")
+            }
+        );
+        let (text, hidden) = redact_text(&text);
+        Ok(Answer {
+            asked: format!("list pages under page {id}"),
+            text,
+            hidden,
+        })
+    }
+
     /// Adds `text` to the end of page `id`. Refused unless the team turned
     /// writes on and listed this page. Returns the new version number.
     pub async fn append(&self, id: &str, text: &str) -> Result<Answer, StepError> {
@@ -375,7 +501,7 @@ impl Confluence<'_> {
         if !self.conn.may_write_page(id) {
             return Err(refused(
                 format!("Coderhelm may not write to page {id}."),
-                "An admin can allow it in Data sources → Confluence (writes on, and the page on the list). Put the text in your reply for a person to add.",
+                "An admin can allow it in Settings → Integrations → Confluence (writes on, and the page on the list). Put the text in your reply for a person to add.",
             ));
         }
         let text = text.trim();
@@ -388,16 +514,15 @@ impl Confluence<'_> {
         let (clean, hidden) = redact_text(text);
         let page = self.page_raw(id).await?;
         let version = page["version"]["number"].as_i64().unwrap_or(0);
-        let old = page["body"]["storage"]["value"].as_str().unwrap_or("");
-        let body = json!({
-            "id": id,
-            "status": "current",
-            "title": page["title"],
-            "body": { "representation": "storage", "value": format!("{old}{}", text_to_storage(&clean)) },
-            "version": { "number": version + 1, "message": "Added by Coderhelm" }
-        });
-        self.call(Method::Put, &format!("/wiki/api/v2/pages/{id}"), Some(body))
-            .await?;
+        let html = text_to_storage(&clean);
+        self.call(Op::Append {
+            id,
+            html: &html,
+            version,
+            title: &page["title"],
+            old: page["body"]["storage"]["value"].as_str().unwrap_or(""),
+        })
+        .await?;
         Ok(Answer {
             asked: format!("append {} characters to page {id}", clean.len()),
             text: format!("Added to page {id} (now version {}).", version + 1),
@@ -407,9 +532,7 @@ impl Confluence<'_> {
 
     /// Checks the email and token: who they sign in as.
     pub async fn whoami(&self) -> Result<String, StepError> {
-        let v = self
-            .call(Method::Get, "/wiki/rest/api/user/current", None)
-            .await?;
+        let v = self.call(Op::WhoAmI).await?;
         Ok(v["displayName"]
             .as_str()
             .or(v["publicName"].as_str())
@@ -484,7 +607,7 @@ mod tests {
         let c = conn();
         let a = Confluence {
             conn: &c,
-            token: "t",
+            access: Access::Token("t"),
             http: &http,
         }
         .page("42")
@@ -518,7 +641,7 @@ mod tests {
         c.spaces = vec!["ENG".into()];
         let e = Confluence {
             conn: &c,
-            token: "t",
+            access: Access::Token("t"),
             http: &http,
         }
         .page("42")
@@ -533,7 +656,7 @@ mod tests {
         let c = conn();
         let a = Confluence {
             conn: &c,
-            token: "t",
+            access: Access::Token("t"),
             http: &http,
         }
         .append(
@@ -567,7 +690,7 @@ mod tests {
         let c = conn();
         let cf = Confluence {
             conn: &c,
-            token: "t",
+            access: Access::Token("t"),
             http: &http,
         };
         assert!(cf.append("43", "x").await.unwrap_err().is_refusal());
@@ -575,14 +698,14 @@ mod tests {
         off.write_enabled = false;
         let cf = Confluence {
             conn: &off,
-            token: "t",
+            access: Access::Token("t"),
             http: &http,
         };
         assert!(cf.append("42", "x").await.unwrap_err().is_refusal());
         let c = conn();
         let cf = Confluence {
             conn: &c,
-            token: "t",
+            access: Access::Token("t"),
             http: &http,
         };
         assert!(cf.append("42", "").await.unwrap_err().is_refusal());
@@ -603,7 +726,7 @@ mod tests {
         let c = conn();
         let a = Confluence {
             conn: &c,
-            token: "t",
+            access: Access::Token("t"),
             http: &http,
         }
         .search("lessons", true, None)
@@ -615,5 +738,150 @@ mod tests {
         assert!(sent[0]
             .url
             .contains("/wiki/rest/api/search?limit=15&cql=type+%3D+page"));
+    }
+
+    const APP_URL: &str = "https://example.invalid/x1/confluence";
+
+    fn app_conn() -> Connector {
+        Connector {
+            via: crate::live::connectors::VIA_JIRA_APP.into(),
+            email: String::new(),
+            ..conn()
+        }
+    }
+
+    fn app<'a>(c: &'a Connector, http: &'a Fake) -> Confluence<'a> {
+        Confluence {
+            conn: c,
+            access: Access::JiraApp {
+                url: APP_URL,
+                secret: "s3cret",
+            },
+            http,
+        }
+    }
+
+    #[tokio::test]
+    async fn through_the_jira_app_a_read_is_one_call_to_its_trigger() {
+        let http = Fake::answering(vec![(200, PAGE)]);
+        let c = app_conn();
+        let a = app(&c, &http).page("42").await.unwrap();
+        assert!(a.text.contains("# Lessons"));
+        let sent = http.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].method, Method::Post);
+        assert_eq!(sent[0].url, APP_URL);
+        assert!(
+            !sent[0].headers.iter().any(|(k, _)| k == "Authorization"),
+            "no token is sent"
+        );
+        let body = sent[0].body.as_ref().unwrap();
+        assert_eq!(body["op"], "page");
+        assert_eq!(body["id"], "42");
+        assert_eq!(body["forge_secret"], "s3cret");
+    }
+
+    #[tokio::test]
+    async fn through_the_jira_app_searches_send_the_checked_cql() {
+        let http = Fake::answering(vec![(200, r#"{"results":[]}"#)]);
+        let mut c = app_conn();
+        c.spaces = vec!["ENG".into()];
+        let a = app(&c, &http).search("deploy", false, None).await.unwrap();
+        assert_eq!(a.text, "No pages matched.");
+        let body = http.sent()[0].body.clone().unwrap();
+        assert_eq!(body["op"], "search");
+        assert_eq!(
+            body["cql"],
+            "type = page AND text ~ \"deploy\" AND space IN (\"ENG\") ORDER BY lastmodified DESC"
+        );
+        let refused = Fake::default();
+        assert!(app(&c, &refused)
+            .search("x", false, Some("HR"))
+            .await
+            .unwrap_err()
+            .is_refusal());
+        assert!(refused.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn through_the_jira_app_an_append_sends_only_the_new_text_and_the_version_read() {
+        let http = Fake::answering(vec![(200, PAGE), (200, r#"{"id":"42"}"#)]);
+        let c = app_conn();
+        let a = app(&c, &http)
+            .append("42", "## New lesson\n\nMail ops@example.com")
+            .await
+            .unwrap();
+        assert!(a.text.contains("version 4"));
+        let sent = http.sent();
+        assert_eq!(sent.len(), 2);
+        let body = sent[1].body.as_ref().unwrap();
+        assert_eq!(body["op"], "append");
+        assert_eq!(body["version"], 3, "the version that was read");
+        let html = body["html"].as_str().unwrap();
+        assert!(html.starts_with("<h3>New lesson</h3>"), "{html}");
+        assert!(!html.contains("Lessons</h1>"), "never the whole page");
+        assert!(!html.contains("ops@example.com"), "redacted");
+    }
+
+    #[tokio::test]
+    async fn through_the_jira_app_the_write_rules_are_the_same() {
+        let http = Fake::default();
+        let c = app_conn();
+        assert!(app(&c, &http)
+            .append("43", "x")
+            .await
+            .unwrap_err()
+            .is_refusal());
+        let mut off = app_conn();
+        off.write_enabled = false;
+        assert!(app(&off, &http)
+            .append("42", "x")
+            .await
+            .unwrap_err()
+            .is_refusal());
+        assert!(http.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn through_the_jira_app_a_wrong_secret_says_how_to_fix_it() {
+        let http = Fake::answering(vec![(401, r#"{"error":"forbidden"}"#)]);
+        let c = app_conn();
+        let e = app(&c, &http).whoami().await.unwrap_err();
+        assert!(e.fix.contains("Coderhelm Settings in Jira"), "{}", e.fix);
+    }
+
+    #[tokio::test]
+    async fn children_are_listed_after_the_parent_passes_the_space_check() {
+        let http = Fake::answering(vec![
+            (200, PAGE),
+            (
+                200,
+                r#"{"results":[{"id":"43","title":"Runbook"},{"id":"44","title":"Postmortems"}]}"#,
+            ),
+        ]);
+        let c = conn();
+        let a = Confluence {
+            conn: &c,
+            access: Access::Token("t"),
+            http: &http,
+        }
+        .children("42")
+        .await
+        .unwrap();
+        assert!(a.text.contains("- Runbook (page 43)"), "{}", a.text);
+        let sent = http.sent();
+        assert_eq!(
+            sent[1].url,
+            "https://example.atlassian.net/wiki/api/v2/pages/42/children?limit=50"
+        );
+        let http = Fake::answering(vec![(200, PAGE), (200, r#"{"key":"HR"}"#)]);
+        let mut c = app_conn();
+        c.spaces = vec!["ENG".into()];
+        assert!(app(&c, &http)
+            .children("42")
+            .await
+            .unwrap_err()
+            .is_refusal());
+        assert_eq!(http.sent().len(), 2, "children never asked for");
     }
 }

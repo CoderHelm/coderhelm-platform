@@ -34,6 +34,7 @@ pub mod graphql;
 pub mod hidden_suggest;
 pub mod http;
 pub mod identity;
+pub mod jira_app;
 pub mod logs;
 pub mod metrics;
 pub mod net;

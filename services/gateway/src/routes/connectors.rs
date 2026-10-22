@@ -18,9 +18,10 @@ use axum::{
     Extension, Json,
 };
 use common::live::aws::AwsTarget;
-use common::live::confluence::{check_site, Confluence};
-use common::live::connectors::{self, check_page_ids, ConnKind, Connector};
+use common::live::confluence::{check_site, Access, Confluence};
+use common::live::connectors::{self, check_page_ids, ConnKind, Connector, VIA_JIRA_APP};
 use common::live::http::Https;
+use common::live::jira_app::{self, JiraApp};
 use common::live::newrelic::NewRelic;
 use common::live::opensearch::{check_endpoint, check_index, OpenSearch};
 use common::live::rest::{check_base, check_header, check_path, Rest, MAX_PATHS};
@@ -213,12 +214,40 @@ async fn record(
     .await;
 }
 
+/// The team's Coderhelm Jira app, when it can reach Confluence.
+async fn jira_app_of(state: &AppState, team_id: &str) -> Option<JiraApp> {
+    jira_app::load(&state.dynamo, &state.config.jira_config_table_name, team_id).await
+}
+
+/// How to reach `c`'s Confluence: through the Jira app, or with `key`.
+fn confluence_access<'a>(
+    c: &Connector,
+    key: &'a str,
+    app: Option<&'a JiraApp>,
+) -> Result<Access<'a>, StepError> {
+    if !c.via_jira_app() {
+        return Ok(Access::Token(key));
+    }
+    let app = app.ok_or_else(|| {
+        StepError::new(
+            "reach",
+            "The Coderhelm app in Jira can't reach Confluence.",
+            "Update the app in Jira, then open Coderhelm Settings there and save.",
+        )
+    })?;
+    Ok(Access::JiraApp {
+        url: &app.confluence_url,
+        secret: &app.secret,
+    })
+}
+
 /// One read that shows the connection works. Returns a line for the page.
 async fn try_connection(
     state: &AppState,
     claims: &Claims,
     c: &Connector,
     key: &str,
+    app: Option<&JiraApp>,
 ) -> Result<String, StepError> {
     match c.kind() {
         ConnKind::NewRelic => {
@@ -243,12 +272,16 @@ async fn try_connection(
         ConnKind::Confluence => {
             let who = Confluence {
                 conn: c,
-                token: key,
+                access: confluence_access(c, key, app)?,
                 http: &Https,
             }
             .whoami()
             .await?;
-            Ok(format!("Signed in as {who}"))
+            if c.via_jira_app() {
+                Ok(format!("Connected through the Jira app (as {who})"))
+            } else {
+                Ok(format!("Signed in as {who}"))
+            }
         }
         ConnKind::OpenSearch => {
             let os = OpenSearch {
@@ -325,6 +358,44 @@ async fn try_connection(
     }
 }
 
+/// Whether a Confluence save goes through the team's Jira app: when the page
+/// says so (`via`), or, when it doesn't, when the saved connection already
+/// does and no key is sent, or nothing is saved, no key is sent and the app
+/// can reach Confluence. Sending a key switches to the token.
+fn via_jira_app(asked: Option<&str>, saved: &Connector, key_sent: bool, app: bool) -> bool {
+    match asked {
+        Some(v) => v == VIA_JIRA_APP,
+        None if key_sent => false,
+        None if saved.via_jira_app() => true,
+        None => app && saved.key_sealed.is_empty() && saved.site.is_empty(),
+    }
+}
+
+/// The Confluence settings both ways of connecting share: spaces agents may
+/// read, the write switch and the pages writes may touch.
+fn confluence_settings(body: &Value, c: &mut Connector) -> Result<(), (StatusCode, Json<Value>)> {
+    if let Some(sp) = strings(
+        body,
+        "spaces",
+        |s| {
+            s.len() <= 255
+                && s.chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || "~_".contains(ch))
+        },
+        "space key",
+    )? {
+        c.spaces = sp;
+    }
+    if let Some(w) = body["write_enabled"].as_bool() {
+        c.write_enabled = w;
+    }
+    if let Some(p) = strings(body, "write_pages", |_| true, "page id")? {
+        check_page_ids(&p).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+        c.write_pages = p;
+    }
+    Ok(())
+}
+
 /// GET /api/connectors — every kind, connected or not, and the team's AWS
 /// accounts the metrics and Airflow connections can use.
 pub async fn list(
@@ -332,9 +403,11 @@ pub async fn list(
     Extension(claims): Extension<Claims>,
 ) -> Reply {
     admin(&claims)?;
-    let saved = connectors::list(
+    // Confluence through the team's Jira app shows as connected on its own.
+    let (saved, _) = jira_app::list_connectors(
         &state.dynamo,
         &state.config.settings_table_name,
+        &state.config.jira_config_table_name,
         &claims.team_id,
     )
     .await
@@ -421,10 +494,25 @@ pub async fn save(
             ..Connector::new(kind)
         });
     let text = |k: &str| body[k].as_str().map(str::trim).map(str::to_string);
+    // Confluence through the team's Jira app: no key of its own.
+    let app = if kind == ConnKind::Confluence {
+        jira_app_of(&state, &claims.team_id).await
+    } else {
+        None
+    };
+    let key_sent = text("key").is_some_and(|k| !k.is_empty());
+    let via_app = kind == ConnKind::Confluence
+        && via_jira_app(body["via"].as_str(), &c, key_sent, app.is_some());
 
     // Key: replaced only when one is sent.
     let mut key = String::new();
-    if let Some(k) = text("key").filter(|k| !k.is_empty()) {
+    if via_app {
+        c.via = VIA_JIRA_APP.into();
+        c.key_sealed.clear();
+        c.key_hint.clear();
+        c.email.clear();
+    } else if let Some(k) = text("key").filter(|k| !k.is_empty()) {
+        c.via.clear();
         if k.len() > 4000 || k.chars().any(char::is_control) {
             return Err(fail(StatusCode::BAD_REQUEST, "Paste the key as one line."));
         }
@@ -490,6 +578,16 @@ pub async fn save(
                 ));
             }
         }
+        ConnKind::Confluence if via_app => {
+            let Some(a) = &app else {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "The Coderhelm app in Jira can't reach Confluence yet. Update the app in Jira, then open Coderhelm Settings there and save.",
+                ));
+            };
+            c.site = a.site.clone();
+            confluence_settings(&body, &mut c)?;
+        }
         ConnKind::Confluence => {
             if let Some(s) = text("site") {
                 c.site = check_site(&s).map_err(step)?;
@@ -503,25 +601,7 @@ pub async fn save(
                 }
                 c.email = e;
             }
-            if let Some(sp) = strings(
-                &body,
-                "spaces",
-                |s| {
-                    s.len() <= 255
-                        && s.chars()
-                            .all(|ch| ch.is_ascii_alphanumeric() || "~_".contains(ch))
-                },
-                "space key",
-            )? {
-                c.spaces = sp;
-            }
-            if let Some(w) = body["write_enabled"].as_bool() {
-                c.write_enabled = w;
-            }
-            if let Some(p) = strings(&body, "write_pages", |_| true, "page id")? {
-                check_page_ids(&p).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
-                c.write_pages = p;
-            }
+            confluence_settings(&body, &mut c)?;
             if c.site.is_empty() || c.email.is_empty() || key.is_empty() {
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
@@ -639,7 +719,7 @@ pub async fn save(
         }
     }
     let started = std::time::Instant::now();
-    let tested = try_connection(&state, &claims, &c, &key).await;
+    let tested = try_connection(&state, &claims, &c, &key, app.as_ref()).await;
     record(
         &state,
         &claims,
@@ -678,9 +758,18 @@ pub async fn test(
     admin(&claims)?;
     let (kind, name) = kind_of(&kind)?;
     let table = &state.config.settings_table_name;
-    let mut c = connectors::get(&state.dynamo, table, &claims.team_id, kind, &name)
+    let app = if kind == ConnKind::Confluence {
+        jira_app_of(&state, &claims.team_id).await
+    } else {
+        None
+    };
+    let saved = connectors::get(&state.dynamo, table, &claims.team_id, kind, &name)
         .await
-        .map_err(|e| internal("get connector", e))?
+        .map_err(|e| internal("get connector", e))?;
+    // Confluence through the Jira app is there without being saved.
+    let mut c = jira_app::with_jira_app(saved.into_iter().collect(), app.as_ref())
+        .into_iter()
+        .find(|c| c.kind() == kind && c.name == name)
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "That connection isn't set up."))?;
     let key = if c.key_sealed.is_empty() {
         String::new()
@@ -690,7 +779,7 @@ pub async fn test(
             .map_err(|e| internal("open connector key", e))?
     };
     let started = std::time::Instant::now();
-    let tested = try_connection(&state, &claims, &c, &key).await;
+    let tested = try_connection(&state, &claims, &c, &key, app.as_ref()).await;
     record(
         &state,
         &claims,
@@ -772,6 +861,44 @@ pub async fn aws_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_confluence_save_goes_through_the_jira_app_unless_a_token_is_given() {
+        let empty = Connector::new(ConnKind::Confluence);
+        let app_saved = Connector {
+            via: VIA_JIRA_APP.into(),
+            ..Connector::new(ConnKind::Confluence)
+        };
+        let token_saved = Connector {
+            key_sealed: "sealed".into(),
+            site: "https://yourcompany.atlassian.net".into(),
+            ..Connector::new(ConnKind::Confluence)
+        };
+        // The page says which.
+        assert!(via_jira_app(Some(VIA_JIRA_APP), &token_saved, false, true));
+        assert!(!via_jira_app(Some(""), &app_saved, false, true));
+        // A key always means the token.
+        assert!(!via_jira_app(None, &app_saved, true, true));
+        // Otherwise: what is saved, or the app when nothing is.
+        assert!(via_jira_app(None, &app_saved, false, false));
+        assert!(!via_jira_app(None, &token_saved, false, true));
+        assert!(via_jira_app(None, &empty, false, true));
+        assert!(!via_jira_app(None, &empty, false, false));
+    }
+
+    #[test]
+    fn confluence_settings_check_page_ids() {
+        let mut c = Connector::new(ConnKind::Confluence);
+        confluence_settings(
+            &json!({ "write_enabled": true, "write_pages": ["42"], "spaces": ["ENG"] }),
+            &mut c,
+        )
+        .unwrap();
+        assert!(c.may_write_page("42"));
+        assert_eq!(c.spaces, vec!["ENG".to_string()]);
+        assert!(confluence_settings(&json!({ "write_pages": ["abc"] }), &mut c).is_err());
+        assert!(confluence_settings(&json!({ "spaces": ["bad space"] }), &mut c).is_err());
+    }
 
     #[test]
     fn the_update_link_opens_the_add_on_stack_for_the_existing_role() {

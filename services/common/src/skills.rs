@@ -425,6 +425,7 @@ pub const AGENT_READ_TOOLS: &[&str] = &[
     "newrelic_golden_metrics",
     "confluence_search",
     "confluence_page",
+    "confluence_children",
     "opensearch_indexes",
     "opensearch_mapping",
     "opensearch_search",
@@ -495,8 +496,22 @@ const AGENT_MCP_MAP: &[(&str, &[&str])] = &[
             "newrelic_golden_metrics",
         ],
     ),
-    ("confluence", &["confluence_search", "confluence_page"]),
-    ("atlassian", &["confluence_search", "confluence_page"]),
+    (
+        "confluence",
+        &[
+            "confluence_search",
+            "confluence_page",
+            "confluence_children",
+        ],
+    ),
+    (
+        "atlassian",
+        &[
+            "confluence_search",
+            "confluence_page",
+            "confluence_children",
+        ],
+    ),
     (
         "opensearch",
         &[
