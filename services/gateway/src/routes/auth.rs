@@ -307,6 +307,29 @@ pub async fn verify_email(
 
     let cognito_sub = user_result.username();
 
+    // Someone invited (or already on a team) lands there at first sign-in:
+    // no personal team for them. A failed lookup falls back to making one, as
+    // before.
+    let records = state
+        .dynamo
+        .query()
+        .table_name(&state.config.users_table_name)
+        .index_name("gsi2")
+        .key_condition_expression("gsi2pk = :pk")
+        .expression_attribute_values(":pk", attr_s(&format!("EMAIL#{}", normalize_email(&email))))
+        .send()
+        .await
+        .map(|r| r.items().to_vec())
+        .unwrap_or_default();
+    if !needs_personal_team(&records, chrono::Utc::now()) {
+        info!(email = %email, "Email verified; invited or already on a team, so no personal team");
+        send_welcome_email(&state, &email).await;
+        return Ok(Json(serde_json::json!({
+            "status": "verified",
+            "message": "Email verified. You can now log in."
+        })));
+    }
+
     // Create a personal team for the new user
     let team_id = format!("TEAM#{cognito_sub}");
     let user_id = format!("USER#{cognito_sub}");
@@ -724,9 +747,15 @@ pub async fn google_callback(
         return Ok(Redirect::temporary(&redirect).into_response());
     }
 
+    // Accept pending invites first: Google sign-ins never accepted them, so an
+    // invited teammate got a personal team and the invite stayed pending.
+    let accepted =
+        accept_pending_invites(&state, &existing, &format!("USER#{cognito_sub}"), &email).await;
+    let pool = landing_records(&existing, accepted);
+
     // Prefer a real team the user joined over their personal team (dropped the
     // .limit(1) above so all memberships are visible to the picker).
-    let selected = select_session_team(&existing, cognito_sub);
+    let selected = select_session_team(&pool, cognito_sub);
     let (team_id, user_id, role) = if let Some(item) = selected {
         let tid = item
             .get("pk")
@@ -1552,10 +1581,17 @@ async fn issue_session_from_cognito(
 
     let items = existing.items().to_vec();
 
+    // Accept pending invites FIRST, so a teammate's first sign-in lands on the
+    // team that invited them instead of minting a personal team that then
+    // lingers, empty, in the admin overview.
+    let accepted =
+        accept_pending_invites(state, &items, &format!("USER#{cognito_sub}"), email).await;
+    let pool = landing_records(&items, accepted);
+
     // Prefer a real team the user was added to over their auto-created personal
     // team (see select_session_team) — else an invited teammate lands on their
     // empty personal team and gets prompted for an Anthropic key.
-    let active_item = select_session_team(&items, cognito_sub);
+    let active_item = select_session_team(&pool, cognito_sub);
 
     let (team_id, user_id, role, github_login) = if let Some(item) = active_item {
         let tid = item
@@ -1630,79 +1666,6 @@ async fn issue_session_from_cognito(
         (tid, uid, "owner".to_string(), None)
     };
 
-    // Process any pending invites — create real user records in the inviting teams
-    let real_user_id = format!("USER#{cognito_sub}");
-    let now = chrono::Utc::now().to_rfc3339();
-    for item in &items {
-        let is_invite = item
-            .get("status")
-            .and_then(|v| v.as_s().ok())
-            .map(|s| s == "invited")
-            .unwrap_or(false);
-        if !is_invite {
-            continue;
-        }
-        let invite_tid = match item.get("pk").and_then(|v| v.as_s().ok()) {
-            Some(t) => t.to_string(),
-            None => continue,
-        };
-        // An expired invite is not accepted. It stays on the team page, marked
-        // expired, until an admin resends (renews) or revokes it.
-        if crate::routes::users::invite_expired(item, chrono::Utc::now()) {
-            info!(team_id = %invite_tid, "Skipped an expired invite on login");
-            continue;
-        }
-        let invite_role = item
-            .get("role")
-            .and_then(|v| v.as_s().ok())
-            .cloned()
-            .unwrap_or_else(|| "member".to_string());
-
-        // Create a real user record in the inviting team
-        let _ = state
-            .dynamo
-            .put_item()
-            .table_name(&state.config.users_table_name)
-            .item("pk", attr_s(&invite_tid))
-            .item("sk", attr_s(&real_user_id))
-            .item("email", attr_s(email))
-            .item("role", attr_s(&invite_role))
-            .item("avatar_url", attr_s(""))
-            .item("updated_at", attr_s(&now))
-            .item(
-                "gsi2pk",
-                attr_s(&format!("EMAIL#{}", normalize_email(email))),
-            )
-            .item("gsi2sk", attr_s(&invite_tid))
-            .item("status", attr_s("active"))
-            .item(
-                "invited_by",
-                attr_s(
-                    item.get("invited_by")
-                        .and_then(|v| v.as_s().ok())
-                        .map_or("", |v| v),
-                ),
-            )
-            // Already a member of that team (e.g. linked to GitHub): keep their
-            // record as it is and just drop the invite.
-            .condition_expression("attribute_not_exists(pk)")
-            .send()
-            .await;
-
-        // Delete the invite record
-        if let Some(invite_sk) = item.get("sk").and_then(|v| v.as_s().ok()) {
-            let _ = state
-                .dynamo
-                .delete_item()
-                .table_name(&state.config.users_table_name)
-                .key("pk", attr_s(&invite_tid))
-                .key("sk", attr_s(invite_sk))
-                .send()
-                .await;
-            info!(email = %email, team_id = %invite_tid, role = %invite_role, "Processed pending invite on login");
-        }
-    }
-
     touch_last_login(state, &team_id, &user_id).await;
 
     let token = jwt::create_token(
@@ -1728,6 +1691,133 @@ async fn issue_session_from_cognito(
         })),
     )
         .into_response())
+}
+
+/// Accept every live invite among `items` (the person's records by email):
+/// a member record in each inviting team, and the invite removed. Returns the
+/// member records it made, so the sign-in can land on one of them. An expired
+/// invite is skipped and stays on the team page, marked expired.
+async fn accept_pending_invites(
+    state: &AppState,
+    items: &[HashMap<String, AttributeValue>],
+    real_user_id: &str,
+    email: &str,
+) -> Vec<HashMap<String, AttributeValue>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut accepted = Vec::new();
+    for item in items {
+        let is_invite = item
+            .get("status")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s == "invited")
+            .unwrap_or(false);
+        if !is_invite {
+            continue;
+        }
+        let invite_tid = match item.get("pk").and_then(|v| v.as_s().ok()) {
+            Some(t) => t.to_string(),
+            None => continue,
+        };
+        if crate::routes::users::invite_expired(item, chrono::Utc::now()) {
+            info!(team_id = %invite_tid, "Skipped an expired invite on login");
+            continue;
+        }
+        let invite_role = item
+            .get("role")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_else(|| "member".to_string());
+        let record = HashMap::from([
+            ("pk".to_string(), attr_s(&invite_tid)),
+            ("sk".to_string(), attr_s(real_user_id)),
+            ("email".to_string(), attr_s(email)),
+            ("role".to_string(), attr_s(&invite_role)),
+            ("avatar_url".to_string(), attr_s("")),
+            ("updated_at".to_string(), attr_s(&now)),
+            (
+                "gsi2pk".to_string(),
+                attr_s(&format!("EMAIL#{}", normalize_email(email))),
+            ),
+            ("gsi2sk".to_string(), attr_s(&invite_tid)),
+            ("status".to_string(), attr_s("active")),
+            (
+                "invited_by".to_string(),
+                attr_s(
+                    item.get("invited_by")
+                        .and_then(|v| v.as_s().ok())
+                        .map_or("", |v| v),
+                ),
+            ),
+        ]);
+        // Already a member of that team (e.g. linked to GitHub): keep their
+        // record as it is and just drop the invite.
+        let created = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.users_table_name)
+            .set_item(Some(record.clone()))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await
+            .is_ok();
+
+        if let Some(invite_sk) = item.get("sk").and_then(|v| v.as_s().ok()) {
+            let _ = state
+                .dynamo
+                .delete_item()
+                .table_name(&state.config.users_table_name)
+                .key("pk", attr_s(&invite_tid))
+                .key("sk", attr_s(invite_sk))
+                .send()
+                .await;
+            info!(email = %email, team_id = %invite_tid, role = %invite_role, "Processed pending invite on login");
+        }
+        if created {
+            accepted.push(record);
+        }
+    }
+    accepted
+}
+
+/// The records a sign-in may land on: the person's memberships (never a bare
+/// invite) plus the ones just made from accepted invites.
+fn landing_records(
+    items: &[HashMap<String, AttributeValue>],
+    accepted: Vec<HashMap<String, AttributeValue>>,
+) -> Vec<HashMap<String, AttributeValue>> {
+    items
+        .iter()
+        .filter(|i| {
+            i.get("status")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str)
+                != Some("invited")
+        })
+        .cloned()
+        .chain(accepted)
+        .collect()
+}
+
+/// Whether confirming an email sign-up should make a personal team: only when
+/// the email has no membership and no live invite. Someone invited lands on
+/// the inviting team at first sign-in; a personal team made here would sit
+/// empty forever (most of the admin overview's duplicate teams).
+fn needs_personal_team(
+    items: &[HashMap<String, AttributeValue>],
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    !items.iter().any(|i| {
+        let user = i
+            .get("sk")
+            .and_then(|v| v.as_s().ok())
+            .is_some_and(|s| s.starts_with("USER#"));
+        let invited = i
+            .get("status")
+            .and_then(|v| v.as_s().ok())
+            .map(String::as_str)
+            == Some("invited");
+        user && (!invited || !crate::routes::users::invite_expired(i, now))
+    })
 }
 
 fn extract_cookie<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
@@ -1756,6 +1846,38 @@ pub(crate) fn normalize_email(email: &str) -> String {
 pub struct WaitlistRequest {
     pub email: String,
     pub reason: Option<String>,
+    /// Where they work, if they said.
+    pub company: Option<String>,
+}
+
+/// An optional free-text field, trimmed and cut to `max` characters.
+fn short_text(v: Option<&str>, max: usize) -> String {
+    v.unwrap_or("").trim().chars().take(max).collect()
+}
+
+/// The waitlist record for one sign-up: keyed by the normalised email, with
+/// what they typed, when, and the optional company and message.
+fn waitlist_item(
+    normalized: &str,
+    email: &str,
+    body: &WaitlistRequest,
+    now: &str,
+) -> HashMap<String, aws_sdk_dynamodb::types::AttributeValue> {
+    let mut item = HashMap::from([
+        ("email".to_string(), attr_s(normalized)),
+        ("original_email".to_string(), attr_s(email)),
+        ("created_at".to_string(), attr_s(now)),
+        ("status".to_string(), attr_s("new")),
+    ]);
+    for (key, value) in [
+        ("reason", short_text(body.reason.as_deref(), 500)),
+        ("company", short_text(body.company.as_deref(), 120)),
+    ] {
+        if !value.is_empty() {
+            item.insert(key.to_string(), attr_s(&value));
+        }
+    }
+    item
 }
 
 /// POST /auth/waitlist — join the closed beta waitlist.
@@ -1804,28 +1926,25 @@ pub async fn join_waitlist(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    let reason = body
-        .reason
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .take(500)
-        .collect::<String>();
-
-    let mut put = state
+    let put = state
         .dynamo
         .put_item()
         .table_name(&state.config.waitlist_table_name)
-        .item("email", attr_s(&normalized))
-        .item("original_email", attr_s(&email))
-        .item("created_at", attr_s(&now));
-
-    if !reason.is_empty() {
-        put = put.item("reason", attr_s(&reason));
-    }
+        .set_item(Some(waitlist_item(&normalized, &email, &body, &now)))
+        // Two quick submits must not reset a sign-up an admin already invited.
+        .condition_expression("attribute_not_exists(email)");
 
     put.send().await.map_err(|e| {
+        let e = aws_sdk_dynamodb::error::DisplayErrorContext(e).to_string();
+        if e.contains("ConditionalCheckFailed") {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "already_joined",
+                    "message": "You're already on the list! We'll notify you when Coderhelm opens up."
+                })),
+            );
+        }
         error!("Failed to save waitlist entry: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2126,5 +2245,121 @@ mod github_signin_update_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod first_sign_in_tests {
+    use super::*;
+
+    fn rec(
+        pk: &str,
+        sk: &str,
+        role: &str,
+        status: Option<&str>,
+        sent: Option<&str>,
+    ) -> HashMap<String, AttributeValue> {
+        let mut m = HashMap::from([
+            ("pk".to_string(), attr_s(pk)),
+            ("sk".to_string(), attr_s(sk)),
+            ("role".to_string(), attr_s(role)),
+        ]);
+        if let Some(s) = status {
+            m.insert("status".into(), attr_s(s));
+        }
+        if let Some(t) = sent {
+            m.insert("updated_at".into(), attr_s(t));
+        }
+        m
+    }
+
+    fn at(t: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(t).unwrap().into()
+    }
+
+    #[test]
+    fn an_invited_email_gets_no_personal_team() {
+        let now = at("2026-10-22T00:00:00Z");
+        // Nobody knows this email: a personal team, as always.
+        assert!(needs_personal_team(&[], now));
+        // A live invite: they land on the inviting team instead.
+        let invite = rec(
+            "TEAM#co",
+            "USER#invite_1",
+            "member",
+            Some("invited"),
+            Some("2026-10-20T00:00:00Z"),
+        );
+        assert!(!needs_personal_team(&[invite], now));
+        // Already a member somewhere (e.g. linked through GitHub).
+        let member = rec("TEAM#co", "USER#123", "member", None, None);
+        assert!(!needs_personal_team(&[member], now));
+    }
+
+    #[test]
+    fn an_expired_invite_still_gets_a_personal_team() {
+        let now = at("2026-10-22T00:00:00Z");
+        let old = rec(
+            "TEAM#co",
+            "USER#invite_1",
+            "member",
+            Some("invited"),
+            Some("2026-07-01T00:00:00Z"),
+        );
+        assert!(needs_personal_team(&[old], now));
+    }
+
+    #[test]
+    fn a_first_sign_in_lands_on_the_team_whose_invite_it_accepted() {
+        let sub = "abc";
+        let invite = rec("TEAM#co", "USER#invite_1", "member", Some("invited"), None);
+        // Before: only the invite, so nothing to land on and a personal team was made.
+        assert!(
+            select_session_team(&landing_records(std::slice::from_ref(&invite), vec![]), sub)
+                .is_none()
+        );
+        let accepted = rec("TEAM#co", "USER#abc", "member", Some("active"), None);
+        let pool = landing_records(&[invite], vec![accepted]);
+        assert_eq!(pool.len(), 1, "the invite itself is never a landing record");
+        let chosen = select_session_team(&pool, sub).unwrap();
+        assert_eq!(
+            chosen.get("pk").and_then(|v| v.as_s().ok()).unwrap(),
+            "TEAM#co"
+        );
+    }
+
+    #[test]
+    fn waitlist_records_keep_what_was_typed_and_cut_long_text() {
+        let body = WaitlistRequest {
+            email: "Dee+beta@Beta.test".into(),
+            reason: Some(format!("  {}  ", "x".repeat(600))),
+            company: Some("  Beta Co  ".into()),
+        };
+        let item = waitlist_item(
+            "dee@beta.test",
+            "dee+beta@beta.test",
+            &body,
+            "2026-10-22T00:00:00Z",
+        );
+        let s = |k: &str| {
+            item.get(k)
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(s("email"), "dee@beta.test");
+        assert_eq!(s("original_email"), "dee+beta@beta.test");
+        assert_eq!(s("company"), "Beta Co");
+        assert_eq!(s("reason").chars().count(), 500);
+        assert_eq!(s("status"), "new");
+        assert_eq!(s("created_at"), "2026-10-22T00:00:00Z");
+
+        let bare = WaitlistRequest {
+            email: "a@b.test".into(),
+            reason: None,
+            company: Some("   ".into()),
+        };
+        let item = waitlist_item("a@b.test", "a@b.test", &bare, "t");
+        assert!(!item.contains_key("reason") && !item.contains_key("company"));
     }
 }
