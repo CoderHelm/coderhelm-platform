@@ -2328,6 +2328,9 @@ pub async fn forge_register_urls(
     };
     let publish_release_url = https_or_empty("publish_release_url");
     let get_issues_url = https_or_empty("get_issues_url");
+    // Sent only when Confluence answered the app on its site; agents then
+    // read Confluence through the app (`common::live::jira_app`).
+    let confluence_trigger_url = https_or_empty(common::live::jira_app::CONFLUENCE_TRIGGER_FIELD);
 
     // Verify the team exists
     state
@@ -2391,10 +2394,11 @@ pub async fn forge_register_urls(
         .key("pk", attr_s(&team_id))
         .key("sk", attr_s("JIRA#config"))
         .update_expression(
-            "SET list_projects_url = :lpu, create_ticket_url = :ctu, add_comment_url = :acu, site_url = :su, publish_release_url = :pru, get_issues_url = :giu, updated_at = :ua",
+            "SET list_projects_url = :lpu, create_ticket_url = :ctu, add_comment_url = :acu, site_url = :su, publish_release_url = :pru, get_issues_url = :giu, confluence_trigger_url = :cfu, updated_at = :ua",
         )
         .expression_attribute_values(":pru", attr_s(publish_release_url))
         .expression_attribute_values(":giu", attr_s(get_issues_url))
+        .expression_attribute_values(":cfu", attr_s(confluence_trigger_url))
         .expression_attribute_values(":lpu", attr_s(list_projects_url))
         .expression_attribute_values(":ctu", attr_s(create_ticket_url))
         .expression_attribute_values(":acu", attr_s(add_comment_url))

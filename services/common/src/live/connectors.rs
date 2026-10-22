@@ -18,6 +18,9 @@ use serde_json::{json, Value};
 use super::aws::AwsTarget;
 
 const PREFIX: &str = "CONNECTOR#";
+/// A Confluence connection reached through the team's installed Coderhelm
+/// Jira app instead of an API token.
+pub const VIA_JIRA_APP: &str = "jira_app";
 /// Pages a Confluence write list may hold.
 pub const MAX_WRITE_PAGES: usize = 20;
 /// Lookups one agent pass may make across every connection here.
@@ -144,6 +147,10 @@ pub struct Connector {
     pub write_enabled: bool,
     /// Confluence page ids an append may touch. Nothing else is writable.
     pub write_pages: Vec<String>,
+    /// Confluence: how Coderhelm reaches it. Empty: the API token above.
+    /// [`VIA_JIRA_APP`]: through the Coderhelm app installed in the team's
+    /// Jira (no token; the site is the app's site).
+    pub via: String,
     /// Metrics and Airflow: the team's AWS role (the log reader).
     pub aws: Option<AwsTarget>,
     /// Airflow: MWAA environment names agents may read.
@@ -241,6 +248,7 @@ impl Connector {
                 AttributeValue::Bool(self.write_enabled),
             ),
             ("write_pages".to_string(), av_list(&self.write_pages)),
+            ("via".to_string(), av_s(&self.via)),
             ("environments".to_string(), av_list(&self.environments)),
             ("indexes".to_string(), av_list(&self.indexes)),
             ("hidden_fields".to_string(), av_list(&self.hidden_fields)),
@@ -280,6 +288,7 @@ impl Connector {
             spaces: strings(item, "spaces"),
             write_enabled: b(item, "write_enabled"),
             write_pages: strings(item, "write_pages"),
+            via: s(item, "via"),
             aws: serde_json::from_str(&s(item, "aws")).ok(),
             environments: strings(item, "environments"),
             indexes: strings(item, "indexes"),
@@ -320,6 +329,7 @@ impl Connector {
             "spaces": self.spaces,
             "write_enabled": self.write_enabled,
             "write_pages": self.write_pages,
+            "via": self.via,
             "environments": self.environments,
             "indexes": self.indexes,
             "hidden_fields": self.hidden_fields,
@@ -331,6 +341,11 @@ impl Connector {
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
         })
+    }
+
+    /// Reached through the team's Coderhelm Jira app, not a key of its own.
+    pub fn via_jira_app(&self) -> bool {
+        self.via == VIA_JIRA_APP
     }
 
     /// Whether work on `repo` (`owner/name`) may use it.
@@ -480,6 +495,7 @@ mod tests {
     fn a_record_survives_the_round_trip() {
         let mut c = confluence();
         c.instructions = "Pages under ENG are the runbooks.".into();
+        c.via = VIA_JIRA_APP.into();
         c.aws = Some(AwsTarget {
             role_arn: "arn:aws:iam::123456789012:role/CoderHelmLogReader".into(),
             external_id: "x".into(),

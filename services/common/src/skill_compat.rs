@@ -1010,8 +1010,11 @@ fn check_inner(q: Requirement, inv: &Inventory) -> Requirement {
         q.connect = "data_sources".into();
         q.server.clear();
         q.action = "connect".into();
+        let writes = q.status == "blocked" || q.write == "outside";
         q.fix = match (connected, q.status.as_str(), kind.uses_aws()) {
-            (true, "blocked", _) => format!(
+            // Connected (with a token or through the Jira app) but this step
+            // writes: the write switch and page list are what's missing.
+            (true, _, _) if writes => format!(
                 "Turn on {} writes and list the page in Settings → Integrations, or leave this step to a person.",
                 kind.label()
             ),
@@ -1023,6 +1026,9 @@ fn check_inner(q: Requirement, inv: &Inventory) -> Requirement {
                 "Turn on {} for your AWS account in Settings → Integrations.",
                 kind.label()
             ),
+            (false, _, false) if kind == crate::live::connectors::ConnKind::Confluence => {
+                "Connect Confluence in Settings → Integrations, or install the Coderhelm app in Jira (it reads Confluence on the same site).".into()
+            }
             (false, _, false) => format!("Connect {} in Settings → Integrations.", kind.label()),
         };
         return q;
@@ -1802,7 +1808,11 @@ mod tests {
         assert_eq!(q.connect, "data_sources");
         assert_eq!(q.connection, "confluence");
         assert_eq!(q.action, "connect");
-        assert_eq!(q.fix, "Connect Confluence in Settings → Integrations.");
+        assert!(
+            q.fix.starts_with("Connect Confluence in Settings → Integrations, or install the Coderhelm app in Jira"),
+            "{}",
+            q.fix
+        );
         assert_eq!(q.link, "/settings/integrations#integration-confluence");
         let mut connected = inv();
         connected.sources.push(Source {
@@ -1814,6 +1824,12 @@ mod tests {
         });
         let q = check(conn_req("blocked", "confluence", "outside"), &connected);
         assert!(q.fix.starts_with("Turn on Confluence writes"), "{}", q.fix);
+        // Connected (say, through the Jira app) and the step writes: point
+        // at the write switch, never at connecting Confluence.
+        let q = check(conn_req("missing", "confluence", "outside"), &connected);
+        assert!(q.fix.starts_with("Turn on Confluence writes"), "{}", q.fix);
+        let q = check(conn_req("missing", "confluence", "none"), &connected);
+        assert!(q.fix.starts_with("Confluence is connected"), "{}", q.fix);
         let q = check(conn_req("missing", "jira", "none"), &inv());
         assert_eq!(q.connection, "", "not a connection id");
         assert_eq!(q.connect, "plugins");

@@ -194,5 +194,7 @@ exports.getIssuesHandler = async (request) => {
   }
 };
 
+exports.authorized = authorized;
+exports.json = json;
 exports.upsertEntry = upsertEntry;
 exports.anchorFor = anchorFor;
