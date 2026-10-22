@@ -405,9 +405,60 @@ async fn process_jira_payload(
         ticket_key,
         Some(&context_hash),
         false,
+        super::trigger_gate::jira_reopened(payload),
     )
     .await
     {
+        super::trigger_gate::TicketGate::OpenPr(pr) => {
+            // The ticket's PR is open: the edit is feedback on it, read by
+            // the worker first (like a comment), never a second run.
+            let note = super::trigger_gate::edit_note(&pr, &title, &body_text);
+            let message = WorkerMessage::JiraComment(crate::models::JiraCommentMessage {
+                team_id: team_id.to_string(),
+                installation_id,
+                ticket_id: ticket_key.to_string(),
+                title: title.clone(),
+                run_id: pr.run_id.clone(),
+                run_status: pr.run_status.clone(),
+                pr_number: pr.pr_number,
+                repo_owner: pr.repo_owner.clone(),
+                repo_name: pr.repo_name.clone(),
+                author: sender.clone(),
+                comment: note.clone(),
+                context_hash: context_hash.clone(),
+                action: Some(Box::new(WorkerMessage::Feedback(
+                    crate::models::FeedbackMessage {
+                        team_id: team_id.to_string(),
+                        installation_id,
+                        run_id: pr.run_id.clone(),
+                        repo_owner: pr.repo_owner.clone(),
+                        repo_name: pr.repo_name.clone(),
+                        pr_number: pr.pr_number,
+                        review_id: 0,
+                        review_body: format!("Jira ticket edited by {sender}: {note}"),
+                        comments: vec![],
+                        trigger_author: String::new(),
+                    },
+                ))),
+            });
+            let result = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+            let repo_display = format!("{}/{}", pr.repo_owner, pr.repo_name);
+            log_jira_event(
+                state,
+                team_id,
+                event_type,
+                ticket_key,
+                &title,
+                if result.is_ok() {
+                    "sent_to_pr"
+                } else {
+                    "error"
+                },
+                Some(&repo_display),
+            )
+            .await;
+            return result;
+        }
         super::trigger_gate::TicketGate::SkipInFlight => {
             log_jira_event(
                 state,

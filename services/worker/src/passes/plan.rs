@@ -17,6 +17,32 @@ pub const PLANNER_VERSION: &str = "2026-10-21.data-first-regex-last";
 /// The cached plan's file holding its key.
 pub const PLAN_KEY_FILE: &str = "plan_key.txt";
 
+/// The cached plan's file naming the run that made it (or took it up): a
+/// continuation of that run reuses the plan whatever its key now says.
+pub const PLAN_RUN_FILE: &str = "plan_run.txt";
+
+/// Records `run_id` as the run whose plan the cached files are.
+pub async fn mark_plan_run(state: &WorkerState, msg: &TicketMessage, run_id: &str) {
+    let prefix = crate::passes::openspec_prefix(
+        &msg.team_id,
+        &msg.ticket_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+    );
+    if let Err(e) = state
+        .s3
+        .put_object()
+        .bucket(&state.config.bucket_name)
+        .key(format!("{prefix}/{PLAN_RUN_FILE}"))
+        .body(run_id.as_bytes().to_vec().into())
+        .content_type("text/plain")
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not record which run the plan belongs to");
+    }
+}
+
 /// The key a plan is cached under: everything that can change the plan.
 /// The ticket's content (title, body, images; a Jira comment that re-runs
 /// the ticket rides in the body), what memory recalled for it (team lessons
@@ -677,6 +703,9 @@ Then the ```fix_location.json block described above."#,
                 .await;
         }
     }
+
+    // This run's plan now: its continuation picks it up as is.
+    mark_plan_run(state, msg, run_id).await;
 
     info!("Plan openspec written to S3");
 

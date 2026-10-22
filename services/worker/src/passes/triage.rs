@@ -449,6 +449,17 @@ pub async fn select_repo(
         )
     };
 
+    // The team's own instructions often say where work goes ("booking
+    // changes go in the API"); the picker reads them like a person would.
+    let global_instructions = super::load_content(state, &msg.team_id, "INSTRUCTIONS#GLOBAL").await;
+    let mut repo_instructions: Vec<(String, String)> = Vec::new();
+    for r in repos.iter().take(25) {
+        let text =
+            super::load_content(state, &msg.team_id, &format!("INSTRUCTIONS#REPO#{r}")).await;
+        repo_instructions.push((r.clone(), text));
+    }
+    let instructions_section = team_instructions_section(&global_instructions, &repo_instructions);
+
     let global_agents = super::load_content(state, &msg.team_id, "AGENTS#GLOBAL").await;
 
     let context_section = if global_agents.is_empty() {
@@ -469,10 +480,10 @@ Description:
 {context_section}
 ## Available repositories
 {repo_list}
-{evidence_section}{roles_section}{disabled_section}
+{evidence_section}{roles_section}{instructions_section}{disabled_section}
 Think step by step:
 1. What is this ticket about, and what DOMAIN is it — web/frontend, backend/API, mobile, cms, infra, or data? (one sentence)
-2. If a repo has a ROLE matching that domain (see Repo roles), pick it — roles are authoritative and override descriptions. Otherwise weigh the CODE EVIDENCE (which repo actually contains the ticket's identifiers) ABOVE the repo descriptions.
+2. If the team's instructions say where this kind of work goes, follow them. Otherwise, if a repo has a ROLE matching that domain (see Repo roles), pick it — roles are authoritative and override descriptions. Otherwise weigh the CODE EVIDENCE (which repo actually contains the ticket's identifiers) ABOVE the repo descriptions.
 3. Why is it NOT any of the other repos?
 
 Then on the LAST line, return ONLY the repository in `owner/name` format (or `NOT_ENABLED: owner/name` when the ticket belongs in a repo that isn't turned on)."#,
@@ -595,9 +606,58 @@ fn extract_repo_choice(response: &str, repos: &[String]) -> Option<String> {
     None
 }
 
+/// The picker's section for the team's own instructions: the team-wide
+/// ones, then each candidate repo's. Empty when there are none.
+fn team_instructions_section(global: &str, per_repo: &[(String, String)]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !global.trim().is_empty() {
+        parts.push(format!(
+            "Team-wide:\n{}",
+            common::truncate_str(global.trim(), 4000)
+        ));
+    }
+    for (repo, text) in per_repo {
+        if !text.trim().is_empty() {
+            parts.push(format!(
+                "For {repo}:\n{}",
+                common::truncate_str(text.trim(), 2000)
+            ));
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n## Your team's instructions (written by people, AUTHORITATIVE on where work goes)\n{}\n\
+         When these say which repo owns this kind of work, pick that repo unless the ticket \
+         explicitly names a different one.\n",
+        parts.join("\n\n")
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_repo_choice, extract_ticket_search_terms, pick_reason};
+    use super::{
+        extract_repo_choice, extract_ticket_search_terms, pick_reason, team_instructions_section,
+    };
+
+    #[test]
+    fn the_picker_reads_the_teams_instructions() {
+        assert_eq!(
+            team_instructions_section(" ", &[("a/b".into(), "".into())]),
+            ""
+        );
+        let s = team_instructions_section(
+            "Booking changes go in acme/api.",
+            &[
+                ("acme/api".into(), "Owns bookings.".into()),
+                ("acme/web".into(), " ".into()),
+            ],
+        );
+        assert!(s.contains("Booking changes go in acme/api."), "{s}");
+        assert!(s.contains("For acme/api:\nOwns bookings."), "{s}");
+        assert!(!s.contains("acme/web"), "{s}");
+    }
 
     #[test]
     fn pick_reason_drops_the_answer_line() {
