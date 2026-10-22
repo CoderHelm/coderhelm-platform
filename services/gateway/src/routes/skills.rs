@@ -16,7 +16,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
-use common::skill_apply::AlwaysApply;
+use common::skill_apply::{AlwaysApply, ReviewSteps};
 use common::skills::{
     new_ask_id, usage_stats, valid_repo, AccessFilter, AgentAsk, Kind, SkillAskMessage, SkillStore,
     SkillSyncMessage, ACCESS_DAYS, MAX_REPOS, STAT_DAYS,
@@ -471,6 +471,56 @@ pub async fn set_always_apply(
     out["by"] = json!(claims.email);
     out["at"] = json!(chrono::Utc::now().to_rfc3339());
     Ok(Json(json!({ "ok": true, "always_apply": out })))
+}
+
+/// PUT /api/skills/reviews `{repo, path, set, steps}` — an admin's choice of
+/// the review steps a team agent runs in ("plan", "code", "prose"): `set`
+/// true keeps `steps` (empty runs it in none), false goes back to what the
+/// item's check says. Kept across syncs. Only agents review.
+pub async fn set_reviews(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Reply {
+    admin(&claims)?;
+    let repo = body["repo"].as_str().unwrap_or("");
+    let path = body["path"].as_str().unwrap_or("");
+    let Some(set) = body["set"].as_bool() else {
+        return Err(fail(StatusCode::BAD_REQUEST, "Say set: true or false."));
+    };
+    if !valid_repo(repo) || path.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "Give a repo and a path."));
+    }
+    let steps = ReviewSteps::validate(&strings(&body["steps"]))
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
+    let st = store(&state, &claims);
+    let mut m = match st
+        .item(repo, path)
+        .await
+        .map_err(|e| internal("get skill", e))?
+    {
+        None => return Err(fail(StatusCode::NOT_FOUND, "No such skill.")),
+        Some((m, _)) if m.kind != Kind::Agent => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "Only team agents run as review steps; skills and commands are read.",
+            ))
+        }
+        Some((m, _)) => m,
+    };
+    let found = st
+        .set_reviews(repo, path, set.then_some(steps.as_slice()), &claims.email)
+        .await
+        .map_err(|e| internal("set reviews", e))?;
+    if !found {
+        return Err(fail(StatusCode::NOT_FOUND, "No such skill."));
+    }
+    info!(team_id = %claims.team_id, repo, path, set, steps = ?steps, "Skill review steps set");
+    m.reviews.set = set;
+    m.reviews.steps = if set { steps } else { Vec::new() };
+    m.reviews.by = claims.email.clone();
+    m.reviews.at = chrono::Utc::now().to_rfc3339();
+    Ok(Json(json!({ "ok": true, "reviews": m.reviews.json() })))
 }
 
 /// POST /api/skills/recheck `{repo, path?}` — checks a repository's items

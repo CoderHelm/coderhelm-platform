@@ -226,6 +226,7 @@ mod tests {
                 compat: Default::default(),
                 always: Default::default(),
                 suggestion: Default::default(),
+                reviews: Default::default(),
             },
             format!("---\nname: {name}\n---\nUse the web app's components."),
         )

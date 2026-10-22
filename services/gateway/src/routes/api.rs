@@ -870,6 +870,15 @@ pub async fn get_run(
     })))
 }
 
+/// What a pass kept about what it did (e.g. which team agents reviewed a
+/// plan): its JSON, or the text as kept when it isn't JSON, or null.
+fn trace_detail(raw: Option<&String>) -> Value {
+    match raw {
+        Some(s) => serde_json::from_str(s).unwrap_or_else(|_| json!(s)),
+        None => Value::Null,
+    }
+}
+
 /// GET /api/runs/:run_id/traces — fetch per-pass trace records for a run.
 pub async fn get_run_traces(
     State(state): State<Arc<AppState>>,
@@ -907,6 +916,8 @@ pub async fn get_run_traces(
                 "cache_write_tokens": item.get("cache_write_tokens").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
                 "error": item.get("error").and_then(|v| v.as_s().ok()),
                 "timestamp": item.get("timestamp").and_then(|v| v.as_s().ok()),
+                "cost_usd": item.get("cost_usd").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<f64>().ok()),
+                "detail": trace_detail(item.get("detail").and_then(|v| v.as_s().ok())),
             })
         })
         .collect();
@@ -5050,5 +5061,21 @@ mod git_conventions_tests {
         assert!(error.contains("`{owner}` is not a token"), "{error}");
         let (field, _) = parse_git_conventions(&json!({ "branch": "fix/{slug}" })).unwrap_err();
         assert_eq!(field, "branch");
+    }
+}
+
+#[cfg(test)]
+mod trace_detail_tests {
+    use super::trace_detail;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn a_passs_detail_reads_back_as_json_or_as_kept() {
+        let kept = r#"{"step":"plan","revised":true,"reviews":[{"agent":"spec-review","gaps":"No rollback task"}]}"#.to_string();
+        let d = trace_detail(Some(&kept));
+        assert_eq!(d["revised"], true);
+        assert_eq!(d["reviews"][0]["gaps"], "No rollback task");
+        assert_eq!(trace_detail(Some(&"cut {".to_string())), json!("cut {"));
+        assert_eq!(trace_detail(None), Value::Null);
     }
 }

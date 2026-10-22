@@ -33,7 +33,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Bumped when the analysis format changes, so every item is checked again.
-pub const FORMAT: u32 = 7;
+pub const FORMAT: u32 = 8;
+/// The first format whose checks say which review steps an item is for.
+pub const REVIEWS_FORMAT: u32 = 8;
 /// Longest translated text kept.
 pub const MAX_TRANSLATED_CHARS: usize = 64_000;
 const MAX_STEPS: usize = 40;
@@ -336,6 +338,11 @@ pub struct Requirement {
     /// check), "model" when it is the model's judgment.
     #[serde(default)]
     pub basis: String,
+    /// Worked out here, never by the model: for something that only exists
+    /// on a person's own machine, what Coderhelm does instead. Empty
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instead: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +379,12 @@ pub struct Need {
     pub status: String,
     /// Steps it holds up.
     pub steps: usize,
+    /// It assumes a person's own machine (a local path, a terminal): there
+    /// is nothing to connect, and `instead` says what Coderhelm does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instead: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +420,11 @@ pub struct Analysis {
     pub cost_usd: f64,
     #[serde(default)]
     pub ms: u64,
+    /// The review steps a team agent is meant for, from its name and
+    /// description: some of `skill_apply::REVIEW_STEPS`. Always empty for
+    /// a skill or command (only agents review).
+    #[serde(default)]
+    pub reviews: Vec<String>,
 }
 
 const STATUSES: [&str; 4] = ["available", "translated", "missing", "blocked"];
@@ -437,8 +455,9 @@ pub fn output_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["steps", "translated"],
+        "required": ["steps", "translated", "reviews"],
         "properties": {
+            "reviews": { "type": "array", "items": enum_of(&crate::skill_apply::REVIEW_STEPS) },
             "steps": {
                 "type": "array",
                 "items": {
@@ -553,7 +572,14 @@ that does it, by its exact name and source (for a translated command, say so bri
 it inline as `GAP: <step> — <what it tried to do> — not connected in Coderhelm (<fix>)`, so a \
 run reports it instead of skipping it. Where a write is blocked, have the agent put what it \
 would have written in its own reply for a person to apply. Leave out steps that only make sense \
-on a person's machine (local paths, installing tools). Drop the front matter. Write plain words.";
+on a person's machine (local paths, installing tools). Drop the front matter. Write plain words.
+
+Last, `reviews`: the review steps the item is meant for, judged from its name and description \
+(its front matter) and what its text says it checks. \"plan\" when it reviews a plan, spec, \
+proposal or requirements before code is written; \"code\" when it reviews code changes, a diff \
+or a pull request's code; \"prose\" when it reviews written text such as a pull request \
+description, docs or release notes. Several can apply. Empty when it does work rather than \
+review someone else's, or when the runtime is `readers` (only a team agent reviews).";
 
 /// The message with the inventory and the item.
 pub fn user_message(
@@ -600,6 +626,8 @@ pub fn finish(
     struct Raw {
         steps: Vec<Step>,
         translated: String,
+        #[serde(default)]
+        reviews: Value,
     }
     let r: Raw = serde_json::from_value(raw.clone())
         .map_err(|e| format!("The answer wasn't in the expected shape: {e}"))?;
@@ -667,7 +695,11 @@ pub fn finish(
     if let Some(n) = repaired_note(&named, inv) {
         notes.push(n);
     }
-    Ok((tally(steps, notes), translated))
+    let mut a = tally(steps, notes);
+    if inv.is_agent() {
+        a.reviews = crate::skill_apply::ReviewSteps::from_answer(&r.reviews);
+    }
+    Ok((a, translated))
 }
 
 /// An analysis of `steps`: counted, its needs listed, its status and
@@ -703,6 +735,7 @@ fn tally(steps: Vec<Step>, notes: Vec<String>) -> Analysis {
         output_tokens: 0,
         cost_usd: 0.0,
         ms: 0,
+        reviews: Vec::new(),
     }
 }
 
@@ -736,6 +769,7 @@ pub fn partial(why: &str) -> Analysis {
         output_tokens: 0,
         cost_usd: 0.0,
         ms: 0,
+        reviews: Vec::new(),
     }
 }
 
@@ -785,18 +819,120 @@ const LOCAL_PATHS: &[&str] = &["~/", "~\\", "$HOME", "${HOME}", "/Users/", "/hom
 /// What `needs` and `fix` say for a person's local path, the same every time.
 const LOCAL_NEEDS: &str = "Local files";
 const LOCAL_FIX: &str = "Coderhelm reads the repository, never a file on someone's own computer.";
+/// What Coderhelm does instead of reading a person's local file.
+const LOCAL_INSTEAD: &str = "Reads the repository and the team's connected sources instead";
+/// What Coderhelm does instead of running a command on a person's machine.
+const TERMINAL_INSTEAD: &str =
+    "Works through GitHub and runs only the repository's own checks; there is no terminal";
+
+/// Something only a person's own machine has, that Coderhelm does its own
+/// way or doesn't need. Matched on what a requirement asks for, lowercased
+/// and without backticks: `starts` as a prefix, `names` as the whole ask.
+struct LocalEquivalent {
+    starts: &'static [&'static str],
+    names: &'static [&'static str],
+    /// "translated" (Coderhelm has its own way) or "available" (the step
+    /// runs without it).
+    status: &'static str,
+    instead: &'static str,
+}
+
+/// Checked before [`LOCAL_PATHS`], so `~/.claude/...` is memory, not a
+/// missing file.
+const LOCAL_EQUIVALENTS: &[LocalEquivalent] = &[
+    // A coding assistant's own memory and history on the laptop: Coderhelm
+    // keeps the team's memory and recalls it for the work by itself.
+    LocalEquivalent {
+        starts: &[
+            "~/.claude/",
+            "~/.claude ",
+            "$home/.claude/",
+            "${home}/.claude/",
+            ".claude/projects/",
+        ],
+        names: &[
+            "~/.claude",
+            "claude code memory",
+            "claude code project memory",
+            "claude code's memory",
+            "project memory",
+            "auto memory",
+            "auto-memory",
+            "session history",
+            "conversation history",
+        ],
+        status: "translated",
+        instead: "Team memory: Coderhelm recalls what the team's earlier work learned and keeps \
+                  what this work learns",
+    },
+    // Tools that only show something on the person's screen.
+    LocalEquivalent {
+        starts: &[],
+        names: &[
+            "artifact",
+            "artifacts",
+            "the artifact tool",
+            "artifact tool",
+            "todowrite",
+            "todo list",
+            "exitplanmode",
+        ],
+        status: "available",
+        instead: "Runs without it: Coderhelm puts the result in its reply or the pull request",
+    },
+];
+
+/// What Coderhelm does instead, when `asks` names something only a
+/// person's machine has.
+fn local_equivalent(asks: &str) -> Option<&'static LocalEquivalent> {
+    let a = asks.trim().to_lowercase().replace('`', "");
+    let a = a.trim();
+    LOCAL_EQUIVALENTS
+        .iter()
+        .find(|e| e.names.contains(&a) || e.starts.iter().any(|p| a.starts_with(p)))
+}
+
+/// Whether `asks` is a path on a person's own computer.
+fn local_path(asks: &str) -> bool {
+    let named = asks.trim().trim_matches('`').trim();
+    LOCAL_PATHS.iter().any(|p| named.starts_with(p))
+}
 
 /// Settles a requirement from the inventory alone, when it can be: then the
 /// same request gets the same status on every check, whatever the model
 /// said. Returns whether it did; otherwise the model's call stands (and is
 /// checked by [`check`]).
 ///
+/// - something only a person's machine has that Coderhelm does its own way
+///   ([`LOCAL_EQUIVALENTS`]) is translated or runs without it, whatever its
+///   kind or what it writes;
+/// - a path on a person's computer is missing, whatever its kind or what it
+///   writes;
 /// - talking to the person (`kind` person) always runs as written;
 /// - a Coderhelm tool named outright is available;
 /// - commands that are all in the inventory's translations are translated,
-///   with the tools those translations name;
-/// - a path on a person's computer is missing.
+///   with the tools those translations name.
 fn settle(q: &mut Requirement, inv: &Inventory) -> bool {
+    if let Some(e) = local_equivalent(&q.asks) {
+        q.status = e.status.into();
+        q.uses.clear();
+        q.write = "none".into();
+        q.instead = e.instead.into();
+        return true;
+    }
+    if local_path(&q.asks) {
+        q.status = "missing".into();
+        q.uses.clear();
+        q.needs = LOCAL_NEEDS.into();
+        q.fix = LOCAL_FIX.into();
+        q.instead = LOCAL_INSTEAD.into();
+        q.connect = "none".into();
+        q.server.clear();
+        q.connection.clear();
+        // Never an outside write: the file is on someone's computer.
+        q.write = "none".into();
+        return true;
+    }
     if q.kind == "person" {
         q.status = "available".into();
         q.uses.clear();
@@ -818,16 +954,6 @@ fn settle(q: &mut Requirement, inv: &Inventory) -> bool {
             q.uses = uses;
             return true;
         }
-    }
-    if q.kind == "path" && LOCAL_PATHS.iter().any(|p| named.starts_with(p)) {
-        q.status = "missing".into();
-        q.uses.clear();
-        q.needs = LOCAL_NEEDS.into();
-        q.fix = LOCAL_FIX.into();
-        q.connect = "none".into();
-        q.server.clear();
-        q.connection.clear();
-        return true;
     }
     false
 }
@@ -910,6 +1036,7 @@ fn check_inner(q: Requirement, inv: &Inventory) -> Requirement {
             .map(|u| u.trim().trim_matches('`').to_string())
             .filter(|u| !u.is_empty())
             .collect(),
+        instead: String::new(),
         ..q
     };
     if !STATUSES.contains(&q.status.as_str()) {
@@ -930,7 +1057,9 @@ fn check_inner(q: Requirement, inv: &Inventory) -> Requirement {
     }
     let settled = settle(&mut q, inv);
     q.basis = if settled { "inventory" } else { "model" }.into();
-    let talks = settled && q.kind == "person";
+    // Talking to the person, or something Coderhelm does its own way with
+    // no tool to name: covered without a tool in `uses`.
+    let talks = settled && (q.kind == "person" || !q.instead.is_empty());
     let covered = matches!(q.status.as_str(), "available" | "translated");
     if covered && !talks && (q.uses.is_empty() || q.uses.iter().any(|u| !inv.has_tool(u))) {
         let unknown: Vec<String> = q
@@ -1064,6 +1193,11 @@ fn check_inner(q: Requirement, inv: &Inventory) -> Requirement {
         _ => "none",
     }
     .to_string();
+    if q.kind == "command" && q.status == "missing" && q.action == "none" {
+        // A command nothing can be connected for runs on someone's own
+        // machine.
+        q.instead = TERMINAL_INSTEAD.into();
+    }
     q
 }
 
@@ -1229,6 +1363,7 @@ pub fn enforce(mut a: Analysis, translated: String, inv: &Inventory) -> (Analysi
     out.output_tokens = meta.output_tokens;
     out.cost_usd = meta.cost_usd;
     out.ms = meta.ms;
+    out.reviews = meta.reviews;
     (out, translated)
 }
 
@@ -1278,6 +1413,8 @@ fn needs(steps: &[Step]) -> Vec<Need> {
                 link: q.link.clone(),
                 status: q.status.clone(),
                 steps: 0,
+                local: !q.instead.is_empty() && q.action == "none",
+                instead: q.instead.clone(),
             });
             if seen.insert(key) {
                 e.steps += 1;
@@ -1421,12 +1558,20 @@ pub fn stabilize(
     inv: &Inventory,
 ) -> (Analysis, String) {
     let prev = last.analysis;
+    // The review steps follow the text, like the steps: held to the last
+    // check's once it said them.
+    let reviews = if prev.format >= REVIEWS_FORMAT {
+        prev.reviews.clone()
+    } else {
+        new.reviews.clone()
+    };
     let meta = |mut a: Analysis, from: &Analysis| {
         a.model = from.model.clone();
         a.input_tokens = from.input_tokens;
         a.output_tokens = from.output_tokens;
         a.cost_usd = from.cost_usd;
         a.ms = from.ms;
+        a.reviews = reviews.clone();
         a
     };
     if prev.status == "partial" || prev.steps.is_empty() {
@@ -1441,6 +1586,7 @@ pub fn stabilize(
     };
     if last.tools_changed {
         let mut a = new;
+        a.reviews = reviews.clone();
         let mut notes = Vec::new();
         for (i, p) in prev.steps.iter().enumerate() {
             if let Some(j) = matching(&a.steps, i, &p.title) {
@@ -1746,6 +1892,7 @@ mod tests {
             action: String::new(),
             basis: String::new(),
             link: Default::default(),
+            instead: String::new(),
         };
         let merged = merge_same(vec![
             r("`git log`", "missing", &[]),
@@ -2399,5 +2546,157 @@ mod tests {
             &other.fingerprint_at(FORMAT - 1),
             FORMAT - 1
         ));
+    }
+
+    #[test]
+    fn only_a_team_agent_keeps_the_review_steps_it_was_given() {
+        let raw = json!({
+            "steps": [stp("Check the spec", vec![])],
+            "translated": "Check the spec against the rubric, section by section.",
+            "reviews": ["plan", "deploy", "PLAN", "prose"]
+        });
+        let agent = inv().for_agent(&["read_file".to_string()]);
+        let (a, _) = finish(&raw, &agent, 10).unwrap();
+        assert_eq!(a.reviews, ["plan", "prose"], "known steps only, in order");
+        // A skill or command is read, never run as a review step.
+        let (a, _) = finish(&raw, &inv(), 10).unwrap();
+        assert!(a.reviews.is_empty());
+        // An answer from before the field reads as none.
+        let old =
+            json!({ "steps": [stp("Check", vec![])], "translated": "Check the spec, all of it." });
+        assert!(finish(&old, &agent, 10).unwrap().0.reviews.is_empty());
+        // The schema asks for it.
+        assert_eq!(
+            output_schema()["properties"]["reviews"]["items"]["enum"],
+            json!(["plan", "code", "prose"])
+        );
+        assert!(SYSTEM.contains("`reviews`"));
+    }
+
+    #[test]
+    fn a_recheck_of_the_same_text_keeps_its_review_steps() {
+        let mut prev = analysis(vec![stp("Check", vec![])]);
+        prev.reviews = vec!["plan".into()];
+        let mut new = analysis(vec![stp("Check", vec![])]);
+        new.reviews = vec!["code".into()];
+        for tools_changed in [false, true] {
+            let last = Last {
+                analysis: &prev,
+                translated: "old",
+                tools_changed,
+            };
+            let (a, _) = stabilize(new.clone(), "new".into(), &last, &inv());
+            assert_eq!(a.reviews, ["plan"], "tools changed: {tools_changed}");
+        }
+        // A check from before the format that asked for them takes the new
+        // answer.
+        prev.format = REVIEWS_FORMAT - 1;
+        let last = Last {
+            analysis: &prev,
+            translated: "old",
+            tools_changed: false,
+        };
+        assert_eq!(
+            stabilize(new.clone(), "new".into(), &last, &inv())
+                .0
+                .reviews,
+            ["code"]
+        );
+        // enforce keeps them too.
+        let (a, _) = enforce(new, "Do it.".into(), &inv());
+        assert_eq!(a.reviews, ["code"]);
+    }
+
+    #[test]
+    fn a_local_path_is_settled_whatever_its_kind_or_write() {
+        for (kind, write) in [
+            ("path", "none"),
+            ("other", "none"),
+            ("data", "outside"),
+            ("tool", "outside"),
+        ] {
+            let mut q = ask("~/notes/release.md", kind, "available", &["read_file"], "");
+            q["write"] = json!(write);
+            q["connect"] = json!("plugins");
+            let q = one(q);
+            assert_eq!(q.status, "missing", "{kind}/{write}");
+            assert_eq!(q.basis, "inventory");
+            assert_eq!(q.action, "none", "nothing to connect for a laptop file");
+            assert_eq!(q.write, "none");
+            assert_eq!(q.instead, LOCAL_INSTEAD);
+        }
+    }
+
+    #[test]
+    fn a_laptop_only_thing_is_done_coderhelms_way() {
+        // An assistant's memory and history on the laptop: team memory.
+        for (asks, kind) in [
+            ("~/.claude/projects/app/memory/notes.md", "path"),
+            ("`~/.claude/history.jsonl`", "other"),
+            ("Claude Code memory", "tool"),
+            ("project memory", "data"),
+        ] {
+            let q = one(ask(asks, kind, "missing", &[], "Local files"));
+            assert_eq!(q.status, "translated", "{asks}");
+            assert!(q.uses.is_empty() && q.needs.is_empty() && q.fix.is_empty());
+            assert_eq!((q.basis.as_str(), q.action.as_str()), ("inventory", "none"));
+            assert!(q.instead.starts_with("Team memory"), "{asks}");
+        }
+        // A display tool only the laptop has: the step runs without it.
+        let q = one(ask("Artifact", "tool", "missing", &[], "Artifact"));
+        assert_eq!(q.status, "available");
+        assert!(q.instead.starts_with("Runs without it"));
+        // A file in the repository named like memory is still the model's.
+        let q = one(ask(
+            "docs/memory.md",
+            "path",
+            "available",
+            &["read_file"],
+            "",
+        ));
+        assert_eq!(
+            (q.status.as_str(), q.basis.as_str()),
+            ("available", "model")
+        );
+        assert!(q.instead.is_empty());
+    }
+
+    #[test]
+    fn needs_say_what_to_do_and_which_assume_a_local_machine() {
+        let a = analysis(vec![
+            stp(
+                "Notes",
+                vec![ask("~/notes/x.md", "path", "missing", &[], "Local files")],
+            ),
+            stp(
+                "Build",
+                vec![ask(
+                    "make release",
+                    "command",
+                    "missing",
+                    &[],
+                    "Shell access",
+                )],
+            ),
+            stp(
+                "Wiki",
+                vec![
+                    json!({ "asks": "wiki page", "kind": "tool", "status": "missing", "uses": [],
+                    "write": "none", "needs": "Wiki", "fix": "Connect it", "connect": "plugins",
+                    "server": "", "connection": "" }),
+                ],
+            ),
+        ]);
+        let by = |name: &str| a.needs.iter().find(|n| n.name == name).unwrap();
+        assert!(by("Local files").local);
+        assert_eq!(by("Local files").instead, LOCAL_INSTEAD);
+        assert!(
+            by("Shell access").local,
+            "a command with nothing to connect"
+        );
+        assert_eq!(by("Shell access").instead, TERMINAL_INSTEAD);
+        let wiki = by("Wiki");
+        assert!(!wiki.local && wiki.instead.is_empty());
+        assert_eq!(wiki.action, "connect");
     }
 }

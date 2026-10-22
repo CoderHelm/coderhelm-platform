@@ -12,7 +12,7 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-21.data-first-regex-last";
+pub const PLANNER_VERSION: &str = "2026-10-22.team-agent-plan-review";
 
 /// The cached plan's file holding its key.
 pub const PLAN_KEY_FILE: &str = "plan_key.txt";
@@ -47,12 +47,15 @@ pub async fn mark_plan_run(state: &WorkerState, msg: &TicketMessage, run_id: &st
 /// The ticket's content (title, body, images; a Jira comment that re-runs
 /// the ticket rides in the body), what memory recalled for it (team lessons
 /// included), the ticket's history (earlier runs, how their PRs ended,
-/// lessons, people's notes), and the planner's version.
+/// lessons, people's notes), the planner's version, and the plan review it
+/// goes through (`skills::plan_review_key`: the review's version and each
+/// reviewing team agent's text), so a reused plan never skips a review.
 pub fn plan_cache_key(
     context_hash: &str,
     memory_context: &str,
     history_digest: &str,
     team_instructions: &str,
+    review_key: &str,
 ) -> String {
     let memory = common::sha256_hex(&[memory_context]);
     let instructions = common::sha256_hex(&[team_instructions]);
@@ -62,7 +65,56 @@ pub fn plan_cache_key(
         &memory,
         history_digest,
         &instructions,
+        review_key,
     ])
+}
+
+/// Whether a draft plan is one the team's agents review: a plan of work,
+/// not a finding that nothing is needed or a question back, and one that
+/// parsed.
+pub fn reviewable(files: &PlanResult) -> bool {
+    let tasks = files.tasks.trim_start();
+    !tasks.is_empty()
+        && !files.proposal.trim().is_empty()
+        && !tasks.starts_with("NO_CHANGES_NEEDED")
+        && !tasks.starts_with("CLARIFICATION_NEEDED")
+}
+
+/// The draft as the reviewing agents read it: proposal, spec and tasks.
+pub fn review_draft(files: &PlanResult) -> String {
+    let mut out = format!("## proposal.md\n{}\n", files.proposal.trim());
+    if !files.spec.trim().is_empty() {
+        out.push_str(&format!("\n## spec.md\n{}\n", files.spec.trim()));
+    }
+    out.push_str(&format!("\n## tasks.md\n{}\n", files.tasks.trim()));
+    out
+}
+
+/// What the planner is told after the review: the notes as advice, and to
+/// answer with the whole plan again.
+pub fn revision_prompt(advice: &str) -> String {
+    format!(
+        "{advice}\n\nRevise your plan once with these notes: change it only where a note points \
+         to a real gap for this change. Then output the COMPLETE plan again in exactly the same \
+         format as before (every file block, the fix decision included), not just the changes."
+    )
+}
+
+/// The revised plan when it parsed into a plan, else the draft. The
+/// decision on where the fix belongs stays the draft's: it was checked
+/// against the planner's trace, and a review doesn't move it.
+pub fn take_revision(draft: PlanResult, revised: PlanResult) -> (PlanResult, bool) {
+    let lost_design = revised.design.trim().is_empty() && !draft.design.trim().is_empty();
+    if !reviewable(&revised) || lost_design {
+        return (draft, false);
+    }
+    (
+        PlanResult {
+            fix: draft.fix,
+            ..revised
+        },
+        true,
+    )
 }
 
 /// Result of the plan pass: the four openspec files.
@@ -626,6 +678,96 @@ Then the ```fix_location.json block described above."#,
                 super::fix_location::mark_untraced(d, &gaps)
             }
         });
+    }
+
+    // The team's plan-review agents read the draft before it's kept; with
+    // gaps, the planner gets one revision turn on the same conversation.
+    if let Some(s) = skills.as_ref().filter(|_| reviewable(&files)) {
+        if !s.reviewers_for("plan").is_empty() {
+            let started = std::time::Instant::now();
+            let before = usage.clone();
+            let host = s.host(
+                &executor,
+                Some(super::agent_tools::RepoReads {
+                    github,
+                    owner: &msg.repo_owner,
+                    repo: &msg.repo_name,
+                    git_ref: &msg.base_branch,
+                    http: &state.http,
+                }),
+            );
+            let reviews = s
+                .review(state, "plan", "draft plan", &review_draft(&files), &host)
+                .await;
+            s.drain_usage_into(usage);
+            let advice = super::skills::advice_block(&reviews);
+            let mut revised = false;
+            if !advice.is_empty() {
+                messages.push((
+                    "user".to_string(),
+                    vec![serde_json::json!({"type": "text", "text": revision_prompt(&advice)})],
+                ));
+                let one_turn = llm::ConverseOptions {
+                    max_turns: 1,
+                    ..plan_opts
+                };
+                match provider::converse(
+                    state,
+                    provider,
+                    model_id,
+                    &full_system,
+                    &mut messages,
+                    &tools,
+                    &executor,
+                    usage,
+                    one_turn,
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(text) => {
+                        let (kept, took) = take_revision(files, parse_openspec_files(&text));
+                        files = kept;
+                        revised = took;
+                        if !took {
+                            warn!(ticket_id = %msg.ticket_id, "Plan revision after review didn't parse; the draft stands");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(ticket_id = %msg.ticket_id, error = %e, "Plan revision after review failed; the draft stands")
+                    }
+                }
+            }
+            let cost = (usage.cost_usd - before.cost_usd).max(0.0);
+            info!(
+                ticket_id = %msg.ticket_id,
+                reviewers = reviews.len(),
+                with_gaps = reviews.iter().filter(|r| r.gaps.is_some()).count(),
+                revised,
+                cost_usd = cost,
+                "Plan reviewed by team agents"
+            );
+            super::write_pass_trace_with(
+                state,
+                &msg.team_id,
+                run_id,
+                "plan_review",
+                started,
+                &before,
+                usage,
+                None,
+                Some(&super::skills::review_detail("plan", &reviews, revised)),
+            )
+            .await;
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &super::skills::review_note("plan", &reviews, revised, cost),
+            )
+            .await;
+        }
     }
 
     // Write openspec to S3
@@ -1222,5 +1364,62 @@ mod planner_turns_tests {
         assert_eq!(planner_turns("simple", true), 20);
         assert_eq!(planner_turns("medium", true), 20);
         assert_eq!(planner_turns("complex", true), 25);
+    }
+}
+
+#[cfg(test)]
+mod plan_review_tests {
+    use super::*;
+
+    fn plan(tasks: &str) -> PlanResult {
+        PlanResult {
+            proposal: "Add a rollback path".into(),
+            design: "Design".into(),
+            tasks: tasks.into(),
+            spec: "Spec".into(),
+            repo_tasks: vec![],
+            fix: None,
+        }
+    }
+
+    #[test]
+    fn only_a_plan_of_work_is_reviewed() {
+        assert!(reviewable(&plan("- [ ] 1. Add the path")));
+        assert!(!reviewable(&plan("NO_CHANGES_NEEDED: already there")));
+        assert!(!reviewable(&plan("  CLARIFICATION_NEEDED: which env?")));
+        assert!(!reviewable(&plan("")));
+        let d = review_draft(&plan("- [ ] 1. Add the path"));
+        assert!(d.contains("## proposal.md\nAdd a rollback path"));
+        assert!(d.contains("## spec.md\nSpec"));
+        assert!(d.contains("## tasks.md\n- [ ] 1. Add the path"));
+        assert!(
+            !d.contains("design.md"),
+            "the reviewers read proposal, spec and tasks"
+        );
+    }
+
+    #[test]
+    fn a_revision_that_doesnt_parse_keeps_the_draft() {
+        let draft = plan("- [ ] 1. Add the path");
+        let (kept, took) =
+            take_revision(draft, parse_openspec_files("Sorry, here are my thoughts."));
+        assert!(!took);
+        assert_eq!(kept.tasks, "- [ ] 1. Add the path");
+
+        let revised = "```proposal.md\nAdd a rollback path, tested\n```\n```design.md\nD2\n```\n\
+                       ```tasks.md\n- [ ] 1. Add the path\n- [ ] 2. Test the rollback\n```\n\
+                       ```spec.md\nS2\n```";
+        let (kept, took) =
+            take_revision(plan("- [ ] 1. Add the path"), parse_openspec_files(revised));
+        assert!(took);
+        assert!(kept.tasks.contains("Test the rollback"));
+        assert!(revision_prompt("## notes").contains("COMPLETE plan again"));
+    }
+
+    #[test]
+    fn a_cached_plan_is_keyed_to_the_review_it_went_through() {
+        let k = |review: &str| plan_cache_key("ctx", "mem", "hist", "team", review);
+        assert_ne!(k("no-reviewers"), k("one-reviewer"));
+        assert_eq!(k("same"), k("same"));
     }
 }

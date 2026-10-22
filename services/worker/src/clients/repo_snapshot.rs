@@ -162,6 +162,20 @@ impl RepoSnapshot {
         Some(out)
     }
 
+    /// Calls `f` with every file's path and its text (`None` for a binary or
+    /// oversized file), in path order, without copying the texts.
+    pub async fn visit(&self, f: &mut (dyn FnMut(&str, Option<&str>) + Send)) {
+        let files = self.files.read().await;
+        let mut paths: Vec<&String> = files.keys().collect();
+        paths.sort();
+        for p in paths {
+            match files.get(p) {
+                Some(FileEntry::Text(t)) => f(p, Some(t)),
+                _ => f(p, None),
+            }
+        }
+    }
+
     /// Full text content, if the file is indexed.
     pub async fn read_file(&self, path: &str) -> Option<String> {
         let files = self.files.read().await;

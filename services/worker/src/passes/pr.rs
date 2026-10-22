@@ -176,7 +176,13 @@ Return ONLY the markdown body text."#,
     )];
 
     let model_id = provider.primary_model_id();
-    let body_text = provider::converse(
+    let write_opts = llm::ConverseOptions {
+        max_turns: 1,
+        max_tokens: 4096,
+        deadline: None,
+        effort: Some("low"),
+    };
+    let mut body_text = provider::converse(
         state,
         provider,
         model_id,
@@ -185,16 +191,99 @@ Return ONLY the markdown body text."#,
         &[],
         &super::triage::NoOpExecutor,
         usage,
-        llm::ConverseOptions {
-            max_turns: 1,
-            max_tokens: 4096,
-            deadline: None,
-            effort: Some("low"),
-        },
+        write_opts,
         None,
         None,
     )
     .await?;
+
+    // The team's prose-review agents read the draft (at most two, each
+    // with a time limit); with gaps, the writer gets one revision on the
+    // same conversation. Fails open: the draft stands.
+    if let Some(s) = standards
+        .as_ref()
+        .filter(|s| !s.reviewers_for("prose").is_empty())
+    {
+        let started = std::time::Instant::now();
+        let before = usage.clone();
+        let host = super::agent_tools::Host {
+            reads: Some(super::agent_tools::RepoReads {
+                github,
+                owner: &msg.repo_owner,
+                repo: &msg.repo_name,
+                git_ref: branch,
+                http: &state.http,
+            }),
+            parent: None,
+            offered: &[],
+        };
+        let draft = format!(
+            "## Pull request description draft\n{body_text}\n\n## What the change does (files)\n{diff_summary}"
+        );
+        let reviews = s
+            .review(state, "prose", "pull request description", &draft, &host)
+            .await;
+        s.drain_usage_into(usage);
+        let advice = super::skills::advice_block(&reviews);
+        let mut revised = false;
+        if !advice.is_empty() {
+            messages.push((
+                "user".to_string(),
+                vec![serde_json::json!({"type": "text", "text": format!(
+                    "{advice}\n\nRevise the description once with these notes, only where a note \
+                     points to a real problem. Keep every rule above. Return ONLY the full \
+                     markdown body again."
+                )})],
+            ));
+            match provider::converse(
+                state,
+                provider,
+                model_id,
+                &system,
+                &mut messages,
+                &[],
+                &super::triage::NoOpExecutor,
+                usage,
+                write_opts,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(text) if !text.trim().is_empty() => {
+                    body_text = text;
+                    revised = true;
+                }
+                Ok(_) => warn!(
+                    run_id,
+                    "PR description revision came back empty; the draft stands"
+                ),
+                Err(e) => {
+                    warn!(run_id, error = %e, "PR description revision failed; the draft stands")
+                }
+            }
+        }
+        let cost = (usage.cost_usd - before.cost_usd).max(0.0);
+        super::write_pass_trace_with(
+            state,
+            &msg.team_id,
+            run_id,
+            "pr_review",
+            started,
+            &before,
+            usage,
+            None,
+            Some(&super::skills::review_detail("prose", &reviews, revised)),
+        )
+        .await;
+        super::add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &super::skills::review_note("pull request description", &reviews, revised, cost),
+        )
+        .await;
+    }
 
     // Add issue link for GitHub tickets.
     // Strip any "Closes #N" the model may have included to avoid duplication.
