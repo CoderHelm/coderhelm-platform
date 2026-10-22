@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod admin;
 pub mod alerts;
 pub mod analytics;
 pub mod api;

@@ -129,7 +129,7 @@ fn opt(v: &str) -> Value {
 
 /// When the member last signed in or used the app, whichever is later
 /// (both are UTC RFC 3339, so they compare as text).
-fn last_active(item: &Item) -> &str {
+pub(crate) fn last_active(item: &Item) -> &str {
     let login = s(item, "last_login_at");
     let seen = s(item, "last_seen_at");
     if seen > login {

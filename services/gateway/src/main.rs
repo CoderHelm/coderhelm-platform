@@ -115,7 +115,12 @@ async fn main() -> Result<(), Error> {
                 .post(routes::api::add_to_allowlist)
                 .delete(routes::api::remove_from_allowlist),
         )
-        .route("/admin/teams", get(routes::api::admin_teams))
+        .route("/admin/teams", get(routes::admin::admin_teams))
+        .route("/admin/beta-signups", get(routes::admin::beta_signups))
+        .route(
+            "/admin/beta-signups/invite",
+            post(routes::admin::invite_beta_signup),
+        )
         // Support tickets: the team's own, and the platform admin's queue
         .route(
             "/support/tickets",
