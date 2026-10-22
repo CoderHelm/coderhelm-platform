@@ -139,9 +139,45 @@ fn last_active(item: &Item) -> &str {
     }
 }
 
+/// How long an invite stays good after it was last sent. Resending starts the
+/// clock again. An expired invite is not accepted at sign-in, but it stays on
+/// the team page (marked expired) until an admin resends or revokes it.
+pub(crate) const INVITE_VALID_DAYS: i64 = 30;
+
+fn rfc3339(v: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(v)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// When the invite was last sent: `invited_at`, or `updated_at` on invites
+/// written before `invited_at` existed.
+fn invite_sent_at(item: &Item) -> Option<chrono::DateTime<chrono::Utc>> {
+    rfc3339(s(item, "invited_at")).or_else(|| rfc3339(s(item, "updated_at")))
+}
+
+/// When a pending invite stops working. `None` for members, and for an invite
+/// with no readable date (it is treated as still open).
+pub(crate) fn invite_expires_at(item: &Item) -> Option<chrono::DateTime<chrono::Utc>> {
+    if status_of(item) != "invited" {
+        return None;
+    }
+    invite_sent_at(item).map(|t| t + chrono::Duration::days(INVITE_VALID_DAYS))
+}
+
+pub(crate) fn invite_expired(item: &Item, now: chrono::DateTime<chrono::Utc>) -> bool {
+    invite_expires_at(item).is_some_and(|t| t <= now)
+}
+
 /// What the team page shows for one record.
-fn member_view(item: &Item, self_id: &str) -> Value {
+fn member_view(item: &Item, self_id: &str, now: chrono::DateTime<chrono::Utc>) -> Value {
     let user_id = bare_id(s(item, "sk"));
+    let invited = status_of(item) == "invited";
+    let stamp = |t: Option<chrono::DateTime<chrono::Utc>>| {
+        t.map_or(Value::Null, |t| {
+            Value::String(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        })
+    };
     json!({
         "user_id": user_id,
         "email": opt(s(item, "email")),
@@ -155,6 +191,9 @@ fn member_view(item: &Item, self_id: &str) -> Value {
         "invited_by": opt(bare_id(s(item, "invited_by"))),
         "last_active_at": opt(last_active(item)),
         "updated_at": opt(s(item, "updated_at")),
+        "invited_at": stamp(if invited { invite_sent_at(item) } else { None }),
+        "invite_expires_at": stamp(invite_expires_at(item)),
+        "invite_expired": invite_expired(item, now),
         "is_self": !user_id.is_empty() && user_id == bare_id(self_id),
     })
 }
@@ -239,6 +278,12 @@ fn check_removal(
             StatusCode::BAD_REQUEST,
             "You can't remove yourself from the team.",
         ));
+    }
+    // A pending invite gives nobody access yet, so revoking one takes nothing
+    // away from anyone: any admin may revoke any invite, whatever role it
+    // offers and however old it is. The route has already checked for admin.
+    if status_of(target) == "invited" {
+        return Ok(());
     }
     let target_role = role_of(target);
     if !can_manage(&claims.role, target_role) {
@@ -395,6 +440,7 @@ pub async fn get_permissions(Extension(claims): Extension<Claims>) -> Json<Value
         "capabilities": permissions::CAPABILITIES,
         "your_role": claims.role,
         "grantable_roles": permissions::grantable_roles(&claims.role),
+        "can_manage_invites": permissions::can_manage_invites(&claims.role),
         "manageable_roles": permissions::ROLES
             .iter()
             .filter(|r| can_manage(&claims.role, r.key))
@@ -411,11 +457,12 @@ pub async fn list_users(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, ApiError> {
     let items = team_items(&state, &claims.team_id).await?;
-    let show_invites = role_level(&claims.role) >= 3;
+    let show_invites = permissions::can_manage_invites(&claims.role);
+    let now = chrono::Utc::now();
     let mut users: Vec<Value> = items
         .iter()
         .filter(|i| show_invites || status_of(i) != "invited")
-        .map(|i| member_view(i, &claims.sub))
+        .map(|i| member_view(i, &claims.sub, now))
         .collect();
     sort_members(&mut users);
     Ok(Json(json!({ "users": users })))
@@ -516,6 +563,7 @@ pub async fn invite_user(
         .item("status", attr_s(status))
         .item("avatar_url", attr_s(""))
         .item("updated_at", attr_s(&now))
+        .item("invited_at", attr_s(&now))
         .item("invited_by", attr_s(&claims.sub))
         .item("gsi2pk", attr_s(&gsi2pk))
         .item("gsi2sk", attr_s(&claims.team_id))
@@ -554,16 +602,7 @@ pub async fn resend_invite(
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&claims)?;
     let item = get_member(&state, &claims.team_id, &user_id).await?;
-    if status_of(&item) != "invited" {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            "They've already joined; there's no invite to resend.",
-        ));
-    }
-    let email = s(&item, "email");
-    if email.is_empty() {
-        return Err(fail(StatusCode::BAD_REQUEST, "This invite has no email."));
-    }
+    let email = check_resend(&item)?;
     let role = role_of(&item);
 
     let team_name = get_team_name(state.clone(), &claims).await;
@@ -571,9 +610,59 @@ pub async fn resend_invite(
         .await
         .map_err(|_| internal("Failed to resend invite", "email send failed"))?;
 
+    // The email went out, so the invite is good again from now (this is also
+    // how an expired invite is renewed). Only while it is still an invite: if
+    // they signed in meanwhile, the record is theirs and is left alone.
+    let now = chrono::Utc::now();
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(s(&item, "sk")))
+        .update_expression("SET invited_at = :now, updated_at = :now")
+        .condition_expression("#st = :invited")
+        .expression_attribute_names("#st", "status")
+        .expression_attribute_values(":now", attr_s(&now.to_rfc3339()))
+        .expression_attribute_values(":invited", attr_s("invited"))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.as_service_error()
+                .is_some_and(|se| se.is_conditional_check_failed_exception())
+            {
+                fail(
+                    StatusCode::CONFLICT,
+                    "They joined or the invite was revoked while you were looking. Refresh the page.",
+                )
+            } else {
+                internal("Failed to renew invite", e)
+            }
+        })?;
+
     info!(team_id = %claims.team_id, "Invite resent");
 
-    Ok(Json(json!({ "status": "sent" })))
+    let expires = now + chrono::Duration::days(INVITE_VALID_DAYS);
+    Ok(Json(json!({
+        "status": "sent",
+        "invited_at": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "invite_expires_at": expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    })))
+}
+
+/// What resending needs from the record: still an invite, with an email.
+/// Its role and age don't matter; an expired invite is renewed by resending.
+fn check_resend(item: &Item) -> Result<&str, ApiError> {
+    if status_of(item) != "invited" {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "They've already joined; there's no invite to resend.",
+        ));
+    }
+    match s(item, "email") {
+        "" => Err(fail(StatusCode::BAD_REQUEST, "This invite has no email.")),
+        email => Ok(email),
+    }
 }
 
 // ── Update role ──────────────────────────────────────────────────────
@@ -1138,7 +1227,7 @@ mod tests {
 
     #[test]
     fn member_view_reports_sign_in_kind_status_and_self() {
-        let gh = member_view(&github_only("USER#4242", "member"), "USER#4242");
+        let gh = member_view(&github_only("USER#4242", "member"), "USER#4242", at(DAY0));
         assert_eq!(gh["user_id"], "4242");
         assert_eq!(gh["email"], Value::Null);
         assert_eq!(gh["github_login"], "sam-dev");
@@ -1150,7 +1239,7 @@ mod tests {
         let mut owner = email_member("USER#abc", "owner");
         owner.insert("github_login".into(), attr_s("sam-dev"));
         owner.insert("last_login_at".into(), attr_s("2026-01-02T00:00:00Z"));
-        let v = member_view(&owner, "abc");
+        let v = member_view(&owner, "abc", at(DAY0));
         assert_eq!(v["sign_in"], "email_and_github");
         assert_eq!(v["last_active_at"], "2026-01-02T00:00:00Z");
         assert_eq!(v["is_self"], true, "bare and prefixed ids match");
@@ -1160,7 +1249,7 @@ mod tests {
             ("email", "new@example.com"),
             ("status", "invited"),
         ]);
-        let v = member_view(&invite, "USER#abc");
+        let v = member_view(&invite, "USER#abc", at(DAY0));
         assert_eq!(v["status"], "invited");
         assert_eq!(v["role"], "member");
         assert_eq!(v["is_self"], false);
@@ -1349,6 +1438,157 @@ mod tests {
         ] {
             assert!(!valid_email(bad), "{bad}");
         }
+    }
+
+    const DAY0: &str = "2026-01-01T12:00:00+00:00";
+
+    fn at(t: &str) -> chrono::DateTime<chrono::Utc> {
+        rfc3339(t).unwrap()
+    }
+
+    fn invite(role: &str, dates: &[(&str, &str)]) -> Item {
+        let mut item = rec(&[
+            ("pk", "TEAM#t1"),
+            ("sk", "USER#invite_01"),
+            ("email", "person@example.com"),
+            ("role", role),
+            ("status", "invited"),
+        ]);
+        for (k, v) in dates {
+            item.insert(k.to_string(), attr_s(v));
+        }
+        item
+    }
+
+    #[test]
+    fn admins_can_revoke_every_pending_invite_whatever_its_role_or_age() {
+        let admin = claims("USER#me", "admin");
+        let owner = claims("USER#me", "owner");
+        let old = [("updated_at", "2025-01-01T00:00:00+00:00")];
+        let fresh = [("invited_at", DAY0)];
+        for role in ["viewer", "member", "billing", "admin", "owner", ""] {
+            for dates in [&[][..], &old[..], &fresh[..]] {
+                let item = invite(role, dates);
+                assert!(
+                    check_removal(&admin, "invite_01", &item, 1).is_ok(),
+                    "admin revokes a {role:?} invite ({dates:?})"
+                );
+                assert!(check_removal(&owner, "invite_01", &item, 1).is_ok());
+            }
+        }
+        // Seated admins and owners are still an owner's call.
+        assert_eq!(
+            check_removal(&admin, "x", &email_member("USER#x", "admin"), 1)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn invite_people_routes_refuse_non_admins() {
+        for role in ["viewer", "member", "billing", "", "superuser"] {
+            assert_eq!(
+                require_admin(&claims("USER#me", role)).unwrap_err().0,
+                StatusCode::FORBIDDEN,
+                "{role:?}"
+            );
+            assert!(!permissions::can_manage_invites(role));
+        }
+        for role in ["admin", "owner"] {
+            assert!(require_admin(&claims("USER#me", role)).is_ok());
+            assert!(permissions::can_manage_invites(role));
+        }
+    }
+
+    #[test]
+    fn invites_expire_after_the_valid_window_and_resending_renews_them() {
+        let sent = invite("admin", &[("invited_at", DAY0)]);
+        let expires = at(DAY0) + chrono::Duration::days(INVITE_VALID_DAYS);
+        assert_eq!(invite_expires_at(&sent), Some(expires));
+        assert!(!invite_expired(&sent, at(DAY0)));
+        assert!(!invite_expired(
+            &sent,
+            expires - chrono::Duration::seconds(1)
+        ));
+        assert!(invite_expired(&sent, expires));
+
+        // Older invites carry no invited_at: their write time (updated_at) counts.
+        let legacy = invite(
+            "admin",
+            &[("updated_at", "2026-01-01T12:00:00.195746945+00:00")],
+        );
+        assert!(invite_expired(
+            &legacy,
+            expires + chrono::Duration::seconds(1)
+        ));
+        assert!(!invite_expired(&legacy, at(DAY0)));
+
+        // A resend sets invited_at, which wins over the old write time.
+        let mut renewed = legacy.clone();
+        renewed.insert("invited_at".into(), attr_s("2026-03-01T00:00:00+00:00"));
+        assert!(!invite_expired(
+            &renewed,
+            expires + chrono::Duration::days(1)
+        ));
+
+        // No readable date: shown as open rather than guessed.
+        assert_eq!(invite_expires_at(&invite("member", &[])), None);
+        assert!(!invite_expired(
+            &invite("member", &[("updated_at", "junk")]),
+            at(DAY0)
+        ));
+
+        // Members never expire.
+        let mut member = email_member("USER#a", "member");
+        member.insert("updated_at".into(), attr_s("2000-01-01T00:00:00+00:00"));
+        assert_eq!(invite_expires_at(&member), None);
+        assert!(!invite_expired(&member, at(DAY0)));
+    }
+
+    #[test]
+    fn member_view_reports_invite_age_and_expiry() {
+        let item = invite("admin", &[("updated_at", DAY0)]);
+        let later = at(DAY0) + chrono::Duration::days(INVITE_VALID_DAYS + 1);
+        let v = member_view(&item, "USER#me", later);
+        assert_eq!(v["status"], "invited");
+        assert_eq!(v["role"], "admin");
+        assert_eq!(v["invited_at"], "2026-01-01T12:00:00Z");
+        assert_eq!(v["invite_expires_at"], "2026-01-31T12:00:00Z");
+        assert_eq!(v["invite_expired"], true);
+        assert_eq!(
+            member_view(&item, "USER#me", at(DAY0))["invite_expired"],
+            false
+        );
+
+        let m = member_view(&email_member("USER#a", "admin"), "USER#me", later);
+        assert_eq!(m["invited_at"], Value::Null);
+        assert_eq!(m["invite_expires_at"], Value::Null);
+        assert_eq!(m["invite_expired"], false);
+    }
+
+    #[test]
+    fn resend_works_for_any_pending_invite_including_expired_ones() {
+        let old = [("updated_at", "2025-01-01T00:00:00+00:00")];
+        for role in ["member", "admin", "owner"] {
+            assert_eq!(
+                check_resend(&invite(role, &old)).unwrap(),
+                "person@example.com"
+            );
+        }
+        assert_eq!(
+            check_resend(&email_member("USER#a", "member"))
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST,
+            "a member has no invite to resend"
+        );
+        let mut no_email = invite("member", &[]);
+        no_email.insert("email".into(), attr_s(""));
+        assert_eq!(
+            check_resend(&no_email).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

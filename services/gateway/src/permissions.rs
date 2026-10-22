@@ -204,7 +204,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // ── Admins ──────────────────────────────────────────────────────
     Capability {
         key: "people",
-        label: "Invite people, resend or revoke invites, link GitHub accounts, and change or remove members and viewers",
+        label: "Invite people, resend or revoke any pending invite, link GitHub accounts, and change or remove members and viewers",
         min_role: "admin",
         handlers: &[
             "users::invite_user",
@@ -428,6 +428,13 @@ pub fn can_manage(actor_role: &str, target_role: &str) -> bool {
     actor >= 4 || (actor >= 3 && role_level(target_role) <= 2)
 }
 
+/// May `actor_role` see, resend and revoke pending invites? Any admin or owner,
+/// for every invite: an invite grants nothing until it is accepted, so this is
+/// not limited by the role the invite offers (unlike `can_manage`).
+pub fn can_manage_invites(actor_role: &str) -> bool {
+    role_level(actor_role) >= 3
+}
+
 /// May `actor_role` give someone `new_role`? Same split as `can_manage`.
 pub fn can_grant(actor_role: &str, new_role: &str) -> bool {
     VALID_ROLES.contains(&new_role) && can_manage(actor_role, new_role)
@@ -587,6 +594,14 @@ mod tests {
             vec!["viewer", "member", "admin", "owner"]
         );
         assert!(grantable_roles("member").is_empty());
+
+        // Invites are not seats: an admin manages every pending invite,
+        // including an admin invite an owner sent.
+        assert!(can_manage_invites("admin"));
+        assert!(can_manage_invites("owner"));
+        assert!(!can_manage_invites("billing"));
+        assert!(!can_manage_invites("member"));
+        assert!(!can_manage_invites("viewer"));
     }
 
     #[test]

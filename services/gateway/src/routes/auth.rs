@@ -1646,6 +1646,12 @@ async fn issue_session_from_cognito(
             Some(t) => t.to_string(),
             None => continue,
         };
+        // An expired invite is not accepted. It stays on the team page, marked
+        // expired, until an admin resends (renews) or revokes it.
+        if crate::routes::users::invite_expired(item, chrono::Utc::now()) {
+            info!(team_id = %invite_tid, "Skipped an expired invite on login");
+            continue;
+        }
         let invite_role = item
             .get("role")
             .and_then(|v| v.as_s().ok())
