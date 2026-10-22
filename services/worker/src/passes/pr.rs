@@ -560,18 +560,20 @@ pub async fn resolve_conflicts(
             .iter()
             .any(|f| f.get("filename").and_then(|v| v.as_str()) == Some(base_file));
         if !touched_by_branch {
+            // Only a 404 means base deleted the file. Any other failed read
+            // aborts the resolution: reading it as a deletion (or as empty
+            // content) would commit that loss into the branch.
             match github
-                .read_file(&msg.repo_owner, &msg.repo_name, base_file, &msg.base_branch)
-                .await
+                .read_file_if_exists(&msg.repo_owner, &msg.repo_name, base_file, &msg.base_branch)
+                .await?
             {
-                Ok(content) => {
+                Some(content) => {
                     resolved_files.push(FileOp::Write {
                         path: base_file.clone(),
                         content,
                     });
                 }
-                Err(_) => {
-                    // File was deleted on base
+                None => {
                     resolved_files.push(FileOp::Delete {
                         path: base_file.clone(),
                     });
@@ -587,19 +589,18 @@ pub async fn resolve_conflicts(
             None => continue,
         };
 
-        // Read all three versions: merge base, base branch (main), feature branch
+        // Read all three versions: merge base, base branch (main), feature
+        // branch. None means the file is absent on that side; a failed read
+        // aborts instead of passing for a deletion.
         let ancestor = github
-            .read_file(&msg.repo_owner, &msg.repo_name, path, merge_base_sha)
-            .await
-            .ok();
+            .read_file_if_exists(&msg.repo_owner, &msg.repo_name, path, merge_base_sha)
+            .await?;
         let main_content = github
-            .read_file(&msg.repo_owner, &msg.repo_name, path, &msg.base_branch)
-            .await
-            .ok();
+            .read_file_if_exists(&msg.repo_owner, &msg.repo_name, path, &msg.base_branch)
+            .await?;
         let branch_content = github
-            .read_file(&msg.repo_owner, &msg.repo_name, path, branch)
-            .await
-            .ok();
+            .read_file_if_exists(&msg.repo_owner, &msg.repo_name, path, branch)
+            .await?;
 
         // If either side deleted the file, prefer branch's decision
         let (main_content, branch_content) = match (main_content, branch_content) {

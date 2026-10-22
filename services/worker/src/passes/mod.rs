@@ -5733,19 +5733,14 @@ pub(crate) async fn detect_check_commands(
 
             // Package manager from whichever lockfile the repo commits.
             let (install, run) = if github
-                .read_file(owner, repo, "pnpm-lock.yaml", git_ref)
+                .file_exists(owner, repo, "pnpm-lock.yaml", git_ref)
                 .await
-                .is_ok()
             {
                 (
                     "corepack enable && pnpm install --frozen-lockfile",
                     "pnpm run",
                 )
-            } else if github
-                .read_file(owner, repo, "yarn.lock", git_ref)
-                .await
-                .is_ok()
-            {
+            } else if github.file_exists(owner, repo, "yarn.lock", git_ref).await {
                 ("corepack enable && yarn install --frozen-lockfile", "yarn")
             } else {
                 ("npm ci --no-audit --no-fund", "npm run")
@@ -6176,19 +6171,14 @@ pub(crate) async fn detect_codegen_command(
     let has = |name: &str| scripts.map(|s| s.contains_key(name)).unwrap_or(false);
 
     let (install, run) = if github
-        .read_file(owner, repo, "pnpm-lock.yaml", git_ref)
+        .file_exists(owner, repo, "pnpm-lock.yaml", git_ref)
         .await
-        .is_ok()
     {
         (
             "corepack enable && pnpm install --frozen-lockfile",
             "pnpm run",
         )
-    } else if github
-        .read_file(owner, repo, "yarn.lock", git_ref)
-        .await
-        .is_ok()
-    {
+    } else if github.file_exists(owner, repo, "yarn.lock", git_ref).await {
         ("corepack enable && yarn install --frozen-lockfile", "yarn")
     } else {
         ("npm ci --no-audit --no-fund", "npm run")
