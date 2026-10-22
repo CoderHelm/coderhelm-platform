@@ -1161,6 +1161,20 @@ async fn run_once(
                     !super::review_scope::touches_code(&since) || own_change_unchanged;
                 if nothing_new && unconfirmed.is_empty() {
                     info!(pr = msg.pr_number, approved = %approved, head = %head_sha, own_change_unchanged, "Push changed none of the PR's code or data since the approval — review skipped, approval carried");
+                    // Many repos dismiss approvals when commits are pushed:
+                    // post the approval again on this head, so the PR never
+                    // sits without a visible verdict.
+                    carry_approval(
+                        state,
+                        &github,
+                        &msg,
+                        &head_sha,
+                        &approved,
+                        own_change_unchanged,
+                        standing.clone(),
+                        self_authored,
+                    )
+                    .await;
                     // The auto-merge gate is bound to a head: carry the
                     // approval to this one, as a review of it would.
                     let _ = super::review_actions::run_on_approve(
@@ -2113,6 +2127,78 @@ async fn run_once(
 /// The trigger of a review a ticket run asks for on its own PR before it
 /// completes (see [`review_for_run`]).
 pub(crate) const TRIGGER_RUN: &str = "run";
+
+/// The body of an approval carried to a new head without a review: the
+/// verdict and why in one line.
+pub(crate) fn carried_approval_body(approved: &str, only_base_merged: bool) -> String {
+    let short = &approved[..approved.len().min(7)];
+    let why = if only_base_merged {
+        format!(
+            "the new commits only bring in the base branch; the PR's own change is the same as \
+             the approved `{short}`."
+        )
+    } else {
+        format!(
+            "the new commits change only docs, comments or whitespace since the approved \
+             `{short}`."
+        )
+    };
+    format!("✅ **Approved**: {why}")
+}
+
+/// Posts the approval of `approved` again on `head` (a COMMENT on
+/// CoderHelm's own PR, where GitHub refuses a verdict) and records it, so
+/// the head carries a visible verdict and later pushes are reviewed from it.
+/// Best-effort: a failure is logged and the auto-merge gate still runs.
+#[allow(clippy::too_many_arguments)]
+async fn carry_approval(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &ReviewMessage,
+    head: &str,
+    approved: &str,
+    only_base_merged: bool,
+    standing: Option<super::review_verdict::StandingReview>,
+    self_authored: bool,
+) {
+    let super::review_verdict::Decision::Post {
+        event,
+        dismiss_stale,
+    } = super::review_verdict::decide(
+        super::review_verdict::Input::Carried,
+        &super::review_verdict::Context {
+            standing,
+            self_authored,
+        },
+    )
+    else {
+        return;
+    };
+    let heading = carried_approval_body(approved, only_base_merged);
+    let body = format!("{heading}{RATING_FOOTER}");
+    if let Err(e) =
+        super::review_verdict::post(github, msg, head, event, dismiss_stale, &body, &[]).await
+    {
+        warn!(pr = msg.pr_number, head = %head, error = %e, "Could not post the carried approval");
+        return;
+    }
+    store_review_record(
+        state,
+        msg,
+        head,
+        "APPROVE",
+        "N/A",
+        &heading,
+        event,
+        "",
+        &common::review_stats::ReviewCounts {
+            posted: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    info!(pr = msg.pr_number, head = %head, approved = %approved, event, "Approval carried to the new head");
+}
 
 /// The PR reviewer's verdict on a run's own PR, for the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3330,6 +3416,23 @@ mod verdict_tests {
             body: body.into(),
             evidence: evidence.map(String::from),
             ..Default::default()
+        }
+    }
+
+    /// A carried approval says it is one, and why, in its one line.
+    #[test]
+    fn a_carried_approval_names_the_approved_commit_and_why() {
+        let merged = super::carried_approval_body("abc1234def", true);
+        assert_eq!(
+            merged,
+            "✅ **Approved**: the new commits only bring in the base branch; the PR's own \
+             change is the same as the approved `abc1234`."
+        );
+        let docs = super::carried_approval_body("abc1234def", false);
+        assert!(docs.starts_with("✅ **Approved**: "), "{docs}");
+        assert!(docs.contains("only docs, comments or whitespace"));
+        for b in [merged, docs] {
+            assert_eq!(b.lines().count(), 1);
         }
     }
 

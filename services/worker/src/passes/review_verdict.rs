@@ -59,6 +59,11 @@ pub enum Input {
     },
     /// A review that didn't finish (model API, unreadable answer, GitHub).
     Failed,
+    /// A push after CoderHelm's approval that changed none of the PR's own
+    /// code (only docs, or only merges of the base branch): the approval is
+    /// posted again on the new head, since many repos dismiss approvals
+    /// when commits are pushed.
+    Carried,
     /// A reply CoderHelm is about to post, and what it concludes.
     Reply { change: VerdictChange },
 }
@@ -104,6 +109,16 @@ pub fn decide(input: Input, ctx: &Context) -> Decision {
     match input {
         // No verdict from a review that didn't finish; the previous one stays.
         Input::Failed => Decision::Nothing,
+        // Always posted: a head without a visible verdict is what a carried
+        // approval exists to prevent.
+        Input::Carried => Decision::Post {
+            event: if ctx.self_authored {
+                "COMMENT"
+            } else {
+                "APPROVE"
+            },
+            dismiss_stale: false,
+        },
         Input::Reply { change } => {
             if ctx.self_authored {
                 return Decision::Nothing;
@@ -398,6 +413,42 @@ mod tests {
         };
         assert_eq!(
             decide(review("REQUEST_CHANGES", true, false), &own),
+            Decision::Post {
+                event: "COMMENT",
+                dismiss_stale: false
+            }
+        );
+    }
+
+    /// A push that changed none of the PR's own code after an approval posts
+    /// the approval again on the new head, whatever stands (repos that
+    /// dismiss stale approvals would otherwise leave it without one); on
+    /// CoderHelm's own PR it is a COMMENT.
+    #[test]
+    fn a_carried_approval_is_posted_on_the_new_head() {
+        for s in [
+            None,
+            standing("APPROVE", false),
+            standing("REQUEST_CHANGES", true),
+        ] {
+            let ctx = Context {
+                standing: s,
+                self_authored: false,
+            };
+            assert_eq!(
+                decide(Input::Carried, &ctx),
+                Decision::Post {
+                    event: "APPROVE",
+                    dismiss_stale: false
+                }
+            );
+        }
+        let own = Context {
+            standing: None,
+            self_authored: true,
+        };
+        assert_eq!(
+            decide(Input::Carried, &own),
             Decision::Post {
                 event: "COMMENT",
                 dismiss_stale: false
