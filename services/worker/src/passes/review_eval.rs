@@ -29,7 +29,7 @@
 
 use super::await_merge::{classify_check_runs, decide_gate, Action, GateView};
 use super::review_actions::approval_state;
-use super::review_agent::{self, Evidence, Finding, ReviewOutput, VerdictChange};
+use super::review_agent::{self, Finding, ReviewOutput, VerdictChange};
 use super::review_pr::{
     failure_plan, reply_after_formal, retry_message, FailurePlan, FormalResult,
 };
@@ -235,7 +235,6 @@ struct FinalFormal {
 /// An open CoderHelm thread on the PR.
 struct Thread {
     holds: bool,
-    question: bool,
 }
 
 /// A formal review CoderHelm posted.
@@ -409,12 +408,8 @@ impl Sim {
             keep
         });
         let holding = self.threads.iter().filter(|t| t.holds).count();
-        let questions = self
-            .threads
-            .iter()
-            .filter(|t| !t.holds && t.question)
-            .count();
-        let verdict = review_agent::decide_verdict(&findings, holding, questions, false);
+        let unconfirmed = review_agent::unconfirmed_external_facts("", &out.unconfirmed_facts);
+        let verdict = review_agent::decide_verdict(&findings, holding, &unconfirmed, false);
         let prev = self.standing();
         let has_news = prev.as_ref().map(|p| p.verdict.as_str()) != Some(verdict)
             || prev.as_ref().is_some_and(|p| p.head_sha != step.head)
@@ -435,7 +430,6 @@ impl Sim {
         for f in &findings {
             self.threads.push(Thread {
                 holds: f.holds_merge(),
-                question: f.evidence() == Evidence::Question,
             });
         }
         match decision {
@@ -1031,6 +1025,7 @@ struct LiveOutcome {
     findings: Vec<Finding>,
     verdict: &'static str,
     prior: Vec<review_agent::PriorStatus>,
+    unconfirmed: Vec<review_agent::UnconfirmedFact>,
 }
 
 /// Reviews `lr` with the real prompts; `prior` is the earlier-threads section.
@@ -1103,11 +1098,13 @@ async fn live_review(
     };
     review_agent::enforce_source_data_override(&mut findings);
     review_agent::enforce_manual_checks_are_notes(&mut findings);
-    let verdict = review_agent::decide_verdict(&findings, 0, 0, false);
+    let unconfirmed = review_agent::unconfirmed_external_facts(&lr.body, &out.unconfirmed_facts);
+    let verdict = review_agent::decide_verdict(&findings, 0, &unconfirmed, false);
     Ok(LiveOutcome {
         findings,
         verdict,
         prior: out.prior,
+        unconfirmed,
     })
 }
 
@@ -1128,6 +1125,12 @@ fn live_violations(want: &LiveExpect, got: &LiveOutcome) -> Vec<String> {
     if want.no_blocking {
         for f in got.findings.iter().filter(|f| f.holds_merge()) {
             out.push(format!("holds the merge ({}): {}", got.verdict, show(f)));
+        }
+        for f in got.unconfirmed.iter().filter(|f| f.blocks) {
+            out.push(format!(
+                "unconfirmed fact holds the merge ({}): {} ({})",
+                got.verdict, f.fact, f.why
+            ));
         }
     }
     for cat in &want.no_category {
@@ -1518,7 +1521,9 @@ fn review_eval_replays_every_run_case() {
                 let mut findings = out.findings.clone();
                 review_agent::enforce_source_data_override(&mut findings);
                 review_agent::enforce_manual_checks_are_notes(&mut findings);
-                let verdict = review_agent::decide_verdict(&findings, 0, 0, false);
+                let unconfirmed =
+                    review_agent::unconfirmed_external_facts("", &out.unconfirmed_facts);
+                let verdict = review_agent::decide_verdict(&findings, 0, &unconfirmed, false);
                 let override_found = findings.iter().any(|f| {
                     f.category
                         .eq_ignore_ascii_case(review_agent::SOURCE_DATA_OVERRIDE)

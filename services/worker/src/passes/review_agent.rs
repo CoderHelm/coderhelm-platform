@@ -45,6 +45,12 @@ pub struct Finding {
     /// empty rests on nothing (see [`enforce_failed_lookups`]).
     #[serde(default)]
     pub lookups: Vec<String>,
+    /// For a `question`: whether the change's correctness rests on the
+    /// answer (the code reads a field, shape or behaviour of another system
+    /// nobody verified). A question that does requests changes with its ask;
+    /// one that doesn't is a note on the approval. Unset means it doesn't.
+    #[serde(default)]
+    pub blocks: Option<bool>,
 }
 
 /// What a finding rests on. The verdict depends on it: only a defect the
@@ -106,15 +112,6 @@ pub fn thread_holds_merge(body: &str) -> bool {
     !first.trim_end().ends_with("(question)")
 }
 
-/// Whether an earlier CoderHelm comment is a question for a person (its first
-/// line, as posted, ends with "(question)"). An open, unanswered question
-/// keeps the review from approving; an open note or unverified concern
-/// doesn't.
-pub fn thread_is_question(body: &str) -> bool {
-    let first = body.lines().next().unwrap_or("");
-    first.trim_end().ends_with("(question)")
-}
-
 /// The model's structured review output.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ReviewOutput {
@@ -136,10 +133,68 @@ pub struct ReviewOutput {
     pub tests_note: String,
     /// Facts about a system the repository doesn't own that the PR's own
     /// description or evidence says are unconfirmed, unverified or never
-    /// read. Any one keeps the review from approving
-    /// ([`hold_for_unconfirmed`]).
+    /// read, each triaged: only one the change's correctness rests on
+    /// requests changes ([`decide_verdict`]); the rest are notes.
     #[serde(default)]
-    pub unconfirmed_facts: Vec<String>,
+    pub unconfirmed_facts: Vec<UnconfirmedFact>,
+}
+
+/// A fact the PR's own evidence says is unconfirmed, and whether the change
+/// rests on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnconfirmedFact {
+    pub fact: String,
+    /// The change's correctness rests on it: the code reads a field, shape or
+    /// behaviour of another system that nobody verified. Requests changes.
+    /// An environment or test-data note (a staging system without data, a
+    /// vendor's sandbox that is down) doesn't.
+    pub blocks: bool,
+    /// The reviewer's one-line reason, shown with the fact.
+    pub why: String,
+}
+
+impl UnconfirmedFact {
+    /// A fact nobody triaged. It holds the merge until a review says the
+    /// change doesn't rest on it: an approval never stands on a fact nobody
+    /// looked at.
+    pub fn untriaged(fact: &str) -> Self {
+        UnconfirmedFact {
+            fact: fact.trim().to_string(),
+            blocks: true,
+            why: "the review didn't say whether the change relies on it".to_string(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UnconfirmedFact {
+    /// `{"fact", "blocks", "why"}`; a bare string (the older shape) is a fact
+    /// nobody triaged, and so is an object without `blocks`.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Triaged {
+                #[serde(default)]
+                fact: String,
+                #[serde(default)]
+                blocks: Option<bool>,
+                #[serde(default)]
+                why: String,
+            },
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Text(s) => UnconfirmedFact::untriaged(&s),
+            Raw::Triaged { fact, blocks, why } => match blocks {
+                Some(blocks) => UnconfirmedFact {
+                    fact: fact.trim().to_string(),
+                    blocks,
+                    why: why.trim().to_string(),
+                },
+                None => UnconfirmedFact::untriaged(&fact),
+            },
+        })
+    }
 }
 
 /// The model's judgment of one earlier CoderHelm thread at the new head.
@@ -231,7 +286,8 @@ pub const PROOF_RULE: &str = "PROOF BEHIND THE CHANGE: check these things. (1) U
      PR description nor a lookup shows it in a real payload or row. When a live source can reach \
      it, look it up yourself: a result that contradicts the code is a verified-defect \
      \"correctness\" finding; one that confirms it is noted in the summary. Otherwise raise it as \
-     a \"question\" naming the field and the source that would settle it. (2) UNMEASURED IMPACT: \
+     a \"question\" with `blocks`: true naming the field and the source that would settle it. \
+     (2) UNMEASURED IMPACT: \
      the change alters behaviour for stored records and the description gives no count, or says \
      the impact was not measured or not verified, while a connected source holds the data. Count \
      it yourself with a live source and report the number and a few examples; raise a \
@@ -241,8 +297,8 @@ pub const PROOF_RULE: &str = "PROOF BEHIND THE CHANGE: check these things. (1) U
      (the diff shows it), severity \"medium\": diagnostics belong at DEBUG. (4) UNPROVEN \
      ASSUMPTION: the logic depends on an assumption (what another system sends, the values a \
      field takes, uniqueness, ordering) that nothing in the PR proves. Check it with your tools \
-     when you can; otherwise one \"question\" saying exactly what has to be confirmed. \
-     (5) NAME PARSING: the logic reads another system's data by parsing a name, title or \
+     when you can; otherwise one \"question\" with `blocks`: true saying exactly what has to be \
+     confirmed. (5) NAME PARSING: the logic reads another system's data by parsing a name, title or \
      description (a regex, a pattern, a substring) while the payload has a structured field or \
      flag (a boolean, a type, a quantity, an id) that says the same thing; people rename \
      things. Parsing text is a last resort, acceptable only when real records show no such \
@@ -288,6 +344,22 @@ pub fn enforce_source_data_override(findings: &mut [Finding]) {
         }
     }
 }
+
+/// How the reviewer triages a fact the PR's own evidence says is
+/// unconfirmed. A blanket hold on every such fact once kept a correct change
+/// from approval over a staging system without data and a vendor sandbox
+/// that was down.
+pub const UNCONFIRMED_RULE: &str = "UNCONFIRMED FACTS: for each fact the PR's own description or \
+     evidence says is unconfirmed, decide whether the change's correctness rests on it. It does \
+     (`blocks`: true) when the code reads a field, value, shape or behaviour of another system \
+     and nobody verified it from a real payload or row; `why` then names what to confirm and \
+     from where (\"confirm `refund_total` from a real refund payload\"). It doesn't (`blocks`: \
+     false) when it is about an environment or test data rather than the code: a staging or \
+     test system without data, a vendor's sandbox or staging API that is down or returns \
+     errors, a flaky external environment, a manual check that couldn't run there. A test or \
+     staging environment data gap and a third-party sandbox outage never block: staging \
+     differing from production is expected. `why` then says in a few words why the change \
+     doesn't rest on it. ";
 
 /// How the reviewer treats what people wrote back to it.
 const REPLIES_RULE: &str = "PEOPLE'S REPLIES: the prompt may list replies under your earlier \
@@ -436,9 +508,14 @@ impl Finding {
             .unwrap_or(Evidence::VerifiedDefect)
     }
 
-    /// Only a verified defect (or a repo policy) requests changes.
+    /// A verified defect (or a repo policy) requests changes, and so does a
+    /// question the change's correctness rests on: its ask is the change.
     pub fn holds_merge(&self) -> bool {
-        self.evidence() == Evidence::VerifiedDefect
+        match self.evidence() {
+            Evidence::VerifiedDefect => true,
+            Evidence::Question => self.blocks == Some(true),
+            Evidence::UnverifiedConcern => false,
+        }
     }
 
     /// Weakens the finding to `to` when that is weaker than what it has.
@@ -494,77 +571,173 @@ pub fn enforce_failed_lookups(findings: &mut [Finding], lookups: &[super::proof:
     changed
 }
 
-/// The facts the PR's own evidence says are unconfirmed: the lines its
-/// description marks so (as CoderHelm's PRs write them, see
-/// `proof::unconfirmed_facts`), and those the reviewer read in it. Each once.
-pub fn unconfirmed_external_facts(pr_body: &str, read: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for f in super::proof::unconfirmed_facts(pr_body)
-        .into_iter()
-        .chain(read.iter().map(|f| f.trim().to_string()))
-    {
-        if !f.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&f)) {
-            out.push(f);
+/// A fact's text for matching: lower case, letters and digits only.
+fn fact_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The facts the PR's own evidence says are unconfirmed, each triaged: those
+/// the reviewer triaged, then any line the description marks unconfirmed (as
+/// CoderHelm's PRs write them, see `proof::unconfirmed_facts`) that the
+/// reviewer's triage doesn't cover, which holds the merge until a review
+/// triages it. Each once.
+pub fn unconfirmed_external_facts(pr_body: &str, read: &[UnconfirmedFact]) -> Vec<UnconfirmedFact> {
+    let mut out: Vec<UnconfirmedFact> = Vec::new();
+    let covered = |out: &[UnconfirmedFact], key: &str| {
+        out.iter().any(|o| {
+            let k = fact_key(&o.fact);
+            !k.is_empty() && (k == key || k.contains(key) || key.contains(&k))
+        })
+    };
+    for f in read {
+        let key = fact_key(&f.fact);
+        if !key.is_empty() && !covered(&out, &key) {
+            out.push(f.clone());
+        }
+    }
+    for f in super::proof::unconfirmed_facts(pr_body) {
+        let key = fact_key(&f);
+        if !key.is_empty() && !covered(&out, &key) {
+            out.push(UnconfirmedFact::untriaged(&f));
         }
     }
     out
 }
 
-/// An approval never stands on facts the PR itself says are unconfirmed:
-/// it becomes a COMMENT with a question (which also never arms auto-merge).
-/// A request for changes stays one.
-pub fn hold_for_unconfirmed(verdict: &'static str, unconfirmed: &[String]) -> &'static str {
-    if verdict == "APPROVE" && !unconfirmed.is_empty() {
-        "COMMENT"
-    } else {
-        verdict
-    }
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The question a review asks about the facts the PR says are unconfirmed.
-pub fn unconfirmed_markdown(unconfirmed: &[String]) -> String {
-    if unconfirmed.is_empty() {
-        return String::new();
+/// The unconfirmed facts in a review body: those the change rests on, as the
+/// ask that clears them, and the rest under "Notes" (they don't hold the
+/// merge).
+pub fn unconfirmed_markdown(unconfirmed: &[UnconfirmedFact]) -> String {
+    let line = |f: &UnconfirmedFact| {
+        if f.why.trim().is_empty() {
+            format!("- {}\n", one_line(&f.fact))
+        } else {
+            format!("- {} ({})\n", one_line(&f.fact), one_line(&f.why))
+        }
+    };
+    let mut s = String::new();
+    let blocking: Vec<&UnconfirmedFact> = unconfirmed.iter().filter(|f| f.blocks).collect();
+    if !blocking.is_empty() {
+        s.push_str(
+            "\n\n#### Confirm before merge\nThe change relies on these facts about another \
+             system, and the PR's evidence says they weren't confirmed. Confirm each from the \
+             real system (a payload or a row) and add what came back to the description:\n",
+        );
+        for f in blocking {
+            s.push_str(&line(f));
+        }
     }
-    let mut s = String::from(
-        "\n\n#### Unconfirmed in the PR's own evidence\nThe description says these facts about \
-         another system weren't confirmed, so this isn't approved yet. Could you confirm each \
-         from the real system (a payload or a row) and add what came back to the description?\n",
-    );
-    for f in unconfirmed {
-        s.push_str(&format!(
-            "- {}\n",
-            f.split_whitespace().collect::<Vec<_>>().join(" ")
-        ));
+    let notes: Vec<&UnconfirmedFact> = unconfirmed.iter().filter(|f| !f.blocks).collect();
+    if !notes.is_empty() {
+        s.push_str(
+            "\n\n#### Notes\nUnconfirmed in the PR's evidence, but the change doesn't rest on \
+             them, so they don't hold the merge:\n",
+        );
+        for f in notes {
+            s.push_str(&line(f));
+        }
     }
     s
 }
 
 /// The verdict of a review that finished. (A review that didn't finish has
-/// no verdict: it is retried, and never posted as a block.)
+/// no verdict: it is retried, and never posted as a block.) Always
+/// `APPROVE` or `REQUEST_CHANGES`: a formal review never leaves the author
+/// guessing with a bare comment.
 ///
-/// `REQUEST_CHANGES` only for something that holds the merge: a verified
-/// defect (or a policy like required tests), an earlier requested change
-/// still open, or a failed verification. `COMMENT` when a question for a
-/// person is still unanswered, new or from an earlier review. Otherwise
-/// `APPROVE`: notes, suggestions and concerns the reviewer couldn't verify
-/// are posted with the approval, and questions or suggestions the author
-/// answered or accepted are settled, so none of them hold it back.
+/// `REQUEST_CHANGES` for anything that holds the merge: a verified defect
+/// (or a policy like required tests), a question or an unconfirmed fact the
+/// change's correctness rests on, an earlier requested change still open, or
+/// a failed verification. Otherwise `APPROVE`: notes, suggestions, concerns
+/// the reviewer couldn't verify, questions the change doesn't rest on and
+/// environment notes are posted with the approval.
 pub fn decide_verdict(
     findings: &[Finding],
     prior_open_holding: usize,
-    prior_open_questions: usize,
+    unconfirmed: &[UnconfirmedFact],
     verify_failed: bool,
 ) -> &'static str {
-    if verify_failed || prior_open_holding > 0 || findings.iter().any(Finding::holds_merge) {
-        "REQUEST_CHANGES"
-    } else if prior_open_questions > 0
-        || findings.iter().any(|f| f.evidence() == Evidence::Question)
+    if verify_failed
+        || prior_open_holding > 0
+        || findings.iter().any(Finding::holds_merge)
+        || unconfirmed.iter().any(|f| f.blocks)
     {
-        "COMMENT"
+        "REQUEST_CHANGES"
     } else {
         "APPROVE"
     }
+}
+
+/// What a review's heading says. The counts are of what holds the merge,
+/// except `notes`: everything posted with an approval that doesn't.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeadingCounts {
+    pub defects: usize,
+    pub blocking_questions: usize,
+    pub blocking_facts: usize,
+    pub prior_open: usize,
+    pub verify_failed: bool,
+    pub notes: usize,
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The first line of a formal review: the verdict, and why in one sentence.
+pub fn verdict_heading(verdict: &str, c: &HeadingCounts) -> String {
+    if verdict == "APPROVE" {
+        return if c.notes == 0 {
+            "✅ **Approved**: nothing in the change needs fixing.".to_string()
+        } else {
+            format!(
+                "✅ **Approved with notes**: nothing blocks the merge; {} below {} for a look.",
+                plural(c.notes, "note", "notes"),
+                if c.notes == 1 { "is" } else { "are" }
+            )
+        };
+    }
+    let mut why: Vec<String> = Vec::new();
+    if c.defects > 0 {
+        why.push(plural(c.defects, "defect to fix", "defects to fix"));
+    }
+    if c.blocking_questions > 0 {
+        why.push(plural(
+            c.blocking_questions,
+            "question the change rests on",
+            "questions the change rests on",
+        ));
+    }
+    if c.blocking_facts > 0 {
+        why.push(plural(
+            c.blocking_facts,
+            "unconfirmed fact the change relies on",
+            "unconfirmed facts the change relies on",
+        ));
+    }
+    if c.prior_open > 0 {
+        why.push(plural(
+            c.prior_open,
+            "earlier requested change still open",
+            "earlier requested changes still open",
+        ));
+    }
+    if c.verify_failed {
+        why.push("the verification run failed".to_string());
+    }
+    let reason = match why.len() {
+        0 => "something holds the merge.".to_string(),
+        1 => format!("{}.", why[0]),
+        n => format!("{} and {}.", why[..n - 1].join(", "), why[n - 1]),
+    };
+    format!("❌ **Changes requested**: {reason}")
 }
 
 pub fn review_tools() -> Vec<ToolDefinition> {
@@ -1159,7 +1332,12 @@ pub fn review_system_prompt(
          body); \"unverified-concern\" when it might be wrong but you could not establish it; \
          \"question\" when only a person can confirm it. Only verified defects request changes; \
          the others are posted as comments and don't hold the merge, so never dress a concern \
-         you couldn't verify as a defect. \
+         you couldn't verify as a defect. A \"question\" sets `blocks`: true only when the \
+         change's correctness rests on the answer (the code reads a field, shape or behaviour of \
+         another system that nobody verified); its body then says exactly what to confirm and \
+         where (\"confirm `status` from a real order payload\"). Every other question sets \
+         `blocks`: false and is a note. \
+         {UNCONFIRMED_RULE}\
          {REPLIES_RULE}\
          {MANUAL_CHECK_RULE}\
          {SOURCE_DATA_RULE}\
@@ -1172,14 +1350,15 @@ pub fn review_system_prompt(
          cite the check instead. A RED check is evidence for a finding; name it.\
          {instructions_block}\n\n\
          When done exploring, output ONLY a fenced ```json block, no prose after it, matching:\n\
-         {{\n  \"verdict\": \"APPROVE\" | \"COMMENT\" | \"REQUEST_CHANGES\",\n  \"risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n  \
+         {{\n  \"verdict\": \"APPROVE\" | \"REQUEST_CHANGES\",\n  \"risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n  \
          \"summary\": \"2-4 sentence overview\",\n  \"findings\": [{{\n    \"file\": \"path\", \"line\": <int, a line present on the RIGHT side of the diff>,\n    \
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
          \"category\": \"bug|security|correctness|perf|convention|scope|tests|source-data-override|manual-check|question\", \"title\": \"short\",\n    \
          \"evidence\": \"verified-defect|unverified-concern|question\",\n    \
          \"lookups\": [\"L1\"]  (ids of the live lookups the finding rests on, if any),\n    \
+         \"blocks\": <bool, questions only: true when the change's correctness rests on the answer>,\n    \
          \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}],\n  \
-         \"unconfirmed_facts\": [\"...\"]  (each fact about a system the repository doesn't own that the PR's OWN description or evidence says is unconfirmed, unverified, not measured or never read from a real payload, in a few words; empty when it says none),\n  \
+         \"unconfirmed_facts\": [{{\"fact\": \"...\", \"blocks\": <bool>, \"why\": \"one short sentence\"}}]  (each fact about a system the repository doesn't own that the PR's OWN description or evidence says is unconfirmed, unverified, not measured or never read from a real payload, in a few words, copying a listed fact's text as given; `blocks` and `why` per UNCONFIRMED FACTS; empty when it says none),\n  \
          \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"answered\" | \"open\"}}]  (one per earlier unresolved comment listed, if any),\n  \
          \"labels\": [{{\"name\": \"label\", \"reason\": \"changed file(s) that need it\"}}]  (only if a PR-labels section is given),\n  \
          \"tests_note\": \"which tests will run and where, or why none are needed\"  (only if a PR-labels section is given)\n}}\n\
@@ -1187,10 +1366,12 @@ pub fn review_system_prompt(
          (just `line` without end_line) at the PR head with exactly its text. Give one ONLY when the whole fix is \
          that in-place replacement: the full new text of every anchored line, nothing outside them. A fix that \
          moves code, or changes more than one place, gets NO suggestion; describe it in the body instead.\n\
-         Use \"blocking\" ONLY for real bugs/risks that should stop the merge. The PR is approved \
-         unless a verified defect, a required test, a failed check or an unanswered question is \
-         left; notes and suggestions are posted with the approval. So every reason to hold the \
-         merge MUST be a verified-defect finding: a concern written only in the summary holds \
+         Use \"blocking\" ONLY for real bugs/risks that should stop the merge. The verdict is \
+         always APPROVE or REQUEST_CHANGES, never a bare comment: the PR is approved unless a \
+         verified defect, a required test, a failed check, or a question or unconfirmed fact the \
+         change rests on is left; notes, suggestions and questions it doesn't rest on are posted \
+         with the approval. So every reason to hold the merge MUST be a verified-defect finding \
+         or a question with `blocks`: true: a concern written only in the summary holds \
          nothing. Give every remaining item now, in this review: do not hold back non-blocking \
          notes (wording of the PR description, counts in it) for a later round. If you are unsure whether something is a real problem, read more code until you \
          know.{graph_note}"
@@ -1200,8 +1381,21 @@ pub fn review_system_prompt(
 /// The user message of a review: the PR, its diff and what is known around it
 /// (`context`: the graph, earlier threads, live sources, skills).
 pub fn review_user_prompt(title: &str, pr_body: &str, diff: &str, context: &str) -> String {
+    let marked = super::proof::unconfirmed_facts(pr_body);
+    let triage = if marked.is_empty() {
+        String::new()
+    } else {
+        let mut t = String::from(
+            "\n## Facts the description marks unconfirmed\nTriage every one in \
+             `unconfirmed_facts` (copy its text as given), per UNCONFIRMED FACTS:\n",
+        );
+        for f in &marked {
+            t.push_str(&format!("- {}\n", one_line(f)));
+        }
+        t
+    };
     format!(
-        "PR: {title}\n\n{pr_body}\n\n## Diff (base...head)\n{diff}\n{context}\n\
+        "PR: {title}\n\n{pr_body}\n{triage}\n## Diff (base...head)\n{diff}\n{context}\n\
          Explore with the tools as needed, then emit the JSON review."
     )
 }
@@ -1540,7 +1734,6 @@ pub struct PostableReview {
     pub inline: Vec<InlineComment>,
     /// Findings that couldn't be anchored to a diff line — folded into the body.
     pub unanchored_md: String,
-    pub blocking_count: usize,
 }
 
 /// Net bracket depth of `text` per bracket pair: (), [], {}.
@@ -1607,12 +1800,7 @@ pub fn to_postable(
     };
     let mut inline = Vec::new();
     let mut unanchored = String::new();
-    let mut blocking_count = 0;
-
     for f in findings {
-        if f.is_blocking() && f.holds_merge() {
-            blocking_count += 1;
-        }
         let anchored = f.line > 0
             && changed
                 .get(&f.file)
@@ -1635,6 +1823,9 @@ pub fn to_postable(
         };
         let kind = match f.evidence() {
             Evidence::VerifiedDefect => f.category.clone(),
+            // "(question)" alone marks a question that doesn't hold the
+            // merge (see `thread_holds_merge`).
+            Evidence::Question if holds => "question, blocks the merge".to_string(),
             Evidence::Question => "question".to_string(),
             Evidence::UnverifiedConcern => format!("{}, not verified", f.category),
         };
@@ -1689,7 +1880,6 @@ pub fn to_postable(
     PostableReview {
         inline,
         unanchored_md: unanchored,
-        blocking_count,
     }
 }
 
@@ -2061,6 +2251,7 @@ mod tests {
                 suggestion: Some("let x = y?;".into()),
                 evidence: None,
                 lookups: Vec::new(),
+                blocks: None,
             },
             Finding {
                 file: "a.rs".into(),
@@ -2073,6 +2264,7 @@ mod tests {
                 suggestion: None,
                 evidence: None,
                 lookups: Vec::new(),
+                blocks: None,
             },
         ];
         let mut changed = HashMap::new();
@@ -2081,7 +2273,6 @@ mod tests {
         assert_eq!(p.inline.len(), 1);
         assert_eq!(p.inline[0].line, 2);
         assert!(p.inline[0].body.contains("```suggestion"));
-        assert_eq!(p.blocking_count, 1);
         assert!(p.unanchored_md.contains("a.rs:99"));
     }
 }
@@ -2103,6 +2294,7 @@ mod anchoring_tests {
             suggestion: suggestion.map(String::from),
             evidence: None,
             lookups: Vec::new(),
+            blocks: None,
         }
     }
 
@@ -2212,6 +2404,7 @@ mod required_tests_tests {
             suggestion: None,
             evidence: None,
             lookups: Vec::new(),
+            blocks: None,
         }
     }
 
@@ -2223,7 +2416,7 @@ mod required_tests_tests {
         assert!(v[0].is_blocking());
         assert!(v[0].holds_merge(), "a kept override is a verified defect");
         assert_eq!(v[1].severity, "medium");
-        assert_eq!(decide_verdict(&v[..1], 0, 0, false), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&v[..1], 0, &[], false), "REQUEST_CHANGES");
     }
 
     #[test]
@@ -2304,6 +2497,7 @@ mod required_tests_tests {
             suggestion: Some(s.into()),
             evidence: None,
             lookups: Vec::new(),
+            blocks: None,
         }
     }
 
@@ -2405,7 +2599,6 @@ mod evidence_tests {
         .into_iter()
         .collect();
         let p = to_postable(&[f("question", None)], &changed, &HashMap::new());
-        assert_eq!(p.blocking_count, 0);
         assert!(p.inline[0].body.contains(NON_BLOCKING_MARK));
         assert!(!thread_holds_merge(&p.inline[0].body));
         let p = to_postable(
@@ -2413,7 +2606,6 @@ mod evidence_tests {
             &changed,
             &HashMap::new(),
         );
-        assert_eq!(p.blocking_count, 1);
         assert!(thread_holds_merge(&p.inline[0].body));
     }
 
@@ -2478,52 +2670,277 @@ mod evidence_tests {
                 .into_iter()
                 .collect();
         let p = to_postable(&v[..1], &changed, &HashMap::new());
-        assert_eq!(p.blocking_count, 0);
         assert!(!thread_holds_merge(&p.inline[0].body));
-        assert_eq!(decide_verdict(&v[..3], 0, 0, false), "APPROVE");
+        assert_eq!(decide_verdict(&v[..3], 0, &[], false), "APPROVE");
+    }
+
+    fn fact(text: &str, blocks: bool, why: &str) -> UnconfirmedFact {
+        UnconfirmedFact {
+            fact: text.into(),
+            blocks,
+            why: why.into(),
+        }
     }
 
     #[test]
-    fn the_review_reads_finding_lookups_and_unconfirmed_facts() {
+    fn the_review_reads_finding_lookups_and_triaged_unconfirmed_facts() {
         let out = parse_review(
-            "```json\n{\"verdict\":\"APPROVE\",\"findings\":[{\"file\":\"a.rs\",\"line\":1,\"lookups\":[\"L2\"]}],\"unconfirmed_facts\":[\"refund lines carry `amount`\"]}\n```",
+            "```json\n{\"verdict\":\"APPROVE\",\"findings\":[{\"file\":\"a.rs\",\"line\":1,\"lookups\":[\"L2\"]}],\"unconfirmed_facts\":[\
+             {\"fact\":\"refund lines carry `amount`\",\"blocks\":true,\"why\":\"the code sums it\"},\
+             {\"fact\":\"the sandbox is down\",\"blocks\":false,\"why\":\"environment only\"},\
+             {\"fact\":\"no blocks given\"},\
+             \"a bare string\"]}\n```",
         )
         .unwrap();
         assert_eq!(out.findings[0].lookups, vec!["L2".to_string()]);
         assert_eq!(
             out.unconfirmed_facts,
-            vec!["refund lines carry `amount`".to_string()]
+            vec![
+                fact("refund lines carry `amount`", true, "the code sums it"),
+                fact("the sandbox is down", false, "environment only"),
+                // Nobody triaged these: they hold until a review does.
+                UnconfirmedFact::untriaged("no blocks given"),
+                UnconfirmedFact::untriaged("a bare string"),
+            ]
         );
         let p = review_system_prompt("acme", "app", "", false);
         assert!(p.contains("\"lookups\""));
         assert!(p.contains("\"unconfirmed_facts\""));
+        assert!(p.contains("\"blocks\""));
+        assert!(p.contains("UNCONFIRMED FACTS"));
+        assert!(p.contains("third-party sandbox outage never block"));
+        assert!(
+            !p.contains("\"COMMENT\""),
+            "the reviewer is never offered a bare comment"
+        );
+    }
+
+    /// Only an unconfirmed fact the change's correctness rests on requests
+    /// changes; the rest are notes on an approval.
+    #[test]
+    fn unconfirmed_facts_are_triaged_not_a_blanket_hold() {
+        let body = "Fixes the sync.\n\n**Evidence**\n- Confirmed: `id` is numeric (7)\n- Unconfirmed: the vendor's `line_type` on refunds; the payload was never read";
+        // The reviewer's triage covers the description's line (case and
+        // punctuation aside): one fact.
+        let rests_on = unconfirmed_external_facts(
+            body,
+            &[fact(
+                "The vendor's `LINE_TYPE` on refunds; the payload was never read.",
+                true,
+                "confirm `line_type` from a real refund payload",
+            )],
+        );
+        assert_eq!(rests_on.len(), 1, "{rests_on:?}");
+        assert_eq!(decide_verdict(&[], 0, &rests_on, false), "REQUEST_CHANGES");
+        let md = unconfirmed_markdown(&rests_on);
+        assert!(md.contains("#### Confirm before merge"), "{md}");
+        assert!(md.contains("confirm `line_type` from a real refund payload"));
+        assert!(!md.contains("#### Notes"));
+
+        let env_only = unconfirmed_external_facts(
+            body,
+            &[fact(
+                "the vendor's `line_type` on refunds; the payload was never read",
+                false,
+                "the field is already read the same way elsewhere",
+            )],
+        );
+        assert_eq!(decide_verdict(&[], 0, &env_only, false), "APPROVE");
+
+        // A description line no triage covers holds the merge until one does.
+        let untriaged = unconfirmed_external_facts(body, &[]);
+        assert!(untriaged[0].blocks);
+        assert_eq!(decide_verdict(&[], 0, &untriaged, false), "REQUEST_CHANGES");
+
+        // A human PR that says so in words: the reviewer's triage counts.
+        let read = unconfirmed_external_facts(
+            "We didn't check the vendor field.",
+            &[fact(
+                "the vendor's `status` field",
+                true,
+                "the code branches on it",
+            )],
+        );
+        assert_eq!(decide_verdict(&[], 0, &read, false), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[], 0, &[], false), "APPROVE");
+        assert_eq!(unconfirmed_markdown(&[]), "");
+    }
+
+    /// Regression: a PR approved earlier, then main merged in twice, was
+    /// re-reviewed into "Questions, nothing blocking" because its
+    /// description listed two staging problems as unconfirmed: a vendor's
+    /// staging API returning errors the vendor has to fix, and a staging
+    /// backend with no data for one area. Neither is about the change.
+    #[test]
+    fn staging_gaps_in_the_evidence_approve_with_notes() {
+        let body = "Shows delivery estimates on the order page.\n\n**Evidence**\n\
+                    - Confirmed: `eta_days` read from a real production payload (order 1001)\n\
+                    - Unconfirmed: the carrier's staging API returns 502 on tracking lookups; the vendor has to fix it\n\
+                    - Unconfirmed: the staging backend has no shipment rows to check the page against";
+        let triaged = vec![
+            fact(
+                "the carrier's staging API returns 502 on tracking lookups; the vendor has to fix it",
+                false,
+                "a vendor sandbox outage, not the change",
+            ),
+            fact(
+                "the staging backend has no shipment rows to check the page against",
+                false,
+                "staging data differs from production by design",
+            ),
+        ];
+        let facts = unconfirmed_external_facts(body, &triaged);
+        assert_eq!(facts.len(), 2, "{facts:?}");
+        let verdict = decide_verdict(&[], 0, &facts, false);
+        assert_eq!(verdict, "APPROVE");
+        let heading = verdict_heading(
+            verdict,
+            &HeadingCounts {
+                notes: facts.iter().filter(|f| !f.blocks).count(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            heading.starts_with("✅ **Approved with notes**"),
+            "{heading}"
+        );
+        assert!(!heading.contains("Questions"));
+        let md = unconfirmed_markdown(&facts);
+        assert!(md.contains("#### Notes"), "{md}");
+        assert!(md.contains("a vendor sandbox outage, not the change"));
+        assert!(!md.contains("Confirm before merge"));
+        assert!(!md.contains("isn't approved"));
+        // The reviewer is handed the description's lines to triage.
+        let prompt = review_user_prompt("Delivery estimates", body, "(diff)", "");
+        assert!(prompt.contains("## Facts the description marks unconfirmed"));
+        assert!(prompt.contains("- the staging backend has no shipment rows"));
+        assert!(
+            !review_user_prompt("t", "No evidence notes.", "d", "").contains("marks unconfirmed")
+        );
+    }
+
+    /// A question holds the merge only when the change rests on its answer,
+    /// and then it is said as a requested change.
+    #[test]
+    fn a_question_blocks_only_when_the_change_rests_on_it() {
+        let q = |blocks: Option<bool>| Finding {
+            file: "src/sync.rs".into(),
+            line: 3,
+            severity: "medium".into(),
+            category: "question".into(),
+            evidence: Some("question".into()),
+            title: "Confirm `status` on refunds".into(),
+            body: "Confirm `status` from a real refund payload.".into(),
+            blocks,
+            ..Default::default()
+        };
+        let changed: HashMap<String, HashSet<u64>> =
+            [("src/sync.rs".to_string(), [3u64].into_iter().collect())]
+                .into_iter()
+                .collect();
+        for note in [q(None), q(Some(false))] {
+            assert!(!note.holds_merge());
+            assert_eq!(
+                decide_verdict(std::slice::from_ref(&note), 0, &[], false),
+                "APPROVE"
+            );
+            let p = to_postable(std::slice::from_ref(&note), &changed, &HashMap::new());
+            assert!(!thread_holds_merge(&p.inline[0].body));
+        }
+        let rests_on = q(Some(true));
+        assert!(rests_on.holds_merge());
+        assert_eq!(
+            decide_verdict(std::slice::from_ref(&rests_on), 0, &[], false),
+            "REQUEST_CHANGES"
+        );
+        let p = to_postable(std::slice::from_ref(&rests_on), &changed, &HashMap::new());
+        assert!(p.inline[0].body.contains("(question, blocks the merge)"));
+        // A later review counts the open thread as a requested change.
+        assert!(thread_holds_merge(&p.inline[0].body));
+    }
+
+    /// Whatever the inputs, a finished review's verdict is one of two.
+    #[test]
+    fn the_verdict_is_always_approve_or_request_changes() {
+        let kinds = [
+            ("bug", "verified-defect", None),
+            ("bug", "unverified-concern", None),
+            ("question", "question", None),
+            ("question", "question", Some(false)),
+            ("question", "question", Some(true)),
+            ("manual-check", "unverified-concern", None),
+        ];
+        let findings: Vec<Finding> = kinds
+            .iter()
+            .map(|(category, evidence, blocks)| Finding {
+                file: "a.rs".into(),
+                line: 1,
+                category: category.to_string(),
+                evidence: Some(evidence.to_string()),
+                blocks: *blocks,
+                ..Default::default()
+            })
+            .collect();
+        let facts = [fact("x", false, ""), fact("y", true, "")];
+        for n in 0..=findings.len() {
+            for prior in [0, 1] {
+                for f in [&facts[..0], &facts[..1], &facts[..]] {
+                    for verify_failed in [false, true] {
+                        let v = decide_verdict(&findings[..n], prior, f, verify_failed);
+                        assert!(v == "APPROVE" || v == "REQUEST_CHANGES", "{v}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn an_unconfirmed_external_fact_holds_the_approval_as_a_question() {
-        let body = "Fixes the sync.\n\n**Evidence**\n- Confirmed: `id` is numeric (7)\n- Unconfirmed: the vendor's `line_type` on refunds; the payload was never read";
-        let facts = unconfirmed_external_facts(
-            body,
-            &["The vendor's `LINE_TYPE` on refunds; the payload was never read".into()],
-        );
-        // Read from the description and from the reviewer's reading, once.
-        assert_eq!(facts.len(), 1, "{facts:?}");
-        assert_eq!(hold_for_unconfirmed("APPROVE", &facts), "COMMENT");
+    fn the_heading_names_the_verdict_and_why_in_one_line() {
+        let approved = verdict_heading("APPROVE", &HeadingCounts::default());
         assert_eq!(
-            hold_for_unconfirmed("REQUEST_CHANGES", &facts),
-            "REQUEST_CHANGES"
+            approved,
+            "✅ **Approved**: nothing in the change needs fixing."
         );
-        assert_eq!(hold_for_unconfirmed("APPROVE", &[]), "APPROVE");
-        // A human PR that says so in words: the reviewer's reading counts.
-        let read = unconfirmed_external_facts(
-            "We didn't check the vendor field.",
-            &["the vendor's `status` field".into()],
+        let notes = verdict_heading(
+            "APPROVE",
+            &HeadingCounts {
+                notes: 2,
+                ..Default::default()
+            },
         );
-        assert_eq!(hold_for_unconfirmed("APPROVE", &read), "COMMENT");
-        let md = unconfirmed_markdown(&facts);
-        assert!(md.contains("isn't approved yet"));
-        assert!(md.contains("Could you confirm each"));
-        assert!(md.contains("- the vendor's `line_type` on refunds"));
-        assert_eq!(unconfirmed_markdown(&[]), "");
+        assert_eq!(
+            notes,
+            "✅ **Approved with notes**: nothing blocks the merge; 2 notes below are for a look."
+        );
+        let blocked = verdict_heading(
+            "REQUEST_CHANGES",
+            &HeadingCounts {
+                defects: 1,
+                blocking_facts: 2,
+                notes: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            blocked,
+            "❌ **Changes requested**: 1 defect to fix and 2 unconfirmed facts the change relies on."
+        );
+        let prior = verdict_heading(
+            "REQUEST_CHANGES",
+            &HeadingCounts {
+                prior_open: 1,
+                blocking_questions: 1,
+                verify_failed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            prior,
+            "❌ **Changes requested**: 1 question the change rests on, 1 earlier requested change still open and the verification run failed."
+        );
+        for h in [approved, notes, blocked, prior] {
+            assert_eq!(h.lines().count(), 1);
+            assert!(!h.contains("Questions, nothing blocking"));
+        }
     }
 }

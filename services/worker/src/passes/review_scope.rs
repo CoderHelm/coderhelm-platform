@@ -66,6 +66,38 @@ pub fn code_files(since: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether the PR's own change (its base...head compare) is the same at two
+/// heads: the same files, each with the same status and the same added and
+/// removed lines. After pushes that only merge the base branch in (work
+/// already merged there), the PR's change is the one approved even though
+/// the commits since the approval change code. Line numbers and context
+/// lines may move with the base and don't count. A file whose patch GitHub
+/// didn't send, or a compare without its file list, is never the same.
+pub fn same_own_change(at_approval: &Value, now: &Value) -> bool {
+    fn changes(compare: &Value) -> Option<Vec<(String, String, Vec<String>)>> {
+        let mut out = Vec::new();
+        for f in compare["files"].as_array()? {
+            let patch = f["patch"].as_str()?;
+            let lines: Vec<String> = patch
+                .lines()
+                .filter(|l| l.starts_with('+') || l.starts_with('-'))
+                .map(str::to_string)
+                .collect();
+            out.push((
+                f["filename"].as_str()?.to_string(),
+                f["status"].as_str().unwrap_or("").to_string(),
+                lines,
+            ));
+        }
+        out.sort();
+        Some(out)
+    }
+    match (changes(at_approval), changes(now)) {
+        (Some(a), Some(b)) => !a.is_empty() && a == b,
+        _ => false,
+    }
+}
+
 fn file_touches_code(f: &Value) -> bool {
     let name = f["filename"].as_str().unwrap_or("");
     if name.is_empty() || is_lockfile(name) {
@@ -379,5 +411,41 @@ mod tests {
             Some("@@\n-a\n+b")
         )])));
         assert!(touches_code(&json!({"status": "ahead"})));
+    }
+
+    #[test]
+    fn merging_the_base_branch_in_leaves_the_prs_own_change_as_approved() {
+        // The PR's change when it was approved.
+        let at_approval = since(vec![file(
+            "src/orders.rs",
+            "modified",
+            Some("@@ -10,3 +10,3 @@ fn total()\n let a = 1;\n-let fee = 2;\n+let fee = 3;\n let b = 2;"),
+        )]);
+        // Two merges of the base branch later: other work moved the lines
+        // and the context, the PR's own lines are the same.
+        let after_merges = since(vec![file(
+            "src/orders.rs",
+            "modified",
+            Some("@@ -42,3 +42,3 @@ fn total_with_tax()\n let a = 10;\n-let fee = 2;\n+let fee = 3;\n let c = 4;"),
+        )]);
+        assert!(same_own_change(&at_approval, &after_merges));
+        // A conflict resolved differently, or one more file, is a new change.
+        let resolved = since(vec![file(
+            "src/orders.rs",
+            "modified",
+            Some("@@ -42,3 +42,3 @@\n-let fee = 2;\n+let fee = 4;"),
+        )]);
+        assert!(!same_own_change(&at_approval, &resolved));
+        let mut more = after_merges.clone();
+        more["files"].as_array_mut().unwrap().push(file(
+            "src/tax.rs",
+            "modified",
+            Some("@@\n-a\n+b"),
+        ));
+        assert!(!same_own_change(&at_approval, &more));
+        // A file GitHub sent no patch for can't be shown to be the same.
+        let no_patch = since(vec![file("src/orders.rs", "modified", None)]);
+        assert!(!same_own_change(&no_patch, &no_patch));
+        assert!(!same_own_change(&json!({}), &json!({})));
     }
 }

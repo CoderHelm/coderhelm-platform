@@ -1,12 +1,12 @@
 {
   "name": "please-confirm question, then the reviewer checks and approves",
-  "description": "A redirects map changes six 301 targets. The first review could not open the pages and asked a person to confirm them: a question, never a block. Re-reviewed with the URL check, all six return 200 and the question is answered.",
+  "description": "A redirects map changes six 301 targets. The first review could not open the pages and asked a person to confirm them: a question the change does not rest on, so a note on an approval, never a block and never a bare comment. Re-reviewed with the URL check, all six return 200 and the question is answered.",
   "steps": [
     {"push": "h1"},
     {"review": {"head": "h1", "model_output": {
       "verdict": "REQUEST_CHANGES",
       "summary": "Six redirect targets changed.",
-      "findings": [{"file": "infra/redirects.tf", "line": 12, "severity": "medium", "category": "question", "evidence": "question",
+      "findings": [{"file": "infra/redirects.tf", "line": 12, "severity": "medium", "category": "question", "evidence": "question", "blocks": false,
         "title": "Confirm the six new targets load", "body": "Please confirm the new 301 targets work on the live site."}]
     }}},
     {"comment": {"id": 301, "text": "@coderhelm re-review", "ask_kind": "re_review",
@@ -20,6 +20,6 @@
   ],
   "expect": {
     "final_formal": {"head": "h1", "event": "APPROVE"},
-    "formal_events": [["h1", "COMMENT"], ["h1", "APPROVE"]]
+    "formal_events": [["h1", "APPROVE"], ["h1", "APPROVE"]]
   }
 }
