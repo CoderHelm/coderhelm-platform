@@ -7,13 +7,12 @@
 //!
 //! Storage, all in the settings table:
 //!   switch → pk=team_id, sk=GRAPH_CONFIG#REPO#{owner}/{name}  (`enabled`)
-//!   legacy → pk=team_id, sk=REVIEW_CONFIG#REPO#{owner}/{name} (`graph_enabled`)
 //!   status → pk=CG#{team_id}#{owner}/{name}, sk=STATUS
 //!   graph  → pk=CG#{team_id}#{owner}/{name}, sk=META | SUMMARY | NM#/R#/I#/RI#/F#
 //!
-//! The legacy flag is read only while a repo has no switch of its own: an
-//! explicit `false` there keeps the graph off, anything else leaves it on.
-//! The first write to the switch replaces it.
+//! Only the repo's own switch turns a graph off. The reviewer config's old
+//! `graph_enabled` flag is ignored: the reviewer page saved `false` by
+//! default, so it never meant someone turned the graph off.
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client as DynamoClient;
@@ -33,21 +32,14 @@ pub fn config_sk(repo: &str) -> String {
     format!("GRAPH_CONFIG#REPO#{repo}")
 }
 
-/// Sort key of the reviewer config that used to carry the switch.
-pub fn legacy_sk(repo: &str) -> String {
-    format!("REVIEW_CONFIG#REPO#{repo}")
-}
-
 pub const STATUS_SK: &str = "STATUS";
 pub const META_SK: &str = "META";
 
-/// Whether a repo's graph is on: its own switch when set, else an explicit
-/// `false` on the legacy reviewer flag, else on.
-pub fn effective_enabled(own: Option<bool>, legacy: Option<bool>) -> bool {
-    match own {
-        Some(v) => v,
-        None => legacy != Some(false),
-    }
+/// Whether a repo's graph is on: its own switch when set, else on. The
+/// reviewer config's old `graph_enabled` (saved `false` by default) is
+/// deliberately not an input.
+pub fn effective_enabled(own: Option<bool>) -> bool {
+    own.unwrap_or(true)
 }
 
 /// Where a repo's graph build is.
@@ -214,13 +206,7 @@ pub async fn is_enabled(dynamo: &DynamoClient, table: &str, team_id: &str, repo:
     let own = get(dynamo, table, team_id, &config_sk(repo))
         .await
         .and_then(|it| item_bool(&it, "enabled"));
-    if own.is_some() {
-        return effective_enabled(own, None);
-    }
-    let legacy = get(dynamo, table, team_id, &legacy_sk(repo))
-        .await
-        .and_then(|it| item_bool(&it, "graph_enabled"));
-    effective_enabled(None, legacy)
+    effective_enabled(own)
 }
 
 /// Every repo with its own switch set, and its value.
@@ -430,19 +416,16 @@ mod tests {
     }
 
     #[test]
-    fn a_repo_without_reviewer_config_is_on() {
-        assert!(effective_enabled(None, None));
-        // A reviewer config that never mentioned the graph.
-        assert!(effective_enabled(None, Some(true)));
+    fn a_repo_without_its_own_switch_is_on() {
+        // No reviewer config, or a reviewer config with the old
+        // `graph_enabled: false` (saved by default): both are unset here.
+        assert!(effective_enabled(None));
     }
 
     #[test]
-    fn an_explicit_off_is_respected() {
-        assert!(!effective_enabled(None, Some(false)));
-        assert!(!effective_enabled(Some(false), None));
-        assert!(!effective_enabled(Some(false), Some(true)));
-        // The repo's own switch replaces the legacy flag.
-        assert!(effective_enabled(Some(true), Some(false)));
+    fn only_the_repos_own_switch_turns_it_off() {
+        assert!(!effective_enabled(Some(false)));
+        assert!(effective_enabled(Some(true)));
     }
 
     #[test]
