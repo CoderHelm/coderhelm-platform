@@ -1,0 +1,79 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "title": "Open PR",
+            "type": "Action.OpenUrl",
+            "url": "https://github.com/acme/web/pull/13"
+          }
+        ],
+        "body": [
+          {
+            "bleed": true,
+            "items": [
+              {
+                "color": "Warning",
+                "size": "Large",
+                "text": "⏳ Review needed",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "style": "warning",
+            "type": "Container"
+          },
+          {
+            "items": [
+              {
+                "size": "Large",
+                "text": "Fix",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              },
+              {
+                "isSubtle": true,
+                "spacing": "None",
+                "text": "acme/web · #13",
+                "type": "TextBlock",
+                "wrap": true
+              }
+            ],
+            "spacing": "Medium",
+            "type": "Container"
+          },
+          {
+            "facts": [
+              {
+                "title": "Author",
+                "value": "octo-dev"
+              },
+              {
+                "title": "Open for",
+                "value": "just now"
+              },
+              {
+                "title": "Waiting on",
+                "value": "the team"
+              }
+            ],
+            "spacing": "Medium",
+            "type": "FactSet"
+          }
+        ],
+        "msteams": {
+          "width": "Full"
+        },
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive",
+      "contentUrl": null
+    }
+  ],
+  "type": "message"
+}

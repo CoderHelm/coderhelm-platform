@@ -201,5 +201,69 @@ class ModelRetryTest(unittest.TestCase):
             self.assertFalse(h.is_transient_status(c), c)
 
 
+class Slack(unittest.TestCase):
+    SLACK = "https://hooks.slack.com/services/T0001/B0001/abcdefghijklmnop"
+    TEAMS = "https://prod-1.westus.logic.azure.com/workflows/t"
+
+    def test_only_slack_incoming_webhooks(self):
+        self.assertTrue(h.valid_slack_url(self.SLACK))
+        self.assertFalse(h.valid_slack_url("https://hooks.slack.com.evil.com/services/T0/B0/X"))
+        self.assertFalse(h.valid_slack_url("https://hooks.slack.com/services/T0/B0"))
+        self.assertFalse(h.valid_slack_url("https://hooks.slack.com/services/T0/B0/X?y=1"))
+        self.assertFalse(h.valid_slack_url("https://hooks.slack.com/triggers/T0/1/abc"))
+        self.assertFalse(h.valid_slack_url(self.TEAMS))
+
+    def test_block_kit_lists_findings_with_a_button(self):
+        recs = [{"title": "<boom>", "severity": "critical", "summary": "5xx & rising", "source_log_group": "/aws/lambda/x"}]
+        msg = h.recommendations_slack("123456789012", recs, "https://app.example")
+        self.assertEqual(msg["text"], "🔎 1 new log finding in AWS account 123456789012")
+        self.assertEqual(msg["blocks"][0]["type"], "header")
+        section = msg["blocks"][3]["text"]["text"]
+        self.assertEqual(section, "🔴 *&lt;boom&gt;*\n5xx &amp; rising")
+        self.assertEqual(msg["blocks"][-1]["elements"][0]["url"], "https://app.example/settings/aws")
+
+    def test_sealed_webhooks_open_for_their_team_only(self):
+        class Kms:
+            def decrypt(self, CiphertextBlob, EncryptionContext):
+                if EncryptionContext != {"team": "TEAM#a", "purpose": "notify-webhook"}:
+                    raise RuntimeError("wrong context")
+                return {"Plaintext": CiphertextBlob}
+
+        import base64
+        old = h.kms_client
+        h.kms_client = Kms()
+        try:
+            item = {
+                "slack_webhook_sealed": base64.b64encode(self.SLACK.encode()).decode(),
+                "teams_webhook_url": self.TEAMS,
+            }
+            self.assertEqual(h.open_channels("TEAM#a", item), {"teams": self.TEAMS, "slack": self.SLACK})
+            self.assertEqual(h.open_channels("TEAM#b", item), {"teams": self.TEAMS})
+            # A plain Slack value is never trusted.
+            self.assertEqual(h.open_channels("TEAM#a", {"slack_webhook_url": self.SLACK}), {})
+        finally:
+            h.kms_client = old
+
+    def test_channel_choice_covers_both(self):
+        both = {"teams": self.TEAMS, "slack": self.SLACK}
+        self.assertEqual(h.pick_channels("team", {}, both, True), both)
+        self.assertEqual(h.pick_channels("team", {}, both, False), {})
+        self.assertEqual(h.pick_channels("custom", {"slack": self.SLACK}, both, False), {"slack": self.SLACK})
+        self.assertEqual(h.pick_channels("off", both, both, True), {})
+
+    def test_a_failing_slack_post_does_not_stop_teams(self):
+        posted = []
+
+        def post(url, payload):
+            posted.append(url)
+            if "slack" in url:
+                raise RuntimeError("500")
+
+        recs = [{"title": "t", "severity": "info"}]
+        sent = h.deliver({"slack": self.SLACK, "teams": self.TEAMS}, "1", recs, post=post)
+        self.assertEqual(sent, {"slack": False, "teams": True})
+        self.assertEqual(sorted(posted), sorted([self.SLACK, self.TEAMS]))
+
+
 if __name__ == "__main__":
     unittest.main()

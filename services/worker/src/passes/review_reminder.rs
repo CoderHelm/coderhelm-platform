@@ -1,7 +1,8 @@
 //! Periodic review-reminder sweep. An EventBridge rule (every ~20 min) drops a
 //! `{"type":"review_reminder"}` message on the ticket queue; this pass scans
 //! every repo that has reminders configured, finds open PRs still waiting on a
-//! reviewer, and posts a card to that repo's Microsoft Teams webhook.
+//! reviewer, and posts a reminder to that repo's channels (Microsoft Teams,
+//! Slack or both).
 //!
 //! "People who need to review" = the PR's `requested_reviewers` (GitHub removes
 //! a reviewer from that list once they submit a review), so a non-empty list is
@@ -21,6 +22,8 @@ use crate::clients::github::GitHubClient;
 use crate::passes::{attr_n, attr_s};
 use crate::WorkerState;
 use aws_sdk_dynamodb::types::AttributeValue;
+use common::mcp_credentials::Kms;
+use common::notify::{self, store, Channels};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
@@ -35,7 +38,7 @@ const MAX_CARDS_PER_SWEEP: usize = 5;
 struct RepoReminder {
     team_id: String,
     repo: String, // owner/name
-    webhook_url: String,
+    channels: Channels,
     cooldown_secs: i64,
 }
 
@@ -93,7 +96,7 @@ pub async fn run(state: &WorkerState) -> Result<(), Box<dyn std::error::Error + 
 }
 
 /// Scan the settings table for reviewer configs with reminders enabled and a
-/// non-empty Teams webhook URL. Paginated; bounded so a huge table can't run the
+/// saved channel (Teams or Slack webhook). Paginated; bounded so a huge table can't run the
 /// Lambda forever (logs when truncated rather than silently capping).
 async fn load_reminder_configs(state: &WorkerState) -> Vec<RepoReminder> {
     let mut out = vec![];
@@ -117,12 +120,7 @@ async fn load_reminder_configs(state: &WorkerState) -> Vec<RepoReminder> {
             }
         };
         for item in resp.items() {
-            let webhook_url = item
-                .get("teams_webhook_url")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-                .unwrap_or_default();
-            if webhook_url.trim().is_empty() {
+            if !store::any_set(item) {
                 continue;
             }
             let team_id = item
@@ -144,10 +142,19 @@ async fn load_reminder_configs(state: &WorkerState) -> Vec<RepoReminder> {
                 .and_then(|n| n.parse::<i64>().ok())
                 .filter(|h| *h > 0)
                 .unwrap_or(DEFAULT_COOLDOWN_HOURS);
+            let cipher = Kms {
+                client: &state.kms,
+                key_id: "",
+            };
+            let channels = store::open_all(&cipher, &team_id, item).await;
+            if channels.is_empty() {
+                warn!(repo = %repo, "Reminder channels could not be opened — skipping");
+                continue;
+            }
             out.push(RepoReminder {
                 team_id,
                 repo,
-                webhook_url,
+                channels,
                 cooldown_secs: cooldown_hours * 3600,
             });
         }
@@ -242,14 +249,21 @@ async fn sweep_repo(
         let author = pr["user"]["login"].as_str().unwrap_or("");
         let url = pr["html_url"].as_str().unwrap_or("");
         let age = human_age(pr["created_at"].as_str().unwrap_or(""), now_ts);
-        let card = build_card(&cfg.repo, pr_number, title, author, url, &age, &reviewers);
-        match post_teams(&state.http, &cfg.webhook_url, &card).await {
-            Ok(()) => {
-                save_reminder_state(state, &cfg.team_id, &cfg.repo, pr_number, head, now_ts).await;
-                posted += 1;
-                info!(repo = %cfg.repo, pr = pr_number, reviewers = reviewers.len(), "Posted Teams review reminder");
-            }
-            Err(e) => warn!(repo = %cfg.repo, pr = pr_number, error = %e, "Teams post failed"),
+        let msg = notify::messages::review_reminder(
+            &cfg.repo, pr_number, title, author, url, &age, &reviewers,
+        );
+        let sent = notify::deliver(
+            &notify::Http(&state.http),
+            &cfg.channels,
+            &msg,
+            "review_reminder",
+        )
+        .await;
+        // One channel taking it counts: re-posting would repeat it there.
+        if sent.any_ok() {
+            save_reminder_state(state, &cfg.team_id, &cfg.repo, pr_number, head, now_ts).await;
+            posted += 1;
+            info!(repo = %cfg.repo, pr = pr_number, reviewers = reviewers.len(), "Posted review reminder");
         }
     }
     Ok(())
@@ -328,88 +342,6 @@ fn human_age(created_at: &str, now_ts: i64) -> String {
     } else {
         let d = secs / 86_400;
         format!("{d} day{}", if d == 1 { "" } else { "s" })
-    }
-}
-
-/// Polished Adaptive Card (v1.5) wrapped for a Teams Workflows incoming webhook:
-/// a colored, bled header + FactSet metadata + an Open-PR button. Kept to the
-/// v1.5 primitives Teams renders reliably (Container style tint, FactSet, emoji).
-fn build_card(
-    repo: &str,
-    pr: u64,
-    title: &str,
-    author: &str,
-    url: &str,
-    age: &str,
-    reviewers: &[String],
-) -> serde_json::Value {
-    let who = if reviewers.is_empty() {
-        "the team".to_string()
-    } else {
-        reviewers
-            .iter()
-            .map(|r| format!("@{r}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    serde_json::json!({
-        "type": "message",
-        "attachments": [{
-            "contentType": "application/vnd.microsoft.card.adaptive",
-            "contentUrl": null,
-            "content": {
-                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                "type": "AdaptiveCard",
-                "version": "1.5",
-                "msteams": { "width": "Full" },
-                "body": [
-                    {
-                        "type": "Container",
-                        "bleed": true,
-                        "style": "warning",
-                        "items": [
-                            { "type": "TextBlock", "text": "⏳ Review needed", "weight": "Bolder",
-                              "size": "Large", "color": "Warning", "wrap": true }
-                        ]
-                    },
-                    {
-                        "type": "Container",
-                        "spacing": "Medium",
-                        "items": [
-                            { "type": "TextBlock", "text": title, "weight": "Bolder", "size": "Large", "wrap": true },
-                            { "type": "TextBlock", "text": format!("{repo} · #{pr}"), "isSubtle": true, "spacing": "None", "wrap": true }
-                        ]
-                    },
-                    {
-                        "type": "FactSet",
-                        "spacing": "Medium",
-                        "facts": [
-                            { "title": "Author", "value": author },
-                            { "title": "Open for", "value": age },
-                            { "title": "Waiting on", "value": who }
-                        ]
-                    }
-                ],
-                "actions": [
-                    { "type": "Action.OpenUrl", "title": "Open PR", "url": url }
-                ]
-            }
-        }]
-    })
-}
-
-async fn post_teams(
-    http: &reqwest::Client,
-    webhook_url: &str,
-    card: &serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let resp = http.post(webhook_url).json(card).send().await?;
-    let status = resp.status();
-    if status.is_success() {
-        Ok(())
-    } else {
-        let body = resp.text().await.unwrap_or_default();
-        Err(format!("teams webhook returned {status}: {body}").into())
     }
 }
 

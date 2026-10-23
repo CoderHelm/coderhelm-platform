@@ -10,8 +10,11 @@ pub mod memlock;
 /// Shared so every claim compares its expiry the same way.
 pub mod claim;
 
-/// Teams notifications for alerts: channel resolution and Adaptive Cards.
+/// Alert notifications: which channels an alert posts to, and its messages.
 pub mod alert_notify;
+/// Chat notifications (Teams and Slack): one message model, a renderer per
+/// channel, sealed webhook URLs.
+pub mod notify;
 
 /// Read-only lookups against a team's own systems (their API today). Shared so
 /// the dashboard's test path and the reviewer's tool path enforce the same rules.

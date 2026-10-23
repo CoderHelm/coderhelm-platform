@@ -239,6 +239,7 @@ async fn main() -> Result<(), Error> {
             get(routes::alerts::get_notify).put(routes::alerts::put_notify),
         )
         .route("/alert-notify/test", post(routes::alerts::test_notify))
+        .route("/notify/test", post(routes::alerts::test_notify))
         .route("/alerts", get(routes::alerts::list_events))
         .route("/alerts/event", get(routes::alerts::get_event))
         .route("/reviewer/reviews", get(routes::reviewer::list_reviews))

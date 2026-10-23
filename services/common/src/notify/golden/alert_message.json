@@ -1,0 +1,96 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "title": "View alert",
+            "type": "Action.OpenUrl",
+            "url": "https://app.example.com/alerts/detail?id=4"
+          },
+          {
+            "title": "Open in AWS",
+            "type": "Action.OpenUrl",
+            "url": "https://console.example.com"
+          },
+          {
+            "title": "Log",
+            "type": "Action.OpenUrl",
+            "url": "https://airflow.example.com/log?dag_id=nightly_load"
+          },
+          {
+            "title": "Run",
+            "type": "Action.OpenUrl",
+            "url": "https://airflow.example.com/run/1"
+          }
+        ],
+        "body": [
+          {
+            "bleed": true,
+            "items": [
+              {
+                "color": "Warning",
+                "size": "Medium",
+                "text": "🟠 Airflow failed: nightly_load.extract",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "style": "warning",
+            "type": "Container"
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "spacing": "None",
+            "text": "us-east-1 · 2026-10-12 17:09 UTC",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "spacing": "Small",
+            "text": "The extract task failed after 3 tries.",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "facts": [
+              {
+                "title": "DAG",
+                "value": "nightly_load"
+              },
+              {
+                "title": "Task",
+                "value": "extract"
+              },
+              {
+                "title": "Error",
+                "value": "KeyError: 'id'"
+              }
+            ],
+            "spacing": "Small",
+            "type": "FactSet"
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "spacing": "Small",
+            "text": "🤖 Notification only: no automatic fix for this alert.",
+            "type": "TextBlock",
+            "wrap": true
+          }
+        ],
+        "msteams": {
+          "width": "Full"
+        },
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive",
+      "contentUrl": null
+    }
+  ],
+  "type": "message"
+}

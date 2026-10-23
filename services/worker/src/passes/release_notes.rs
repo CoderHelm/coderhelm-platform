@@ -19,7 +19,7 @@
 //!
 //! Every step's result is recorded per tag (RELEASE#{owner}/{repo}#{tag}), so a
 //! retry or a dashboard re-send only redoes what is missing. A failed step posts
-//! to the repo's Teams webhook when one is configured.
+//! to the repo's channels (Teams, Slack) when any are configured.
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use serde::Deserialize;
@@ -71,7 +71,8 @@ pub struct ReleaseNotesConfig {
     pub guide_path: String,
     /// Extra free-text instructions (audience, tone, product name…).
     pub instructions: String,
-    pub teams_webhook_url: String,
+    /// Where a failure is posted: the repo's reviewer channels.
+    pub channels: common::notify::Channels,
 }
 
 impl ReleaseNotesConfig {
@@ -103,6 +104,15 @@ impl ReleaseNotesConfig {
                 .unwrap_or(false)
         };
         let killed = b("killed");
+        let channels = common::notify::store::open_all(
+            &common::mcp_credentials::Kms {
+                client: &state.kms,
+                key_id: "",
+            },
+            team_id,
+            &item,
+        )
+        .await;
         let container = s("release_notes_confluence_container");
         Self {
             enabled: b("release_notes") && !killed,
@@ -118,7 +128,7 @@ impl ReleaseNotesConfig {
             email_webhook_secret: s("release_notes_email_webhook_secret"),
             guide_path: s("release_notes_guide"),
             instructions: s("release_notes_instructions"),
-            teams_webhook_url: s("teams_webhook_url"),
+            channels,
         }
     }
 }
@@ -660,7 +670,7 @@ pub async fn run(
                 enqueue_after(state, &next, notes_retry_delay(next.attempt)).await
             };
             if !retried {
-                alert_teams(state, &cfg, owner, repo, &msg.tag, &e.to_string()).await;
+                alert_channels(state, &cfg, owner, repo, &msg.tag, &e.to_string()).await;
             }
         }
     }
@@ -996,7 +1006,7 @@ async fn claim(state: &WorkerState, team_id: &str, sk: &str, ttl_secs: u64) -> b
     }
 }
 
-async fn alert_teams(
+async fn alert_channels(
     state: &WorkerState,
     cfg: &ReleaseNotesConfig,
     owner: &str,
@@ -1004,34 +1014,17 @@ async fn alert_teams(
     tag: &str,
     error: &str,
 ) {
-    if cfg.teams_webhook_url.trim().is_empty() {
+    if cfg.channels.is_empty() {
         return;
     }
-    let card = json!({
-        "type": "message",
-        "attachments": [{
-            "contentType": "application/vnd.microsoft.card.adaptive",
-            "content": {
-                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                "type": "AdaptiveCard",
-                "version": "1.5",
-                "body": [
-                    {"type": "TextBlock", "text": format!("⚠️ Release notes failed — {owner}/{repo} {tag}"), "weight": "Bolder", "wrap": true, "color": "Attention"},
-                    {"type": "TextBlock", "text": common::truncate_str(error, 500), "wrap": true},
-                    {"type": "TextBlock", "text": "Send them again from CoderHelm → Releases once fixed.", "wrap": true, "isSubtle": true}
-                ]
-            }
-        }]
-    });
-    if let Err(e) = state
-        .http
-        .post(cfg.teams_webhook_url.trim())
-        .json(&card)
-        .send()
-        .await
-    {
-        warn!(error = %e, "Release notes: Teams alert failed");
-    }
+    let msg = common::notify::messages::release_notes_failed(owner, repo, tag, error);
+    common::notify::deliver(
+        &common::notify::Http(&state.http),
+        &cfg.channels,
+        &msg,
+        "release_notes",
+    )
+    .await;
 }
 
 #[cfg(test)]

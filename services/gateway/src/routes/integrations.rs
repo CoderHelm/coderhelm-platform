@@ -3,7 +3,7 @@
 //! checked and the one thing to do next.
 //!
 //! Members see it read-only; admins act on it through each integration's own
-//! routes (GitHub, Jira, AWS, New Relic and Confluence, MCP servers, Teams).
+//! routes (GitHub, Jira, AWS, New Relic and Confluence, MCP servers, Teams, Slack).
 //!
 //! A connected AWS account is one integration with abilities (logs, metrics,
 //! Airflow). What the account's role can do is found by a read-only check,
@@ -69,7 +69,7 @@ pub fn section_of(id: &str) -> &'static str {
         "aws" | "opensearch" | "rest" => "cloud",
         "newrelic" | "sentry" => "monitoring",
         "confluence" | "notion" | "figma" | "sanity" => "docs",
-        "teams" => "chat",
+        "teams" | "slack" => "chat",
         _ => "other",
     }
 }
@@ -480,25 +480,39 @@ pub async fn list(
         }
     }
 
-    // Teams.
-    let teams_on = teams.enabled && !teams.url.is_empty();
-    items.push(card(
-        "teams",
-        "Microsoft Teams",
-        "Posts alert cards, pull request links and recoveries to a Teams channel.",
-        match (teams.url.is_empty(), teams.enabled) {
-            (true, _) => cs("not_connected", "", "connect"),
-            (false, false) => cs(
-                "connected",
-                "A channel is saved but posting is off.",
-                "manage",
+    // Chat channels: the team's alert channel, per channel.
+    {
+        use common::notify::{store, ChannelKind};
+        for (kind, does) in [
+            (
+                ChannelKind::Teams,
+                "Posts alert cards, pull request links and recoveries to a Teams channel.",
             ),
-            (false, true) => cs("connected", "", "manage"),
-        },
-        "",
-        "",
-        json!({ "enabled": teams_on, "has_webhook": !teams.url.is_empty() }),
-    ));
+            (
+                ChannelKind::Slack,
+                "Posts alerts, pull request links and recoveries to a Slack channel.",
+            ),
+        ] {
+            let saved = store::stored(&teams.item, kind).is_set();
+            items.push(card(
+                kind.key(),
+                kind.label(),
+                does,
+                match (saved, teams.enabled) {
+                    (false, _) => cs("not_connected", "", "connect"),
+                    (true, false) => cs(
+                        "connected",
+                        "A channel is saved but posting is off.",
+                        "manage",
+                    ),
+                    (true, true) => cs("connected", "", "manage"),
+                },
+                "",
+                "",
+                json!({ "enabled": teams.enabled && saved, "has_webhook": saved }),
+            ));
+        }
+    }
 
     // MCP servers.
     for p in super::plugins::catalog_json() {
@@ -736,6 +750,7 @@ mod tests {
             assert_eq!(section_of(d), "docs");
         }
         assert_eq!(section_of("teams"), "chat");
+        assert_eq!(section_of("slack"), "chat");
         assert_eq!(section_of("linear"), "other");
     }
 

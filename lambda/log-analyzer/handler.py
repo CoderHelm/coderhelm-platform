@@ -11,6 +11,7 @@ Triggered by EventBridge every 6 hours. For each team with an AWS connection:
 No raw logs are stored — only error summaries and recommendations.
 """
 
+import base64
 import hashlib
 import json
 import logging
@@ -44,6 +45,7 @@ dynamodb_client = boto3.client("dynamodb")
 aws_insights_table = dynamodb.Table(AWS_INSIGHTS_TABLE)
 settings_table = dynamodb.Table(SETTINGS_TABLE)
 sts_client = boto3.client("sts")
+kms_client = boto3.client("kms")
 
 # ── Pre-built Insights Queries ──────────────────────────────────
 
@@ -809,17 +811,23 @@ def record_connection_success(team_id, account_id):
         logger.warning(f"Failed to record connection success: {e}")
 
 
-# ─── Teams notifications for new recommendations ──────────────────────────
+# ─── Chat notifications (Teams, Slack) for new recommendations ─────────────
+#
+# Mirrors common::notify in the services: a destination posts to Teams, Slack
+# or both, each webhook is sealed with KMS (bound to the team), and a failure
+# on one channel never stops the other.
 
 REC_NOTIFY_SK = "REC_NOTIFY"
 TEAM_CHANNEL_SK = "ALERT_NOTIFY"  # the team's alert channel (common::alert_notify)
 WEBHOOK_HOST_SUFFIXES = (".powerplatform.com", ".logic.azure.com", ".webhook.office.com")
+SLACK_PREFIX = "https://hooks.slack.com/services/"
 SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
 SEVERITY_ICON = {"critical": "🔴", "warning": "🟠", "info": "🔵"}
+CHANNELS = ("teams", "slack")
 
 
 def valid_webhook_url(url):
-    """https on a Microsoft webhook host (mirrors common::alert_notify)."""
+    """https on a Microsoft webhook host (mirrors common::notify::teams)."""
     if not isinstance(url, str) or not url.startswith("https://") or len(url) > 1000:
         return False
     if any(c.isspace() for c in url):
@@ -831,13 +839,63 @@ def valid_webhook_url(url):
     return host.endswith(WEBHOOK_HOST_SUFFIXES)
 
 
-def pick_webhook(mode, own_url, team_url, team_enabled):
-    """The channel new recommendations post to. Off unless the team turned it on."""
+def valid_slack_url(url):
+    """https://hooks.slack.com/services/<team>/<bot>/<secret> (mirrors common::notify::slack)."""
+    if not isinstance(url, str) or len(url) > 500 or not url.startswith(SLACK_PREFIX):
+        return False
+    parts = url[len(SLACK_PREFIX):].split("/")
+    return len(parts) == 3 and all(p and p.isascii() and p.isalnum() for p in parts)
+
+
+VALID = {"teams": valid_webhook_url, "slack": valid_slack_url}
+
+
+def open_webhook(team_id, item, channel):
+    """The URL one channel posts to: sealed (KMS, bound to the team), or a
+    Teams URL saved before sealing. None when unset or unreadable."""
+    sealed = item.get(f"{channel}_webhook_sealed") or ""
+    if sealed:
+        try:
+            out = kms_client.decrypt(
+                CiphertextBlob=base64.b64decode(sealed),
+                EncryptionContext={"team": team_id, "purpose": "notify-webhook"},
+            )
+            url = out["Plaintext"].decode("utf-8")
+        except Exception as e:  # noqa: BLE001 - one channel never stops the other
+            logger.warning(f"Could not open the saved {channel} webhook: {type(e).__name__}")
+            return None
+    elif channel == "teams":
+        url = item.get("teams_webhook_url") or ""
+    else:
+        return None
+    url = url.strip()
+    return url if url and VALID[channel](url) else None
+
+
+def open_channels(team_id, item):
+    """{channel: url} for every channel the item can post to."""
+    out = {}
+    for ch in CHANNELS:
+        url = open_webhook(team_id, item, ch)
+        if url:
+            out[ch] = url
+    return out
+
+
+def pick_channels(mode, own, team, team_enabled):
+    """The channels new recommendations post to. Off unless the team turned it on."""
     if mode == "custom":
-        return own_url if valid_webhook_url(own_url) else None
-    if mode == "team":
-        return team_url if team_enabled and valid_webhook_url(team_url) else None
-    return None
+        return own
+    if mode == "team" and team_enabled:
+        return team
+    return {}
+
+
+def pick_webhook(mode, own_url, team_url, team_enabled):
+    """One Teams URL (kept for callers of the single-channel shape)."""
+    own = {"teams": own_url} if valid_webhook_url(own_url) else {}
+    team = {"teams": team_url} if valid_webhook_url(team_url) else {}
+    return pick_channels(mode, own, team, team_enabled).get("teams")
 
 
 def recommendations_card(account_id, recs, dashboard_url):
@@ -910,8 +968,80 @@ def recommendations_card(account_id, recs, dashboard_url):
     }
 
 
+def slack_text(text):
+    """Text as Slack mrkdwn: &, < and > escaped (mirrors common::notify::slack)."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("**", "*")
+
+
+def recommendations_slack(account_id, recs, dashboard_url):
+    """Block Kit (Slack incoming webhook) listing new findings."""
+    recs = sorted(recs, key=lambda r: SEVERITY_ORDER.get(r.get("severity"), 3))
+    n = len(recs)
+    title = f"🔎 {n} new log finding{'s' if n != 1 else ''}"
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": title[:150], "emoji": True}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"CloudWatch Logs · AWS account {account_id}"}]},
+    ]
+    for r in recs[:5]:
+        sev = r.get("severity", "info")
+        head = f"{SEVERITY_ICON.get(sev, '⚪')} *{slack_text(str(r.get('title', 'Finding'))[:150])}*"
+        summary = slack_text(str(r.get("summary", ""))[:400])
+        blocks.append({"type": "divider"})
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"{head}\n{summary}".strip()[:3000]}})
+        if r.get("source_log_group"):
+            blocks.append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": slack_text(str(r["source_log_group"])[:200])}],
+            })
+    if n > 5:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"+{n - 5} more"}]})
+    blocks.append({
+        "type": "actions",
+        "elements": [{
+            "type": "button",
+            "action_id": "link-0",
+            "text": {"type": "plain_text", "text": "Review findings", "emoji": True},
+            "url": f"{dashboard_url}/settings/aws",
+        }],
+    })
+    return {"text": f"{title} in AWS account {account_id}", "blocks": blocks}
+
+
+RENDER = {"teams": recommendations_card, "slack": recommendations_slack}
+
+
+def post_json(url, payload):
+    """POST one payload. Raises on a non-2xx answer; the URL is never logged."""
+    req = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(req, timeout=10) as resp:
+        if resp.status >= 300:
+            raise RuntimeError(f"webhook returned {resp.status}")
+
+
+def deliver(channels, account_id, recs, post=post_json):
+    """Post to every channel; one failing never stops the next. Returns
+    {channel: True/False}."""
+    sent = {}
+    for ch, url in channels.items():
+        try:
+            post(url, RENDER[ch](account_id, recs, DASHBOARD_URL))
+            sent[ch] = True
+        except HTTPError as e:
+            logger.warning(f"{ch} notification failed ({e.code})")
+            sent[ch] = False
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"{ch} notification failed: {type(e).__name__}")
+            sent[ch] = False
+    return sent
+
+
 def notify_new_recommendations(team_id, account_id, recs):
-    """Post one card for this run's new findings. Best effort."""
+    """Post this run's new findings to the team's chosen channels. Best effort."""
     if not recs:
         return
     try:
@@ -920,28 +1050,17 @@ def notify_new_recommendations(team_id, account_id, recs):
         if mode == "off":
             return
         team = settings_table.get_item(Key={"pk": team_id, "sk": TEAM_CHANNEL_SK}).get("Item") or {}
-        url = pick_webhook(
+        enabled = bool(team.get("enabled", False))
+        channels = pick_channels(
             mode,
-            own.get("teams_webhook_url", ""),
-            team.get("teams_webhook_url", ""),
-            bool(team.get("enabled", False)),
+            open_channels(team_id, own) if mode == "custom" else {},
+            open_channels(team_id, team) if mode == "team" and enabled else {},
+            enabled,
         )
-        if not url:
-            return
-        card = recommendations_card(account_id, recs, DASHBOARD_URL)
-        req = Request(
-            url,
-            data=json.dumps(card).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urlopen(req, timeout=10) as resp:
-            if resp.status >= 300:
-                logger.warning(f"Teams webhook returned {resp.status}")
-    except HTTPError as e:
-        logger.warning(f"Teams notification failed ({e.code})")
-    except Exception as e:
-        logger.warning(f"Teams notification failed: {e}")
+        if channels:
+            deliver(channels, account_id, recs)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Recommendation notification failed: {type(e).__name__}")
 
 
 def ulid_now():

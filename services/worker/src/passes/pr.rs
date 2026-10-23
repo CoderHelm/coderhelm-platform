@@ -640,7 +640,7 @@ Return ONLY the markdown body text."#,
 }
 
 /// For a run started by an alert, post a follow-up card with the new PR's link
-/// to the alert's Teams channel. Best effort: never affects the run.
+/// to the alert's channels (Teams, Slack). Best effort: never affects the run.
 async fn notify_alert_pr(
     state: &WorkerState,
     msg: &TicketMessage,
@@ -672,12 +672,21 @@ async fn notify_alert_pr(
             .cloned()
             .unwrap_or_default()
     };
-    let Some(webhook) =
-        common::alert_notify::notify_target(&state.dynamo, table, &msg.team_id, &s("topic_arn"))
-            .await
-    else {
-        return;
+    let cipher = common::mcp_credentials::Kms {
+        client: &state.kms,
+        key_id: "",
     };
+    let channels = common::alert_notify::notify_target(
+        &state.dynamo,
+        &cipher,
+        table,
+        &msg.team_id,
+        &s("topic_arn"),
+    )
+    .await;
+    if channels.is_empty() {
+        return;
+    }
     let base = super::skills::app_url(&state.config.stage);
     let alert_id = s("alert_id");
     let alert_url = if alert_id.is_empty() {
@@ -688,7 +697,7 @@ async fn notify_alert_pr(
     let alert_title = Some(s("title"))
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| msg.title.clone());
-    let card = common::alert_notify::fix_card(
+    let card = common::alert_notify::fix_message(
         &alert_title,
         &format!("{}/{}", msg.repo_owner, msg.repo_name),
         number,
@@ -696,7 +705,13 @@ async fn notify_alert_pr(
         url,
         &alert_url,
     );
-    common::alert_notify::send(&state.http, &webhook, &card, "alert_pr").await;
+    common::notify::deliver(
+        &common::notify::Http(&state.http),
+        &channels,
+        &card,
+        "alert_pr",
+    )
+    .await;
 }
 
 /// Reopen the branch's prior closed-unmerged PR, if any. A ticket-update

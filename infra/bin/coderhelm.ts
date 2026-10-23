@@ -108,6 +108,7 @@ new LogAnalyzerStack(app, `${prefix}-log-analyzer`, {
   stage,
   awsInsightsTable: database.awsInsightsTable,
   settingsTable: database.settingsTable,
+  secretsKey: database.secretsKey,
 });
 
 // --- Streaming (SSE via Lambda Function URL + Web Adapter) ---
