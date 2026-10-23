@@ -2052,6 +2052,21 @@ impl GitHubClient {
         .await
     }
 
+    /// The issue/PR events (closed, reopened, merged, ...), oldest first: a
+    /// `closed` event carries who closed it (`actor`) and when.
+    pub async fn list_issue_events(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_pages(
+            &format!("{API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/events"),
+            5,
+        )
+        .await
+    }
+
     /// GET a list endpoint page by page (100 per page) and concatenate the
     /// arrays, up to `max_pages`. Stops at the first short page.
     async fn get_pages(

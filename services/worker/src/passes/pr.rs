@@ -1240,10 +1240,10 @@ fn owned_sections(plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> super::co
     super::completeness::Owned {
         mirrors: super::completeness::mirrors_section(proof.mirrors),
         merge_order: String::new(),
-        not_in_pr: super::completeness::not_in_pr_section(&super::fix_location::not_in_pr_steps(
-            plan.fix.as_ref(),
-            repo,
-        )),
+        not_in_pr: super::completeness::for_people_section(
+            &super::fix_location::not_in_pr_steps(plan.fix.as_ref(), repo),
+            plan.fix.as_ref().map_or(&[][..], |d| &d.questions),
+        ),
         open_items: proof.gaps.to_string(),
     }
 }

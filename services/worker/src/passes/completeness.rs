@@ -9,7 +9,7 @@
 //! - the block a change mirrors, read from the coder's `mirrors.json` notes
 //!   and rendered under Changes ([`parse_mirrors`], [`mirrors_section`]);
 //! - the steps outside the PR, from the plan's end-to-end checklist
-//!   ([`not_in_pr_section`], [`checklist_gaps`]), and the merge order of a
+//!   ([`for_people_section`], [`checklist_gaps`]), and the merge order of a
 //!   multi-repo run ([`merge_order_section`]);
 //! - the environments the diff changes, from its paths, each needing its own
 //!   evidence line ([`changed_environments`], [`env_gaps`]);
@@ -355,16 +355,34 @@ pub fn mirrors_section(mirrors: &[Mirror]) -> String {
     out
 }
 
-/// The section listing every step outside this PR, one bullet each with its
-/// owner. Empty when the plan has none.
-pub fn not_in_pr_section(steps: &[(String, String)]) -> String {
-    if steps.is_empty() {
+/// What this PR leaves to people: every step outside it with its owner,
+/// then the plan's questions only a person can answer, numbered. Empty when
+/// there is neither.
+pub fn for_people_section(steps: &[(String, String)], questions: &[String]) -> String {
+    let questions: Vec<String> = questions
+        .iter()
+        .map(|q| one_line(q))
+        .filter(|q| !q.is_empty())
+        .collect();
+    if steps.is_empty() && questions.is_empty() {
         return String::new();
     }
     let (start, end) = Section::NotInPr.markers();
-    let mut out = format!("{start}\n## Not in this PR\n");
-    for (step, owner) in steps {
-        out.push_str(&format!("* {step} (owner: {owner})\n"));
+    let mut out = format!("{start}\n");
+    if !steps.is_empty() {
+        out.push_str("## Not in this PR\n");
+        for (step, owner) in steps {
+            out.push_str(&format!("* {step} (owner: {owner})\n"));
+        }
+    }
+    if !questions.is_empty() {
+        if !steps.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("## Questions only a person can answer\n");
+        for (i, q) in questions.iter().enumerate() {
+            out.push_str(&format!("{}. {q}\n", i + 1));
+        }
     }
     out.push_str(end);
     out
@@ -940,9 +958,9 @@ mod tests {
                 ),
             ]
         );
-        let s = not_in_pr_section(&steps);
+        let s = for_people_section(&steps, &[]);
         assert!(s.contains("## Not in this PR\n* Allow the vendor's IP range on the database firewall (owner: the network team)\n"));
-        assert_eq!(not_in_pr_section(&[]), "");
+        assert_eq!(for_people_section(&[], &[]), "");
         // The step with nobody named is an Open item, never a fix round.
         let g = checklist_gaps(Some(&d), "acme/infra");
         assert_eq!(g.len(), 1, "{g:?}");
@@ -1033,7 +1051,7 @@ mod tests {
                 ],
                 0,
             ),
-            not_in_pr: not_in_pr_section(&[("Allow the IP".into(), "the network team".into())]),
+            not_in_pr: for_people_section(&[("Allow the IP".into(), "the network team".into())], &[]),
             open_items: format!(
                 "{}\n## Open items\n- **Waiting on CI:** tests did not run. Settles when this PR's CI passes. <!-- coderhelm:ci -->\n{}",
                 crate::passes::proof::UNVERIFIED_START,
@@ -1157,5 +1175,28 @@ mod tests {
         assert_eq!(h.len(), 6, "{h:?}");
         assert!(placeholder_holes("Closes #4\n\n**Summary** Secret at `/app/prod/db-password`, see https://x.io/y <details><summary>a</summary></details>").is_empty());
         assert!(placeholder_holes("x <>").iter().any(|x| x.contains("`<>`")));
+    }
+}
+
+#[cfg(test)]
+mod for_people_tests {
+    use super::*;
+
+    #[test]
+    fn the_pr_carries_the_plans_questions_for_people() {
+        assert_eq!(for_people_section(&[], &[" ".into()]), "");
+        let only_questions = for_people_section(&[], &["Use the existing schema?".into()]);
+        assert!(only_questions
+            .contains("## Questions only a person can answer\n1. Use the existing schema?"));
+        assert!(!only_questions.contains("## Not in this PR"));
+        let both = for_people_section(
+            &[("Allow the job's subnet".into(), "the network team".into())],
+            &["Why was #41 closed?".into(), "Which schema?".into()],
+        );
+        assert!(both.contains("* Allow the job's subnet (owner: the network team)\n\n## Questions"));
+        assert!(both.contains("2. Which schema?"));
+        // Kept whole when the description is rewritten.
+        let (owned, _) = take_owned(&format!("## Summary\nx\n\n{both}"));
+        assert!(owned.not_in_pr.contains("1. Why was #41 closed?"));
     }
 }

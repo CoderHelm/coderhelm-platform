@@ -532,13 +532,18 @@ impl LiveSources {
                  data back through the code that produces it. If the data is right, the bug is in \
                  the code that reads or shows it. If the logs show an error, find the code that \
                  raised it. Put what you found in the plan as the evidence for the root cause, and \
-                 say plainly if you could not reproduce it."
+                 say plainly if you could not reproduce it. ENVIRONMENTS: when the evidence \
+                 concerns more than one environment, prove which one each lookup hit with data \
+                 that only exists there (the team's instructions or a source's guide may name it) \
+                 instead of saying you didn't confirm it."
             }
             Role::Coder => {
                 "Use them to confirm the real shape of the running system before you write code \
                  against it: exact field, table and column names, types, whether something \
                  exists. When fixing a reported bug, check the records it names and the errors it \
-                 left in the logs, to confirm your fix addresses what actually happened. Never copy \
+                 left in the logs, to confirm your fix addresses what actually happened. When the \
+                 work spans environments, prove which one each lookup hit with data that only \
+                 exists there. Never copy \
                  values you read (ids, names, records, log lines) into code, tests, fixtures or \
                  commit messages; use field, table and type names only."
             }

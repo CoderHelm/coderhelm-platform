@@ -15,6 +15,61 @@ pub struct TriageResult {
     pub branch_slug: String,
     pub clarity: String,
     pub questions: Vec<String>,
+    /// What the ticket asks for, as the model read it. A triage saved before
+    /// the field existed reads as a bug: the flow every run had then.
+    #[serde(default)]
+    pub intent: TicketIntent,
+}
+
+/// What a ticket asks for. Decides how the planner frames the work: a bug is
+/// traced to its cause (in the code or in data), new work is planned as what
+/// to build and what only a person can decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketIntent {
+    /// Something that worked, or should work, is wrong.
+    #[default]
+    Bug,
+    /// Something new to build, create or add.
+    Feature,
+    /// Upkeep with no new behaviour: a dependency bump, config, cleanup.
+    Chore,
+    /// A request for information, not a change.
+    Question,
+}
+
+impl TicketIntent {
+    /// Reads the model's value. Anything it can't name is a bug, so an
+    /// unreadable answer keeps the root-cause flow.
+    pub fn parse(s: &str) -> TicketIntent {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "feature" => TicketIntent::Feature,
+            "chore" => TicketIntent::Chore,
+            "question" => TicketIntent::Question,
+            _ => TicketIntent::Bug,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TicketIntent::Bug => "bug",
+            TicketIntent::Feature => "feature",
+            TicketIntent::Chore => "chore",
+            TicketIntent::Question => "question",
+        }
+    }
+
+    /// A bug: the only intent framed as "where is the fault".
+    pub fn is_bug(self) -> bool {
+        self == TicketIntent::Bug
+    }
+}
+
+impl<'de> Deserialize<'de> for TicketIntent {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = Option::<String>::deserialize(d)?;
+        Ok(s.as_deref().map(TicketIntent::parse).unwrap_or_default())
+    }
 }
 
 pub async fn run(
@@ -83,6 +138,11 @@ Return a JSON object with these fields:
 - "branch_slug": short kebab-case slug for the branch suffix (e.g., "add-retry-logic")
 - "clarity": "clear" if you have enough info to implement, "needs_clarification" if not
 - "questions": list of specific questions if clarity is "needs_clarification" (empty list if clear)
+- "intent": what the ticket asks for, read from its meaning (not its wording or its labels):
+  - "bug": something that works, or should work, is wrong, missing or failing for its users
+  - "feature": something new to build, create or add (a new user, resource, endpoint, page, job, integration or setting), including setup work that never existed before
+  - "chore": upkeep with no new behaviour (a dependency bump, a config value, a cleanup, a rename)
+  - "question": asks for information or an investigation, not a change
 
 Rules:
 - If the issue is vague, ambiguous, or missing acceptance criteria, set clarity to "needs_clarification".
@@ -160,7 +220,7 @@ Rules:
             common::truncate_str(raw, 200)
         )
     })?;
-    info!(complexity = %result.complexity, clarity = %result.clarity, "Triage complete");
+    info!(complexity = %result.complexity, clarity = %result.clarity, intent = result.intent.as_str(), "Triage complete");
     Ok(result)
 }
 
@@ -727,5 +787,31 @@ mod tests {
             extract_repo_choice("org/WEB-APP", &repos).as_deref(),
             Some("Org/web-app")
         );
+    }
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::{TicketIntent, TriageResult};
+
+    #[test]
+    fn the_models_intent_is_read_and_anything_else_is_a_bug() {
+        let r: TriageResult = serde_json::from_str(
+            r#"{"complexity":"simple","summary":"s","branch_slug":"b","clarity":"clear","questions":[],"intent":"Feature"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.intent, TicketIntent::Feature);
+        // A triage saved before the field existed keeps the bug flow.
+        let old: TriageResult = serde_json::from_str(
+            r#"{"complexity":"simple","summary":"s","branch_slug":"b","clarity":"clear","questions":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.intent, TicketIntent::Bug);
+        assert_eq!(TicketIntent::parse("chore"), TicketIntent::Chore);
+        assert_eq!(TicketIntent::parse("question"), TicketIntent::Question);
+        assert_eq!(TicketIntent::parse("enhancement"), TicketIntent::Bug);
+        assert!(!TicketIntent::Feature.is_bug());
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"intent\":\"feature\""), "{json}");
     }
 }

@@ -12,6 +12,8 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+pub use super::triage::TicketIntent;
+
 /// The fence the planner writes its decision in.
 pub const FENCE: &str = "fix_location.json";
 
@@ -93,6 +95,73 @@ pub struct FixEvidence {
     /// How many records have the same defect, from a query.
     #[serde(default)]
     pub scope: String,
+    /// Which environment each lookup hit, and the data that proves it.
+    #[serde(default)]
+    pub environments: Vec<EnvCheck>,
+    /// Existing objects close to what the ticket names, followed to the end.
+    #[serde(default)]
+    pub near_matches: Vec<NearMatch>,
+}
+
+/// One environment the evidence concerns, and how the planner proved a
+/// lookup hit it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvCheck {
+    /// The environment (`prod`, `staging`, an account or cluster name).
+    #[serde(default)]
+    pub env: String,
+    /// The data the lookup returned that only exists in that environment,
+    /// or, when unproven, the access that is missing.
+    #[serde(default)]
+    pub proof: String,
+    /// Whether a lookup proved it.
+    #[serde(default)]
+    pub proven: bool,
+}
+
+/// An existing object close to what the ticket names (a similar name, the
+/// same purpose), and what the planner found about it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NearMatch {
+    /// The existing object.
+    #[serde(default)]
+    pub name: String,
+    /// What the ticket names instead.
+    #[serde(default)]
+    pub asked_for: String,
+    /// Who owns it.
+    #[serde(default)]
+    pub owner: String,
+    /// Who can use it (grants, permissions, policies).
+    #[serde(default)]
+    pub grants: String,
+    /// What is in it.
+    #[serde(default)]
+    pub contents: String,
+    /// What created it (a repository file, a job), or where it was searched for.
+    #[serde(default)]
+    pub origin: String,
+    /// The one decisive question for a person.
+    #[serde(default)]
+    pub question: String,
+}
+
+impl NearMatch {
+    /// What the planner left unfound about it, by name.
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        for (field, value) in [
+            ("owner", &self.owner),
+            ("contents", &self.contents),
+            ("origin", &self.origin),
+            ("question", &self.question),
+        ] {
+            if value.trim().is_empty() {
+                out.push(field);
+            }
+        }
+        out
+    }
 }
 
 /// What writes a wrong value: code (a repository file and function the
@@ -154,6 +223,18 @@ pub struct FixDecision {
     /// The PR lists the steps outside it under "Not in this PR".
     #[serde(default)]
     pub end_to_end: Vec<EndToEndStep>,
+    /// What the ticket asks for, from triage (never from the planner's
+    /// block): a bug is traced to its fault; new work is not.
+    #[serde(default)]
+    pub intent: TicketIntent,
+    /// What only a person can answer, one decision each. Shown in the plan,
+    /// on the ticket and in the pull request.
+    #[serde(default, deserialize_with = "string_or_list")]
+    pub questions: Vec<String>,
+    /// What the plan's own check found still open after the planner was
+    /// sent back once (see `plan_judge`), one line each.
+    #[serde(default, deserialize_with = "string_or_list")]
+    pub open_gaps: Vec<String>,
 }
 
 /// One step of the whole job, and who does it.
@@ -289,7 +370,9 @@ pub fn gaps(
     if basis == "data" && can_look_up && lookups == 0 {
         out.push("Your decision rests on data, but you made no lookups. Check the records the ticket and the comments name against the connected data (stored values by id, and the sync or pipeline that writes them).".to_string());
     }
-    if !settled || basis == "feature" {
+    // New work, upkeep and questions have no fault to trace: no producer of
+    // a wrong value, no count of records sharing a defect.
+    if !settled || basis == "feature" || !d.intent.is_bug() {
         return out;
     }
     if basis.is_empty() {
@@ -329,6 +412,9 @@ fn basis_of(d: &FixDecision) -> &'static str {
         "data" => return "data",
         "feature" => return "feature",
         _ => {}
+    }
+    if !d.intent.is_bug() {
+        return "feature";
     }
     match d.evidence.producer.kind.trim() {
         "code" => "code",
@@ -415,6 +501,15 @@ pub fn jira_text(markdown: &str) -> String {
         .join("\n\n")
 }
 
+/// The decision in the planner's reply with the ticket's intent from
+/// triage on it (the planner's block never sets it).
+pub fn parse_for(response: &str, intent: TicketIntent) -> Option<FixDecision> {
+    parse(response).map(|mut d| {
+        d.intent = intent;
+        d
+    })
+}
+
 /// The decision in the planner's reply, if it wrote one that reads.
 pub fn parse(response: &str) -> Option<FixDecision> {
     let marker = format!("```{FENCE}");
@@ -426,7 +521,13 @@ pub fn parse(response: &str) -> Option<FixDecision> {
         .unwrap_or(response.len());
     let raw = response[body_start..end].trim();
     match serde_json::from_str::<FixDecision>(raw) {
-        Ok(d) => Some(d),
+        Ok(mut d) => {
+            // What the ticket asks for comes from triage, never the block.
+            d.intent = TicketIntent::default();
+            // What is still open is the plan check's to say.
+            d.open_gaps.clear();
+            Some(d)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "Planner's fix_location block didn't read");
             None
@@ -434,8 +535,62 @@ pub fn parse(response: &str) -> Option<FixDecision> {
     }
 }
 
-/// The planner's instructions for the decision, appended to its prompt.
-pub const PLANNER_GUIDANCE: &str = r#"## Where the fix belongs (decide before you plan code)
+/// The planner's instructions for the decision, appended to its prompt, by
+/// what the ticket asks for: a bug is traced to where its fault is; new
+/// work, upkeep and questions are not framed as a fault. Every plan gets the
+/// rules on the ticket's earlier pull requests, environments and near
+/// matches, and the end-to-end checklist with the block.
+pub fn planner_guidance(intent: TicketIntent) -> String {
+    let framing = match intent {
+        TicketIntent::Bug => BUG_GUIDANCE,
+        TicketIntent::Feature | TicketIntent::Chore => NEW_WORK_GUIDANCE,
+        TicketIntent::Question => QUESTION_GUIDANCE,
+    };
+    format!("{framing}\n\n{EVERY_PLAN_GUIDANCE}\n\n{CHECKLIST_GUIDANCE}")
+}
+
+/// For a ticket that asks for something new (or upkeep): what to build, not
+/// where a fault is.
+const NEW_WORK_GUIDANCE: &str = r#"## This ticket asks for new work (not a bug)
+
+Triage read this ticket as something new to build (or upkeep), not as a fault. Don't frame it as a bug: there is no "is the code or the data at fault" question and no root cause to trace.
+- Say what to build: each object, file and setting to create or change, which repository each lives in, and the order the pull requests merge.
+- Look at what exists first: the pattern the team's repositories use for the same kind of thing (copy it), and anything already close to what the ticket names (see "Something close to what the ticket names" below).
+- Ask only what a person must decide: put each in `questions`, one decision per question, specific (name the options you found). Never ask what a lookup, the code or the ticket's history can answer.
+- Set `fix_location` to `code`, or `both` when a person or a vendor makes part of it outside the code. Use `unknown` only when a question in `questions` blocks every task; then tasks.md is `NO_CODE_CHANGE: <the blocking question>`.
+- `evidence.basis` is `feature`; `producer` and `scope` stay empty; `cause` says in one or two sentences what is being built and why.
+- If an earlier pull request for this ticket already holds the design, build on it: plan code again and say in `history_check` what you kept, what changes this time and why."#;
+
+/// For a ticket that asks a question: answer it, don't trace a fault.
+const QUESTION_GUIDANCE: &str = r#"## This ticket asks a question (not a bug)
+
+Triage read this ticket as a request for information. Answer it from what you can read and look up; don't frame it as a fault.
+- Put the answer in `cause`, each lookup behind it in `looked_up`, and what only a person can decide in `questions`.
+- When the ticket also asks for a change, plan it as new work (`code`); otherwise set `fix_location` to `unknown` and tasks.md to `NO_CODE_CHANGE: <the answer in one line>`.
+- `evidence.basis` is `feature`; `producer` and `scope` stay empty."#;
+
+/// Every plan, whatever the ticket asks for.
+pub const EVERY_PLAN_GUIDANCE: &str = r#"## Earlier pull requests for this ticket (every plan)
+
+When the prompt lists earlier pull requests for this ticket (CoderHelm's or anyone's, in any of the team's repositories), they are the ticket's own history. Read each one listed (its description, review threads, comments and how it ended) before you plan.
+- Reuse what was right in them. Say in `history_check` what changes this time and why, naming each pull request by number (`#123`).
+- A pull request closed without merging: when its comments give the reason, build on it. When they don't, write in `history_check` who closed it and the date, exactly as the close event is listed, and ask ONE question about why in `questions`. Never write that you couldn't find out why it was closed while its close event is listed.
+
+## Which environment a lookup hit (every plan that looks things up)
+
+When the change or the evidence concerns more than one environment (production and staging, several accounts or clusters) and a live data source is connected, prove which environment each lookup hit with data that only exists there: a record, a name or a setting that the team's instructions or the source's guide name for that environment, or one only that environment has. Record it in `evidence.environments`, one entry per environment, quoting that data in `proof`.
+- Never write that you didn't confirm which environment you queried while a lookup could confirm it: make that lookup.
+- When no connected source reaches an environment, add it with `proven: false` and name the missing access in `proof`.
+
+## Something close to what the ticket names (every plan)
+
+When a lookup or a search finds an existing object close to what the ticket names (a similar name, the same purpose: a schema, user, role, table, bucket, queue, job, secret), follow it to the end before you plan around it:
+- who owns it, what grants or permissions it has, and what is in it (look them up);
+- what created it: search the team's repositories for its name.
+Record it in `evidence.near_matches` with those findings and ONE decisive question for a person (for example "use the existing X instead of creating Y?"), and put that question in `questions` too."#;
+
+/// For a bug: find where the fault is before planning code.
+const BUG_GUIDANCE: &str = r#"## Where the fix belongs (decide before you plan code)
 
 Before writing tasks, decide whether the fix belongs in this code at all.
 
@@ -484,9 +639,10 @@ Before writing tasks, decide whether the fix belongs in this code at all.
 - If you looked and still cannot tell whether the code or the data is at fault, use `unknown`, say what you checked and what a person needs to confirm, and set tasks.md to `NO_CODE_CHANGE: <what is unclear>`. Prefer asking over coding.
 - Ordinary feature work and bugs in the code's own logic are `code`.
 - Quote values only as the tools returned them; a value shown as `[hidden]` stays hidden.
-- If the prompt has a "This ticket's history" section (an earlier pull request for this ticket closed without merging, a lesson, or a person saying the fix is elsewhere), read it first. The default then is NOT to plan code again: use `outside_code` or `unknown`. Plan code only when you can say why a code change is right despite that history, in `history_check`; a change like the one already closed is never right.
+- If the prompt has a "This ticket's history" section (an earlier pull request for this ticket closed without merging, a lesson, or a person saying the fix is elsewhere), read it first. The default then is NOT to plan code again: use `outside_code` or `unknown`. Plan code only when you can say why a code change is right despite that history, in `history_check`; a change like the one already closed is never right."#;
 
-## The whole job, end to end (every plan)
+/// Every plan's end-to-end checklist and the block it ends with.
+const CHECKLIST_GUIDANCE: &str = r#"## The whole job, end to end (every plan)
 
 List every step the ticket needs to work in production, not only this repository's half, and who does each one. Think through, for this kind of change:
 - credentials and secrets, and who or what reads them;
@@ -509,7 +665,9 @@ After the four openspec files, output this block (JSON, all fields required; `ou
     "data_shows": "what the data or settings show for the records in the ticket; empty when no stored data is involved (a bug in the code itself)",
     "basis": "code | data | feature: code when the bug is in code you read (no data lookup needed), data when the decision depends on stored records or a source system (lookups needed), feature for new work",
     "producer": {"kind": "code | source", "where": "for code: owner/repo:path:line and the function that writes the wrong value (a file you opened); for source: the system, the record and the wrong value it holds"},
-    "scope": "how many records (from a query) or places in the code have the same defect"
+    "scope": "how many records (from a query) or places in the code have the same defect",
+    "environments": [{"env": "each environment the evidence concerns", "proof": "the data a lookup returned that only exists there; or the missing access when unproven", "proven": true}],
+    "near_matches": [{"name": "an existing object close to what the ticket names", "asked_for": "what the ticket names", "owner": "who owns it", "grants": "who can use it", "contents": "what is in it", "origin": "what created it (repository and file, or job), or where you searched", "question": "the one decisive question for a person"}]
   },
   "outside_change": {
     "system": "the system the change is made in",
@@ -517,7 +675,8 @@ After the four openspec files, output this block (JSON, all fields required; `ou
     "where": "who can make it, or where in that system",
     "verify": "how to confirm afterwards (for example: after the next sync, the item shows on the site)"
   },
-  "history_check": "only when the prompt has a ticket history: why a code change is right despite it; otherwise empty",
+  "history_check": "only when the prompt has a ticket history: each earlier pull request by number, what you reuse from it, what changes this time and why (and for one closed without a reason in its comments: who closed it and when); otherwise empty",
+  "questions": ["each question only a person can answer, one decision each; [] when there are none"],
   "end_to_end": [
     {"step": "each step the ticket needs to work in production", "by": "this_pr | other_repo | person | vendor", "owner": "who does it (a team, a role, the vendor); empty for this_pr", "repo": "owner/repo for this_pr and other_repo steps"}
   ]
@@ -554,6 +713,98 @@ fn push_evidence(out: &mut String, d: &FixDecision) {
     if !ev.scope.trim().is_empty() {
         out.push_str(&format!("**How widespread:** {}\n\n", ev.scope.trim()));
     }
+    if !ev.environments.is_empty() {
+        out.push_str("**Which environment each lookup hit**\n");
+        for e in &ev.environments {
+            out.push_str(&format!("- {}\n", env_line(e)));
+        }
+        out.push('\n');
+    }
+    if !ev.near_matches.is_empty() {
+        out.push_str("**Close to what the ticket names**\n");
+        for m in &ev.near_matches {
+            out.push_str(&format!("- {}\n", near_match_line(m)));
+        }
+        out.push('\n');
+    }
+}
+
+fn env_line(e: &EnvCheck) -> String {
+    let state = if e.proven {
+        "confirmed"
+    } else {
+        "not confirmed"
+    };
+    match one_line(&e.proof) {
+        p if p.is_empty() => format!("{}: {state}", one_line(&e.env)),
+        p => format!("{}: {state} ({p})", one_line(&e.env)),
+    }
+}
+
+fn near_match_line(m: &NearMatch) -> String {
+    let mut parts = Vec::new();
+    for (label, v) in [
+        ("owner", &m.owner),
+        ("grants", &m.grants),
+        ("contents", &m.contents),
+        ("created by", &m.origin),
+    ] {
+        if !v.trim().is_empty() {
+            parts.push(format!("{label}: {}", one_line(v)));
+        }
+    }
+    let mut out = one_line(&m.name);
+    if !m.asked_for.trim().is_empty() {
+        out.push_str(&format!(" (the ticket names {})", one_line(&m.asked_for)));
+    }
+    if !parts.is_empty() {
+        out.push_str(&format!("; {}", parts.join("; ")));
+    }
+    out
+}
+
+/// The questions only a person can answer, numbered, under a heading. Empty
+/// when there are none.
+pub fn questions_markdown(d: &FixDecision) -> String {
+    let qs: Vec<String> = d
+        .questions
+        .iter()
+        .map(|q| one_line(q))
+        .filter(|q| !q.is_empty())
+        .collect();
+    if qs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("**Questions only a person can answer**\n");
+    for (i, q) in qs.iter().enumerate() {
+        out.push_str(&format!("{}. {q}\n", i + 1));
+    }
+    out.push('\n');
+    out
+}
+
+/// What the plan's own check left open, under a heading. Empty when none.
+fn open_gaps_markdown(d: &FixDecision) -> String {
+    if d.open_gaps.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("**Not yet settled in this plan**\n");
+    for g in &d.open_gaps {
+        out.push_str(&format!("- {}\n", one_line(g)));
+    }
+    out.push('\n');
+    out
+}
+
+/// The title a run that stops to ask gives its report: a fault question
+/// for a bug, questions before building for new work, the findings for a
+/// question.
+pub fn ask_title(d: &FixDecision) -> &'static str {
+    match d.intent {
+        TicketIntent::Bug => "Not sure yet where the fix belongs",
+        TicketIntent::Feature | TicketIntent::Chore => "Questions before I build this",
+        TicketIntent::Question => "What I found",
+    }
 }
 
 fn push_change(out: &mut String, c: &OutsideChange) {
@@ -589,6 +840,8 @@ pub fn outside_report(d: &FixDecision, heading: bool) -> String {
         push_change(&mut out, c);
         out.push('\n');
     }
+    out.push_str(&questions_markdown(d));
+    out.push_str(&open_gaps_markdown(d));
     out.push_str(
         "No code was changed and no pull request was opened here: the fix is the change above. \
          Once it is made, nothing else is needed here.",
@@ -607,14 +860,26 @@ pub fn undecided() -> FixDecision {
     }
 }
 
-/// The report when the planner could not tell where the fix belongs.
+/// The report when the run stops to ask: for a bug, where the fix belongs
+/// wasn't settled; for new work, what to build and what a person must
+/// decide first; for a question, what was found.
 pub fn unknown_report(d: &FixDecision, heading: bool) -> String {
     let mut out = String::new();
     if heading {
-        out.push_str("**Not sure yet where the fix belongs**\n\n");
+        out.push_str(&format!("**{}**\n\n", ask_title(d)));
     }
     if !d.cause.trim().is_empty() {
-        out.push_str(&format!("**What I found:** {}\n\n", d.cause.trim()));
+        let label = match d.intent {
+            TicketIntent::Bug | TicketIntent::Question => "What I found",
+            TicketIntent::Feature | TicketIntent::Chore => "What this needs",
+        };
+        out.push_str(&format!("**{label}:** {}\n\n", d.cause.trim()));
+    }
+    if !d.intent.is_bug() && !d.history_check.trim().is_empty() {
+        out.push_str(&format!(
+            "**Earlier pull requests:** {}\n\n",
+            one_line(&d.history_check)
+        ));
     }
     push_evidence(&mut out, d);
     if let Some(c) = d.outside_change.as_ref() {
@@ -625,11 +890,44 @@ pub fn unknown_report(d: &FixDecision, heading: bool) -> String {
             ));
         }
     }
-    out.push_str(
-        "I didn't change any code. Please confirm whether the code or the data is at fault \
-         (reply here with what you find), and I'll pick it up from there.",
-    );
+    if !d.intent.is_bug() && !d.end_to_end.is_empty() {
+        out.push_str("**The plan, step by step**\n");
+        for s in &d.end_to_end {
+            if !s.step.trim().is_empty() {
+                out.push_str(&format!(
+                    "- {} (by: {})\n",
+                    one_line(&s.step),
+                    step_owner(s)
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    out.push_str(&questions_markdown(d));
+    out.push_str(&open_gaps_markdown(d));
+    out.push_str(match d.intent {
+        TicketIntent::Bug => {
+            "I didn't change any code. Please confirm whether the code or the data is at fault \
+             (reply here with what you find), and I'll pick it up from there."
+        }
+        TicketIntent::Feature | TicketIntent::Chore => {
+            "I didn't change any code yet. Reply here with the answers, and I'll build it from \
+             this plan."
+        }
+        TicketIntent::Question => {
+            "I didn't change any code. Reply here if this should become a change, and I'll plan it."
+        }
+    });
     out
+}
+
+/// Who does a step, as a report names them.
+fn step_owner(s: &EndToEndStep) -> String {
+    match (s.by.trim(), s.repo.trim()) {
+        ("this_pr", "") => "this change".to_string(),
+        ("this_pr", r) => format!("a pull request in {r}"),
+        _ => s.owner_label(),
+    }
 }
 
 /// The section a pull request (and its ticket comment) carries when a change
@@ -680,6 +978,25 @@ pub fn reviewer_context(d: &FixDecision) -> String {
                 c.change.trim()
             ));
         }
+    }
+    out.push_str(&format!("Ticket asks for: {}\n", d.intent.as_str()));
+    if !d.history_check.trim().is_empty() {
+        out.push_str(&format!(
+            "Earlier pull requests (history check): {}\n",
+            one_line(&d.history_check)
+        ));
+    }
+    for e in &d.evidence.environments {
+        out.push_str(&format!("- Environment: {}\n", env_line(e)));
+    }
+    for m in &d.evidence.near_matches {
+        out.push_str(&format!("- Close match: {}\n", near_match_line(m)));
+    }
+    for q in &d.questions {
+        out.push_str(&format!("- Question for a person: {}\n", one_line(q)));
+    }
+    for g in &d.open_gaps {
+        out.push_str(&format!("- Left open by the plan: {}\n", one_line(g)));
     }
     out.push_str(&end_to_end_markdown(d));
     out
@@ -902,18 +1219,26 @@ mod tests {
 
     #[test]
     fn the_planner_writes_the_whole_job_with_an_owner_per_step() {
-        for kind in [
-            "credentials and secrets, and who or what reads them",
-            "the resource itself",
-            "network access and allowlists",
-            "permissions and read grants",
-            "the handoff to whoever uses it",
-            "the deploy and merge order",
+        for intent in [
+            TicketIntent::Bug,
+            TicketIntent::Feature,
+            TicketIntent::Chore,
+            TicketIntent::Question,
         ] {
-            assert!(PLANNER_GUIDANCE.contains(kind), "{kind}");
+            let g = planner_guidance(intent);
+            for kind in [
+                "credentials and secrets, and who or what reads them",
+                "the resource itself",
+                "network access and allowlists",
+                "permissions and read grants",
+                "the handoff to whoever uses it",
+                "the deploy and merge order",
+            ] {
+                assert!(g.contains(kind), "{kind}");
+            }
+            assert!(g.contains("\"end_to_end\": ["));
+            assert!(g.contains("order the `## owner/repo` groups"));
         }
-        assert!(PLANNER_GUIDANCE.contains("\"end_to_end\": ["));
-        assert!(PLANNER_GUIDANCE.contains("order the `## owner/repo` groups"));
         // Invented two-repo job: an infra repo makes the queue, a pipeline
         // repo reads it, a person allows the network path.
         let reply = r#"```fix_location.json
@@ -1215,5 +1540,128 @@ mod code_only_tests {
         assert!(g.iter().any(|x| x.contains("didn't open it")), "{g:?}");
         assert!(!g.iter().any(|x| x.contains("made no lookups")), "{g:?}");
         assert!(!needs_lookup(Some(&d), true, 0, &[]));
+    }
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+
+    /// New work that a person must settle first: a new user and schema, an
+    /// earlier attempt closed without a reason, an existing schema with a
+    /// similar name.
+    fn new_work(intent: TicketIntent) -> FixDecision {
+        let block = format!(
+            "```fix_location.json\n{}\n```",
+            serde_json::json!({
+                "fix_location": "unknown",
+                "intent": "bug",
+                "open_gaps": ["the planner must not set this"],
+                "cause": "Create a reporting user with its own schema, mirroring the existing vendor user.",
+                "evidence": {
+                    "basis": "feature",
+                    "looked_up": ["[prod warehouse] schemas named like the request: one"],
+                    "environments": [{"env": "prod", "proof": "the production-only audit table has rows", "proven": true}],
+                    "near_matches": [{"name": "reports_upload", "asked_for": "reports_table_upload", "owner": "admin", "grants": "loader role", "contents": "2 tables", "origin": "no repository creates it", "question": "Use reports_upload instead?"}]
+                },
+                "outside_change": null,
+                "history_check": "#41 (secret only) was closed by a-maintainer on 2026-01-11; this plan keeps its secret.",
+                "questions": ["Use the existing reports_upload schema instead of a new one?"],
+                "end_to_end": [
+                    {"step": "Create the user's secret", "by": "this_pr", "owner": "", "repo": "acme/infra"},
+                    {"step": "Create the user and schema", "by": "other_repo", "owner": "", "repo": "acme/pipelines"}
+                ]
+            })
+        );
+        parse_for(&block, intent).expect("parses")
+    }
+
+    #[test]
+    fn intent_comes_from_triage_never_the_block() {
+        let d = new_work(TicketIntent::Feature);
+        assert_eq!(d.intent, TicketIntent::Feature);
+        assert!(d.open_gaps.is_empty());
+        let block = format!("```{FENCE}\n{}\n```", r#"{"intent":"feature"}"#);
+        assert_eq!(parse(&block).unwrap().intent, TicketIntent::Bug);
+        assert_eq!(d.questions.len(), 1);
+        assert_eq!(d.evidence.environments[0].env, "prod");
+        assert!(d.evidence.near_matches[0].missing().is_empty());
+    }
+
+    #[test]
+    fn new_work_is_never_framed_as_a_fault() {
+        // A code plan for new work with no producer or scope is complete.
+        let mut d = new_work(TicketIntent::Feature);
+        d.fix_location = FixLocation::Code;
+        d.evidence.basis.clear();
+        assert!(gaps(Some(&d), true, 2, &[]).is_empty());
+        // The same decision on a bug is held to the trace.
+        let mut bug = d.clone();
+        bug.intent = TicketIntent::Bug;
+        bug.evidence.data_shows = "The record holds the old value.".into();
+        assert!(!gaps(Some(&bug), true, 2, &[]).is_empty());
+
+        let report = unknown_report(&new_work(TicketIntent::Feature), true);
+        assert!(
+            report.starts_with("**Questions before I build this**"),
+            "{report}"
+        );
+        assert!(!report.contains("code or the data is at fault"), "{report}");
+        assert!(report.contains("**What this needs:** Create a reporting user"));
+        assert!(report.contains("**Earlier pull requests:** #41"));
+        assert!(report.contains("1. Use the existing reports_upload schema instead of a new one?"));
+        assert!(
+            report.contains("- Create the user and schema (by: a pull request in acme/pipelines)")
+        );
+        assert!(report.contains("- prod: confirmed (the production-only audit table has rows)"));
+        assert!(
+            report.contains("reports_upload (the ticket names reports_table_upload); owner: admin")
+        );
+        assert!(report.contains("Reply here with the answers"));
+        assert_eq!(
+            ask_title(&new_work(TicketIntent::Chore)),
+            "Questions before I build this"
+        );
+
+        // A bug keeps its question about the fault.
+        let bug = unknown_report(&new_work(TicketIntent::Bug), true);
+        assert!(bug.starts_with("**Not sure yet where the fix belongs**"));
+        assert!(bug.contains("code or the data is at fault"));
+    }
+
+    #[test]
+    fn each_intent_gets_its_own_framing_and_every_plan_the_shared_rules() {
+        let bug = planner_guidance(TicketIntent::Bug);
+        let feature = planner_guidance(TicketIntent::Feature);
+        let question = planner_guidance(TicketIntent::Question);
+        assert!(bug.contains("## Where the fix belongs"));
+        assert!(!feature.contains("## Where the fix belongs"));
+        assert!(feature.contains("not a bug"));
+        assert!(question.contains("asks a question"));
+        for g in [&bug, &feature, &question] {
+            assert!(g.contains("## Earlier pull requests for this ticket"));
+            assert!(g.contains("who closed it and the date"));
+            assert!(g.contains("## Which environment a lookup hit"));
+            assert!(g.contains("data that only exists there"));
+            assert!(g.contains("## Something close to what the ticket names"));
+            assert!(g.contains("what created it: search the team's repositories"));
+            assert!(g.contains("\"near_matches\""));
+            assert!(g.contains("\"questions\""));
+        }
+    }
+
+    #[test]
+    fn the_reviewer_and_the_jira_note_see_the_questions() {
+        let d = new_work(TicketIntent::Feature);
+        let r = reviewer_context(&d);
+        assert!(r.contains("Ticket asks for: feature"));
+        assert!(r.contains("- Question for a person: Use the existing reports_upload"));
+        assert!(r.contains("Earlier pull requests (history check): #41"));
+        let jira = jira_text(&unknown_report(&d, false));
+        assert!(jira.contains("1. Use the existing reports_upload schema"));
+        let mut open = d.clone();
+        open.open_gaps = vec!["[env_unproven] staging was not checked.".into()];
+        assert!(unknown_report(&open, false)
+            .contains("**Not yet settled in this plan**\n- [env_unproven]"));
     }
 }
