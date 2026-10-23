@@ -84,13 +84,270 @@ impl GitConventions {
     }
 
     /// The commit message for a commit described by `summary` (an agent's
-    /// own message, a ticket title). Without a team template the summary is
-    /// kept as written.
+    /// own message, a ticket title). The subject's ticket key is the run's
+    /// real one whatever the agent wrote: a placeholder (`ABC-0`,
+    /// `ABC-XXXX`, `{ticket}`) becomes the run's key, and a subject with no
+    /// key gets it when the convention puts the key in commits (the team's
+    /// template names `{ticket}`, or the default does). A run without a
+    /// tracker key (a GitHub issue) never gets one invented; a placeholder is
+    /// dropped instead. With a team template the agent's subject, without
+    /// any key, is its `{summary}`; without one the message is kept as
+    /// written apart from the key, body included.
     pub fn commit_message(&self, tokens: &Tokens, summary: &str) -> String {
+        let key = tokens.key();
+        let (first, body) = match summary.split_once('\n') {
+            Some((f, b)) => (f, Some(b)),
+            None => (summary, None),
+        };
         match &self.commit {
-            Some(t) => commit(t, &tokens.with_summary(summary)),
-            None => summary.to_string(),
+            Some(t) if names_ticket(t) => {
+                let bare = without_key(first, key);
+                commit(t, &tokens.with_summary(&bare))
+            }
+            Some(t) => commit(
+                t,
+                &tokens.with_summary(&normalize_subject(first, key, false)),
+            ),
+            None => {
+                let subject = normalize_subject(first, key, names_ticket(DEFAULT_COMMIT));
+                match body {
+                    Some(b) => format!("{subject}\n{b}"),
+                    None => subject,
+                }
+            }
         }
+    }
+
+    /// How a commit subject this run makes reads, for the agent's prompt:
+    /// the team's template (or the default) with the run's real key filled
+    /// in and `…` for the summary. A run without a tracker key is told to
+    /// put none in.
+    pub fn commit_hint(&self, tokens: &Tokens) -> String {
+        match tokens.key() {
+            Some(key) => {
+                let example = match &self.commit {
+                    Some(t) => commit(t, &tokens.with_summary("…")),
+                    None => format!("{key}: …"),
+                };
+                format!(
+                    "Commit subject: `{example}`. This run's ticket key is `{key}`: write it \
+                     exactly, never a placeholder such as `{project}-0`, `{project}-XXXX` or \
+                     `{{ticket}}`.",
+                    project = key.split('-').next().unwrap_or(key),
+                )
+            }
+            None => "Commit subject: a short summary of the change. This run has no ticket \
+                     key: put none in the subject and never make one up."
+                .to_string(),
+        }
+    }
+}
+
+/// Whether a template puts the ticket in what it renders.
+fn names_ticket(template: &str) -> bool {
+    template.contains("{ticket}") || template.contains("{ticket_lower}")
+}
+
+/// Whether `s` is a tracker key as people write it: a project of ASCII
+/// letters and digits that starts with a letter, `-`, then the number
+/// (`ABC-123`, `OPS2-7`). A GitHub reference (`#42`) is not one.
+pub fn is_ticket_key(s: &str) -> bool {
+    let Some((project, number)) = s.split_once('-') else {
+        return false;
+    };
+    project
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && project.chars().all(|c| c.is_ascii_alphanumeric())
+        && !number.is_empty()
+        && number.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Project names people use as stand-ins in an example key.
+const STAND_IN_PROJECTS: &[&str] = &[
+    "ABC", "XYZ", "XXX", "PROJ", "PROJECT", "KEY", "TICKET", "ISSUE", "JIRA", "TASK", "STORY",
+    "FOO", "ID",
+];
+
+/// Words that stand for the ticket inside braces or angle brackets
+/// (`{ticket}`, `<TICKET-ID>`).
+const STAND_IN_WORDS: &[&str] = &[
+    "ticket",
+    "ticket_id",
+    "ticketid",
+    "ticket-id",
+    "ticket_key",
+    "ticket-key",
+    "ticket_lower",
+    "key",
+    "jira",
+    "jira_key",
+    "jira-key",
+    "issue",
+    "issue_key",
+    "issue-key",
+    "id",
+];
+
+/// A ticket key, or a stand-in for one, at the start of a commit subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Lead {
+    /// Where the subject's own text starts after the key and its separator.
+    rest: usize,
+    /// The key as written, without brackets.
+    key: String,
+    /// It stands in for a key rather than naming one.
+    stand_in: bool,
+}
+
+/// Whether the number part of a key is an example rather than a ticket's:
+/// letters or marks (`XXXX`, `NNN`, `####`, `…`), all zeros, or the counting
+/// sequence and nines people type as examples (`123`, `1234`, `9999`).
+fn stand_in_number(number: &str) -> bool {
+    if number.is_empty() {
+        return true;
+    }
+    if !number.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    let counting = "1234567890".starts_with(number) && number.len() >= 3;
+    number.chars().all(|c| c == '0') || counting || number.chars().all(|c| c == '9')
+}
+
+/// The key (or stand-in) a commit subject starts with, if any. `run_key` is
+/// the run's real key: an exact match is never a stand-in.
+fn lead(subject: &str, run_key: Option<&str>) -> Option<Lead> {
+    let start = subject.len() - subject.trim_start().len();
+    let s = &subject[start..];
+    let close_of = |c: char| match c {
+        '{' => Some('}'),
+        '<' => Some('>'),
+        '[' => Some(']'),
+        '(' => Some(')'),
+        _ => None,
+    };
+    let (inner, after, bracketed) = match s.chars().next().and_then(close_of) {
+        Some(close) => {
+            let end = s[1..].find(close)? + 1;
+            (&s[1..end], end + 1, true)
+        }
+        None => {
+            let end = s
+                .find(|c: char| c == ':' || c.is_whitespace())
+                .unwrap_or(s.len());
+            (&s[..end], end, false)
+        }
+    };
+    let inner_t = inner.trim();
+    if inner_t.is_empty() || inner_t.len() > 32 {
+        return None;
+    }
+    let is_run_key = run_key.is_some_and(|k| inner_t.eq_ignore_ascii_case(k));
+    // Tracker projects are written in capitals; a lowercase word with a
+    // dash (`utf-8`, `pre-commit`) is prose, unless it is the run's own
+    // project written in lowercase (a `{ticket_lower}` template).
+    let run_project = run_key.and_then(|k| k.split_once('-')).map(|(p, _)| p);
+    let key_like_project = |project: &str| {
+        !project.chars().any(|c| c.is_ascii_lowercase())
+            || run_project.is_some_and(|p| p.eq_ignore_ascii_case(project))
+    };
+    let stand_in = if is_run_key {
+        false
+    } else if bracketed
+        && STAND_IN_WORDS
+            .iter()
+            .any(|w| inner_t.eq_ignore_ascii_case(w))
+    {
+        true
+    } else {
+        let (project, number) = inner_t.split_once('-')?;
+        let project_ok = project
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            && project.chars().all(|c| c.is_ascii_alphanumeric())
+            && key_like_project(project);
+        // A key's number part: digits, or the marks examples are written with.
+        let number_ok = number.chars().all(|c| {
+            c.is_ascii_digit() || matches!(c, 'X' | 'x' | 'N' | 'n' | '#' | '?' | '*' | '…' | '.')
+        });
+        if !project_ok || !number_ok || number.is_empty() {
+            return None;
+        }
+        stand_in_number(number)
+            || STAND_IN_PROJECTS
+                .iter()
+                .any(|p| project.eq_ignore_ascii_case(p))
+    };
+    if !stand_in && !is_ticket_key(inner_t) {
+        return None;
+    }
+    // The separator: `:`, ` - `, or plain space.
+    let mut rest = start + after;
+    let tail = &subject[rest..];
+    let skipped = tail.len()
+        - tail
+            .trim_start_matches([':', ' ', '\t', '-', '–', '—'])
+            .len();
+    rest += skipped;
+    Some(Lead {
+        rest,
+        key: inner_t.to_string(),
+        stand_in,
+    })
+}
+
+/// A commit subject with the run's real key: a stand-in key at its start is
+/// replaced by `key` (or dropped when the run has none), and when `prefix`
+/// is set and the subject names no key, `key` is put in front. A real key
+/// that differs from the run's is left: the subject is about that ticket.
+pub fn normalize_subject(subject: &str, key: Option<&str>, prefix: bool) -> String {
+    let subject = subject.trim_end();
+    match lead(subject, key) {
+        Some(l) if l.stand_in => {
+            let rest = &subject[l.rest..];
+            match key {
+                Some(k) if !rest.is_empty() => format!("{k}: {rest}"),
+                Some(k) => k.to_string(),
+                None => rest.to_string(),
+            }
+        }
+        Some(_) => subject.trim_start().to_string(),
+        None => match key {
+            Some(k) if prefix && !subject.trim().is_empty() => {
+                format!("{k}: {}", subject.trim_start())
+            }
+            _ => subject.trim_start().to_string(),
+        },
+    }
+}
+
+/// The real tracker key a subject starts with (a PR title CoderHelm wrote
+/// from the ticket), if any; never a stand-in.
+pub fn subject_key(subject: &str) -> Option<String> {
+    lead(subject, None)
+        .filter(|l| !l.stand_in && is_ticket_key(&l.key))
+        .map(|l| l.key)
+}
+
+/// A whole commit message with its subject normalized as in
+/// [`normalize_subject`] (no key added), its body kept.
+pub fn normalize_message(message: &str, key: Option<&str>) -> String {
+    match message.split_once('\n') {
+        Some((first, body)) => format!("{}\n{body}", normalize_subject(first, key, false)),
+        None => normalize_subject(message, key, false),
+    }
+}
+
+/// The subject without the run's key or a stand-in for it at its start, for
+/// a template that puts the key in itself.
+fn without_key(subject: &str, key: Option<&str>) -> String {
+    match lead(subject, key) {
+        Some(l) if l.stand_in || key.is_some_and(|k| l.key.eq_ignore_ascii_case(k)) => {
+            subject[l.rest..].trim().to_string()
+        }
+        _ => subject.trim().to_string(),
     }
 }
 
@@ -122,6 +379,12 @@ impl Tokens {
             summary: summary(&title),
             title,
         }
+    }
+
+    /// The run's tracker key (`ABC-123`), when its ticket has one. `None`
+    /// for a GitHub issue (`#42`) or a run with no ticket.
+    pub fn key(&self) -> Option<&str> {
+        is_ticket_key(&self.ticket).then_some(self.ticket.as_str())
     }
 
     /// The same ticket, with `{summary}` taken from `text`.
@@ -511,6 +774,139 @@ mod tests {
             c.commit_message(&tokens(), "Add the retry to the export job."),
             "ABC-123: add the retry to the export job"
         );
+    }
+
+    fn jira(key: &str) -> Tokens {
+        Tokens::new(key, key, "Tidy the settings screen")
+    }
+
+    #[test]
+    fn a_placeholder_key_becomes_the_runs_real_key() {
+        let c = GitConventions::default();
+        let t = jira("ABC-8121");
+        for written in [
+            "ABC-0: use the shared button",
+            "ABC-0000: use the shared button",
+            "ABC-XXXX: use the shared button",
+            "ABC-XXX use the shared button",
+            "ABC-NNNN: use the shared button",
+            "ABC-####: use the shared button",
+            "ABC-123: use the shared button",
+            "ABC-…: use the shared button",
+            "TICKET-1: use the shared button",
+            "PROJ-42 - use the shared button",
+            "{ticket}: use the shared button",
+            "<ticket>: use the shared button",
+            "[TICKET-ID] use the shared button",
+            "use the shared button",
+        ] {
+            assert_eq!(
+                c.commit_message(&t, written),
+                "ABC-8121: use the shared button",
+                "{written}"
+            );
+        }
+        // The real key stays as written, in either case.
+        assert_eq!(
+            c.commit_message(&t, "ABC-8121: use the shared button"),
+            "ABC-8121: use the shared button"
+        );
+        assert_eq!(
+            c.commit_message(&t, "abc-8121: use the shared button"),
+            "abc-8121: use the shared button"
+        );
+        // `ABC-123` is this run's own ticket here, not an example.
+        assert_eq!(
+            c.commit_message(&jira("ABC-123"), "ABC-123: fix"),
+            "ABC-123: fix"
+        );
+        // Another real ticket is named on purpose.
+        assert_eq!(
+            c.commit_message(&t, "OPS-4411: bump the pool size"),
+            "OPS-4411: bump the pool size"
+        );
+        // Prose with a dash is not a key.
+        assert_eq!(
+            c.commit_message(&t, "utf-8 decode the export"),
+            "ABC-8121: utf-8 decode the export"
+        );
+        // The body is kept.
+        assert_eq!(
+            c.commit_message(&t, "ABC-0: fix\n\nWhy: the old one broke."),
+            "ABC-8121: fix\n\nWhy: the old one broke."
+        );
+    }
+
+    #[test]
+    fn a_run_without_a_ticket_key_never_gets_one() {
+        let c = GitConventions::default();
+        let t = Tokens::new("#42", "GH-42", "Fix bug");
+        assert_eq!(t.key(), None);
+        assert_eq!(c.commit_message(&t, "ABC-0: fix the bug"), "fix the bug");
+        assert_eq!(c.commit_message(&t, "{ticket}: fix the bug"), "fix the bug");
+        assert_eq!(c.commit_message(&t, "fix the bug"), "fix the bug");
+        let hint = c.commit_hint(&t);
+        assert!(hint.contains("no ticket key"), "{hint}");
+        // CoderHelm's own E2E tickets have no tracker key either.
+        assert_eq!(
+            Tokens::new("E2E-FIX-01ABC", "E2E-FIX-01ABC", "x").key(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_team_template_gets_the_subject_without_any_key() {
+        let c = GitConventions {
+            commit: Some("{ticket}: {summary}".into()),
+            ..Default::default()
+        };
+        let t = jira("ABC-8121");
+        for written in [
+            "ABC-0000: Use the shared button.",
+            "ABC-8121: Use the shared button.",
+            "Use the shared button.",
+        ] {
+            assert_eq!(
+                c.commit_message(&t, written),
+                "ABC-8121: use the shared button",
+                "{written}"
+            );
+        }
+        // A template without the ticket still never keeps a placeholder.
+        let plain = GitConventions {
+            commit: Some("{summary}".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            plain.commit_message(&t, "ABC-0: fix it"),
+            "ABC-8121: fix it"
+        );
+    }
+
+    #[test]
+    fn the_agent_is_told_the_real_key() {
+        let t = jira("ABC-8121");
+        let hint = GitConventions::default().commit_hint(&t);
+        assert!(hint.starts_with("Commit subject: `ABC-8121: …`"), "{hint}");
+        assert!(hint.contains("`ABC-0`"), "{hint}");
+        let team = GitConventions {
+            commit: Some("[{ticket}] {summary}".into()),
+            ..Default::default()
+        };
+        assert!(team
+            .commit_hint(&t)
+            .starts_with("Commit subject: `[ABC-8121] …`"));
+    }
+
+    #[test]
+    fn tracker_keys_are_read_strictly() {
+        assert!(is_ticket_key("ABC-123"));
+        assert!(is_ticket_key("OPS2-7"));
+        assert!(!is_ticket_key("#42"));
+        assert!(!is_ticket_key("ABC-"));
+        assert!(!is_ticket_key("ABC-12a"));
+        assert!(!is_ticket_key("1AB-12"));
+        assert!(!is_ticket_key("E2E-FIX-01ABC"));
     }
 
     #[test]

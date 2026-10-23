@@ -196,16 +196,21 @@ pub async fn run(
             // trigger an endless revert/re-merge loop.
             let base_branch = resolve_pr_base(&github, &msg).await;
             if !branch.is_empty() {
+                // The run's ticket, so the merge commit carries its real key.
                 let ticket_msg = crate::models::TicketMessage {
                     team_id: msg.team_id.clone(),
                     installation_id: msg.installation_id,
-                    source: TicketSource::Github,
-                    ticket_id: String::new(),
-                    title: String::new(),
+                    source: if ticket.2 > 0 {
+                        TicketSource::Github
+                    } else {
+                        TicketSource::Jira
+                    },
+                    ticket_id: ticket.0.clone(),
+                    title: ticket.1.clone(),
                     body: String::new(),
                     repo_owner: msg.repo_owner.clone(),
                     repo_name: msg.repo_name.clone(),
-                    issue_number: 0,
+                    issue_number: ticket.2,
                     sender: String::new(),
                     requester: None,
                     base_branch,
@@ -436,6 +441,20 @@ pub async fn run(
         repo = msg.repo_name,
     );
 
+    // The team's commit convention and the run's ticket: every commit this
+    // round makes follows them, and the agent is told the real key.
+    let conventions = super::load_git_conventions(state, &msg.team_id, &ticket.0).await;
+    let tokens = common::git_conventions::Tokens::new(
+        &if ticket.2 > 0 {
+            format!("#{}", ticket.2)
+        } else {
+            ticket.0.clone()
+        },
+        &ticket.0,
+        &ticket.1,
+    );
+    let commit_hint = conventions.commit_hint(&tokens);
+
     let prompt = format!(
         r#"A reviewer left comments on PR #{pr_number}.
 
@@ -458,6 +477,7 @@ Rules:
 - Address every comment
 - Follow the reviewer's suggestions exactly unless they conflict with codebase conventions
 - Don't make unrelated changes
+- {commit_hint}
 - Use GitHub markdown (backticks for code, triple-backtick for blocks)
 - Keep replies SHORT — 1-2 sentences max. Just say what you did, not what was wrong or why. Example: "Fixed — reformatted to multi-line with trailing comma." Do NOT list every file or explain every change in detail."#,
         pr_number = msg.pr_number,
@@ -621,18 +641,7 @@ Rules:
         skills: skills.as_ref(),
         web: Some(&web),
         state,
-        commits: (
-            super::load_git_conventions(state, &msg.team_id, &ticket.0).await,
-            common::git_conventions::Tokens::new(
-                &if ticket.2 > 0 {
-                    format!("#{}", ticket.2)
-                } else {
-                    ticket.0.clone()
-                },
-                &ticket.0,
-                &ticket.1,
-            ),
-        ),
+        commits: (conventions, tokens),
     };
 
     let mut messages = vec![(

@@ -1249,13 +1249,14 @@ impl GitHubClient {
         repo: &str,
         base: &str,
         head: &str,
+        message: &str,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/merges");
         let headers = self.auth_headers().await?;
         let mut req = self.http.post(&url).json(&serde_json::json!({
             "base": base,
             "head": head,
-            "commit_message": format!("Merge {head} into {base}"),
+            "commit_message": message,
         }));
         for (k, v) in &headers {
             req = req.header(k.clone(), v.clone());
