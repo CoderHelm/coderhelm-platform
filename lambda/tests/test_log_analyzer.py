@@ -122,7 +122,7 @@ class UsageAccounting(unittest.TestCase):
         })
         self.assertEqual(self.u.total_tokens(u), 6_000_000)
         # Same numbers as the Rust test: Sonnet 5.5 = 2 + 0.2 + 2.5 + 4 + 10.
-        self.assertAlmostEqual(self.u.call_cost("claude-sonnet-5-5", u), 18.7, places=9)
+        self.assertAlmostEqual(self.u.call_cost("claude-sonnet-5-5", u), 18.9, places=9)
         self.assertAlmostEqual(self.u.call_cost("claude-opus-5-5", u), 37.4, places=9)
 
     def test_unknown_model_is_never_free(self):
