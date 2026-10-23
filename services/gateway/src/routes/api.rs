@@ -20,6 +20,22 @@ pub async fn me(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    // A support-view session is no person on the team: answer for the view
+    // itself instead of looking up a member record.
+    if let Some(sv) = &claims.support_view {
+        return Ok(Json(json!({
+            "user_id": claims.sub,
+            "team_id": claims.team_id,
+            "github_login": null,
+            "email": sv.admin_email,
+            "avatar_url": null,
+            "role": claims.role,
+            "status": "active",
+            "auth_provider": "support",
+            "mfa_enabled": false,
+            "support_view": { "team_id": sv.team_id, "until": sv.until },
+        })));
+    }
     let result = state
         .dynamo
         .get_item()
@@ -348,7 +364,11 @@ pub async fn rename_team(
 pub(crate) fn is_platform_admin(claims: &Claims) -> bool {
     let admins = std::env::var("PLATFORM_ADMIN_EMAILS")
         .unwrap_or_else(|_| "admin@coderhelm.com".to_string());
-    verified_identity(&claims.sub) && platform_admin_listed(&admins, &claims.email)
+    // A support-view session is the team's read-only view, never the admin's
+    // own powers: the admin routes refuse it.
+    claims.support_view.is_none()
+        && verified_identity(&claims.sub)
+        && platform_admin_listed(&admins, &claims.email)
 }
 
 /// Whether a session's user id is one whose email CoderHelm verified: not a

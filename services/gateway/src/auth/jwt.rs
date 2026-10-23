@@ -20,6 +20,7 @@ pub fn create_token(
         aud: "coderhelm-dashboard".to_string(),
         iat: now,
         exp: now + ttl_secs,
+        support_view: None,
     };
     encode(
         &Header::default(),

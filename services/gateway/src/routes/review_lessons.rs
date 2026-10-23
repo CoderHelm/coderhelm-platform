@@ -524,6 +524,7 @@ mod tests {
             aud: "coderhelm-dashboard".into(),
             exp: 0,
             iat: 0,
+            support_view: None,
         }
     }
 

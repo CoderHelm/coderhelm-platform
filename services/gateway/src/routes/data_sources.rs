@@ -146,7 +146,11 @@ pub async fn list(
 ) -> Reply {
     admin(&claims)?;
     // REST APIs and OpenSearch connected in Settings → Integrations live here now.
-    if let Err(e) = store::adopt_connections(&state.dynamo, table(&state), &claims.team_id).await {
+    if claims.support_view.is_some() {
+        // A support view only reads.
+    } else if let Err(e) =
+        store::adopt_connections(&state.dynamo, table(&state), &claims.team_id).await
+    {
         warn!(error = %e, "Could not move connections to data sources");
     }
     let mut sources = store::list_sources(&state.dynamo, table(&state), &claims.team_id)

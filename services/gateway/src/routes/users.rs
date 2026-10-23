@@ -1186,6 +1186,7 @@ mod tests {
             aud: "coderhelm-dashboard".to_string(),
             exp: 0,
             iat: 0,
+            support_view: None,
         }
     }
 
