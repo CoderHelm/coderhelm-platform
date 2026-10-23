@@ -652,7 +652,7 @@ mod tests {
                 s.cache_write_5m,
                 s.cache_write_1h
             ),
-            (2.0, 10.0, 0.10, 2.5, 4.0)
+            (2.0, 10.0, 0.20, 2.5, 4.0)
         );
         let (f, _) = rates_for("claude-fable-5-1");
         assert_eq!((f.input, f.output, f.cache_read), (10.0, 50.0, 0.25));
@@ -721,8 +721,8 @@ mod tests {
         };
         // Opus 5.5: 4 + 2×0.20 + 5 + 8 + 20
         assert!((call.cost_usd("claude-opus-5-5") - 37.4).abs() < 1e-9);
-        // Sonnet 5.5: 2 + 2×0.10 + 2.5 + 4 + 10
-        assert!((call.cost_usd("claude-sonnet-5-5") - 18.7).abs() < 1e-9);
+        // Sonnet 5.5: 2 + 2×0.20 + 2.5 + 4 + 10 (cache reads are $0.20/MTok)
+        assert!((call.cost_usd("claude-sonnet-5-5") - 18.9).abs() < 1e-9);
     }
 
     #[test]
