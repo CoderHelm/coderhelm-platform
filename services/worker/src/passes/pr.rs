@@ -738,9 +738,23 @@ pub async fn resolve_conflicts(
     provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    // The merge commit follows the team's commit convention like every
+    // other commit the run makes, with the run's real ticket key.
+    let merge_message = super::load_git_conventions(state, &msg.team_id, &msg.ticket_id)
+        .await
+        .commit_message(
+            &super::ticket_tokens(msg),
+            &format!("Merge {} into {}", msg.base_branch, branch),
+        );
     // Try to merge main into the feature branch
     let merged = github
-        .merge_branch(&msg.repo_owner, &msg.repo_name, branch, &msg.base_branch)
+        .merge_branch(
+            &msg.repo_owner,
+            &msg.repo_name,
+            branch,
+            &msg.base_branch,
+            &merge_message,
+        )
         .await?;
 
     if merged {
@@ -1005,7 +1019,13 @@ pub async fn resolve_conflicts(
         );
         // Try the merge one more time in case it was transient
         let retry = github
-            .merge_branch(&msg.repo_owner, &msg.repo_name, branch, &msg.base_branch)
+            .merge_branch(
+                &msg.repo_owner,
+                &msg.repo_name,
+                branch,
+                &msg.base_branch,
+                &merge_message,
+            )
             .await?;
         return Ok(retry);
     }
@@ -1026,7 +1046,7 @@ pub async fn resolve_conflicts(
             branch,
             &branch_sha,
             &base_sha,
-            &format!("Merge {} into {}", msg.base_branch, branch),
+            &merge_message,
             &resolved_files,
         )
         .await?;

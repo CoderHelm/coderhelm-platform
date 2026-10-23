@@ -91,18 +91,99 @@ pub struct CheckOutcome {
     /// Checks exited 0.
     pub passed: bool,
     pub exit_code: Option<i32>,
-    /// Tail of the real command output (stdout+stderr), for the agent to read.
+    /// Tail of the real command output (stdout+stderr), for the agent to
+    /// read. When the checks didn't run: why, then the build's last log lines.
     pub output: String,
+    /// When the checks didn't run, why, in one clause people read in a PR
+    /// (`the sandbox build ended FAILED and printed no result (INSTALL
+    /// FAILED: ...)`). Empty when they ran.
+    pub reason: String,
+    /// A build ran and gave no result (the sandbox broke), as opposed to
+    /// none starting for lack of time: what [`NoResults`] counts.
+    pub broken: bool,
 }
 
 impl CheckOutcome {
+    /// Didn't run because nothing was started (no sandbox, no time): not a
+    /// fault of the sandbox.
     fn not_run(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
         Self {
             ran: false,
             passed: false,
             exit_code: None,
-            output: reason.into(),
+            output: reason.clone(),
+            reason,
+            broken: false,
         }
+    }
+
+    /// A build ran and gave no result: `reason`, then `log_tail` (the last
+    /// lines of its log) for whoever reads the detail.
+    fn broke(reason: impl Into<String>, log_tail: &str) -> Self {
+        let reason = reason.into();
+        let output = if log_tail.trim().is_empty() {
+            reason.clone()
+        } else {
+            format!("{reason}\n\nLast lines of the sandbox build log:\n```\n{log_tail}\n```")
+        };
+        Self {
+            ran: false,
+            passed: false,
+            exit_code: None,
+            output,
+            reason,
+            broken: true,
+        }
+    }
+}
+
+/// How many sandbox builds of one run may end without a result before the
+/// run stops starting more: the same setup failing twice fails the same way
+/// a third time, and each try costs minutes of the pass.
+pub const MAX_NO_RESULT: u32 = 2;
+
+/// Sandbox builds that ended without a result, per run, in this process: a
+/// later pass of the same run (a fix round) reads the count too.
+pub struct NoResults;
+
+type NoResultEntry = (String, u32, String);
+
+static NO_RESULTS: std::sync::Mutex<Vec<NoResultEntry>> = std::sync::Mutex::new(Vec::new());
+
+impl NoResults {
+    /// Count one more build of `key` that gave no result, with its reason;
+    /// returns how many there have been.
+    pub fn record(key: &str, reason: &str) -> u32 {
+        let Ok(mut v) = NO_RESULTS.lock() else {
+            return 0;
+        };
+        if let Some(e) = v.iter_mut().find(|e| e.0 == key) {
+            e.1 += 1;
+            e.2 = reason.to_string();
+            return e.1;
+        }
+        if v.len() >= 200 {
+            v.remove(0);
+        }
+        v.push((key.to_string(), 1, reason.to_string()));
+        1
+    }
+
+    /// A build of `key` gave a result: the setup works.
+    pub fn clear(key: &str) {
+        if let Ok(mut v) = NO_RESULTS.lock() {
+            v.retain(|e| e.0 != key);
+        }
+    }
+
+    /// How many builds of `key` gave no result and the last reason, once
+    /// that has reached [`MAX_NO_RESULT`].
+    pub fn given_up(key: &str) -> Option<(u32, String)> {
+        let v = NO_RESULTS.lock().ok()?;
+        v.iter()
+            .find(|e| e.0 == key && e.1 >= MAX_NO_RESULT)
+            .map(|e| (e.1, e.2.clone()))
     }
 }
 
@@ -598,7 +679,10 @@ impl<'a> SandboxClient<'a> {
                     .and_then(|l| Some((l.group_name()?.to_string(), l.stream_name()?.to_string())))
                     .unzip_or_default();
                 let status_str = status.map(|s| s.as_str().to_string()).unwrap_or_default();
-                let outcome = self.read_outcome(&group, &stream, &status_str).await;
+                let phases = phase_notes(build);
+                let outcome = self
+                    .read_outcome(&group, &stream, &status_str, &phases)
+                    .await;
                 if matches!(&outcome, Ok(o) if o.ran) {
                     let took = build_started.elapsed();
                     record_build_duration(took);
@@ -610,9 +694,10 @@ impl<'a> SandboxClient<'a> {
             if Instant::now() >= poll_until {
                 warn!(build_id = %build_id, "sandbox: deadline reached, stopping build");
                 let _ = self.codebuild.stop_build().id(&build_id).send().await;
-                return Ok(CheckOutcome::not_run(
-                    "sandbox build exceeded the time budget and was stopped",
-                ));
+                return Ok(CheckOutcome::not_run(format!(
+                    "the sandbox build was stopped after {}s because the pass's time ran out",
+                    build_started.elapsed().as_secs()
+                )));
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -623,41 +708,16 @@ impl<'a> SandboxClient<'a> {
         group: &str,
         stream: &str,
         status_str: &str,
+        phases: &[String],
     ) -> Result<CheckOutcome, Box<dyn std::error::Error + Send + Sync>> {
         if group.is_empty() || stream.is_empty() {
-            return Ok(CheckOutcome::not_run(format!(
-                "sandbox produced no logs (build {status_str}) — treating as infra fault"
-            )));
+            return Ok(CheckOutcome::broke(
+                no_result_reason(status_str, phases, "wrote no log"),
+                "",
+            ));
         }
         let full = self.fetch_log(group, stream).await?;
-        let exit = parse_exit(&full);
-        let window = extract_window(&full);
-        let output = common::tail_str(&window, MAX_OUTPUT_CHARS).to_string();
-
-        match exit {
-            // A kill signal is a SANDBOX RESOURCE problem, not the agent's code:
-            // 137 = SIGKILL (OOM), 143 = SIGTERM, 124 = coreutils `timeout`.
-            // Reporting these as a code RED sent the agent chasing a "failure"
-            // that was really the container running out of memory. Treat as
-            // unverified -> blind fallback.
-            Some(code) if code == 137 || code == 143 || code == 124 => {
-                Ok(CheckOutcome::not_run(format!(
-                    "sandbox checks were killed (exit {code} — out of memory or timeout), \
-                     which is a sandbox resource limit, not a code failure; unverified"
-                )))
-            }
-            Some(code) => Ok(CheckOutcome {
-                ran: true,
-                passed: code == 0,
-                exit_code: Some(code),
-                output,
-            }),
-            // Terminal build but no marker => the check commands never reached
-            // completion (download/extract failed, image error). Infra fault.
-            None => Ok(CheckOutcome::not_run(format!(
-                "sandbox checks did not complete (build {status_str}, no result marker)"
-            ))),
-        }
+        Ok(outcome_from_log(&full, status_str, phases))
     }
 
     /// Fetch the build's CloudWatch log stream, oldest-first, bounded.
@@ -734,12 +794,21 @@ pub fn source_key(run_id: &str, head_sha: &str) -> String {
     format!("sandbox/{}/src-{}.tgz", safe(run_id), safe(head_sha))
 }
 
-/// Parse the exit code that follows a given end-marker.
+/// The exit code a build printed after `marker`: the last line where the
+/// marker is followed by a number. CodeBuild echoes the whole buildspec
+/// command into the log before running it (`Running command ... echo
+/// "===CODERHELM_CHECKS_END exit=$CODE==="`), so the first occurrence of the
+/// marker is the script's own text, never a result. Reading that one made
+/// every check build report "no result marker" though its checks had run.
 fn parse_marker_exit(log: &str, marker: &str) -> Option<i32> {
-    let idx = log.find(marker)?;
-    let rest = &log[idx + marker.len()..];
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
+    log.lines().rev().find_map(|line| {
+        let idx = line.rfind(marker)?;
+        let digits: String = line[idx + marker.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().ok()
+    })
 }
 
 /// Parse the exit code from the checks end marker.
@@ -747,15 +816,131 @@ fn parse_exit(log: &str) -> Option<i32> {
     parse_marker_exit(log, MARKER_END)
 }
 
-/// Slice the log to just the check window (between the start/end markers), so
-/// we hand the agent the command output and not the sandbox's own plumbing.
+/// Slice the log to just the check window (from the start marker the checks
+/// printed), so we hand the agent the command output and not the sandbox's
+/// own plumbing. The marker counts only as a line of its own: the echoed
+/// buildspec holds its text inside an `echo`.
 fn extract_window(log: &str) -> String {
-    let start = log.find(MARKER_START);
-    let end = log.find(MARKER_END);
-    match (start, end) {
-        (Some(s), _) => log[s..].to_string(),
-        (None, Some(_)) | (None, None) => log.to_string(),
+    let mut at = 0;
+    let mut start = None;
+    for line in log.split_inclusive('\n') {
+        if line.trim() == MARKER_START {
+            start = Some(at);
+        }
+        at += line.len();
     }
+    match start {
+        Some(s) => log[s..].to_string(),
+        None => log.to_string(),
+    }
+}
+
+/// What a finished check build came to, read from its whole log.
+fn outcome_from_log(full: &str, status_str: &str, phases: &[String]) -> CheckOutcome {
+    let exit = parse_exit(full);
+    let window = extract_window(full);
+    let output = common::tail_str(&window, MAX_OUTPUT_CHARS).to_string();
+    match exit {
+        // A kill signal is a SANDBOX RESOURCE problem, not the agent's code:
+        // 137 = SIGKILL (OOM), 143 = SIGTERM, 124 = coreutils `timeout`.
+        // Reporting these as a code RED sent the agent chasing a "failure"
+        // that was really the container running out of memory. Treat as
+        // unverified -> blind fallback.
+        Some(code) if code == 137 || code == 143 || code == 124 => CheckOutcome::broke(
+            format!(
+                "the sandbox checks were killed (exit {code}: out of memory or a timeout), a \
+                 sandbox limit rather than a code failure"
+            ),
+            &log_tail(full, LOG_TAIL_LINES),
+        ),
+        Some(code) => CheckOutcome {
+            ran: true,
+            passed: code == 0,
+            exit_code: Some(code),
+            output,
+            reason: String::new(),
+            broken: false,
+        },
+        // A finished build with no result line: the check commands never
+        // reached the end (download or extract failed, image error).
+        None => CheckOutcome::broke(
+            no_result_reason(status_str, phases, "printed no result"),
+            &log_tail(full, LOG_TAIL_LINES),
+        ),
+    }
+}
+
+/// How many of a build's last log lines a no-result report carries.
+const LOG_TAIL_LINES: usize = 15;
+
+/// Why a build gave no result, in one clause: its status, then each phase
+/// that didn't succeed with CodeBuild's own message for it.
+fn no_result_reason(status: &str, phases: &[String], missing: &str) -> String {
+    let status = if status.is_empty() { "UNKNOWN" } else { status };
+    let mut out = format!("the sandbox build ended {status} and {missing}");
+    if !phases.is_empty() {
+        out.push_str(&format!(" ({})", phases.join("; ")));
+    }
+    out
+}
+
+/// The phases of a build that didn't succeed, each with CodeBuild's own
+/// message (`INSTALL FAILED: COMMAND_EXECUTION_ERROR ...`).
+fn phase_notes(build: &aws_sdk_codebuild::types::Build) -> Vec<String> {
+    build
+        .phases()
+        .iter()
+        .filter(|p| {
+            p.phase_status()
+                .is_some_and(|s| !matches!(s, StatusType::Succeeded))
+        })
+        .map(|p| {
+            let name = p.phase_type().map(|t| t.as_str()).unwrap_or("phase");
+            let status = p.phase_status().map(|s| s.as_str()).unwrap_or("");
+            let msg = p
+                .contexts()
+                .iter()
+                .map(|c| {
+                    [c.status_code(), c.message()]
+                        .into_iter()
+                        .flatten()
+                        .filter(|s| !s.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|m| !m.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let note = if msg.is_empty() {
+                format!("{name} {status}")
+            } else {
+                format!("{name} {status}: {msg}")
+            };
+            common::truncate_str(&note, 300).to_string()
+        })
+        .collect()
+}
+
+/// The last `n` lines of a build log that say something: CodeBuild's
+/// routine report and artifact lines are left out.
+fn log_tail(log: &str, n: usize) -> String {
+    const ROUTINE: [&str; 6] = [
+        "auto-discover",
+        "Expanding",
+        "Assembling file list",
+        "Phase context status code:  Message:",
+        "Entering phase",
+        "Phase complete: UPLOAD_ARTIFACTS",
+    ];
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !ROUTINE.iter().any(|r| l.contains(r)))
+        .collect();
+    lines[lines.len().saturating_sub(n)..]
+        .iter()
+        .map(|l| common::truncate_str(l, 300))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Small helper: `Option<(A,B)>::unzip` with a default when None.
@@ -771,6 +956,102 @@ impl<A: Default, B: Default> UnzipOrDefault<A, B> for Option<(A, B)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A check build's log as CodeBuild writes it: the whole buildspec
+    /// command echoed first (marker text inside `echo`), then the checks.
+    fn build_log(result: &str) -> String {
+        format!(
+            "[Container] 2026/10/22 20:38:58.014835 Running command set +e\n\
+             aws s3 cp \"s3://$SANDBOX_BUCKET/$SANDBOX_KEY\" /tmp/src.tgz\n\
+             if [ -n \"$CODEGEN_CMD\" ]; then\n\
+             \x20 echo \"===CODERHELM_CODEGEN_START===\"; node --version\n\
+             \x20 echo \"===CODERHELM_CODEGEN_END exit=$CODE===\"\n\
+             else\n\
+             \x20 echo \"===CODERHELM_CHECKS_START===\"; node --version\n\
+             \x20 (eval \"$CHECKS_CMD\"); CODE=$?\n\
+             \x20 echo \"===CODERHELM_CHECKS_END exit=$CODE===\"\n\
+             fi\n\
+             download: s3://bucket/sandbox/RUN/src-abc.tgz to ../tmp/src.tgz\n\
+             {result}\
+             [Container] 2026/10/22 20:41:07.549332 Phase complete: BUILD State: SUCCEEDED\n\
+             [Container] 2026/10/22 20:41:07.549352 Phase context status code:  Message:\n\
+             [Container] 2026/10/22 20:41:07.651953 No matching auto-discover report paths found\n"
+        )
+    }
+
+    #[test]
+    fn the_result_is_read_from_what_ran_not_the_echoed_script() {
+        // The incident: every build printed its result, and the worker read
+        // the echoed `exit=$CODE` first and reported "no result marker".
+        let log = build_log(
+            "===CODERHELM_CHECKS_START===\nv20.20.2\n=== CoderHelm check summary ===\n\
+             CODERHELM_STEP 1 0\n===CODERHELM_CHECKS_END exit=0===\n",
+        );
+        assert_eq!(parse_exit(&log), Some(0));
+        let o = outcome_from_log(&log, "SUCCEEDED", &[]);
+        assert!(o.ran && o.passed && !o.broken);
+        assert_eq!(o.exit_code, Some(0));
+        // The agent reads the checks' output, not the echoed script.
+        assert!(o
+            .output
+            .starts_with("===CODERHELM_CHECKS_START===\nv20.20.2"));
+        assert!(!o.output.contains("eval"));
+
+        let red = build_log(
+            "===CODERHELM_CHECKS_START===\nerror TS2322\n===CODERHELM_CHECKS_END exit=2===\n",
+        );
+        let o = outcome_from_log(&red, "SUCCEEDED", &[]);
+        assert!(o.ran && !o.passed);
+        assert_eq!(o.exit_code, Some(2));
+        // Codegen reads its marker the same way.
+        let gen = build_log("===CODERHELM_CODEGEN_END exit=0===\n");
+        assert_eq!(parse_marker_exit(&gen, MARKER_CODEGEN_END), Some(0));
+    }
+
+    #[test]
+    fn a_build_without_a_result_says_why_with_its_last_log_lines() {
+        let log = build_log("npm ERR! code ENOENT\nnpm ERR! path /tmp/src/package.json\n");
+        let phases = vec![
+            "BUILD FAILED: COMMAND_EXECUTION_ERROR Error while executing command: set +e"
+                .to_string(),
+        ];
+        let o = outcome_from_log(&log, "FAILED", &phases);
+        assert!(!o.ran && o.broken);
+        assert_eq!(
+            o.reason,
+            "the sandbox build ended FAILED and printed no result (BUILD FAILED: \
+             COMMAND_EXECUTION_ERROR Error while executing command: set +e)"
+        );
+        assert!(o.output.contains("npm ERR! path /tmp/src/package.json"));
+        assert!(o.output.contains("Phase complete: BUILD State: SUCCEEDED"));
+        assert!(!o.output.contains("auto-discover"));
+        // Killed by memory: a sandbox limit, named as one.
+        let oom = build_log("===CODERHELM_CHECKS_START===\n===CODERHELM_CHECKS_END exit=137===\n");
+        let o = outcome_from_log(&oom, "SUCCEEDED", &[]);
+        assert!(!o.ran && o.broken);
+        assert!(o.reason.contains("exit 137"));
+        // A build that never started for lack of time is not a broken sandbox.
+        assert!(!CheckOutcome::not_run("no time").broken);
+    }
+
+    #[test]
+    fn a_run_gives_up_on_a_sandbox_after_two_builds_without_a_result() {
+        let key = "test-run-gives-up";
+        assert_eq!(NoResults::given_up(key), None);
+        assert_eq!(NoResults::record(key, "first"), 1);
+        assert_eq!(NoResults::given_up(key), None);
+        assert_eq!(
+            NoResults::record(key, "the sandbox build ended FAILED"),
+            MAX_NO_RESULT
+        );
+        assert_eq!(
+            NoResults::given_up(key),
+            Some((2, "the sandbox build ended FAILED".to_string()))
+        );
+        // A build with a result shows the setup works again.
+        NoResults::clear(key);
+        assert_eq!(NoResults::given_up(key), None);
+    }
 
     #[test]
     fn one_commit_is_one_upload_per_run() {

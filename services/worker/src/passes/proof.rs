@@ -53,7 +53,7 @@ pub const CODER_RULES: &str = "
 ";
 
 /// How the coder ends: its evidence becomes the PR description's.
-pub const EVIDENCE_OUTPUT: &str = "When you finish, output a one-line summary, then a section that starts with `Evidence:` listing: each fact about a system this code doesn't own that the change relies on, on its own line that starts `- Confirmed:` (the fact, the lookup that confirmed it and what came back: quote the field and its value) or `- Unconfirmed:` (the fact, and why nothing confirmed it: the source that is missing, or the lookup that failed or came back empty); how many records the change affects, where you counted them, and a few examples (ids or names); and anything no connected source could answer, naming the source that is missing. Write `Evidence: none needed` when the change relies on nothing outside the code and changes no stored records. Do NOT describe each code change in detail. Last, when the change copies an existing block, a fenced ```mirrors.json block: `[{\"path\": \"the file of the block you copied\", \"name\": \"the block (resource, function, key)\", \"differences\": [\"each intentional difference, and why\"]}]`; `[]` when it copies none.";
+pub const EVIDENCE_OUTPUT: &str = "When you finish, output a one-line summary, then a section that starts with `Evidence:` listing: each fact about a system this code doesn't own that the change relies on, on its own line that starts `- Confirmed:` (the fact, the lookup that confirmed it and what came back: quote the field and its value) or `- Unconfirmed [external:<the system>]:` (the fact, and why nothing confirmed it: the source that is missing, or the lookup that failed or came back empty); a check of this repository's own (lint, type-check, tests, build, format) that didn't run or pass goes on a line of its own, `- Unconfirmed [check:<lint|typecheck|tests|build|format>]:`, never as an outside fact; how many records the change affects, where you counted them, and a few examples (ids or names); and anything no connected source could answer, naming the source that is missing. Write `Evidence: none needed` when the change relies on nothing outside the code and changes no stored records. Do NOT describe each code change in detail. Last, when the change copies an existing block, a fenced ```mirrors.json block: `[{\"path\": \"the file of the block you copied\", \"name\": \"the block (resource, function, key)\", \"differences\": [\"each intentional difference, and why\"]}]`; `[]` when it copies none.";
 
 /// How one lookup ended, as recorded when it ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +122,9 @@ pub struct RunEvidence {
     /// What the last sandbox check run came to, one line per step (kind,
     /// command, PASS or FAIL), as run_checks recorded it. Empty when none ran.
     pub checks: Vec<String>,
+    /// Which kinds of check the last sandbox run reported, which passed, or
+    /// why it gave no result.
+    pub sandbox: SandboxRecord,
     /// The kinds of check the repository's CI runs on the pull request.
     pub ci_gates: Vec<CheckKind>,
     /// Each check command the repository's CI runs on the pull request, with
@@ -131,6 +134,60 @@ pub struct RunEvidence {
     /// The environments the diff changes, read from its paths when the
     /// change is judged (see `completeness::changed_environments`).
     pub environments: Vec<String>,
+}
+
+/// What the sandbox came to on the run's last check: the kinds of check it
+/// reported a result for and those that passed, or why it gave none.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SandboxRecord {
+    pub ran: Vec<CheckKind>,
+    pub passed: Vec<CheckKind>,
+    /// Why the last attempt gave no result (the build's status and phases).
+    pub failure: Option<String>,
+}
+
+impl SandboxRecord {
+    /// From one check run's steps and each step's exit code.
+    pub fn from_steps(steps: &[crate::passes::checks::Step], codes: &[Option<i32>]) -> Self {
+        let mut out = Self::default();
+        for (step, code) in steps.iter().zip(codes) {
+            let Some(code) = code else { continue };
+            for k in &step.kinds {
+                if !out.ran.contains(k) {
+                    out.ran.push(*k);
+                }
+                if *code == 0 && !out.passed.contains(k) {
+                    out.passed.push(*k);
+                }
+            }
+        }
+        // A kind with a failing step didn't pass, whatever another step did.
+        for (step, code) in steps.iter().zip(codes) {
+            if matches!(code, Some(c) if *c != 0) {
+                out.passed.retain(|k| !step.kinds.contains(k));
+            }
+        }
+        out
+    }
+
+    /// Why the sandbox didn't run a check of `kind`, in a clause, when the
+    /// run's record says: it gave no result, or its checks had no such step.
+    fn why_not(&self, kind: CheckKind) -> Option<String> {
+        if let Some(f) = &self.failure {
+            return Some(f.clone());
+        }
+        (!self.ran.is_empty() && !self.ran.contains(&kind)).then(|| {
+            format!(
+                "the sandbox ran {} but has no {} step for this repository",
+                self.ran
+                    .iter()
+                    .map(|k| k.name())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                kind.name()
+            )
+        })
+    }
 }
 
 /// Starts a fix round's notes inside [`RunEvidence::notes`].
@@ -158,6 +215,7 @@ impl RunEvidence {
         // The latest check run is what the branch now stands on.
         if !later.checks.is_empty() {
             self.checks = later.checks;
+            self.sandbox = later.sandbox;
         }
         for k in later.ci_gates {
             if !self.ci_gates.contains(&k) {
@@ -478,7 +536,20 @@ pub fn classify(findings: Vec<Finding>, evidence: &RunEvidence) -> Vec<Finding> 
             match kind {
                 Some(k) if evidence.ci_gates.contains(&k) => f.point = "ci_pending".into(),
                 Some(CheckKind::Plan) => f.point = "manual_check".into(),
-                Some(_) => f.point = "unrun_check".into(),
+                Some(k) => {
+                    f.point = "unrun_check".into();
+                    f.check = k.name().into();
+                    // Named from the run's record, not the judge's guess at
+                    // why: what the sandbox came to, and that CI won't run it.
+                    if let Some(why) = evidence.sandbox.why_not(k) {
+                        f.detail = format!(
+                            "{} never ran before the PR: {why}, and the repository's CI does not \
+                             run {} on this pull request.",
+                            capitalised(k.name()),
+                            k.name()
+                        );
+                    }
+                }
                 None if f.point.trim() == "ci_pending" && evidence.ci_gates.is_empty() => {
                     f.point = "unrun_check".into();
                 }
@@ -487,6 +558,15 @@ pub fn classify(findings: Vec<Finding>, evidence: &RunEvidence) -> Vec<Finding> 
             f
         })
         .collect()
+}
+
+/// `text` with its first letter in capitals.
+fn capitalised(text: &str) -> String {
+    let mut c = text.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
 }
 
 /// What the repository's CI runs on the pull request, one line per
@@ -652,21 +732,169 @@ fn proof_gaps(findings: &[Finding]) -> usize {
 }
 
 /// How an evidence line that names a fact nothing confirmed starts (after
-/// any `>` quote and `-` bullet). `- Unconfirmed:` is what the coder is told
-/// to write ([`EVIDENCE_OUTPUT`]); the last is how [`gaps_section`] names an
-/// open `external_fact` gap in a PR's Open items.
-const UNCONFIRMED_MARKERS: &[&str] = &[
-    "unconfirmed:",
-    "unverified:",
-    "not confirmed:",
-    "not verified:",
-    "unconfirmed external field or behaviour:",
+/// any `>` quote and `-` bullet), and what such a line is about when its
+/// marker alone says. `- Unconfirmed:` is what the coder is told to write
+/// ([`EVIDENCE_OUTPUT`]), with a tag; the last is how [`gaps_section`] names
+/// an open `external_fact` gap in a PR's Open items.
+const UNCONFIRMED_MARKERS: &[(&str, bool)] = &[
+    ("unconfirmed external field or behaviour", true),
+    ("unconfirmed", false),
+    ("unverified", false),
+    ("not confirmed", false),
+    ("not verified", false),
 ];
 
-/// The facts an evidence text itself marks as unconfirmed: each line that
-/// starts with one of [`UNCONFIRMED_MARKERS`], with the marker taken off.
-/// Reads the coder's notes before a PR opens and a PR description in review.
-pub fn unconfirmed_facts(text: &str) -> Vec<String> {
+/// What an unconfirmed evidence line is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum About {
+    /// The repository's own checks (lint, type-check, tests, build, format):
+    /// the sandbox or CI settles them, never an outside system.
+    Checks(Vec<CheckKind>),
+    /// A system the code doesn't own, by name when the line's tag gives one.
+    External(Option<String>),
+    /// Untagged and not about the repository's checks: held as an outside
+    /// fact, as before tags.
+    Unknown,
+}
+
+/// One fact an evidence text marks as unconfirmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unconfirmed {
+    pub fact: String,
+    pub about: About,
+}
+
+/// What a line's tag (`check:lint`, `checks:typecheck,tests`,
+/// `external:vendor API`) says it is about.
+fn about_tag(tag: &str) -> Option<About> {
+    let (kind, value) = match tag.split_once(':') {
+        Some((k, v)) => (k.trim().to_ascii_lowercase(), v.trim()),
+        None => (tag.trim().to_ascii_lowercase(), ""),
+    };
+    match kind.as_str() {
+        "check" | "checks" => {
+            let kinds: Vec<CheckKind> = value
+                .split([',', '+', '/', ' '])
+                .filter_map(CheckKind::parse)
+                .fold(Vec::new(), |mut v, k| {
+                    if !v.contains(&k) {
+                        v.push(k);
+                    }
+                    v
+                });
+            (!kinds.is_empty()).then_some(About::Checks(kinds))
+        }
+        "external" | "outside" | "system" => Some(About::External(
+            (!value.is_empty()).then(|| value.to_string()),
+        )),
+        _ => None,
+    }
+}
+
+/// Words that may sit around check names in a line about checks only
+/// ("lint, type-check and tests passing").
+const CHECK_LINE_WORDS: &[&str] = &[
+    "and",
+    "or",
+    "the",
+    "all",
+    "a",
+    "its",
+    "this",
+    "of",
+    "repo",
+    "repository's",
+    "repository",
+    "own",
+    "check",
+    "checks",
+    "suite",
+    "step",
+    "steps",
+    "passing",
+    "pass",
+    "passes",
+    "passed",
+    "green",
+    "clean",
+    "run",
+    "runs",
+    "ran",
+    "running",
+    "not",
+    "never",
+    "no",
+    "did",
+    "didn't",
+    "locally",
+    "in",
+    "on",
+    "the",
+    "sandbox",
+    "result",
+    "results",
+    "were",
+    "was",
+    "is",
+    "are",
+    "be",
+    "could",
+    "couldn't",
+    "verified",
+    "confirmed",
+    "unit",
+    "type",
+    "ci",
+    "before",
+    "pr",
+];
+
+/// The checks an untagged line is about, read through the tool table: a
+/// backticked command it names (`npm run lint`), or a line made only of
+/// check names and the words around them. `None` when it names anything
+/// else, which keeps it an outside fact.
+fn about_checks(fact: &str) -> Option<Vec<CheckKind>> {
+    let mut kinds: Vec<CheckKind> = Vec::new();
+    let mut add = |k: CheckKind| {
+        if !kinds.contains(&k) {
+            kinds.push(k);
+        }
+    };
+    // Backticked commands, matched against the CI tool table.
+    let spans: Vec<&str> = fact.split('`').skip(1).step_by(2).collect();
+    let commands: Vec<CheckKind> = spans
+        .iter()
+        .filter_map(|c| crate::passes::checks::classify_command(c).map(|m| m.kind))
+        .collect();
+    let rest: String = fact.split('`').step_by(2).collect::<Vec<_>>().join(" ");
+    for k in commands {
+        add(k);
+    }
+    // Every other word is a check name or a word around one.
+    let words: Vec<String> = rest
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | ';' | '.' | '(' | ')' | '/' | '&' | ':')
+        })
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    for (i, w) in words.iter().enumerate() {
+        if let Some(k) = CheckKind::parse(w) {
+            add(k);
+        } else if w == "type" && words.get(i + 1).is_some_and(|n| n.starts_with("check")) {
+            add(CheckKind::Typecheck);
+        } else if !CHECK_LINE_WORDS.contains(&w.as_str()) {
+            return None;
+        }
+    }
+    (!kinds.is_empty()).then_some(kinds)
+}
+
+/// The facts an evidence text marks as unconfirmed, each with what it is
+/// about: its tag when it has one (`- Unconfirmed [check:lint]:`), else the
+/// repository's checks when the line names only those, else unknown. Reads
+/// the coder's notes before a PR opens and a PR description in review.
+pub fn unconfirmed_items(text: &str) -> Vec<Unconfirmed> {
     text.lines()
         .filter_map(|line| {
             let mut l = line.trim();
@@ -682,10 +910,53 @@ pub fn unconfirmed_facts(text: &str) -> Vec<String> {
             }
             let l = l.trim_start_matches("**");
             let lower = l.to_ascii_lowercase();
-            let marker = UNCONFIRMED_MARKERS.iter().find(|m| lower.starts_with(*m))?;
-            let fact = l[marker.len()..].trim_start_matches("**").trim();
-            (!fact.is_empty()).then(|| fact.to_string())
+            let (marker, external) = UNCONFIRMED_MARKERS
+                .iter()
+                .find(|(m, _)| lower.starts_with(m))?;
+            let mut rest = l[marker.len()..].trim_start();
+            let mut tag = None;
+            if let Some(open) = rest.strip_prefix('[').or_else(|| rest.strip_prefix('(')) {
+                let close = open.find([']', ')'])?;
+                tag = Some(open[..close].to_string());
+                rest = open[close + 1..].trim_start();
+            }
+            let rest = rest.trim_start_matches("**").trim_start();
+            let fact = rest.strip_prefix(':')?.trim_start_matches("**").trim();
+            if fact.is_empty() {
+                return None;
+            }
+            let about = match tag.as_deref().and_then(about_tag) {
+                Some(a) => a,
+                None if *external => About::External(None),
+                None => match about_checks(fact) {
+                    Some(kinds) => About::Checks(kinds),
+                    None => About::Unknown,
+                },
+            };
+            Some(Unconfirmed {
+                fact: fact.to_string(),
+                about,
+            })
         })
+        .collect()
+}
+
+/// The outside facts an evidence text marks as unconfirmed: each
+/// [`unconfirmed_items`] line that isn't about the repository's own checks.
+pub fn unconfirmed_facts(text: &str) -> Vec<String> {
+    unconfirmed_items(text)
+        .into_iter()
+        .filter(|u| !matches!(u.about, About::Checks(_)))
+        .map(|u| u.fact)
+        .collect()
+}
+
+/// A fact's text reduced to compare it with another: lowercase letters and
+/// digits only.
+fn fact_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
         .collect()
 }
 
@@ -732,16 +1003,48 @@ pub fn recorded_gaps(evidence: &RunEvidence) -> Vec<Finding> {
             ..Default::default()
         });
     }
-    for fact in unconfirmed_facts(evidence.latest_notes()) {
-        out.push(Finding {
-            point: "external_fact".into(),
-            detail: format!("The evidence notes mark this unconfirmed: {fact}"),
-            settle: "Confirm it through a connected source and quote what came back, or change \
-                     the code so it no longer depends on it."
-                .into(),
-            ..Default::default()
-        });
+    // Each unconfirmed line once: an outside fact is a proof gap; one about
+    // the repository's own checks is settled by CI or named as not run, the
+    // way a judge's finding about a check is.
+    let mut checks: Vec<Finding> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for u in unconfirmed_items(evidence.latest_notes()) {
+        let key = fact_key(&u.fact);
+        if key.is_empty() || seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        match u.about {
+            About::Checks(kinds) => {
+                for k in kinds {
+                    if evidence.sandbox.passed.contains(&k)
+                        || checks.iter().any(|c| c.check == k.name())
+                    {
+                        continue;
+                    }
+                    checks.push(Finding {
+                        point: "ci_pending".into(),
+                        detail: format!(
+                            "{} is not confirmed to pass: the evidence notes say so ({}).",
+                            capitalised(k.name()),
+                            u.fact
+                        ),
+                        check: k.name().into(),
+                        ..Default::default()
+                    });
+                }
+            }
+            About::External(_) | About::Unknown => out.push(Finding {
+                point: "external_fact".into(),
+                detail: format!("The evidence notes mark this unconfirmed: {}", u.fact),
+                settle: "Confirm it through a connected source and quote what came back, or \
+                         change the code so it no longer depends on it."
+                    .into(),
+                ..Default::default()
+            }),
+        }
     }
+    out.extend(classify(checks, evidence));
     // Each environment the diff changes needs its own evidence line.
     out.extend(super::completeness::env_gaps(
         &evidence.environments,
@@ -751,8 +1054,10 @@ pub fn recorded_gaps(evidence: &RunEvidence) -> Vec<Finding> {
 }
 
 /// The judge's findings with the [`recorded_gaps`] added. A recorded gap
-/// stands even when the judge passed the change or couldn't answer, and it is
-/// added after [`classify`], so it is always a proof gap (never `ci_pending`).
+/// stands even when the judge passed the change or couldn't answer. An
+/// outside fact is a proof gap; a check the notes leave unconfirmed went
+/// through [`classify`] like the judge's. Nothing is listed twice: a check
+/// the judge already named, or an outside fact it already holds, is kept once.
 pub fn with_recorded(judged: Option<Vec<Finding>>, evidence: &RunEvidence) -> Option<Vec<Finding>> {
     let recorded = recorded_gaps(evidence);
     if recorded.is_empty() {
@@ -765,11 +1070,33 @@ pub fn with_recorded(judged: Option<Vec<Finding>>, evidence: &RunEvidence) -> Op
         all.retain(|f| f.point.trim() != "environment");
     }
     for g in recorded {
-        if !all.contains(&g) {
+        if !all.iter().any(|f| same_item(f, &g)) {
             all.push(g);
         }
     }
     Some(all)
+}
+
+/// Whether two findings name the same open item: the same finding, a check
+/// of the same kind, or the same outside fact (one's text holds the other's).
+fn same_item(a: &Finding, b: &Finding) -> bool {
+    if a == b {
+        return true;
+    }
+    let kind = |f: &Finding| CheckKind::parse(&f.check);
+    if let (Some(x), Some(y)) = (kind(a), kind(b)) {
+        return x == y;
+    }
+    if a.point.trim() == "external_fact" && b.point.trim() == "external_fact" {
+        let (x, y) = (fact_key(&a.detail), fact_key(&b.detail));
+        let marked = fact_key("The evidence notes mark this unconfirmed:");
+        let (x, y) = (
+            x.strip_prefix(&marked).unwrap_or(&x).to_string(),
+            y.strip_prefix(&marked).unwrap_or(&y).to_string(),
+        );
+        return !x.is_empty() && !y.is_empty() && (x.contains(&y) || y.contains(&x));
+    }
+    false
 }
 
 /// The findings with what the plan's end-to-end checklist leaves open added
@@ -1263,7 +1590,9 @@ mod tests {
             vec!["confirm `name` from the vendor API".to_string()]
         );
         assert!(unconfirmed_facts(&gaps_section(&[finding("logging", "x")])).is_empty());
-        assert!(EVIDENCE_OUTPUT.contains("`- Unconfirmed:`"));
+        assert!(EVIDENCE_OUTPUT.contains("`- Unconfirmed [external:<the system>]:`"));
+        assert!(EVIDENCE_OUTPUT
+            .contains("`- Unconfirmed [check:<lint|typecheck|tests|build|format>]:`"));
         assert!(JUDGE_SYSTEM.contains("FAILED or EMPTY confirms nothing"));
     }
 
@@ -1754,7 +2083,8 @@ mod tests {
                 ("ci_pending", "format", "C1"),
                 ("ci_pending", "plan", "C2"),
                 ("ci_pending", "format", "C1"),
-                ("unrun_check", "", ""),
+                // An unrun check names its kind.
+                ("unrun_check", "lint", ""),
                 ("impact", "", ""),
             ]
         );
@@ -1831,5 +2161,189 @@ mod tests {
         assert!(JUDGE_SYSTEM.contains("`detail` is ONE sentence"));
         assert!(JUDGE_SYSTEM.contains("\"settle\":\"one sentence\""));
         assert!(JUDGE_SYSTEM.contains("is not a team_rule miss"));
+    }
+
+    fn app_ci() -> Vec<CiCommand> {
+        // An app whose PR workflow runs the type-check and the tests, not lint.
+        crate::passes::checks::pr_commands(
+            &[crate::passes::checks::Workflow {
+                path: ".github/workflows/pr.yml".into(),
+                text: "on: pull_request\njobs:\n  ci:\n    steps:\n      - run: npm ci\n      - run: npm run typecheck\n      - run: npm test -- --ci\n".into(),
+            }],
+            "develop",
+        )
+    }
+
+    #[test]
+    fn unconfirmed_lines_say_what_they_are_about() {
+        let text = "Evidence:\n\
+            - Unconfirmed [check:lint]: lint did not run in the sandbox\n\
+            - Unconfirmed [checks:typecheck, tests]: never confirmed to pass\n\
+            - Unconfirmed [external:billing API]: refunds carry `amount`\n\
+            - Unconfirmed: lint, type-check and tests passing\n\
+            - Unconfirmed: `npm run lint` was not run\n\
+            - Unconfirmed: the vendor's `status` field passes validation\n\
+            - **Unconfirmed external field or behaviour:** confirm `name`";
+        let items = unconfirmed_items(text);
+        let about: Vec<&About> = items.iter().map(|u| &u.about).collect();
+        assert_eq!(
+            about,
+            vec![
+                &About::Checks(vec![CheckKind::Lint]),
+                &About::Checks(vec![CheckKind::Typecheck, CheckKind::Tests]),
+                &About::External(Some("billing API".into())),
+                &About::Checks(vec![
+                    CheckKind::Lint,
+                    CheckKind::Typecheck,
+                    CheckKind::Tests
+                ]),
+                &About::Checks(vec![CheckKind::Lint]),
+                &About::Unknown,
+                &About::External(None),
+            ]
+        );
+        assert_eq!(items[2].fact, "refunds carry `amount`");
+        // Only what isn't about the repository's own checks is an outside fact,
+        // in a review as before a PR opens.
+        assert_eq!(
+            unconfirmed_facts(text),
+            vec![
+                "refunds carry `amount`".to_string(),
+                "the vendor's `status` field passes validation".to_string(),
+                "confirm `name`".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sandbox_record_reads_each_steps_result() {
+        use crate::passes::checks::Step;
+        let steps = [
+            Step {
+                kinds: vec![CheckKind::Typecheck],
+                cmd: "npm ci && npm run typecheck".into(),
+                scope: None,
+            },
+            Step {
+                kinds: vec![CheckKind::Tests],
+                cmd: "npm test -- a.test.tsx".into(),
+                scope: None,
+            },
+            Step {
+                kinds: vec![CheckKind::Lint],
+                cmd: "npm run lint".into(),
+                scope: None,
+            },
+        ];
+        let r = SandboxRecord::from_steps(&steps, &[Some(0), Some(1), None]);
+        assert_eq!(r.ran, vec![CheckKind::Typecheck, CheckKind::Tests]);
+        assert_eq!(r.passed, vec![CheckKind::Typecheck]);
+        assert_eq!(r.failure, None);
+        assert!(r
+            .why_not(CheckKind::Lint)
+            .unwrap()
+            .contains("has no lint step"));
+        assert_eq!(r.why_not(CheckKind::Typecheck), None);
+    }
+
+    /// The incident, with invented names: an app whose CI runs
+    /// the type-check and the tests but not lint; the coder's notes marked
+    /// "lint, type-check and tests passing" unconfirmed; the sandbox gave no
+    /// result four times; the judge said lint never ran.
+    #[test]
+    fn the_repos_own_checks_are_never_an_outside_fact() {
+        let ci = app_ci();
+        let ev = RunEvidence {
+            notes: "Moved the card to the shared button.\n\nEvidence:\n\
+                    - Confirmed: the button takes `overrideOnPress` (read src/Button.tsx)\n\
+                    - Unconfirmed: lint, type-check and tests passing\n\
+                    - Unconfirmed: lint, type-check and tests passing"
+                .into(),
+            checks: vec![
+                "- typecheck: no result (the run stopped before this step reported), `npm ci && npm run typecheck`".into(),
+                "- sandbox: no result, the sandbox build ended SUCCEEDED and printed no result, 4 builds in a row".into(),
+            ],
+            sandbox: SandboxRecord {
+                failure: Some(
+                    "the sandbox build ended SUCCEEDED and printed no result, 4 builds in a row"
+                        .into(),
+                ),
+                ..Default::default()
+            },
+            ci_gates: crate::passes::checks::kinds_from(&ci),
+            ci_commands: ci,
+            ..Default::default()
+        };
+        assert_eq!(ev.ci_gates, vec![CheckKind::Typecheck, CheckKind::Tests]);
+        let judged = classify(
+            vec![Finding {
+                point: "ci_pending".into(),
+                detail: "Lint never ran: the sandbox stopped with no result.".into(),
+                check: "lint".into(),
+                command: "npm run lint".into(),
+                ..Default::default()
+            }],
+            &ev,
+        );
+        let all = with_recorded(Some(judged), &ev).unwrap();
+        let got: Vec<(&str, &str)> = all
+            .iter()
+            .map(|f| (f.point.as_str(), f.check.as_str()))
+            .collect();
+        // Lint once (the judge's and the notes' are the same item), the
+        // type-check and tests wait on CI, and no outside fact at all.
+        assert_eq!(
+            got,
+            vec![
+                ("unrun_check", "lint"),
+                ("ci_pending", "typecheck"),
+                ("ci_pending", "tests"),
+            ]
+        );
+        assert!(all.iter().all(|f| f.point != "external_fact"));
+        // Lint names the sandbox's real failure and that CI doesn't run it.
+        assert_eq!(
+            all[0].detail,
+            "Lint never ran before the PR: the sandbox build ended SUCCEEDED and printed no \
+             result, 4 builds in a row, and the repository's CI does not run lint on this pull \
+             request."
+        );
+        // CI settles the other two: they leave Open items when it passes.
+        assert!(all[1].ci_cmd.contains("npm run typecheck"), "{:?}", all[1]);
+        let section = gaps_section(&all);
+        assert!(section.contains("- **Check not run:** Lint never ran before the PR"));
+        assert!(!section.contains("Unconfirmed external field"));
+        let after_ci = settle_by_ci(&format!("Body\n\n{section}")).unwrap();
+        assert!(after_ci.contains("Check not run"));
+        assert!(!after_ci.contains("Waiting on CI") && !after_ci.contains("CI runs `"));
+        // Only lint is a proof gap: one fix round, then the PR opens with it.
+        assert_eq!(proof_gaps(&all), 1);
+
+        // Checks the sandbox passed are not held open by the notes.
+        let mut passed = ev.clone();
+        passed.sandbox = SandboxRecord {
+            ran: vec![CheckKind::Typecheck, CheckKind::Tests],
+            passed: vec![CheckKind::Typecheck, CheckKind::Tests],
+            failure: None,
+        };
+        let kinds: Vec<String> = recorded_gaps(&passed)
+            .into_iter()
+            .map(|f| f.check)
+            .collect();
+        assert_eq!(kinds, vec!["lint".to_string()]);
+        // An outside fact is still a proof gap, listed once.
+        let mut vendor = ev.clone();
+        vendor.notes = "Evidence:\n- Unconfirmed [external:billing API]: refunds carry `amount`\n\
+                        - Unconfirmed: refunds carry `amount`"
+            .into();
+        let gaps = with_recorded(
+            Some(vec![finding(
+                "external_fact",
+                "The evidence notes mark this unconfirmed: refunds carry `amount`",
+            )]),
+            &vendor,
+        )
+        .unwrap();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
     }
 }

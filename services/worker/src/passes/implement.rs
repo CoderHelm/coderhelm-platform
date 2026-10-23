@@ -261,6 +261,11 @@ pub async fn run(
         )
     };
 
+    // The team's commit convention and this run's ticket: every commit the
+    // agent makes follows them, and the agent is told the real key.
+    let conventions = super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
+    let tokens = super::ticket_tokens(msg);
+    let commit_hint = conventions.commit_hint(&tokens);
     let prompt = task_prompt(&TaskPrompt {
         simple: complexity == "simple",
         number: msg.issue_number,
@@ -271,6 +276,7 @@ pub async fn run(
         files_hint: &files_hint,
         feedback: &feedback_section,
         issue: &issue_source_block,
+        commit: &commit_hint,
     });
 
     // Execution sandbox: construct the driver (if configured) and derive the
@@ -642,6 +648,7 @@ pub async fn run(
             test_cmd,
             ci_steps,
             check_results: std::sync::Mutex::new(Vec::new()),
+            sandbox_record: std::sync::Mutex::new(Default::default()),
             last_checks_passed: std::sync::atomic::AtomicBool::new(true),
             codegen_cmd,
             codegen_env,
@@ -652,10 +659,7 @@ pub async fn run(
             check_budget: std::sync::atomic::AtomicUsize::new(0),
             gen_edit_rejects: std::sync::Mutex::new(std::collections::HashMap::new()),
             deadline,
-            commits: (
-                super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await,
-                super::ticket_tokens(msg),
-            ),
+            commits: (conventions, tokens),
         },
         mcp_plugins: &loaded_mcp_plugins,
         lambda: &state.lambda,
@@ -983,6 +987,12 @@ pub async fn run(
         .lock()
         .unwrap()
         .clone();
+    let sandbox = executor
+        .write_executor
+        .sandbox_record
+        .lock()
+        .unwrap()
+        .clone();
     let ci_gates = super::checks::kinds_from(&ci);
     Ok(ImplementResult {
         files_modified: files,
@@ -992,6 +1002,7 @@ pub async fn run(
             lookups,
             notes: closing.trim().to_string(),
             checks,
+            sandbox,
             ci_gates,
             ci_commands: ci,
             // Read from the diff when the change is judged.
@@ -1011,6 +1022,8 @@ struct TaskPrompt<'a> {
     files_hint: &'a str,
     feedback: &'a str,
     issue: &'a str,
+    /// How this run's commit subjects read, with its real ticket key.
+    commit: &'a str,
 }
 
 /// The coder's system prompt, the same for every task prompt (simple or
@@ -1046,6 +1059,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - You should need 2-5 tool calls total, plus any lookups the rules below call for.
 - Only implement the listed tasks. Do not add extras.
 - NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
+- {commit}
 - {evidence_output}
 {proof_rules}"#,
             number = p.number,
@@ -1056,6 +1070,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             files_hint = p.files_hint,
             feedback = p.feedback,
             issue = p.issue,
+            commit = p.commit,
             evidence_output = super::proof::EVIDENCE_OUTPUT,
             proof_rules = super::proof::CODER_RULES,
         )
@@ -1074,6 +1089,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - Follow existing code patterns exactly (imports, naming, structure, test style).
 - NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
 - NEVER delete existing functions, methods, or logic unless the task explicitly requires removing them. Modify code, don't gut it.
+- {commit}
 - {evidence_output}
 - Only implement the listed tasks. Do not add extras.
 {proof_rules}{schema_rules}"#,
@@ -1084,6 +1100,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             openspec = p.openspec,
             feedback = p.feedback,
             issue = p.issue,
+            commit = p.commit,
             evidence_output = super::proof::EVIDENCE_OUTPUT,
             proof_rules = super::proof::CODER_RULES,
             schema_rules = SCHEMA_CHANGE_RULES,
@@ -1438,6 +1455,10 @@ struct WriteToolExecutor<'a> {
     /// command, which kind of check, PASS or FAIL). The run's evidence, so
     /// the proof check reads facts instead of the coder's account.
     check_results: std::sync::Mutex<Vec<String>>,
+    /// Which kinds of check the most recent run_checks reported and passed,
+    /// or why it gave no result: the proof check names the real reason a
+    /// check didn't run.
+    sandbox_record: std::sync::Mutex<super::proof::SandboxRecord>,
     /// Verdict of the most recent run_checks (incl. tests). Starts true (nothing
     /// run yet ⇒ no red seen); set on every run_checks so the finish path can
     /// warn when the agent stops on a red result.
@@ -2110,6 +2131,15 @@ impl<'a> WriteToolExecutor<'a> {
                  the output you already have."
             )));
         }
+        // The same setup that gave no result twice gives none a third time:
+        // say why and stop spending the pass on it.
+        if let Some((n, reason)) = crate::clients::sandbox::NoResults::given_up(run_id) {
+            self.record_no_result(&reason, n, &[]);
+            return Ok(json!(format!(
+                "The sandbox gave no result {n} times in this run ({reason}), so no more builds \
+                 are started. Finalize your changes without it; CI still runs on the PR."
+            )));
+        }
         if !sandbox.has_time(self.deadline) {
             return Ok(json!(
                 "Not enough time remains to run a sandbox build safely; finalize your changes now."
@@ -2146,12 +2176,15 @@ impl<'a> WriteToolExecutor<'a> {
             .await
         {
             Ok(o) if o.ran => {
+                crate::clients::sandbox::NoResults::clear(run_id);
                 let codes = super::checks::step_results(&o.output, steps.len());
                 let lines: Vec<String> = steps
                     .iter()
                     .zip(&codes)
                     .map(|(s, c)| super::checks::result_line(s, *c))
                     .collect();
+                *self.sandbox_record.lock().unwrap() =
+                    super::proof::SandboxRecord::from_steps(&steps, &codes);
                 // Record the verdict so the finish path can catch a stop-on-red.
                 // Lint is reported, not part of it: a lint-config quirk in the
                 // sandbox must not force a remediation pass.
@@ -2168,14 +2201,56 @@ impl<'a> WriteToolExecutor<'a> {
                     &o.output
                 )))
             }
-            Ok(o) => Ok(json!(format!(
-                "Sandbox couldn't verify this time ({}). Proceed carefully; CI still runs.",
-                o.output
-            ))),
-            Err(e) => Ok(json!(format!(
-                "Sandbox error: {e}. Proceed carefully; CI still runs."
-            ))),
+            Ok(o) => {
+                let n = if o.broken {
+                    crate::clients::sandbox::NoResults::record(run_id, &o.reason)
+                } else {
+                    0
+                };
+                self.record_no_result(&o.reason, n, &steps);
+                let stop = if n >= crate::clients::sandbox::MAX_NO_RESULT {
+                    format!(
+                        " That is {n} builds without a result in this run, so no more are \
+                         started."
+                    )
+                } else {
+                    String::new()
+                };
+                Ok(json!(format!(
+                    "The sandbox couldn't verify this time: {}{stop} Proceed carefully; CI \
+                     still runs.",
+                    o.output
+                )))
+            }
+            Err(e) => {
+                let reason = format!("the sandbox could not be driven ({e})");
+                self.record_no_result(&reason, 0, &steps);
+                Ok(json!(format!(
+                    "Sandbox error: {e}. Proceed carefully; CI still runs."
+                )))
+            }
         }
+    }
+
+    /// Records that the sandbox gave no result and why (`n` builds in a row
+    /// when counted), as the run's check results: each step with no result,
+    /// then the reason, which the proof check and the PR name.
+    fn record_no_result(&self, reason: &str, n: u32, steps: &[super::checks::Step]) {
+        let reason = if n > 1 {
+            format!("{reason}, {n} builds in a row")
+        } else {
+            reason.to_string()
+        };
+        let mut lines: Vec<String> = steps
+            .iter()
+            .map(|s| super::checks::result_line(s, None))
+            .collect();
+        lines.push(format!("- sandbox: no result, {reason}"));
+        *self.check_results.lock().unwrap() = lines;
+        *self.sandbox_record.lock().unwrap() = super::proof::SandboxRecord {
+            failure: Some(reason),
+            ..Default::default()
+        };
     }
 
     /// Regenerate the repo's generated files in the sandbox and COMMIT the
@@ -2762,6 +2837,7 @@ mod task_prompt_tests {
             files_hint: "",
             feedback: "",
             issue: "",
+            commit: "Commit subject: `ABC-7: …`.",
         })
     }
 
@@ -2779,6 +2855,32 @@ mod task_prompt_tests {
         }
         assert!(!prompt(true).contains(SCHEMA_CHANGE_RULES));
         assert!(prompt(false).contains(SCHEMA_CHANGE_RULES));
+    }
+
+    #[test]
+    fn every_change_is_told_the_commit_subject_with_the_real_key() {
+        // A placeholder key (`ABC-0`) came from instructions that only
+        // showed the pattern; the prompt names the run's real key.
+        let hint = common::git_conventions::GitConventions::default()
+            .commit_hint(&common::git_conventions::Tokens::new("ABC-7", "ABC-7", "x"));
+        for simple in [true, false] {
+            let p = task_prompt(&TaskPrompt {
+                simple,
+                number: 7,
+                title: "t",
+                design: "",
+                continuation: "",
+                openspec: "",
+                files_hint: "",
+                feedback: "",
+                issue: "",
+                commit: &hint,
+            });
+            assert!(
+                p.contains("- Commit subject: `ABC-7: …`"),
+                "simple={simple}"
+            );
+        }
     }
 
     #[test]

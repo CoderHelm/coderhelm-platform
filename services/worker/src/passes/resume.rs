@@ -2702,6 +2702,12 @@ async fn mark_ready(
                             }
                         }
                     }
+                    // A commit message an agent wrote may carry a stand-in
+                    // key (`ABC-0`); the PR title carries the real one.
+                    let squash_msg = common::git_conventions::normalize_message(
+                        &squash_msg,
+                        common::git_conventions::subject_key(title).as_deref(),
+                    );
                     if let Err(e) = github
                         .squash_branch(repo_owner, repo_name, head, base, &squash_msg)
                         .await
