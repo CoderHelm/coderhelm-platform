@@ -561,7 +561,7 @@ fn wall_clock_secs(
         .unwrap_or_else(|| start.elapsed().as_secs())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RunEvent {
     sk: String,
     event_type: String,
@@ -689,6 +689,216 @@ mod stale_ci_event_tests {
     }
 }
 
+/// Names of the checks that concluded failure or timed_out.
+fn failing_check_names(checks: &Value) -> std::collections::BTreeSet<String> {
+    checks["check_runs"]
+        .as_array()
+        .map(|rs| {
+            rs.iter()
+                .filter(|r| {
+                    matches!(
+                        r["conclusion"].as_str().unwrap_or(""),
+                        "failure" | "timed_out"
+                    )
+                })
+                .filter_map(|r| r["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The head's failing checks split into this PR's own and those that also
+/// fail on the base branch's latest commit. A check failing on the base too
+/// was red before this PR: not Coderhelm's to fix, and not counted against it.
+fn split_base_failures(
+    head: &std::collections::BTreeSet<String>,
+    base: &std::collections::BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    head.iter().cloned().partition(|n| !base.contains(n))
+}
+
+/// Re-run a failure once before spending a fix attempt on it? Only when this
+/// head was not re-run already and a failing workflow passed earlier on this
+/// PR: a check that was green and went red on a small change is the shape a
+/// flaky test takes (a random id matching a pattern, a timing race). A check
+/// that never passed is fixed straight away.
+fn should_rerun(
+    head: Option<&str>,
+    rerun_heads: &[String],
+    failing_workflows: &[String],
+    passed_before: &std::collections::HashSet<String>,
+) -> bool {
+    let Some(head) = head.filter(|h| !h.is_empty()) else {
+        return false;
+    };
+    !rerun_heads.iter().any(|h| h == head)
+        && failing_workflows.iter().any(|w| passed_before.contains(w))
+}
+
+/// How long a failure waits for the rest of its head's checks to finish
+/// before it is fixed anyway (a check can sit queued forever).
+const MAX_FULL_CI_WAIT_MINUTES: i64 = 45;
+
+/// When an event arrived, from its key (`EVENT#20261021T231915.657Z#...`).
+fn event_time(sk: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let ts = sk.strip_prefix("EVENT#")?.split('#').next()?;
+    chrono::NaiveDateTime::parse_from_str(ts, "%Y%m%dT%H%M%S%.3fZ")
+        .ok()
+        .map(|t| t.and_utc())
+}
+
+/// The oldest CI failure among `events` has waited longer than
+/// `MAX_FULL_CI_WAIT_MINUTES` for the rest of the checks.
+fn waited_long_for_full_ci(events: &[RunEvent], now: chrono::DateTime<chrono::Utc>) -> bool {
+    events
+        .iter()
+        .filter(|e| e.event_type == "ci_failed")
+        .filter_map(|e| event_time(&e.sk))
+        .min()
+        .is_some_and(|t| (now - t).num_minutes() >= MAX_FULL_CI_WAIT_MINUTES)
+}
+
+/// Lines kept before each error marker of a job log.
+const ERROR_WINDOW_LINES: usize = 80;
+
+/// The part of a failed job's log that explains the failure. GitHub marks
+/// the failing step's errors with `##[error]`; the lines just before each
+/// marker are the failing step's own output. A long job (an end-to-end
+/// suite, a deploy) fails mid-log and then runs its upload and comment
+/// steps, so a head-and-tail cut showed only those and the fixer read the
+/// wrong part. Logs without markers keep the head and the tail.
+fn focus_failing_log(log: &str, budget: usize) -> String {
+    let lines: Vec<&str> = log.lines().collect();
+    let marks: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("##[error]"))
+        .map(|(i, _)| i)
+        .collect();
+    if marks.is_empty() {
+        return common::head_tail_str(log, budget);
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut shown_to = 0usize;
+    for &m in &marks {
+        let from = m.saturating_sub(ERROR_WINDOW_LINES).max(shown_to);
+        if from > shown_to {
+            out.push(format!("… ({} lines not shown)", from - shown_to));
+        }
+        out.extend(lines[from..=m].iter().map(|l| l.to_string()));
+        shown_to = m + 1;
+    }
+    common::head_tail_str(&out.join("\n"), budget)
+}
+
+#[cfg(test)]
+mod ci_triage_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::{BTreeSet, HashSet};
+
+    fn set(v: &[&str]) -> BTreeSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn failing_checks_are_named() {
+        let checks = json!({"check_runs": [
+            {"name": "Lint", "conclusion": "success"},
+            {"name": "Test Suite", "conclusion": "failure"},
+            {"name": "Deploy Preview", "conclusion": "timed_out"},
+            {"name": "Skipped", "conclusion": "skipped"},
+        ]});
+        assert_eq!(
+            failing_check_names(&checks),
+            set(&["Deploy Preview", "Test Suite"])
+        );
+    }
+
+    #[test]
+    fn checks_red_on_base_are_not_this_prs() {
+        let (own, base) = split_base_failures(
+            &set(&["Lint", "Test Suite"]),
+            &set(&["Test Suite", "Other"]),
+        );
+        assert_eq!(own, vec!["Lint"]);
+        assert_eq!(base, vec!["Test Suite"]);
+        // Everything red on base: nothing of this PR's own to fix.
+        let (own, _) = split_base_failures(&set(&["Test Suite"]), &set(&["Test Suite"]));
+        assert!(own.is_empty());
+    }
+
+    #[test]
+    fn a_once_green_check_is_rerun_once_per_head() {
+        let passed: HashSet<String> = ["Test Suite".to_string()].into();
+        let failing = vec!["Test Suite".to_string()];
+        assert!(should_rerun(Some("abc"), &[], &failing, &passed));
+        // Already re-run on this head: spend the attempt.
+        assert!(!should_rerun(
+            Some("abc"),
+            &["abc".to_string()],
+            &failing,
+            &passed
+        ));
+        // Never green on this PR: fix it, a re-run would only wait.
+        assert!(!should_rerun(
+            Some("abc"),
+            &[],
+            &["Lint".to_string()],
+            &passed
+        ));
+        // Unknown head: can't track the one re-run.
+        assert!(!should_rerun(None, &[], &failing, &passed));
+    }
+
+    #[test]
+    fn the_failing_step_is_kept_not_the_steps_after_it() {
+        let mut log: Vec<String> = (0..500).map(|i| format!("setup line {i}")).collect();
+        log.push("  1) checkout › pays with a saved card".into());
+        log.push("     Error: expected 200, got 500".into());
+        log.push("##[error]Process completed with exit code 1.".into());
+        log.extend((0..2000).map(|i| format!("upload report chunk {i}")));
+        let focused = focus_failing_log(&log.join("\n"), 4000);
+        assert!(
+            focused.contains("Error: expected 200, got 500"),
+            "{focused}"
+        );
+        assert!(focused.contains("##[error]Process completed"));
+        assert!(!focused.contains("upload report chunk"));
+        assert!(focused.starts_with("… ("));
+    }
+
+    #[test]
+    fn a_failure_waits_for_the_full_check_set_but_not_forever() {
+        let ev = |sk: &str| RunEvent {
+            sk: sk.into(),
+            event_type: "ci_failed".into(),
+            payload: json!({}),
+        };
+        let t = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let events = vec![ev("EVENT#20261021T231915.657Z#ci_failed")];
+        assert!(!waited_long_for_full_ci(&events, t("2026-10-21T23:30:00Z")));
+        assert!(waited_long_for_full_ci(&events, t("2026-10-22T00:05:00Z")));
+        // No parsable failure time: keep waiting (the day cap still holds).
+        assert!(!waited_long_for_full_ci(
+            &[ev("EVENT#garbage")],
+            t("2026-10-22T00:05:00Z")
+        ));
+    }
+
+    #[test]
+    fn a_log_without_markers_keeps_head_and_tail() {
+        let log: String = (0..3000).map(|i| format!("line {i}\n")).collect();
+        let focused = focus_failing_log(&log, 2000);
+        assert!(focused.contains("line 0"));
+        assert!(focused.contains("line 2999"));
+    }
+}
+
 /// Resume a run after receiving a webhook event (CI pass/fail, PR comment, etc).
 pub async fn run(
     state: &WorkerState,
@@ -777,6 +987,12 @@ pub async fn run(
                 return Ok(());
             }
         } else {
+            // A run handed off while red can still go green afterwards (a
+            // person's push, a re-run, a flaky check passing). Record it, or
+            // the run counts as "ended red" forever.
+            if matches!(status.as_str(), "completed" | "merged") {
+                record_late_green(state, &msg, &run_record).await;
+            }
             info!(
                 run_id = msg.run_id,
                 status, "Run not in awaiting_ci status, skipping resume"
@@ -1054,6 +1270,15 @@ pub async fn run(
                     run_id = msg.run_id,
                     "CI passed (missed webhook) — marking PR ready and completing"
                 );
+                // A green CI counts however Coderhelm learned of it: without
+                // this, a fixed run that missed its webhook read "ended red".
+                super::record_ci_outcome(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    passed_outcome(&run_record, branch_head.as_deref()),
+                )
+                .await;
                 if let Some(names) = &quarantined {
                     super::add_progress_note(
                         state,
@@ -1152,8 +1377,91 @@ pub async fn run(
     // check failed only on quarantined tests, there's nothing to fix and the
     // run carries on as if CI passed. Decided before claiming the run, so a
     // wait for an unread test report leaves the run untouched.
-    let mut quarantined_only: Option<Vec<String>> = None;
+    //
+    // Before that, and before any fix attempt is spent, the whole check set on
+    // the CURRENT head decides (events are only wake-ups):
+    //  - still running → wait for the full set: fixing on the first failure
+    //    to land fed the fixer a partial set, so the stall signature drifted
+    //    every cycle and never caught a loop;
+    //  - green → the failure belonged to an older commit (an event without a
+    //    head sha can't be judged stale otherwise): nothing to fix;
+    //  - failed → checks also failing on the base branch are not this PR's;
+    //    and a check that passed earlier on this PR is re-run once first.
+    let mut on_base: Vec<String> = Vec::new();
+    let mut red_on_base_only = false;
     if has_ci_fail && !repo_owner.is_empty() && !repo_name.is_empty() {
+        if let Ok(gh) = GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            msg.installation_id,
+            &state.http,
+        ) {
+            let git_ref = branch_head.as_deref().unwrap_or(&branch).to_string();
+            match gh
+                .list_check_runs_for_ref(&repo_owner, &repo_name, &git_ref)
+                .await
+            {
+                Ok(checks) => match ci_verdict_from_checks(&checks) {
+                    CiVerdict::Pending if !waited_long_for_full_ci(&events, chrono::Utc::now()) => {
+                        info!(
+                            run_id = msg.run_id,
+                            "A check failed but others still run on this head — waiting for the full set before fixing"
+                        );
+                        send_delayed_resume(state, &msg, 90).await;
+                        return Ok(());
+                    }
+                    // A check stuck queued must not hold the fix for a day.
+                    CiVerdict::Pending => {}
+                    CiVerdict::Green => {
+                        info!(
+                            run_id = msg.run_id,
+                            "The failure is not on the current head, which is green — treating CI as passed"
+                        );
+                        has_ci_fail = false;
+                        has_ci_pass = true;
+                    }
+                    CiVerdict::NoChecks => {}
+                    CiVerdict::Failed => {
+                        let head_failing = failing_check_names(&checks);
+                        let base_failing = match gh
+                            .list_check_runs_for_ref(&repo_owner, &repo_name, &base_branch)
+                            .await
+                        {
+                            Ok(b) => failing_check_names(&b),
+                            Err(e) => {
+                                warn!(run_id = msg.run_id, error = %e, "Could not read the base branch's checks");
+                                Default::default()
+                            }
+                        };
+                        let (own, base) = split_base_failures(&head_failing, &base_failing);
+                        on_base = base;
+                        red_on_base_only = own.is_empty() && !on_base.is_empty();
+                        if !red_on_base_only
+                            && try_rerun_once(
+                                state,
+                                &msg,
+                                &gh,
+                                &run_record,
+                                &repo_owner,
+                                &repo_name,
+                                branch_head.as_deref(),
+                                &events,
+                            )
+                            .await
+                        {
+                            return Ok(());
+                        }
+                    }
+                },
+                Err(e) => {
+                    warn!(run_id = msg.run_id, error = %e, "Could not read the head's checks — fixing from the events");
+                }
+            }
+        }
+    }
+
+    let mut quarantined_only: Option<Vec<String>> = None;
+    if has_ci_fail && !red_on_base_only && !repo_owner.is_empty() && !repo_name.is_empty() {
         if let Ok(gh) = GitHubClient::new(
             &state.secrets.github_app_id,
             &state.secrets.github_private_key,
@@ -1238,7 +1546,7 @@ pub async fn run(
         issue_number,
         sender: String::new(),
         requester: None,
-        base_branch,
+        base_branch: base_branch.clone(),
         image_attachments,
         continuation: 0,
         continuation_run_id: None,
@@ -1288,6 +1596,64 @@ pub async fn run(
         // Lint passing must NOT mask Test Suite failing. The old guard
         // (`has_ci_fail && !has_ci_pass`) skipped this path whenever any workflow
         // passed, shipping red PRs as "completed" (run 01KZ5AJW).
+        if !on_base.is_empty() {
+            super::record_ci_outcome(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                super::CiOutcome::RedOnBase(on_base.clone()),
+            )
+            .await;
+        }
+        if red_on_base_only {
+            // Every failing check fails on the base branch too: red before
+            // this PR. Not a fix attempt, and not Coderhelm's to "fix".
+            info!(
+                run_id = msg.run_id,
+                checks = ?on_base,
+                "CI is red only on checks that fail on the base branch too — handing off"
+            );
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &format!(
+                    "CI is red only on checks that also fail on {base_branch} ({}) — not caused by this PR; handed off for human review.",
+                    on_base.join(", ")
+                ),
+            )
+            .await;
+            super::record_ci_outcome(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                super::CiOutcome::HandedOff(super::GaveUp::RedOnBase),
+            )
+            .await;
+            mark_events_processed(state, &msg.run_id, &events).await;
+            mark_pr_ready(
+                state,
+                &msg.team_id,
+                &github,
+                &repo_owner,
+                &repo_name,
+                pr_number,
+            )
+            .await;
+            complete_run_with_status(
+                state,
+                &ticket_msg,
+                &msg.run_id,
+                "completed",
+                &pr_url,
+                pr_number,
+                &branch,
+                &usage,
+                wall_clock_secs(created_at, &start),
+            )
+            .await?;
+            return Ok(());
+        }
         info!(run_id = msg.run_id, "CI failed — attempting fix");
         super::record_ci_outcome(
             state,
@@ -1319,12 +1685,11 @@ pub async fn run(
                 .await
             {
                 Ok(l) => {
-                    // Head+tail: compile cascades put the root-cause error at
-                    // the HEAD of the log; the old tail-only keep discarded it
-                    // and fed the fixer downstream noise. (Also char-safe —
-                    // the raw byte slice panicked on multibyte log content.)
+                    // The failing step's own output (see focus_failing_log);
+                    // head+tail when the log has no error markers, since
+                    // compile cascades put the root cause at the head.
                     let budget = MAX_LOG_CHARS / failed_run_ids.len().max(1);
-                    all_logs.push(common::head_tail_str(&l, budget));
+                    all_logs.push(focus_failing_log(&l, budget));
                 }
                 Err(e) => {
                     warn!(
@@ -1372,7 +1737,7 @@ pub async fn run(
                 state,
                 &msg.team_id,
                 &msg.run_id,
-                super::CiOutcome::HandedOff,
+                super::CiOutcome::HandedOff(super::GaveUp::Budget),
             )
             .await;
             // Every terminal path consumes its events; left unprocessed, the
@@ -1418,6 +1783,13 @@ pub async fn run(
                 &msg.team_id,
                 &msg.run_id,
                 "Automated fixes stalled on the same failure (no progress) — handed off for human review.",
+            )
+            .await;
+            super::record_ci_outcome(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                super::CiOutcome::HandedOff(super::GaveUp::Stalled),
             )
             .await;
             // mark_pr_ready squashes the branch (while the PR is still a draft)
@@ -1471,6 +1843,15 @@ pub async fn run(
         } else {
             format!("\n\nPR review comments (also address if relevant):\n{review_feedback}")
         };
+        let base_note = if on_base.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nThese checks also fail on {base_branch}, so this PR did not cause them. \
+                 Leave them alone: {}.",
+                on_base.join(", ")
+            )
+        };
 
         let feedback = format!(
             "CI workflow failed on PR #{pr_number} (branch: {branch}). Fix the failures.\n\n\
@@ -1487,7 +1868,7 @@ pub async fn run(
              - Before you finish, call run_checks to verify your fix builds and type-checks against real output. Do not finish on a red result if run_checks is available.\n\
              - You may create new test files or edit existing ones if needed.\n\n\
              Failure summary:\n{failure_logs}\n\n\
-             Full logs:\n{logs}{review_context}"
+             Full logs:\n{logs}{review_context}{base_note}"
         );
 
         // The tree before the fix: compared with the tree after it to tell a
@@ -1541,6 +1922,13 @@ pub async fn run(
                         run_id = msg.run_id,
                         "CI fix produced no changes — completing with PR for human review"
                     );
+                    super::record_ci_outcome(
+                        state,
+                        &msg.team_id,
+                        &msg.run_id,
+                        super::CiOutcome::HandedOff(super::GaveUp::NoChange),
+                    )
+                    .await;
                     // Don't hard-fail — complete the run and mark PR ready for human review
                     mark_events_processed(state, &msg.run_id, &events).await;
                     complete_run_with_status(
@@ -1572,6 +1960,13 @@ pub async fn run(
                     return Ok(());
                 }
                 error!(run_id = msg.run_id, error = %e, "CI fix implementation failed — completing with PR for human review");
+                super::record_ci_outcome(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    super::CiOutcome::HandedOff(super::GaveUp::FixError),
+                )
+                .await;
                 mark_events_processed(state, &msg.run_id, &events).await;
                 complete_run_with_status(
                     state,
@@ -1623,6 +2018,13 @@ pub async fn run(
                 &msg.team_id,
                 &msg.run_id,
                 "Automated fixes stopped changing the code (same files, same bytes) — handed off for human review.",
+            )
+            .await;
+            super::record_ci_outcome(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                super::CiOutcome::HandedOff(super::GaveUp::NoProgress),
             )
             .await;
             mark_events_processed(state, &msg.run_id, &events).await;
@@ -1796,7 +2198,13 @@ pub async fn run(
             )
             .await;
         }
-        super::record_ci_outcome(state, &msg.team_id, &msg.run_id, super::CiOutcome::Passed).await;
+        super::record_ci_outcome(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            passed_outcome(&run_record, branch_head.as_deref()),
+        )
+        .await;
         // CI's green result settles the checks the PR opened without.
         if verdict == CiVerdict::Green {
             super::pr::settle_unverified_by_ci(&github, &repo_owner, &repo_name, pr_number).await;
@@ -1967,6 +2375,13 @@ pub async fn run(
                     &msg.team_id,
                     &msg.run_id,
                     "Automated fix budget exhausted — PR handed off for human review",
+                )
+                .await;
+                super::record_ci_outcome(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    super::CiOutcome::HandedOff(super::GaveUp::Budget),
                 )
                 .await;
                 mark_pr_ready(
@@ -2237,6 +2652,195 @@ fn collect_ci_failure_info(events: &[RunEvent]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+type RunRecord = std::collections::HashMap<String, AttributeValue>;
+
+/// Heads whose failed jobs this run already re-ran once.
+fn rerun_heads(run_record: &RunRecord) -> Vec<String> {
+    run_record
+        .get("ci_rerun_heads")
+        .and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
+        .unwrap_or_default()
+}
+
+/// A green CI on `head`: flaky when this head failed and was re-run.
+fn passed_outcome(run_record: &RunRecord, head: Option<&str>) -> super::CiOutcome {
+    match head {
+        Some(h) if rerun_heads(run_record).iter().any(|x| x == h) => {
+            super::CiOutcome::PassedAfterRerun
+        }
+        _ => super::CiOutcome::Passed,
+    }
+}
+
+/// Workflows that passed at least once on this run's PR, any commit.
+async fn ci_passed_workflows(
+    state: &WorkerState,
+    run_id: &str,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if state.config.events_table_name.is_empty() {
+        return out;
+    }
+    let mut start = None;
+    loop {
+        let resp = state
+            .dynamo
+            .query()
+            .table_name(&state.config.events_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+            .filter_expression("event_type = :t")
+            .expression_attribute_values(":pk", attr_s(&format!("RUN#{run_id}")))
+            .expression_attribute_values(":prefix", attr_s("EVENT#"))
+            .expression_attribute_values(":t", attr_s("ci_passed"))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await;
+        let Ok(resp) = resp else {
+            return out;
+        };
+        for item in resp.items() {
+            let payload: Value = item
+                .get("payload")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            if let Some(w) = payload["workflow_name"].as_str() {
+                out.insert(w.to_string());
+            }
+        }
+        match resp.last_evaluated_key() {
+            Some(k) => start = Some(k.clone()),
+            None => return out,
+        }
+    }
+}
+
+/// Re-runs this head's failed workflows once instead of spending a fix
+/// attempt, when the failure looks flaky (see `should_rerun`). True when a
+/// re-run started: the run stays in awaiting_ci and the re-run's result
+/// wakes it again.
+#[allow(clippy::too_many_arguments)]
+async fn try_rerun_once(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    gh: &GitHubClient,
+    run_record: &RunRecord,
+    owner: &str,
+    name: &str,
+    head: Option<&str>,
+    events: &[RunEvent],
+) -> bool {
+    let failed: Vec<&RunEvent> = events
+        .iter()
+        .filter(|e| e.event_type == "ci_failed")
+        .filter(|e| {
+            matches!(
+                e.payload["conclusion"].as_str().unwrap_or(""),
+                "failure" | "timed_out"
+            )
+        })
+        .collect();
+    let workflows: Vec<String> = failed
+        .iter()
+        .filter_map(|e| e.payload["workflow_name"].as_str().map(str::to_string))
+        .collect();
+    let passed_before = ci_passed_workflows(state, &msg.run_id).await;
+    if !should_rerun(head, &rerun_heads(run_record), &workflows, &passed_before) {
+        return false;
+    }
+    let mut started = false;
+    for e in &failed {
+        let Some(wf_run) = e.payload["workflow_run_id"].as_u64() else {
+            continue;
+        };
+        match gh.rerun_failed_jobs(owner, name, wf_run).await {
+            Ok(()) => started = true,
+            Err(err) => {
+                warn!(run_id = msg.run_id, workflow_run_id = wf_run, error = %err, "Could not re-run failed jobs")
+            }
+        }
+    }
+    if !started {
+        return false;
+    }
+    info!(run_id = msg.run_id, workflows = ?workflows, "CI failed on a check that passed earlier on this PR — re-running once before a fix");
+    super::record_ci_outcome(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        super::CiOutcome::Rerun(head.unwrap_or_default().to_string()),
+    )
+    .await;
+    super::add_progress_note(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        &format!(
+            "CI failed on {} after passing earlier on this PR — re-running the failed jobs once before changing code.",
+            workflows.join(", ")
+        ),
+    )
+    .await;
+    // The failures this re-run replaces; the re-run's own result arrives as
+    // new events. Comments stay for the next resume.
+    let consumed: Vec<RunEvent> = failed.into_iter().cloned().collect();
+    mark_events_processed(state, &msg.run_id, &consumed).await;
+    send_delayed_resume(state, msg, 120).await;
+    true
+}
+
+/// After a run was handed off red, a green CI on its current head is
+/// recorded, so the run counts as ended green. Only looks when the run's last
+/// CI result was red and a CI pass arrived.
+async fn record_late_green(state: &WorkerState, msg: &ResumeMessage, run_record: &RunRecord) {
+    let last = run_record.get("ci_last").and_then(|v| v.as_s().ok());
+    if last.map(String::as_str) != Some("failed") {
+        return;
+    }
+    let Ok(events) = load_unprocessed_events(state, &msg.run_id).await else {
+        return;
+    };
+    let ci: Vec<RunEvent> = events
+        .into_iter()
+        .filter(|e| e.event_type == "ci_passed" || e.event_type == "ci_failed")
+        .collect();
+    if !ci.iter().any(|e| e.event_type == "ci_passed") {
+        return;
+    }
+    let Some(repo) = run_record.get("repo").and_then(|v| v.as_s().ok()) else {
+        return;
+    };
+    let Some((owner, name)) = repo.split_once('/') else {
+        return;
+    };
+    let Some(head) = current_branch_head(state, msg, run_record).await else {
+        return;
+    };
+    let Ok(gh) = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    ) else {
+        return;
+    };
+    if evaluate_ci_verdict(&gh, owner, name, &head).await == CiVerdict::Green {
+        info!(
+            run_id = msg.run_id,
+            "CI went green after the hand-off — recording it"
+        );
+        super::record_ci_outcome(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            passed_outcome(run_record, Some(&head)),
+        )
+        .await;
+        mark_events_processed(state, &msg.run_id, &ci).await;
+    }
 }
 
 fn collect_review_feedback(events: &[RunEvent]) -> String {

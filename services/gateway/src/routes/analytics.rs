@@ -52,6 +52,28 @@ fn b(item: &Item, k: &str) -> Option<bool> {
 fn av(v: &str) -> AttributeValue {
     AttributeValue::S(v.to_string())
 }
+fn list_s(item: &Item, k: &str) -> Vec<String> {
+    item.get(k)
+        .and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
+        .unwrap_or_default()
+}
+/// The last pass a run's `pass_history` names.
+fn last_history_pass(item: &Item) -> String {
+    item.get("pass_history")
+        .and_then(|v| v.as_l().ok())
+        .and_then(|l| {
+            l.iter().rev().find_map(|e| {
+                e.as_m()
+                    .ok()
+                    .and_then(|m| m.get("pass"))
+                    .and_then(|p| p.as_s().ok())
+                    .filter(|p| !p.is_empty())
+                    .cloned()
+            })
+        })
+        .unwrap_or_default()
+}
 
 // ── Rows ───────────────────────────────────────────────────────────────────
 
@@ -84,6 +106,21 @@ pub struct RunRow {
     pub merged_at: String,
     pub pr_opened_at: String,
     pub human_commits: Option<u64>,
+    /// The reason older failure writes saved under `error`.
+    pub error_legacy: String,
+    /// The pass a failed run was in (`common::run_fail`).
+    pub failed_pass: String,
+    pub current_pass: String,
+    /// The last pass in `pass_history`.
+    pub last_pass: String,
+    /// Why Coderhelm left a red PR to a person (worker `GaveUp`).
+    pub ci_end: String,
+    /// Failing checks that also failed on the base branch.
+    pub ci_red_on_base: Vec<String>,
+    /// Times the failed jobs of a head were re-run instead of fixed.
+    pub ci_reruns: u64,
+    /// CI went green after such a re-run.
+    pub ci_flaky: bool,
 }
 
 impl RunRow {
@@ -121,6 +158,14 @@ impl RunRow {
             merged_at: s(i, "merged_at"),
             pr_opened_at: s(i, "pr_opened_at"),
             human_commits: opt_n(i, "human_commits").map(|v| v as u64),
+            error_legacy: s(i, "error"),
+            failed_pass: s(i, "failed_pass"),
+            current_pass: s(i, "current_pass"),
+            last_pass: last_history_pass(i),
+            ci_end: s(i, "ci_end"),
+            ci_red_on_base: list_s(i, "ci_red_on_base"),
+            ci_reruns: n(i, "ci_reruns") as u64,
+            ci_flaky: b(i, "ci_flaky").unwrap_or(false),
         }
     }
     fn merged(&self) -> bool {
@@ -232,6 +277,8 @@ impl LookupRow {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TraceRow {
+    /// From the key, `RUN#<run_id>#PASS#<pass>`.
+    pub run_id: String,
     pub pass: String,
     pub timestamp: String,
     pub input_tokens: f64,
@@ -241,7 +288,13 @@ pub struct TraceRow {
 
 impl TraceRow {
     fn from_item(i: &Item) -> TraceRow {
+        let sk = s(i, "sk");
         TraceRow {
+            run_id: sk
+                .strip_prefix("RUN#")
+                .and_then(|r| r.split("#PASS#").next())
+                .unwrap_or_default()
+                .to_string(),
             pass: s(i, "pass"),
             timestamp: s(i, "timestamp"),
             input_tokens: n(i, "input_tokens"),
@@ -370,6 +423,181 @@ pub fn failure_reason(msg: &str) -> String {
     }
     let out: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
     common::truncate_str(&out, 120).to_string()
+}
+
+/// Values of `current_pass` that name a state, not a pass.
+const NOT_A_PASS: [&str; 4] = ["cancelled", "done", "awaiting_ci", "unknown"];
+
+/// Why a failed run failed, for grouping. Runs since
+/// `common::run_fail::REASONS_RECORDED_SINCE` always record a reason and a
+/// pass; for older ones the reason is derived from what they did record: the
+/// field older writes used (`error`), the pass they reached (history, then
+/// traces), a cancel a late write overwrote.
+pub fn run_failure_reason(r: &RunRow, trace_pass: Option<&str>) -> String {
+    let pass = [
+        r.failed_pass.as_str(),
+        r.last_pass.as_str(),
+        trace_pass.unwrap_or(""),
+    ]
+    .into_iter()
+    .map(|p| p.split(':').next().unwrap_or(p).trim())
+    .find(|p| {
+        !p.is_empty() && !NOT_A_PASS.contains(p) && *p != common::run_fail::BEFORE_FIRST_PASS
+    });
+    let msg = r.error_message.trim();
+    if !msg.is_empty() {
+        // The stuck-run sweep's message from before it looked up the pass.
+        if msg.contains("during unknown pass") {
+            return match pass {
+                Some(p) => failure_reason(&msg.replace("unknown pass", &format!("{p} pass"))),
+                None => "Run stopped before its first pass started (auto-cleanup)".to_string(),
+            };
+        }
+        return failure_reason(msg);
+    }
+    // Cancelled (its pass says so), then a late write set "failed" over it.
+    if r.current_pass == "cancelled" {
+        return "Cancelled, then marked failed by a late write".to_string();
+    }
+    if !r.error_legacy.trim().is_empty() {
+        let base = failure_reason(&r.error_legacy);
+        return match pass {
+            Some(p) => format!("{base} ({p} pass)"),
+            None => base,
+        };
+    }
+    let since = common::run_fail::REASONS_RECORDED_SINCE;
+    if r.created_at.as_str() < since {
+        format!("Not recorded (before {since})")
+    } else {
+        "No reason recorded".to_string()
+    }
+}
+
+/// How a run whose CI went red ended up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiEnd {
+    /// Green after a fix Coderhelm pushed.
+    GreenAfterFix,
+    /// Green after a re-run of the failed jobs, with no code change.
+    Flaky,
+    /// Green without a Coderhelm fix (a person's push, a later run).
+    GreenOtherwise,
+    /// Red only on checks that also fail on the base branch.
+    RedOnBase,
+    /// The run is still working on it.
+    Running,
+    /// Coderhelm left it red to a person, for this reason.
+    GaveUp(String),
+}
+
+/// The worker's fix attempt ceiling (resume.rs `MAX_CI_FIX_CYCLES`): an older
+/// run that recorded no reason but reached it ran out of attempts.
+const MAX_CI_FIX_ATTEMPTS: u64 = 10;
+
+/// What a stored `ci_end` means, for a person.
+fn gave_up_label(ci_end: &str, r: &RunRow) -> String {
+    match ci_end {
+        "budget" => "Fix attempts used up".into(),
+        "stalled" => "Same failure after a fix".into(),
+        "no_change" => "Fix found nothing to change".into(),
+        "no_progress" => "Fixes stopped changing the code".into(),
+        "fix_error" => "Fix attempt errored".into(),
+        "" if r.ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS => "Fix attempts used up".into(),
+        "" => format!(
+            "Not recorded (before {})",
+            common::run_fail::REASONS_RECORDED_SINCE
+        ),
+        other => other.replace('_', " "),
+    }
+}
+
+impl RunRow {
+    /// CI went red on this run at least once.
+    fn ci_went_red(&self) -> bool {
+        self.ci_fix_attempts > 0 || self.ci_reruns > 0 || !self.ci_red_on_base.is_empty()
+    }
+    /// Red only on checks that already failed on the base branch: never its
+    /// own failure to fix.
+    fn red_only_on_base(&self) -> bool {
+        !self.ci_red_on_base.is_empty() && self.ci_fix_attempts == 0 && self.ci_reruns == 0
+    }
+    fn ci_end_state(&self) -> CiEnd {
+        if self.ci_last == "passed" {
+            return if self.ci_flaky {
+                CiEnd::Flaky
+            } else if self.ci_fix_commits > 0 {
+                CiEnd::GreenAfterFix
+            } else {
+                CiEnd::GreenOtherwise
+            };
+        }
+        if matches!(
+            self.status.as_str(),
+            "running" | "awaiting_ci" | "queued" | "pending"
+        ) {
+            return CiEnd::Running;
+        }
+        if !self.ci_red_on_base.is_empty() && matches!(self.ci_end.as_str(), "" | "red_on_base") {
+            return CiEnd::RedOnBase;
+        }
+        CiEnd::GaveUp(gave_up_label(&self.ci_end, self))
+    }
+}
+
+/// CI self-fixes, told honestly: runs red only on checks that fail on the
+/// base branch too are counted apart, and every red run is placed in one
+/// outcome, with the reason when Coderhelm gave up.
+pub fn ci_outcomes(runs: &[&RunRow]) -> Value {
+    let red: Vec<&RunRow> = runs.iter().copied().filter(|r| r.ci_went_red()).collect();
+    let own: Vec<&RunRow> = red
+        .iter()
+        .copied()
+        .filter(|r| !r.red_only_on_base())
+        .collect();
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &red {
+        let key = match r.ci_end_state() {
+            CiEnd::GreenAfterFix => "green_after_fix",
+            CiEnd::Flaky => "flaky",
+            CiEnd::GreenOtherwise => "green_without_fix",
+            CiEnd::RedOnBase => "red_on_base",
+            CiEnd::Running => "running",
+            CiEnd::GaveUp(why) => {
+                *reasons.entry(why).or_default() += 1;
+                "gave_up"
+            }
+        };
+        *counts.entry(key).or_default() += 1;
+    }
+    let c = |k: &str| counts.get(k).copied().unwrap_or(0);
+    let mut gave_up_reasons: Vec<Value> = reasons
+        .into_iter()
+        .map(|(reason, count)| json!({"reason": reason, "count": count}))
+        .collect();
+    gave_up_reasons.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()));
+    let fixed = c("green_after_fix");
+    // Runs still working on it have no outcome yet.
+    let settled = own.len().saturating_sub(c("running"));
+    json!({
+        "runs_with_red_ci": own.len(),
+        "red_on_base_runs": red.len() - own.len(),
+        "fixed_by_coderhelm": fixed,
+        "fix_rate": ratio(fixed as f64, settled as f64),
+        "fix_attempts": own.iter().map(|r| r.ci_fix_attempts).sum::<u64>(),
+        "fix_commits": own.iter().map(|r| r.ci_fix_commits).sum::<u64>(),
+        "reruns": red.iter().map(|r| r.ci_reruns).sum::<u64>(),
+        "outcomes": {
+            "green_after_fix": fixed,
+            "green_without_fix": c("green_without_fix"),
+            "flaky": c("flaky"),
+            "red_on_base": c("red_on_base"),
+            "gave_up": c("gave_up"),
+            "running": c("running"),
+        },
+        "gave_up_reasons": gave_up_reasons,
+    })
 }
 
 /// One row per pull request among `runs`: a rerun that pushed to the same PR
@@ -841,12 +1069,24 @@ pub fn build(
             .then_with(|| a["person"].as_str().cmp(&b["person"].as_str()))
     });
 
+    // The last pass each run's traces name (kept 30 days): a failed run with
+    // no pass of its own on record gets its reason's pass from here.
+    let mut trace_pass: HashMap<&str, (&str, &str)> = HashMap::new();
+    for t in traces.iter().filter(|t| !t.run_id.is_empty()) {
+        let e = trace_pass
+            .entry(t.run_id.as_str())
+            .or_insert((t.timestamp.as_str(), t.pass.as_str()));
+        if t.timestamp.as_str() > e.0 {
+            *e = (t.timestamp.as_str(), t.pass.as_str());
+        }
+    }
+    let reason_of =
+        |r: &RunRow| run_failure_reason(r, trace_pass.get(r.run_id.as_str()).map(|e| e.1));
+
     // Failures, grouped by reason.
     let mut failures: HashMap<String, (usize, &RunRow)> = HashMap::new();
     for r in cur_runs.iter().filter(|r| r.status == "failed") {
-        let e = failures
-            .entry(failure_reason(&r.error_message))
-            .or_insert((0, r));
+        let e = failures.entry(reason_of(r)).or_insert((0, r));
         e.0 += 1;
         if r.created_at > e.1.created_at {
             e.1 = r;
@@ -859,16 +1099,8 @@ pub fn build(
     failures.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()));
     failures.truncate(8);
 
-    // CI self-fixes.
-    let red: Vec<&&RunRow> = cur_runs.iter().filter(|r| r.ci_fix_attempts > 0).collect();
-    let fixed = red.iter().filter(|r| r.ci_last == "passed").count();
-    let ci = json!({
-        "runs_with_red_ci": red.len(),
-        "fixed_by_coderhelm": fixed,
-        "fix_rate": ratio(fixed as f64, red.len() as f64),
-        "fix_attempts": red.iter().map(|r| r.ci_fix_attempts).sum::<u64>(),
-        "fix_commits": red.iter().map(|r| r.ci_fix_commits).sum::<u64>(),
-    });
+    // CI self-fixes, with how each red run ended.
+    let ci = ci_outcomes(&cur_runs);
 
     // Reviews, split by what GitHub shows.
     let posted: Vec<&&ReviewRow> = cur_reviews
@@ -963,7 +1195,7 @@ pub fn build(
     let failed_recent: Vec<Value> = failed_recent
         .iter()
         .take(10)
-        .map(|r| json!({"run_id": r.run_id, "title": r.title, "repo": r.repo, "reason": failure_reason(&r.error_message), "at": r.created_at}))
+        .map(|r| json!({"run_id": r.run_id, "title": r.title, "repo": r.repo, "reason": reason_of(r), "at": r.created_at}))
         .collect();
 
     let mut repo_names: Vec<String> = runs
@@ -1024,9 +1256,11 @@ async fn load_runs(state: &AppState, team: &str, w: Window) -> Result<Vec<RunRow
                  requester_email, title, ticket_id, cost_usd, tokens_in, tokens_out, \
                  cache_read_tokens, cache_write_tokens, \
                  duration_s, pr_number, pr_url, error_message, ci_fix_attempts, ci_fix_commits, ci_last, \
-                 pr_outcome, merged_at, pr_opened_at, human_commits",
+                 pr_outcome, merged_at, pr_opened_at, human_commits, #err, failed_pass, current_pass, \
+                 pass_history, ci_end, ci_red_on_base, ci_reruns, ci_flaky",
             )
             .expression_attribute_names("#s", "status")
+            .expression_attribute_names("#err", "error")
             .set_exclusive_start_key(start.take())
             .send()
             .await
@@ -1133,7 +1367,7 @@ async fn load_traces(state: &AppState, team: &str) -> Vec<TraceRow> {
             .key_condition_expression("team_id = :t AND begins_with(sk, :p)")
             .expression_attribute_values(":t", av(team))
             .expression_attribute_values(":p", av("RUN#"))
-            .projection_expression("pass, #ts, input_tokens, output_tokens, duration_ms")
+            .projection_expression("sk, pass, #ts, input_tokens, output_tokens, duration_ms")
             .expression_attribute_names("#ts", "timestamp")
             .set_exclusive_start_key(start.take())
             .send()
@@ -1701,11 +1935,167 @@ mod tests {
         assert_eq!(actors, vec!["coder", "people", "planner"]);
     }
 
+    fn old_failed(id: &str) -> RunRow {
+        RunRow {
+            created_at: "2026-10-12T13:49:26+00:00".into(),
+            ..run(id, 1, "failed")
+        }
+    }
+
+    #[test]
+    fn older_failures_get_a_reason_derived_from_what_they_recorded() {
+        // The sweep's old message, with the pass found in the run's history.
+        let r = RunRow {
+            error_message: "Run timed out during unknown pass (auto-cleanup)".into(),
+            last_pass: "implement".into(),
+            ..old_failed("1")
+        };
+        assert_eq!(
+            run_failure_reason(&r, None),
+            "Run timed out during implement pass (auto-cleanup)"
+        );
+        // ...or in its traces.
+        let r = RunRow {
+            last_pass: String::new(),
+            ..r
+        };
+        assert_eq!(
+            run_failure_reason(&r, Some("ci_fix:2")),
+            "Run timed out during ci_fix pass (auto-cleanup)"
+        );
+        // ...or nowhere: it never started a pass.
+        assert_eq!(
+            run_failure_reason(&r, None),
+            "Run stopped before its first pass started (auto-cleanup)"
+        );
+        // A cancel overwritten by a late write.
+        let r = RunRow {
+            current_pass: "cancelled".into(),
+            error_legacy: "service error".into(),
+            ..old_failed("2")
+        };
+        assert_eq!(
+            run_failure_reason(&r, None),
+            "Cancelled, then marked failed by a late write"
+        );
+        // The field older writes used, with the pass it failed in.
+        let r = RunRow {
+            error_legacy: "Model call failed".into(),
+            last_pass: "feedback".into(),
+            ..old_failed("3")
+        };
+        assert_eq!(
+            run_failure_reason(&r, None),
+            "Model call failed (feedback pass)"
+        );
+        // Nothing at all on an old run.
+        assert_eq!(
+            run_failure_reason(&old_failed("4"), None),
+            format!(
+                "Not recorded (before {})",
+                common::run_fail::REASONS_RECORDED_SINCE
+            )
+        );
+        // A recorded reason is used as is.
+        let r = RunRow {
+            error_message: "Feedback pass failed: boom".into(),
+            failed_pass: "feedback".into(),
+            ..old_failed("5")
+        };
+        assert_eq!(run_failure_reason(&r, None), "Feedback pass failed: boom");
+    }
+
+    #[test]
+    fn ci_outcomes_place_every_red_run_and_keep_base_failures_apart() {
+        let red = |id: &str, status: &str| RunRow {
+            ci_fix_attempts: 1,
+            ci_last: "failed".into(),
+            ..run(id, 2, status)
+        };
+        let runs = [
+            // Fixed by a Coderhelm push.
+            RunRow {
+                ci_fix_commits: 1,
+                ci_last: "passed".into(),
+                ..red("1", "completed")
+            },
+            // Green after a person's push, no Coderhelm fix.
+            RunRow {
+                ci_last: "passed".into(),
+                ..red("2", "completed")
+            },
+            // Re-run turned it green.
+            RunRow {
+                ci_fix_attempts: 0,
+                ci_reruns: 1,
+                ci_flaky: true,
+                ci_last: "passed".into(),
+                ..run("3", 2, "completed")
+            },
+            // Red only on a check that fails on the base branch too.
+            RunRow {
+                ci_red_on_base: vec!["Deploy Preview".into()],
+                ci_end: "red_on_base".into(),
+                ci_last: "failed".into(),
+                ..run("4", 2, "completed")
+            },
+            // Gave up: nothing to change.
+            RunRow {
+                ci_end: "no_change".into(),
+                ..red("5", "completed")
+            },
+            // Older run that used every attempt, no reason stored.
+            RunRow {
+                ci_fix_attempts: 10,
+                ci_fix_commits: 8,
+                ..red("6", "completed")
+            },
+            // Still fixing.
+            red("7", "running"),
+            // Never red: not counted.
+            run("8", 2, "completed"),
+        ];
+        let refs: Vec<&RunRow> = runs.iter().collect();
+        let ci = ci_outcomes(&refs);
+        assert_eq!(ci["runs_with_red_ci"], 6);
+        assert_eq!(ci["red_on_base_runs"], 1);
+        let o = &ci["outcomes"];
+        assert_eq!(o["green_after_fix"], 1);
+        assert_eq!(o["green_without_fix"], 1);
+        assert_eq!(o["flaky"], 1);
+        assert_eq!(o["red_on_base"], 1);
+        assert_eq!(o["gave_up"], 2);
+        assert_eq!(o["running"], 1);
+        assert_eq!(ci["fixed_by_coderhelm"], 1);
+        // Settled own red runs: 6 minus the one still running.
+        assert!((ci["fix_rate"].as_f64().unwrap() - 0.2).abs() < 1e-9);
+        assert_eq!(ci["fix_attempts"], 14);
+        let reasons: Vec<&str> = ci["gave_up_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["reason"].as_str().unwrap())
+            .collect();
+        assert!(reasons.contains(&"Fix found nothing to change"));
+        assert!(reasons.contains(&"Fix attempts used up"));
+    }
+
+    #[test]
+    fn a_trace_key_names_its_run() {
+        let item: Item = [
+            ("sk".to_string(), av("RUN#01ABC#PASS#ci_fix:2")),
+            ("pass".to_string(), av("ci_fix:2")),
+        ]
+        .into();
+        assert_eq!(TraceRow::from_item(&item).run_id, "01ABC");
+    }
+
     #[test]
     fn daily_series_is_zero_filled_and_steps_group_cycles() {
         let (w, p) = windows();
         let traces = vec![
             TraceRow {
+                run_id: "1".into(),
                 pass: "implement".into(),
                 timestamp: at(1),
                 input_tokens: 300.0,
@@ -1713,6 +2103,7 @@ mod tests {
                 duration_ms: 2000.0,
             },
             TraceRow {
+                run_id: "1".into(),
                 pass: "ci_fix:1".into(),
                 timestamp: at(1),
                 input_tokens: 50.0,
@@ -1720,6 +2111,7 @@ mod tests {
                 duration_ms: 1000.0,
             },
             TraceRow {
+                run_id: "1".into(),
                 pass: "ci_fix:2".into(),
                 timestamp: at(1),
                 input_tokens: 50.0,

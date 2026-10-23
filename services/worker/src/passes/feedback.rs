@@ -863,7 +863,7 @@ Rules:
 
     // Update run record in runs table (including status_run_id for GSI)
     let now = chrono::Utc::now().to_rfc3339();
-    state
+    let update = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
@@ -951,7 +951,18 @@ Rules:
         )
         .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]))
         .send()
-        .await?;
+        .await;
+    match update {
+        Ok(_) => {}
+        // The run was cancelled while this pass worked (a person closed the
+        // PR, which a parallel pass saw first). That ends the run; it is not
+        // this pass failing, and the cancel must stand.
+        Err(e) if common::run_fail::is_condition_failed(&e) => {
+            info!(run_id = %msg.run_id, "Run was cancelled while feedback ran — leaving it cancelled");
+            return Ok(());
+        }
+        Err(e) => return Err(common::run_fail::error_text(&e).into()),
+    }
 
     // The team's counters already have these tokens: each model call is
     // counted as it happens (common::usage).
@@ -2619,7 +2630,7 @@ async fn hand_off_to_human(state: &WorkerState, github: &GitHubClient, msg: &Fee
         state,
         &msg.team_id,
         &msg.run_id,
-        super::CiOutcome::HandedOff,
+        super::CiOutcome::HandedOff(super::GaveUp::NoChange),
     )
     .await;
 

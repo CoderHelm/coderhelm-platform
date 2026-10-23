@@ -41,6 +41,8 @@ pub mod review_lessons;
 /// done), and the one status a PR shows on the dashboard.
 pub mod review_live;
 pub mod review_stats;
+/// The one way a run is marked failed: always with a reason and a pass.
+pub mod run_fail;
 pub mod skill_apply;
 pub mod skill_compat;
 pub mod skills;
