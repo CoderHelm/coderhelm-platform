@@ -1,7 +1,7 @@
 //! The code graph's per-repo switch and build status, shared by the gateway
 //! (dashboard, webhooks) and the worker (indexing, agent tools).
 //!
-//! Every repo CoderHelm works in gets a graph unless someone turned it off
+//! Every repo Coderhelm works in gets a graph unless someone turned it off
 //! for that repo. The graph is its own feature: it is not tied to the
 //! reviewer.
 //!
@@ -402,7 +402,7 @@ pub fn failure_reason(err: &str) -> String {
     let first = err.lines().next().unwrap_or("").trim();
     let lower = first.to_lowercase();
     let reason = if lower.contains("404") || lower.contains("not found") {
-        "CoderHelm can't read this repository. Check that the GitHub App can access it."
+        "Coderhelm can't read this repository. Check that the GitHub App can access it."
     } else if lower.contains("403") || lower.contains("forbidden") {
         "GitHub refused access to this repository."
     } else if lower.contains("too large") || lower.contains("size") {

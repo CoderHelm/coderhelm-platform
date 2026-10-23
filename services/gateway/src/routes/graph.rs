@@ -192,7 +192,7 @@ async fn repo_row(state: &AppState, team_id: &str, repo: &str) -> Value {
     })
 }
 
-/// GET /api/graph/repos — every repo CoderHelm works in, with its graph's
+/// GET /api/graph/repos — every repo Coderhelm works in, with its graph's
 /// switch, build status (off, not built, queued, indexing, ready, failed with
 /// the reason) and, once built, its stats. Drives the /graph page.
 pub async fn list_repos(
