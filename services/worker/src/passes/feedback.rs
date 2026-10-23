@@ -427,6 +427,10 @@ pub async fn run(
          (the default, and the ONLY safe option for a few lines in a large file), and write_file \
          or batch_write only for new files or whole-file rewrites — then confirm briefly. \
          If a comment asks a question, read the code and answer clearly. \
+         If a comment asks to change the pull request's description (its text, a section, a \
+         banner, a name in it), call update_pr_description with exactly what to change; never \
+         edit files for that. CoderHelm rewrites the description and adds what changed to your \
+         reply. \
          Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}{team_block}{tests_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
@@ -442,6 +446,7 @@ pub async fn run(
 For each comment:
 - **Question** — read the relevant code, answer concisely
 - **Change request** — fix the code (prefer edit_file for targeted changes, especially in large files; write_file only for whole-file rewrites), then confirm (e.g. "Done — added error handling.")
+- **Description change** — call update_pr_description with the change, in the person's words with every value they gave; don't commit anything for it
 
 If there are CI failures listed above, also fix those — read the failing files, diagnose the issue, and commit a fix.
 
@@ -494,6 +499,15 @@ Rules:
     };
 
     let mut tools = feedback_tools();
+    // Who may have the description changed: a person with write access or
+    // higher, the same check as the comment commands.
+    let may_edit_description = !msg.trigger_author.trim().is_empty()
+        && github
+            .has_write_access(&msg.repo_owner, &msg.repo_name, msg.trigger_author.trim())
+            .await;
+    if !msg.trigger_author.trim().is_empty() {
+        tools.push(update_description_tool());
+    }
     let mut full_system = system.clone();
     // Live systems the team connected for this repo, if any: read-only lookups
     // so the fix rests on the system's real shape.
@@ -599,6 +613,7 @@ Rules:
         branch: &branch,
         base_branch: &base,
         files_modified: std::sync::Mutex::new(false),
+        description: DescriptionRequests::new(may_edit_description),
         scope_guard,
         history: Some(&history),
         ops: ops.as_ref(),
@@ -663,11 +678,38 @@ Rules:
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Which team agents were asked goes once, on the last reply.
-    let consulted = skills
-        .as_ref()
-        .map(|s| s.consulted_markdown(super::skills::app_url(&state.config.stage)))
-        .unwrap_or_default();
+    // The description: rewritten when the code changed (so it stays true)
+    // or when a person with write access asked for a change to it, even
+    // with no code change. What changed goes on the reply.
+    let fix_pushed = *executor.files_modified.lock().unwrap();
+    let asked = executor.description.taken();
+    let description_note = if fix_pushed || !asked.is_empty() {
+        let changed = super::pr::refresh_description(
+            state,
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            &team_instructions,
+            &asked,
+            &provider,
+            &mut usage,
+        )
+        .await;
+        description_reply(&asked, changed.as_deref())
+    } else {
+        String::new()
+    };
+
+    // Which team agents were asked goes once, on the last reply, after what
+    // changed in the description.
+    let consulted = format!(
+        "{description_note}{}",
+        skills
+            .as_ref()
+            .map(|s| s.consulted_markdown(super::skills::app_url(&state.config.stage)))
+            .unwrap_or_default()
+    );
 
     // Only match against actionable (non-context) comments for reply posting
     let actionable_comments: Vec<&ReviewComment> = comments
@@ -776,22 +818,8 @@ Rules:
     // If feedback committed code changes — OR the pre-feedback conflict
     // resolution pushed a merge commit — set awaiting_ci so the CI result
     // has a consumer.
-    let fix_pushed = *executor.files_modified.lock().unwrap();
+    // (The description was rewritten above, before the replies went out.)
     let code_pushed = fix_pushed || conflicts_pushed;
-    // The code changed after the description was written: keep it true.
-    if fix_pushed {
-        super::pr::refresh_description(
-            state,
-            &github,
-            &msg.repo_owner,
-            &msg.repo_name,
-            msg.pr_number,
-            &team_instructions,
-            &provider,
-            &mut usage,
-        )
-        .await;
-    }
     // A push that carried CI failures to fix is a CI fix, counted with its time.
     if fix_pushed && has_ci_failures {
         super::record_ci_outcome(
@@ -1441,8 +1469,100 @@ fn feedback_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+/// The tool a person's comment reaches the PR description through.
+fn update_description_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "update_pr_description".to_string(),
+        description: "Change this pull request's description as the person asked (remove a \
+                      banner, fix a name, add a section such as Not in this PR with an owner per \
+                      item). Pass the change in the person's words, with every value they gave. \
+                      CoderHelm rewrites the description once you finish (after any code you \
+                      commit), keeps its shape, and adds what changed to your reply. Only people \
+                      with write access to the repository can have it changed."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "change": {"type": "string", "description": "What to change in the description, with the exact values"}
+            },
+            "required": ["change"]
+        }),
+    }
+}
+
+/// What people asked to change in the PR description this round, and
+/// whether the person who asked may have it changed.
+struct DescriptionRequests {
+    allowed: bool,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+impl DescriptionRequests {
+    fn new(allowed: bool) -> Self {
+        Self {
+            allowed,
+            asked: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Records one request and says what happens with it.
+    fn ask(&self, change: &str) -> String {
+        let change = change.split_whitespace().collect::<Vec<_>>().join(" ");
+        if change.is_empty() {
+            return "Say what to change in the description.".to_string();
+        }
+        if !self.allowed {
+            return "Not changed: only people with write access to this repository can have the \
+                    description changed. Tell the person so in your reply, politely; change \
+                    nothing else for it."
+                .to_string();
+        }
+        if let Ok(mut a) = self.asked.lock() {
+            if !a.contains(&change) {
+                a.push(change);
+            }
+        }
+        "Recorded. CoderHelm rewrites the description when you finish and adds what changed to \
+         your reply, so don't describe the description change yourself."
+            .to_string()
+    }
+
+    /// The requests a person with write access made (none otherwise).
+    fn taken(&self) -> Vec<String> {
+        if !self.allowed {
+            return Vec::new();
+        }
+        self.asked.lock().map(|a| a.clone()).unwrap_or_default()
+    }
+}
+
+/// Pure: what the reply says about the description. Nothing when nobody
+/// asked for a change to it (a rewrite after code changes goes unannounced,
+/// as before); what changed when it was saved; that it couldn't be changed
+/// when a request didn't go through.
+fn description_reply(asked: &[String], changed: Option<&[String]>) -> String {
+    if asked.is_empty() {
+        return String::new();
+    }
+    match changed {
+        Some(list) if !list.is_empty() => format!(
+            "\n\nUpdated the description:\n{}",
+            list.iter()
+                .map(|c| format!("- {c}\n"))
+                .collect::<String>()
+                .trim_end()
+        ),
+        Some(_) => "\n\nUpdated the description as asked.".to_string(),
+        None => "\n\nI couldn't update the description this time, so it is unchanged; ask again \
+                 and I'll retry."
+            .to_string(),
+    }
+}
+
 struct FeedbackToolExecutor<'a> {
     github: &'a GitHubClient,
+    /// What people asked to change in the PR description.
+    description: DescriptionRequests,
     owner: &'a str,
     repo: &'a str,
     branch: &'a str,
@@ -1531,6 +1651,9 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
             }
         }
         match name {
+            "update_pr_description" => Ok(serde_json::json!(self
+                .description
+                .ask(input["change"].as_str().unwrap_or("")))),
             "read_tree" => {
                 let tree = self
                     .github
@@ -2795,6 +2918,58 @@ pub(crate) fn top_level_reply(
         common::truncate_str(&text, 60_000).to_string()
     };
     Some(format!("@{author} {text}{consulted}"))
+}
+
+#[cfg(test)]
+mod description_request_tests {
+    use super::{description_reply, update_description_tool, DescriptionRequests};
+
+    #[test]
+    fn a_person_with_write_access_gets_the_description_changed_without_code() {
+        let d = DescriptionRequests::new(true);
+        let out = d.ask("drop the warning banner");
+        assert!(out.starts_with("Recorded."));
+        d.ask("fix the secret name to `/app/prod/db-password`");
+        d.ask("  drop the   warning banner ");
+        d.ask("");
+        assert_eq!(
+            d.taken(),
+            vec![
+                "drop the warning banner".to_string(),
+                "fix the secret name to `/app/prod/db-password`".to_string(),
+            ]
+        );
+        // What changed goes on the reply, one line each.
+        let changed = vec![
+            "Removed the warning banner; its items are Open items at the bottom".to_string(),
+            "Added Not in this PR: allowlist (network team), grant (data team)".to_string(),
+        ];
+        let reply = description_reply(&d.taken(), Some(&changed));
+        assert_eq!(
+            reply,
+            "\n\nUpdated the description:\n- Removed the warning banner; its items are Open items at the bottom\n- Added Not in this PR: allowlist (network team), grant (data team)"
+        );
+        assert_eq!(
+            description_reply(&d.taken(), Some(&[])),
+            "\n\nUpdated the description as asked."
+        );
+        assert!(description_reply(&d.taken(), None).contains("couldn't update the description"));
+    }
+
+    #[test]
+    fn without_write_access_nothing_changes_and_the_person_is_told() {
+        let d = DescriptionRequests::new(false);
+        let out = d.ask("drop the warning banner");
+        assert!(out.starts_with("Not changed: only people with write access"));
+        assert!(d.taken().is_empty());
+        // No request went through: the reply says nothing about the
+        // description, and a rewrite after code changes stays unannounced.
+        assert_eq!(description_reply(&d.taken(), Some(&["x".to_string()])), "");
+        let tool = update_description_tool();
+        assert_eq!(tool.name, "update_pr_description");
+        assert!(tool.description.contains("write access"));
+        assert_eq!(tool.input_schema["required"][0], "change");
+    }
 }
 
 #[cfg(test)]

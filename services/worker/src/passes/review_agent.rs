@@ -273,7 +273,11 @@ pub const EXISTING_PATTERN_RULE: &str = "EXISTING PATTERNS: before objecting to 
      chose it, and one PR is not the place to relitigate it. Review what the diff adds within \
      that pattern (a wrong id, a missing case, a broken edge). Object to the pattern only when \
      it causes a concrete defect in this diff, and then say the pattern already exists and \
-     where. ";
+     where. When the PR description says the change mirrors an existing block (\"mirrors `name` \
+     in `path`\"), read that block: a difference from it the description doesn't list with a \
+     reason is a finding. A new block that copies an existing one (another user, secret, \
+     certificate, route, config entry) without naming it is a non-blocking \"convention\" note \
+     asking the author to name the block and list the differences. ";
 
 /// What a change must prove before it merges: the facts about other systems
 /// it relies on, how far it reaches, and that its logs stay quiet. A PR
@@ -2444,6 +2448,21 @@ mod required_tests_tests {
         assert!(SOURCE_DATA_CRITIC_NOTE.contains("deliberate decision"));
         assert!(EXISTING_PATTERN_RULE.contains("already uses"));
         assert!(REPLIES_RULE.contains("owner's call"));
+    }
+
+    #[test]
+    fn a_named_copy_is_checked_against_its_original_and_open_items_are_read_at_the_bottom() {
+        assert!(EXISTING_PATTERN_RULE.contains("mirrors `name` in `path`"));
+        assert!(EXISTING_PATTERN_RULE.contains("doesn't list with a reason is a finding"));
+        assert!(EXISTING_PATTERN_RULE.contains("without naming it is a non-blocking"));
+        // CoderHelm's PRs now list what's open at the bottom, with no banner:
+        // the reviewer still reads the unconfirmed facts from there.
+        let body = "Closes #4\n\n**Summary** x\n\n**Risk** Low\n\n<!-- coderhelm:unverified -->\n## Open items\n- **Unconfirmed external field or behaviour:** the vendor's `status` values Settle: read one order.\n- **Waiting on CI:** tests did not run Settles when this PR's CI passes. <!-- coderhelm:ci -->\n<!-- /coderhelm:unverified -->";
+        let facts = unconfirmed_external_facts(body, &[]);
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert!(facts[0].fact.starts_with("the vendor's `status` values"));
+        let p = review_user_prompt("t", body, "+x", "");
+        assert!(p.contains("## Facts the description marks unconfirmed"));
     }
 
     #[test]

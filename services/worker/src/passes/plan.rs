@@ -12,7 +12,10 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-22.team-agent-plan-review";
+pub const PLANNER_VERSION: &str = "2026-10-22.end-to-end-checklist";
+
+/// The openspec file holding the plan's end-to-end checklist, readable.
+pub const END_TO_END_FILE: &str = "end_to_end.md";
 
 /// The cached plan's file holding its key.
 pub const PLAN_KEY_FILE: &str = "plan_key.txt";
@@ -290,6 +293,7 @@ Do NOT include manual verification tasks, post-deploy checks, browser testing, o
    - [ ] src/other.ts: Change something else
    ```
    Only use multi-repo headers when changes span 2+ repos. For single-repo issues, omit headers.
+   List the repo groups in the order their pull requests must merge: each PR names the others in that order.
 4. **spec.md** — Acceptance criteria as Given/When/Then scenarios
 
 {fix_guidance}
@@ -794,6 +798,23 @@ Then the ```fix_location.json block described above."#,
             .send()
             .await?;
     }
+
+    // The whole job end to end, as an openspec file people can read; the
+    // structured steps ride in the decision's JSON below.
+    let end_to_end = files
+        .fix
+        .as_ref()
+        .map(super::fix_location::end_to_end_markdown)
+        .unwrap_or_default();
+    let _ = state
+        .s3
+        .put_object()
+        .bucket(&state.config.bucket_name)
+        .key(format!("{prefix}/{END_TO_END_FILE}"))
+        .body(end_to_end.trim().as_bytes().to_vec().into())
+        .content_type("text/markdown")
+        .send()
+        .await;
 
     // The decision on where the fix belongs, so a reused plan keeps it.
     if let Some(fix) = &files.fix {
