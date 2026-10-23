@@ -26,7 +26,7 @@ fn attr_bool(val: bool) -> AttributeValue {
 }
 
 /// Reject repo path params that could inject into a DynamoDB key.
-fn validate_repo(repo: &str) -> Result<(), StatusCode> {
+pub(crate) fn validate_repo(repo: &str) -> Result<(), StatusCode> {
     if repo.is_empty()
         || repo.len() > 200
         || repo.contains("..")
@@ -227,7 +227,9 @@ pub async fn get_config(
         "deploy_label": item_str(&item, "deploy_label", ""),
         "health_log_groups": log_groups,
         "reminders_enabled": item_bool(&item, "reminders_enabled", false),
-        "teams_webhook_url": item_str(&item, "teams_webhook_url", ""),
+        // Where reminders and release notes failures post. Shown only as a
+        // hint: a webhook posts as the team.
+        "webhooks": common::notify::store::view(&item),
         "reminder_cooldown_hours": item_num(&item, "reminder_cooldown_hours", 4),
     })))
 }
@@ -286,18 +288,12 @@ pub async fn update_config(
         .chars()
         .take(200)
         .collect();
-    // Teams webhook: must be an https URL (or empty to disable). Guards against a
-    // config that would make the worker POST to an arbitrary/internal endpoint.
-    let teams_webhook_url = {
-        let u = body["teams_webhook_url"].as_str().unwrap_or("").trim();
-        if u.is_empty() {
-            ""
-        } else if u.starts_with("https://") && u.len() <= 500 {
-            u
-        } else {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    };
+    // Reminder channels (Teams, Slack): each kept unless the body sets or
+    // clears it, and only on its channel's webhook hosts, so the worker never
+    // posts to an arbitrary or internal endpoint.
+    let channels: common::notify::store::ChannelsInput =
+        serde_json::from_value(body.clone()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    channels.check().map_err(super::alerts::save_error)?;
     // Reviewer-picked CI labels: free text, bounded. The worker parses + enforces
     // (allow-list and companion rules) — nothing outside `auto_label_allow` is
     // ever added.
@@ -414,7 +410,6 @@ pub async fn update_config(
             "reminders_enabled",
             attr_bool(body["reminders_enabled"].as_bool().unwrap_or(false)),
         )
-        .item("teams_webhook_url", attr_s(teams_webhook_url))
         .item("reminder_cooldown_hours", attr_n(reminder_cooldown_hours))
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()));
     // Read the prior value BEFORE the overwrite. The code graph is its OWN
@@ -458,6 +453,17 @@ pub async fn update_config(
         prior_secret
     };
     put = put.item("release_notes_email_webhook_secret", attr_s(&rn_secret));
+    for (k, v) in common::notify::store::save_attrs(
+        &super::alerts::cipher(&state),
+        &claims.team_id,
+        prior.as_ref(),
+        &channels,
+    )
+    .await
+    .map_err(super::alerts::save_error)?
+    {
+        put = put.item(k, v);
+    }
     let graph_enabled = body["graph_enabled"].as_bool().unwrap_or(was_enabled);
     put = put.item("graph_enabled", attr_bool(graph_enabled));
     put = put.item("health_log_groups", AttributeValue::L(log_groups));

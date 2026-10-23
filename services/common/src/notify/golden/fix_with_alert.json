@@ -1,0 +1,73 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "title": "Open PR",
+            "type": "Action.OpenUrl",
+            "url": "https://github.com/acme/etl/pull/42"
+          },
+          {
+            "title": "View alert",
+            "type": "Action.OpenUrl",
+            "url": "https://app.example.com/alerts/detail?id=1"
+          }
+        ],
+        "body": [
+          {
+            "bleed": true,
+            "items": [
+              {
+                "color": "Accent",
+                "size": "Medium",
+                "text": "🛠️ Fix proposed · PR #42",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "style": "accent",
+            "type": "Container"
+          },
+          {
+            "isSubtle": true,
+            "spacing": "Small",
+            "text": "For alert: ALARM: Airflow Task Failures",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "spacing": "Medium",
+            "text": "Retry the extract on KeyError",
+            "type": "TextBlock",
+            "weight": "Bolder",
+            "wrap": true
+          },
+          {
+            "facts": [
+              {
+                "title": "Repository",
+                "value": "acme/etl"
+              },
+              {
+                "title": "Status",
+                "value": "Waiting for review — nothing merges without a person's approval"
+              }
+            ],
+            "type": "FactSet"
+          }
+        ],
+        "msteams": {
+          "width": "Full"
+        },
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive",
+      "contentUrl": null
+    }
+  ],
+  "type": "message"
+}

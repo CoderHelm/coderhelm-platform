@@ -1,16 +1,17 @@
-//! Teams notifications for alerts.
+//! Chat notifications for alerts.
 //!
-//! A team sets one Teams channel (a Workflows "post to a channel when a webhook
-//! request is received" URL) that every alert route notifies; a route can
-//! instead use its own channel or notify nowhere. Each alert posts an Adaptive
-//! Card, and when CoderHelm opens a pull request for an alert a follow-up card
-//! links it. Workflows webhooks can't edit a posted card, so the follow-up is
-//! a new card that names the alert.
+//! A team sets one alert channel (Teams, Slack or both) that every alert route
+//! notifies; a route can instead use its own channels or notify nowhere. Each
+//! alert posts a message, and when CoderHelm opens a pull request for an alert
+//! a follow-up message links it. Webhooks can't edit a posted message, so the
+//! follow-up is a new message that names the alert. Messages are built here as
+//! [`Message`]s and rendered per channel by [`crate::notify`].
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client as DynamoClient;
-use serde_json::{json, Value};
-use tracing::warn;
+
+use crate::mcp_credentials::Cipher;
+use crate::notify::{store, Block, Button, Channels, Message, Size, Spacing, Text, Tone};
 
 /// Settings-table sort key of the team's alert channel.
 pub const TEAM_SETTINGS_SK: &str = "ALERT_NOTIFY";
@@ -24,59 +25,31 @@ const MAX_FACTS: usize = 8;
 const MAX_FACT_VALUE: usize = 300;
 const MAX_SUMMARY: usize = 900;
 
-/// Hosts that serve Teams webhooks: Power Automate / Workflows (both URL
-/// generations) and legacy incoming webhooks.
-const WEBHOOK_HOST_SUFFIXES: &[&str] = &[
-    ".powerplatform.com",
-    ".logic.azure.com",
-    ".webhook.office.com",
-];
-
-/// Pure: a Teams webhook URL the API accepts — https on a Microsoft webhook
-/// host, so the server never posts to arbitrary addresses.
+/// Pure: a Teams webhook URL the API accepts (see [`crate::notify::teams`]).
 pub fn valid_webhook_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
-        return false;
-    };
-    if url.len() > 1000 || url.contains(char::is_whitespace) {
-        return false;
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.contains('@') {
-        return false;
-    }
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    WEBHOOK_HOST_SUFFIXES.iter().any(|sfx| host.ends_with(sfx))
+    crate::notify::teams::valid_url(url)
 }
 
-/// Pure: the channel a route's alerts go to, if any.
-pub fn pick_webhook(
-    route_mode: &str,
-    route_url: &str,
-    team_url: &str,
-    team_enabled: bool,
-) -> Option<String> {
-    let usable = |u: &str| valid_webhook_url(u).then(|| u.to_string());
+/// Pure: the channels a route's alerts go to. Empty = nowhere.
+pub fn pick(route_mode: &str, route: Channels, team: Channels, team_enabled: bool) -> Channels {
     match route_mode {
-        MODE_OFF => None,
-        MODE_CUSTOM => usable(route_url),
+        MODE_OFF => Channels::default(),
+        MODE_CUSTOM => route.usable(),
         // "team" and routes saved before notifications existed.
-        _ => team_enabled.then(|| usable(team_url)).flatten(),
+        _ if team_enabled => team.usable(),
+        _ => Channels::default(),
     }
 }
 
-/// The channel the alerts on `topic_arn` notify, read from the route and the
-/// team's settings. None when notifications are off or unset.
+/// The channels the alerts on `topic_arn` notify, read from the route and the
+/// team's settings and opened. Empty when notifications are off or unset.
 pub async fn notify_target(
     dynamo: &DynamoClient,
+    cipher: &dyn Cipher,
     table: &str,
     team_id: &str,
     topic_arn: &str,
-) -> Option<String> {
+) -> Channels {
     let get = |pk: String, sk: &str| {
         dynamo
             .get_item()
@@ -89,63 +62,44 @@ pub async fn notify_target(
         get(format!("ALERTTOPIC#{topic_arn}"), "ROUTE"),
         get(team_id.to_string(), TEAM_SETTINGS_SK),
     );
-    let route = route.ok()?.item().cloned()?;
+    let Some(route) = route.ok().and_then(|r| r.item().cloned()) else {
+        return Channels::default();
+    };
     if route
         .get("team_id")
         .and_then(|v| v.as_s().ok())
         .map(String::as_str)
         != Some(team_id)
     {
-        return None;
+        return Channels::default();
     }
     let team = team
         .ok()
         .and_then(|t| t.item().cloned())
         .unwrap_or_default();
-    let s = |m: &std::collections::HashMap<String, AttributeValue>, k: &str| {
-        m.get(k)
-            .and_then(|v| v.as_s().ok())
-            .cloned()
-            .unwrap_or_default()
-    };
+    let mode = route
+        .get("notify_mode")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
     let enabled = team
         .get("enabled")
         .and_then(|v| v.as_bool().ok())
         .copied()
         .unwrap_or(false);
-    pick_webhook(
-        &s(&route, "notify_mode"),
-        &s(&route, "teams_webhook_url"),
-        &s(&team, "teams_webhook_url"),
-        enabled,
-    )
-}
-
-/// Post a card. Retries once when Teams throttles (429). Never panics.
-pub async fn post(http: &reqwest::Client, url: &str, card: &Value) -> Result<(), String> {
-    for attempt in 0..2 {
-        let resp = http
-            .post(url)
-            .timeout(std::time::Duration::from_secs(6))
-            .json(card)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        if status.as_u16() == 429 && attempt == 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-            continue;
-        }
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "teams webhook returned {status}: {}",
-            crate::truncate_str(&body, 300)
-        ));
-    }
-    Err("teams webhook throttled".into())
+    let (route_channels, team_channels) = match mode.as_str() {
+        MODE_OFF => return Channels::default(),
+        MODE_CUSTOM => (
+            store::open_all(cipher, team_id, &route).await,
+            Channels::default(),
+        ),
+        _ if enabled => (
+            Channels::default(),
+            store::open_all(cipher, team_id, &team).await,
+        ),
+        _ => return Channels::default(),
+    };
+    pick(&mode, route_channels, team_channels, enabled)
 }
 
 /// How an alert reads at a glance.
@@ -199,27 +153,12 @@ pub fn facts_and_summary(body: &str) -> (Vec<(String, String)>, String) {
     )
 }
 
-fn wrap(card: Value) -> Value {
-    json!({
-        "type": "message",
-        "attachments": [{
-            "contentType": "application/vnd.microsoft.card.adaptive",
-            "contentUrl": null,
-            "content": card
-        }]
-    })
-}
-
-fn header(style: &str, color: &str, text: &str) -> Value {
-    json!({
-        "type": "Container",
-        "bleed": true,
-        "style": style,
-        "items": [{
-            "type": "TextBlock", "text": text, "weight": "Bolder",
-            "size": "Medium", "color": color, "wrap": true
-        }]
-    })
+fn banner(tone: Tone, text: &str) -> Block {
+    Block::Banner {
+        text: text.to_string(),
+        tone,
+        size: Size::Medium,
+    }
 }
 
 pub struct AlertCard<'a> {
@@ -286,12 +225,12 @@ fn threshold_line(facts: &[(String, String)]) -> Option<String> {
 /// Most buttons a card shows.
 const MAX_ACTIONS: usize = 5;
 
-/// Pure: the Teams card for one alert. CloudWatch alarms are compact: a
-/// colored title, when and where, one line on what happened, the reading
-/// against its threshold, and what CoderHelm did, with the raw alarm fields
-/// behind Details. Other alerts are the sender's own message, so their text
-/// and fields stay visible. Fields that are links become buttons.
-pub fn alert_card(a: &AlertCard) -> Value {
+/// Pure: the message for one alert. CloudWatch alarms are compact: a colored
+/// title, when and where, one line on what happened, the reading against its
+/// threshold, and what CoderHelm did, with the raw alarm fields behind
+/// Details. Other alerts are the sender's own message, so their text and
+/// fields stay visible. Fields that are links become buttons.
+pub fn alert_message(a: &AlertCard) -> Message {
     let sev = severity(a.kind, a.title);
     let name = a
         .title
@@ -299,14 +238,14 @@ pub fn alert_card(a: &AlertCard) -> Value {
         .filter(|_| a.kind == "cloudwatch_alarm")
         .map(|(_, n)| n)
         .unwrap_or(a.title);
-    let (style, color, label) = match sev {
-        Severity::Alarm => ("attention", "Attention", format!("🔴 {name}")),
+    let (tone, label) = match sev {
+        Severity::Alarm => (Tone::Attention, format!("🔴 {name}")),
         Severity::Resolved if a.kind == "cloudwatch_alarm" => {
-            ("good", "Good", format!("✅ Resolved · {name}"))
+            (Tone::Good, format!("✅ Resolved · {name}"))
         }
-        Severity::Resolved => ("good", "Good", format!("✅ {name}")),
-        Severity::Info => ("emphasis", "Default", format!("⚪ {}", a.title)),
-        Severity::Warning => ("warning", "Warning", format!("🟠 {name}")),
+        Severity::Resolved => (Tone::Good, format!("✅ {name}")),
+        Severity::Info => (Tone::Neutral, format!("⚪ {}", a.title)),
+        Severity::Warning => (Tone::Warning, format!("🟠 {name}")),
     };
     let (all_facts, summary) = facts_and_summary(a.body);
     let (links, facts): (Vec<_>, Vec<_>) = all_facts
@@ -319,105 +258,113 @@ pub fn alert_card(a: &AlertCard) -> Value {
         .map(|(_, v)| v.as_str())
         .unwrap_or("");
     let line = headline(description, &summary);
-    let mut body = vec![
-        header(style, color, &label),
-        json!({ "type": "TextBlock", "text": a.context, "isSubtle": true, "size": "Small", "spacing": "None", "wrap": true }),
+    let mut blocks = vec![
+        banner(tone, &label),
+        Block::Text(
+            Text::new(a.context)
+                .subtle()
+                .size(Size::Small)
+                .spacing(Spacing::None),
+        ),
     ];
     if compact {
         if !line.is_empty() && line != name {
-            body.push(
-                json!({ "type": "TextBlock", "text": line, "wrap": true, "spacing": "Small" }),
-            );
+            blocks.push(Block::Text(Text::new(&line).spacing(Spacing::Small)));
         }
     } else if !summary.is_empty() {
-        body.push(
-            json!({ "type": "TextBlock", "text": summary, "wrap": true, "spacing": "Small" }),
-        );
+        blocks.push(Block::Text(Text::new(&summary).spacing(Spacing::Small)));
     }
     if !compact && !facts.is_empty() {
-        body.push(json!({
-            "type": "FactSet", "spacing": "Small",
-            "facts": facts.iter().map(|(k, v)| json!({ "title": k, "value": v })).collect::<Vec<_>>()
-        }));
+        blocks.push(Block::Facts {
+            facts: facts.clone(),
+            spacing: Spacing::Small,
+        });
     }
     if let Some(t) = threshold_line(&facts) {
-        body.push(json!({ "type": "TextBlock", "text": t, "wrap": true, "spacing": "Small" }));
+        blocks.push(Block::Text(Text::new(t).spacing(Spacing::Small)));
     }
     if !a.outcome.is_empty() {
-        body.push(json!({
-            "type": "TextBlock", "text": format!("🤖 {}", a.outcome),
-            "isSubtle": true, "size": "Small", "wrap": true, "spacing": "Small"
-        }));
+        blocks.push(Block::Text(
+            Text::new(format!("🤖 {}", a.outcome))
+                .subtle()
+                .size(Size::Small)
+                .spacing(Spacing::Small),
+        ));
     }
-    let details: Vec<Value> = facts
+    let details: Vec<(String, String)> = facts
         .iter()
         .filter(|_| compact)
         .filter(|(k, _)| !FACTS_SHOWN_ELSEWHERE.contains(&k.as_str()))
-        .map(|(k, v)| json!({ "title": k, "value": v }))
+        .cloned()
         .collect();
-    let mut actions =
-        vec![json!({ "type": "Action.OpenUrl", "title": "View alert", "url": a.alert_url })];
+    let mut buttons = vec![Button::new("View alert", a.alert_url)];
     if let Some(url) = a.console_url {
-        actions.push(json!({ "type": "Action.OpenUrl", "title": "Open in AWS", "url": url }));
+        buttons.push(Button::new("Open in AWS", url));
     }
+    // One place is kept for the Details toggle.
     for (k, url) in links
         .iter()
-        .take(MAX_ACTIONS.saturating_sub(actions.len() + 1))
+        .take(MAX_ACTIONS.saturating_sub(buttons.len() + 1))
     {
-        actions.push(
-            json!({ "type": "Action.OpenUrl", "title": crate::truncate_str(k, 30), "url": url }),
-        );
+        buttons.push(Button::new(crate::truncate_str(k, 30), url));
     }
     if !details.is_empty() {
-        body.push(json!({
-            "type": "Container", "id": "details", "isVisible": false, "spacing": "Medium",
-            "items": [{ "type": "FactSet", "facts": details }]
-        }));
-        actions.push(json!({
-            "type": "Action.ToggleVisibility", "title": "Details", "targetElements": ["details"]
-        }));
+        blocks.push(Block::Details { facts: details });
     }
-    wrap(json!({
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "type": "AdaptiveCard",
-        "version": "1.5",
-        "msteams": { "width": "Full" },
-        "body": body,
-        "actions": actions
-    }))
+    Message {
+        summary: label,
+        blocks,
+        buttons,
+        full_width: true,
+    }
 }
 
-/// Pure: the follow-up card when CoderHelm opens a pull request for an alert.
-pub fn fix_card(
+/// Pure: the follow-up message when CoderHelm opens a pull request for an
+/// alert.
+pub fn fix_message(
     alert_title: &str,
     repo: &str,
     pr_number: u64,
     pr_title: &str,
     pr_url: &str,
     alert_url: &str,
-) -> Value {
-    let mut actions = vec![json!({ "type": "Action.OpenUrl", "title": "Open PR", "url": pr_url })];
+) -> Message {
+    let mut buttons = vec![Button::new("Open PR", pr_url)];
     if !alert_url.is_empty() {
-        actions.push(json!({ "type": "Action.OpenUrl", "title": "View alert", "url": alert_url }));
+        buttons.push(Button::new("View alert", alert_url));
     }
-    wrap(json!({
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "type": "AdaptiveCard",
-        "version": "1.5",
-        "msteams": { "width": "Full" },
-        "body": [
-            header("accent", "Accent", &format!("🛠️ Fix proposed · PR #{pr_number}")),
-            { "type": "TextBlock", "text": format!("For alert: {}", crate::truncate_str(alert_title, 200)),
-              "isSubtle": true, "spacing": "Small", "wrap": true },
-            { "type": "TextBlock", "text": crate::truncate_str(pr_title, 300), "weight": "Bolder",
-              "wrap": true, "spacing": "Medium" },
-            { "type": "FactSet", "facts": [
-                { "title": "Repository", "value": repo },
-                { "title": "Status", "value": "Waiting for review — nothing merges without a person's approval" }
-            ]}
+    let title = format!("🛠️ Fix proposed · PR #{pr_number}");
+    Message {
+        summary: format!("{title}: {}", crate::truncate_str(pr_title, 200)),
+        blocks: vec![
+            banner(Tone::Accent, &title),
+            Block::Text(
+                Text::new(format!(
+                    "For alert: {}",
+                    crate::truncate_str(alert_title, 200)
+                ))
+                .subtle()
+                .spacing(Spacing::Small),
+            ),
+            Block::Text(
+                Text::new(crate::truncate_str(pr_title, 300))
+                    .bold()
+                    .spacing(Spacing::Medium),
+            ),
+            Block::Facts {
+                facts: vec![
+                    ("Repository".into(), repo.into()),
+                    (
+                        "Status".into(),
+                        "Waiting for review — nothing merges without a person's approval".into(),
+                    ),
+                ],
+                spacing: Spacing::Default,
+            },
         ],
-        "actions": actions
-    }))
+        buttons,
+        full_width: true,
+    }
 }
 
 /// Pure: the alarm's page in the CloudWatch console.
@@ -441,35 +388,182 @@ pub fn cloudwatch_console_url(region: &str, alarm_name: &str) -> Option<String> 
     ))
 }
 
-/// Log-and-continue wrapper: a notification never fails the caller.
-/// Post a card, logging a failure. True when Teams accepted it.
-pub async fn send(http: &reqwest::Client, url: &str, card: &Value, what: &str) -> bool {
-    match post(http, url, card).await {
-        Ok(()) => true,
-        Err(e) => {
-            warn!(what, error = %e, "Teams alert notification failed");
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notify::ChannelKind;
+
+    fn teams(m: &Message) -> serde_json::Value {
+        crate::notify::teams::render(m)
+    }
+
+    fn golden(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/src/notify/golden/{name}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    const AIRFLOW: &str = "A task has failed to run. Please check MWAA for more information.\n\
+        - Alarm: Airflow Task Failures\n\
+        - State: ALARM (was INSUFFICIENT_DATA)\n\
+        - Description: # Airflow Task Failure\n\
+        - Reason: Threshold Crossed: 1 out of the last 1 datapoints [5.0 (12/10/26 16:54:00)] was greater than the threshold (1.0)\n\
+        - Metric: AmazonMWAA / TaskInstanceFailures\n\
+        - Dimensions: Task=All, Environment=prod-etl, DAG=All\n\
+        - Statistic: AVERAGE\n\
+        - Threshold: GreaterThanThreshold 1\n";
+
+    /// Every alert message the golden files were captured from, by name.
+    fn golden_messages() -> Vec<(&'static str, Message)> {
+        vec![
+            ("alert_cloudwatch", alert_message(&AlertCard {
+                kind: "cloudwatch_alarm",
+                title: "ALARM: Airflow Task Failures",
+                body: AIRFLOW,
+                outcome: "CoderHelm is working on a fix in acme/etl. A follow-up card will link the pull request.",
+                alert_url: "https://app.example.com/alerts/detail?id=1",
+                console_url: Some("https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#alarmsV2:alarm/x"),
+                context: "us-east-1 · 123456789012 · 2026-10-12 17:09 UTC",
+            })),
+            ("alert_resolved", alert_message(&AlertCard {
+                kind: "cloudwatch_alarm",
+                title: "OK: Airflow Task Failures",
+                body: AIRFLOW,
+                outcome: "",
+                alert_url: "https://app.example.com/alerts/detail?id=2",
+                console_url: None,
+                context: "us-east-1",
+            })),
+            ("alert_info", alert_message(&AlertCard {
+                kind: "cloudwatch_alarm",
+                title: "INSUFFICIENT_DATA: db-cpu",
+                body: "- Alarm: db-cpu\n- Reason: no data",
+                outcome: "",
+                alert_url: "https://app.example.com/alerts/detail?id=3",
+                console_url: None,
+                context: "",
+            })),
+            ("alert_message", alert_message(&AlertCard {
+                kind: "message",
+                title: "Airflow failed: nightly_load.extract",
+                body: "The extract task failed after 3 tries.\n- DAG: nightly_load\n- Task: extract\n- Error: KeyError: 'id'\n- Log: https://airflow.example.com/log?dag_id=nightly_load\n- Run: https://airflow.example.com/run/1\n- Grid: https://airflow.example.com/grid\n- More: https://airflow.example.com/more",
+                outcome: "Notification only: no automatic fix for this alert.",
+                alert_url: "https://app.example.com/alerts/detail?id=4",
+                console_url: Some("https://console.example.com"),
+                context: "us-east-1 · 2026-10-12 17:09 UTC",
+            })),
+            ("alert_recovery", alert_message(&AlertCard {
+                kind: "recovery",
+                title: "Recovered: nightly_load",
+                body: "All tasks succeeded.",
+                outcome: "Resolves the alert posted 2026-10-12 17:09 UTC.",
+                alert_url: "https://app.example.com/alerts/detail?id=5",
+                console_url: None,
+                context: "us-east-1",
+            })),
+            ("fix_with_alert", fix_message(
+                "ALARM: Airflow Task Failures",
+                "acme/etl",
+                42,
+                "Retry the extract on KeyError",
+                "https://github.com/acme/etl/pull/42",
+                "https://app.example.com/alerts/detail?id=1",
+            )),
+            ("fix_without_alert", fix_message(
+                "ALARM: x",
+                "acme/etl",
+                7,
+                "Add fingerprint",
+                "https://github.com/acme/etl/pull/7",
+                "",
+            )),
+        ]
+    }
+
+    /// The Teams card is byte for byte the card posted before Slack existed
+    /// (captured from the old card builders into `notify/golden`).
+    #[test]
+    fn teams_cards_are_unchanged() {
+        for (name, m) in golden_messages() {
+            assert_eq!(
+                serde_json::to_string(&teams(&m)).unwrap(),
+                serde_json::to_string(&golden(name)).unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn slack_alert_messages_carry_the_same_content() {
+        for (name, m) in golden_messages() {
+            let v = ChannelKind::Slack.render(&m);
+            let blocks = v["blocks"].as_array().unwrap();
+            assert_eq!(blocks[0]["type"], "header", "{name}");
+            assert!(!v["text"].as_str().unwrap().is_empty(), "{name}");
+            let actions = blocks.last().unwrap();
+            assert_eq!(actions["type"], "actions", "{name}");
+            // Every link button, and no Details toggle (Slack shows them).
+            let titles: Vec<&str> = actions["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| b["text"]["text"].as_str().unwrap())
+                .collect();
+            let expected: Vec<&str> = m.buttons.iter().map(|b| b.title.as_str()).collect();
+            assert_eq!(titles, expected, "{name}");
+        }
+        let (_, cw) = golden_messages().remove(0);
+        let v = ChannelKind::Slack.render(&cw).to_string();
+        // The threshold line, in Slack bold, and the hidden details shown.
+        assert!(
+            v.contains("TaskInstanceFailures: *5* (alarms above 1)"),
+            "{v}"
+        );
+        assert!(v.contains("*Dimensions*\\nTask=All"), "{v}");
+        assert_eq!(
+            ChannelKind::Slack.render(&cw)["blocks"][0]["text"]["text"],
+            "🔴 Airflow Task Failures"
+        );
+    }
+
+    fn ch(teams: Option<&str>, slack: Option<&str>) -> Channels {
+        Channels {
+            teams: teams.map(String::from),
+            slack: slack.map(String::from),
+        }
+    }
 
     #[test]
     fn route_overrides_team_channel() {
         let team = "https://prod-1.westus.logic.azure.com/workflows/a";
         let mine = "https://x.environment.api.powerplatform.com:443/powerautomate/b";
-        assert_eq!(pick_webhook("team", "", team, true).as_deref(), Some(team));
-        assert_eq!(pick_webhook("", "", team, true).as_deref(), Some(team));
-        assert_eq!(pick_webhook("team", "", team, false), None);
+        let slack = "https://hooks.slack.com/services/T0/B0/abc";
+        let t = || ch(Some(team), Some(slack));
+        assert_eq!(pick("team", Channels::default(), t(), true), t());
+        assert_eq!(pick("", Channels::default(), t(), true), t());
+        assert!(pick("team", Channels::default(), t(), false).is_empty());
         assert_eq!(
-            pick_webhook("custom", mine, team, false).as_deref(),
-            Some(mine)
+            pick("custom", ch(Some(mine), None), t(), false),
+            ch(Some(mine), None)
         );
-        assert_eq!(pick_webhook("custom", "http://insecure", team, true), None);
-        assert_eq!(pick_webhook("off", mine, team, true), None);
+        assert_eq!(
+            pick("custom", ch(None, Some(slack)), t(), true),
+            ch(None, Some(slack))
+        );
+        assert!(pick("custom", ch(Some("http://insecure"), None), t(), true).is_empty());
+        assert!(pick("off", ch(Some(mine), None), t(), true).is_empty());
+        // A URL on the wrong channel's host is dropped.
+        assert_eq!(
+            pick(
+                "team",
+                Channels::default(),
+                ch(Some(slack), Some(slack)),
+                true
+            ),
+            ch(None, Some(slack))
+        );
     }
 
     #[test]
@@ -508,7 +602,7 @@ mod tests {
 
     #[test]
     fn alarm_card_has_red_header_and_buttons() {
-        let card = alert_card(&AlertCard {
+        let card = teams(&alert_message(&AlertCard {
             kind: "cloudwatch_alarm",
             title: "ALARM: prod-db-cpu",
             body: "- Alarm: prod-db-cpu\n- Reason: Threshold crossed",
@@ -516,14 +610,14 @@ mod tests {
             alert_url: "https://app.example/alerts/detail?id=1",
             console_url: Some("https://console.example"),
             context: "us-east-1",
-        });
+        }));
         let c = &card["attachments"][0]["content"];
         assert_eq!(c["version"], "1.5");
         assert_eq!(c["body"][0]["style"], "attention");
         assert_eq!(c["body"][0]["items"][0]["text"], "🔴 prod-db-cpu");
         // View alert, Open in AWS, Details.
         assert_eq!(c["actions"].as_array().unwrap().len(), 3);
-        let resolved = alert_card(&AlertCard {
+        let resolved = teams(&alert_message(&AlertCard {
             title: "OK: prod-db-cpu",
             console_url: None,
             ..AlertCard {
@@ -535,7 +629,7 @@ mod tests {
                 console_url: None,
                 context: "",
             }
-        });
+        }));
         assert_eq!(
             resolved["attachments"][0]["content"]["body"][0]["style"],
             "good"
@@ -553,7 +647,7 @@ mod tests {
             - Dimensions: Task=All, Environment=prod-etl, DAG=All\n\
             - Statistic: AVERAGE\n\
             - Threshold: GreaterThanThreshold 1\n";
-        let card = alert_card(&AlertCard {
+        let card = teams(&alert_message(&AlertCard {
             kind: "cloudwatch_alarm",
             title: "ALARM: Airflow Task Failures",
             body,
@@ -561,7 +655,7 @@ mod tests {
             alert_url: "u",
             console_url: None,
             context: "us-east-1 · 2026-10-12 17:09 UTC",
-        });
+        }));
         let c = &card["attachments"][0]["content"];
         let texts: Vec<&str> = c["body"]
             .as_array()
@@ -593,7 +687,7 @@ mod tests {
 
     #[test]
     fn message_alerts_keep_their_fields_and_links_become_buttons() {
-        let card = alert_card(&AlertCard {
+        let card = teams(&alert_message(&AlertCard {
             kind: "message",
             title: "Airflow failed: nightly_load.extract",
             body: "- DAG: nightly_load\n- Task: extract\n- Error: KeyError: 'id'\n\
@@ -602,7 +696,7 @@ mod tests {
             alert_url: "u",
             console_url: None,
             context: "us-east-1",
-        });
+        }));
         let c = &card["attachments"][0]["content"];
         let facts: Vec<&str> = c["body"]
             .as_array()
@@ -627,14 +721,14 @@ mod tests {
 
     #[test]
     fn fix_card_links_the_pr() {
-        let c = fix_card(
+        let c = teams(&fix_message(
             "ALARM: x",
             "o/r",
             7,
             "Add fingerprint",
             "https://github.com/o/r/pull/7",
             "",
-        );
+        ));
         let actions = c["attachments"][0]["content"]["actions"]
             .as_array()
             .unwrap()

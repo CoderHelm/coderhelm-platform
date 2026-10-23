@@ -4,6 +4,7 @@ import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as kms from "aws-cdk-lib/aws-kms";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
@@ -14,6 +15,8 @@ interface LogAnalyzerStackProps extends cdk.StackProps {
   stage: string;
   awsInsightsTable: dynamodb.TableV2;
   settingsTable: dynamodb.TableV2;
+  /** Opens the sealed Teams/Slack webhooks new findings post to. */
+  secretsKey: kms.Key;
 }
 
 export class LogAnalyzerStack extends cdk.Stack {
@@ -74,6 +77,9 @@ export class LogAnalyzerStack extends cdk.Stack {
     // DynamoDB permissions
     props.awsInsightsTable.grantReadWriteData(analyzerFunction);
     props.settingsTable.grantReadData(analyzerFunction);
+    // Webhook URLs are sealed with the secrets key (bound to the team), like
+    // the worker's: the analyzer only opens them.
+    props.secretsKey.grantDecrypt(analyzerFunction);
     // Decoupled by name (like the worker) to avoid a cross-stack export.
     dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `${prefix}-analytics`)
       .grantWriteData(analyzerFunction);

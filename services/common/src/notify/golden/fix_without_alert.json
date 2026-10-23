@@ -1,0 +1,68 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "title": "Open PR",
+            "type": "Action.OpenUrl",
+            "url": "https://github.com/acme/etl/pull/7"
+          }
+        ],
+        "body": [
+          {
+            "bleed": true,
+            "items": [
+              {
+                "color": "Accent",
+                "size": "Medium",
+                "text": "🛠️ Fix proposed · PR #7",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "style": "accent",
+            "type": "Container"
+          },
+          {
+            "isSubtle": true,
+            "spacing": "Small",
+            "text": "For alert: ALARM: x",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "spacing": "Medium",
+            "text": "Add fingerprint",
+            "type": "TextBlock",
+            "weight": "Bolder",
+            "wrap": true
+          },
+          {
+            "facts": [
+              {
+                "title": "Repository",
+                "value": "acme/etl"
+              },
+              {
+                "title": "Status",
+                "value": "Waiting for review — nothing merges without a person's approval"
+              }
+            ],
+            "type": "FactSet"
+          }
+        ],
+        "msteams": {
+          "width": "Full"
+        },
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive",
+      "contentUrl": null
+    }
+  ],
+  "type": "message"
+}

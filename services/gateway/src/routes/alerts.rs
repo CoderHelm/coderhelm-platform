@@ -7,7 +7,7 @@
 //! repository to fix them in, and how to act. An alert a rule takes becomes a
 //! ticket run against that rule's repository: CoderHelm analyzes it, makes the
 //! change the instructions call for, and opens a pull request. Alerts no rule
-//! takes are only posted to Teams. The PR goes through the normal review, and a
+//! takes are only posted to the team's chat channels (Teams, Slack). The PR goes through the normal review, and a
 //! CoderHelm-authored PR never merges without a person's approval.
 //!
 //! Safety:
@@ -37,6 +37,7 @@ use super::sns::{self, SnsMessage};
 use crate::models::{Claims, TicketMessage, TicketSource, WorkerMessage};
 use crate::AppState;
 use common::alert_notify;
+use common::notify::{self, store, ChannelKind, Channels};
 
 /// Same alert (same fingerprint) within this window is one alert.
 const REPEAT_WINDOW_SECS: u64 = 6 * 3600;
@@ -410,14 +411,14 @@ pub fn topic_account(topic_arn: &str) -> Option<&str> {
 struct Route {
     team_id: String,
     /// Alerts the first matching rule takes open a PR; the rest only post to
-    /// Teams. No rules = a notify-only route.
+    /// the chat channels. No rules = a notify-only route.
     rules: Vec<Rule>,
     enabled: bool,
-    /// Teams notifications: "team" (the team channel), "custom" or "off".
+    /// Chat notifications: "team" (the team channels), "custom" or "off".
     notify_mode: String,
-    /// The route's own channel when `notify_mode` is "custom".
-    teams_webhook_url: String,
-    /// Post recoveries and other non-alarm state changes to Teams. Off by
+    /// The route's own webhooks (sealed) when `notify_mode` is "custom".
+    webhooks: HashMap<String, AttributeValue>,
+    /// Post recoveries and other non-alarm state changes to chat. Off by
     /// default: they are still recorded on the alert's page.
     post_recoveries: bool,
 }
@@ -454,6 +455,14 @@ fn rule_to_attr(r: &Rule) -> AttributeValue {
         ("repo".to_string(), attr_s(&r.repo)),
         ("instructions".to_string(), attr_s(&r.instructions)),
     ]))
+}
+
+/// The webhook attributes of an item, and nothing else.
+fn webhook_attrs(item: &HashMap<String, AttributeValue>) -> HashMap<String, AttributeValue> {
+    ChannelKind::ALL
+        .iter()
+        .flat_map(|k| store::stored(item, *k).to_attrs(*k))
+        .collect()
 }
 
 fn route_from_item(item: &HashMap<String, AttributeValue>) -> Option<Route> {
@@ -495,7 +504,7 @@ fn route_from_item(item: &HashMap<String, AttributeValue>) -> Option<Route> {
         notify_mode: Some(s("notify_mode"))
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| alert_notify::MODE_TEAM.to_string()),
-        teams_webhook_url: s("teams_webhook_url"),
+        webhooks: webhook_attrs(item),
         post_recoveries: item
             .get("post_recoveries")
             .and_then(|v| v.as_bool().ok())
@@ -676,7 +685,7 @@ async fn handle_notification(
     };
     let repo = rule.map(|r| r.repo.as_str()).unwrap_or("");
     record_event(state, msg, route, repo, &alert, &tid, outcome).await;
-    notify_teams(state, msg, route, repo, &alert, outcome, opened.as_ref()).await;
+    notify_channels(state, msg, route, repo, &alert, outcome, opened.as_ref()).await;
     result.map(|_| StatusCode::OK)
 }
 
@@ -716,8 +725,32 @@ fn dashboard_base(state: &AppState) -> &'static str {
     }
 }
 
-/// Post the alert to the route's Teams channel. Best effort.
-async fn notify_teams(
+/// The secrets key, for sealing and opening saved webhooks.
+pub(crate) fn cipher(state: &AppState) -> common::mcp_credentials::Kms<'_> {
+    common::mcp_credentials::Kms {
+        client: &state.kms,
+        key_id: &state.config.secrets_key_id,
+    }
+}
+
+/// The channels a route's alerts post to, opened. Empty = nowhere.
+async fn route_channels(state: &AppState, route: &Route) -> Channels {
+    let c = cipher(state);
+    match route.notify_mode.as_str() {
+        alert_notify::MODE_OFF => Channels::default(),
+        alert_notify::MODE_CUSTOM => store::open_all(&c, &route.team_id, &route.webhooks).await,
+        _ => {
+            let team = team_notify_settings(state, &route.team_id).await;
+            if !team.enabled {
+                return Channels::default();
+            }
+            store::open_all(&c, &route.team_id, &team.item).await
+        }
+    }
+}
+
+/// Post the alert to the route's channels (Teams, Slack). Best effort.
+async fn notify_channels(
     state: &AppState,
     msg: &SnsMessage,
     route: &Route,
@@ -729,15 +762,10 @@ async fn notify_teams(
     let Some(mut line) = notify_line(outcome, repo, route.post_recoveries) else {
         return;
     };
-    let team = team_notify_settings(state, &route.team_id).await;
-    let Some(url) = alert_notify::pick_webhook(
-        &route.notify_mode,
-        &route.teams_webhook_url,
-        &team.url,
-        team.enabled,
-    ) else {
+    let channels = route_channels(state, route).await;
+    if channels.is_empty() {
         return;
-    };
+    }
     let region = msg.topic_arn.split(':').nth(3).unwrap_or("");
     let account = topic_account(&msg.topic_arn).unwrap_or("");
     let when = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
@@ -762,7 +790,7 @@ async fn notify_teams(
         .then(|| alert.title.split_once(": ").map(|(_, name)| name))
         .flatten()
         .and_then(|name| alert_notify::cloudwatch_console_url(region, name));
-    let card = alert_notify::alert_card(&alert_notify::AlertCard {
+    let card = alert_notify::alert_message(&alert_notify::AlertCard {
         kind: alert.kind,
         title: &alert.title,
         body: &alert.body,
@@ -771,7 +799,9 @@ async fn notify_teams(
         console_url: console.as_deref(),
         context: &context,
     });
-    let posted = alert_notify::send(&state.http, &url, &card, "alert").await;
+    let posted = notify::deliver(&notify::Http(&state.http), &channels, &card, "alert")
+        .await
+        .any_ok();
     if posted && alert.actionable {
         open_alert(state, &route.team_id, alert, &id, &msg.timestamp).await;
     }
@@ -779,7 +809,7 @@ async fn notify_teams(
 
 // ─── Open alerts ────────────────────────────────────────────────────────────
 //
-// Teams Workflows webhooks can't reply in a thread, so a recovery is its own
+// Chat webhooks (Teams Workflows, Slack incoming webhooks) can't reply in a thread, so a recovery is its own
 // card that links the alert it resolves. To keep recoveries from spamming the
 // channel, a posted alert card is "open" until one recovery closes it: the
 // first recovery posts (on a route that posts recoveries), later ones (SNS
@@ -883,8 +913,10 @@ async fn close_open_alert(state: &AppState, team_id: &str, fingerprint: &str) ->
     })
 }
 
+/// The team's alert channel setting: whether it is on, and the raw item
+/// (its webhooks are sealed; see [`store`]).
 pub(crate) struct TeamNotify {
-    pub(crate) url: String,
+    pub(crate) item: HashMap<String, AttributeValue>,
     pub(crate) enabled: bool,
 }
 
@@ -901,16 +933,12 @@ pub(crate) async fn team_notify_settings(state: &AppState, team_id: &str) -> Tea
         .and_then(|o| o.item().cloned())
         .unwrap_or_default();
     TeamNotify {
-        url: item
-            .get("teams_webhook_url")
-            .and_then(|v| v.as_s().ok())
-            .cloned()
-            .unwrap_or_default(),
         enabled: item
             .get("enabled")
             .and_then(|v| v.as_bool().ok())
             .copied()
             .unwrap_or(false),
+        item,
     }
 }
 
@@ -1288,7 +1316,7 @@ pub async fn list_routes(
                 })).collect::<Vec<_>>(),
                 "enabled": r.enabled,
                 "notify_mode": r.notify_mode,
-                "teams_webhook_url": r.teams_webhook_url,
+                "webhooks": store::view(&r.webhooks),
                 "post_recoveries": r.post_recoveries,
                 "updated_at": it.get("updated_at").and_then(|v| v.as_s().ok()),
             }))
@@ -1335,9 +1363,10 @@ pub struct PutRouteRequest {
     /// "team" (default), "custom" or "off".
     #[serde(default)]
     notify_mode: String,
-    #[serde(default)]
-    teams_webhook_url: String,
-    /// Post recoveries to Teams (default off).
+    /// The route's own webhooks, for "custom": each kept unless set or cleared.
+    #[serde(flatten)]
+    channels: store::ChannelsInput,
+    /// Post recoveries (default off).
     #[serde(default)]
     post_recoveries: bool,
 }
@@ -1443,10 +1472,7 @@ pub async fn put_route(
         return Err(StatusCode::BAD_REQUEST);
     }
     let notify_mode = notify_mode_of(&req).ok_or(StatusCode::BAD_REQUEST)?;
-    let route_webhook = req.teams_webhook_url.trim();
-    if notify_mode == alert_notify::MODE_CUSTOM && !alert_notify::valid_webhook_url(route_webhook) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    req.channels.check().map_err(save_error)?;
 
     // Only the team that owns the topic's AWS account may route its alerts.
     let owns_account = state
@@ -1468,6 +1494,28 @@ pub async fn put_route(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    // A custom route keeps its saved webhooks unless the request changes them;
+    // any other mode posts to none of its own.
+    let webhooks = if notify_mode == alert_notify::MODE_CUSTOM {
+        let prior = load_route(&state, topic)
+            .await?
+            .filter(|r| r.team_id == claims.team_id)
+            .map(|r| r.webhooks);
+        let attrs = store::save_attrs(
+            &cipher(&state),
+            &claims.team_id,
+            prior.as_ref(),
+            &req.channels,
+        )
+        .await
+        .map_err(save_error)?;
+        if !store::any_set(&store::as_item(&attrs)) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        attrs
+    } else {
+        vec![]
+    };
     let rules_attr = AttributeValue::L(rules.iter().map(rule_to_attr).collect());
     let now = chrono::Utc::now().to_rfc3339();
     let fields = |pk: &str, sk: &str| {
@@ -1480,10 +1528,12 @@ pub async fn put_route(
             .item("rules", rules_attr.clone())
             .item("enabled", AttributeValue::Bool(req.enabled))
             .item("notify_mode", attr_s(notify_mode))
-            .item("teams_webhook_url", attr_s(route_webhook))
             .item("post_recoveries", AttributeValue::Bool(req.post_recoveries))
             .item("updated_at", attr_s(&now))
             .item("updated_by", attr_s(&claims.email));
+        for (k, v) in &webhooks {
+            b = b.item(k, v.clone());
+        }
         if sk == "ROUTE" {
             // A topic routes to exactly one team.
             b = b
@@ -1689,9 +1739,22 @@ pub async fn delete_route(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ─── Team Teams channel ─────────────────────────────────────────────────────
+// ─── Team alert channel ─────────────────────────────────────────────────────
 
-/// GET /api/alert-notify — the team's alert channel (admin+).
+/// Pure: a refused webhook save as a status. A bad URL is the caller's; a seal
+/// that failed is ours.
+pub(crate) fn save_error(e: store::SaveError) -> StatusCode {
+    match e {
+        store::SaveError::InvalidUrl(_) => StatusCode::BAD_REQUEST,
+        store::SaveError::Seal(err) => {
+            error!(error = %err, "Could not seal a webhook");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
+}
+
+/// GET /api/alert-notify — the team's alert channels (admin+). Webhooks are
+/// shown only as a hint.
 pub async fn get_notify(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -1699,45 +1762,56 @@ pub async fn get_notify(
     claims.require_role(3)?;
     let t = team_notify_settings(&state, &claims.team_id).await;
     Ok(Json(
-        json!({ "teams_webhook_url": t.url, "enabled": t.enabled }),
+        json!({ "enabled": t.enabled, "webhooks": store::view(&t.item) }),
     ))
 }
 
 #[derive(Deserialize)]
 pub struct PutNotifyRequest {
     #[serde(default)]
-    teams_webhook_url: String,
-    #[serde(default)]
     enabled: bool,
+    /// Each webhook is kept unless the request sets or clears it.
+    #[serde(flatten)]
+    channels: store::ChannelsInput,
 }
 
-/// PUT /api/alert-notify — set the team's alert channel (admin+).
+/// PUT /api/alert-notify — set the team's alert channels (admin+). On needs at
+/// least one channel.
 pub async fn put_notify(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(req): Json<PutNotifyRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(3)?;
-    let url = req.teams_webhook_url.trim();
-    if (req.enabled || !url.is_empty()) && !alert_notify::valid_webhook_url(url) {
+    req.channels.check().map_err(save_error)?;
+    let prior = team_notify_settings(&state, &claims.team_id).await;
+    let attrs = store::save_attrs(
+        &cipher(&state),
+        &claims.team_id,
+        Some(&prior.item),
+        &req.channels,
+    )
+    .await
+    .map_err(save_error)?;
+    if req.enabled && !store::any_set(&store::as_item(&attrs)) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    state
+    let mut put = state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
         .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(alert_notify::TEAM_SETTINGS_SK))
-        .item("teams_webhook_url", attr_s(url))
         .item("enabled", AttributeValue::Bool(req.enabled))
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
-        .item("updated_by", attr_s(&claims.email))
-        .send()
-        .await
-        .map_err(|e| {
-            error!(error = %e, "Could not save alert channel");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .item("updated_by", attr_s(&claims.email));
+    for (k, v) in attrs {
+        put = put.item(k, v);
+    }
+    put.send().await.map_err(|e| {
+        error!(error = %e, "Could not save alert channel");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     info!(team_id = %claims.team_id, enabled = req.enabled, "Alert channel saved");
     Ok(Json(json!({ "ok": true })))
 }
@@ -1802,36 +1876,114 @@ pub async fn put_budget(
 
 #[derive(Deserialize)]
 pub struct TestNotifyRequest {
+    /// "teams" or "slack". Empty = Teams (the request saved before Slack).
+    #[serde(default)]
+    channel: String,
+    /// A URL being entered, not saved yet. Empty = the destination's saved one.
+    #[serde(default)]
+    url: String,
+    /// The request saved before Slack: a Teams URL.
+    #[serde(default)]
     teams_webhook_url: String,
+    /// Whose saved webhook to test: "alerts" (the team alert channel),
+    /// "route" (with `topic_arn`), "recommendations", or "reviewer" (with
+    /// `repo`). Also picks the sample message.
+    #[serde(default)]
+    destination: String,
+    #[serde(default)]
+    topic_arn: String,
+    #[serde(default)]
+    repo: String,
 }
 
-/// POST /api/alert-notify/test — post a sample alert card to a channel (admin+).
+/// The settings item that holds a destination's saved webhooks.
+fn destination_sk(req: &TestNotifyRequest) -> Option<String> {
+    match req.destination.as_str() {
+        "" | "alerts" => Some(alert_notify::TEAM_SETTINGS_SK.to_string()),
+        "route" if !req.topic_arn.trim().is_empty() => Some(team_route_sk(req.topic_arn.trim())),
+        "recommendations" => Some(super::log_analyzer::REC_NOTIFY_SK.to_string()),
+        "reviewer"
+            if valid_repo(req.repo.trim())
+                && super::reviewer::validate_repo(req.repo.trim()).is_ok() =>
+        {
+            Some(format!("REVIEW_CONFIG#REPO#{}", req.repo.trim()))
+        }
+        _ => None,
+    }
+}
+
+/// POST /api/notify/test (and /api/alert-notify/test) — post a sample message
+/// to one channel of a destination: a URL being entered, or the saved one
+/// (admin+). The URL is never echoed back.
 pub async fn test_notify(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(req): Json<TestNotifyRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(3)?;
-    let url = req.teams_webhook_url.trim();
-    if !alert_notify::valid_webhook_url(url) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let card = alert_notify::alert_card(&alert_notify::AlertCard {
-        kind: "cloudwatch_alarm",
-        title: "ALARM: example-api-5xx-rate",
-        body: "This is a test card from CoderHelm. Real alerts on your alert routes will look like this.\n\n\
-               - Metric: AWS/ApplicationELB / HTTPCode_Target_5XX_Count\n\
-               - Threshold: GreaterThanThreshold 50\n\
-               - Reason: Threshold Crossed: 1 datapoint [73.0] was greater than the threshold (50.0).",
-        outcome: "Notification only: this is a test.",
-        alert_url: &format!("{}/alerts", dashboard_base(&state)),
-        console_url: None,
-        context: "us-east-1 · test",
-    });
-    match alert_notify::post(&state.http, url, &card).await {
+    let kind = match req.channel.trim() {
+        "" => ChannelKind::Teams,
+        c => ChannelKind::parse(c).ok_or(StatusCode::BAD_REQUEST)?,
+    };
+    let sk = destination_sk(&req).ok_or(StatusCode::BAD_REQUEST)?;
+    let typed = Some(req.url.trim())
+        .filter(|u| !u.is_empty())
+        .or_else(|| Some(req.teams_webhook_url.trim()).filter(|u| !u.is_empty()));
+    let url = match typed {
+        Some(u) if kind.valid_url(u) => u.to_string(),
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+        None => {
+            let item = state
+                .dynamo
+                .get_item()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", attr_s(&claims.team_id))
+                .key("sk", attr_s(&sk))
+                .send()
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "Could not read a saved webhook");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+                .item()
+                .cloned()
+                .unwrap_or_default();
+            let opened = store::open_all(&cipher(&state), &claims.team_id, &item).await;
+            match opened.get(kind) {
+                Some(u) => u.to_string(),
+                None => {
+                    return Ok(Json(
+                        json!({ "ok": false, "error": format!("No {} webhook is saved here.", kind.label()) }),
+                    ))
+                }
+            }
+        }
+    };
+    let base = dashboard_base(&state);
+    let msg = match req.destination.as_str() {
+        "" | "alerts" | "route" => alert_notify::alert_message(&alert_notify::AlertCard {
+            kind: "cloudwatch_alarm",
+            title: "ALARM: example-api-5xx-rate",
+            body: "This is a test card from CoderHelm. Real alerts on your alert routes will look like this.\n\n\
+                   - Metric: AWS/ApplicationELB / HTTPCode_Target_5XX_Count\n\
+                   - Threshold: GreaterThanThreshold 50\n\
+                   - Reason: Threshold Crossed: 1 datapoint [73.0] was greater than the threshold (50.0).",
+            outcome: "Notification only: this is a test.",
+            alert_url: &format!("{base}/alerts"),
+            console_url: None,
+            context: "us-east-1 · test",
+        }),
+        "recommendations" => notify::messages::test_message("New log findings", &format!("{base}/settings/aws")),
+        _ => notify::messages::test_message("Review reminders", &format!("{base}/reviewer")),
+    };
+    use notify::Poster;
+    match notify::Http(&state.http)
+        .post(&url, &kind.render(&msg))
+        .await
+    {
         Ok(()) => Ok(Json(json!({ "ok": true }))),
         Err(e) => {
-            warn!(team_id = %claims.team_id, error = %e, "Test alert card failed");
+            warn!(team_id = %claims.team_id, channel = kind.key(), error = %e, "Test message failed");
             Ok(Json(json!({ "ok": false, "error": e })))
         }
     }
@@ -1975,6 +2127,81 @@ pub async fn get_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_route_keeps_only_its_webhooks_and_shows_them_as_hints() {
+        let item: HashMap<String, AttributeValue> = HashMap::from([
+            ("team_id".to_string(), attr_s("TEAM#a")),
+            ("notify_mode".to_string(), attr_s("custom")),
+            (
+                "teams_webhook_url".to_string(),
+                attr_s("https://acme.webhook.office.com/webhookb2/abc-123/IncomingWebhook/zz9Q"),
+            ),
+            ("slack_webhook_sealed".to_string(), attr_s("c2VhbGVk")),
+            (
+                "slack_webhook_hint".to_string(),
+                attr_s("hooks.slack.com …mnop"),
+            ),
+            ("rules".to_string(), AttributeValue::L(vec![])),
+        ]);
+        let r = route_from_item(&item).unwrap();
+        assert_eq!(r.webhooks.len(), 3);
+        let shown = store::view(&r.webhooks);
+        assert_eq!(shown["teams"]["set"], true);
+        assert_eq!(shown["slack"]["hint"], "hooks.slack.com …mnop");
+        let text = shown.to_string();
+        assert!(
+            !text.contains("abc-123") && !text.contains("c2VhbGVk"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_test_message_reads_the_destinations_own_setting() {
+        let req = |d: &str, topic: &str, repo: &str| TestNotifyRequest {
+            channel: "slack".into(),
+            url: String::new(),
+            teams_webhook_url: String::new(),
+            destination: d.into(),
+            topic_arn: topic.into(),
+            repo: repo.into(),
+        };
+        assert_eq!(
+            destination_sk(&req("", "", "")).as_deref(),
+            Some("ALERT_NOTIFY")
+        );
+        assert_eq!(
+            destination_sk(&req("alerts", "", "")).as_deref(),
+            Some("ALERT_NOTIFY")
+        );
+        assert_eq!(
+            destination_sk(&req("recommendations", "", "")).as_deref(),
+            Some("REC_NOTIFY")
+        );
+        assert_eq!(
+            destination_sk(&req("reviewer", "", "acme/web")).as_deref(),
+            Some("REVIEW_CONFIG#REPO#acme/web")
+        );
+        assert_eq!(destination_sk(&req("reviewer", "", "../x")), None);
+        assert_eq!(destination_sk(&req("route", "", "")), None);
+        assert_eq!(
+            destination_sk(&req("route", "arn:aws:sns:us-east-1:123456789012:t", "")),
+            Some(team_route_sk("arn:aws:sns:us-east-1:123456789012:t"))
+        );
+        assert_eq!(destination_sk(&req("other", "", "")), None);
+    }
+
+    #[test]
+    fn webhook_save_errors_map_to_statuses() {
+        assert_eq!(
+            save_error(store::SaveError::InvalidUrl(ChannelKind::Slack)),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            save_error(store::SaveError::Seal("no key".into())),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 
     fn alarm(name: &str) -> Alert {
         Alert {

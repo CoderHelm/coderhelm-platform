@@ -344,6 +344,9 @@ pub const SUPPORT_VIEW_BLOCKED_READS: &[&str] = &[
 /// in answers at all (they are sealed and shown only as a hint).
 pub const SUPPORT_VIEW_HIDDEN_FIELDS: &[&str] = &[
     "teams_webhook_url",
+    "teams_webhook_sealed",
+    "slack_webhook_url",
+    "slack_webhook_sealed",
     "release_notes_email_webhook_url",
     "webhook_url",
     "external_id",

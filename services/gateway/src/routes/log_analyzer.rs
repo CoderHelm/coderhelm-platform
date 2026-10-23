@@ -983,24 +983,23 @@ pub async fn dismiss_recommendation(
 }
 
 // ────────────────────────────────────────────────────────────────
-// Teams notifications for new recommendations
+// Chat notifications (Teams, Slack) for new recommendations
 // ────────────────────────────────────────────────────────────────
 
 /// Settings-table key of the recommendation notification setting (read by
 /// the log analyzer Lambda).
-const REC_NOTIFY_SK: &str = "REC_NOTIFY";
+pub(crate) const REC_NOTIFY_SK: &str = "REC_NOTIFY";
 
-/// GET /api/recommendations/notify — where new findings post (admin+).
-pub async fn get_rec_notify(
-    State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
-) -> Result<Json<Value>, StatusCode> {
-    claims.require_role(3)?;
-    let item = state
+async fn rec_notify_item(
+    state: &AppState,
+    team_id: &str,
+) -> Result<std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>, StatusCode>
+{
+    Ok(state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.team_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s(REC_NOTIFY_SK))
         .send()
         .await
@@ -1010,57 +1009,84 @@ pub async fn get_rec_notify(
         })?
         .item()
         .cloned()
-        .unwrap_or_default();
-    let s = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
+        .unwrap_or_default())
+}
+
+/// GET /api/recommendations/notify — where new findings post (admin+).
+/// Webhooks are shown only as a hint.
+pub async fn get_rec_notify(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?;
+    let item = rec_notify_item(&state, &claims.team_id).await?;
+    let mode = item
+        .get("notify_mode")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_else(|| "off".to_string());
     Ok(Json(json!({
-        "notify_mode": s("notify_mode").unwrap_or_else(|| "off".to_string()),
-        "teams_webhook_url": s("teams_webhook_url").unwrap_or_default(),
+        "notify_mode": mode,
+        "webhooks": common::notify::store::view(&item),
     })))
 }
 
 #[derive(serde::Deserialize)]
 pub struct RecNotifyBody {
     notify_mode: String,
-    #[serde(default)]
-    teams_webhook_url: String,
+    /// Its own webhooks, for "custom": each kept unless set or cleared.
+    #[serde(flatten)]
+    channels: common::notify::store::ChannelsInput,
 }
 
-/// PUT /api/recommendations/notify — "team" (the team's alert channel),
-/// "custom" (its own channel) or "off" (admin+).
+/// PUT /api/recommendations/notify — "team" (the team's alert channels),
+/// "custom" (its own channels) or "off" (admin+).
 pub async fn put_rec_notify(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<RecNotifyBody>,
 ) -> Result<Json<Value>, StatusCode> {
-    use common::alert_notify::{valid_webhook_url, MODE_CUSTOM, MODE_OFF, MODE_TEAM};
+    use common::alert_notify::{MODE_CUSTOM, MODE_OFF, MODE_TEAM};
+    use common::notify::store;
     claims.require_role(3)?;
     let mode = body.notify_mode.trim();
     if ![MODE_TEAM, MODE_CUSTOM, MODE_OFF].contains(&mode) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let url = body.teams_webhook_url.trim();
-    if mode == MODE_CUSTOM && !valid_webhook_url(url) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    state
+    body.channels.check().map_err(super::alerts::save_error)?;
+    let attrs = if mode == MODE_CUSTOM {
+        let prior = rec_notify_item(&state, &claims.team_id).await?;
+        let attrs = store::save_attrs(
+            &super::alerts::cipher(&state),
+            &claims.team_id,
+            Some(&prior),
+            &body.channels,
+        )
+        .await
+        .map_err(super::alerts::save_error)?;
+        if !store::any_set(&store::as_item(&attrs)) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        attrs
+    } else {
+        vec![]
+    };
+    let mut put = state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
         .item("pk", attr_s(&claims.team_id))
         .item("sk", attr_s(REC_NOTIFY_SK))
         .item("notify_mode", attr_s(mode))
-        .item(
-            "teams_webhook_url",
-            attr_s(if mode == MODE_CUSTOM { url } else { "" }),
-        )
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
-        .item("updated_by", attr_s(&claims.email))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to save recommendation notify setting: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .item("updated_by", attr_s(&claims.email));
+    for (k, v) in attrs {
+        put = put.item(k, v);
+    }
+    put.send().await.map_err(|e| {
+        error!("Failed to save recommendation notify setting: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     info!(
         team_id = claims.team_id,
         mode, "Recommendation notifications saved"

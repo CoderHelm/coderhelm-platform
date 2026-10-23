@@ -1,0 +1,114 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "title": "View alert",
+            "type": "Action.OpenUrl",
+            "url": "https://app.example.com/alerts/detail?id=1"
+          },
+          {
+            "title": "Open in AWS",
+            "type": "Action.OpenUrl",
+            "url": "https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#alarmsV2:alarm/x"
+          },
+          {
+            "targetElements": [
+              "details"
+            ],
+            "title": "Details",
+            "type": "Action.ToggleVisibility"
+          }
+        ],
+        "body": [
+          {
+            "bleed": true,
+            "items": [
+              {
+                "color": "Attention",
+                "size": "Medium",
+                "text": "🔴 Airflow Task Failures",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "style": "attention",
+            "type": "Container"
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "spacing": "None",
+            "text": "us-east-1 · 123456789012 · 2026-10-12 17:09 UTC",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "spacing": "Small",
+            "text": "A task has failed to run. Please check MWAA for more information.",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "spacing": "Small",
+            "text": "TaskInstanceFailures: **5** (alarms above 1)",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "spacing": "Small",
+            "text": "🤖 CoderHelm is working on a fix in acme/etl. A follow-up card will link the pull request.",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "id": "details",
+            "isVisible": false,
+            "items": [
+              {
+                "facts": [
+                  {
+                    "title": "Reason",
+                    "value": "Threshold Crossed: 1 out of the last 1 datapoints [5.0 (12/10/26 16:54:00)] was greater than the threshold (1.0)"
+                  },
+                  {
+                    "title": "Metric",
+                    "value": "AmazonMWAA / TaskInstanceFailures"
+                  },
+                  {
+                    "title": "Dimensions",
+                    "value": "Task=All, Environment=prod-etl, DAG=All"
+                  },
+                  {
+                    "title": "Statistic",
+                    "value": "AVERAGE"
+                  },
+                  {
+                    "title": "Threshold",
+                    "value": "GreaterThanThreshold 1"
+                  }
+                ],
+                "type": "FactSet"
+              }
+            ],
+            "spacing": "Medium",
+            "type": "Container"
+          }
+        ],
+        "msteams": {
+          "width": "Full"
+        },
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive",
+      "contentUrl": null
+    }
+  ],
+  "type": "message"
+}

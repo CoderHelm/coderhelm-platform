@@ -1,0 +1,63 @@
+{
+  "attachments": [
+    {
+      "content": {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "actions": [
+          {
+            "title": "View alert",
+            "type": "Action.OpenUrl",
+            "url": "https://app.example.com/alerts/detail?id=5"
+          }
+        ],
+        "body": [
+          {
+            "bleed": true,
+            "items": [
+              {
+                "color": "Good",
+                "size": "Medium",
+                "text": "✅ Recovered: nightly_load",
+                "type": "TextBlock",
+                "weight": "Bolder",
+                "wrap": true
+              }
+            ],
+            "style": "good",
+            "type": "Container"
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "spacing": "None",
+            "text": "us-east-1",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "spacing": "Small",
+            "text": "All tasks succeeded.",
+            "type": "TextBlock",
+            "wrap": true
+          },
+          {
+            "isSubtle": true,
+            "size": "Small",
+            "spacing": "Small",
+            "text": "🤖 Resolves the alert posted 2026-10-12 17:09 UTC.",
+            "type": "TextBlock",
+            "wrap": true
+          }
+        ],
+        "msteams": {
+          "width": "Full"
+        },
+        "type": "AdaptiveCard",
+        "version": "1.5"
+      },
+      "contentType": "application/vnd.microsoft.card.adaptive",
+      "contentUrl": null
+    }
+  ],
+  "type": "message"
+}
