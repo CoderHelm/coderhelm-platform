@@ -102,10 +102,10 @@ async fn main() -> Result<(), Error> {
     let api_routes = Router::new()
         .route("/me", get(routes::api::me))
         .route("/health", get(routes::api::health))
-        .route("/dlq", get(routes::api::list_dlq_messages))
-        .route("/dlq/redrive", post(routes::api::redrive_dlq_message))
-        .route("/dlq/delete", post(routes::api::delete_dlq_message))
-        .route("/dlq/purge", post(routes::api::purge_dlq))
+        .route("/dlq", get(routes::dlq::list_dlq_messages))
+        .route("/dlq/redrive", post(routes::dlq::redrive_dlq_message))
+        .route("/dlq/delete", post(routes::dlq::delete_dlq_message))
+        .route("/dlq/purge", post(routes::dlq::purge_dlq))
         .route("/teams", get(routes::api::list_teams))
         .route("/teams/switch", post(routes::api::switch_team))
         .route("/teams/rename", put(routes::api::rename_team))
@@ -116,6 +116,9 @@ async fn main() -> Result<(), Error> {
                 .delete(routes::api::remove_from_allowlist),
         )
         .route("/admin/teams", get(routes::admin::admin_teams))
+        // The shared DLQ: every team's failed messages and the global jobs'
+        .route("/admin/dlq", get(routes::admin::admin_dlq))
+        .route("/admin/dlq/delete", post(routes::admin::admin_dlq_delete))
         .route("/admin/beta-signups", get(routes::admin::beta_signups))
         .route(
             "/admin/beta-signups/invite",

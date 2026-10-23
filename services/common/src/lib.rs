@@ -13,6 +13,9 @@ pub mod claim;
 
 /// The code graph's per-repo switch and build status (gateway and worker).
 pub mod code_graph;
+/// The shared dead-letter queue: whose each failed message is, whether the
+/// worker can read it, and when the cleanup archives it.
+pub mod dlq;
 
 /// Alert notifications: which channels an alert posts to, and its messages.
 pub mod alert_notify;

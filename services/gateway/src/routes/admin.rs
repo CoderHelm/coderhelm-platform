@@ -961,6 +961,34 @@ pub async fn invite_beta_signup(
     ))
 }
 
+/// GET /api/admin/dlq — the shared dead-letter queue: every team's failed
+/// messages, the global jobs', and the ones nobody can read. Platform admin
+/// only; teams see only their own on the health page.
+pub async fn admin_dlq(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    if !is_platform_admin(&claims) {
+        warn!(email = %claims.email, "Shared queue refused: not a platform admin");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    super::dlq::admin_list(&state).await.map(Json)
+}
+
+/// POST /api/admin/dlq/delete — delete any one message from the shared queue
+/// by `message_id`. Platform admin only; logged with the admin's email.
+pub async fn admin_dlq_delete(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, StatusCode> {
+    if !is_platform_admin(&claims) {
+        warn!(email = %claims.email, "Shared queue delete refused: not a platform admin");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    super::dlq::admin_delete(&state, &claims.email, &body).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,6 +1236,6 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 3);
+        assert_eq!(checked, 5);
     }
 }

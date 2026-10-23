@@ -34,6 +34,8 @@ interface WorkerStackProps extends cdk.StackProps {
   ticketQueue: sqs.Queue;
   ciFixQueue: sqs.Queue;
   feedbackQueue: sqs.Queue;
+  /** The shared DLQ: the daily cleanup archives and deletes unreadable messages. */
+  dlq: sqs.Queue;
   mcpProxyFunction: lambda.Function;
   encryptionKey: kms.Key;
   secretsKey: kms.Key;
@@ -110,6 +112,7 @@ export class WorkerStack extends cdk.Stack {
         CI_FIX_QUEUE_URL: props.ciFixQueue.queueUrl,
         TICKET_QUEUE_URL: props.ticketQueue.queueUrl,
         FEEDBACK_QUEUE_URL: props.feedbackQueue.queueUrl,
+        DLQ_URL: props.dlq.queueUrl,
         RUST_LOG: "info",
       },
     });
@@ -215,6 +218,10 @@ export class WorkerStack extends cdk.Stack {
     // Worker needs to defer feedback back onto the feedback queue when it loses
     // the per-run writer-slot race (delayed re-enqueue instead of failing the run)
     props.feedbackQueue.grantSendMessages(this.workerFunction);
+
+    // The DLQ cleanup receives, gives back (visibility 0) and deletes DLQ
+    // messages; the archive goes to the data bucket (granted above).
+    props.dlq.grantConsumeMessages(this.workerFunction);
 
     this.workerFunction.addEventSource(
       new eventsources.SqsEventSource(props.feedbackQueue, {
