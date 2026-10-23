@@ -5,6 +5,7 @@
 /// the gateway's dashboard memory-delete (an unlocked delete raced a concurrent
 /// run's upload, silently resurrecting deleted memories).
 pub mod memlock;
+pub mod model_ids;
 
 /// Expiring once-only claims (dedup markers, leases) on the settings table.
 /// Shared so every claim compares its expiry the same way.

@@ -3973,10 +3973,6 @@ const ALLOWED_MODELS: &[&str] = &[
     "claude-sonnet-4-5",
     "claude-haiku-4-5",
     "claude-haiku-4-5-20251001",
-    // Snapshot IDs kept for backward compatibility
-    "claude-sonnet-4-20250514",
-    "claude-opus-4-20250514",
-    "claude-haiku-4-5-20250514",
 ];
 
 /// GET /api/settings/model-provider — get model provider configuration.
@@ -4021,18 +4017,26 @@ pub async fn get_model_provider(
         }
     });
 
-    let primary_model = item
-        .get("primary_model")
-        .and_then(|v| v.as_s().ok())
-        .cloned();
-
-    let heavy_model = item.get("heavy_model").and_then(|v| v.as_s().ok()).cloned();
+    // A retired saved id is shown as the model that now runs in its place,
+    // with the old id, so the page can say it changed.
+    let saved = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
+    let (primary_saved, heavy_saved) = (saved("primary_model"), saved("heavy_model"));
+    let current = |m: &Option<String>| -> Option<String> {
+        m.as_deref()
+            .map(|id| common::model_ids::current(id).to_string())
+    };
+    let retired: Vec<&String> = [&primary_saved, &heavy_saved]
+        .into_iter()
+        .flatten()
+        .filter(|m| common::model_ids::is_retired(m))
+        .collect();
 
     Ok(Json(json!({
         "provider": provider,
         "api_key_masked": api_key_masked,
-        "primary_model": primary_model,
-        "heavy_model": heavy_model,
+        "primary_model": current(&primary_saved),
+        "heavy_model": current(&heavy_saved),
+        "retired_models": retired,
     })))
 }
 
