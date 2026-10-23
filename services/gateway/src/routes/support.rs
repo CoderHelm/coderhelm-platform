@@ -1438,9 +1438,9 @@ pub struct DynamoLookup<'a> {
     pub state: &'a AppState,
 }
 
-fn dynamo_err<E: std::error::Error + 'static>(e: aws_sdk_dynamodb::error::SdkError<E>) -> String
+fn dynamo_err<E>(e: aws_sdk_dynamodb::error::SdkError<E>) -> String
 where
-    E: aws_sdk_dynamodb::error::ProvideErrorMetadata,
+    E: std::error::Error + aws_sdk_dynamodb::error::ProvideErrorMetadata + 'static,
 {
     format!("{}", aws_sdk_dynamodb::error::DisplayErrorContext(&e))
 }
