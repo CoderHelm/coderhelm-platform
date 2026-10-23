@@ -226,7 +226,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "repos",
-        label: "Manage repositories: sync, turn on, roles, code graph and infrastructure scans",
+        label: "Manage repositories: sync, turn on, roles, code graph (turn off, rebuild) and infrastructure scans",
         min_role: "admin",
         handlers: &[
             "api::sync_repos",
@@ -235,6 +235,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "api::delete_repo",
             "api::regenerate_repo",
             "graph::update_config",
+            "graph::rebuild",
             "infrastructure::refresh_infrastructure",
             "infrastructure::refresh_repo_infrastructure",
         ],

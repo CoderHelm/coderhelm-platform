@@ -1002,13 +1002,32 @@ async fn run_once(
         )
         .await;
         let system = format!("{system}{}", web.prompt_section());
+        let graphs = super::code_graph::RepoGraphs::load(
+            state,
+            &msg.team_id,
+            msg.installation_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            Vec::new(),
+            "reviewer",
+            msg.pr_number,
+        )
+        .await;
+        let graph_tools = graphs.tools();
+        let system = if graph_tools.is_empty() {
+            system
+        } else {
+            format!(
+                "{system}{}",
+                super::code_graph::prompt_line(super::code_graph::Role::Reviewer)
+            )
+        };
         let executor = review_agent::PrReviewToolExecutor {
             github: &github,
             owner: &msg.repo_owner,
             repo: &msg.repo_name,
             head_sha: &head_sha,
             state,
-            graph: None,
+            graph: Some(&graphs),
             history: Some(&history),
             ops: ops.as_ref(),
             live: live.as_ref(),
@@ -1018,6 +1037,7 @@ async fn run_once(
         let mut tools = review_agent::review_tools();
         tools.push(super::github_history::tool());
         tools.push(super::web_check::tool());
+        tools.extend(graph_tools);
         if let Some(o) = &ops {
             tools.extend(o.tools());
         }
@@ -1252,9 +1272,17 @@ async fn run_once(
     // for the PR's changed files and inject it into the prompt (agents under-use
     // structural tools unless the result is put in front of them), and hand the
     // agent the graph lookup tools for deeper digging.
-    let graph =
-        super::code_graph::Graph::open(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
-    let graph_context = if let Some(g) = &graph {
+    let graphs = super::code_graph::RepoGraphs::load(
+        state,
+        &msg.team_id,
+        msg.installation_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        Vec::new(),
+        "reviewer",
+        msg.pr_number,
+    )
+    .await;
+    let graph_context = if let Some(g) = graphs.ready() {
         let changed_paths: Vec<String> = compare["files"]
             .as_array()
             .map(|fs| {
@@ -1529,7 +1557,7 @@ async fn run_once(
         pr_body,
         &review_diff,
         &instructions_block,
-        graph.as_ref(),
+        Some(&graphs),
         &extra_context,
         &prior_context,
         Some(&history),

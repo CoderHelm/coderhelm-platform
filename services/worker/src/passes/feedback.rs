@@ -551,10 +551,11 @@ Rules:
         full_system.push_str(&l.prompt_section());
     }
     // Repository history through the GitHub App: no setup.
+    let team_repos = plan::fetch_team_repos(state, &msg.team_id).await;
     let history = super::github_history::GithubHistory::new(
         &msg.team_id,
         &format!("{}/{}", msg.repo_owner, msg.repo_name),
-        plan::fetch_team_repos(state, &msg.team_id).await,
+        team_repos.clone(),
         "coder",
         msg.pr_number,
     )
@@ -564,6 +565,27 @@ Rules:
     );
     tools.push(super::github_history::tool());
     full_system.push_str(super::github_history::prompt_line());
+    // The code graph: who calls what a reviewer asked to change.
+    let graphs = super::code_graph::RepoGraphs::load(
+        state,
+        &msg.team_id,
+        msg.installation_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        team_repos,
+        "coder",
+        msg.pr_number,
+    )
+    .await
+    .with_run(
+        &msg.run_id,
+        format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
+    );
+    super::code_graph::offer(
+        &graphs,
+        super::code_graph::Role::Coder,
+        &mut tools,
+        &mut full_system,
+    );
     // `check_url` on the team's own public pages.
     let web = super::web_check::WebCheck::load(
         state,
@@ -637,6 +659,7 @@ Rules:
         description: DescriptionRequests::new(may_edit_description),
         scope_guard,
         history: Some(&history),
+        graphs: Some(&graphs),
         ops: ops.as_ref(),
         live: live.as_ref(),
         skills: skills.as_ref(),
@@ -1593,6 +1616,8 @@ struct FeedbackToolExecutor<'a> {
     scope_guard: super::write_guard::ScopeGuard,
     /// Repository history (commits, blame, pull requests, releases, deploys).
     history: Option<&'a super::github_history::GithubHistory>,
+    /// The code graph, shared with every agent that reads code.
+    graphs: Option<&'a super::code_graph::RepoGraphs>,
     /// Monitoring, docs and pipeline connections (New Relic, Confluence,
     /// CloudWatch metrics, Airflow) and the AWS identity check.
     ops: Option<&'a super::ops_tools::OpsTools>,
@@ -1626,6 +1651,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(graphs) = self.graphs {
+            if let Some(out) = graphs.handle(self.state, name, input).await {
+                return Ok(serde_json::json!(out));
+            }
+        }
         if let Some(history) = self.history {
             if let Some(out) = history.handle(self.state, self.github, name, input).await {
                 return Ok(serde_json::json!(out));
@@ -3017,5 +3047,31 @@ mod top_level_reply_tests {
     fn automated_feedback_and_inline_threads_get_no_top_level_reply() {
         assert_eq!(top_level_reply("", 0, "fixed CI", ""), None);
         assert_eq!(top_level_reply("alice", 2, "fixed", ""), None);
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    #[test]
+    fn review_replies_get_the_graph_tools() {
+        use super::super::code_graph::{offer, Avail, RepoGraphs, Role, TOOLS};
+        let graphs = RepoGraphs::with(
+            "t",
+            1,
+            "acme/app",
+            Avail::Building(common::code_graph::Shown::Queued),
+            Vec::new(),
+            "coder",
+            7,
+        );
+        let mut tools = feedback_tools();
+        let mut system = String::new();
+        assert!(offer(&graphs, Role::Coder, &mut tools, &mut system));
+        for name in TOOLS {
+            assert!(tools.iter().any(|t| t.name == name), "{name}");
+        }
+        assert!(system.contains("graph_callers"));
     }
 }

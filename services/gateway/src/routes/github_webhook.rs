@@ -2619,25 +2619,15 @@ async fn handle_push(
         });
         let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
     }
-    // Graph must be explicitly enabled for the repo.
-    let sk = format!("REVIEW_CONFIG#REPO#{owner}/{name}");
-    let graph_enabled = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(team_id))
-        .key("sk", attr_s(&sk))
-        .send()
-        .await
-        .ok()
-        .and_then(|o| o.item().cloned())
-        .and_then(|it| {
-            it.get("graph_enabled")
-                .and_then(|v| v.as_bool().ok())
-                .copied()
-        })
-        .unwrap_or(false);
-    if !graph_enabled {
+    // The code graph is on for every repo unless turned off for it. A push
+    // updates a graph that exists; a repo without one gets its first build
+    // when work starts on it (or when it is turned on), never from a push to
+    // a repo nobody uses.
+    let full_repo = format!("{owner}/{name}");
+    let table = &state.config.settings_table_name;
+    if !common::code_graph::is_enabled(&state.dynamo, table, team_id, &full_repo).await
+        || !common::code_graph::has_graph(&state.dynamo, table, team_id, &full_repo).await
+    {
         return Ok(StatusCode::OK);
     }
     // Every file any commit in this push touched (deduped, bounded — a huge

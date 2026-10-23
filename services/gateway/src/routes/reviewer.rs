@@ -223,7 +223,6 @@ pub async fn get_config(
         "release_notes_email_webhook_secret_set": !item_str(&item, "release_notes_email_webhook_secret", "").is_empty(),
         "release_notes_guide": item_str(&item, "release_notes_guide", ""),
         "release_notes_instructions": item_str(&item, "release_notes_instructions", ""),
-        "graph_enabled": item_bool(&item, "graph_enabled", false),
         "deploy_label": item_str(&item, "deploy_label", ""),
         "health_log_groups": log_groups,
         "reminders_enabled": item_bool(&item, "reminders_enabled", false),
@@ -412,12 +411,10 @@ pub async fn update_config(
         )
         .item("reminder_cooldown_hours", attr_n(reminder_cooldown_hours))
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()));
-    // Read the prior value BEFORE the overwrite. The code graph is its OWN
-    // feature (managed from the /graph page): this full-item PUT must PRESERVE
-    // graph_enabled when the reviewer page's body doesn't carry it — otherwise
-    // saving reviewer config would silently disable the graph. The OFF→ON
-    // transition (only possible when the body explicitly sets it) still kicks
-    // off the initial full index.
+    // Read the prior item BEFORE the overwrite: its write-only secret and its
+    // legacy `graph_enabled` are carried over. The code graph is its OWN
+    // feature with its own switch (`common::code_graph`); this page never
+    // turns it on or off.
     let prior = state
         .dynamo
         .get_item()
@@ -428,14 +425,9 @@ pub async fn update_config(
         .await
         .ok()
         .and_then(|o| o.item().cloned());
-    let was_enabled = prior
+    let legacy_graph = prior
         .as_ref()
-        .and_then(|it| {
-            it.get("graph_enabled")
-                .and_then(|v| v.as_bool().ok())
-                .copied()
-        })
-        .unwrap_or(false);
+        .and_then(|it| it.get("graph_enabled").cloned());
     // The email-webhook secret is write-only: a PUT sets it only when the body
     // carries a new value, clears it on `release_notes_email_webhook_secret_clear`,
     // and otherwise keeps the stored one (GET never returns it, so the page
@@ -464,8 +456,9 @@ pub async fn update_config(
     {
         put = put.item(k, v);
     }
-    let graph_enabled = body["graph_enabled"].as_bool().unwrap_or(was_enabled);
-    put = put.item("graph_enabled", attr_bool(graph_enabled));
+    if let Some(v) = legacy_graph {
+        put = put.item("graph_enabled", v);
+    }
     put = put.item("health_log_groups", AttributeValue::L(log_groups));
 
     put.send().await.map_err(|e| {
@@ -473,9 +466,18 @@ pub async fn update_config(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if graph_enabled && !was_enabled {
-        // Shared with the /graph toggle — one enqueue implementation.
-        crate::routes::graph::enqueue_full_index(&state, &claims.team_id, &owner, &name).await;
+    // A repo the reviewer is set up for gets its code graph built (once),
+    // unless the graph was turned off for it.
+    if common::code_graph::is_enabled(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        &format!("{owner}/{name}"),
+    )
+    .await
+    {
+        crate::routes::graph::enqueue_full_index(&state, &claims.team_id, &owner, &name, false)
+            .await;
     }
     Ok(StatusCode::OK)
 }
