@@ -50,6 +50,17 @@ pub const CODER_RULES: &str = "
 - When the change edits more than one environment (`envs/*`, `staging` and `prod` directories, per-environment config files), confirm each one with a read-only lookup where a connected source can reach it (the resource, name or path exists as the change expects there): one `- Confirmed:` line per environment, naming it.
 - When an environment can't be checked, write one `- Unconfirmed:` line naming that environment and exactly what access is missing. Never let one environment's lookup stand for another.
 - Write real values everywhere: a path with its environment filled in (`/app/prod/db-password`), never a template left as `${env}`, `<env>`, `{}` or an empty segment (`/app//db-password`).
+
+## Which environment a lookup hit (every change whose evidence spans environments)
+- When the change or its evidence concerns more than one environment and a live data source is connected, prove which environment each lookup hit with data that only exists there (a record, a name, a setting the team's instructions or the source's guide name for that environment), and quote it on the `- Confirmed:` line.
+- Never write that you didn't confirm which environment a lookup hit while a lookup could confirm it: make that lookup. Only when no connected source reaches it, write `- Unconfirmed:` naming the missing access.
+
+## Something close to what the ticket names (every change)
+- When a lookup or a search finds an existing object close to what the ticket names (a similar name, the same purpose: a schema, user, role, table, bucket, queue, job, secret), follow it to the end before writing around it: who owns it, what grants or permissions it has, what is in it (look them up), and what created it (search the team's repositories for its name).
+- Put those findings in the `Evidence:` section, with ONE decisive question for a person (\"use the existing X instead of creating Y?\").
+
+## The ticket's earlier pull requests (every change that has them)
+- When the plan lists earlier pull requests for this ticket, read what they changed and what reviewers wrote on them before you write code: reuse what was right, and don't repeat what a reviewer turned down.
 ";
 
 /// How the coder ends: its evidence becomes the PR description's.
@@ -271,7 +282,8 @@ pub struct Finding {
     /// One of the judge's points: `external_fact`, `impact`, `logging`,
     /// `assumption`, `structured_field`, `survey`, `silent_fallback`,
     /// `fixtures`, `one_record`, `team_rule`, `ci_pending`,
-    /// `manual_check`, `pattern_cited`, `end_to_end` or `environment`; or
+    /// `manual_check`, `pattern_cited`, `end_to_end`, `environment`,
+    /// `env_unproven`, `near_match_unresolved` or `history_used`; or
     /// `unrun_check`, which only [`classify`] sets.
     pub point: String,
     /// What is unverified, in one sentence.
@@ -348,6 +360,9 @@ impl Finding {
             "pattern_cited" => "Copied block not named",
             "end_to_end" => "Missing from the end-to-end checklist",
             "environment" => "Environment not confirmed",
+            "env_unproven" => "Environment a lookup hit not proven",
+            "near_match_unresolved" => "Close match not followed up",
+            "history_used" => "Earlier pull requests not built on",
             other => other,
         }
     }
@@ -572,6 +587,17 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      each one that no evidence line names: a `- Confirmed:` line from a read-only lookup, or one \
      `- Unconfirmed:` line saying exactly what access is missing. One environment's lookup never \
      stands for another's.\n\
+     16. env_unproven: a miss when the evidence hedges about which environment a lookup hit (it \
+     didn't confirm it was production, isn't sure which cluster or account) while a connected \
+     source could have shown it with data only that environment has. Not a miss when no \
+     connected source reaches it and the notes name the missing access.\n\
+     17. near_match_unresolved: a miss when the evidence mentions an existing object close to \
+     what the ticket names (a similar name, the same purpose) without saying who owns it, what \
+     is in it and what created it, or without one decisive question for a person about using it \
+     instead.\n\
+     18. history_used: when the plan names earlier pull requests for this ticket, a miss when \
+     the diff repeats a change a reviewer turned down on one of them, or ignores what the plan \
+     says it reuses from them.\n\
      Many changes touch none of these: a change that relies on nothing outside its own code, \
      changes no stored records and adds no logs passes all of them. Judge only what the evidence \
      shows and do not invent concerns. A fact the lookups confirm is proven even when the notes \
@@ -580,7 +606,7 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      exact field, records, log line, assumption or check); `settle` is ONE sentence on how to \
      settle it (which connected source to read, what to count, which log to lower, which check \
      result). No lists, no preamble, no repeating the rule's text.\n\
-     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule|ci_pending|manual_check|pattern_cited|end_to_end|environment\",\"detail\":\"one sentence\",\"settle\":\"one sentence\",\"check\":\"format|lint|typecheck|build|tests|plan|security, or empty\",\"command\":\"the command the check needs, or empty\",\"ci\":\"the CI command id (C1), or empty\"}]}. \
+     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule|ci_pending|manual_check|pattern_cited|end_to_end|environment|env_unproven|near_match_unresolved|history_used\",\"detail\":\"one sentence\",\"settle\":\"one sentence\",\"check\":\"format|lint|typecheck|build|tests|plan|security, or empty\",\"command\":\"the command the check needs, or empty\",\"ci\":\"the CI command id (C1), or empty\"}]}. \
      An empty list when all pass.";
 
 /// The judge's prompt: the change and everything the run gathered.
@@ -1831,5 +1857,34 @@ mod tests {
         assert!(JUDGE_SYSTEM.contains("`detail` is ONE sentence"));
         assert!(JUDGE_SYSTEM.contains("\"settle\":\"one sentence\""));
         assert!(JUDGE_SYSTEM.contains("is not a team_rule miss"));
+    }
+}
+
+#[cfg(test)]
+mod env_near_history_tests {
+    use super::*;
+
+    #[test]
+    fn the_coder_and_the_judge_hold_environments_near_matches_and_history() {
+        assert!(CODER_RULES.contains("## Which environment a lookup hit"));
+        assert!(CODER_RULES.contains("data that only exists there"));
+        assert!(CODER_RULES.contains("## Something close to what the ticket names"));
+        assert!(CODER_RULES.contains("search the team's repositories for its name"));
+        assert!(CODER_RULES.contains("## The ticket's earlier pull requests"));
+        assert!(JUDGE_SYSTEM.contains("16. env_unproven"));
+        assert!(JUDGE_SYSTEM.contains("17. near_match_unresolved"));
+        assert!(JUDGE_SYSTEM.contains("18. history_used"));
+        assert!(
+            JUDGE_SYSTEM.contains("environment|env_unproven|near_match_unresolved|history_used")
+        );
+        let f = |p: &str| Finding {
+            point: p.into(),
+            detail: "x".into(),
+            ..Default::default()
+        };
+        for p in ["env_unproven", "near_match_unresolved", "history_used"] {
+            assert_eq!(f(p).settler(), Settler::Proof, "{p}");
+            assert_ne!(f(p).label(), p, "{p} has a label");
+        }
     }
 }

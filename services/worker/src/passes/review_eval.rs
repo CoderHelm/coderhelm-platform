@@ -1450,6 +1450,7 @@ fn review_eval_replays_every_run_case() {
                         .collect(),
                     notes: h.notes,
                     done_hash: String::new(),
+                    prs: vec![],
                 };
                 // What the run does: the planner's route, then the history.
                 let route = match history.guard(case.plan.as_ref(), &case.current_hash) {

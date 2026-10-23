@@ -66,6 +66,73 @@ pub struct TicketHistory {
     /// The ticket's hash when a person's comment marked it done (empty
     /// when it isn't).
     pub done_hash: String,
+    /// Every pull request for this ticket in the team's repositories
+    /// (CoderHelm's or anyone's), as GitHub shows it now, oldest first.
+    pub prs: Vec<EarlierPr>,
+}
+
+/// An earlier pull request for the ticket, read from GitHub: what it said,
+/// what reviewers wrote, and how it ended (who closed or merged it, when).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EarlierPr {
+    /// `owner/name`.
+    pub repo: String,
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub branch: String,
+    /// `open`, `merged` or `closed` (without merging).
+    pub state: String,
+    pub created_at: String,
+    /// The description, as written.
+    pub body: String,
+    /// Conversation comments as (author, text), oldest first.
+    pub comments: Vec<(String, String)>,
+    /// Review summaries as (author, review state, text), oldest first.
+    pub reviews: Vec<(String, String, String)>,
+    /// Inline review comments as (author, path, text), oldest first.
+    pub threads: Vec<(String, String, String)>,
+    /// Who closed it and when, from the issue's `closed` event (for a
+    /// merged pull request: who merged it).
+    pub closed_by: String,
+    pub closed_at: String,
+}
+
+impl EarlierPr {
+    pub fn closed_unmerged(&self) -> bool {
+        self.state == "closed"
+    }
+
+    /// The close date as `YYYY-MM-DD`, as plans are told to write it.
+    pub fn closed_on(&self) -> &str {
+        self.closed_at.get(..10).unwrap_or(&self.closed_at)
+    }
+
+    /// Whether people said anything on it (a reason may be there).
+    pub fn has_discussion(&self) -> bool {
+        !self.comments.is_empty() || !self.threads.is_empty() || !self.reviews.is_empty()
+    }
+}
+
+/// Whether `text` names pull request `number` (`#123`, or a link ending
+/// `/pull/123`), not a longer number that starts with it.
+pub fn names_pr(text: &str, number: u64) -> bool {
+    if number == 0 {
+        return false;
+    }
+    let n = number.to_string();
+    for mark in ["#", "/pull/", "/pulls/"] {
+        let needle = format!("{mark}{n}");
+        let mut from = 0;
+        while let Some(i) = text[from..].find(&needle) {
+            let end = from + i + needle.len();
+            if !text[end..].starts_with(|c: char| c.is_ascii_digit()) {
+                return true;
+            }
+            from = end;
+        }
+    }
+    false
 }
 
 /// Where the fix belongs, as the history shows it.
@@ -92,7 +159,74 @@ pub enum Guard {
 
 impl TicketHistory {
     pub fn is_empty(&self) -> bool {
-        self.runs.is_empty() && self.notes.is_empty()
+        self.runs.is_empty() && self.notes.is_empty() && self.prs.is_empty()
+    }
+
+    /// Every earlier pull request for the ticket as `(repo, number)`: the
+    /// ones read from GitHub, and any a run record names that wasn't.
+    pub fn earlier_pr_numbers(&self) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = self
+            .prs
+            .iter()
+            .map(|p| (p.repo.clone(), p.number))
+            .collect();
+        for r in &self.runs {
+            if r.pr_number > 0
+                && !out
+                    .iter()
+                    .any(|(repo, n)| *n == r.pr_number && repo == &r.repo)
+            {
+                out.push((r.repo.clone(), r.pr_number));
+            }
+        }
+        out
+    }
+
+    /// What a plan leaves out of the ticket's own history, checked on its
+    /// text (`plan_text`: the openspec files and the decision's words):
+    /// - the ticket has earlier pull requests and the plan names none;
+    /// - a pull request closed without merging whose close event was read,
+    ///   and the plan doesn't say who closed it and when.
+    pub fn plan_gaps(&self, plan_text: &str) -> Vec<String> {
+        let prs = self.earlier_pr_numbers();
+        if prs.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if !prs.iter().any(|(_, n)| names_pr(plan_text, *n)) {
+            let list: Vec<String> = prs.iter().map(|(r, n)| format!("#{n} in {r}")).collect();
+            out.push(format!(
+                "This ticket has earlier pull requests ({}) and the plan names none of them. Read \
+                 each (its description, review threads, how it ended), reuse what was right, and \
+                 say in `history_check` what changes this time and why, by number.",
+                list.join(", ")
+            ));
+        }
+        let lower = plan_text.to_ascii_lowercase();
+        for p in self
+            .prs
+            .iter()
+            .filter(|p| p.closed_unmerged() && !p.closed_by.is_empty())
+        {
+            let who = lower.contains(&p.closed_by.to_ascii_lowercase());
+            let when = p.closed_on().is_empty() || plan_text.contains(p.closed_on());
+            if !(who && when) {
+                out.push(format!(
+                    "#{} in {} was closed without merging by {} on {} (its close event). Say who \
+                     closed it and when in `history_check`{}, instead of saying it is unknown.",
+                    p.number,
+                    p.repo,
+                    p.closed_by,
+                    p.closed_on(),
+                    if p.has_discussion() {
+                        " and build on what its comments say"
+                    } else {
+                        ", and ask ONE question about why in `questions`"
+                    }
+                ));
+            }
+        }
+        out
     }
 
     pub fn closed_unmerged(&self) -> Vec<&PriorRun> {
@@ -159,11 +293,22 @@ impl TicketHistory {
         }
         let mut out = String::from(
             "\n\n## This ticket's history (read before planning)\n\
-             CoderHelm has worked on this ticket before. Answer this history in `history_check` \
-             before you plan any code. The default is NOT to open another pull request: if the \
-             history says the fix is outside the code, or a person said it was fixed elsewhere, \
-             decide `outside_code` (or `unknown`) and reply on the ticket instead.\n",
+             This ticket has been worked on before. Answer this history in `history_check` \
+             before you plan any code, naming each earlier pull request by number: what you \
+             reuse from it, what changes this time and why. If the history says the fix is \
+             outside the code, or a person said it was fixed elsewhere, the default is NOT to \
+             open another pull request: decide `outside_code` (or `unknown`) and reply on the \
+             ticket instead.\n",
         );
+        if !self.prs.is_empty() {
+            out.push_str(
+                "Earlier pull requests for this ticket, as GitHub shows them now (read each; a \
+                 closed one's close event says who closed it and when):\n",
+            );
+            for p in &self.prs {
+                out.push_str(&pr_note(p));
+            }
+        }
         for r in &self.runs {
             let pr = if r.pr_number > 0 {
                 let ended = if r.pr_closed_unmerged() {
@@ -249,6 +394,18 @@ impl TicketHistory {
         }
         for n in &self.notes {
             parts.push(format!("{}|{}|{}", n.at, n.intent.as_str(), n.text));
+        }
+        for p in &self.prs {
+            parts.push(format!(
+                "pr|{}|{}|{}|{}|{}|{}|{}",
+                p.repo, p.number, p.state, p.title, p.body, p.closed_by, p.closed_at
+            ));
+            for (a, t) in &p.comments {
+                parts.push(format!("{a}|{t}"));
+            }
+            for (a, s, t) in p.reviews.iter().chain(&p.threads) {
+                parts.push(format!("{a}|{s}|{t}"));
+            }
         }
         let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
         common::sha256_hex(&refs)
@@ -425,6 +582,254 @@ pub async fn add_pr_comments(
     }
 }
 
+/// The most pull requests read for one ticket, and repositories searched.
+const MAX_PRS: usize = 8;
+const MAX_REPOS: usize = 10;
+
+/// How one earlier pull request reads in the planner's history.
+fn pr_note(p: &EarlierPr) -> String {
+    let ended = match p.state.as_str() {
+        "merged" => match (p.closed_by.is_empty(), p.closed_on()) {
+            (false, d) => format!("merged by {} on {d}", p.closed_by),
+            (true, _) => "merged".to_string(),
+        },
+        "closed" => {
+            let by = if p.closed_by.is_empty() {
+                "closed WITHOUT merging (the close event couldn't be read)".to_string()
+            } else {
+                format!(
+                    "closed WITHOUT merging by {} on {} (close event)",
+                    p.closed_by,
+                    p.closed_on()
+                )
+            };
+            if p.has_discussion() {
+                by
+            } else {
+                format!("{by}; nobody wrote a reason on it")
+            }
+        }
+        _ => "still open".to_string(),
+    };
+    let mut out = format!(
+        "- #{} in {} \"{}\" by {}{}, opened {}: {ended}.\n",
+        p.number,
+        p.repo,
+        one_line(&p.title, 200),
+        p.author,
+        if p.branch.is_empty() {
+            String::new()
+        } else {
+            format!(" (branch `{}`)", p.branch)
+        },
+        p.created_at.get(..10).unwrap_or(&p.created_at),
+    );
+    if !p.body.trim().is_empty() {
+        out.push_str(&format!("  Description: {}\n", one_line(&p.body, 2500)));
+    }
+    for (author, state, text) in &p.reviews {
+        out.push_str(&format!(
+            "  Review by {author} ({state}): {}\n",
+            one_line(text, 800)
+        ));
+    }
+    for (author, path, text) in &p.threads {
+        out.push_str(&format!(
+            "  {author} on `{path}`: {}\n",
+            one_line(text, 600)
+        ));
+    }
+    for (author, text) in &p.comments {
+        out.push_str(&format!("  {author} wrote: {}\n", one_line(text, 800)));
+    }
+    out
+}
+
+/// Adds every pull request for the ticket in `repos` (`owner/name`, the
+/// team's repositories, searched in order): the ones the ticket's runs
+/// opened, and any whose title, branch or description names the ticket.
+/// Each is read in full: description, comments, reviews, inline review
+/// threads, and how it ended (GitHub's `closed` event: who and when; for a
+/// merged one, who merged it). Best-effort, bounded by [`MAX_PRS`].
+pub async fn add_earlier_prs(
+    history: &mut TicketHistory,
+    github: &crate::clients::github::GitHubClient,
+    repos: &[String],
+    ticket_id: &str,
+) {
+    let mut found: Vec<(String, u64)> = Vec::new();
+    for r in &history.runs {
+        if r.pr_number > 0
+            && r.repo.contains('/')
+            && !found.contains(&(r.repo.clone(), r.pr_number))
+        {
+            found.push((r.repo.clone(), r.pr_number));
+        }
+    }
+    if !ticket_id.is_empty() {
+        for repo in repos.iter().take(MAX_REPOS) {
+            let Some((owner, name)) = repo.split_once('/') else {
+                continue;
+            };
+            match github.list_pull_requests(owner, name, "all", 100).await {
+                Ok(v) => {
+                    for p in v.as_array().into_iter().flatten() {
+                        let number = p["number"].as_u64().unwrap_or(0);
+                        let names = [&p["title"], &p["head"]["ref"], &p["body"]]
+                            .iter()
+                            .any(|t| super::mentions_ticket(t.as_str().unwrap_or(""), ticket_id));
+                        let key = (repo.clone(), number);
+                        if number > 0 && names && !found.contains(&key) {
+                            found.push(key);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(repo, error = %e, "Could not list pull requests for the ticket's history")
+                }
+            }
+        }
+    }
+    found.truncate(MAX_PRS);
+    for (repo, number) in found {
+        if let Some(p) = read_pr(github, &repo, number).await {
+            history.prs.push(p);
+        }
+    }
+    history.prs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+}
+
+/// One pull request read in full. None when it can't be read.
+async fn read_pr(
+    github: &crate::clients::github::GitHubClient,
+    repo: &str,
+    number: u64,
+) -> Option<EarlierPr> {
+    let (owner, name) = repo.split_once('/')?;
+    let pr = match github.get_pull_request(owner, name, number).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(repo, pr = number, error = %e, "Could not read an earlier pull request");
+            return None;
+        }
+    };
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    let merged = pr["merged"].as_bool().unwrap_or(false) || pr["merged_at"].is_string();
+    let state = if merged {
+        "merged"
+    } else if pr["state"].as_str() == Some("closed") {
+        "closed"
+    } else {
+        "open"
+    };
+    let mut p = EarlierPr {
+        repo: repo.to_string(),
+        number,
+        title: text(&pr["title"]),
+        author: text(&pr["user"]["login"]),
+        branch: text(&pr["head"]["ref"]),
+        state: state.to_string(),
+        created_at: text(&pr["created_at"]),
+        body: common::truncate_str(pr["body"].as_str().unwrap_or(""), 6000).to_string(),
+        ..Default::default()
+    };
+    if merged {
+        p.closed_by = text(&pr["merged_by"]["login"]);
+        p.closed_at = text(&pr["merged_at"]);
+    } else if state == "closed" {
+        match github.list_issue_events(owner, name, number).await {
+            Ok(events) => {
+                if let Some((by, at)) = close_event(&events) {
+                    p.closed_by = by;
+                    p.closed_at = at;
+                }
+            }
+            Err(e) => {
+                warn!(repo, pr = number, error = %e, "Could not read a pull request's events")
+            }
+        }
+        if p.closed_at.is_empty() {
+            p.closed_at = text(&pr["closed_at"]);
+        }
+    }
+    match github.list_issue_comments(owner, name, number).await {
+        Ok(c) => p.comments = others_comments(&c, 8),
+        Err(e) => warn!(repo, pr = number, error = %e, "Could not read a pull request's comments"),
+    }
+    match github.list_pr_reviews(owner, name, number).await {
+        Ok(v) => p.reviews = reviews_of(&v, 6),
+        Err(e) => warn!(repo, pr = number, error = %e, "Could not read a pull request's reviews"),
+    }
+    match github.get_review_comments(owner, name, number).await {
+        Ok(c) => p.threads = threads_of(&c, 10),
+        Err(e) => {
+            warn!(repo, pr = number, error = %e, "Could not read a pull request's review threads")
+        }
+    }
+    Some(p)
+}
+
+/// Who closed an issue or pull request last, and when, from its events.
+fn close_event(events: &serde_json::Value) -> Option<(String, String)> {
+    events.as_array()?.iter().rev().find_map(|e| {
+        (e["event"].as_str() == Some("closed")).then(|| {
+            (
+                e["actor"]["login"].as_str().unwrap_or("").to_string(),
+                e["created_at"].as_str().unwrap_or("").to_string(),
+            )
+        })
+    })
+}
+
+/// The last `max` conversation comments not written by CoderHelm itself
+/// (its own progress notes say nothing about the work), as (author, text).
+fn others_comments(comments: &[serde_json::Value], max: usize) -> Vec<(String, String)> {
+    let all: Vec<(String, String)> = comments
+        .iter()
+        .filter_map(|c| {
+            let author = c["user"]["login"].as_str()?;
+            let body = c["body"].as_str()?.trim();
+            (!super::is_own_login(author) && !body.is_empty())
+                .then(|| (author.to_string(), body.to_string()))
+        })
+        .collect();
+    let skip = all.len().saturating_sub(max);
+    all.into_iter().skip(skip).collect()
+}
+
+/// The last `max` reviews that say something (a text, or a verdict), as
+/// (author, state, text).
+fn reviews_of(reviews: &serde_json::Value, max: usize) -> Vec<(String, String, String)> {
+    let all: Vec<(String, String, String)> = reviews
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let author = r["user"]["login"].as_str()?.to_string();
+            let state = r["state"].as_str().unwrap_or("").to_string();
+            let body = r["body"].as_str().unwrap_or("").trim().to_string();
+            let verdict = matches!(state.as_str(), "APPROVED" | "CHANGES_REQUESTED");
+            (!body.is_empty() || verdict).then_some((author, state, body))
+        })
+        .collect();
+    let skip = all.len().saturating_sub(max);
+    all.into_iter().skip(skip).collect()
+}
+
+/// The last `max` inline review comments, as (author, path, text).
+fn threads_of(comments: &[serde_json::Value], max: usize) -> Vec<(String, String, String)> {
+    let all: Vec<(String, String, String)> = comments
+        .iter()
+        .filter_map(|c| {
+            let author = c["user"]["login"].as_str()?.to_string();
+            let body = c["body"].as_str()?.trim().to_string();
+            (!body.is_empty()).then(|| (author, c["path"].as_str().unwrap_or("").to_string(), body))
+        })
+        .collect();
+    let skip = all.len().saturating_sub(max);
+    all.into_iter().skip(skip).collect()
+}
+
 /// Reads the ticket's earlier runs and its notes. Best-effort: a read error
 /// gives what was read (an empty history at worst), logged.
 pub async fn load(
@@ -534,6 +939,7 @@ mod tests {
             ],
             notes: vec![],
             done_hash: String::new(),
+            prs: vec![],
         }
     }
 
@@ -610,6 +1016,7 @@ mod tests {
                 at: "2026-01-01T00:00:00Z".into(),
             }],
             done_hash: "h1".into(),
+            prs: vec![],
         };
         match h.guard(Some(&override_plan("")), "h1") {
             Guard::Stop {
@@ -718,6 +1125,7 @@ mod traced_guard_tests {
             }],
             notes: vec![],
             done_hash: String::new(),
+            prs: vec![],
         }
     }
 
@@ -759,5 +1167,132 @@ mod traced_guard_tests {
                 "{p:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod earlier_pr_tests {
+    use super::*;
+
+    fn closed(discussed: bool) -> EarlierPr {
+        EarlierPr {
+            repo: "acme/infra".into(),
+            number: 41,
+            title: "Add the reporting user's secret".into(),
+            author: "coderhelm-bot".into(),
+            branch: "feat/abc-12-reporting-user".into(),
+            state: "closed".into(),
+            created_at: "2026-01-10T10:00:00Z".into(),
+            body: "Adds the secret, mirroring the vendor user's.".into(),
+            comments: if discussed {
+                vec![("a-reviewer".into(), "Split the user out first.".into())]
+            } else {
+                vec![]
+            },
+            closed_by: "a-maintainer".into(),
+            closed_at: "2026-01-11T09:30:00Z".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_pr_is_named_by_its_number_or_link_only() {
+        assert!(names_pr("see #41.", 41));
+        assert!(names_pr("https://github.com/acme/infra/pull/41", 41));
+        assert!(!names_pr("see #410", 41));
+        assert!(!names_pr("issue 41", 41));
+        assert!(!names_pr("#0", 0));
+    }
+
+    #[test]
+    fn the_planner_reads_each_earlier_pr_and_how_it_ended() {
+        let h = TicketHistory {
+            prs: vec![closed(false)],
+            ..Default::default()
+        };
+        assert!(!h.is_empty());
+        let note = h.planner_note();
+        assert!(note.contains(
+            "- #41 in acme/infra \"Add the reporting user's secret\" by coderhelm-bot (branch `feat/abc-12-reporting-user`), opened 2026-01-10: closed WITHOUT merging by a-maintainer on 2026-01-11 (close event); nobody wrote a reason on it."
+        ), "{note}");
+        assert!(note.contains("Description: Adds the secret"), "{note}");
+        let discussed = TicketHistory {
+            prs: vec![closed(true)],
+            ..Default::default()
+        };
+        let note = discussed.planner_note();
+        assert!(note.contains("a-reviewer wrote: Split the user out first."));
+        assert!(!note.contains("nobody wrote a reason"));
+        assert_ne!(h.digest(), discussed.digest());
+        assert_ne!(h.digest(), TicketHistory::default().digest());
+    }
+
+    #[test]
+    fn the_close_event_names_who_and_when() {
+        let events = serde_json::json!([
+            {"event": "closed", "actor": {"login": "first"}, "created_at": "2026-01-01T00:00:00Z"},
+            {"event": "reopened", "actor": {"login": "first"}, "created_at": "2026-01-02T00:00:00Z"},
+            {"event": "closed", "actor": {"login": "second"}, "created_at": "2026-01-03T00:00:00Z"},
+            {"event": "labeled", "actor": {"login": "x"}, "created_at": "2026-01-04T00:00:00Z"}
+        ]);
+        assert_eq!(
+            close_event(&events),
+            Some(("second".into(), "2026-01-03T00:00:00Z".into()))
+        );
+        assert_eq!(close_event(&serde_json::json!([])), None);
+    }
+
+    #[test]
+    fn reviews_and_threads_are_kept_and_coderhelms_own_notes_are_not() {
+        let comments = vec![
+            serde_json::json!({"user": {"login": "coderhelm[bot]"}, "body": "Working on it"}),
+            serde_json::json!({"user": {"login": "a-person"}, "body": "Why a new schema?"}),
+            serde_json::json!({"user": {"login": "some-ci[bot]", "type": "Bot"}, "body": "Plan: 1 to add"}),
+        ];
+        let c = others_comments(&comments, 8);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert_eq!(c[0].0, "a-person");
+        let reviews = serde_json::json!([
+            {"user": {"login": "r1"}, "state": "COMMENTED", "body": ""},
+            {"user": {"login": "r2"}, "state": "CHANGES_REQUESTED", "body": ""},
+            {"user": {"login": "r3"}, "state": "COMMENTED", "body": "Use the existing module."}
+        ]);
+        let r = reviews_of(&reviews, 6);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].1, "CHANGES_REQUESTED");
+        let threads = vec![
+            serde_json::json!({"user": {"login": "r3"}, "path": "a.tf", "body": "Mirror the vendor block."}),
+        ];
+        assert_eq!(threads_of(&threads, 10)[0].1, "a.tf");
+    }
+
+    #[test]
+    fn a_run_records_pr_counts_as_an_earlier_pr_once() {
+        let mut h = TicketHistory {
+            prs: vec![closed(false)],
+            ..Default::default()
+        };
+        h.runs.push(PriorRun {
+            run_id: "01A".into(),
+            repo: "acme/infra".into(),
+            pr_number: 41,
+            ..Default::default()
+        });
+        h.runs.push(PriorRun {
+            run_id: "01B".into(),
+            repo: "acme/pipelines".into(),
+            pr_number: 7,
+            ..Default::default()
+        });
+        assert_eq!(
+            h.earlier_pr_numbers(),
+            vec![("acme/infra".into(), 41), ("acme/pipelines".into(), 7)]
+        );
+        let g = h.plan_gaps("Nothing about earlier work.");
+        assert_eq!(g.len(), 2, "{g:?}");
+        assert!(g[0].contains("#41 in acme/infra, #7 in acme/pipelines"));
+        assert!(h
+            .plan_gaps("#7 kept; #41 closed by a-maintainer on 2026-01-11, asking why.")
+            .is_empty());
     }
 }

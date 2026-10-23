@@ -708,6 +708,7 @@ pub mod ops_tools;
 mod plan;
 pub mod plan_chat;
 pub mod plan_execute;
+mod plan_judge;
 mod pr;
 pub mod pr_outcomes;
 mod proof;
@@ -1194,6 +1195,22 @@ async fn run_passes(
     // the planner is shown it and held to it below.
     let mut history = ticket_history::load(state, &msg.team_id, &msg.ticket_id, run_id).await;
     ticket_history::add_pr_comments(&mut history, &github).await;
+    // Every pull request for the ticket in the team's repositories (this
+    // repo first; CoderHelm's or anyone's), read in full with how it ended:
+    // an earlier attempt often holds the design, and its close event says
+    // who closed it and when.
+    if !is_internal_ticket(&msg.ticket_id) {
+        let mut repos: Vec<String> = Vec::new();
+        if !msg.repo_owner.is_empty() && !msg.repo_name.is_empty() {
+            repos.push(format!("{}/{}", msg.repo_owner, msg.repo_name));
+        }
+        for r in plan::fetch_team_repo_list(state, &msg.team_id).await {
+            if !repos.contains(&r.full_name) {
+                repos.push(r.full_name);
+            }
+        }
+        ticket_history::add_earlier_prs(&mut history, &github, &repos, &msg.ticket_id).await;
+    }
 
     // --- Resolve repo for Jira tickets ---
     // For Jira: explicit pin on the message > the repo of the ticket's own
@@ -1608,6 +1625,7 @@ async fn run_passes(
             run_id,
             earlier_runs = history.runs.len(),
             closed_unmerged = history.closed_unmerged().len(),
+            earlier_prs = history.prs.len(),
             notes = history.notes.len(),
             "Ticket has history — the planner gets it"
         );
@@ -1675,6 +1693,7 @@ async fn run_passes(
                 &provider,
                 usage,
                 run_id,
+                &history,
             )
             .await?
         }
@@ -1688,6 +1707,7 @@ async fn run_passes(
             &provider,
             usage,
             run_id,
+            &history,
         )
         .await?
     };
@@ -1785,6 +1805,7 @@ async fn run_passes(
                     &provider,
                     usage,
                     run_id,
+                    &history,
                 )
                 .await?;
                 v = validate_plan(
@@ -1844,6 +1865,7 @@ async fn run_passes(
                 &provider,
                 usage,
                 run_id,
+                &history,
             )
             .await?;
             restore_plan_hash(state, msg, &context_hash).await;
@@ -2011,6 +2033,16 @@ async fn run_passes(
                 )
                 .send()
                 .await;
+        }
+    }
+    // What only a person can answer goes to the ticket now (the PR carries
+    // it too), so the answers can come while the code is written.
+    if matches!(
+        fix_route,
+        fix_location::Route::Code | fix_location::Route::CodeAndOutside
+    ) {
+        if let Some(decision) = plan_result.fix.as_ref() {
+            report_questions(state, msg, run_id, &github, decision).await;
         }
     }
 
@@ -2789,6 +2821,7 @@ async fn run_passes(
                 &provider,
                 usage,
                 run_id,
+                &history,
             )
             .await
             {
@@ -4600,7 +4633,7 @@ async fn finish_without_code(
     } else {
         (
             fix_location::unknown_report(decision, false),
-            "Not sure yet where the fix belongs",
+            fix_location::ask_title(decision),
             "clarification",
         )
     };
@@ -4763,6 +4796,50 @@ async fn report_also_outside(
         .expression_attribute_values(":rep", attr_s(&format!("**{title}**\n\n{report}")))
         .send()
         .await;
+}
+
+/// Tells the ticket the plan's questions only a person can answer when the
+/// run goes on to write code. Nothing when the plan has none.
+async fn report_questions(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    decision: &fix_location::FixDecision,
+) {
+    let questions = fix_location::questions_markdown(decision);
+    let Some((_, list)) = questions.split_once('\n') else {
+        return;
+    };
+    let title = "Questions only a person can answer";
+    let report = format!(
+        "{}\n\nI'm building the rest of the plan meanwhile; reply here with the answers.",
+        list.trim()
+    );
+    add_progress_note(state, &msg.team_id, run_id, title).await;
+    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+        let _ = github
+            .create_issue_comment(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                &format!("**{title}**\n\n{report}"),
+            )
+            .await;
+    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+        if let Err(e) = post_jira_comment(
+            state,
+            &msg.team_id,
+            &msg.ticket_id,
+            &fix_location::jira_text(&report),
+            "clarification",
+            title,
+        )
+        .await
+        {
+            warn!(run_id, error = %e, "Could not post the plan's questions on the ticket");
+        }
+    }
 }
 
 /// Mark a run `needs_input` (a comment or re-run can pick it up again) and

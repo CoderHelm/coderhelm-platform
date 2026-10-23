@@ -12,7 +12,7 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-22.end-to-end-checklist";
+pub const PLANNER_VERSION: &str = "2026-10-23.intent-history-env-near-match";
 
 /// The openspec file holding the plan's end-to-end checklist, readable.
 pub const END_TO_END_FILE: &str = "end_to_end.md";
@@ -151,7 +151,9 @@ pub async fn run(
     provider: &ModelProvider,
     usage: &mut TokenUsage,
     run_id: &str,
+    ticket_history: &super::ticket_history::TicketHistory,
 ) -> Result<PlanResult, Box<dyn std::error::Error + Send + Sync>> {
+    let intent = triage.intent;
     // Fetch all enabled repos for this team so the planner can explore cross-repo
     let team_repos = fetch_team_repos(state, &msg.team_id).await;
     let default_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
@@ -258,6 +260,9 @@ Summary: {summary}
 ## Original Issue Body
 {body}{image_hint}
 
+## What the ticket asks for
+Triage read this ticket as: **{intent}** (bug: something is wrong; feature: something new to build; chore: upkeep; question: a request for information). Plan accordingly; the guidance below is for this kind of ticket.
+
 {complexity_guidance}
 
 ## Research Instructions
@@ -317,7 +322,8 @@ After researching, output the four files using this exact format:
 ```
 
 Then the ```fix_location.json block described above."#,
-        fix_guidance = super::fix_location::PLANNER_GUIDANCE,
+        fix_guidance = super::fix_location::planner_guidance(intent),
+        intent = intent.as_str(),
         title = msg.title,
         summary = triage.summary,
         body = msg.body,
@@ -623,18 +629,51 @@ Then the ```fix_location.json block described above."#,
             .map(|r| r.clone())
             .unwrap_or_default()
     };
-    let gaps = super::fix_location::gaps(
-        super::fix_location::parse(&response).as_ref(),
-        can_look_up,
-        lookups(),
-        &read(),
+    let draft = parse_openspec_files(&response, intent);
+    let gaps = super::fix_location::gaps(draft.fix.as_ref(), can_look_up, lookups(), &read());
+    // The plan's own check (see plan_judge): its history, the environments
+    // its lookups hit, and anything close to what the ticket names.
+    let history_note = msg.ticket_history_note.as_deref().unwrap_or("");
+    let judge_prompt = |files: &PlanResult| {
+        super::plan_judge::prompt(
+            &msg.title,
+            &msg.body,
+            history_note,
+            &live.as_ref().map(|l| l.connected()).unwrap_or_default(),
+            &live
+                .as_ref()
+                .map(|l| l.lookups().into_iter().map(|x| x.line).collect::<Vec<_>>())
+                .unwrap_or_default(),
+            files,
+        )
+    };
+    let judged = if super::plan_judge::worth_judging(ticket_history, lookups()) {
+        super::plan_judge::judge(state, provider, usage, &judge_prompt(&draft)).await
+    } else {
+        Vec::new()
+    };
+    let judge_found = !judged.is_empty();
+    let plan_findings = super::plan_judge::merge(
+        super::plan_judge::structural(&draft, ticket_history, can_look_up),
+        judged,
     );
-    if !gaps.is_empty() {
-        info!(ticket_id = %msg.ticket_id, gaps = gaps.len(), "Plan's trace is incomplete — sending it back");
+    let mut back = gaps.clone();
+    back.extend(
+        plan_findings
+            .iter()
+            .map(super::plan_judge::PlanFinding::line),
+    );
+    if !back.is_empty() {
+        info!(
+            ticket_id = %msg.ticket_id,
+            trace_gaps = gaps.len(),
+            plan_gaps = plan_findings.len(),
+            "Plan is incomplete — sending it back"
+        );
         messages.push((
             "user".to_string(),
             vec![
-                serde_json::json!({"type": "text", "text": super::fix_location::send_back(&gaps)}),
+                serde_json::json!({"type": "text", "text": super::fix_location::send_back(&back)}),
             ],
         ));
         response = provider::converse(
@@ -656,7 +695,7 @@ Then the ```fix_location.json block described above."#,
         s.drain_usage_into(usage);
     }
 
-    let mut files = parse_openspec_files(&response);
+    let mut files = parse_openspec_files(&response, intent);
     let gaps = super::fix_location::gaps(files.fix.as_ref(), can_look_up, lookups(), &read());
     if !gaps.is_empty() && msg.person_direction.is_some() {
         // A person told CoderHelm where the fix is and to go ahead: their
@@ -682,6 +721,33 @@ Then the ```fix_location.json block described above."#,
                 super::fix_location::mark_untraced(d, &gaps)
             }
         });
+    }
+    // What the plan's own check still finds after the send-back stays on
+    // the decision: the ticket, the PR and the reviewer see it.
+    if !plan_findings.is_empty() {
+        let mut left = super::plan_judge::structural(&files, ticket_history, can_look_up);
+        if judge_found {
+            let again =
+                super::plan_judge::judge(state, provider, usage, &judge_prompt(&files)).await;
+            left = super::plan_judge::merge(left, again);
+        }
+        if !left.is_empty() {
+            warn!(ticket_id = %msg.ticket_id, gaps = ?left, "Plan check still finds gaps after one send-back");
+            let lines: Vec<String> = left
+                .iter()
+                .map(super::plan_judge::PlanFinding::line)
+                .collect();
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("Plan check: {} left open: {}", lines.len(), lines.join(" ")),
+            )
+            .await;
+            if let Some(d) = files.fix.as_mut() {
+                d.open_gaps = lines;
+            }
+        }
     }
 
     // The team's plan-review agents read the draft before it's kept; with
@@ -731,7 +797,8 @@ Then the ```fix_location.json block described above."#,
                 .await
                 {
                     Ok(text) => {
-                        let (kept, took) = take_revision(files, parse_openspec_files(&text));
+                        let (kept, took) =
+                            take_revision(files, parse_openspec_files(&text, intent));
                         files = kept;
                         revised = took;
                         if !took {
@@ -772,6 +839,11 @@ Then the ```fix_location.json block described above."#,
             )
             .await;
         }
+    }
+
+    // The questions only a person can answer are part of the plan people read.
+    if let Some(d) = files.fix.as_ref() {
+        files.proposal = with_questions(&files.proposal, d);
     }
 
     // Write openspec to S3
@@ -899,7 +971,20 @@ Then the ```fix_location.json block described above."#,
     Ok(files)
 }
 
-fn parse_openspec_files(response: &str) -> PlanResult {
+/// The proposal with the decision's questions for a person after it, once.
+fn with_questions(proposal: &str, d: &super::fix_location::FixDecision) -> String {
+    let qs = super::fix_location::questions_markdown(d);
+    if qs.is_empty() || proposal.contains(QUESTIONS_HEADING) {
+        return proposal.to_string();
+    }
+    let list = qs.split_once('\n').map_or("", |(_, rest)| rest).trim_end();
+    format!("{}\n\n{QUESTIONS_HEADING}\n{list}", proposal.trim_end())
+}
+
+/// The proposal's heading for what only a person can answer.
+const QUESTIONS_HEADING: &str = "## Questions only a person can answer";
+
+fn parse_openspec_files(response: &str, intent: super::triage::TicketIntent) -> PlanResult {
     let filenames = ["proposal.md", "design.md", "tasks.md", "spec.md"];
     let mut contents: Vec<String> = Vec::new();
 
@@ -929,7 +1014,7 @@ fn parse_openspec_files(response: &str) -> PlanResult {
         tasks: contents.remove(0),
         spec: contents.remove(0),
         repo_tasks,
-        fix: super::fix_location::parse(response),
+        fix: super::fix_location::parse_for(response, intent),
     }
 }
 
@@ -1422,16 +1507,20 @@ mod plan_review_tests {
     #[test]
     fn a_revision_that_doesnt_parse_keeps_the_draft() {
         let draft = plan("- [ ] 1. Add the path");
-        let (kept, took) =
-            take_revision(draft, parse_openspec_files("Sorry, here are my thoughts."));
+        let (kept, took) = take_revision(
+            draft,
+            parse_openspec_files("Sorry, here are my thoughts.", Default::default()),
+        );
         assert!(!took);
         assert_eq!(kept.tasks, "- [ ] 1. Add the path");
 
         let revised = "```proposal.md\nAdd a rollback path, tested\n```\n```design.md\nD2\n```\n\
                        ```tasks.md\n- [ ] 1. Add the path\n- [ ] 2. Test the rollback\n```\n\
                        ```spec.md\nS2\n```";
-        let (kept, took) =
-            take_revision(plan("- [ ] 1. Add the path"), parse_openspec_files(revised));
+        let (kept, took) = take_revision(
+            plan("- [ ] 1. Add the path"),
+            parse_openspec_files(revised, Default::default()),
+        );
         assert!(took);
         assert!(kept.tasks.contains("Test the rollback"));
         assert!(revision_prompt("## notes").contains("COMPLETE plan again"));
@@ -1442,5 +1531,34 @@ mod plan_review_tests {
         let k = |review: &str| plan_cache_key("ctx", "mem", "hist", "team", review);
         assert_ne!(k("no-reviewers"), k("one-reviewer"));
         assert_eq!(k("same"), k("same"));
+    }
+}
+
+#[cfg(test)]
+mod questions_tests {
+    use super::*;
+    use crate::passes::triage::TicketIntent;
+
+    #[test]
+    fn the_plans_questions_go_in_the_proposal_once() {
+        let reply = "```proposal.md\nCreate the reporting user.\n```\n```design.md\nD\n```\n\
+                     ```tasks.md\n- [ ] a.tf: add the secret\n```\n```spec.md\nS\n```\n\
+                     ```fix_location.json\n{\"fix_location\":\"code\",\"questions\":[\"Use the existing schema?\"]}\n```";
+        let files = parse_openspec_files(reply, TicketIntent::Feature);
+        let d = files.fix.as_ref().unwrap();
+        assert_eq!(d.intent, TicketIntent::Feature);
+        let p = with_questions(&files.proposal, d);
+        assert_eq!(
+            p,
+            "Create the reporting user.\n\n## Questions only a person can answer\n1. Use the existing schema?"
+        );
+        assert_eq!(with_questions(&p, d), p, "added once");
+        let none = crate::passes::fix_location::FixDecision::default();
+        assert_eq!(with_questions("P", &none), "P");
+    }
+
+    #[test]
+    fn the_planner_is_versioned_for_intent_and_history() {
+        assert!(PLANNER_VERSION.contains("intent-history"));
     }
 }
