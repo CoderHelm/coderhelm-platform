@@ -183,6 +183,15 @@ impl Caller {
     }
 }
 
+/// The key condition for items under one key, with or without an `sk` prefix.
+fn key_condition(prefix: &str) -> &'static str {
+    if prefix.is_empty() {
+        "pk = :pk"
+    } else {
+        "pk = :pk AND begins_with(sk, :p)"
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Fail {
     BadRequest(String),
@@ -425,13 +434,18 @@ impl DynamoStore<'_> {
         let mut out = Vec::new();
         let mut start = None;
         loop {
-            let page = self
+            // DynamoDB refuses `begins_with` with an empty string: no prefix
+            // means every item under the key.
+            let mut q = self
                 .dynamo
                 .query()
                 .table_name(self.table)
-                .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
-                .expression_attribute_values(":pk", s(pk))
-                .expression_attribute_values(":p", s(prefix))
+                .key_condition_expression(key_condition(prefix))
+                .expression_attribute_values(":pk", s(pk));
+            if !prefix.is_empty() {
+                q = q.expression_attribute_values(":p", s(prefix));
+            }
+            let page = q
                 .set_exclusive_start_key(start)
                 .send()
                 .await
@@ -1485,6 +1499,17 @@ pub async fn admin_status(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_empty_prefix_never_reaches_begins_with() {
+        // DynamoDB refuses begins_with(sk, ""): the admin queue reads every
+        // item under its key with no prefix.
+        assert_eq!(super::key_condition(""), "pk = :pk");
+        assert_eq!(
+            super::key_condition("TICKET#"),
+            "pk = :pk AND begins_with(sk, :p)"
+        );
+    }
+
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
