@@ -20,10 +20,13 @@
 //! `/api/admin/support` routes.
 //!
 //! What a ticket records about where it was filed: the dashboard path (no
-//! query string), the run, review, release or plan it is about, the team and
-//! the filer's role. Never a diff, file contents or anything read from the
-//! team's repos. Likely secrets typed into the subject or message are
-//! replaced before anything is stored or emailed.
+//! query string), the team and the filer's role, and the items attached to
+//! it (runs, reviews, releases, plans, alerts, data sources; at most
+//! [`MAX_ATTACHMENTS`]). An attachment is its id, kind, a readable name and
+//! a status, read from the team's own record when it is attached: an item
+//! that is not the caller's team's is refused. Never a diff, file contents
+//! or anything read from the team's repos. Likely secrets typed into the
+//! subject or message are replaced before anything is stored or emailed.
 
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
 use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message as SesMessage};
@@ -55,6 +58,10 @@ pub const MAX_BODY: usize = 8000;
 const MAX_PAGE: usize = 300;
 const MAX_ITEM_ID: usize = 200;
 const MAX_LABEL: usize = 200;
+/// Items one ticket can carry, over the ticket and all its replies.
+pub const MAX_ATTACHMENTS: usize = 10;
+/// What tickets can carry.
+pub const ITEM_KINDS: [&str; 6] = ["run", "review", "release", "plan", "alert", "data_source"];
 
 /// New tickets a team may open per hour, and one person within that.
 pub const TEAM_TICKETS_PER_HOUR: u32 = 10;
@@ -93,7 +100,7 @@ impl Status {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelatedItem {
-    /// run | review | release | plan
+    /// run | review | release | plan | alert | data_source
     pub kind: String,
     pub id: String,
     /// Readable name: a run's title, "owner/repo #42", "owner/repo v1.2.0".
@@ -101,7 +108,8 @@ pub struct RelatedItem {
     pub label: String,
     #[serde(default)]
     pub repo: String,
-    /// A run's status when the ticket was filed.
+    /// The item's status when it was attached: a run's status, a review's
+    /// verdict, an alert's outcome.
     #[serde(default)]
     pub status: String,
 }
@@ -111,8 +119,13 @@ pub struct TicketContext {
     /// The dashboard path the ticket was filed from, without a query string.
     #[serde(default)]
     pub page: String,
+    /// The first attachment, kept for tickets filed before `items` and for
+    /// readers that know only one item.
     #[serde(default)]
     pub item: Option<RelatedItem>,
+    /// Everything attached to the ticket, with the ticket or in a reply.
+    #[serde(default)]
+    pub items: Vec<RelatedItem>,
     /// The browser, for "it looks broken" reports.
     #[serde(default)]
     pub user_agent: String,
@@ -157,6 +170,9 @@ pub struct Message {
     /// "status:waiting", "priority:urgent".
     pub body: String,
     pub created_at: String,
+    /// Items attached with this message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<RelatedItem>,
 }
 
 /// Who is asking, from the session.
@@ -168,10 +184,12 @@ pub struct Caller {
     pub name: String,
     pub role: String,
     pub platform_admin: bool,
+    /// A read-only support-view session (see `support_access`).
+    pub in_support_view: bool,
 }
 
 impl Caller {
-    fn from_claims(c: &Claims) -> Self {
+    pub(crate) fn from_claims(c: &Claims) -> Self {
         Caller {
             user_id: c.sub.clone(),
             team_id: c.team_id.clone(),
@@ -179,6 +197,7 @@ impl Caller {
             name: c.github_login.clone().unwrap_or_default(),
             role: c.role.clone(),
             platform_admin: super::api::is_platform_admin(c),
+            in_support_view: c.support_view.is_some(),
         }
     }
 }
@@ -197,12 +216,14 @@ pub enum Fail {
     BadRequest(String),
     NotFound,
     Forbidden,
+    /// Refused, with the reason in words.
+    Denied(String),
     TooMany(String),
     Internal(String),
 }
 
 impl Fail {
-    fn reply(self) -> (StatusCode, Json<Value>) {
+    pub(crate) fn reply(self) -> (StatusCode, Json<Value>) {
         let (code, msg) = match self {
             Fail::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             Fail::NotFound => (StatusCode::NOT_FOUND, "Ticket not found.".to_string()),
@@ -210,6 +231,7 @@ impl Fail {
                 StatusCode::FORBIDDEN,
                 "Only Coderhelm platform admins can do this.".to_string(),
             ),
+            Fail::Denied(m) => (StatusCode::FORBIDDEN, m),
             Fail::TooMany(m) => (StatusCode::TOO_MANY_REQUESTS, m),
             Fail::Internal(e) => {
                 error!(error = %e, "support tickets");
@@ -223,7 +245,7 @@ impl Fail {
     }
 }
 
-type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
+pub(crate) type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
 // ── Cleaning what people send ────────────────────────────────────────────
 
@@ -302,11 +324,11 @@ fn clean_item_id(id: &str) -> Option<String> {
     ok.then(|| id.to_string())
 }
 
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-fn one_line(s: &str) -> String {
+pub(crate) fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -320,8 +342,12 @@ pub struct NewTicket {
     pub priority: Option<String>,
     #[serde(default)]
     pub page: Option<String>,
+    /// The item from the page the ticket was filed on (older dashboards).
     #[serde(default)]
     pub item: Option<ItemRef>,
+    /// Items the filer attached.
+    #[serde(default)]
+    pub items: Vec<ItemRef>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -338,10 +364,10 @@ impl ItemRef {
     /// The item as the customer described it, cleaned. `None` when it is not
     /// a kind tickets can be about or its id is not a plain id.
     pub fn cleaned(&self) -> Option<RelatedItem> {
-        let kind = match self.kind.as_str() {
-            k @ ("run" | "review" | "release" | "plan") => k.to_string(),
-            _ => return None,
-        };
+        let kind = ITEM_KINDS
+            .iter()
+            .find(|k| **k == self.kind.as_str())?
+            .to_string();
         let id = clean_item_id(&self.id)?;
         let text =
             |v: &Option<String>| clip(&scrub(&one_line(v.as_deref().unwrap_or(""))), MAX_LABEL);
@@ -374,6 +400,96 @@ fn check_body(body: &str, what: &str) -> Result<String, Fail> {
         )));
     }
     Ok(scrub(body))
+}
+
+// ── Attachments ──────────────────────────────────────────────────────────
+
+/// Finds an item in a team's own records. A trait so the team checks can be
+/// tested without DynamoDB.
+pub trait ItemLookup {
+    /// The item as `team_id`'s records have it (its readable name, repo and
+    /// status), or `None` when the team has no such item. Reads only under
+    /// `team_id`.
+    async fn find(&self, team_id: &str, item: &RelatedItem) -> Result<Option<RelatedItem>, String>;
+}
+
+/// Everything attached to a ticket, including the one item older tickets
+/// kept in `context.item`.
+pub fn attachments(t: &Ticket) -> Vec<RelatedItem> {
+    if t.context.items.is_empty() {
+        t.context.item.iter().cloned().collect()
+    } else {
+        t.context.items.clone()
+    }
+}
+
+fn kind_words(kind: &str) -> &'static str {
+    match kind {
+        "run" => "run",
+        "review" => "review",
+        "release" => "release",
+        "plan" => "plan",
+        "alert" => "alert",
+        _ => "data source",
+    }
+}
+
+/// The items a person wants to attach, checked: each a kind tickets carry
+/// with a plain id, each found in the caller's team's own records (its name
+/// and status come from there, not from the request), none attached twice,
+/// and no more than [`MAX_ATTACHMENTS`] on the ticket with `already`.
+pub async fn resolve_items<L: ItemLookup>(
+    lookup: &L,
+    team_id: &str,
+    refs: &[ItemRef],
+    already: &[RelatedItem],
+) -> Result<Vec<RelatedItem>, Fail> {
+    let mut out: Vec<RelatedItem> = Vec::new();
+    for r in refs {
+        let Some(cleaned) = r.cleaned() else {
+            return Err(Fail::BadRequest(
+                "Attach runs, reviews, releases, plans, alerts or data sources.".into(),
+            ));
+        };
+        let seen = |v: &[RelatedItem]| {
+            v.iter()
+                .any(|i| i.kind == cleaned.kind && i.id == cleaned.id)
+        };
+        if seen(already) || seen(&out) {
+            continue;
+        }
+        if already.len() + out.len() >= MAX_ATTACHMENTS {
+            return Err(Fail::BadRequest(format!(
+                "A ticket can carry at most {MAX_ATTACHMENTS} items."
+            )));
+        }
+        let found = lookup
+            .find(team_id, &cleaned)
+            .await
+            .map_err(Fail::Internal)?;
+        let Some(mut found) = found else {
+            return Err(Fail::BadRequest(format!(
+                "That {} is not one of your team's.",
+                kind_words(&cleaned.kind)
+            )));
+        };
+        // What is kept is the team's own record of it, cleaned again.
+        found.kind = cleaned.kind.clone();
+        found.id = cleaned.id.clone();
+        let text = |v: &str, max: usize| clip(&scrub(&one_line(v)), max);
+        found.label = text(
+            if found.label.is_empty() {
+                &cleaned.label
+            } else {
+                &found.label
+            },
+            MAX_LABEL,
+        );
+        found.repo = text(&found.repo, MAX_LABEL);
+        found.status = text(&found.status, 40);
+        out.push(found);
+    }
+    Ok(out)
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────
@@ -605,13 +721,14 @@ fn by_recent(mut v: Vec<Ticket>) -> Vec<Ticket> {
     v
 }
 
-/// Open a ticket for the caller's team, within the hourly limits.
-pub async fn create<S: Store>(
+/// Open a ticket for the caller's team, within the hourly limits, with the
+/// items attached that the team's records confirm.
+pub async fn create<S: Store, L: ItemLookup>(
     store: &S,
+    lookup: &L,
     caller: &Caller,
     req: &NewTicket,
     team_name: &str,
-    item: Option<RelatedItem>,
     user_agent: &str,
 ) -> Result<(Ticket, Message), Fail> {
     let subject = one_line(req.subject.trim());
@@ -624,6 +741,8 @@ pub async fn create<S: Store>(
         )));
     }
     let body = check_body(&req.body, "The description")?;
+    let refs: Vec<ItemRef> = req.item.iter().chain(req.items.iter()).cloned().collect();
+    let items = resolve_items(lookup, &caller.team_id, &refs, &[]).await?;
 
     // The person's allowance first, so one busy person does not use up the
     // team's.
@@ -671,7 +790,8 @@ pub async fn create<S: Store>(
         role: caller.role.clone(),
         context: TicketContext {
             page: clean_page(req.page.as_deref().unwrap_or("")),
-            item,
+            item: items.first().cloned(),
+            items: items.clone(),
             user_agent: clip(&one_line(user_agent), 300),
         },
         created_at: now.clone(),
@@ -687,6 +807,7 @@ pub async fn create<S: Store>(
         author_name: caller.name.clone(),
         body,
         created_at: now,
+        attachments: items,
     };
     store.save(&ticket).await.map_err(Fail::Internal)?;
     store
@@ -742,19 +863,34 @@ fn event(author: &str, caller: &Caller, action: &str, at: &str) -> Message {
         author_name: caller.name.clone(),
         body: action.into(),
         created_at: at.into(),
+        attachments: Vec::new(),
     }
 }
 
-/// A customer adds to their team's ticket. It becomes support's turn again,
-/// which reopens a resolved ticket.
-pub async fn reply_as_customer<S: Store>(
+/// A customer adds to their team's ticket, with or without more items. It
+/// becomes support's turn again, which reopens a resolved ticket.
+pub async fn reply_as_customer<S: Store, L: ItemLookup>(
     store: &S,
+    lookup: &L,
     caller: &Caller,
     id: &str,
     body: &str,
+    refs: &[ItemRef],
 ) -> Result<(Ticket, Message), Fail> {
-    let body = check_body(body, "The reply")?;
+    // Attaching items alone is a reply too.
+    let body = if body.trim().is_empty() && !refs.is_empty() {
+        String::new()
+    } else {
+        check_body(body, "The reply")?
+    };
     let (mut ticket, _) = open_for_team(store, caller, id).await?;
+    let mut all = attachments(&ticket);
+    let added = resolve_items(lookup, &caller.team_id, refs, &all).await?;
+    if body.is_empty() && added.is_empty() {
+        return Err(Fail::BadRequest(
+            "Those items are already on this ticket.".into(),
+        ));
+    }
     let (hour, ttl) = hour_bucket(chrono::Utc::now());
     if !store
         .take(
@@ -789,17 +925,50 @@ pub async fn reply_as_customer<S: Store>(
         author_name: caller.name.clone(),
         body,
         created_at: now.clone(),
+        attachments: added.clone(),
     };
     store
         .append(&ticket.team_id, &ticket.id, &m)
         .await
         .map_err(Fail::Internal)?;
+    all.extend(added);
+    ticket.context.item = all.first().cloned();
+    ticket.context.items = all;
     ticket.status = Status::Open;
     ticket.last_actor = "customer".into();
     ticket.updated_at = now;
     ticket.message_count += 1;
     store.save(&ticket).await.map_err(Fail::Internal)?;
     Ok((ticket, m))
+}
+
+/// Adds a timeline event to one of `team_id`'s tickets (support access
+/// granted or ended, support viewed the workspace) and moves the ticket up
+/// the queue. Its status stays as it is. A ticket of another team is not
+/// found.
+pub async fn note_on_ticket<S: Store>(
+    store: &S,
+    team_id: &str,
+    ticket_id: &str,
+    author: &str,
+    caller: &Caller,
+    action: &str,
+) -> Result<(), Fail> {
+    let mut ticket = store
+        .load(team_id, ticket_id)
+        .await
+        .map_err(Fail::Internal)?
+        .ok_or(Fail::NotFound)?;
+    if ticket.team_id != team_id {
+        return Err(Fail::NotFound);
+    }
+    let now = now_iso();
+    store
+        .append(team_id, ticket_id, &event(author, caller, action, &now))
+        .await
+        .map_err(Fail::Internal)?;
+    ticket.updated_at = now;
+    store.save(&ticket).await.map_err(Fail::Internal)
 }
 
 fn require_admin(caller: &Caller) -> Result<(), Fail> {
@@ -862,6 +1031,7 @@ pub async fn admin_reply<S: Store>(
         author_name: caller.name.clone(),
         body,
         created_at: now.clone(),
+        attachments: Vec::new(),
     };
     store
         .append(&ticket.team_id, &ticket.id, &m)
@@ -1006,7 +1176,9 @@ fn item_words(item: &RelatedItem) -> String {
         "run" => "Run",
         "review" => "Review",
         "release" => "Release",
-        _ => "Plan",
+        "plan" => "Plan",
+        "alert" => "Alert",
+        _ => "Data source",
     };
     let name = if item.label.is_empty() {
         item.id.clone()
@@ -1077,8 +1249,8 @@ fn context_lines(t: &Ticket) -> Vec<(String, String)> {
     if !t.context.page.is_empty() {
         lines.push(("Page".to_string(), t.context.page.clone()));
     }
-    if let Some(item) = &t.context.item {
-        lines.push(("About".to_string(), item_words(item)));
+    for item in attachments(t) {
+        lines.push(("Attached".to_string(), item_words(&item)));
     }
     lines
 }
@@ -1124,14 +1296,22 @@ pub fn mail_customer_reply(inbox: &str, t: &Ticket, m: &Message) -> Mail {
     } else {
         m.author_name.clone()
     };
-    let lines = vec![
+    let mut lines = vec![
         ("From".to_string(), who),
         ("Team".to_string(), team.to_string()),
     ];
+    for item in &m.attachments {
+        lines.push(("Attached".to_string(), item_words(item)));
+    }
+    let mut text = format!("{}\n\n", t.subject);
+    for (k, v) in lines.iter().skip(2) {
+        text.push_str(&format!("{k}: {v}\n"));
+    }
+    text.push_str(&format!("{}\n\nAnswer it: {link}\n", m.body));
     Mail {
         to: inbox.to_string(),
         subject: format!("[Support] Reply from {team}: {}", t.subject),
-        text: format!("{}\n\n{}\n\nAnswer it: {link}\n", t.subject, m.body),
+        text,
         html: html_page(
             &format!("New reply: {}", t.subject),
             &lines,
@@ -1237,7 +1417,7 @@ async fn send(state: &AppState, mail: Mail) {
 
 // ── Lookups the handlers need ────────────────────────────────────────────
 
-async fn team_name(state: &AppState, team_id: &str) -> String {
+pub(crate) async fn team_name(state: &AppState, team_id: &str) -> String {
     state
         .dynamo
         .get_item()
@@ -1252,59 +1432,130 @@ async fn team_name(state: &AppState, team_id: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The related item, checked where it can be: a run must be one of the
-/// caller's team's runs, and its title, repo and status come from the run
-/// itself.
-async fn resolve_item(
-    state: &AppState,
-    team_id: &str,
-    item: &ItemRef,
-) -> Result<Option<RelatedItem>, Fail> {
-    let Some(mut cleaned) = item.cleaned() else {
-        return Ok(None);
-    };
-    if cleaned.kind == "run" {
-        let r = state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.runs_table_name)
-            .key("team_id", s(team_id))
-            .key("run_id", s(&cleaned.id))
-            .send()
-            .await
-            .map_err(|e| {
-                Fail::Internal(format!(
-                    "{}",
-                    aws_sdk_dynamodb::error::DisplayErrorContext(&e)
-                ))
-            })?;
-        let Some(run) = r.item() else {
-            return Err(Fail::BadRequest(
-                "That run is not one of your team's runs.".into(),
-            ));
-        };
-        let get = |k: &str| {
-            run.get(k)
+/// Items read from the team's own records: every read is keyed on the
+/// caller's team, so another team's id finds nothing.
+pub struct DynamoLookup<'a> {
+    pub state: &'a AppState,
+}
+
+fn dynamo_err<E>(e: aws_sdk_dynamodb::error::SdkError<E>) -> String
+where
+    E: std::error::Error + aws_sdk_dynamodb::error::ProvideErrorMetadata + 'static,
+{
+    format!("{}", aws_sdk_dynamodb::error::DisplayErrorContext(&e))
+}
+
+/// `owner/name` and the PR number from `REVIEW#{owner}/{name}#{pr:06}[#…]`.
+fn review_repo_pr(sk: &str) -> Option<(String, u64)> {
+    let rest = sk.strip_prefix("REVIEW#")?;
+    let mut parts = rest.splitn(3, '#');
+    let repo = parts.next()?;
+    let pr = parts.next()?.parse().ok()?;
+    (!repo.is_empty()).then(|| (repo.to_string(), pr))
+}
+
+impl ItemLookup for DynamoLookup<'_> {
+    async fn find(&self, team_id: &str, item: &RelatedItem) -> Result<Option<RelatedItem>, String> {
+        let cfg = &self.state.config;
+        let db = &self.state.dynamo;
+        let id = item.id.as_str();
+        let get = |row: &HashMap<String, AttributeValue>, k: &str| {
+            row.get(k)
                 .and_then(|v| v.as_s().ok())
                 .cloned()
                 .unwrap_or_default()
         };
-        let title = get("title");
-        cleaned.label = clip(
-            &scrub(&one_line(if title.is_empty() {
-                &cleaned.label
-            } else {
-                &title
-            })),
-            MAX_LABEL,
-        );
-        cleaned.repo = clip(&get("repo"), MAX_LABEL);
-        cleaned.status = clip(&get("status"), 40);
+        let found = |label: String, repo: String, status: String| {
+            Some(RelatedItem {
+                kind: item.kind.clone(),
+                id: item.id.clone(),
+                label,
+                repo,
+                status,
+            })
+        };
+        let settings = |sk: String| {
+            db.get_item()
+                .table_name(&cfg.settings_table_name)
+                .key("pk", s(team_id))
+                .key("sk", s(&sk))
+                .send()
+        };
+        match item.kind.as_str() {
+            "run" => {
+                let r = db
+                    .get_item()
+                    .table_name(&cfg.runs_table_name)
+                    .key("team_id", s(team_id))
+                    .key("run_id", s(id))
+                    .send()
+                    .await
+                    .map_err(dynamo_err)?;
+                Ok(r.item()
+                    .and_then(|row| found(get(row, "title"), get(row, "repo"), get(row, "status"))))
+            }
+            "review" => {
+                let Some((repo, pr)) = review_repo_pr(id) else {
+                    return Ok(None);
+                };
+                let r = settings(id.to_string()).await.map_err(dynamo_err)?;
+                Ok(r.item().and_then(|row| {
+                    found(format!("{repo} #{pr}"), repo.clone(), get(row, "verdict"))
+                }))
+            }
+            "release" => {
+                let Some((repo, tag)) = id.rsplit_once('@') else {
+                    return Ok(None);
+                };
+                if repo.is_empty() || tag.is_empty() {
+                    return Ok(None);
+                }
+                let r = settings(format!("RELEASE#{repo}#{tag}"))
+                    .await
+                    .map_err(dynamo_err)?;
+                Ok(r.item()
+                    .and_then(|_| found(format!("{repo} {tag}"), repo.to_string(), String::new())))
+            }
+            "plan" => {
+                if id.is_empty() || id.len() > 30 || !id.chars().all(|c| c.is_ascii_alphanumeric())
+                {
+                    return Ok(None);
+                }
+                let r = db
+                    .get_item()
+                    .table_name(&cfg.plans_table_name)
+                    .key("pk", s(team_id))
+                    .key("sk", s(&format!("PLAN#{id}")))
+                    .send()
+                    .await
+                    .map_err(dynamo_err)?;
+                Ok(r.item()
+                    .and_then(|row| found(get(row, "title"), get(row, "repo"), get(row, "status"))))
+            }
+            "alert" => {
+                if ulid::Ulid::from_string(id).is_err() {
+                    return Ok(None);
+                }
+                let r = settings(format!("ALERT_EVENT#{id}"))
+                    .await
+                    .map_err(dynamo_err)?;
+                Ok(r.item().and_then(|row| {
+                    found(get(row, "title"), get(row, "repo"), get(row, "outcome"))
+                }))
+            }
+            "data_source" => {
+                let source =
+                    common::live::store::get_source(db, &cfg.settings_table_name, team_id, id)
+                        .await?;
+                Ok(source
+                    .and_then(|src| found(src.name.clone(), String::new(), src.status.clone())))
+            }
+            _ => Ok(None),
+        }
     }
-    Ok(Some(cleaned))
 }
 
-fn store(state: &AppState) -> DynamoStore<'_> {
+pub(crate) fn store(state: &AppState) -> DynamoStore<'_> {
     DynamoStore {
         dynamo: &state.dynamo,
         table: &state.config.settings_table_name,
@@ -1338,18 +1589,13 @@ pub async fn create_handler(
     Json(req): Json<NewTicket>,
 ) -> Reply {
     let caller = Caller::from_claims(&claims);
-    let item = match &req.item {
-        Some(i) => resolve_item(&state, &caller.team_id, i)
-            .await
-            .map_err(Fail::reply)?,
-        None => None,
-    };
     let name = team_name(&state, &caller.team_id).await;
     let ua = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let (ticket, first) = create(&store(&state), &caller, &req, &name, item, ua)
+    let lookup = DynamoLookup { state: &state };
+    let (ticket, first) = create(&store(&state), &lookup, &caller, &req, &name, ua)
         .await
         .map_err(Fail::reply)?;
     info!(team = %caller.team_id, ticket = %ticket.id, "support ticket opened");
@@ -1378,6 +1624,9 @@ pub struct ReplyBody {
     pub status: Option<String>,
     #[serde(default)]
     pub priority: Option<String>,
+    /// Items to attach with the reply (customers only).
+    #[serde(default)]
+    pub items: Vec<ItemRef>,
 }
 
 /// POST /api/support/tickets/:id/reply — the customer adds to the thread.
@@ -1389,7 +1638,8 @@ pub async fn reply(
 ) -> Reply {
     let caller = Caller::from_claims(&claims);
     let st = store(&state);
-    let (t, m) = reply_as_customer(&st, &caller, &id, &req.body)
+    let lookup = DynamoLookup { state: &state };
+    let (t, m) = reply_as_customer(&st, &lookup, &caller, &id, &req.body, &req.items)
         .await
         .map_err(Fail::reply)?;
     send(&state, mail_customer_reply(&inbox(), &t, &m)).await;
@@ -1432,7 +1682,14 @@ pub async fn admin_list_handler(
     let v = admin_list(&store(&state), &caller)
         .await
         .map_err(Fail::reply)?;
-    Ok(Json(json!({ "tickets": v })))
+    // Which teams have support access on, so the queue can offer a view.
+    let open: Vec<String> = v
+        .iter()
+        .filter(|t| t.status != Status::Resolved)
+        .map(|t| t.team_id.clone())
+        .collect();
+    let access = super::support_access::active_until(&state, &open).await;
+    Ok(Json(json!({ "tickets": v, "support_access": access })))
 }
 
 /// GET /api/admin/support/tickets/:id — any ticket and its full thread.
@@ -1445,7 +1702,17 @@ pub async fn admin_get(
     let (t, thread) = admin_open(&store(&state), &caller, &id)
         .await
         .map_err(Fail::reply)?;
-    Ok(detail(t, thread))
+    admin_detail(&state, t, thread).await
+}
+
+/// A ticket for support, with when its team's support access ends (null
+/// when it is off).
+async fn admin_detail(state: &AppState, t: Ticket, thread: Vec<Message>) -> Reply {
+    let access = super::support_access::active_until(state, std::slice::from_ref(&t.team_id)).await;
+    let until = access.get(&t.team_id).cloned();
+    Ok(Json(
+        json!({ "ticket": t, "messages": thread, "support_access": { "until": until } }),
+    ))
 }
 
 /// POST /api/admin/support/tickets/:id/reply — support answers; `status`
@@ -1466,7 +1733,7 @@ pub async fn admin_reply_handler(
         send(&state, mail).await;
     }
     let (t, thread) = admin_open(&st, &caller, &id).await.map_err(Fail::reply)?;
-    Ok(detail(t, thread))
+    admin_detail(&state, t, thread).await
 }
 
 /// POST /api/admin/support/tickets/:id/status — set status and/or priority.
@@ -1494,7 +1761,7 @@ pub async fn admin_status(
         }
     }
     let (t, thread) = admin_open(&st, &caller, &id).await.map_err(Fail::reply)?;
-    Ok(detail(t, thread))
+    admin_detail(&state, t, thread).await
 }
 
 #[cfg(test)]
@@ -1616,7 +1883,46 @@ mod tests {
             name: user.to_string(),
             role: "member".into(),
             platform_admin: false,
+            in_support_view: false,
         }
+    }
+
+    /// Each team's items, by (team, kind, id).
+    #[derive(Default)]
+    struct Items(Mutex<HashMap<(String, String, String), RelatedItem>>);
+
+    impl Items {
+        fn add(&self, team: &str, kind: &str, id: &str, label: &str, status: &str) {
+            self.0.lock().unwrap().insert(
+                (format!("TEAM#{team}"), kind.into(), id.into()),
+                RelatedItem {
+                    kind: kind.into(),
+                    id: id.into(),
+                    label: label.into(),
+                    repo: "acme/web".into(),
+                    status: status.into(),
+                },
+            );
+        }
+    }
+
+    impl ItemLookup for Items {
+        async fn find(
+            &self,
+            team_id: &str,
+            item: &RelatedItem,
+        ) -> Result<Option<RelatedItem>, String> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(&(team_id.to_string(), item.kind.clone(), item.id.clone()))
+                .cloned())
+        }
+    }
+
+    fn none() -> Items {
+        Items::default()
     }
 
     fn admin() -> Caller {
@@ -1633,14 +1939,22 @@ mod tests {
             priority: None,
             page: Some("/runs/detail/?id=01RUN".into()),
             item: None,
+            items: Vec::new(),
         }
     }
 
     async fn file(store: &Mem, who: &Caller, subject: &str) -> Ticket {
-        create(store, who, &ask(subject), "acme-web", None, "Test browser")
-            .await
-            .unwrap()
-            .0
+        create(
+            store,
+            &none(),
+            who,
+            &ask(subject),
+            "acme-web",
+            "Test browser",
+        )
+        .await
+        .unwrap()
+        .0
     }
 
     #[tokio::test]
@@ -1659,7 +1973,7 @@ mod tests {
         );
         // No reply lands on it.
         assert_eq!(
-            reply_as_customer(&store, &mallory, &t.id, "hello")
+            reply_as_customer(&store, &none(), &mallory, &t.id, "hello", &[])
                 .await
                 .unwrap_err(),
             Fail::NotFound
@@ -1728,7 +2042,7 @@ mod tests {
         assert_eq!(t.status, Status::Waiting);
         assert_eq!(t.last_actor, "support");
 
-        let (t, _) = reply_as_customer(&store, &alice, &t.id, "Still broken.")
+        let (t, _) = reply_as_customer(&store, &none(), &alice, &t.id, "Still broken.", &[])
             .await
             .unwrap();
         assert_eq!(t.status, Status::Open);
@@ -1739,7 +2053,7 @@ mod tests {
         assert_eq!(t.status, Status::Resolved);
 
         // A reply to a resolved ticket reopens it, with an event in the thread.
-        let (t, _) = reply_as_customer(&store, &alice, &t.id, "It came back.")
+        let (t, _) = reply_as_customer(&store, &none(), &alice, &t.id, "It came back.", &[])
             .await
             .unwrap();
         assert_eq!(t.status, Status::Open);
@@ -1803,7 +2117,7 @@ mod tests {
         for i in 0..USER_TICKETS_PER_HOUR {
             file(&store, &alice, &format!("Ticket {i}")).await;
         }
-        let err = create(&store, &alice, &ask("One more"), "", None, "")
+        let err = create(&store, &none(), &alice, &ask("One more"), "", "")
             .await
             .unwrap_err();
         assert!(matches!(err, Fail::TooMany(_)));
@@ -1819,17 +2133,22 @@ mod tests {
         }
         let fresh = person("alpha", "newcomer");
         assert!(matches!(
-            create(&store, &fresh, &ask("Late"), "", None, "")
+            create(&store, &none(), &fresh, &ask("Late"), "", "")
                 .await
                 .unwrap_err(),
             Fail::TooMany(_)
         ));
         // Another team is not affected.
-        assert!(
-            create(&store, &person("beta", "bea"), &ask("Mine"), "", None, "")
-                .await
-                .is_ok()
-        );
+        assert!(create(
+            &store,
+            &none(),
+            &person("beta", "bea"),
+            &ask("Mine"),
+            "",
+            ""
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
@@ -1843,8 +2162,9 @@ mod tests {
             priority: Some("urgent".into()),
             page: Some("/releases/?repo=acme/web&q=v1#top".into()),
             item: None,
+            items: Vec::new(),
         };
-        let (t, m) = create(&store, &alice, &req, "acme", None, "Browser/1.0")
+        let (t, m) = create(&store, &none(), &alice, &req, "acme", "Browser/1.0")
             .await
             .unwrap();
         assert_eq!(t.subject, "Deploy fails");
@@ -1857,13 +2177,13 @@ mod tests {
 
         assert!(create(
             &store,
+            &none(),
             &alice,
             &NewTicket {
                 body: "x".into(),
                 ..Default::default()
             },
             "",
-            None,
             ""
         )
         .await
@@ -1874,7 +2194,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            create(&store, &alice, &long, "", None, "")
+            create(&store, &none(), &alice, &long, "", "")
                 .await
                 .unwrap_err(),
             Fail::BadRequest(_)
@@ -1933,6 +2253,7 @@ mod tests {
             author_name: "helper".into(),
             body: "Hi".into(),
             created_at: "t".into(),
+            attachments: Vec::new(),
         }];
         let v = customer_view(thread);
         assert_eq!(v[0].author_email, "");
@@ -1950,8 +2271,9 @@ mod tests {
             label: Some("Fix login".into()),
             repo: Some("acme/web".into()),
         });
-        let item = req.item.as_ref().unwrap().cleaned();
-        let (t, first) = create(&store, &alice, &req, "acme", item, "")
+        let items = Items::default();
+        items.add("alpha", "run", "01RUN", "Fix login", "failed");
+        let (t, first) = create(&store, &items, &alice, &req, "acme", "")
             .await
             .unwrap();
 
@@ -1960,7 +2282,9 @@ mod tests {
         assert!(to_support.subject.contains("acme"));
         assert!(to_support.html.contains("&lt;b&gt;Broken&lt;/b&gt;"));
         assert!(!to_support.html.contains("<b>Broken"));
-        assert!(to_support.text.contains("Run: Fix login (acme/web)"));
+        assert!(to_support
+            .text
+            .contains("Attached: Run: Fix login (acme/web) · failed"));
         assert!(to_support
             .text
             .contains(&format!("/admin/tickets/?id={}", t.id)));
@@ -1978,7 +2302,7 @@ mod tests {
             "support staff stay anonymous"
         );
 
-        let (t, m) = reply_as_customer(&store, &alice, &t.id, "Thanks")
+        let (t, m) = reply_as_customer(&store, &none(), &alice, &t.id, "Thanks", &[])
             .await
             .unwrap();
         assert_eq!(
@@ -1986,5 +2310,186 @@ mod tests {
             "help@example.com"
         );
         assert_eq!(mail_resolved(&t).unwrap().to, "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn attachments_must_be_the_callers_teams_and_keep_only_their_names() {
+        let store = Mem::default();
+        let items = Items::default();
+        items.add("alpha", "run", "01RUN", "Fix login", "failed");
+        items.add(
+            "alpha",
+            "alert",
+            "01J0000000000000000000000A",
+            "CPU high",
+            "opened",
+        );
+        items.add("beta", "plan", "PLANB", "Their plan", "draft");
+        let alice = person("alpha", "alice");
+        let mut req = ask("Run broke");
+        req.items = vec![
+            ItemRef {
+                kind: "run".into(),
+                id: "01RUN".into(),
+                // What the browser says is not what is kept.
+                label: Some("made up".into()),
+                repo: None,
+            },
+            ItemRef {
+                kind: "alert".into(),
+                id: "01J0000000000000000000000A".into(),
+                label: None,
+                repo: None,
+            },
+            // The same run twice is kept once.
+            ItemRef {
+                kind: "run".into(),
+                id: "01RUN".into(),
+                label: None,
+                repo: None,
+            },
+        ];
+        let (t, first) = create(&store, &items, &alice, &req, "acme", "")
+            .await
+            .unwrap();
+        assert_eq!(t.context.items.len(), 2);
+        assert_eq!(t.context.items[0].label, "Fix login");
+        assert_eq!(t.context.items[0].status, "failed");
+        assert_eq!(t.context.item.as_ref().unwrap().id, "01RUN");
+        assert_eq!(first.attachments.len(), 2);
+
+        // Another team's plan is refused, and nothing is saved or counted.
+        let mut theirs = ask("Their plan");
+        theirs.items = vec![ItemRef {
+            kind: "plan".into(),
+            id: "PLANB".into(),
+            label: Some("Their plan".into()),
+            repo: None,
+        }];
+        let before = store.list_team(&alice.team_id).await.unwrap().len();
+        let err = create(&store, &items, &alice, &theirs, "acme", "")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Fail::BadRequest("That plan is not one of your team's.".into())
+        );
+        assert_eq!(store.list_team(&alice.team_id).await.unwrap().len(), before);
+
+        // A reply can attach more of the team's own items, not another team's.
+        items.add("alpha", "data_source", "src1", "Orders API", "ready");
+        let (t2, m) = reply_as_customer(
+            &store,
+            &items,
+            &alice,
+            &t.id,
+            "",
+            &[ItemRef {
+                kind: "data_source".into(),
+                id: "src1".into(),
+                label: None,
+                repo: None,
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(m.body, "");
+        assert_eq!(m.attachments[0].label, "Orders API");
+        assert_eq!(attachments(&t2).len(), 3);
+        let err = reply_as_customer(
+            &store,
+            &items,
+            &alice,
+            &t.id,
+            "and this",
+            &[ItemRef {
+                kind: "plan".into(),
+                id: "PLANB".into(),
+                label: None,
+                repo: None,
+            }],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Fail::BadRequest(_)));
+        // Kinds tickets do not carry are refused.
+        let err = reply_as_customer(
+            &store,
+            &items,
+            &alice,
+            &t.id,
+            "x",
+            &[ItemRef {
+                kind: "secret".into(),
+                id: "k".into(),
+                label: None,
+                repo: None,
+            }],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Fail::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn a_ticket_carries_at_most_ten_items() {
+        let store = Mem::default();
+        let items = Items::default();
+        for i in 0..12 {
+            items.add("alpha", "run", &format!("R{i}"), "run", "done");
+        }
+        let alice = person("alpha", "alice");
+        let refs = |r: std::ops::Range<usize>| -> Vec<ItemRef> {
+            r.map(|i| ItemRef {
+                kind: "run".into(),
+                id: format!("R{i}"),
+                label: None,
+                repo: None,
+            })
+            .collect()
+        };
+        let mut req = ask("Many");
+        req.items = refs(0..11);
+        assert!(matches!(
+            create(&store, &items, &alice, &req, "", "")
+                .await
+                .unwrap_err(),
+            Fail::BadRequest(_)
+        ));
+        req.items = refs(0..9);
+        let (t, _) = create(&store, &items, &alice, &req, "", "").await.unwrap();
+        let (t, _) = reply_as_customer(&store, &items, &alice, &t.id, "one more", &refs(9..10))
+            .await
+            .unwrap();
+        assert_eq!(attachments(&t).len(), MAX_ATTACHMENTS);
+        let err = reply_as_customer(&store, &items, &alice, &t.id, "too many", &refs(10..11))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Fail::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn ticket_notes_land_only_on_the_teams_own_ticket() {
+        let store = Mem::default();
+        let alice = person("alpha", "alice");
+        let t = file(&store, &alice, "Look please").await;
+        note_on_ticket(
+            &store,
+            &alice.team_id,
+            &t.id,
+            "support",
+            &admin(),
+            "support_viewed",
+        )
+        .await
+        .unwrap();
+        let (_, thread) = open_for_team(&store, &alice, &t.id).await.unwrap();
+        assert_eq!(thread.last().unwrap().body, "support_viewed");
+        assert_eq!(
+            note_on_ticket(&store, "TEAM#beta", &t.id, "support", &admin(), "x")
+                .await
+                .unwrap_err(),
+            Fail::NotFound
+        );
     }
 }

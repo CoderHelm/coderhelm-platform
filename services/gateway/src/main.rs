@@ -145,6 +145,22 @@ async fn main() -> Result<(), Error> {
             "/admin/support/tickets/:id/status",
             post(routes::support::admin_status),
         )
+        // Support access: the team lets support in for a window, and a
+        // platform admin opens a read-only support view while it is on.
+        .route(
+            "/support/access",
+            get(routes::support_access::get_access)
+                .post(routes::support_access::grant_access)
+                .delete(routes::support_access::revoke_access),
+        )
+        .route(
+            "/support/view",
+            get(routes::support_access::view_status).delete(routes::support_access::exit_view),
+        )
+        .route(
+            "/admin/support/view",
+            post(routes::support_access::start_view),
+        )
         .route("/search", get(routes::search::search))
         .route("/runs", get(routes::api::list_runs))
         .route("/runs/:run_id", get(routes::api::get_run))

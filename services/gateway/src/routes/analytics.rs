@@ -1410,7 +1410,9 @@ pub async fn get_analytics(
         end: window.end,
     };
 
-    if let Err(e) = repair_review_stats(&state, &team).await {
+    // A support view only reads: the repair waits for the team's own visit.
+    if claims.support_view.is_some() {
+    } else if let Err(e) = repair_review_stats(&state, &team).await {
         // The page still works; some older reviews just aren't counted yet.
         warn!(error = %e, "Review stats repair did not finish");
     }

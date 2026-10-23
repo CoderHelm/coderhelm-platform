@@ -2,13 +2,14 @@ use axum::{
     extract::{Request, State},
     http::StatusCode,
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::auth::jwt;
+use crate::routes::support_access;
 use crate::AppState;
 
 /// Session TTL: 7 days. Used by both token creation and cookie Max-Age.
@@ -36,8 +37,61 @@ pub async fn require_auth(
     let token = extract_cookie(cookie_header, "__Host-coderhelm_session")
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let claims = jwt::validate_token(token, &state.secrets.jwt_secret)
+    let mut claims = jwt::validate_token(token, &state.secrets.jwt_secret)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    // Only a support-view token carries a support view; a session never does.
+    claims.support_view = None;
+
+    // A support view: the platform admin's own session plus a support-view
+    // cookie. Enforced here for every route: reads only, every request
+    // written to the team's audit log, and the team's grant checked on each
+    // request (cached at most a minute). Leaving the view always works.
+    if let Some(support_token) =
+        extract_cookie(cookie_header, support_access::SUPPORT_COOKIE).filter(|t| !t.is_empty())
+    {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        if !support_access::is_exit(&method, &path) {
+            let route = req
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| path.clone());
+            let access = support_access::store(&state);
+            let Some(sv) = support_access::check_session(
+                &access,
+                &claims,
+                support_token,
+                &state.secrets.jwt_secret,
+            )
+            .await
+            else {
+                return Ok(support_access::refused(
+                    "Support view has ended. Open it again from the ticket if the team still allows it.",
+                    true,
+                ));
+            };
+            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            if let Some(why) = support_access::support_view_refusal(&method, &path) {
+                if let Err(e) =
+                    support_access::record(&access, &sv, "refused", &method, &route, now).await
+                {
+                    tracing::warn!(error = %e, "Support view audit not written");
+                }
+                return Ok(support_access::refused(why, false));
+            }
+            // A read is served only once it is in the team's log.
+            if let Err(e) = support_access::record(&access, &sv, "read", &method, &route, now).await
+            {
+                tracing::error!(error = %e, "Support view audit not written; read refused");
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            req.extensions_mut()
+                .insert(support_access::view_claims(&sv));
+            let response = next.run(req).await;
+            return Ok(hide_in_answer(response).await);
+        }
+    }
 
     // Check if token needs refresh (sliding session)
     let now = chrono::Utc::now().timestamp() as u64;
@@ -77,6 +131,31 @@ pub async fn require_auth(
     }
 
     Ok(response)
+}
+
+/// A support-view answer with its credential fields hidden
+/// ([`support_access::hide_secrets`]). Answers that are not JSON pass as
+/// they are; a JSON answer that cannot be read is refused.
+async fn hide_in_answer(response: Response) -> Response {
+    let is_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if !is_json {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 16 * 1024 * 1024).await else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    support_access::hide_secrets(&mut value);
+    let out = serde_json::to_vec(&value).unwrap_or_default();
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(out))
 }
 
 /// Whether to write `last_seen_at` for this member now: at most once per

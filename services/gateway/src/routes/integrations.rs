@@ -308,19 +308,29 @@ pub async fn list(
         aws_account::list(&state.dynamo, &state.config.aws_insights_table_name, &team)
             .await
             .map_err(|e| internal("list aws accounts", e))?;
-    let migrated = migrate_legacy(&state, &team, &mut accounts).await;
+    // A support view only reads: no migration, no checks into the team's
+    // AWS accounts (they would run as the support admin).
+    let support_view = claims.support_view.is_some();
+    let migrated = if support_view {
+        Default::default()
+    } else {
+        migrate_legacy(&state, &team, &mut accounts).await
+    };
     let now = chrono::Utc::now();
     let actor = claims.email.clone();
     let checks = accounts
         .iter_mut()
-        .filter(|a| a.check_is_stale(now))
+        .filter(|a| !support_view && a.check_is_stale(now))
         .map(|a| check_and_save(&state, &team, a, &actor));
     futures::future::join_all(checks).await;
 
     // Everything else, read in parallel.
     let settings = &state.config.settings_table_name;
     // REST APIs and OpenSearch connected here before live in Data sources.
-    if let Err(e) = common::live::store::adopt_connections(&state.dynamo, settings, &team).await {
+    if support_view {
+    } else if let Err(e) =
+        common::live::store::adopt_connections(&state.dynamo, settings, &team).await
+    {
         warn!(error = %e, "Could not move connections to data sources");
     }
     let team_key = [("team_id", team.as_str()), ("sk", "META")];

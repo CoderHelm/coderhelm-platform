@@ -434,6 +434,24 @@ pub struct Claims {
     pub aud: String,
     pub exp: u64,
     pub iat: u64,
+    /// Set only on a support-view session: a Coderhelm platform admin reading
+    /// one team's workspace, read-only, under that team's grant. Never set on
+    /// a normal session token (the auth middleware drops it there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_view: Option<SupportView>,
+}
+
+/// What a support-view session may see: one team, until a time, under one
+/// grant. Revoking or replacing the grant ends the session.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SupportView {
+    pub team_id: String,
+    /// Unix seconds; the session ends then even if the grant runs longer.
+    pub until: u64,
+    pub grant_id: String,
+    /// The platform admin's own user id; their own session must be present.
+    pub admin_sub: String,
+    pub admin_email: String,
 }
 
 fn default_aud() -> String {
@@ -648,6 +666,7 @@ mod tests {
             aud: "coderhelm-dashboard".into(),
             exp: 9999999999,
             iat: 1000000000,
+            support_view: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: Claims = serde_json::from_str(&json).unwrap();
