@@ -128,6 +128,18 @@ async fn main() -> Result<(), Error> {
         )
         .route("/support/tickets/:id", get(routes::support::get))
         .route("/support/tickets/:id/reply", post(routes::support::reply))
+        .route(
+            "/support/tickets/:id/resolve",
+            post(routes::support::resolve),
+        )
+        .route(
+            "/support/tickets/:id/participants",
+            post(routes::support::add_people),
+        )
+        .route(
+            "/support/tickets/:id/participants/remove",
+            post(routes::support::remove_people),
+        )
         .route("/support/badge", get(routes::support::badge))
         .route(
             "/admin/support/tickets",
@@ -144,6 +156,14 @@ async fn main() -> Result<(), Error> {
         .route(
             "/admin/support/tickets/:id/status",
             post(routes::support::admin_status),
+        )
+        .route(
+            "/admin/support/tickets/:id/participants",
+            post(routes::support::admin_add_people),
+        )
+        .route(
+            "/admin/support/tickets/:id/participants/remove",
+            post(routes::support::admin_remove_people),
         )
         // Support access: the team lets support in for a window, and a
         // platform admin opens a read-only support view while it is on.
