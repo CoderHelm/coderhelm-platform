@@ -1997,8 +1997,9 @@ async fn send_team(
         return Ok(0);
     }
     // Read before anything is sent: if it can't be read, send nothing.
-    let only = rollout(state, team_id).await?;
-    if !team_in_rollout(state.config.weekly_summary_listed_teams_only, only.as_ref()) {
+    let listed_only = state.config.weekly_summary_listed_teams_only;
+    let only = rollout_for(listed_only, rollout(state, team_id).await?);
+    if !team_in_rollout(listed_only, only.as_ref()) {
         return Ok(0);
     }
     let name = team_name(state, team_id).await;
@@ -2099,6 +2100,20 @@ async fn rollout(
 /// limited to listed teams, a team without a list gets nothing.
 fn team_in_rollout(listed_only: bool, only: Option<&std::collections::HashSet<String>>) -> bool {
     !listed_only || only.is_some()
+}
+
+/// The list that limits who gets the summary: only while the rollout is
+/// limited to listed teams. Once it goes to everyone, a team's old list no
+/// longer holds anyone back; each person's own setting still does.
+fn rollout_for(
+    listed_only: bool,
+    only: Option<std::collections::HashSet<String>>,
+) -> Option<std::collections::HashSet<String>> {
+    if listed_only {
+        only
+    } else {
+        None
+    }
 }
 
 fn on_rollout(only: Option<&std::collections::HashSet<String>>, email: &str) -> bool {
@@ -2874,6 +2889,9 @@ mod tests {
         // Open rollout: every team, as before.
         assert!(team_in_rollout(false, None));
         assert!(team_in_rollout(false, Some(&list)));
+        // Sent to everyone: an old list no longer limits who gets it.
+        assert_eq!(rollout_for(false, Some(list.clone())), None);
+        assert_eq!(rollout_for(true, Some(list.clone())), Some(list.clone()));
     }
 
     #[test]
