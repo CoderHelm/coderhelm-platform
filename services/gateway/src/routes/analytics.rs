@@ -426,7 +426,7 @@ pub fn failure_reason(msg: &str) -> String {
 }
 
 /// Values of `current_pass` that name a state, not a pass.
-const NOT_A_PASS: [&str; 4] = ["cancelled", "done", "awaiting_ci", "unknown"];
+const NOT_A_PASS: [&str; 5] = ["cancelled", "closed", "done", "awaiting_ci", "unknown"];
 
 /// Why a failed run failed, for grouping. Runs since
 /// `common::run_fail::REASONS_RECORDED_SINCE` always record a reason and a
@@ -456,7 +456,8 @@ pub fn run_failure_reason(r: &RunRow, trace_pass: Option<&str>) -> String {
         return failure_reason(msg);
     }
     // Cancelled (its pass says so), then a late write set "failed" over it.
-    if r.current_pass == "cancelled" {
+    // A close leaves the pass alone, and no write sets failed over a close.
+    if r.current_pass == common::run_status::CANCELLED {
         return "Cancelled, then marked failed by a late write".to_string();
     }
     if !r.error_legacy.trim().is_empty() {
@@ -630,7 +631,16 @@ pub fn summary(runs: &[&RunRow], reviews: &[&ReviewRow]) -> Value {
         .iter()
         .filter(|r| !r.merged() && r.pr_outcome == "closed")
         .count();
-    let failed = runs.iter().filter(|r| r.status == "failed").count();
+    // A run a person closed on purpose is not a failure; it is counted on
+    // its own.
+    let failed = runs
+        .iter()
+        .filter(|r| r.status == common::run_status::FAILED)
+        .count();
+    let closed_by_person = runs
+        .iter()
+        .filter(|r| r.status == common::run_status::CLOSED)
+        .count();
     let cost: f64 = runs.iter().map(|r| r.cost_usd).sum();
     let tokens: f64 = runs.iter().map(|r| r.tokens()).sum();
     let hours: Vec<f64> = merged.iter().filter_map(|r| r.hours_to_merge()).collect();
@@ -657,6 +667,7 @@ pub fn summary(runs: &[&RunRow], reviews: &[&ReviewRow]) -> Value {
         "merge_rate": ratio(merged.len() as f64, with_pr.len() as f64),
         "failed_runs": failed,
         "failure_rate": ratio(failed as f64, total),
+        "closed_runs": closed_by_person,
         "cost_usd": round2(cost),
         "cost_per_run": ratio(cost, total).map(round2),
         "cost_per_merged_pr": ratio(cost, merged.len() as f64).map(round2),
@@ -1752,6 +1763,33 @@ mod tests {
         r.cache_write_tokens = 200.0;
         r.tokens_out = 50.0;
         assert_eq!(r.tokens(), 1260.0);
+    }
+
+    #[test]
+    fn a_closed_run_is_counted_as_closed_by_a_person_not_failed() {
+        let closed = run("1", 3, "closed");
+        let failed = RunRow {
+            error_message: "Timed out after 900s".into(),
+            ..run("2", 4, "failed")
+        };
+        let done = run("3", 5, "completed");
+        let (w, p) = windows();
+        let out = build(
+            w,
+            p,
+            None,
+            &[closed, failed, done],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        let sm = &out["summary"];
+        assert_eq!(sm["runs"], 3);
+        assert_eq!(sm["failed_runs"], 1);
+        assert_eq!(sm["closed_runs"], 1);
+        assert!((sm["failure_rate"].as_f64().unwrap() - 1.0 / 3.0).abs() < 1e-9);
     }
 
     #[test]

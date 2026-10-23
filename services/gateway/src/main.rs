@@ -171,6 +171,9 @@ async fn main() -> Result<(), Error> {
         .route("/runs/:run_id/reset", post(routes::api::reset_and_rerun))
         .route("/runs/:run_id/re-review", post(routes::api::re_review_run))
         .route("/runs/:run_id/cancel", post(routes::api::cancel_run))
+        .route("/runs/:run_id/close", post(routes::run_close::close_run))
+        .route("/runs/:run_id/reopen", post(routes::run_close::reopen_run))
+        .route("/runs/close", post(routes::run_close::close_runs))
         .route("/repos", get(routes::api::list_repos))
         .route("/repos/sync", post(routes::api::sync_repos))
         .route(

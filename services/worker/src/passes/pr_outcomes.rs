@@ -108,7 +108,7 @@ pub async fn backfill(state: &WorkerState) -> Result<(), Box<dyn std::error::Err
 }
 
 /// Run statuses that end a run while its PR may still merge or close later.
-const FINISHED_STATUSES: [&str; 3] = ["completed", "cancelled", "retried"];
+const FINISHED_STATUSES: [&str; 4] = ["completed", "cancelled", "closed", "retried"];
 /// An open PR is asked about again after this long.
 const RECHECK_OPEN_AFTER_HOURS: i64 = 24;
 
@@ -146,13 +146,14 @@ async fn reconcile_finished(
     let cutoff = (now - chrono::Duration::hours(RECHECK_OPEN_AFTER_HOURS)).to_rfc3339();
     let pending = find_runs(
         state,
-        "#s IN (:s0, :s1, :s2) AND attribute_exists(pr_url) AND attribute_not_exists(pr_outcome) \
+        "#s IN (:s0, :s1, :s2, :s3) AND attribute_exists(pr_url) AND attribute_not_exists(pr_outcome) \
          AND attribute_not_exists(pr_backfill) \
          AND (attribute_not_exists(pr_outcome_checked_at) OR pr_outcome_checked_at < :cut)",
         vec![
             (":s0", attr_s(FINISHED_STATUSES[0])),
             (":s1", attr_s(FINISHED_STATUSES[1])),
             (":s2", attr_s(FINISHED_STATUSES[2])),
+            (":s3", attr_s(FINISHED_STATUSES[3])),
             (":cut", attr_s(&cutoff)),
         ],
     )
@@ -367,7 +368,10 @@ mod tests {
     }
 
     #[test]
-    fn finished_statuses_cover_completed_cancelled_retried() {
-        assert_eq!(FINISHED_STATUSES, ["completed", "cancelled", "retried"]);
+    fn finished_statuses_cover_completed_cancelled_closed_retried() {
+        assert_eq!(
+            FINISHED_STATUSES,
+            ["completed", "cancelled", "closed", "retried"]
+        );
     }
 }

@@ -25,6 +25,10 @@
 //!   CONTENT changed: a status or field change alone never starts one. The
 //!   run on a cancelled ticket used to re-run on any edit and open the same
 //!   PR again
+//! - a run a person closed from the dashboard (`closed`) never restarts
+//!   itself: a status or field change starts nothing and an edit never goes
+//!   to its PR; reopening the ticket or changing its content starts a fresh
+//!   run, and the closed run stays as history
 //! - a ticket a person marked done on the ticket itself ("fixed in the
 //!   booking system") stays done until its content changes
 //! - a failed / retried latest run never blocks
@@ -83,8 +87,17 @@ impl LatestRun<'_> {
         self.status == "merged" || self.pr_outcome == "merged"
     }
 
+    /// Its PR closed without merging. A cancelled run's PR was closed by a
+    /// person (that is how most runs get cancelled); a closed run's PR may
+    /// still be open, so only its recorded outcome counts.
     fn pr_closed(&self) -> bool {
-        self.pr_number > 0 && (self.pr_outcome == "closed" || self.status == "cancelled")
+        self.pr_number > 0
+            && (self.pr_outcome == "closed" || self.status == common::run_status::CANCELLED)
+    }
+
+    /// A person closed the run on purpose.
+    fn closed_by_person(&self) -> bool {
+        self.status == common::run_status::CLOSED
     }
 
     /// The content changed since CoderHelm last saw it.
@@ -126,7 +139,7 @@ fn decide(latest: &LatestRun, new_hash: Option<&str>, reopened: bool) -> Decisio
             Decision::Skip("its PR merged and the ticket wasn't reopened")
         };
     }
-    if latest.pr_closed() && reopened {
+    if (latest.pr_closed() || latest.closed_by_person()) && reopened {
         return Decision::Enqueue;
     }
     if latest.changed(new_hash) {
@@ -372,11 +385,19 @@ const SEEN_HASH_FIELD: &str = "seen_context_hash";
 /// content starts another run. "needs_outside_change": the fix is a change in
 /// another system. "needs_input": CoderHelm asked; people answer by comment
 /// or by editing the ticket. "cancelled": a person stopped it, or closed its
-/// PR without merging. Only a failed (or retried) run re-runs on any event.
+/// PR without merging. "closed": a person closed the run on purpose; it never
+/// resumes, and only a reopened ticket or new content starts a fresh run.
+/// Only a failed (or retried) run re-runs on any event.
 fn handled(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "success" | "merged" | "needs_outside_change" | "needs_input" | "cancelled"
+        "completed"
+            | "success"
+            | "merged"
+            | "needs_outside_change"
+            | "needs_input"
+            | "cancelled"
+            | "closed"
     )
 }
 
@@ -493,6 +514,30 @@ mod tests {
             Decision::Skip(_)
         ));
         assert_eq!(decide(&seen, Some("h3"), false), Decision::Enqueue);
+    }
+
+    #[test]
+    fn a_closed_run_never_restarts_itself() {
+        // A person closed the run; its PR is still open (they kept it).
+        let closed = run("closed", 12, "", "h1");
+        assert!(handled("closed"));
+        // A status or field change alone starts nothing, and an edit never
+        // goes to the closed run's PR.
+        assert!(matches!(
+            decide(&closed, Some("h1"), false),
+            Decision::Skip(_)
+        ));
+        assert!(matches!(decide(&closed, None, false), Decision::Skip(_)));
+        // A reopened ticket, or new content, starts a fresh run.
+        assert_eq!(decide(&closed, Some("h1"), true), Decision::Enqueue);
+        assert_eq!(decide(&closed, Some("h2"), false), Decision::Enqueue);
+        // Without a PR too.
+        let no_pr = run("closed", 0, "", "h1");
+        assert!(matches!(
+            decide(&no_pr, Some("h1"), false),
+            Decision::Skip(_)
+        ));
+        assert_eq!(decide(&no_pr, Some("h1"), true), Decision::Enqueue);
     }
 
     #[test]

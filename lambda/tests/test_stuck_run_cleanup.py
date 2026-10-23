@@ -47,5 +47,17 @@ class Message(unittest.TestCase):
         self.assertEqual(sweep.BEFORE_FIRST_PASS, "before its first pass")
 
 
+class Swept(unittest.TestCase):
+    def test_only_stuck_working_runs_are_swept(self):
+        self.assertEqual(sweep.SWEPT_STATUSES, ("running", "awaiting_ci"))
+        for status in ("closed", "cancelled", "completed", "failed", "needs_input"):
+            self.assertNotIn(status, sweep.SWEPT_STATUSES)
+
+    def test_closed_is_a_state_not_a_pass(self):
+        self.assertIn("closed", sweep.NOT_A_PASS)
+        run = {"current_pass": "closed", "pass_history": [{"pass": "implement"}]}
+        self.assertEqual(sweep.last_known_pass(run), "implement")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,3 +1,4 @@
+use common::run_status::EndedValues;
 use serde_json::json;
 use tracing::{error, info, warn};
 
@@ -884,13 +885,10 @@ Rules:
              pass_history = list_append(if_not_exists(pass_history, :empty), :entry) \
              REMOVE error_message, #err",
         )
-        .condition_expression("#s <> :cancelled")
+        .condition_expression(common::run_status::not_ended("#s"))
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error")
-        .expression_attribute_values(
-            ":cancelled",
-            aws_sdk_dynamodb::types::AttributeValue::S("cancelled".to_string()),
-        )
+        .ended_values()
         .expression_attribute_values(
             ":ti",
             aws_sdk_dynamodb::types::AttributeValue::N(usage.input_tokens.to_string()),
@@ -2436,7 +2434,7 @@ pub(crate) async fn close_own_pr_outside(
             "SET #s = :s, status_run_id = :sri, updated_at = :t, current_pass = :cp, \
              fix_location = :fl, outside_change_report = :rep",
         )
-        .condition_expression("#s <> :cancelled")
+        .condition_expression(common::run_status::not_ended("#s"))
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":s", super::attr_s(fix_location::STATUS_OUTSIDE))
         .expression_attribute_values(
@@ -2451,7 +2449,7 @@ pub(crate) async fn close_own_pr_outside(
         .expression_attribute_values(":cp", super::attr_s("done"))
         .expression_attribute_values(":fl", super::attr_s(FixLocation::OutsideCode.as_str()))
         .expression_attribute_values(":rep", super::attr_s(&report))
-        .expression_attribute_values(":cancelled", super::attr_s("cancelled"))
+        .ended_values()
         .send()
         .await;
     true
@@ -2613,7 +2611,7 @@ async fn hand_off_to_human(state: &WorkerState, github: &GitHubClient, msg: &Fee
         .update_expression(
             "SET #s = :s, status_run_id = :sri, updated_at = :t REMOVE error_message, #err",
         )
-        .condition_expression("#s <> :cancelled")
+        .condition_expression(common::run_status::not_ended("#s"))
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error")
         .expression_attribute_values(":s", AttributeValue::S("completed".to_string()))
@@ -2622,7 +2620,7 @@ async fn hand_off_to_human(state: &WorkerState, github: &GitHubClient, msg: &Fee
             AttributeValue::S(format!("completed#{}", msg.run_id)),
         )
         .expression_attribute_values(":t", AttributeValue::S(now))
-        .expression_attribute_values(":cancelled", AttributeValue::S("cancelled".to_string()))
+        .ended_values()
         .send()
         .await;
     // When it was handed off (the first time only), for the weekly summary.
@@ -2672,6 +2670,7 @@ async fn hand_off_to_human(state: &WorkerState, github: &GitHubClient, msg: &Fee
     }
 }
 
+/// A person ended the run (cancelled or closed it): no feedback runs on it.
 async fn run_is_cancelled(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
     state
         .dynamo
@@ -2693,7 +2692,7 @@ async fn run_is_cancelled(state: &WorkerState, team_id: &str, run_id: &str) -> b
         .ok()
         .and_then(|r| r.item)
         .and_then(|i| i.get("status").and_then(|v| v.as_s().ok()).cloned())
-        .map(|s| s == "cancelled")
+        .map(|s| common::run_status::ended_by_person(&s))
         .unwrap_or(false)
 }
 
@@ -2895,7 +2894,14 @@ mod resume_owns_ci_tests {
     fn only_active_runs_own_ci() {
         assert!(resume_owns_ci("awaiting_ci"));
         assert!(resume_owns_ci("running"));
-        for s in ["completed", "failed", "needs_input", "cancelled", ""] {
+        for s in [
+            "completed",
+            "failed",
+            "needs_input",
+            "cancelled",
+            "closed",
+            "",
+        ] {
             assert!(!resume_owns_ci(s), "{s}");
         }
     }

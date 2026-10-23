@@ -1,4 +1,5 @@
 use aws_sdk_dynamodb::types::AttributeValue;
+use common::run_status::EndedValues;
 use serde_json::Value;
 use tracing::{error, info, warn};
 
@@ -960,7 +961,7 @@ pub async fn run(
                     .key("team_id", attr_s(&msg.team_id))
                     .key("run_id", attr_s(&msg.run_id))
                     .update_expression("SET #s = :s, current_pass = :cp, status_run_id = :sri")
-                    .condition_expression("#s <> :cancelled")
+                    .condition_expression(common::run_status::not_ended("#s"))
                     .expression_attribute_names("#s", "status")
                     .expression_attribute_values(":s", attr_s("awaiting_ci"))
                     .expression_attribute_values(":cp", attr_s("awaiting_ci"))
@@ -970,7 +971,7 @@ pub async fn run(
                     )
                     // Never resurrect a cancelled run — the condition makes this
                     // force-reset a no-op once the run is cancelled.
-                    .expression_attribute_values(":cancelled", attr_s("cancelled"))
+                    .ended_values()
                     .send()
                     .await
                     .ok();
@@ -3086,10 +3087,10 @@ async fn set_run_awaiting_ci(
              status_run_id = :sri \
              REMOVE error_message, #err",
         )
-        .condition_expression("#s <> :cancelled")
+        .condition_expression(common::run_status::not_ended("#s"))
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error")
-        .expression_attribute_values(":cancelled", attr_s("cancelled"))
+        .ended_values()
         .expression_attribute_values(":s", attr_s("awaiting_ci"))
         .expression_attribute_values(":pr", attr_s(pr_url))
         .expression_attribute_values(":pn", attr_n(pr_number))
@@ -3386,8 +3387,8 @@ async fn complete_run_with_status(
         .expression_attribute_values(":cp", attr_s("done"))
         .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
         // Cancel is terminal: never overwrite a cancelled run with a completion.
-        .condition_expression("#s <> :cancel")
-        .expression_attribute_values(":cancel", attr_s("cancelled"))
+        .condition_expression(common::run_status::not_ended("#s"))
+        .ended_values()
         .send()
         .await;
     match res {
@@ -3594,7 +3595,8 @@ async fn send_delayed_resume(state: &WorkerState, msg: &ResumeMessage, delay_sec
         hand_off_after_ci_wait(state, msg).await;
         return;
     }
-    // Final backstop: never re-arm the resume loop for a cancelled run.
+    // Final backstop: never re-arm the resume loop for a run a person ended
+    // (cancelled or closed).
     let cancelled = state
         .dynamo
         .get_item()
@@ -3609,12 +3611,12 @@ async fn send_delayed_resume(state: &WorkerState, msg: &ResumeMessage, delay_sec
         .ok()
         .and_then(|r| r.item)
         .and_then(|i| i.get("status").and_then(|v| v.as_s().ok()).cloned())
-        .map(|st| st == "cancelled")
+        .map(|st| common::run_status::ended_by_person(&st))
         .unwrap_or(false);
     if cancelled {
         info!(
             run_id = msg.run_id,
-            "Run cancelled — not scheduling delayed resume"
+            "Run cancelled or closed — not scheduling delayed resume"
         );
         return;
     }

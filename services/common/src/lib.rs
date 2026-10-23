@@ -47,6 +47,8 @@ pub mod review_live;
 pub mod review_stats;
 /// The one way a run is marked failed: always with a reason and a pass.
 pub mod run_fail;
+/// Run statuses; which ones a person set; closing and reopening a run.
+pub mod run_status;
 pub mod skill_apply;
 pub mod skill_compat;
 pub mod skills;

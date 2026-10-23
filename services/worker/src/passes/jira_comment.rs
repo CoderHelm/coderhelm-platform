@@ -131,6 +131,9 @@ pub fn prompt(msg: &JiraCommentMessage) -> String {
         }
         "merged" => "CoderHelm's pull request for the ticket was merged.",
         "cancelled" => "CoderHelm's work on the ticket was stopped (or its PR closed).",
+        "closed" => {
+            "A person closed CoderHelm's run on the ticket: they stopped its work on purpose."
+        }
         _ => "CoderHelm finished its last run on the ticket.",
     };
     format!(
@@ -367,6 +370,7 @@ mod tests {
             "completed",
             "needs_outside_change",
             "cancelled",
+            "closed",
             "needs_input",
         ] {
             assert_eq!(
