@@ -19,16 +19,17 @@ use crate::WorkerState;
 const MAX_CHECKS_PER_RUN: usize = 6;
 
 /// The steps run_checks runs, each on its own: the derived type-check/build
-/// command (with the install), the repo's CI lint command, and the repo's
-/// unit tests scoped to the test files THIS change touched. run_checks used
-/// to run only typecheck+build, so a broken test the agent wrote passed the
-/// sandbox gate and shipped a red PR; scoped + --passWithNoTests keeps it fast
-/// and avoids false-REDs from unrelated/service-dependent suites. Lint runs
-/// because CI gates on it; as its own step, a lint failure is reported without
-/// hiding the type-check or test result.
+/// command (with the install), the repo's own CI format and lint commands and
+/// any other derived check (`extra`), and the repo's unit tests scoped to the
+/// test files THIS change touched. run_checks used to run only
+/// typecheck+build, so a broken test the agent wrote passed the sandbox gate
+/// and shipped a red PR; scoped + --passWithNoTests keeps it fast and avoids
+/// false-REDs from unrelated/service-dependent suites. Lint and format run
+/// because CI gates on them; as their own steps, a failure is reported
+/// without hiding the type-check or test result.
 fn check_steps(
     checks_cmd: &str,
-    lint_cmd: Option<&str>,
+    extra: &[super::checks::Step],
     test_cmd: Option<&str>,
     changed: &[String],
 ) -> Vec<super::checks::Step> {
@@ -38,13 +39,7 @@ fn check_steps(
         cmd: checks_cmd.to_string(),
         scope: None,
     }];
-    if let Some(lint) = lint_cmd {
-        steps.push(Step {
-            kinds: vec![CheckKind::Lint],
-            cmd: lint.to_string(),
-            scope: Some("the repo's CI lint command".into()),
-        });
-    }
+    steps.extend(extra.iter().cloned());
     if let Some(tests) = test_cmd.and_then(|tc| super::build_scoped_test_cmd(tc, changed)) {
         steps.push(Step {
             kinds: vec![CheckKind::Tests],
@@ -55,10 +50,41 @@ fn check_steps(
     steps
 }
 
+/// The steps run_checks adds to the derived check command: CI's own format
+/// and lint commands, and for a repository with Terraform, a format check
+/// when CI's isn't among them and a validate of its root modules when the
+/// derived command (another stack's) doesn't validate them.
+fn extra_steps(
+    checks_cmd: Option<&str>,
+    ci: &[super::checks::CiCommand],
+    tf: Option<&super::terraform::TfRepo>,
+) -> Vec<super::checks::Step> {
+    use super::checks::Step;
+    let mut steps = super::checks::mirrored_steps(ci);
+    if let Some(tf) = tf {
+        let ci_formats_tf = ci.iter().any(|c| c.sandbox && c.tool == "terraform fmt");
+        if !ci_formats_tf {
+            steps.push(Step {
+                kinds: vec![CheckKind::Format],
+                cmd: super::terraform::FMT_CHECK.to_string(),
+                scope: Some("Terraform formatting".into()),
+            });
+        }
+        if !checks_cmd.is_some_and(|c| c.contains("terraform validate")) {
+            steps.push(Step {
+                kinds: vec![CheckKind::Typecheck],
+                cmd: tf.validate_cmd(),
+                scope: Some("each Terraform root module, without its backend".into()),
+            });
+        }
+    }
+    steps
+}
+
 /// Whether the build, type-check and test steps passed: the verdict the
-/// finish path holds the agent to. A lint step's result is reported but not
-/// part of it. With no per-step result (the run stopped early), the run's own
-/// exit code decides.
+/// finish path holds the agent to. A lint or format step's result is
+/// reported but not part of it. With no per-step result (the run stopped
+/// early), the run's own exit code decides.
 fn gate_passed(steps: &[super::checks::Step], codes: &[Option<i32>], run_passed: bool) -> bool {
     if codes.iter().all(Option::is_none) {
         return run_passed;
@@ -66,7 +92,7 @@ fn gate_passed(steps: &[super::checks::Step], codes: &[Option<i32>], run_passed:
     steps
         .iter()
         .zip(codes)
-        .all(|(s, c)| s.kinds.as_slice() == [CheckKind::Lint] || matches!(c, Some(0)))
+        .all(|(s, c)| s.advisory() || matches!(c, Some(0)))
 }
 
 /// What run_checks tells the agent: the verdict, each command that ran with
@@ -263,9 +289,26 @@ pub async fn run(
     } else {
         None
     };
+    // Every check the repo's CI runs on a pull request, with its command:
+    // the sandbox mirrors the format and lint ones, and the proof check
+    // reads them all.
+    let ci =
+        super::checks::detect_ci(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await;
     let checks_cmd = if sandbox.is_some() {
         super::detect_check_commands(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch)
             .await
+    } else {
+        None
+    };
+    let terraform = if sandbox.is_some() {
+        super::terraform::detect(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.base_branch,
+            &ci,
+        )
+        .await
     } else {
         None
     };
@@ -278,15 +321,15 @@ pub async fn run(
     } else {
         None
     };
-    // The repo's own CI lint command: run_checks runs it as its own step so the
-    // sandbox runs what CI gates on, without a lint failure hiding the
-    // type-check or test result.
-    let lint_cmd = if sandbox.is_some() {
-        super::checks::detect_ci_lint(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch)
-            .await
+    // The repo's own CI format and lint commands (and Terraform's checks):
+    // run_checks runs each as its own step so the sandbox runs what CI gates
+    // on, without a lint failure hiding the type-check or test result.
+    let ci_steps = if sandbox.is_some() {
+        extra_steps(checks_cmd.as_deref(), &ci, terraform.as_ref())
     } else {
-        None
+        Vec::new()
     };
+    let terraform_version = terraform.map(|t| t.version);
     let node_version = if sandbox.is_some() {
         super::detect_node_version(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await
     } else {
@@ -597,7 +640,7 @@ pub async fn run(
             sandbox,
             checks_cmd,
             test_cmd,
-            lint_cmd,
+            ci_steps,
             check_results: std::sync::Mutex::new(Vec::new()),
             last_checks_passed: std::sync::atomic::AtomicBool::new(true),
             codegen_cmd,
@@ -605,6 +648,7 @@ pub async fn run(
             scope_guard,
             run_id: run_id.map(|s| s.to_string()),
             node_version,
+            terraform_version,
             check_budget: std::sync::atomic::AtomicUsize::new(0),
             gen_edit_rejects: std::sync::Mutex::new(std::collections::HashMap::new()),
             deadline,
@@ -939,9 +983,7 @@ pub async fn run(
         .lock()
         .unwrap()
         .clone();
-    let ci_gates =
-        super::checks::detect_ci_gates(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch)
-            .await;
+    let ci_gates = super::checks::kinds_from(&ci);
     Ok(ImplementResult {
         files_modified: files,
         conversation_log: conv_log,
@@ -951,6 +993,7 @@ pub async fn run(
             notes: closing.trim().to_string(),
             checks,
             ci_gates,
+            ci_commands: ci,
         },
     })
 }
@@ -1385,9 +1428,10 @@ struct WriteToolExecutor<'a> {
     /// The repo's unit-test command (faithful CI replica); run_checks scopes it
     /// to the changed test files. None when not testable / no sandbox.
     test_cmd: Option<String>,
-    /// The repo's CI lint command; run_checks runs it as its own step. None
-    /// when CI runs no lint / no sandbox.
-    lint_cmd: Option<String>,
+    /// The repo's CI format and lint commands and Terraform's checks;
+    /// run_checks runs each as its own step. Empty when there are none / no
+    /// sandbox.
+    ci_steps: Vec<super::checks::Step>,
     /// What the most recent run_checks came to, one line per step (which
     /// command, which kind of check, PASS or FAIL). The run's evidence, so
     /// the proof check reads facts instead of the coder's account.
@@ -1406,6 +1450,9 @@ struct WriteToolExecutor<'a> {
     scope_guard: super::write_guard::ScopeGuard,
     /// Node major version to switch the sandbox to (None -> buildspec default).
     node_version: Option<String>,
+    /// Exact Terraform version the sandbox installs (None when the repo has
+    /// no Terraform).
+    terraform_version: Option<String>,
     run_id: Option<String>,
     /// Bounds sandbox runs per pass; also the S3 key nonce per attempt.
     check_budget: std::sync::atomic::AtomicUsize,
@@ -2074,12 +2121,7 @@ impl<'a> WriteToolExecutor<'a> {
             .iter()
             .cloned()
             .collect();
-        let steps = check_steps(
-            cmd,
-            self.lint_cmd.as_deref(),
-            self.test_cmd.as_deref(),
-            &changed,
-        );
+        let steps = check_steps(cmd, &self.ci_steps, self.test_cmd.as_deref(), &changed);
         let effective_cmd = super::checks::script(&steps);
 
         let source = match self.sandbox_source(sandbox, run_id).await {
@@ -2096,6 +2138,7 @@ impl<'a> WriteToolExecutor<'a> {
                 &source,
                 &effective_cmd,
                 self.node_version.as_deref(),
+                self.terraform_version.as_deref(),
                 self.deadline,
             )
             .await
@@ -2753,15 +2796,25 @@ mod task_prompt_tests {
 
 #[cfg(test)]
 mod run_checks_tests {
-    use super::{check_steps, checks_report, gate_passed, CheckKind};
+    use super::{check_steps, checks_report, extra_steps, gate_passed, CheckKind};
+    use crate::passes::checks::{pr_commands, Step, Workflow};
+    use crate::passes::terraform::TfRepo;
 
     const TYPECHECK: &str = "pnpm install --frozen-lockfile && pnpm --filter web check-types";
+
+    fn lint_step() -> Vec<Step> {
+        vec![Step {
+            kinds: vec![CheckKind::Lint],
+            cmd: "pnpm lint".into(),
+            scope: Some("the repo's CI lint command".into()),
+        }]
+    }
 
     #[test]
     fn runs_what_ci_gates_on_each_as_its_own_step() {
         let steps = check_steps(
             TYPECHECK,
-            Some("pnpm lint"),
+            &lint_step(),
             Some("pnpm test:run"),
             &["src/a.ts".into(), "src/a.test.ts".into()],
         );
@@ -2782,19 +2835,70 @@ mod run_checks_tests {
             .contains("only the test files"));
         // No lint in CI and no test file touched: the type-check alone.
         assert_eq!(
-            check_steps(TYPECHECK, None, Some("pnpm test"), &["src/a.ts".into()]).len(),
+            check_steps(TYPECHECK, &[], Some("pnpm test"), &["src/a.ts".into()]).len(),
             1
         );
     }
 
     #[test]
     fn a_lint_failure_is_reported_but_never_masks_the_gate() {
-        let steps = check_steps(TYPECHECK, Some("pnpm lint"), None, &[]);
+        let steps = check_steps(TYPECHECK, &lint_step(), None, &[]);
         assert!(gate_passed(&steps, &[Some(0), Some(1)], false));
         assert!(!gate_passed(&steps, &[Some(2), Some(0)], false));
         // No per-step result (the run stopped early): the run's exit decides.
         assert!(!gate_passed(&steps, &[None, None], false));
         assert!(gate_passed(&steps, &[None, None], true));
+    }
+
+    #[test]
+    fn a_terraform_repo_checks_format_and_validates_without_planning() {
+        // An invented Terraform repository: CI formats on every PR and plans
+        // each environment; the sandbox validates its root modules.
+        let tf = TfRepo {
+            roots: vec!["envs/prod".into(), "envs/staging".into()],
+            version: "1.9.8".into(),
+        };
+        let lint = Workflow {
+            path: ".github/workflows/lint.yml".into(),
+            text: "on:\n  pull_request:\n    types: [opened, synchronize, reopened, labeled]\njobs:\n  fmt:\n    steps:\n      - run: terraform fmt -recursive -check\n".into(),
+        };
+        let plan = Workflow {
+            path: ".github/workflows/plan.yml".into(),
+            text: "on: pull_request\njobs:\n  plan:\n    steps:\n      - run: |\n          terraform init\n          terraform plan -input=false\n".into(),
+        };
+        let ci = pr_commands(&[lint, plan], "main");
+        let validate = tf.validate_cmd();
+        let steps = check_steps(
+            &validate,
+            &extra_steps(Some(&validate), &ci, Some(&tf)),
+            None,
+            &[],
+        );
+        let got: Vec<(Vec<CheckKind>, &str)> = steps
+            .iter()
+            .map(|s| (s.kinds.clone(), s.cmd.as_str()))
+            .collect();
+        // CI's own format command, mirrored; the validate once; no plan.
+        assert_eq!(
+            got,
+            vec![
+                (vec![CheckKind::Typecheck], validate.as_str()),
+                (vec![CheckKind::Format], "terraform fmt -recursive -check"),
+            ]
+        );
+        assert!(steps.iter().all(|s| !s.cmd.contains("terraform plan")));
+        // A format failure is reported; the validate holds the gate.
+        assert!(gate_passed(&steps, &[Some(0), Some(3)], false));
+        assert!(!gate_passed(&steps, &[Some(1), Some(0)], false));
+
+        // A Go service with a Terraform folder and no CI format check: the
+        // sandbox adds both Terraform steps to the Go build.
+        let go = "go build ./... && go vet ./...";
+        let steps = extra_steps(Some(go), &[], Some(&tf));
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].cmd, "terraform fmt -recursive -check");
+        assert_eq!(steps[1].cmd, validate);
+        assert!(extra_steps(Some(go), &[], None).is_empty());
     }
 
     #[test]

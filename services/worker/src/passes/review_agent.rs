@@ -1911,6 +1911,13 @@ pub async fn verify_in_sandbox(
         (None, None) => return None,
     };
     let node = super::detect_node_version(github, owner, repo, head_sha).await;
+    let terraform = if cmd.contains("terraform ") {
+        super::terraform::detect(github, owner, repo, head_sha, &[])
+            .await
+            .map(|t| t.version)
+    } else {
+        None
+    };
     let sandbox = crate::clients::sandbox::SandboxClient::new(
         &state.codebuild,
         &state.s3,
@@ -1933,7 +1940,7 @@ pub async fn verify_in_sandbox(
         .ok()?;
 
     match sandbox
-        .run_checks(&source, &cmd, node.as_deref(), None)
+        .run_checks(&source, &cmd, node.as_deref(), terraform.as_deref(), None)
         .await
     {
         Ok(o) if o.ran => {
