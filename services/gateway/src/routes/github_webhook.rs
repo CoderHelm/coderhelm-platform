@@ -1061,15 +1061,17 @@ async fn handle_pull_request(
             // merged as Coderhelm wrote it.
             let human_commits =
                 count_human_commits(state, installation_id, owner, name, pr_number).await;
+            let run_status = item
+                .get("status")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str)
+                .unwrap_or("");
             let mut update = state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
                 .key("team_id", attr_s(team_id))
                 .key("run_id", attr_s(&run_id))
-                .expression_attribute_names("#status", "status")
-                .expression_attribute_values(":s", attr_s("merged"))
-                .expression_attribute_values(":sri", attr_s(&format!("merged#{run_id}")))
                 .expression_attribute_values(":t", attr_s(&now))
                 .expression_attribute_values(":o", attr_s("merged"))
                 .expression_attribute_values(
@@ -1082,9 +1084,17 @@ async fn handle_pull_request(
                     attr_s(pr["merged_by"]["login"].as_str().unwrap_or("")),
                 );
             let mut expr =
-                "SET #status = :s, status_run_id = :sri, updated_at = :t, pr_outcome = :o, \
-                            merged_at = :ma, pr_opened_at = :op, merged_by = :mb"
+                "SET updated_at = :t, pr_outcome = :o, merged_at = :ma, pr_opened_at = :op, merged_by = :mb"
                     .to_string();
+            // A run a person closed stays closed; the merge is still recorded
+            // (analytics count it as merged through `pr_outcome`).
+            if merge_sets_status(run_status) {
+                expr.push_str(", #status = :s, status_run_id = :sri");
+                update = update
+                    .expression_attribute_names("#status", "status")
+                    .expression_attribute_values(":s", attr_s("merged"))
+                    .expression_attribute_values(":sri", attr_s(&format!("merged#{run_id}")));
+            }
             if let Some(n) = human_commits {
                 expr.push_str(", human_commits = :hc");
                 update = update.expression_attribute_values(":hc", attr_n(n));
@@ -3553,6 +3563,28 @@ mod installation_owner_tests {
     }
 }
 
+/// Whether a merged PR moves its run to `merged`. A run a person closed keeps
+/// its status.
+fn merge_sets_status(run_status: &str) -> bool {
+    run_status != common::run_status::CLOSED
+}
+
+#[cfg(test)]
+mod merge_status_tests {
+    use super::merge_sets_status;
+
+    #[test]
+    fn a_merge_keeps_a_closed_run_closed() {
+        assert!(!merge_sets_status("closed"));
+        let others = common::run_status::ALL
+            .iter()
+            .filter(|s| **s != common::run_status::CLOSED);
+        for s in others {
+            assert!(merge_sets_status(s), "{s}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod own_pr_ci_after_run_tests {
     use super::{is_failed_conclusion, reopens_for_ci};
@@ -3580,6 +3612,7 @@ mod own_pr_ci_after_run_tests {
         assert!(reopens_for_ci("completed"));
         for s in [
             "cancelled",
+            "closed",
             "failed",
             "awaiting_ci",
             "running",

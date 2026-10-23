@@ -2418,6 +2418,44 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_run_is_neither_finished_work_nor_waiting_on_anyone() {
+        let (start, end) = week();
+        let rows = vec![
+            // A person closed the run and kept its PR open.
+            item(&[
+                ("run_id", "c1"),
+                ("created_at", "2026-10-14T10:00:00Z"),
+                ("status", "closed"),
+                ("pr_number", "#7"),
+                ("pr_url", "https://github.com/x/y/pull/7"),
+                ("ticket_id", "T-7"),
+                ("repo", "x/y"),
+            ]),
+            // An earlier run on the same PR finished; the close is the latest.
+            item(&[
+                ("run_id", "c0"),
+                ("created_at", "2026-10-13T10:00:00Z"),
+                ("status", "completed"),
+                ("pr_number", "#7"),
+                ("pr_url", "https://github.com/x/y/pull/7"),
+                ("ticket_id", "T-7"),
+                ("repo", "x/y"),
+            ]),
+            // A question a person closed instead of answering.
+            item(&[
+                ("run_id", "c2"),
+                ("created_at", "2026-10-15T10:00:00Z"),
+                ("status", "closed"),
+                ("ticket_id", "T-8"),
+                ("repo", "x/y"),
+            ]),
+        ];
+        let r = run_stats(&rows, start, end);
+        assert_eq!((r.started, r.completed), (3, 1));
+        assert_eq!((r.attention_total, r.waiting_review), (0, 0));
+    }
+
+    #[test]
     fn waiting_on_a_person_is_one_entry_per_pr_and_only_the_latest_question() {
         let (start, end) = week();
         let rows = vec![

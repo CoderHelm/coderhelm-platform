@@ -1,3 +1,4 @@
+use common::run_status::EndedValues;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -2578,8 +2579,8 @@ async fn run_passes(
                             // than flip the run back to awaiting_ci and re-trigger the
                             // loop. (This was the resurrection hole — a re-run fix
                             // cycle finished after a cancel and clobbered it.)
-                            .condition_expression("#s <> :cancelled")
-                            .expression_attribute_values(":cancelled", attr_s("cancelled"))
+                            .condition_expression(common::run_status::not_ended("#s"))
+                            .ended_values()
                             .expression_attribute_values(":s", attr_s("awaiting_ci"))
                             .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
                             .expression_attribute_values(":cp", attr_s("awaiting_ci"))
@@ -3240,8 +3241,8 @@ async fn run_passes(
                 )
                 .expression_attribute_names("#status", "status")
                 // Never resurrect a cancelled run (mirrors the single-repo guard).
-                .condition_expression("#status <> :cancel")
-                .expression_attribute_values(":cancel", attr_s("cancelled"))
+                .condition_expression(common::run_status::not_ended("#status"))
+                .ended_values()
                 .expression_attribute_values(":s", attr_s("awaiting_ci"))
                 .expression_attribute_values(":pr", attr_s(&pr_results[0].pr_url))
                 .expression_attribute_values(":pn", attr_n(pr_results[0].pr_number))
@@ -3449,8 +3450,8 @@ async fn run_passes(
                      current_pass = :cp",
                 )
                 .expression_attribute_names("#status", "status")
-                .condition_expression("#status <> :cancelled")
-                .expression_attribute_values(":cancelled", attr_s("cancelled"))
+                .condition_expression(common::run_status::not_ended("#status"))
+                .ended_values()
                 .expression_attribute_values(":s", attr_s("completed"))
                 .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
                 .expression_attribute_values(":pn", attr_n(pr_number))
@@ -3910,8 +3911,8 @@ async fn run_passes(
         )
         .expression_attribute_names("#status", "status")
         // Never flip a cancelled run back to awaiting_ci (would resume it).
-        .condition_expression("#status <> :cancel")
-        .expression_attribute_values(":cancel", attr_s("cancelled"))
+        .condition_expression(common::run_status::not_ended("#status"))
+        .ended_values()
         .expression_attribute_values(":s", attr_s("awaiting_ci"))
         .expression_attribute_values(":pr", attr_s(&pr_result.pr_url))
         .expression_attribute_values(":pn", attr_n(pr_result.pr_number))
@@ -4415,12 +4416,15 @@ async fn resume_run_to_running(state: &WorkerState, team_id: &str, run_id: &str)
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
         .update_expression("SET #s = :r, status_run_id = :sri, updated_at = :t")
-        .condition_expression("attribute_exists(run_id) AND #s <> :cancelled")
+        .condition_expression(format!(
+            "attribute_exists(run_id) AND {}",
+            common::run_status::not_ended("#s")
+        ))
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":r", attr_s("running"))
         .expression_attribute_values(":sri", attr_s(&format!("running#{run_id}")))
         .expression_attribute_values(":t", attr_s(&now))
-        .expression_attribute_values(":cancelled", attr_s("cancelled"))
+        .ended_values()
         .send()
         .await
         .is_ok()
@@ -5073,7 +5077,8 @@ async fn write_conversation_log(
     }
 }
 
-/// Check if a run has been cancelled by the user via the dashboard.
+/// Check if a person ended the run from the dashboard (cancelled or closed
+/// it). The error text is the one `cancelled by user` checks for.
 async fn check_cancelled(
     state: &WorkerState,
     team_id: &str,
@@ -5092,7 +5097,7 @@ async fn check_cancelled(
 
     if let Some(item) = result.item() {
         if let Some(status) = item.get("status").and_then(|v| v.as_s().ok()) {
-            if status == "cancelled" {
+            if common::run_status::ended_by_person(status) {
                 return Err("Run cancelled by user".into());
             }
         }

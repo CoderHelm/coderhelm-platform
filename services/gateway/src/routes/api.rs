@@ -742,6 +742,12 @@ pub async fn get_run(
         "outside_change_report": item.get("outside_change_report").and_then(|v| v.as_s().ok()),
         // A lesson recorded for the repository when the fix was elsewhere.
         "lesson": item.get("lesson").and_then(|v| v.as_s().ok()),
+        // A person closed the run on purpose (`run_close`): who, when, why,
+        // and the status it had then.
+        "closed_by": item.get("closed_by_name").or_else(|| item.get("closed_by")).and_then(|v| v.as_s().ok()),
+        "closed_at": item.get("closed_at").and_then(|v| v.as_s().ok()),
+        "close_reason": item.get("close_reason").and_then(|v| v.as_s().ok()),
+        "closed_from": item.get("closed_from").and_then(|v| v.as_s().ok()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
         "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
         "pass_history": item.get("pass_history").and_then(|v| v.as_l().ok()).map(|list| {
@@ -1041,7 +1047,7 @@ pub async fn retry_run(
         .unwrap_or("");
     if !matches!(
         status,
-        "failed" | "needs_input" | "needs_outside_change" | "cancelled"
+        "failed" | "needs_input" | "needs_outside_change" | "cancelled" | "closed"
     ) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -1455,7 +1461,9 @@ pub async fn re_review_run(
         .and_then(|v| v.as_s().ok())
         .map(|s| s.as_str())
         .unwrap_or("");
-    if status == "merged" {
+    // A closed run stays closed until a person reopens it; a re-review would
+    // set it running again behind their back.
+    if status == "merged" || status == common::run_status::CLOSED {
         return Err(StatusCode::CONFLICT);
     }
 
@@ -3218,8 +3226,8 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
 }
 
-/// Force-delete a ticket lock (used for dashboard retry).
-async fn delete_ticket_lock(state: &AppState, team_id: &str, ticket_id: &str) {
+/// Force-delete a ticket lock (dashboard retry, start over and close).
+pub(crate) async fn delete_ticket_lock(state: &AppState, team_id: &str, ticket_id: &str) {
     let sk = format!("TICKET_LOCK#{ticket_id}");
     let _ = state
         .dynamo
@@ -4912,6 +4920,7 @@ mod tests {
             "failed",
             "needs_input",
             "cancelled",
+            "closed",
             "retried",
             "success",
         ] {

@@ -156,13 +156,16 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "runs",
-        label: "Retry, re-run, re-review or cancel runs",
+        label: "Retry, re-run, re-review, cancel, close or reopen runs",
         min_role: "member",
         handlers: &[
             "api::retry_run",
             "api::reset_and_rerun",
             "api::re_review_run",
             "api::cancel_run",
+            "run_close::close_run",
+            "run_close::close_runs",
+            "run_close::reopen_run",
         ],
     },
     Capability {

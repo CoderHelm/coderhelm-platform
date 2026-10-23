@@ -29,8 +29,12 @@ MAX_RUN_MINUTES = int(os.environ.get("MAX_RUN_MINUTES", "20"))
 # the worker's own 24h wall cap, in case no resume ever fired to enforce it.
 MAX_AWAITING_CI_HOURS = int(os.environ.get("MAX_AWAITING_CI_HOURS", "26"))
 
+# The only statuses the sweep touches. A run a person ended (cancelled or
+# closed) is never swept, and neither is any other finished run.
+SWEPT_STATUSES = ("running", "awaiting_ci")
+
 # Values of current_pass that name a state, not a pass the run was doing.
-NOT_A_PASS = {"", "unknown", "cancelled", "done", "awaiting_ci"}
+NOT_A_PASS = {"", "unknown", "cancelled", "closed", "done", "awaiting_ci"}
 BEFORE_FIRST_PASS = "before its first pass"
 
 _dynamodb = None
@@ -129,8 +133,8 @@ def handler(event, context):
         "FilterExpression": "#s = :running OR #s = :awaiting",
         "ExpressionAttributeNames": {"#s": "status"},
         "ExpressionAttributeValues": {
-            ":running": "running",
-            ":awaiting": "awaiting_ci",
+            ":running": SWEPT_STATUSES[0],
+            ":awaiting": SWEPT_STATUSES[1],
         },
         "ProjectionExpression": (
             "team_id, run_id, created_at, updated_at, title, current_pass, pass_history, #s"
