@@ -200,6 +200,9 @@ pub fn pick_repo(
     Ok((o.to_string(), r.to_string()))
 }
 
+/// Most lines one blame returns.
+pub const MAX_BLAME_LINES: u64 = 500;
+
 /// What to send: a REST path under the repo (always a GET), or the blame
 /// GraphQL query.
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +217,8 @@ pub enum Plan {
         git_ref: String,
         start: u64,
         end: u64,
+        /// The last line asked for, when the range was cut to [`MAX_BLAME_LINES`].
+        asked_end: Option<u64>,
     },
     /// Pull requests, filtered after reading (merged, label, since).
     Pulls {
@@ -259,15 +264,16 @@ pub fn plan(input: &Value, now: i64) -> Result<Plan, String> {
             let git_ref = s(input, "ref").unwrap_or("HEAD").to_string();
             clean_ref("ref", &git_ref)?;
             let start = input["start_line"].as_u64().unwrap_or(1).max(1);
-            let end = input["end_line"].as_u64().unwrap_or(start + 199).max(start);
-            if end - start > 500 {
-                return Err(bad("Blame at most 500 lines at a time."));
-            }
+            let asked = input["end_line"].as_u64().unwrap_or(start + 199).max(start);
+            // A range too long is cut, not refused: the first lines answer
+            // most questions, and the answer says how to read on.
+            let end = asked.min(start + MAX_BLAME_LINES - 1);
             Plan::Blame {
                 path,
                 git_ref,
                 start,
                 end,
+                asked_end: (asked > end).then_some(asked),
             }
         }
         "pull_requests" => {
@@ -861,6 +867,7 @@ impl GithubHistory {
                 git_ref,
                 start,
                 end,
+                asked_end,
             } => {
                 let v = github
                     .graphql_read(
@@ -877,7 +884,14 @@ impl GithubHistory {
                             ),
                         )
                     })?;
-                fmt_blame(&v, start, end)
+                let out = fmt_blame(&v, start, end);
+                match asked_end {
+                    Some(asked) => format!(
+                        "{out}\n\nShowed lines {start}-{end} of the {start}-{asked} asked for ({MAX_BLAME_LINES} at most). Ask for start_line {} to read on. A generated file (types, lockfiles, bundles) is better read through the commits that changed its source.",
+                        end + 1
+                    ),
+                    None => out,
+                }
             }
         })
     }
@@ -923,11 +937,21 @@ mod tests {
                 ..
             }
         ));
-        assert!(plan(
-            &json!({"kind":"blame","path":"a.rs","start_line":1,"end_line":900}),
-            NOW
-        )
-        .is_err());
+        // Too long a range is cut to the first 500 lines, never refused.
+        assert_eq!(
+            plan(
+                &json!({"kind":"blame","path":"a.rs","start_line":1,"end_line":90300}),
+                NOW
+            )
+            .unwrap(),
+            Plan::Blame {
+                path: "a.rs".into(),
+                git_ref: "HEAD".into(),
+                start: 1,
+                end: 500,
+                asked_end: Some(90300),
+            }
+        );
         let Plan::Pulls {
             merged_only,
             label,
