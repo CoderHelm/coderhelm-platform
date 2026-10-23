@@ -299,6 +299,22 @@ export class ApiStack extends cdk.Stack {
       ],
     });
 
+    // Automatic fix PRs for new log findings: hourly. The worker only acts
+    // for teams that turned automatic fixes on (off by default), and applies
+    // their severity floor, log groups, quiet hours and daily cap.
+    new events.Rule(this, "LogAutofixSchedule", {
+      ruleName: `${prefix}-log-autofix`,
+      description: "Start fix PRs for new log findings where a team turned it on",
+      schedule: events.Schedule.rate(cdk.Duration.hours(1)),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "log_autofix",
+          }),
+        }),
+      ],
+    });
+
     // Usage reconciliation: daily 06:00 UTC, compares the previous day's
     // recorded model usage with Anthropic's usage/cost report. The worker
     // does nothing unless the coderhelm/<stage>/anthropic-admin-keys secret

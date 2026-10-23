@@ -339,6 +339,7 @@ def analyze_connection(conn):
 
     # Reorganize results grouped by log group
     all_results = group_results_by_log_group(all_results)
+    counts = error_counts_by_log_group(all_results)
 
     seen_ids = set()
     new_recs = []
@@ -373,7 +374,7 @@ def analyze_connection(conn):
             "source_log_group": "multiple",
             "error_pattern": f"secrets_in_logs_{account_id}",
         }
-        rec_id, is_new = store_recommendation(team_id, account_id, advisory_rec, existing)
+        rec_id, is_new = store_recommendation(team_id, account_id, advisory_rec, existing, counts)
         if rec_id:
             seen_ids.add(rec_id)
         if is_new:
@@ -392,7 +393,7 @@ def analyze_connection(conn):
     record_connection_success(team_id, account_id)
 
     for rec in recommendations:
-        rec_id, is_new = store_recommendation(team_id, account_id, rec, existing)
+        rec_id, is_new = store_recommendation(team_id, account_id, rec, existing, counts)
         if rec_id:
             seen_ids.add(rec_id)
         if is_new:
@@ -609,6 +610,7 @@ Return a JSON array of recommendations. Each must have:
 - "suggested_action": Concrete steps — not generic advice. Reference actual service names, error codes, log groups.
 - "source_log_group": The primary log group where this was detected
 - "error_pattern": A representative error string for deduplication
+- "suspected_location": The file, function or module the error text points to (from a stack trace, logger name or path in the messages), or null when the logs don't show one. Never guess.
 - "existing_id": If this is the same underlying issue as one of the already-open findings below, that finding's "id"; otherwise null. Reuse an id only for the same issue, even if the wording differs.
 
 Already-open findings for this account:
@@ -721,6 +723,39 @@ def error_hash_for(account_id, rec):
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def error_counts_by_log_group(grouped):
+    """{log group: matching lines in this run}, from the queries' count
+    columns (a row without one counts once)."""
+    counts = {}
+    for entry in grouped:
+        total = 0
+        for q in entry.get("queries", []):
+            for row in q.get("results", []):
+                raw = row.get("error_count") or row.get("crash_count") or 1
+                try:
+                    total += max(int(float(raw)), 0)
+                except (TypeError, ValueError):
+                    total += 1
+        counts[entry.get("log_group", "")] = total
+    return counts
+
+
+def count_for(rec, counts):
+    """Matching lines for a finding's log group, or None when unknown."""
+    if not counts:
+        return None
+    return counts.get(str(rec.get("source_log_group", "")))
+
+
+def suspected_location(rec):
+    """The model's code location, when it named one."""
+    loc = rec.get("suspected_location")
+    if not isinstance(loc, str):
+        return ""
+    loc = loc.strip()
+    return "" if loc.lower() in ("", "null", "none", "unknown") else loc[:300]
+
+
 def match_existing(rec, existing, error_hash):
     """The open finding this recommendation is the same issue as, if any: the
     model's existing_id when it names an open finding, else the same hash."""
@@ -734,54 +769,88 @@ def match_existing(rec, existing, error_hash):
     return None
 
 
-def store_recommendation(team_id, account_id, rec, existing):
+def store_recommendation(team_id, account_id, rec, existing, counts=None):
     """Store a finding, or refresh the open one it repeats.
     Returns (rec_id, is_new); rec_id is None when the write failed."""
     error_hash = error_hash_for(account_id, rec)
     now = datetime.now(timezone.utc).isoformat()
     # Open findings stay as long as they keep appearing.
     ttl_epoch = int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp())
+    count = count_for(rec, counts)
 
     match = match_existing(rec, existing, error_hash)
     if match:
+        update = "SET last_seen_at = :t, updated_at = :t, #ttl = :ttl"
+        values = {":t": now, ":ttl": ttl_epoch, ":one": 1}
+        if count is not None:
+            update += ", error_count = :c"
+            values[":c"] = count
         try:
             aws_insights_table.update_item(
                 Key={"pk": team_id, "sk": match["sk"]},
-                UpdateExpression="SET last_seen_at = :t, updated_at = :t, #ttl = :ttl ADD seen_count :one",
+                # A finding being fixed has no TTL; seeing it again keeps it so.
+                UpdateExpression=update + " ADD seen_count :one",
+                ConditionExpression="attribute_not_exists(fix_ticket_id)",
                 ExpressionAttributeNames={"#ttl": "ttl"},
-                ExpressionAttributeValues={":t": now, ":ttl": ttl_epoch, ":one": 1},
+                ExpressionAttributeValues=values,
             )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                refresh_fixing(team_id, match["sk"], now, count)
+            else:
+                logger.warning(f"Failed to refresh {match['sk']}: {e}")
         except Exception as e:
             logger.warning(f"Failed to refresh {match['sk']}: {e}")
         return match["rec_id"], False
 
     rec_id = ulid_now()
+    item = {
+        "pk": team_id,
+        "sk": f"REC#{rec_id}",
+        "status": "pending",
+        "severity": rec.get("severity", "info"),
+        "title": str(rec.get("title", "Untitled"))[:200],
+        "summary": str(rec.get("summary", ""))[:2000],
+        "suggested_action": str(rec.get("suggested_action", ""))[:2000],
+        "source_log_group": str(rec.get("source_log_group", ""))[:500],
+        "source_account_id": account_id,
+        "error_pattern": str(rec.get("error_pattern", ""))[:500],
+        "error_hash": error_hash,
+        "created_at": now,
+        "updated_at": now,
+        "last_seen_at": now,
+        "seen_count": 1,
+        "ttl": ttl_epoch,
+    }
+    if count is not None:
+        item["error_count"] = count
+    location = suspected_location(rec)
+    if location:
+        item["suspected_location"] = location
     try:
-        aws_insights_table.put_item(
-            Item={
-                "pk": team_id,
-                "sk": f"REC#{rec_id}",
-                "status": "pending",
-                "severity": rec.get("severity", "info"),
-                "title": str(rec.get("title", "Untitled"))[:200],
-                "summary": str(rec.get("summary", ""))[:2000],
-                "suggested_action": str(rec.get("suggested_action", ""))[:2000],
-                "source_log_group": str(rec.get("source_log_group", ""))[:500],
-                "source_account_id": account_id,
-                "error_pattern": str(rec.get("error_pattern", ""))[:500],
-                "error_hash": error_hash,
-                "created_at": now,
-                "updated_at": now,
-                "last_seen_at": now,
-                "seen_count": 1,
-                "ttl": ttl_epoch,
-            }
-        )
+        aws_insights_table.put_item(Item=item)
         existing.append({"rec_id": rec_id, "sk": f"REC#{rec_id}", "error_hash": error_hash})
         return rec_id, True
     except Exception as e:
         logger.error(f"Failed to store recommendation: {e}")
         return None, False
+
+
+def refresh_fixing(team_id, sk, now, count):
+    """Refresh a finding that has a fix run, keeping it without a TTL."""
+    update = "SET last_seen_at = :t, updated_at = :t"
+    values = {":t": now, ":one": 1}
+    if count is not None:
+        update += ", error_count = :c"
+        values[":c"] = count
+    try:
+        aws_insights_table.update_item(
+            Key={"pk": team_id, "sk": sk},
+            UpdateExpression=update + " ADD seen_count :one",
+            ExpressionAttributeValues=values,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to refresh {sk}: {e}")
 
 
 def record_connection_error(team_id, account_id, error_msg):
@@ -961,7 +1030,7 @@ def recommendations_card(account_id, recs, dashboard_url):
                 "actions": [{
                     "type": "Action.OpenUrl",
                     "title": "Review findings",
-                    "url": f"{dashboard_url}/settings/aws",
+                    "url": f"{dashboard_url}/logs",
                 }],
             },
         }],
@@ -1001,7 +1070,7 @@ def recommendations_slack(account_id, recs, dashboard_url):
             "type": "button",
             "action_id": "link-0",
             "text": {"type": "plain_text", "text": "Review findings", "emoji": True},
-            "url": f"{dashboard_url}/settings/aws",
+            "url": f"{dashboard_url}/logs",
         }],
     })
     return {"text": f"{title} in AWS account {account_id}", "blocks": blocks}

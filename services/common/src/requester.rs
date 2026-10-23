@@ -23,6 +23,8 @@ pub const E2E: &str = "e2e";
 pub const ALERT: &str = "alert";
 /// Scheduled work.
 pub const SCHEDULED: &str = "scheduled";
+/// A fix started automatically from a log finding.
+pub const LOG_FINDING: &str = "log_finding";
 
 /// Settings-table sort key prefix of a Jira user CoderHelm has seen.
 pub const JIRA_USER_PREFIX: &str = "JIRAUSER#";
@@ -202,6 +204,7 @@ fn coderhelm_label(what: &str) -> String {
         E2E => "CoderHelm (E2E tests)".to_string(),
         ALERT => "CoderHelm (alerts)".to_string(),
         SCHEDULED => "CoderHelm (scheduled)".to_string(),
+        LOG_FINDING => "CoderHelm (log findings)".to_string(),
         other => format!("CoderHelm ({other})"),
     }
 }

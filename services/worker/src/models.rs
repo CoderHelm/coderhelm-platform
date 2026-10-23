@@ -211,6 +211,10 @@ pub enum WorkerMessage {
     /// merging, or a person said the fix was outside the code.
     #[serde(rename = "lesson")]
     Lesson(LessonMessage),
+    /// Hourly (EventBridge → SQS): start fix runs for new log findings of
+    /// teams that turned automatic fixes on. Does nothing for anyone else.
+    #[serde(rename = "log_autofix")]
+    LogAutofix,
     /// People pushed back on a CoderHelm review (a reply, a dismissal, a close
     /// over its change request): judge whether the reviewer was wrong.
     #[serde(rename = "review_lesson")]
@@ -326,7 +330,8 @@ impl WorkerMessage {
             | WorkerMessage::WeeklySummary
             | WorkerMessage::WeeklySummaryTest(_)
             | WorkerMessage::UsageReconcile(_)
-            | WorkerMessage::DlqCleanup => f::OTHER,
+            | WorkerMessage::DlqCleanup
+            | WorkerMessage::LogAutofix => f::OTHER,
         }
     }
 }

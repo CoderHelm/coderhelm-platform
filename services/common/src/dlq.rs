@@ -53,6 +53,7 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "review_lesson",
     "jira_comment",
     "dlq_cleanup",
+    "log_autofix",
 ];
 
 /// Scheduled jobs that act on every team (EventBridge puts them on the ticket
@@ -63,6 +64,7 @@ pub const GLOBAL_MESSAGE_TYPES: &[&str] = &[
     "weekly_summary",
     "usage_reconcile",
     "dlq_cleanup",
+    "log_autofix",
 ];
 
 /// The DLQ keeps a message this long, counted from when it was first sent

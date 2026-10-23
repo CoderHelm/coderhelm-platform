@@ -152,7 +152,11 @@ pub async fn activity(
 
 /// Whether the team's GitHub App covers `repo` (it has a repository record,
 /// which only the app's installation writes).
-async fn team_has_repo(state: &AppState, team: &str, repo: &str) -> Result<bool, String> {
+pub(crate) async fn team_has_repo(
+    state: &AppState,
+    team: &str,
+    repo: &str,
+) -> Result<bool, String> {
     state
         .dynamo
         .get_item()

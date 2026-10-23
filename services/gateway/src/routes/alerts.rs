@@ -1973,7 +1973,7 @@ pub async fn test_notify(
             console_url: None,
             context: "us-east-1 · test",
         }),
-        "recommendations" => notify::messages::test_message("New log findings", &format!("{base}/settings/aws")),
+        "recommendations" => notify::messages::test_message("New log findings", &format!("{base}/logs")),
         _ => notify::messages::test_message("Review reminders", &format!("{base}/reviewer")),
     };
     use notify::Poster;

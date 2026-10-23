@@ -181,11 +181,16 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "recommendations",
-        label: "Turn recommendations into plans or dismiss them",
+        label: "Act on log findings: create fix PRs or plans, read sample lines, acknowledge or ignore them",
         min_role: "member",
         handlers: &[
             "log_analyzer::create_plan_from_recommendation",
             "log_analyzer::dismiss_recommendation",
+            "log_findings::get_samples",
+            "log_findings::create_fix",
+            "log_findings::ignore_finding",
+            "log_findings::acknowledge_finding",
+            "log_findings::reopen_finding",
         ],
     },
     Capability {
@@ -362,9 +367,10 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "alerts",
-        label: "Configure alert routes, the alert budget and alert notifications",
+        label: "Configure alert routes, the alert budget, alert notifications and automatic fixes for log findings",
         min_role: "admin",
         handlers: &[
+            "log_findings::put_autofix",
             "alerts::put_route",
             "alerts::delete_route",
             "alerts::get_notify",
