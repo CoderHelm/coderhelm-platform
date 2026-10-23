@@ -57,15 +57,16 @@ impl ModelProvider {
             return Err("Anthropic API key is not configured. Please add your API key in Settings → Model Provider.".into());
         }
 
+        // A retired saved id runs as its replacement (Anthropic refuses it).
         let primary_model = item
             .get("primary_model")
             .and_then(|v| v.as_s().ok())
-            .cloned()
+            .map(|m| common::model_ids::current(m).to_string())
             .unwrap_or_else(|| "claude-sonnet-5-5".to_string());
         let heavy_model = item
             .get("heavy_model")
             .and_then(|v| v.as_s().ok())
-            .cloned()
+            .map(|m| common::model_ids::current(m).to_string())
             .unwrap_or_else(|| "claude-opus-5-5".to_string());
 
         info!(team_id, "Loaded Anthropic provider");
