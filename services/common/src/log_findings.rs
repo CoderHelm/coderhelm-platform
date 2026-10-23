@@ -327,7 +327,9 @@ pub fn fix_state(
     };
     let state = if r.status == "merged" || r.pr_outcome == "merged" {
         FixState::Merged
-    } else if r.pr_number > 0 && (r.pr_outcome == "closed" || r.status == "cancelled") {
+    } else if r.pr_number > 0
+        && (r.pr_outcome == "closed" || crate::run_status::ended_by_person(&r.status))
+    {
         FixState::PrClosed
     } else if r.pr_number > 0 && matches!(r.status.as_str(), "completed" | "success") {
         FixState::PrOpen
@@ -1602,6 +1604,16 @@ mod tests {
             fix_state(&[run(id1, "failed", 0, "", old)], "", now).0,
             FixState::Failed
         );
+        // A person cancelling or closing the run ends the fix too.
+        for ended in ["cancelled", "closed"] {
+            assert_eq!(
+                fix_state(&[run(id1, ended, 4, "", old)], "", now).0,
+                FixState::PrClosed
+            );
+            assert!(!fix_state(&[run(id1, ended, 0, "", recent)], "", now)
+                .0
+                .is_open());
+        }
         // The latest run decides.
         let (s, r) = fix_state(
             &[
