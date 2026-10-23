@@ -260,7 +260,8 @@ async fn main() -> Result<(), Error> {
         .route("/releases/send", post(routes::reviewer::send_release))
         .route("/releases/pending", get(routes::reviewer::pending_releases))
         .route("/releases/now", post(routes::reviewer::release_now))
-        // Code graph — its own feature (serves the reviewer AND the PR maker)
+        // Code graph — its own feature (serves the planner, the coder, CI
+        // fixes, review replies and the reviewer)
         .route("/graph/repos", get(routes::graph::list_repos))
         .route("/graph/status", get(routes::graph::status))
         .route("/graph/symbol", get(routes::graph::symbol))
@@ -269,6 +270,7 @@ async fn main() -> Result<(), Error> {
             "/graph/config/:owner/:name",
             put(routes::graph::update_config),
         )
+        .route("/graph/rebuild/:owner/:name", post(routes::graph::rebuild))
         // GitHub App installation
         .route(
             "/github/link-installation",

@@ -46,6 +46,14 @@ pub async fn run(
         .await;
 
         let full_name = format!("{}/{}", repo.owner, repo.name);
+        // A repo turned on for the team gets its code graph built (once;
+        // unless the graph was turned off for it), so the planner, coder and
+        // reviewer have it from the first piece of work. A repo the
+        // installation merely lists (not turned on) is not indexed.
+        if repo_turned_on(state, &msg.team_id, &full_name).await {
+            super::code_graph::availability(state, &msg.team_id, &full_name, msg.installation_id)
+                .await;
+        }
         match onboard_repo(
             state,
             &github,
@@ -487,4 +495,21 @@ async fn set_onboard_status(
     if let Err(e) = update.send().await {
         warn!(error = %e, repo = %repo, "Failed to update onboard status");
     }
+}
+
+/// Whether the team turned `repo` on (its REPO# item says `enabled`).
+async fn repo_turned_on(state: &WorkerState, team_id: &str, repo: &str) -> bool {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.repos_table_name)
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(format!("REPO#{repo}")))
+        .projection_expression("enabled")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned())
+        .and_then(|it| it.get("enabled").and_then(|v| v.as_bool().ok()).copied())
+        .unwrap_or(false)
 }

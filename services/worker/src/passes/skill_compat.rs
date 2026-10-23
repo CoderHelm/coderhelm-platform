@@ -43,12 +43,15 @@ const MAX_TOKENS: i32 = 32_000;
 const EXTRA_TOOLS: &[(&str, &str)] = &[
     (
         "graph_definition",
-        "Find where a symbol is defined (reviews)",
+        "Find where a symbol is defined, from the code graph (planning, coding, reviews)",
     ),
-    ("graph_callers", "Find which files use a symbol (reviews)"),
+    (
+        "graph_callers",
+        "Find which files use a symbol, from the code graph (planning, coding, reviews)",
+    ),
     (
         "graph_impact",
-        "Find every file affected by a file's symbols (reviews)",
+        "Find every file affected by changing a file, from the code graph (planning, coding, reviews)",
     ),
     (
         "search_org",
@@ -156,9 +159,9 @@ const PASSES: &[(&str, &[&str])] = &[
     ("get_diff", &["coder"]),
     ("run_checks", &["coder"]),
     ("run_codegen", &["coder"]),
-    ("graph_definition", &["coder", "reviewer"]),
-    ("graph_callers", &["coder", "reviewer"]),
-    ("graph_impact", &["coder", "reviewer"]),
+    ("graph_definition", &["planner", "coder", "reviewer"]),
+    ("graph_callers", &["planner", "coder", "reviewer"]),
+    ("graph_impact", &["planner", "coder", "reviewer"]),
     ("search_org", &["reviewer"]),
     ("check_package", &["reviewer"]),
     (super::line_count::TOOL, &["reviewer"]),

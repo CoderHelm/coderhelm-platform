@@ -11,6 +11,9 @@ pub mod model_ids;
 /// Shared so every claim compares its expiry the same way.
 pub mod claim;
 
+/// The code graph's per-repo switch and build status (gateway and worker).
+pub mod code_graph;
+
 /// Alert notifications: which channels an alert posts to, and its messages.
 pub mod alert_notify;
 /// Chat notifications (Teams and Slack): one message model, a renderer per

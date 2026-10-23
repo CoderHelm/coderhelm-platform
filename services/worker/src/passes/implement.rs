@@ -386,14 +386,6 @@ pub async fn run(
         all_tools()
     };
 
-    // Persistent code graph (when the repo is indexed): exact structural lookups
-    // so the implementer KNOWS who calls what it's changing instead of guessing.
-    let graph =
-        super::code_graph::Graph::open(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
-    if graph.is_some() {
-        tools.extend(super::review_agent::graph_tools());
-    }
-
     // Offer the sandbox verifier only when it can actually run for this repo.
     if sandbox.is_some() && checks_cmd.is_some() {
         tools.push(run_checks_tool());
@@ -508,10 +500,11 @@ pub async fn run(
         full_system.push_str(&l.prompt_section());
     }
     // Repository history through the GitHub App: no setup.
+    let team_repos = super::plan::fetch_team_repos(state, &msg.team_id).await;
     let history = super::github_history::GithubHistory::new(
         &msg.team_id,
         &format!("{}/{}", msg.repo_owner, msg.repo_name),
-        super::plan::fetch_team_repos(state, &msg.team_id).await,
+        team_repos.clone(),
         "coder",
         0,
     )
@@ -526,6 +519,34 @@ pub async fn run(
     );
     tools.push(super::github_history::tool());
     full_system.push_str(super::github_history::prompt_line());
+    // The code graph: exact structural lookups so the coder (and CI fixes,
+    // which run through here) KNOWS who calls what it's changing. A repo
+    // without a graph yet gets its first build queued here.
+    let graphs = super::code_graph::RepoGraphs::load(
+        state,
+        &msg.team_id,
+        msg.installation_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        team_repos,
+        "coder",
+        0,
+    )
+    .await
+    .with_run(
+        run_id.unwrap_or_default(),
+        super::skills::ticket_origin(
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.ticket_id,
+            msg.issue_number,
+        ),
+    );
+    super::code_graph::offer(
+        &graphs,
+        super::code_graph::Role::Coder,
+        &mut tools,
+        &mut full_system,
+    );
     // `check_url` on the team's own public pages.
     let web = super::web_check::WebCheck::load(
         state,
@@ -642,7 +663,7 @@ pub async fn run(
             task_tracker: &task_tracker,
             file_cache,
             state,
-            graph,
+            graphs,
             sandbox,
             checks_cmd,
             test_cmd,
@@ -1434,12 +1455,12 @@ struct WriteToolExecutor<'a> {
     files_modified: std::sync::Mutex<HashSet<String>>,
     task_tracker: &'a TaskTracker,
     file_cache: &'a FileCache,
-    /// Worker state + the repo's persistent code graph (None when not indexed).
-    /// Powers graph_definition/graph_callers/graph_impact — exact structural
-    /// lookups (who calls X, what a change reaches) while editing. The graph
-    /// reflects the DEFAULT branch, not this run's in-flight edits.
+    /// Worker state + the code graph (shared with every agent that reads
+    /// code). Powers graph_definition/graph_callers/graph_impact — exact
+    /// structural lookups (who calls X, what a change reaches) while editing.
+    /// The graph reflects the DEFAULT branch, not this run's in-flight edits.
     state: &'a WorkerState,
-    graph: Option<super::code_graph::Graph>,
+    graphs: super::code_graph::RepoGraphs,
     /// Execution sandbox (None when unconfigured). Runs the repo's real checks.
     sandbox: Option<crate::clients::sandbox::SandboxClient<'a>>,
     /// Derived check command (None when the stack wasn't recognized).
@@ -1558,11 +1579,9 @@ impl<'a> WriteToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        // Graph lookups share one implementation with the reviewer agent.
-        if let Some(out) =
-            super::code_graph::handle_tool(self.state, self.graph.as_ref(), name, input).await
-        {
-            return Ok(json!(common::head_tail_str(&out, 8_000)));
+        // Graph lookups share one implementation with every other agent.
+        if let Some(out) = self.graphs.handle(self.state, name, input).await {
+            return Ok(json!(out));
         }
         match name {
             "read_tree" => {
@@ -3042,5 +3061,32 @@ mod run_checks_tests {
         assert!(r.contains("No tests ran: this change touched no test files"));
         assert!(r.ends_with("--- real output (tail) ---\ntail"));
         assert!(!checks_report(&lines, true, Some(0), false, "").contains("No tests ran"));
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    #[test]
+    fn the_coder_and_ci_fixes_get_the_graph_tools() {
+        // CI fixes run through implement::run, so they get the coder's set.
+        use super::super::code_graph::{offer, Avail, RepoGraphs, Role, TOOLS};
+        let graphs = RepoGraphs::with(
+            "t",
+            1,
+            "acme/app",
+            Avail::Building(common::code_graph::Shown::Queued),
+            Vec::new(),
+            "coder",
+            0,
+        );
+        let mut tools = all_tools();
+        let mut system = String::new();
+        assert!(offer(&graphs, Role::Coder, &mut tools, &mut system));
+        for name in TOOLS {
+            assert!(tools.iter().any(|t| t.name == name), "{name}");
+        }
+        assert!(system.contains("not your edits"));
     }
 }

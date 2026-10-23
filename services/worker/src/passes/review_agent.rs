@@ -910,10 +910,10 @@ pub struct PrReviewToolExecutor<'a> {
     pub owner: &'a str,
     pub repo: &'a str,
     pub head_sha: &'a str,
-    /// The repo's persistent code graph, when indexed — powers the exact
-    /// definition/caller/impact tools. None ⇒ those tools aren't offered.
+    /// The code graph (shared with every agent that reads code): powers the
+    /// exact definition/caller/impact tools. None ⇒ those tools aren't offered.
     pub state: &'a WorkerState,
-    pub graph: Option<&'a super::code_graph::Graph>,
+    pub graph: Option<&'a super::code_graph::RepoGraphs>,
     /// Repository history (commits, blame, pull requests, releases, deploys).
     pub history: Option<&'a super::github_history::GithubHistory>,
     /// Monitoring, docs and pipeline connections and the AWS identity check.
@@ -926,49 +926,6 @@ pub struct PrReviewToolExecutor<'a> {
     pub web: Option<&'a super::web_check::WebCheck>,
 }
 
-/// Structural lookup tools backed by the persistent code graph. Offered only
-/// when the repo has an indexed graph.
-pub fn graph_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "graph_definition".to_string(),
-            description: "EXACT lookup: where is this symbol DEFINED? Returns path, kind, line \
-                          and an importance rank from the repo's code graph. Faster and more \
-                          precise than search_code for known symbol names."
-                .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {"name": {"type": "string", "description": "symbol name, e.g. processOrder"}},
-                "required": ["name"]
-            }),
-        },
-        ToolDefinition {
-            name: "graph_callers".to_string(),
-            description: "EXACT lookup: which files REFERENCE this symbol (its caller set)? Use \
-                          for blast radius of a changed function/type. Name-based — confirm \
-                          surprising hits by reading the file."
-                .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {"name": {"type": "string"}},
-                "required": ["name"]
-            }),
-        },
-        ToolDefinition {
-            name: "graph_impact".to_string(),
-            description: "EXACT lookup: every file that imports OR references symbols defined in \
-                          the given files — the impacted set of changing them. Use on the PR's \
-                          changed files to know where to look for breakage."
-                .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {"paths": {"type": "array", "items": {"type": "string"}}},
-                "required": ["paths"]
-            }),
-        },
-    ]
-}
-
 #[async_trait::async_trait]
 impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
     async fn execute(
@@ -977,10 +934,11 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        // Graph lookups share one implementation with the PR-maker agent.
-        if let Some(out) = super::code_graph::handle_tool(self.state, self.graph, name, input).await
-        {
-            return Ok(json!(common::head_tail_str(&out, 8_000)));
+        // Graph lookups share one implementation with every other agent.
+        if let Some(graphs) = self.graph {
+            if let Some(out) = graphs.handle(self.state, name, input).await {
+                return Ok(json!(out));
+            }
         }
         if let Some(history) = self.history {
             if let Some(out) = history.handle(self.state, self.github, name, input).await {
@@ -1297,9 +1255,7 @@ pub fn review_system_prompt(
     has_graph: bool,
 ) -> String {
     let graph_note = if has_graph {
-        "\nThis repo has a CODE GRAPH: prefer graph_definition/graph_callers/graph_impact for \
-         exact structural lookups (where is X defined, who calls X, what a change reaches); use \
-         search_code for text and unindexed languages."
+        super::code_graph::prompt_line(super::code_graph::Role::Reviewer)
     } else {
         ""
     };
@@ -1420,7 +1376,7 @@ pub async fn generate_review(
     pr_body: &str,
     diff: &str,
     instructions_block: &str,
-    graph: Option<&super::code_graph::Graph>,
+    graph: Option<&super::code_graph::RepoGraphs>,
     graph_context: &str,
     prior_context: &str,
     history: Option<&super::github_history::GithubHistory>,
@@ -1430,7 +1386,8 @@ pub async fn generate_review(
     web: Option<&super::web_check::WebCheck>,
     usage: &mut TokenUsage,
 ) -> Result<ReviewOutput, String> {
-    let system = review_system_prompt(owner, repo, instructions_block, graph.is_some());
+    let graph_tools = graph.map(|g| g.tools()).unwrap_or_default();
+    let system = review_system_prompt(owner, repo, instructions_block, !graph_tools.is_empty());
     let live_context = format!(
         "{}{}",
         history
@@ -1467,9 +1424,7 @@ pub async fn generate_review(
     if web.is_some() {
         tools.push(super::web_check::tool());
     }
-    if graph.is_some() {
-        tools.extend(graph_tools());
-    }
+    tools.extend(graph_tools);
     if history.is_some() {
         tools.push(super::github_history::tool());
     }

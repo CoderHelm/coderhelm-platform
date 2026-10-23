@@ -480,6 +480,34 @@ Then the ```fix_location.json block described above."#,
     );
     tools.push(super::github_history::tool());
     full_system.push_str(super::github_history::prompt_line());
+    // The code graph: what a change reaches, so the plan names every
+    // affected file and repository. A repo without a graph yet gets its
+    // first build queued here.
+    let graphs = super::code_graph::RepoGraphs::load(
+        state,
+        &msg.team_id,
+        msg.installation_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        team_repos.clone(),
+        "planner",
+        0,
+    )
+    .await
+    .with_run(
+        run_id,
+        super::skills::ticket_origin(
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.ticket_id,
+            msg.issue_number,
+        ),
+    );
+    super::code_graph::offer(
+        &graphs,
+        super::code_graph::Role::Planner,
+        &mut tools,
+        &mut full_system,
+    );
     // `check_url` on the team's own public pages.
     let web = super::web_check::WebCheck::load(
         state,
@@ -568,6 +596,7 @@ Then the ```fix_location.json block described above."#,
         lambda: &state.lambda,
         mcp_proxy_function_name: &state.config.mcp_proxy_function_name,
         history: Some(&history),
+        graphs: Some(&graphs),
         ops: ops.as_ref(),
         live: live.as_ref(),
         skills: skills.as_ref(),
@@ -1332,6 +1361,8 @@ struct CombinedToolExecutor<'a> {
     mcp_proxy_function_name: &'a str,
     /// Repository history (commits, blame, pull requests, releases, deploys).
     history: Option<&'a super::github_history::GithubHistory>,
+    /// The code graph, shared with every agent that reads code.
+    graphs: Option<&'a super::code_graph::RepoGraphs>,
     /// Monitoring, docs and pipeline connections (New Relic, Confluence,
     /// CloudWatch metrics, Airflow) and the AWS identity check.
     ops: Option<&'a super::ops_tools::OpsTools>,
@@ -1351,6 +1382,11 @@ impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(graphs) = self.graphs {
+            if let Some(out) = graphs.handle(self.state, name, input).await {
+                return Ok(serde_json::json!(out));
+            }
+        }
         if let Some(history) = self.history {
             if let Some(out) = history
                 .handle(self.state, self.read_only.github, name, input)
@@ -1560,5 +1596,33 @@ mod questions_tests {
     #[test]
     fn the_planner_is_versioned_for_intent_and_history() {
         assert!(PLANNER_VERSION.contains("intent-history"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_planner_gets_the_graph_tools() {
+        use super::super::code_graph::{offer, Avail, RepoGraphs, Role, TOOLS};
+        let graphs = RepoGraphs::with(
+            "t",
+            1,
+            "acme/app",
+            Avail::Building(common::code_graph::Shown::Queued),
+            vec!["acme/api".into()],
+            "planner",
+            0,
+        );
+        let mut tools = read_only_tools();
+        let mut system = String::new();
+        assert!(offer(&graphs, Role::Planner, &mut tools, &mut system));
+        for name in TOOLS {
+            let t = tools.iter().find(|t| t.name == name).expect(name);
+            // The planner may look at the team's other repositories.
+            assert!(t.input_schema["properties"].get("repo").is_some());
+        }
+        assert!(system.contains("graph_impact"));
     }
 }

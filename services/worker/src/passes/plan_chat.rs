@@ -16,6 +16,7 @@ use crate::agent::llm::{ToolDefinition, ToolExecutor};
 use crate::clients::github::GitHubClient;
 use crate::WorkerState;
 
+use super::code_graph::RepoGraphs;
 use super::live_sources::{LiveSources, Role};
 use super::ops_tools::OpsTools;
 use super::skills::{Reader, TeamSkills, Work};
@@ -64,6 +65,8 @@ struct Loaded {
     skills: Option<TeamSkills>,
     live: Option<LiveSources>,
     ops: Option<OpsTools>,
+    /// The code graph of the chat's repository (and the team's others).
+    graphs: Option<RepoGraphs>,
 }
 
 async fn load(state: &WorkerState, req: &Request) -> Loaded {
@@ -86,7 +89,22 @@ async fn load(state: &WorkerState, req: &Request) -> Loaded {
     let ops = OpsTools::load(state, &req.team_id, &req.repo, "planner", 0)
         .await
         .map(|o| o.with_run("", origin.clone()));
-    Loaded { skills, live, ops }
+    let graphs = if req.repo.contains('/') {
+        let others = super::plan::fetch_team_repos(state, &req.team_id).await;
+        Some(
+            RepoGraphs::load(state, &req.team_id, 0, &req.repo, others, "planner", 0)
+                .await
+                .with_run("", origin.clone()),
+        )
+    } else {
+        None
+    };
+    Loaded {
+        skills,
+        live,
+        ops,
+        graphs,
+    }
 }
 
 fn defs(l: &Loaded) -> Vec<ToolDefinition> {
@@ -100,6 +118,9 @@ fn defs(l: &Loaded) -> Vec<ToolDefinition> {
     if let Some(o) = &l.ops {
         tools.extend(o.tools());
     }
+    if let Some(g) = &l.graphs {
+        tools.extend(g.tools());
+    }
     tools.retain(|t| !writes(&t.name));
     tools
 }
@@ -108,6 +129,7 @@ fn defs(l: &Loaded) -> Vec<ToolDefinition> {
 struct Sources<'a> {
     live: Option<&'a LiveSources>,
     ops: Option<&'a OpsTools>,
+    graphs: Option<&'a RepoGraphs>,
     state: &'a WorkerState,
 }
 
@@ -120,6 +142,11 @@ impl ToolExecutor for Sources<'_> {
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         if writes(name) {
             return Ok(json!("Not available here."));
+        }
+        if let Some(g) = self.graphs {
+            if let Some(out) = g.handle(self.state, name, input).await {
+                return Ok(json!(out));
+            }
         }
         if let Some(o) = self.ops {
             if let Some(out) = o.handle(self.state, name, input).await {
@@ -147,6 +174,11 @@ fn connection_label(name: &str) -> Option<&'static str> {
     .iter()
     .find(|(p, _)| name.starts_with(p))
     .map(|(_, l)| *l)
+    .or_else(|| {
+        super::code_graph::TOOLS
+            .contains(&name)
+            .then_some("Code graph")
+    })
 }
 
 /// What the chat shows for a tool call: a skill read, an agent asked, a
@@ -183,6 +215,11 @@ pub async fn handle(state: &WorkerState, req: Request) -> Value {
             }
             if let Some(o) = &l.ops {
                 prompt.push_str(&o.prompt_section());
+            }
+            if l.graphs.as_ref().is_some_and(|g| !g.tools().is_empty()) {
+                prompt.push_str(super::code_graph::prompt_line(
+                    super::code_graph::Role::Planner,
+                ));
             }
             info!(team_id = %req.team_id, tools = tools.len(), "Plan chat tools ready");
             json!({
@@ -224,6 +261,7 @@ async fn call(state: &WorkerState, req: &Request, l: &Loaded) -> Value {
             let sources = Sources {
                 live: l.live.as_ref(),
                 ops: l.ops.as_ref(),
+                graphs: l.graphs.as_ref(),
                 state,
             };
             s.offer(&defs(l));
@@ -249,6 +287,7 @@ async fn call(state: &WorkerState, req: &Request, l: &Loaded) -> Value {
     let sources = Sources {
         live: l.live.as_ref(),
         ops: l.ops.as_ref(),
+        graphs: l.graphs.as_ref(),
         state,
     };
     let text = match sources.execute(name, input).await {
@@ -314,6 +353,7 @@ mod tests {
         assert!(!writes("confluence_page"));
         assert_eq!(connection_label("newrelic_nrql"), Some("New Relic"));
         assert_eq!(connection_label("logs_search"), None);
+        assert_eq!(connection_label("graph_callers"), Some("Code graph"));
         assert_eq!(
             item_href("agent", "acme/playbook", "agents/x.md"),
             "/skills/agent/?repo=acme%2Fplaybook&path=agents%2Fx.md"
