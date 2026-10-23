@@ -760,8 +760,13 @@ async fn own_pr_failures(
             return;
         }
         if !super::claim_auto_fix_slot(state, &msg.team_id, &run_id).await {
-            super::record_ci_outcome(state, &msg.team_id, &run_id, super::CiOutcome::HandedOff)
-                .await;
+            super::record_ci_outcome(
+                state,
+                &msg.team_id,
+                &run_id,
+                super::CiOutcome::HandedOff(super::GaveUp::Budget),
+            )
+            .await;
             let body = format!(
                 "These E2E failures look related to this change, but Coderhelm has used its automatic fix attempts on this PR, so it's over to you:\n\n{}",
                 caused.iter().map(|l| format!("- {}", l.text)).collect::<Vec<_>>().join("\n")

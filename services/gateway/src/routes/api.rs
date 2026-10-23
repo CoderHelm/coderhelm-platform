@@ -4245,20 +4245,18 @@ pub async fn health(
                 let tid = claims.team_id.clone();
                 let rid = run_id.clone();
                 tokio::spawn(async move {
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let _ = dynamo
-                        .update_item()
-                        .table_name(&table)
-                        .key("team_id", attr_s(&tid))
-                        .key("run_id", attr_s(&rid))
-                        .update_expression("SET #s = :s, error_message = :e, updated_at = :t, status_run_id = :sri")
-                        .expression_attribute_names("#s", "status")
-                        .expression_attribute_values(":s", attr_s("failed"))
-                        .expression_attribute_values(":e", attr_s("Run timed out (worker process was terminated)"))
-                        .expression_attribute_values(":t", attr_s(&now))
-                        .expression_attribute_values(":sri", attr_s(&format!("failed#{rid}")))
-                        .send()
-                        .await;
+                    // Only while still running (it may have finished since
+                    // the read); the pass is the one the record names.
+                    let failure = common::run_fail::RunFailure {
+                        reason: "Run timed out (worker process was terminated)",
+                        only_from: Some("running"),
+                        ..Default::default()
+                    };
+                    if let Err(e) =
+                        common::run_fail::fail_run(&dynamo, &table, &tid, &rid, &failure).await
+                    {
+                        tracing::warn!(run_id = %rid, error = %e, "Could not mark a crashed run failed");
+                    }
                 });
                 json!({
                     "run_id": &run_id,

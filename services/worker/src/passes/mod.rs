@@ -884,8 +884,17 @@ pub async fn orchestrate_ticket(
             );
             return Ok(());
         }
-    } else {
-        create_run_record(state, &msg, &run_id).await?;
+    } else if let Err(e) = create_run_record(state, &msg, &run_id).await {
+        // The record may already be written: left alone it would sit in
+        // "running" with no pass until the stuck-run sweep called it a timeout.
+        // Say why now; with no record, nothing is written.
+        let reason = format!(
+            "Could not start the run: {}",
+            common::run_fail::error_text(&*e)
+        );
+        error!(run_id, error = %reason, "Run record write failed");
+        fail_run(state, &msg, &run_id, &reason, &usage, 0).await;
+        return Err(reason.into());
     }
 
     match tokio::time::timeout(
@@ -4490,10 +4499,11 @@ async fn create_run_record(
     }
     put.send().await?;
 
-    // Increment analytics counters (current month + all-time)
+    // Increment analytics counters (current month + all-time). A counter is
+    // best effort: it must never stop a run whose record is already written.
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     for period in &[month.as_str(), "ALL_TIME"] {
-        state
+        if let Err(e) = state
             .dynamo
             .update_item()
             .table_name(&state.config.analytics_table_name)
@@ -4502,7 +4512,10 @@ async fn create_run_record(
             .update_expression("ADD total_runs :one")
             .expression_attribute_values(":one", attr_n(1))
             .send()
-            .await?;
+            .await
+        {
+            warn!(run_id, period, error = %common::run_fail::error_text(&e), "Could not count the run");
+        }
     }
 
     Ok(())
@@ -4537,8 +4550,39 @@ pub(crate) async fn update_pass(
     Ok(())
 }
 
-/// A CI result worth counting on the run record, for analytics.
+/// Why Coderhelm stopped trying to get CI green and left the PR to a person.
+/// Stored as `ci_end`; the analytics page groups the runs that ended red by it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GaveUp {
+    /// The run's fix attempts were used up.
+    Budget,
+    /// The same failure came back after a fix.
+    Stalled,
+    /// A fix attempt found nothing to change.
+    NoChange,
+    /// Fixes stopped changing the code.
+    NoProgress,
+    /// The fix attempt itself errored.
+    FixError,
+    /// Every failing check fails on the base branch too.
+    RedOnBase,
+}
+
+impl GaveUp {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            GaveUp::Budget => "budget",
+            GaveUp::Stalled => "stalled",
+            GaveUp::NoChange => "no_change",
+            GaveUp::NoProgress => "no_progress",
+            GaveUp::FixError => "fix_error",
+            GaveUp::RedOnBase => "red_on_base",
+        }
+    }
+}
+
+/// A CI result worth counting on the run record, for analytics.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CiOutcome {
     /// CI was red and Coderhelm started a fix cycle.
     FixAttempt,
@@ -4547,20 +4591,35 @@ pub(crate) enum CiOutcome {
     FixCommitted,
     /// CI came back green.
     Passed,
+    /// CI came back green after a re-run of the failed jobs on a head that
+    /// had failed: the failure was flaky.
+    PassedAfterRerun,
+    /// The failed jobs of this head were re-run once instead of spending a
+    /// fix attempt on them.
+    Rerun(String),
+    /// These failing checks also fail on the base branch.
+    RedOnBase(Vec<String>),
     /// Coderhelm could not get CI green and left the PR to a person; the
-    /// first hand-off's time is kept.
-    HandedOff,
+    /// first hand-off's time is kept, and the latest reason.
+    HandedOff(GaveUp),
 }
 
 impl CiOutcome {
-    fn update_expression(self) -> &'static str {
+    fn update_expression(&self) -> &'static str {
         match self {
             CiOutcome::FixAttempt => "ADD ci_fix_attempts :one SET ci_last = :failed",
             CiOutcome::FixCommitted => {
                 "ADD ci_fix_commits :one SET ci_fixes_at = list_append(if_not_exists(ci_fixes_at, :empty), :at)"
             }
             CiOutcome::Passed => "SET ci_last = :passed",
-            CiOutcome::HandedOff => "SET handed_off_at = if_not_exists(handed_off_at, :now)",
+            CiOutcome::PassedAfterRerun => "SET ci_last = :passed, ci_flaky = :yes",
+            CiOutcome::Rerun(_) => {
+                "ADD ci_reruns :one SET ci_rerun_heads = list_append(if_not_exists(ci_rerun_heads, :empty), :head)"
+            }
+            CiOutcome::RedOnBase(_) => "SET ci_red_on_base = :names, ci_last = :failed",
+            CiOutcome::HandedOff(_) => {
+                "SET handed_off_at = if_not_exists(handed_off_at, :now), ci_end = :why"
+            }
         }
     }
 }
@@ -4584,6 +4643,19 @@ pub(crate) async fn record_ci_outcome(
         CiOutcome::FixAttempt => req
             .expression_attribute_values(":one", attr_n(1))
             .expression_attribute_values(":failed", attr_s("failed")),
+        CiOutcome::PassedAfterRerun => req
+            .expression_attribute_values(":passed", attr_s("passed"))
+            .expression_attribute_values(":yes", AttributeValue::Bool(true)),
+        CiOutcome::Rerun(head) => req
+            .expression_attribute_values(":one", attr_n(1))
+            .expression_attribute_values(":head", AttributeValue::L(vec![attr_s(&head)]))
+            .expression_attribute_values(":empty", AttributeValue::L(vec![])),
+        CiOutcome::RedOnBase(names) => req
+            .expression_attribute_values(
+                ":names",
+                AttributeValue::L(names.iter().map(|n| attr_s(n)).collect()),
+            )
+            .expression_attribute_values(":failed", attr_s("failed")),
         CiOutcome::FixCommitted => {
             let now = chrono::Utc::now().to_rfc3339();
             req.expression_attribute_values(":one", attr_n(1))
@@ -4597,9 +4669,9 @@ pub(crate) async fn record_ci_outcome(
                 )
         }
         CiOutcome::Passed => req.expression_attribute_values(":passed", attr_s("passed")),
-        CiOutcome::HandedOff => {
-            req.expression_attribute_values(":now", attr_s(&chrono::Utc::now().to_rfc3339()))
-        }
+        CiOutcome::HandedOff(why) => req
+            .expression_attribute_values(":now", attr_s(&chrono::Utc::now().to_rfc3339()))
+            .expression_attribute_values(":why", attr_s(why.as_str())),
     };
     if let Err(e) = req.send().await {
         warn!(run_id, error = %e, "Failed to record CI outcome (non-fatal)");
@@ -5210,34 +5282,36 @@ async fn fail_run(
     usage: &TokenUsage,
     duration: u64,
 ) {
-    let now = chrono::Utc::now().to_rfc3339();
     let cost = usage.estimated_cost();
 
-    // Update run record to failed
-    let _ = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(&msg.team_id))
-        .key("run_id", attr_s(run_id))
-        .update_expression(
-            "SET #status = :s, error_message = :err, tokens_in = :ti, \
-             tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, duration_s = :d, \
-             updated_at = :t, status_run_id = :sri",
-        )
-        .expression_attribute_names("#status", "status")
-        .expression_attribute_values(":s", attr_s("failed"))
-        .expression_attribute_values(":err", attr_s(common::truncate_str(error_msg, 500)))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
-        .expression_attribute_values(":d", attr_n(duration))
-        .expression_attribute_values(":t", attr_s(&now))
-        .expression_attribute_values(":sri", attr_s(&format!("failed#{run_id}")))
-        .send()
-        .await;
+    // The one failed-status write: reason, and the pass the record names.
+    let failure = common::run_fail::RunFailure {
+        reason: error_msg,
+        pass: None,
+        only_from: None,
+        extra: vec![
+            ("tokens_in", attr_n(usage.input_tokens)),
+            ("tokens_out", attr_n(usage.output_tokens)),
+            ("cache_read_tokens", attr_n(usage.cache_read_tokens)),
+            ("cache_write_tokens", attr_n(usage.cache_write_tokens)),
+            ("cost_usd", attr_n(format!("{:.4}", cost))),
+            ("duration_s", attr_n(duration)),
+        ],
+    };
+    match common::run_fail::fail_run(
+        &state.dynamo,
+        &state.config.runs_table_name,
+        &msg.team_id,
+        run_id,
+        &failure,
+    )
+    .await
+    {
+        Ok(true) => {}
+        // Cancelled or merged meanwhile: nothing failed, so nothing to tell.
+        Ok(false) => return,
+        Err(e) => warn!(run_id, error = %e, "Could not mark the run failed"),
+    }
 
     // Update analytics counters (include tokens so billing stays accurate)
     let month = chrono::Utc::now().format("%Y-%m").to_string();
@@ -8179,8 +8253,41 @@ mod ci_outcome_tests {
             "SET ci_last = :passed"
         );
         assert_eq!(
-            CiOutcome::HandedOff.update_expression(),
-            "SET handed_off_at = if_not_exists(handed_off_at, :now)"
+            CiOutcome::HandedOff(super::GaveUp::Budget).update_expression(),
+            "SET handed_off_at = if_not_exists(handed_off_at, :now), ci_end = :why"
+        );
+        assert_eq!(
+            CiOutcome::PassedAfterRerun.update_expression(),
+            "SET ci_last = :passed, ci_flaky = :yes"
+        );
+        assert_eq!(
+            CiOutcome::Rerun("h".into()).update_expression(),
+            "ADD ci_reruns :one SET ci_rerun_heads = list_append(if_not_exists(ci_rerun_heads, :empty), :head)"
+        );
+        assert_eq!(
+            CiOutcome::RedOnBase(vec![]).update_expression(),
+            "SET ci_red_on_base = :names, ci_last = :failed"
+        );
+    }
+
+    #[test]
+    fn every_hand_off_reason_has_a_stored_name() {
+        use super::GaveUp::*;
+        let names: Vec<&str> = [Budget, Stalled, NoChange, NoProgress, FixError, RedOnBase]
+            .iter()
+            .map(|g| g.as_str())
+            .collect();
+        // The gateway's analytics read these names (routes/analytics.rs).
+        assert_eq!(
+            names,
+            [
+                "budget",
+                "stalled",
+                "no_change",
+                "no_progress",
+                "fix_error",
+                "red_on_base"
+            ]
         );
     }
 }

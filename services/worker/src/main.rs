@@ -112,7 +112,7 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
         models::WorkerMessage::Ticket(msg) => {
             info!(team_id = %msg.team_id, ticket_id = %msg.ticket_id, "Starting ticket run");
             if let Err(e) = passes::orchestrate_ticket(&state, msg).await {
-                error!("Ticket run failed: {e}");
+                error!(error = %common::run_fail::error_text(&*e), "Ticket run failed");
             }
         }
         models::WorkerMessage::Feedback(msg) => {
@@ -129,43 +129,27 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 {
                     return;
                 }
-                error!("Feedback run failed: {e}");
-                let now = chrono::Utc::now().to_rfc3339();
-                let _ = state
-                    .dynamo
-                    .update_item()
-                    .table_name(&state.config.runs_table_name)
-                    .key(
-                        "team_id",
-                        aws_sdk_dynamodb::types::AttributeValue::S(team_id),
-                    )
-                    .key(
-                        "run_id",
-                        aws_sdk_dynamodb::types::AttributeValue::S(run_id.clone()),
-                    )
-                    .update_expression(
-                        "SET #s = :s, #e = :e, status_run_id = :sri, updated_at = :t",
-                    )
-                    .expression_attribute_names("#s", "status")
-                    .expression_attribute_names("#e", "error")
-                    .expression_attribute_values(
-                        ":s",
-                        aws_sdk_dynamodb::types::AttributeValue::S("failed".to_string()),
-                    )
-                    .expression_attribute_values(
-                        ":e",
-                        aws_sdk_dynamodb::types::AttributeValue::S(format!("{e}")),
-                    )
-                    .expression_attribute_values(
-                        ":sri",
-                        aws_sdk_dynamodb::types::AttributeValue::S(format!("failed#{run_id}")),
-                    )
-                    .expression_attribute_values(
-                        ":t",
-                        aws_sdk_dynamodb::types::AttributeValue::S(now),
-                    )
-                    .send()
-                    .await;
+                // The error with its causes: the SDK's own text is just
+                // "service error".
+                let reason = common::run_fail::error_text(err);
+                error!(run_id, error = %reason, "Feedback run failed");
+                // The one failed-status write. It never overwrites a run that
+                // was cancelled (a closed PR) or merged meanwhile.
+                if let Err(werr) = common::run_fail::fail_run(
+                    &state.dynamo,
+                    &state.config.runs_table_name,
+                    &team_id,
+                    &run_id,
+                    &common::run_fail::RunFailure {
+                        reason: &format!("Feedback pass failed: {reason}"),
+                        pass: Some("feedback"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                {
+                    error!(run_id, error = %werr, "Could not mark the run failed");
+                }
             }
         }
         models::WorkerMessage::JiraComment(msg) => {

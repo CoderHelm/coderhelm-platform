@@ -393,10 +393,15 @@ export class WorkerStack extends cdk.Stack {
       environment: {
         RUNS_TABLE_NAME: `coderhelm-${props.stage}-runs`,
         MAX_RUN_MINUTES: "20",
+        // The last pass a stuck run reached when its record names none.
+        TRACES_TABLE_NAME: props.tracesTable.tableName,
+        CHECKPOINTS_TABLE_NAME: props.checkpointsTable.tableName,
       },
     });
 
     runsTable.grantReadWriteData(cleanupFunction);
+    props.tracesTable.grantReadData(cleanupFunction);
+    props.checkpointsTable.grantReadData(cleanupFunction);
     // The runs table is CMK-encrypted; grantReadWriteData on a fromTableName
     // ref does NOT include KMS, so every scan failed with AccessDenied and the
     // reaper silently never cleaned a single stuck run. Grant decrypt/encrypt.
