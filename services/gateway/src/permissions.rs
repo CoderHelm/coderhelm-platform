@@ -386,10 +386,10 @@ pub const CAPABILITIES: &[Capability] = &[
         min_role: "admin",
         handlers: &[
             "api::health",
-            "api::list_dlq_messages",
-            "api::redrive_dlq_message",
-            "api::delete_dlq_message",
-            "api::purge_dlq",
+            "dlq::list_dlq_messages",
+            "dlq::redrive_dlq_message",
+            "dlq::delete_dlq_message",
+            "dlq::purge_dlq",
         ],
     },
     Capability {

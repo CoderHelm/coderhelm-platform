@@ -76,6 +76,7 @@ const worker = new WorkerStack(app, `${prefix}-worker`, {
   ticketQueue: api.ticketQueue,
   ciFixQueue: api.ciFixQueue,
   feedbackQueue: api.feedbackQueue,
+  dlq: api.dlq,
   mcpProxyFunction: api.mcpProxyFunction,
   encryptionKey: database.encryptionKey,
   secretsKey: database.secretsKey,

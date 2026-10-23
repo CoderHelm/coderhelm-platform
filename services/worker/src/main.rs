@@ -347,6 +347,19 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Code-graph index failed: {e:?}");
             }
         }
+        models::WorkerMessage::DlqCleanup => {
+            info!("DLQ cleanup");
+            match passes::dlq_cleanup::run(&state).await {
+                Ok(report) => info!(
+                    read = report.read,
+                    archived = report.archived,
+                    kept = report.kept,
+                    complete = report.complete,
+                    "DLQ cleanup done"
+                ),
+                Err(e) => error!("DLQ cleanup failed: {e}"),
+            }
+        }
         models::WorkerMessage::UsageReconcile(msg) => {
             info!(day = %msg.day, "Usage reconciliation");
             if let Err(e) = passes::usage_reconcile::run(&state, msg).await {

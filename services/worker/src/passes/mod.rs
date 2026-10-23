@@ -691,6 +691,7 @@ pub mod await_merge;
 mod checks;
 pub mod code_graph;
 mod completeness;
+pub mod dlq_cleanup;
 pub mod e2e;
 pub mod feedback;
 pub mod fix_location;

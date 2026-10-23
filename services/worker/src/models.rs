@@ -29,6 +29,9 @@ pub struct Config {
     pub ci_fix_queue_url: String,
     pub ticket_queue_url: String,
     pub feedback_queue_url: String,
+    /// The shared dead-letter queue (the DLQ cleanup reads it). Empty: the
+    /// cleanup does nothing.
+    pub dlq_url: String,
     /// Execution sandbox: S3 bucket for transient source tarballs and the
     /// CodeBuild project that runs the repo's real build/lint/tests. Both empty
     /// => sandbox disabled (the agent falls back to blind CI, never worse).
@@ -78,6 +81,7 @@ impl Config {
             ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").unwrap_or_default(),
             ticket_queue_url: std::env::var("TICKET_QUEUE_URL").unwrap_or_default(),
             feedback_queue_url: std::env::var("FEEDBACK_QUEUE_URL").unwrap_or_default(),
+            dlq_url: std::env::var("DLQ_URL").unwrap_or_default(),
             sandbox_bucket_name: std::env::var("SANDBOX_BUCKET_NAME").unwrap_or_default(),
             sandbox_project_name: std::env::var("SANDBOX_PROJECT_NAME").unwrap_or_default(),
             tests_table_name: std::env::var("TESTS_TABLE_NAME").unwrap_or_default(),
@@ -184,7 +188,14 @@ pub enum WorkerMessage {
     /// it, a new connection, or an admin's "Sync now").
     #[serde(rename = "skill_sync")]
     SkillSync(common::skills::SkillSyncMessage),
+    /// The one PascalCase tag on the wire. It was left without a rename when
+    /// it was added; gateway and worker agree on it, so it is pinned as is.
+    #[serde(rename = "SkillAsk")]
     SkillAsk(common::skills::SkillAskMessage),
+    /// Daily (EventBridge → SQS): archive to S3, then delete, DLQ messages the
+    /// worker can't read once they are `common::dlq::CLEANUP_AFTER_DAYS` old.
+    #[serde(rename = "dlq_cleanup")]
+    DlqCleanup,
     /// The Monday weekly summary emails (EventBridge → SQS). Sends nothing
     /// unless WEEKLY_SUMMARY_ENABLED is true.
     #[serde(rename = "weekly_summary")]
@@ -314,7 +325,8 @@ impl WorkerMessage {
             | WorkerMessage::GraphIndex(_)
             | WorkerMessage::WeeklySummary
             | WorkerMessage::WeeklySummaryTest(_)
-            | WorkerMessage::UsageReconcile(_) => f::OTHER,
+            | WorkerMessage::UsageReconcile(_)
+            | WorkerMessage::DlqCleanup => f::OTHER,
         }
     }
 }
@@ -932,4 +944,96 @@ pub struct ToolProposalsMessage {
     pub repo_name: String,
     pub sha: String,
     pub paths: Vec<String>,
+}
+
+/// The gateway → worker contract (see `common::dlq::CONTRACT_JSON`): every
+/// message the gateway or a schedule sends is a type this enum reads.
+#[cfg(test)]
+mod worker_contract_tests {
+    use super::WorkerMessage;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+
+    fn contract() -> Value {
+        serde_json::from_str(common::dlq::CONTRACT_JSON).unwrap()
+    }
+
+    /// Every tag this enum accepts, read from serde itself.
+    fn worker_tags() -> BTreeSet<String> {
+        let err = serde_json::from_str::<WorkerMessage>(r#"{"type":"__no_such_type__"}"#)
+            .unwrap_err()
+            .to_string();
+        common::dlq::accepted_tags(&err).into_iter().collect()
+    }
+
+    #[test]
+    fn the_shared_type_list_is_exactly_this_enums_tags() {
+        let listed: BTreeSet<String> = common::dlq::WORKER_MESSAGE_TYPES
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        assert_eq!(
+            worker_tags(),
+            listed,
+            "common::dlq::WORKER_MESSAGE_TYPES must list exactly the tags WorkerMessage reads"
+        );
+    }
+
+    /// Each sample (the gateway's exact output, and each scheduled job) parses
+    /// here and serializes back to the same tag.
+    #[test]
+    fn the_worker_reads_every_gateway_and_scheduled_message() {
+        let c = contract();
+        let mut n = 0;
+        for section in ["gateway", "scheduled"] {
+            for (tag, body) in c[section].as_object().unwrap() {
+                let msg: WorkerMessage = serde_json::from_value(body.clone()).unwrap_or_else(|e| {
+                    panic!("the worker can't read the {section} message `{tag}`: {e}")
+                });
+                let again = serde_json::to_value(&msg).unwrap();
+                assert_eq!(again["type"], tag.as_str(), "{section}.{tag}");
+                n += 1;
+            }
+        }
+        assert!(n >= 25, "only {n} samples");
+    }
+
+    /// Every message an EventBridge schedule in infra sends is in the
+    /// contract's scheduled section (so the test above parses it).
+    #[test]
+    fn every_scheduled_message_in_infra_is_in_the_contract() {
+        let c = contract();
+        let infra = [
+            include_str!("../../../infra/lib/api-stack.ts"),
+            include_str!("../../../infra/lib/worker-stack.ts"),
+        ];
+        let mut found = 0;
+        for src in infra {
+            for chunk in src.split("RuleTargetInput.fromObject(").skip(1) {
+                let Some(t) = chunk
+                    .split("type:")
+                    .nth(1)
+                    .and_then(|r| r.split('"').nth(1))
+                else {
+                    continue;
+                };
+                assert!(
+                    c["scheduled"].get(t).is_some(),
+                    "infra schedules `{t}`, which is missing from the contract's scheduled section"
+                );
+                found += 1;
+            }
+        }
+        assert!(found >= 5, "found only {found} schedules");
+    }
+
+    #[test]
+    fn a_pascal_case_skill_sync_is_refused() {
+        let e = serde_json::from_str::<WorkerMessage>(
+            r#"{"type":"SkillSync","team_id":"TEAM#team-a","repo":"acme/skills","recheck":true}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("unknown variant `SkillSync`"), "{e}");
+    }
 }

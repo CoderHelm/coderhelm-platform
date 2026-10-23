@@ -174,6 +174,9 @@ pub enum WorkerMessage {
     /// Read a connected skill repository's default branch again.
     #[serde(rename = "skill_sync")]
     SkillSync(common::skills::SkillSyncMessage),
+    /// The one PascalCase tag on the wire; pinned as is (the worker reads it
+    /// this way). See `common::dlq::WORKER_MESSAGE_TYPES`.
+    #[serde(rename = "SkillAsk")]
     SkillAsk(common::skills::SkillAskMessage),
     /// CoderHelm's PR was closed without merging: the worker reads what
     /// happened and records a lesson when the fix belonged outside the code.
@@ -732,4 +735,85 @@ pub struct ToolProposalsMessage {
     pub repo_name: String,
     pub sha: String,
     pub paths: Vec<String>,
+}
+
+/// The gateway → worker contract (see `common::dlq::CONTRACT_JSON`). The
+/// worker's test parses the same samples, so a tag the worker can't read
+/// fails a test here or there instead of reaching the DLQ in production.
+#[cfg(test)]
+mod worker_contract_tests {
+    use super::WorkerMessage;
+    use serde_json::Value;
+
+    fn samples() -> serde_json::Map<String, Value> {
+        let v: Value = serde_json::from_str(common::dlq::CONTRACT_JSON).unwrap();
+        v["gateway"].as_object().unwrap().clone()
+    }
+
+    /// Every tag the gateway's enum has, read from serde itself.
+    fn gateway_tags() -> Vec<String> {
+        let err = serde_json::from_str::<WorkerMessage>(r#"{"type":"__no_such_type__"}"#)
+            .unwrap_err()
+            .to_string();
+        common::dlq::accepted_tags(&err)
+    }
+
+    #[test]
+    fn every_gateway_message_type_has_a_contract_sample() {
+        let mut tags = gateway_tags();
+        tags.sort();
+        let mut sampled: Vec<String> = samples().keys().cloned().collect();
+        sampled.sort();
+        assert_eq!(
+            tags, sampled,
+            "every WorkerMessage variant needs a sample in services/common/contract/worker_messages.json"
+        );
+    }
+
+    #[test]
+    fn every_gateway_tag_is_one_the_worker_reads() {
+        for tag in gateway_tags() {
+            assert!(
+                common::dlq::WORKER_MESSAGE_TYPES.contains(&tag.as_str()),
+                "the gateway sends `{tag}` but the worker has no such type"
+            );
+        }
+    }
+
+    /// The samples are byte-for-byte what the gateway sends, so the worker's
+    /// test parses real gateway output. `UPDATE_WORKER_CONTRACT=1` rewrites
+    /// the gateway section from the gateway's own serialization.
+    #[test]
+    fn the_gateway_serializes_each_sample_exactly() {
+        let mut out = serde_json::Map::new();
+        let mut errors = Vec::new();
+        for (tag, body) in samples() {
+            let msg: WorkerMessage = match serde_json::from_value(body.clone()) {
+                Ok(m) => m,
+                Err(e) => {
+                    errors.push(format!("{tag}: the gateway can't parse its sample: {e}"));
+                    continue;
+                }
+            };
+            let again = serde_json::to_value(&msg).unwrap();
+            assert_eq!(
+                again["type"],
+                tag.as_str(),
+                "{tag} serializes to another tag"
+            );
+            if again != body {
+                errors.push(format!("{tag}: the gateway sends {again}"));
+            }
+            out.insert(tag, again);
+        }
+        if std::env::var("UPDATE_WORKER_CONTRACT").is_ok() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../common/contract/worker_messages.json");
+            let mut v: Value = serde_json::from_str(common::dlq::CONTRACT_JSON).unwrap();
+            v["gateway"] = Value::Object(out);
+            std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap() + "\n").unwrap();
+            return;
+        }
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
 }

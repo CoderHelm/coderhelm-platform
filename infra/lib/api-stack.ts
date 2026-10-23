@@ -46,6 +46,8 @@ export class ApiStack extends cdk.Stack {
   public readonly ticketQueue: sqs.Queue;
   public readonly ciFixQueue: sqs.Queue;
   public readonly feedbackQueue: sqs.Queue;
+  /** The shared dead-letter queue (the worker's DLQ cleanup reads it). */
+  public readonly dlq: sqs.Queue;
 
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
@@ -224,6 +226,7 @@ export class ApiStack extends cdk.Stack {
       retentionPeriod: cdk.Duration.days(14),
       encryption: sqs.QueueEncryption.SQS_MANAGED,
     });
+    this.dlq = dlq;
 
     this.ticketQueue = new sqs.Queue(this, "TicketQueue", {
       queueName: `${prefix}-tickets`,
@@ -308,6 +311,24 @@ export class ApiStack extends cdk.Stack {
         new targets.SqsQueue(this.ticketQueue, {
           message: events.RuleTargetInput.fromObject({
             type: "usage_reconcile",
+          }),
+        }),
+      ],
+    });
+
+    // DLQ cleanup: daily 07:00 UTC. The worker archives to S3, then deletes,
+    // DLQ messages it can't parse (an unknown type, not JSON) once they are
+    // 7 days old (common::dlq::CLEANUP_AFTER_DAYS), before the DLQ's 14-day
+    // retention drops them with no record. Messages it can read are never
+    // touched.
+    new events.Rule(this, "DlqCleanupSchedule", {
+      ruleName: `${prefix}-dlq-cleanup`,
+      description: "Archive and delete DLQ messages the worker can't parse (daily)",
+      schedule: events.Schedule.cron({ minute: "0", hour: "7" }),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "dlq_cleanup",
           }),
         }),
       ],
