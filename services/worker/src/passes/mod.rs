@@ -705,6 +705,7 @@ pub mod jira_comment;
 pub mod lessons;
 pub mod line_count;
 pub mod live_sources;
+pub mod log_autofix;
 pub mod onboard;
 pub mod ops_tools;
 mod plan;
@@ -5213,7 +5214,7 @@ async fn complete_run(
 
 /// Check if the team has exceeded their configured monthly token limit.
 /// Returns Some(reason) if exceeded, None if within budget or no limit set.
-async fn check_budget_exceeded(state: &WorkerState, team_id: &str) -> Option<String> {
+pub(crate) async fn check_budget_exceeded(state: &WorkerState, team_id: &str) -> Option<String> {
     // Load token limit
     let limit = state
         .dynamo

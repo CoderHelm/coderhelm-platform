@@ -29,6 +29,8 @@ pub mod e2e;
 /// A team's branch, commit and PR title templates, and how they render.
 pub mod git_conventions;
 pub mod live;
+/// Log findings and the fix runs started from them.
+pub mod log_findings;
 /// Sealed credentials for a team's MCP servers (KMS, bound to team and server).
 pub mod mcp_credentials;
 pub mod memory_meta;

@@ -360,6 +360,15 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 Err(e) => error!("DLQ cleanup failed: {e}"),
             }
         }
+        models::WorkerMessage::LogAutofix => match passes::log_autofix::run(&state).await {
+            Ok(r) => info!(
+                teams = r.teams,
+                started = r.started,
+                skipped = r.skipped,
+                "Automatic log-finding fixes swept"
+            ),
+            Err(e) => error!("Automatic log-finding sweep failed: {e}"),
+        },
         models::WorkerMessage::UsageReconcile(msg) => {
             info!(day = %msg.day, "Usage reconciliation");
             if let Err(e) = passes::usage_reconcile::run(&state, msg).await {

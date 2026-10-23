@@ -440,6 +440,32 @@ Return ONLY the markdown body text."#,
         .join("\n");
     let clean_body = clean_body.trim();
 
+    // A fix from a log finding says where it came from, first, in its own
+    // words (not the writer's): "Started automatically from log finding X".
+    let log_ticket = if matches!(msg.source, TicketSource::Alert) {
+        common::log_findings::load_ticket(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &msg.ticket_id,
+        )
+        .await
+    } else {
+        None
+    };
+    let clean_body = match &log_ticket {
+        Some(t) => {
+            let origin = common::log_findings::origin_line(t.auto, &t.title);
+            let rest: String = clean_body
+                .lines()
+                .filter(|l| l.trim() != origin)
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{origin}\n\n{}", rest.trim())
+        }
+        None => clean_body.to_string(),
+    };
+    let clean_body = clean_body.as_str();
     let full_body = if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
         format!(
             "Closes #{number}\n\n{clean_body}",
@@ -566,7 +592,18 @@ Return ONLY the markdown body text."#,
             .unwrap_or("")
             .to_string();
         info!(pr_number = number, pr_url = %url, "PR created");
-        if matches!(msg.source, TicketSource::Alert) {
+        if let Some(t) = &log_ticket {
+            super::log_autofix::notify_pr(
+                state,
+                &msg.team_id,
+                t,
+                &format!("{}/{}", msg.repo_owner, msg.repo_name),
+                number,
+                &title,
+                &url,
+            )
+            .await;
+        } else if matches!(msg.source, TicketSource::Alert) {
             notify_alert_pr(state, msg, number, &title, &url).await;
         }
         (number, url, nid)

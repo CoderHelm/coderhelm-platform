@@ -513,6 +513,32 @@ async fn main() -> Result<(), Error> {
             "/recommendations/:id/dismiss",
             post(routes::log_analyzer::dismiss_recommendation),
         )
+        // Logs: the log analyzer's findings and the fix runs started from them
+        .route("/log-findings", get(routes::log_findings::list_findings))
+        .route(
+            "/log-findings/autofix",
+            get(routes::log_findings::get_autofix).put(routes::log_findings::put_autofix),
+        )
+        .route(
+            "/log-findings/:id/samples",
+            get(routes::log_findings::get_samples),
+        )
+        .route(
+            "/log-findings/:id/fix",
+            post(routes::log_findings::create_fix),
+        )
+        .route(
+            "/log-findings/:id/ignore",
+            post(routes::log_findings::ignore_finding),
+        )
+        .route(
+            "/log-findings/:id/acknowledge",
+            post(routes::log_findings::acknowledge_finding),
+        )
+        .route(
+            "/log-findings/:id/reopen",
+            post(routes::log_findings::reopen_finding),
+        )
         // MCP Servers
         .route("/plugins/catalog", get(routes::plugins::list_catalog))
         .route("/plugins", get(routes::plugins::list_enabled))

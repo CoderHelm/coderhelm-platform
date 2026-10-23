@@ -106,7 +106,7 @@ class Teams(unittest.TestCase):
         self.assertIn("7 new log findings", c["body"][0]["items"][0]["text"])
         self.assertIn("boom", c["body"][2]["items"][0]["text"])
         self.assertEqual(c["body"][-1]["text"], "+2 more")
-        self.assertEqual(c["actions"][0]["url"], "https://app.example/settings/aws")
+        self.assertEqual(c["actions"][0]["url"], "https://app.example/logs")
 
 
 class UsageAccounting(unittest.TestCase):
@@ -220,7 +220,7 @@ class Slack(unittest.TestCase):
         self.assertEqual(msg["blocks"][0]["type"], "header")
         section = msg["blocks"][3]["text"]["text"]
         self.assertEqual(section, "🔴 *&lt;boom&gt;*\n5xx &amp; rising")
-        self.assertEqual(msg["blocks"][-1]["elements"][0]["url"], "https://app.example/settings/aws")
+        self.assertEqual(msg["blocks"][-1]["elements"][0]["url"], "https://app.example/logs")
 
     def test_sealed_webhooks_open_for_their_team_only(self):
         class Kms:
@@ -267,3 +267,74 @@ class Slack(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FindingCounts(unittest.TestCase):
+    GROUPED = [
+        {"log_group": "/aws/lambda/shop", "queries": [
+            {"results": [{"error_count": "12"}, {"error_count": "3"}]},
+            {"results": [{"@message": "no count column"}]},
+        ]},
+        {"log_group": "/ecs/web", "queries": [{"results": [{"crash_count": "2"}, {"crash_count": "x"}]}]},
+    ]
+
+    def test_counts_sum_per_log_group(self):
+        counts = h.error_counts_by_log_group(self.GROUPED)
+        self.assertEqual(counts, {"/aws/lambda/shop": 16, "/ecs/web": 3})
+        self.assertEqual(h.count_for({"source_log_group": "/ecs/web"}, counts), 3)
+        self.assertIsNone(h.count_for({"source_log_group": "/missing"}, counts))
+        self.assertIsNone(h.count_for({"source_log_group": "/ecs/web"}, None))
+
+    def test_suspected_location_is_kept_only_when_named(self):
+        self.assertEqual(h.suspected_location({"suspected_location": " src/checkout.py:42 "}), "src/checkout.py:42")
+        for empty in (None, "", "null", "Unknown", 5):
+            self.assertEqual(h.suspected_location({"suspected_location": empty}), "")
+        self.assertEqual(len(h.suspected_location({"suspected_location": "x" * 999})), 300)
+
+
+class StoreFindings(unittest.TestCase):
+    class Table:
+        def __init__(self, fail_condition=False):
+            self.calls = []
+            self.fail_condition = fail_condition
+
+        def put_item(self, Item):
+            self.calls.append(("put", Item))
+
+        def update_item(self, **kw):
+            self.calls.append(("update", kw))
+            if self.fail_condition and "ConditionExpression" in kw:
+                e = h.ClientError()
+                e.response = {"Error": {"Code": "ConditionalCheckFailedException"}}
+                raise e
+
+    def setUp(self):
+        self.saved = h.aws_insights_table
+
+    def tearDown(self):
+        h.aws_insights_table = self.saved
+
+    def test_a_new_finding_stores_its_count_and_location(self):
+        h.aws_insights_table = t = self.Table()
+        rec = {"title": "Timeouts", "source_log_group": "/aws/lambda/shop", "error_pattern": "Task timed out",
+               "suspected_location": "handler.py"}
+        rec_id, new = h.store_recommendation("TEAM#a", "111122223333", rec, [], {"/aws/lambda/shop": 16})
+        self.assertTrue(new and rec_id)
+        item = t.calls[0][1]
+        self.assertEqual((item["error_count"], item["suspected_location"]), (16, "handler.py"))
+
+    def test_a_finding_being_fixed_is_refreshed_without_a_ttl(self):
+        h.aws_insights_table = t = self.Table(fail_condition=True)
+        existing = [{"rec_id": "r1", "sk": "REC#r1", "error_hash": h.error_hash_for("111122223333", {"source_log_group": "/g", "error_pattern": "p"})}]
+        rec_id, new = h.store_recommendation("TEAM#a", "111122223333", {"source_log_group": "/g", "error_pattern": "p"}, existing, {"/g": 4})
+        self.assertEqual((rec_id, new), ("r1", False))
+        first, second = t.calls
+        self.assertIn("attribute_not_exists(fix_ticket_id)", first[1]["ConditionExpression"])
+        self.assertNotIn("ttl", second[1]["UpdateExpression"])
+        self.assertEqual(second[1]["ExpressionAttributeValues"][":c"], 4)
+
+    def test_chat_buttons_open_the_logs_page(self):
+        card = h.recommendations_card("1", [{"title": "a", "severity": "critical"}], "https://app")
+        self.assertEqual(card["attachments"][0]["content"]["actions"][0]["url"], "https://app/logs")
+        slack = h.recommendations_slack("1", [{"title": "a"}], "https://app")
+        self.assertEqual(slack["blocks"][-1]["elements"][0]["url"], "https://app/logs")

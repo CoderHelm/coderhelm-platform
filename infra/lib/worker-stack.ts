@@ -137,7 +137,9 @@ export class WorkerStack extends cdk.Stack {
     // Agents read a connected AWS account's abilities (metrics, Airflow) from
     // its record; they never change it.
     const awsInsightsTable = dynamodb.TableV2.fromTableName(this, "AwsInsightsTableRef", `coderhelm-${props.stage}-aws-insights`);
-    awsInsightsTable.grantReadData(this.workerFunction);
+    // Read/write: the automatic log-finding sweep records on each finding the
+    // fix it started or why it didn't.
+    awsInsightsTable.grantReadWriteData(this.workerFunction);
 
     props.usersTable.grantReadData(this.workerFunction);
     props.plansTable.grantReadWriteData(this.workerFunction);
