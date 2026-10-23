@@ -9,6 +9,12 @@
 //! text against the same tools is held to the last one
 //! (`skill_compat::stabilize`), so a re-check never flips a step on the
 //! model's whim.
+//!
+//! Every call of a sync sends the same instructions, schema and inventory
+//! before its item, so those are cached (two breakpoints: the system prompt
+//! with the schema, then the inventory) and the item's text is the only new
+//! input; one item per inventory is checked first so the parallel calls
+//! after it read the cache instead of each writing it.
 
 use std::time::{Duration, Instant};
 
@@ -249,10 +255,13 @@ const NEVER: &[&str] = &[
 #[async_trait::async_trait]
 pub trait Checker: Send + Sync {
     fn model(&self) -> &str;
-    /// `attempt` is which of [`TRIES`] this is.
+    /// `shared` opens the user message and is the same for every item
+    /// checked against the same inventory (it is cached); `user` is this
+    /// item's own text after it. `attempt` is which of [`TRIES`] this is.
     async fn check(
         &self,
         system: &str,
+        shared: &str,
         user: &str,
         schema: &Value,
         attempt: usize,
@@ -274,6 +283,7 @@ impl Checker for TeamModel<'_> {
     async fn check(
         &self,
         system: &str,
+        shared: &str,
         user: &str,
         schema: &Value,
         attempt: usize,
@@ -281,10 +291,11 @@ impl Checker for TeamModel<'_> {
         let mut usage = TokenUsage::default();
         let client = self.provider.client();
         let (effort, constrained) = TRIES[attempt.min(TRIES.len() - 1)];
-        let r = crate::agent::anthropic::converse_json(
+        let r = crate::agent::anthropic::converse_json_shared(
             &client,
             &self.model,
             system,
+            shared,
             user,
             schema,
             constrained,
@@ -307,7 +318,9 @@ pub async fn check_item(
     body: &str,
 ) -> Result<(Analysis, String), String> {
     let started = Instant::now();
-    let user = skill_compat::user_message(inv, m.kind.as_str(), &m.name, body, &m.files);
+    // The inventory first, cached across the sync's items; the item after.
+    let shared = skill_compat::inventory_message(inv);
+    let user = skill_compat::item_message(m.kind.as_str(), &m.name, body, &m.files);
     let source_chars = common::skills::parse_front_matter(body)
         .2
         .trim()
@@ -326,7 +339,7 @@ pub async fn check_item(
             format!("{user}{}", skill_compat::retry_note(&unusable))
         };
         let (raw, spent) = checker
-            .check(skill_compat::SYSTEM, &ask, &schema, attempt)
+            .check(skill_compat::SYSTEM, &shared, &ask, &schema, attempt)
             .await;
         usage.merge(&spent);
         result = match raw {
@@ -404,6 +417,41 @@ pub fn to_check<'a>(
         .collect()
 }
 
+/// Splits the items to check into those checked first, one at a time, and
+/// the rest, checked in parallel. Items checked against the same inventory
+/// (`shared`, the cached opening of their message) share a cache entry, so
+/// the first item of each inventory that more than one item uses goes
+/// first and writes it. When no inventory is shared, the first item goes
+/// first anyway, so the system prompt and schema are cached before the
+/// parallel calls start. Order within each part is kept.
+pub fn warm_first(
+    todo: Vec<&Queued>,
+    shared: impl Fn(&Queued) -> String,
+) -> (Vec<&Queued>, Vec<&Queued>) {
+    let keys: Vec<String> = todo.iter().map(|item| shared(item)).collect();
+    let mut warm_at: Vec<usize> = Vec::new();
+    for (i, k) in keys.iter().enumerate() {
+        let first = keys.iter().position(|o| o == k) == Some(i);
+        let reused = keys.iter().filter(|o| *o == k).count() > 1;
+        if first && reused {
+            warm_at.push(i);
+        }
+    }
+    if warm_at.is_empty() && !todo.is_empty() {
+        warm_at.push(0);
+    }
+    let mut warm = Vec::new();
+    let mut rest = Vec::new();
+    for (i, item) in todo.into_iter().enumerate() {
+        if warm_at.contains(&i) {
+            warm.push(item);
+        } else {
+            rest.push(item);
+        }
+    }
+    (warm, rest)
+}
+
 /// One item's path, checked text hash, the fingerprint of the inventory it
 /// was checked against, whether its last check was of other
 /// text or another inventory, and its check (`None` when the run's time
@@ -467,28 +515,24 @@ async fn run_inner(state: &WorkerState, team_id: &str, repo: &str, only: &str, f
     };
     let started = Instant::now();
     let total = todo.len();
-    let results: Vec<Outcome> = futures::stream::iter(todo)
-        .map(|item| {
-            let (m, body, _) = item;
-            let checker = &checker;
-            let inv = inventory_for(&base, m, body);
-            let fp = inv.fingerprint();
-            let outdated = m.compat.hash != m.hash || m.compat.fingerprint != fp;
-            async move {
-                if started.elapsed() > BUDGET {
-                    return (m.path.clone(), m.hash.clone(), fp, outdated, None);
-                }
-                let r = check_item(checker, &inv, m, body).await.map(|done| {
-                    let (a, t) = hold_to_last(item, &inv, done);
-                    // What's kept names only tools this item's runtime has.
-                    skill_compat::enforce(a, t, &inv)
-                });
-                (m.path.clone(), m.hash.clone(), fp, outdated, Some(r))
-            }
-        })
-        .buffer_unordered(PARALLEL)
-        .collect()
-        .await;
+    let check = |item| check_one(&checker, &base, started, item);
+    // One item per shared inventory is checked first, one at a time, so
+    // its call writes the cache; the rest then read it in parallel instead
+    // of all writing it at once.
+    let (warm, rest) = warm_first(todo, |(m, body, _)| {
+        skill_compat::inventory_message(&inventory_for(&base, m, body))
+    });
+    let mut results: Vec<Outcome> = Vec::with_capacity(total);
+    for item in warm {
+        results.push(check(item).await);
+    }
+    results.extend(
+        futures::stream::iter(rest)
+            .map(check)
+            .buffer_unordered(PARALLEL)
+            .collect::<Vec<_>>()
+            .await,
+    );
     let mut done = 0usize;
     let mut cost = 0.0f64;
     for (path, hash, fp, outdated, r) in results {
@@ -526,6 +570,28 @@ async fn run_inner(state: &WorkerState, team_id: &str, repo: &str, only: &str, f
         cost_usd = cost,
         "Skill checks done"
     );
+}
+
+/// Checks one item of a run, unless the run's time is up.
+async fn check_one(
+    checker: &dyn Checker,
+    base: &Inventory,
+    started: Instant,
+    item: &Queued,
+) -> Outcome {
+    let (m, body, _) = item;
+    let inv = inventory_for(base, m, body);
+    let fp = inv.fingerprint();
+    let outdated = m.compat.hash != m.hash || m.compat.fingerprint != fp;
+    if started.elapsed() > BUDGET {
+        return (m.path.clone(), m.hash.clone(), fp, outdated, None);
+    }
+    let r = check_item(checker, &inv, m, body).await.map(|done| {
+        let (a, t) = hold_to_last(item, &inv, done);
+        // What's kept names only tools this item's runtime has.
+        skill_compat::enforce(a, t, &inv)
+    });
+    (m.path.clone(), m.hash.clone(), fp, outdated, Some(r))
 }
 
 /// Everything the team's items can rely on in Coderhelm right now.
@@ -766,13 +832,15 @@ mod tests {
         async fn check(
             &self,
             system: &str,
+            shared: &str,
             user: &str,
             schema: &Value,
             attempt: usize,
         ) -> (Result<Value, String>, TokenUsage) {
             assert!(attempt < TRIES.len());
             assert!(system.contains("Read the WHOLE text"));
-            assert!(user.contains("## Coderhelm inventory"));
+            assert!(shared.starts_with("## Coderhelm inventory"));
+            assert!(!user.contains("## Coderhelm inventory"));
             assert!(user.contains("skill `triage`"));
             assert_eq!(
                 schema["required"],
@@ -889,6 +957,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
+            _: &str,
             _: &Value,
             _: usize,
         ) -> (Result<Value, String>, TokenUsage) {
@@ -920,6 +989,7 @@ mod tests {
         }
         async fn check(
             &self,
+            _: &str,
             _: &str,
             user: &str,
             _: &Value,
@@ -1042,6 +1112,7 @@ mod tests {
         }
         async fn check(
             &self,
+            _: &str,
             _: &str,
             _: &str,
             _: &Value,
@@ -1200,6 +1271,178 @@ mod tests {
         assert_eq!(run_checks.passes, ["coder"]);
     }
 
+    /// The request one item's check sends, on the model the sync uses.
+    fn request_for(inv: &Inventory, m: &SkillMeta, body: &str) -> Value {
+        serde_json::from_str(&sent_for(inv, m, body)).unwrap()
+    }
+
+    /// The same request as the bytes sent.
+    fn sent_for(inv: &Inventory, m: &SkillMeta, body: &str) -> String {
+        let (effort, constrained) = TRIES[0];
+        crate::agent::anthropic::json_request_body(
+            "claude-sonnet-5-5",
+            skill_compat::SYSTEM,
+            &skill_compat::inventory_message(inv),
+            &skill_compat::item_message(m.kind.as_str(), &m.name, body, &m.files),
+            &skill_compat::output_schema(),
+            constrained,
+            effort,
+            MAX_TOKENS,
+        )
+    }
+
+    /// A sent request up to where the item's own block starts.
+    fn before_item<'a>(sent: &'a str, item_text: &Value) -> &'a str {
+        let start = format!(",{{\"text\":{item_text}");
+        let at = sent.find(&start).expect("the item's block");
+        &sent[..at]
+    }
+
+    #[test]
+    fn two_items_send_the_same_bytes_up_to_the_breakpoint() {
+        let i = inv();
+        let a = meta("skills/triage/SKILL.md", "h1", "", "");
+        let mut b = meta("commands/release.md", "h2", "", "");
+        b.kind = Kind::Command;
+        b.name = "release".into();
+        b.files = vec!["notes.md".into()];
+        let ra = request_for(&i, &a, "Read the logs, then open a ticket.");
+        let rb = request_for(&i, &b, "Tag the release and write the notes.");
+
+        // System prompt and schema: one block, cached.
+        assert_eq!(ra["system"], rb["system"]);
+        assert_eq!(ra["system"].as_array().unwrap().len(), 1);
+        assert_eq!(ra["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(ra["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"required\":[\"steps\",\"translated\",\"reviews\"]"));
+        // The inventory opens the user message and carries the breakpoint;
+        // the item comes after it, uncached.
+        let (ca, cb) = (&ra["messages"][0]["content"], &rb["messages"][0]["content"]);
+        assert_eq!(ca.as_array().unwrap().len(), 2);
+        assert_eq!(ca[0], cb[0]);
+        assert_eq!(ca[0]["cache_control"]["type"], "ephemeral");
+        assert!(ca[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("## Coderhelm inventory for this team"));
+        assert!(ca[1].get("cache_control").is_none());
+        assert_ne!(ca[1], cb[1]);
+        assert!(ca[1]["text"].as_str().unwrap().contains("skill `triage`"));
+        assert!(cb[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("command `release`"));
+        // Everything but the item is the same: no id, time or item detail
+        // before the breakpoint.
+        let strip = |r: &Value| {
+            let mut r = r.clone();
+            r["messages"][0]["content"].as_array_mut().unwrap().pop();
+            r
+        };
+        assert_eq!(strip(&ra), strip(&rb));
+        // Byte for byte, as sent: the same up to the item, and both
+        // breakpoints (system, inventory) are in that prefix.
+        let sa = sent_for(&i, &a, "Read the logs, then open a ticket.");
+        let sb = sent_for(&i, &b, "Tag the release and write the notes.");
+        let (pa, pb) = (
+            before_item(&sa, &ca[1]["text"]),
+            before_item(&sb, &cb[1]["text"]),
+        );
+        assert_eq!(pa, pb);
+        assert!(!pa.contains("triage") && !pa.contains("release.md"));
+        assert_eq!(pa.matches("\"cache_control\"").count(), 2);
+        assert!(pa.ends_with(&format!(
+            "{{\"cache_control\":{{\"type\":\"ephemeral\"}},\"text\":{},\"type\":\"text\"}}",
+            ca[0]["text"]
+        )));
+        assert_eq!(sa.matches("\"cache_control\"").count(), 2, "none after");
+        // The two parts are still the whole message the check always sent.
+        assert_eq!(
+            format!(
+                "{}{}",
+                ca[0]["text"].as_str().unwrap(),
+                ca[1]["text"].as_str().unwrap()
+            ),
+            skill_compat::user_message(
+                &i,
+                "skill",
+                "triage",
+                "Read the logs, then open a ticket.",
+                &[]
+            )
+        );
+        // The same inventory read in another order is the same bytes.
+        let mut shuffled = i.clone();
+        shuffled.builtin.reverse();
+        shuffled.sources.reverse();
+        assert_eq!(
+            skill_compat::inventory_message(&shuffled.sorted()),
+            skill_compat::inventory_message(&i)
+        );
+    }
+
+    /// Claude Sonnet 5.5 (the light model the check runs on) caches a
+    /// prefix of 512 tokens or more. Both cached parts are well past it on
+    /// their own, at a cautious 4 characters a token.
+    #[test]
+    fn the_cached_prefix_is_long_enough_to_cache() {
+        const MIN_TOKENS: usize = 512;
+        let body = request_for(&inv(), &meta("skills/triage/SKILL.md", "h1", "", ""), "x");
+        let system = body["system"][0]["text"].as_str().unwrap().len();
+        let inventory = body["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .len();
+        // A team with nothing connected yet also gets every server and
+        // connection it could set up.
+        let mut fresh = inv();
+        fresh.github = GITHUB.iter().map(|s| s.to_string()).collect();
+        fresh.never = NEVER.iter().map(|s| s.to_string()).collect();
+        fresh.connectable = super::super::MCP_CATALOG
+            .iter()
+            .map(|(id, _, _)| format!("{id}: {}", display_name(id)))
+            .collect();
+        fresh.connections = super::super::ops_tools::connectable_from(&[], &Default::default());
+        let fresh = skill_compat::inventory_message(&fresh.sorted()).len();
+        assert!(system / 4 > MIN_TOKENS, "system prompt: {system} chars");
+        assert!(inventory / 4 > MIN_TOKENS, "inventory: {inventory} chars");
+        assert!(fresh > inventory, "inventory: {fresh} chars");
+    }
+
+    #[test]
+    fn one_item_per_shared_inventory_goes_first() {
+        let item = |path: &str| -> Queued { (meta(path, "h", "", ""), String::new(), None) };
+        let items = [item("a"), item("b"), item("c"), item("d"), item("e")];
+        let paths = |v: &[&Queued]| v.iter().map(|(m, _, _)| m.path.clone()).collect::<Vec<_>>();
+        // Skills a, c, e share the readers' inventory; b and d are agents
+        // with their own.
+        let inv_of = |(m, _, _): &Queued| match m.path.as_str() {
+            "b" => "agent-b".to_string(),
+            "d" => "agent-d".to_string(),
+            _ => "readers".to_string(),
+        };
+        let (warm, rest) = warm_first(items.iter().collect(), inv_of);
+        assert_eq!(paths(&warm), ["a"]);
+        assert_eq!(paths(&rest), ["b", "c", "d", "e"]);
+        // Two shared inventories: one item of each goes first.
+        let inv_of = |(m, _, _): &Queued| match m.path.as_str() {
+            "b" | "d" => "agent".to_string(),
+            _ => "readers".to_string(),
+        };
+        let (warm, rest) = warm_first(items.iter().collect(), inv_of);
+        assert_eq!(paths(&warm), ["a", "b"]);
+        assert_eq!(paths(&rest), ["c", "d", "e"]);
+        // Nothing shared: the first still goes first, to cache the system
+        // prompt before the parallel calls.
+        let (warm, rest) = warm_first(items.iter().collect(), |(m, _, _)| m.path.clone());
+        assert_eq!(paths(&warm), ["a"]);
+        assert_eq!(rest.len(), 4);
+        let (warm, rest) = warm_first(Vec::new(), |(m, _, _)| m.path.clone());
+        assert!(warm.is_empty() && rest.is_empty());
+    }
+
     #[test]
     fn server_names_read_well() {
         assert_eq!(display_name("sentry"), "Sentry");
@@ -1314,6 +1557,7 @@ mod tests {
         }
         async fn check(
             &self,
+            _: &str,
             _: &str,
             _: &str,
             _: &Value,
