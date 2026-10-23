@@ -408,45 +408,49 @@ pub async fn converse_json(
     max_tokens: i32,
     usage: &mut crate::models::TokenUsage,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    let mut request = MessagesRequest {
-        model: model_id.to_string(),
+    converse_json_shared(
+        client,
+        model_id,
+        system,
+        "",
+        user_message,
+        schema,
+        constrained,
+        effort,
         max_tokens,
-        system: vec![SystemBlock::Text {
-            text: system.to_string(),
-            cache_control: Some(CacheControl {
-                r#type: "ephemeral".to_string(),
-            }),
-        }],
-        messages: vec![ApiMessage {
-            role: "user".to_string(),
-            content: vec![json!({ "type": "text", "text": user_message })],
-        }],
-        tools: None,
-        cache_control: None,
-        thinking: None,
-        output_config: None,
-        context_management: None,
-        fallbacks: None,
-        tool_choice: None,
-        temperature: None,
-    };
-    apply_model_family(&mut request, Some(effort), false);
-    request.temperature = deterministic_temperature(model_id);
-    if constrained {
-        request.output_config = Some(json_output_config(request.output_config.take(), schema));
-    } else {
-        request.system = vec![SystemBlock::Text {
-            text: format!(
-                "{system}\n\nAnswer with only one JSON object that matches this JSON schema, \
-                 and nothing before or after it:\n{schema}"
-            ),
-            cache_control: Some(CacheControl {
-                r#type: "ephemeral".to_string(),
-            }),
-        }];
-    }
-    // A decline is an error to see, not an answer from another model.
-    request.fallbacks = None;
+        usage,
+    )
+    .await
+}
+
+/// [`converse_json`] for one of many calls that open their user message the
+/// same way (`shared`: an inventory or catalogue that is the same for every
+/// call of a batch). `shared` goes first with its own cache breakpoint and
+/// `user_message`, this call's own text, after it, so every call after the
+/// first reads the system prompt, the schema and `shared` from the cache.
+#[allow(clippy::too_many_arguments)]
+pub async fn converse_json_shared(
+    client: &AnthropicClient,
+    model_id: &str,
+    system: &str,
+    shared: &str,
+    user_message: &str,
+    schema: &Value,
+    constrained: bool,
+    effort: &str,
+    max_tokens: i32,
+    usage: &mut crate::models::TokenUsage,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let request = json_request(
+        model_id,
+        system,
+        shared,
+        user_message,
+        schema,
+        constrained,
+        effort,
+        max_tokens,
+    );
     let resp = send_request(client, &request).await?;
     account(client, model_id, &resp.usage, usage).await;
     let kinds: Vec<&str> = resp
@@ -481,6 +485,98 @@ pub async fn converse_json(
             format!("the answer wasn't valid JSON: {e}"),
         )) as Box<dyn std::error::Error + Send + Sync>
     })
+}
+
+/// The request [`converse_json_shared`] sends. Everything up to the second
+/// cache breakpoint (the system prompt with the schema, then `shared`) is
+/// the same bytes for every call with the same `system`, `shared`, schema
+/// and settings; only `user` differs, after it. With no `shared`, the user
+/// message is one block and only the system prompt is cached.
+#[allow(clippy::too_many_arguments)]
+fn json_request(
+    model_id: &str,
+    system: &str,
+    shared: &str,
+    user: &str,
+    schema: &Value,
+    constrained: bool,
+    effort: &str,
+    max_tokens: i32,
+) -> MessagesRequest {
+    let mut content = Vec::new();
+    if !shared.is_empty() {
+        content.push(json!({
+            "type": "text",
+            "text": shared,
+            "cache_control": { "type": "ephemeral" },
+        }));
+    }
+    content.push(json!({ "type": "text", "text": user }));
+    let system = if constrained {
+        system.to_string()
+    } else {
+        format!(
+            "{system}\n\nAnswer with only one JSON object that matches this JSON schema, \
+             and nothing before or after it:\n{schema}"
+        )
+    };
+    let mut request = MessagesRequest {
+        model: model_id.to_string(),
+        max_tokens,
+        system: vec![SystemBlock::Text {
+            text: system,
+            cache_control: Some(CacheControl {
+                r#type: "ephemeral".to_string(),
+            }),
+        }],
+        messages: vec![ApiMessage {
+            role: "user".to_string(),
+            content,
+        }],
+        tools: None,
+        cache_control: None,
+        thinking: None,
+        output_config: None,
+        context_management: None,
+        fallbacks: None,
+        tool_choice: None,
+        temperature: None,
+    };
+    apply_model_family(&mut request, Some(effort), false);
+    request.temperature = deterministic_temperature(model_id);
+    if constrained {
+        request.output_config = Some(json_output_config(request.output_config.take(), schema));
+    }
+    // A decline is an error to see, not an answer from another model.
+    request.fallbacks = None;
+    request
+}
+
+/// The body [`converse_json_shared`] sends, byte for byte, for tests of
+/// what is cached.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn json_request_body(
+    model_id: &str,
+    system: &str,
+    shared: &str,
+    user: &str,
+    schema: &Value,
+    constrained: bool,
+    effort: &str,
+    max_tokens: i32,
+) -> String {
+    serde_json::to_string(&json_request(
+        model_id,
+        system,
+        shared,
+        user,
+        schema,
+        constrained,
+        effort,
+        max_tokens,
+    ))
+    .expect("a request serializes")
 }
 
 /// The JSON object in an answer: from its first `{` to its last `}`, so a
