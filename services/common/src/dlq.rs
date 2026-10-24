@@ -51,6 +51,7 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "usage_reconcile",
     "lesson",
     "review_lesson",
+    "reward_outcome",
     "jira_comment",
     "dlq_cleanup",
     "log_autofix",

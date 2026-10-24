@@ -60,6 +60,9 @@ pub mod review_lessons;
 /// done), and the one status a PR shows on the dashboard.
 pub mod review_live;
 pub mod review_stats;
+/// Learning from outcomes: reward events, scores, calibration, variants,
+/// examples and evidence-backed lessons, per team.
+pub mod rewards;
 /// The one way a run is marked failed: always with a reason and a pass.
 pub mod run_fail;
 /// Run statuses; which ones a person set; closing and reopening a run.

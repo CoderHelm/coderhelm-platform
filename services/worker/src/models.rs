@@ -224,6 +224,9 @@ pub enum WorkerMessage {
     /// over its change request): judge whether the reviewer was wrong.
     #[serde(rename = "review_lesson")]
     ReviewLesson(ReviewLessonMessage),
+    /// CoderHelm's PR closed: score what happened to it.
+    #[serde(rename = "reward_outcome")]
+    RewardOutcome(common::rewards::RewardOutcomeMessage),
     /// A person commented on a ticket CoderHelm worked on: read what the
     /// comment is before anything runs.
     #[serde(rename = "jira_comment")]
@@ -315,7 +318,7 @@ impl WorkerMessage {
                 f::RUN
             }
             WorkerMessage::Feedback(_) | WorkerMessage::JiraComment(_) => f::FEEDBACK,
-            WorkerMessage::Lesson(_) => f::MEMORY,
+            WorkerMessage::Lesson(_) | WorkerMessage::RewardOutcome(_) => f::MEMORY,
             WorkerMessage::Onboard(_) => f::ONBOARD,
             WorkerMessage::PlanExecute(_) | WorkerMessage::PlanTaskContinue(_) => f::PLAN,
             WorkerMessage::InfraAnalyze(_) => f::INFRA,

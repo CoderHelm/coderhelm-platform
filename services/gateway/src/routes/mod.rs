@@ -15,6 +15,7 @@ pub mod graph;
 pub mod infrastructure;
 pub mod integrations;
 pub mod jira_webhook;
+pub mod learning;
 pub mod log_analyzer;
 pub mod log_findings;
 pub mod memory;
