@@ -634,10 +634,9 @@ pub async fn inventory(state: &WorkerState, team_id: &str) -> Inventory {
             tools,
         });
     }
-    let connectable = super::MCP_CATALOG
-        .iter()
-        .filter(|(id, _, _)| !servers.iter().any(|s| s.id == *id))
-        .map(|(id, _, _)| format!("{id}: {}", display_name(id)))
+    let connectable = common::mcp_catalog::ids()
+        .filter(|id| !servers.iter().any(|s| s.id == *id))
+        .map(|id| format!("{id}: {}", display_name(id)))
         .collect();
 
     let mut sources = Vec::new();
@@ -1400,9 +1399,8 @@ mod tests {
         let mut fresh = inv();
         fresh.github = GITHUB.iter().map(|s| s.to_string()).collect();
         fresh.never = NEVER.iter().map(|s| s.to_string()).collect();
-        fresh.connectable = super::super::MCP_CATALOG
-            .iter()
-            .map(|(id, _, _)| format!("{id}: {}", display_name(id)))
+        fresh.connectable = common::mcp_catalog::ids()
+            .map(|id| format!("{id}: {}", display_name(id)))
             .collect();
         fresh.connections = super::super::ops_tools::connectable_from(&[], &Default::default());
         let fresh = skill_compat::inventory_message(&fresh.sorted()).len();

@@ -350,6 +350,7 @@ async fn handle_issue_event(
             payload["sender"]["login"].as_str().unwrap_or(""),
         ),
         image_attachments: vec![],
+        ..Default::default()
     });
 
     // Check usage limits before dispatching
@@ -403,6 +404,7 @@ async fn handle_issue_event(
                 review_body: note,
                 comments: vec![],
                 trigger_author: String::new(),
+                ..Default::default()
             });
             return send_to_queue(state, &state.config.ticket_queue_url, &feedback).await;
         }
@@ -626,6 +628,7 @@ async fn handle_review_comment(
         dedup_key: format!("reply#{comment_id}"),
         reply_to_comment_id: Some(comment_id),
         requested_by: commenter.to_string(),
+        ..Default::default()
     });
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
@@ -764,6 +767,7 @@ async fn handle_issue_comment(
                 } else {
                     String::new()
                 },
+                ..Default::default()
             });
             // Budget gate — the review-feedback path checks this, but the comment
             // path didn't, letting over-limit teams keep spending via PR comments.
@@ -828,6 +832,7 @@ async fn handle_issue_comment(
                     dedup_key: format!("reply#{comment_id}"),
                     reply_to_comment_id: None,
                     requested_by: commenter.to_string(),
+                    ..Default::default()
                 });
                 return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
             } else {
@@ -871,6 +876,7 @@ async fn handle_issue_comment(
             payload["sender"]["login"].as_str().unwrap_or(""),
         ),
         image_attachments: vec![],
+        ..Default::default()
     });
 
     // Check usage limits before dispatching
@@ -968,6 +974,7 @@ async fn handle_pull_request(
             dedup_key: format!("rerequest#{req_head}"),
             reply_to_comment_id: None,
             requested_by: String::new(),
+            ..Default::default()
         });
         return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
     }
@@ -1111,6 +1118,7 @@ async fn handle_pull_request(
                 repo_name: name.to_string(),
                 pr_number,
                 trigger: "pr_closed".to_string(),
+                ..Default::default()
             });
             if let Err(e) = send_to_queue(state, &state.config.ticket_queue_url, &lesson).await {
                 warn!(team_id, run_id, pr_number, status = ?e, "Could not queue the closed PR's lesson");
@@ -1499,6 +1507,7 @@ async fn handle_pr_review(
                     dedup_key: format!("review#{review_id}"),
                     reply_to_comment_id: None,
                     requested_by: reviewer.to_string(),
+                    ..Default::default()
                 });
                 return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
             }
@@ -1554,6 +1563,7 @@ async fn handle_pr_review(
         },
         review_body,
         comments: vec![],
+        ..Default::default()
     });
 
     send_to_queue(state, &state.config.feedback_queue_url, &message).await
@@ -2101,6 +2111,7 @@ async fn reopen_finished_run_for_ci(
         review_body: String::new(),
         comments: vec![],
         trigger_author: String::new(),
+        ..Default::default()
     });
     let _ = send_to_queue(state, &state.config.feedback_queue_url, &message).await;
 }
@@ -2265,6 +2276,7 @@ async fn handle_workflow_run(
         team_id: team_id.to_string(),
         run_id: run_id.clone(),
         installation_id,
+        ..Default::default()
     });
     let body = serde_json::to_string(&message).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     // The self-healing CI loop hinges on THIS one message — a discarded send
@@ -2724,6 +2736,7 @@ async fn handle_tag_push(
         sha: tag.to_string(),
         resend: String::new(),
         check_branch: true,
+        ..Default::default()
     });
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
@@ -2998,6 +3011,7 @@ async fn handle_review_trigger(
         dedup_key,
         reply_to_comment_id: None,
         requested_by: String::new(),
+        ..Default::default()
     });
     send_to_queue_after(
         state,

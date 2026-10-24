@@ -296,6 +296,7 @@ pub(crate) async fn apply(
                     } else {
                         String::new()
                     },
+                    ..Default::default()
                 });
                 super::github_webhook::send_to_queue(
                     state,

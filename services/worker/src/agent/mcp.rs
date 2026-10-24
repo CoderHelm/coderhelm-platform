@@ -362,8 +362,6 @@ async fn build_env_vars(
 }
 
 /// Load enabled MCP plugins with credentials for a team from DynamoDB.
-/// Type alias for the MCP catalog: (server_id, description, tools)
-pub type McpCatalog<'a> = &'a [(&'a str, &'a str, &'a [(&'a str, &'a str)])];
 
 /// Returns plugins that are enabled AND have credentials stored.
 pub async fn load_team_plugins(
@@ -371,7 +369,6 @@ pub async fn load_team_plugins(
     kms: &aws_sdk_kms::Client,
     settings_table: &str,
     team_id: &str,
-    catalog: McpCatalog<'_>,
 ) -> Vec<McpPlugin> {
     let result = dynamo
         .query()
@@ -423,9 +420,11 @@ pub async fn load_team_plugins(
         };
 
         // Find this plugin in the catalog
-        let catalog_entry = catalog.iter().find(|(id, _, _)| *id == server_id);
-        let (_, npx_package, env_mapping) = match catalog_entry {
-            Some(e) => e,
+        let (npx_package, env_mapping) = match common::mcp_catalog::find(server_id) {
+            // A remote-only server (no npx package) is reached through the
+            // remote MCP path, never the local proxy.
+            Some(e) if e.npx_package.is_empty() => continue,
+            Some(e) => (e.npx_package, e.env_mapping),
             None => {
                 warn!(server_id, "Plugin not found in catalog, skipping");
                 continue;

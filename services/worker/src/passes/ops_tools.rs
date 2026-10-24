@@ -294,13 +294,9 @@ pub fn tool_names(kind: ConnKind, conn: &Connector) -> Vec<String> {
             "confluence_page",
             "confluence_children",
         ],
-        ConnKind::OpenSearch => &[
-            "opensearch_indexes",
-            "opensearch_mapping",
-            "opensearch_search",
-            "opensearch_count",
-        ],
-        ConnKind::Rest => &["rest_get"],
+        // Data sources now: read with the data source tools.
+        ConnKind::OpenSearch => &["search_read"],
+        ConnKind::Rest => &["api_get"],
         ConnKind::Metrics => &["metrics_list", "metrics_query"],
         ConnKind::Airflow => &[
             "airflow_dags",
@@ -355,14 +351,14 @@ fn describe_line(c: &Connector) -> String {
             c.label(),
             c.site,
             if c.indexes.is_empty() { String::new() } else { format!("; indexes {}", c.indexes.join(", ")) },
-            if c.name.is_empty() { String::new() } else { format!(" (tools with connection \"{}\")", c.name) }
+            if c.name.is_empty() { String::new() } else { format!(" (`search_read` with source \"{}\")", c.name) }
         ),
         ConnKind::Rest => format!(
             "{} at {}: GET under {}{}",
             c.label(),
             c.site,
             c.paths.join(", "),
-            if c.name.is_empty() { String::new() } else { format!(" (`rest_get` with api \"{}\")", c.name) }
+            if c.name.is_empty() { String::new() } else { format!(" (`api_get` with api \"{}\")", c.name) }
         ),
         ConnKind::Metrics => format!(
             "CloudWatch metrics in account {} ({}): ECS, RDS, Lambda, CloudFront, load balancers, SQS, DynamoDB",
@@ -612,98 +608,9 @@ impl OpsTools {
                 ));
             }
         }
-        let clusters = self.of(ConnKind::OpenSearch);
-        if !clusters.is_empty() {
-            let shared = clusters
-                .iter()
-                .map(|l| {
-                    let idx = if l.conn.indexes.is_empty() {
-                        "every index the user can see".to_string()
-                    } else {
-                        l.conn.indexes.join(", ")
-                    };
-                    if clusters.len() > 1 {
-                        format!("`{}`: {idx}", call_name(l))
-                    } else {
-                        idx
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            let index = json!({ "type": "string", "description": "an index name, a pattern like orders-*, or several separated by commas" });
-            out.push(tool(
-                "opensearch_indexes",
-                &format!(
-                    "List the search indexes agents may read ({shared}), with document counts."
-                ),
-                json!({ "type": "object", "properties": {} }),
-            ));
-            out.push(tool(
-                "opensearch_mapping",
-                "An index's fields and their types. Read it before searching an index you haven't seen.",
-                json!({ "type": "object", "properties": { "index": index }, "required": ["index"] }),
-            ));
-            out.push(tool(
-                "opensearch_search",
-                &format!("Search an index with an OpenSearch query and read the matching documents as stored (at most {} per call). Use it to see what the index really holds for a record, e.g. {{\"query\": {{\"term\": {{\"id\": \"…\"}}}}}}. Read only; scripts are refused.", common::live::opensearch::MAX_HITS),
-                json!({ "type": "object", "properties": { "index": index, "body": { "type": "object", "description": "the search body: query, size, from, sort, _source, aggs" } }, "required": ["index", "body"] }),
-            ));
-            out.push(tool(
-                "opensearch_count",
-                "Count the documents in an index, optionally only those matching a query.",
-                json!({ "type": "object", "properties": { "index": index, "query": { "type": "object" } }, "required": ["index"] }),
-            ));
-            if clusters.len() > 1 {
-                let names: Vec<&str> = clusters.iter().map(|l| call_name(l)).collect();
-                for t in out.iter_mut().filter(|t| t.name.starts_with("opensearch_")) {
-                    t.input_schema["properties"]["connection"] = json!({ "type": "string", "enum": names, "description": "which OpenSearch cluster" });
-                    if let Some(req) = t.input_schema["required"].as_array_mut() {
-                        req.push(json!("connection"));
-                    } else {
-                        t.input_schema["required"] = json!(["connection"]);
-                    }
-                }
-            }
-        }
-        let apis = self.of(ConnKind::Rest);
-        if !apis.is_empty() {
-            let listed: Vec<String> = apis
-                .iter()
-                .map(|l| {
-                    format!(
-                        "{}{} (paths under {})",
-                        if l.conn.name.is_empty() {
-                            String::new()
-                        } else {
-                            format!("`{}` at ", l.conn.name)
-                        },
-                        l.conn.site,
-                        l.conn.paths.join(", ")
-                    )
-                })
-                .collect();
-            let names: Vec<&str> = apis
-                .iter()
-                .map(|l| l.conn.name.as_str())
-                .filter(|n| !n.is_empty())
-                .collect();
-            let mut props = json!({
-                "path": { "type": "string", "description": "a path under an allowed prefix, e.g. the prefix plus /42" },
-                "query": { "type": "object", "description": "query parameters as names and plain values" }
-            });
-            if !names.is_empty() {
-                props["api"] =
-                    json!({ "type": "string", "enum": names, "description": "which API to read" });
-            }
-            out.push(tool(
-                "rest_get",
-                &format!(
-                    "GET a path on one of the team's REST APIs and read the JSON it returns (the source system's own record): {}. Only paths under an API's prefixes can be read; pass ids in the path and filters in `query`. Read only. Never guess a path: first find where the team's code calls the API (search the repos for its address or a path segment) and copy that exact shape, including every parent id.",
-                    listed.join("; ")
-                ),
-                json!({ "type": "object", "properties": props, "required": ["path"] }),
-            ));
-        }
+        // REST APIs and OpenSearch are data sources now (`api_get`,
+        // `search_read`): connections of those kinds are moved at load and
+        // never give tools here.
         if !self.aws.metrics.is_empty() {
             let ns: Vec<String> = metrics::NAMESPACES
                 .iter()
@@ -783,8 +690,6 @@ impl OpsTools {
             "aws_identity" => None,
             n if n.starts_with("newrelic_") => Some(ConnKind::NewRelic),
             n if n.starts_with("confluence_") => Some(ConnKind::Confluence),
-            n if n.starts_with("opensearch_") => Some(ConnKind::OpenSearch),
-            "rest_get" => Some(ConnKind::Rest),
             n if n.starts_with("metrics_") => Some(ConnKind::Metrics),
             n if n.starts_with("airflow_") => Some(ConnKind::Airflow),
             _ => return None,
@@ -1086,10 +991,10 @@ impl OpsTools {
                     password: &l.key,
                     http: &Https,
                 };
-                let a = match name {
-                    "opensearch_indexes" => os.indexes().await?,
-                    "opensearch_mapping" => os.mapping(s("index").unwrap_or("")).await?,
-                    "opensearch_count" => {
+                let a = match s("action").unwrap_or("search") {
+                    "indexes" => os.indexes().await?,
+                    "mapping" => os.mapping(s("index").unwrap_or("")).await?,
+                    "count" => {
                         os.count(
                             s("index").unwrap_or(""),
                             input.get("query").filter(|q| q.is_object()),
@@ -1374,23 +1279,23 @@ mod tests {
         let id = o.remember(
             &source,
             LookupOutcome::Answered,
-            "rest_get",
+            "api_get",
             &input,
             "{\n  \"id\": 7,\n  \"title\": \"Swim\"\n}",
         );
         assert_eq!(id, "T1");
         let ev = o.lookups();
         assert_eq!(ev.len(), 1);
-        assert!(ev[0].line.starts_with("- [T1] Ran rest_get: "));
+        assert!(ev[0].line.starts_with("- [T1] Ran api_get: "));
         assert!(ev[0]
             .line
             .contains("Came back: { \"id\": 7, \"title\": \"Swim\" }"));
         // An empty list and a failure are kept too, marked as what they are.
-        o.remember(&source, LookupOutcome::Empty, "rest_get", &input, "[]");
+        o.remember(&source, LookupOutcome::Empty, "api_get", &input, "[]");
         o.remember(
             &source,
             LookupOutcome::Failed,
-            "rest_get",
+            "api_get",
             &input,
             "The API has nothing at that path.",
         );

@@ -353,14 +353,7 @@ Then the ```fix_location.json block described above."#,
             &state.config.mcp_configs_table_name
         };
         let mcp_plugins = mcp::merge_plugins(
-            mcp::load_team_plugins(
-                &state.dynamo,
-                &state.kms,
-                mcp_table,
-                &msg.team_id,
-                &super::MCP_CATALOG,
-            )
-            .await,
+            mcp::load_team_plugins(&state.dynamo, &state.kms, mcp_table, &msg.team_id).await,
             mcp::load_remote_plugins(
                 &state.dynamo,
                 &state.kms,
@@ -409,16 +402,9 @@ Then the ```fix_location.json block described above."#,
             {
                 return true;
             }
-            // For MCP tools, only keep read-like operations
-            let tool_name = t.name.split("__").last().unwrap_or(&t.name);
-            tool_name.starts_with("get_")
-                || tool_name.starts_with("list_")
-                || tool_name.starts_with("search_")
-                || tool_name.starts_with("read_")
-                || tool_name.starts_with("query_")
-                || tool_name.starts_with("fetch_")
-                || tool_name.starts_with("find_")
-                || tool_name.starts_with("describe_")
+            // Everything else keeps its risk from the one tool registry:
+            // only read-only connection tools stay.
+            common::tool_registry::is_read_only(&t.name)
         });
     }
 

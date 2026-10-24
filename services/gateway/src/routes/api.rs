@@ -1616,6 +1616,7 @@ pub async fn retry_run(
             .and_then(|v| v.as_s().ok())
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default(),
+        ..Default::default()
     });
 
     let body = serde_json::to_string(&message).map_err(|e| {
@@ -1861,6 +1862,7 @@ pub async fn reset_and_rerun(
             .and_then(|v| v.as_s().ok())
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default(),
+        ..Default::default()
     });
     let body = serde_json::to_string(&message).map_err(|e| {
         error!("Failed to serialize reset message: {e}");
@@ -1981,6 +1983,7 @@ pub async fn re_review_run(
         comments: vec![],
         // Not a GitHub comment: nobody to address on the PR.
         trigger_author: String::new(),
+        ..Default::default()
     });
 
     let body = serde_json::to_string(&message).map_err(|e| {

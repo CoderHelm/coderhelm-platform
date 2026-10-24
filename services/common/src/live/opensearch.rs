@@ -218,7 +218,7 @@ impl OpenSearch<'_> {
         if !index_allowed(&index, &self.conn.indexes) {
             return Err(refused(
                 format!("The team didn't share {index}."),
-                "Read one of the shared indexes (list them with opensearch_indexes).",
+                "Read one of the shared indexes (list them with `search_read` action \"indexes\").",
             ));
         }
         Ok(index)
@@ -264,7 +264,7 @@ impl OpenSearch<'_> {
             404 => Err(StepError::new(
                 "read",
                 "No such index (or the user can't see it).",
-                "List the indexes with opensearch_indexes.",
+                "List the indexes with `search_read` action \"indexes\".",
             )),
             400 => {
                 let why = reply

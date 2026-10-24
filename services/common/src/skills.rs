@@ -427,11 +427,8 @@ pub const AGENT_READ_TOOLS: &[&str] = &[
     "confluence_search",
     "confluence_page",
     "confluence_children",
-    "opensearch_indexes",
-    "opensearch_mapping",
-    "opensearch_search",
-    "opensearch_count",
-    "rest_get",
+    "search_read",
+    "api_get",
     "metrics_list",
     "metrics_query",
     "airflow_dags",
@@ -517,24 +514,8 @@ const AGENT_MCP_MAP: &[(&str, &[&str])] = &[
             "confluence_children",
         ],
     ),
-    (
-        "opensearch",
-        &[
-            "opensearch_indexes",
-            "opensearch_mapping",
-            "opensearch_search",
-            "opensearch_count",
-        ],
-    ),
-    (
-        "elasticsearch",
-        &[
-            "opensearch_indexes",
-            "opensearch_mapping",
-            "opensearch_search",
-            "opensearch_count",
-        ],
-    ),
+    ("opensearch", &["search_read"]),
+    ("elasticsearch", &["search_read"]),
     (
         "cloudwatch",
         &[
@@ -3583,5 +3564,23 @@ mod tests {
                 "skill:debug@acme/other"
             ]
         );
+    }
+
+    #[test]
+    fn agent_read_and_write_tools_agree_with_the_tool_registry() {
+        use crate::tool_registry::{builtin, Risk};
+        for t in AGENT_READ_TOOLS {
+            assert_eq!(
+                builtin(t),
+                Some(Risk::Read),
+                "{t} is offered as a read tool"
+            );
+        }
+        for t in AGENT_WRITE_TOOLS
+            .iter()
+            .filter(|t| t.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        {
+            assert_ne!(builtin(t), Some(Risk::Read), "{t} writes");
+        }
     }
 }

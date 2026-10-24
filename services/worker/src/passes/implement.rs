@@ -414,14 +414,7 @@ pub async fn run(
             &state.config.mcp_configs_table_name
         };
         let mcp_plugins = mcp::merge_plugins(
-            mcp::load_team_plugins(
-                &state.dynamo,
-                &state.kms,
-                mcp_table,
-                &msg.team_id,
-                &super::MCP_CATALOG,
-            )
-            .await,
+            mcp::load_team_plugins(&state.dynamo, &state.kms, mcp_table, &msg.team_id).await,
             mcp::load_remote_plugins(
                 &state.dynamo,
                 &state.kms,

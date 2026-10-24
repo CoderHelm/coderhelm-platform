@@ -25,7 +25,8 @@ const s3 = new S3Client();
 const BUCKET = process.env.BUCKET_NAME || "";
 const TOOL_CACHE_PREFIX = "config/mcp-tools";
 
-// Allowlist of permitted npx packages — must match gateway and worker catalogs.
+// Allowlist of permitted npx packages: exactly the packages in
+// services/common/src/mcp_catalog.rs (a test there checks every one is here).
 const ALLOWED_PACKAGES = new Set([
   "figma-developer-mcp",
   "@sentry/mcp-server",
@@ -33,7 +34,6 @@ const ALLOWED_PACKAGES = new Set([
   "@notionhq/notion-mcp-server",
   "@vercel/mcp",
   "@stripe/mcp",
-  "@cloudflare/mcp-server-cloudflare",
   "@nicholasoxford/posthog-mcp",
   "@anthropic-ai/gitlab-mcp-server",
   "@neondatabase/mcp-server-neon",
@@ -44,6 +44,7 @@ const ALLOWED_PACKAGES = new Set([
   "mcp-grafana",
   "@redis/mcp-server",
   "@anthropic-ai/upstash-mcp-server",
+  "sanity-mcp-server",
 ]);
 
 export async function handler(event) {
