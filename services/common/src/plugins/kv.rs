@@ -124,10 +124,13 @@ pub async fn query_as<T: DeserializeOwned>(
 
 // ── In memory (tests) ───────────────────────────────────────────────────────
 
+/// One partition in memory: key -> (data, revision).
+type Partition = BTreeMap<String, (Value, u64)>;
+
 /// The same contract in memory.
 #[derive(Default)]
 pub struct Memory {
-    data: Mutex<HashMap<String, BTreeMap<String, (Value, u64)>>>,
+    data: Mutex<HashMap<String, Partition>>,
 }
 
 impl Memory {

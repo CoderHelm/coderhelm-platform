@@ -589,6 +589,7 @@ async fn version_of(kv: &dyn Kv, team: &str, a: &Artifact) -> Result<Version, Re
 }
 
 /// Rejects `version`.
+#[allow(clippy::too_many_arguments)]
 pub async fn reject(
     kv: &dyn Kv,
     team: &str,

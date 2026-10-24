@@ -715,6 +715,8 @@ mod plan;
 pub mod plan_chat;
 pub mod plan_execute;
 mod plan_judge;
+/// Plugin runs, publishing, source sync and results.
+pub mod plugins;
 mod pr;
 pub mod pr_outcomes;
 mod proof;

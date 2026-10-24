@@ -29,6 +29,8 @@ pub struct AppState {
     pub kms: aws_sdk_kms::Client,
     pub sts: aws_sdk_sts::Client,
     pub bedrock: aws_sdk_bedrockruntime::Client,
+    /// Plugin schedules (publish at a time, recurring triggers).
+    pub scheduler: common::plugins::schedule::aws_sdk_scheduler::Client,
     pub http: reqwest::Client,
     pub secrets: models::Secrets,
     pub config: models::Config,
@@ -56,6 +58,7 @@ async fn main() -> Result<(), Error> {
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
     // Claude through Bedrock when the deployment says so (MODEL_PROVIDER).
     common::model_provider::set_bedrock_client(bedrock.clone());
+    let scheduler = common::plugins::schedule::aws_sdk_scheduler::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
     // Where this deployment's dashboard and API are (config, or SSM).
     common::public_urls::init(common::public_urls::ssm::Client::new(&aws_config)).await;
@@ -98,6 +101,7 @@ async fn main() -> Result<(), Error> {
         kms,
         sts,
         bedrock,
+        scheduler,
         http: reqwest::Client::new(),
         secrets,
         config,
@@ -134,6 +138,10 @@ async fn main() -> Result<(), Error> {
         .route("/system/update", post(routes::system::update_now))
         .route("/system/rollback", post(routes::system::rollback))
         .route("/system/test-email", post(routes::system::test_email))
+        .route(
+            "/admin/teams/:team_id/flags",
+            put(routes::admin::set_team_flags),
+        )
         // The shared DLQ: every team's failed messages and the global jobs'
         .route("/admin/dlq", get(routes::admin::admin_dlq))
         // The daily check of recorded usage against Anthropic's report
@@ -652,6 +660,110 @@ async fn main() -> Result<(), Error> {
             post(routes::log_findings::reopen_finding),
         )
         // MCP Servers
+        // Plugin packages (the MCP servers keep /plugins, /plugins/catalog
+        // and /plugins/:id/... for the Connections page).
+        .route("/plugins/flag", get(routes::plugin_pkgs::get_flag))
+        .route(
+            "/plugins/settings",
+            get(routes::plugin_pkgs::get_settings).put(routes::plugin_pkgs::put_settings),
+        )
+        .route(
+            "/plugins/sources",
+            get(routes::plugin_pkgs::list_sources).post(routes::plugin_pkgs::add_source),
+        )
+        .route(
+            "/plugins/sources/:id/sync",
+            post(routes::plugin_pkgs::sync_source),
+        )
+        .route(
+            "/plugins/sources/:id",
+            delete(routes::plugin_pkgs::remove_source),
+        )
+        .route("/plugins/available", get(routes::plugin_pkgs::available))
+        .route(
+            "/plugins/install",
+            post(routes::plugin_pkgs::install_plugin),
+        )
+        .route(
+            "/plugins/installed",
+            get(routes::plugin_pkgs::list_installed),
+        )
+        .route(
+            "/plugins/installed/:id",
+            get(routes::plugin_pkgs::get_installed).delete(routes::plugin_pkgs::uninstall),
+        )
+        .route(
+            "/plugins/installed/:id/approve",
+            post(routes::plugin_pkgs::approve_pending),
+        )
+        .route(
+            "/plugins/installed/:id/decline",
+            post(routes::plugin_pkgs::decline_pending),
+        )
+        .route(
+            "/plugins/installed/:id/options",
+            put(routes::plugin_pkgs::set_options),
+        )
+        .route(
+            "/plugins/installed/:id/rollback",
+            post(routes::plugin_pkgs::rollback),
+        )
+        .route(
+            "/plugins/installed/:id/sync",
+            post(routes::plugin_pkgs::sync_plugin),
+        )
+        .route(
+            "/plugins/installed/:id/settings",
+            put(routes::plugin_pkgs::set_plugin_settings),
+        )
+        .route(
+            "/plugins/installed/:id/limit",
+            put(routes::plugin_pkgs::set_limit),
+        )
+        .route(
+            "/plugins/installed/:id/approvers",
+            put(routes::plugin_pkgs::set_approvers),
+        )
+        .route(
+            "/plugins/installed/:id/enabled",
+            put(routes::plugin_pkgs::set_enabled),
+        )
+        .route(
+            "/plugins/installed/:id/runs",
+            post(routes::plugin_pkgs::start_run),
+        )
+        .route("/plugins/runs", get(routes::plugin_pkgs::list_runs))
+        .route("/plugins/runs/:run_id", get(routes::plugin_pkgs::get_run))
+        .route("/plugins/drafts", get(routes::plugin_pkgs::list_drafts))
+        .route(
+            "/plugins/drafts/:id",
+            get(routes::plugin_pkgs::get_draft).put(routes::plugin_pkgs::edit_draft),
+        )
+        .route(
+            "/plugins/drafts/:id/submit",
+            post(routes::plugin_pkgs::submit_draft),
+        )
+        .route(
+            "/plugins/drafts/:id/approve",
+            post(routes::plugin_pkgs::approve_draft),
+        )
+        .route(
+            "/plugins/drafts/:id/reject",
+            post(routes::plugin_pkgs::reject_draft),
+        )
+        .route(
+            "/plugins/drafts/:id/stop",
+            post(routes::plugin_pkgs::stop_draft),
+        )
+        .route(
+            "/plugins/drafts/:id/cancel",
+            post(routes::plugin_pkgs::cancel_draft),
+        )
+        .route(
+            "/plugins/brain-sources",
+            get(routes::plugin_pkgs::brain_sources),
+        )
+        .route("/audit", get(routes::plugin_pkgs::audit_log))
         .route("/plugins/catalog", get(routes::plugins::list_catalog))
         .route("/plugins", get(routes::plugins::list_enabled))
         .route("/plugins/:id/enable", post(routes::plugins::enable_plugin))
@@ -919,6 +1031,12 @@ async fn main() -> Result<(), Error> {
             "/knowledge/:token",
             post(routes::knowledge_sources::webhook),
         )
+        // Plugin briefs from chat, verified with the team's own secrets
+        .route("/slack/plugins", post(routes::plugin_pkgs::slack_command))
+        .route(
+            "/teams/plugins/:token",
+            post(routes::plugin_pkgs::teams_message),
+        )
         // CI calls signed with a GitHub Actions OIDC token
         .route("/ci/tests/results", post(routes::tests::ci_upload))
         .route("/ci/tests/quarantine", get(routes::tests::ci_quarantine));
@@ -965,6 +1083,18 @@ async fn main() -> Result<(), Error> {
             middleware::rate_limit::rate_limit_email,
         ));
 
+    // Signed email approval links for plugin drafts: public, the signed
+    // token (one approver, one version) is the credential.
+    let plugin_link_routes = Router::new()
+        .route(
+            "/approve",
+            get(routes::plugin_pkgs::email_approve_page).post(routes::plugin_pkgs::email_approve),
+        )
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit::rate_limit_email,
+        ));
+
     let app = Router::new()
         // Root health/info
         .route(
@@ -992,6 +1122,7 @@ async fn main() -> Result<(), Error> {
         .nest("/auth", auth_routes)
         .nest("/email", email_routes)
         .nest("/agent-approvals", approval_link_routes)
+        .nest("/plugins", plugin_link_routes)
         // Nest protected routes under /api
         .nest("/api", api_routes)
         .layer(SetResponseHeaderLayer::overriding(

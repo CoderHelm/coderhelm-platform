@@ -2,6 +2,11 @@ use serde::Deserialize;
 
 pub struct Config {
     pub stage: String,
+    /// EventBridge Scheduler group for plugin schedules, the role it sends
+    /// with, and the tickets queue it sends to (plugins only).
+    pub plugin_schedule_group: String,
+    pub plugin_scheduler_role_arn: String,
+    pub ticket_queue_arn: String,
     pub table_name: String,
     pub teams_table_name: String,
     pub runs_table_name: String,
@@ -53,6 +58,10 @@ impl Config {
     pub fn from_env() -> Self {
         Self {
             stage: std::env::var("STAGE").unwrap_or_else(|_| "dev".to_string()),
+            plugin_schedule_group: std::env::var("PLUGIN_SCHEDULE_GROUP").unwrap_or_default(),
+            plugin_scheduler_role_arn: std::env::var("PLUGIN_SCHEDULER_ROLE_ARN")
+                .unwrap_or_default(),
+            ticket_queue_arn: std::env::var("TICKET_QUEUE_ARN").unwrap_or_default(),
             table_name: std::env::var("TABLE_NAME").expect("TABLE_NAME required"),
             teams_table_name: std::env::var("TEAMS_TABLE_NAME").expect("TEAMS_TABLE_NAME required"),
             runs_table_name: std::env::var("RUNS_TABLE_NAME").expect("RUNS_TABLE_NAME required"),

@@ -22,6 +22,8 @@ pub struct WorkerState {
     pub sqs: aws_sdk_sqs::Client,
     pub codebuild: aws_sdk_codebuild::Client,
     pub logs: aws_sdk_cloudwatchlogs::Client,
+    /// Plugin schedules (publish at a time, recurring triggers).
+    pub scheduler: common::plugins::schedule::aws_sdk_scheduler::Client,
     pub http: reqwest::Client,
     pub config: models::Config,
     pub secrets: models::Secrets,
@@ -47,6 +49,7 @@ async fn main() -> Result<(), Error> {
     let logs = aws_sdk_cloudwatchlogs::Client::new(&aws_config);
     let kms = aws_sdk_kms::Client::new(&aws_config);
     let sts = aws_sdk_sts::Client::new(&aws_config);
+    let scheduler = common::plugins::schedule::aws_sdk_scheduler::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
     // Where this deployment's dashboard and API are (config, or SSM).
     common::public_urls::init(common::public_urls::ssm::Client::new(&aws_config)).await;
@@ -70,6 +73,7 @@ async fn main() -> Result<(), Error> {
         sqs,
         codebuild,
         logs,
+        scheduler,
         http: reqwest::Client::builder()
             .user_agent("coderhelm-worker/0.1")
             .build()?,
@@ -385,6 +389,42 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             }
             if let Err(e) = passes::skills::sweep(&state).await {
                 error!("Skill repository sweep failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::PluginRun(msg) => {
+            info!(team_id = %msg.team_id, plugin = %msg.plugin_id, run_id = %msg.run_id, trigger = %msg.trigger, "Plugin run");
+            if let Err(e) = passes::plugins::run_plugin(&state, msg).await {
+                error!("Plugin run failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::PluginPublish(msg) => {
+            info!(team_id = %msg.team_id, artifact = %msg.artifact_id, version = msg.version, "Plugin publish");
+            if let Err(e) = passes::plugins::publish(&state, msg).await {
+                error!("Plugin publish failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::PluginSync(msg) => {
+            info!(team_id = %msg.team_id, source = %msg.source_id, plugin = %msg.plugin_id, reason = %msg.reason, "Plugin sync");
+            if let Err(e) = passes::plugins::sync(&state, msg).await {
+                error!("Plugin sync failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::PluginSweep => {
+            info!("Plugin source poll");
+            if let Err(e) = passes::plugins::sweep(&state).await {
+                error!("Plugin source poll failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::PluginTrigger(msg) => {
+            info!(team_id = %msg.team_id, plugin = %msg.plugin_id, trigger = msg.trigger, "Plugin schedule fired");
+            if let Err(e) = passes::plugins::trigger(&state, msg).await {
+                error!("Plugin trigger failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::PluginResults(msg) => {
+            info!(team_id = %msg.team_id, artifact = %msg.artifact_id, "Plugin results");
+            if let Err(e) = passes::plugins::results(&state, msg).await {
+                error!("Plugin results failed: {e:?}");
             }
         }
         models::WorkerMessage::SkillSync(msg) => {

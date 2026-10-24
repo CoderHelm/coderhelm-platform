@@ -362,7 +362,6 @@ async fn build_env_vars(
 }
 
 /// Load enabled MCP plugins with credentials for a team from DynamoDB.
-
 /// Returns plugins that are enabled AND have credentials stored.
 pub async fn load_team_plugins(
     dynamo: &aws_sdk_dynamodb::Client,

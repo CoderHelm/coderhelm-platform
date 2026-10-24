@@ -118,6 +118,10 @@ export class WorkerStack extends cdk.Stack {
         WEEKLY_SUMMARY_LISTED_TEAMS_ONLY: cfg.integrations.weeklySummaryListedTeamsOnly ? "true" : "false",
         CI_FIX_QUEUE_URL: props.ciFixQueue.queueUrl,
         TICKET_QUEUE_URL: props.ticketQueue.queueUrl,
+        // Plugin schedules (made in the API stack, named the same here).
+        TICKET_QUEUE_ARN: props.ticketQueue.queueArn,
+        PLUGIN_SCHEDULE_GROUP: `${prefix}-plugins`,
+        PLUGIN_SCHEDULER_ROLE_ARN: `arn:aws:iam::${this.account}:role/${prefix}-plugin-scheduler`,
         FEEDBACK_QUEUE_URL: props.feedbackQueue.queueUrl,
         DLQ_URL: props.dlq.queueUrl,
         RUST_LOG: "info",
@@ -236,6 +240,23 @@ export class WorkerStack extends cdk.Stack {
 
     // Worker needs to re-trigger tickets (e.g. wrong-repo re-routing)
     props.ticketQueue.grantSendMessages(this.workerFunction);
+    // Plugin schedules: recurring triggers and results checks, in the
+    // plugins group only.
+    this.workerFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["scheduler:CreateSchedule", "scheduler:DeleteSchedule", "scheduler:GetSchedule"],
+        resources: [
+          `arn:aws:scheduler:${this.region}:${this.account}:schedule/${prefix}-plugins/*`,
+        ],
+      })
+    );
+    this.workerFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["iam:PassRole"],
+        conditions: { StringEquals: { "iam:PassedToService": "scheduler.amazonaws.com" } },
+        resources: [`arn:aws:iam::${this.account}:role/${prefix}-plugin-scheduler`],
+      })
+    );
 
     // Worker needs to defer feedback back onto the feedback queue when it loses
     // the per-run writer-slot race (delayed re-enqueue instead of failing the run)

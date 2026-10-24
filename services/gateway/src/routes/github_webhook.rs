@@ -2787,6 +2787,10 @@ async fn handle_push(
     if owner.is_empty() || name.is_empty() {
         return Ok(StatusCode::OK);
     }
+    // Plugin sources on the team's installation: any push (a branch or a
+    // tag a plugin may track) syncs them; wording applies at once, widened
+    // versions wait for an admin. The worker reads only what moved.
+    super::plugin_pkgs::on_push(state, team_id, installation_id, &format!("{owner}/{name}")).await;
     // A new tag → release notes (for tags CoderHelm didn't cut itself).
     if let Some(tag) = git_ref.strip_prefix("refs/tags/") {
         return handle_tag_push(state, payload, installation_id, team_id, owner, name, tag).await;

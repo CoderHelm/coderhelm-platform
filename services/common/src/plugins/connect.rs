@@ -65,6 +65,7 @@ pub trait HttpSend: Send + Sync {
         credential: &str,
         method: &str,
         url: &str,
+        headers: &std::collections::BTreeMap<String, String>,
         body: &Value,
     ) -> Result<HttpReply, String>;
 }
@@ -116,6 +117,7 @@ impl HttpSend for Https<'_> {
         credential: &str,
         method: &str,
         url: &str,
+        headers: &std::collections::BTreeMap<String, String>,
         body: &Value,
     ) -> Result<HttpReply, String> {
         if !url.starts_with("https://") {
@@ -134,6 +136,9 @@ impl HttpSend for Https<'_> {
             .request(m, url)
             .bearer_auth(token)
             .timeout(std::time::Duration::from_secs(20));
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
         if method != "GET" {
             req = req.json(body);
         }
@@ -251,6 +256,7 @@ pub(crate) mod tests {
             credential: &str,
             method: &str,
             url: &str,
+            _headers: &std::collections::BTreeMap<String, String>,
             body: &Value,
         ) -> Result<HttpReply, String> {
             self.sent.lock().unwrap().push((

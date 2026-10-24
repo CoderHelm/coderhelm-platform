@@ -773,7 +773,21 @@ pub async fn admin_teams(
     }))
     .await;
 
-    let orgs = orgs_json(&teams);
+    let mut orgs = orgs_json(&teams);
+    // Each team's plugin flag, for the switch on the admin page.
+    let kv = common::plugins::kv::Dynamo {
+        client: state.dynamo.clone(),
+        table: state.config.settings_table_name.clone(),
+    };
+    for o in orgs.iter_mut() {
+        if let Some(ts) = o["teams"].as_array_mut() {
+            for t in ts.iter_mut() {
+                let id = t["team_id"].as_str().unwrap_or("").to_string();
+                let on = !id.is_empty() && common::plugins::flag::enabled(&kv, &id).await;
+                t["flags"] = json!({ "plugins": on });
+            }
+        }
+    }
     let flat: Vec<Value> = orgs
         .iter()
         .flat_map(|o| o["teams"].as_array().cloned().unwrap_or_default())
@@ -790,6 +804,50 @@ pub async fn admin_teams(
             "inactive_orgs": orgs.len() - active,
         },
     })))
+}
+
+/// PUT /api/admin/teams/:team_id/flags { plugins } — turns a team's
+/// feature flags on or off (platform admins only).
+pub async fn set_team_flags(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(team_id): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    if !is_platform_admin(&claims) {
+        warn!(email = %claims.email, "Team flags refused: not a platform admin");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let Some(on) = body["plugins"].as_bool() else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    if team_id.is_empty() || team_id.len() > 128 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let kv = common::plugins::kv::Dynamo {
+        client: state.dynamo.clone(),
+        table: state.config.settings_table_name.clone(),
+    };
+    let flags = common::plugins::flag::set(&kv, &team_id, on)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Couldn't set team flags");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    common::plugins::audit::record(
+        &kv,
+        &team_id,
+        common::plugins::audit::Event::new(
+            &claims.email,
+            common::plugins::audit::ActorKind::Person,
+            common::plugins::audit::action::FLAG_SET,
+            "ok",
+        )
+        .detail(format!("plugins {}", if on { "on" } else { "off" })),
+    )
+    .await;
+    info!(team_id, plugins = on, by = %claims.email, "Team plugin flag set");
+    Ok(Json(json!({ "team_id": team_id, "flags": flags })))
 }
 
 // ── Beta sign-ups ────────────────────────────────────────────────────
@@ -1262,6 +1320,6 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 6);
+        assert_eq!(checked, 7);
     }
 }

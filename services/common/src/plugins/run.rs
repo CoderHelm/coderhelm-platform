@@ -380,6 +380,7 @@ fn actor_kind(by: &str) -> ActorKind {
 
 /// Starts a run for every active plugin with a release trigger that covers
 /// this repository.
+#[allow(clippy::too_many_arguments)]
 pub async fn on_release(
     kv: &dyn Kv,
     queue: &dyn Queue,
@@ -543,8 +544,8 @@ pub async fn offered_tools(
             match t.kind.as_deref() {
                 Some("http") => tools.push(ToolDef {
                     name: n.clone(),
-                    description: if risk == Risk::Read {
-                        format!("[read] {}", t.description)
+                    description: if risk != Risk::Consequential {
+                        format!("[{}] {}", risk.as_str(), t.description)
                     } else {
                         format!("[{}] {} Calling this asks for approval: the request is saved as a draft and only sent after a person approves it.", risk.as_str(), t.description)
                     },
@@ -782,22 +783,28 @@ impl ToolExec for Exec<'_> {
                 if let Some((server, tool)) = n.split_once("__") {
                     self.d.conns.call(&self.team, server, tool, input).await
                 } else if let Some(spec) = self.manifest.named_tool(n) {
-                    // A read-only HTTP tool (writes were queued above).
+                    // An HTTP tool at read or write risk (consequential ones,
+                    // and writes above the cap, were queued above). Only the
+                    // manifest's URL is ever called.
                     let conn = spec.connection.as_deref().unwrap_or("");
+                    let (method, body) = if risk == Risk::Read {
+                        ("GET", json!({}))
+                    } else {
+                        (spec.method.as_deref().unwrap_or("POST"), input.clone())
+                    };
+                    let url = spec.url.as_deref().unwrap_or("");
                     match install::open_setting(self.d.cipher, &self.team, &self.plugin, conn).await
                     {
-                        Some(cred) => self
+                        Some(cred) => match self
                             .d
                             .http
-                            .send(
-                                &self.team,
-                                &cred,
-                                "GET",
-                                spec.url.as_deref().unwrap_or(""),
-                                &json!({}),
-                            )
+                            .send(&self.team, &cred, method, url, &spec.headers, &body)
                             .await
-                            .map(|r| r.body),
+                        {
+                            Ok(r) if (200..300).contains(&r.status) => Ok(r.body),
+                            Ok(r) => Err(format!("The service answered {}.", r.status)),
+                            Err(e) => Err(e),
+                        },
                         None => Err(format!("The {conn} connection isn't set.")),
                     }
                 } else {

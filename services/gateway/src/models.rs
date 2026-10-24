@@ -25,6 +25,11 @@ pub struct Config {
     pub waitlist_table_name: String,
     pub bucket_name: String,
     pub ticket_queue_url: String,
+    /// Plugin schedules: the EventBridge Scheduler group, the role it sends
+    /// with, and the tickets queue it sends to.
+    pub plugin_schedule_group: String,
+    pub plugin_scheduler_role_arn: String,
+    pub ticket_queue_arn: String,
     pub ci_fix_queue_url: String,
     pub feedback_queue_url: String,
     pub dlq_url: String,
@@ -77,6 +82,10 @@ impl Config {
                 .expect("WAITLIST_TABLE_NAME required"),
             bucket_name: std::env::var("BUCKET_NAME").expect("BUCKET_NAME required"),
             ticket_queue_url: std::env::var("TICKET_QUEUE_URL").expect("TICKET_QUEUE_URL required"),
+            plugin_schedule_group: std::env::var("PLUGIN_SCHEDULE_GROUP").unwrap_or_default(),
+            plugin_scheduler_role_arn: std::env::var("PLUGIN_SCHEDULER_ROLE_ARN")
+                .unwrap_or_default(),
+            ticket_queue_arn: std::env::var("TICKET_QUEUE_ARN").unwrap_or_default(),
             ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").expect("CI_FIX_QUEUE_URL required"),
             feedback_queue_url: std::env::var("FEEDBACK_QUEUE_URL")
                 .expect("FEEDBACK_QUEUE_URL required"),

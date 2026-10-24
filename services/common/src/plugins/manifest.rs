@@ -138,6 +138,16 @@ pub struct ToolSpec {
     pub method: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// For `http`: the JSON body to send, with `{{title}}`, `{{content}}`,
+    /// `{{kind}}`, `{{channel}}` and `{{setting:<key>}}` (a setting that
+    /// isn't sensitive) filled in. Without it the body is
+    /// `{title, content, kind, channel}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<serde_json::Value>,
+    /// For `http`: extra request headers (never credentials: the token comes
+    /// from the connection).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     /// The risk the plugin declares. It can raise a tool's risk, never
     /// lower it below what CoderHelm's registry says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -287,6 +297,64 @@ pub fn eventbridge_cron(c: &str) -> Option<String> {
         "cron({} {} {} {} {} *)",
         f[0], f[1], dom, f[3], dow
     ))
+}
+
+/// The `{{setting:<key>}}` names a body template uses.
+pub fn template_settings(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => {
+                let mut rest = s.as_str();
+                while let Some(i) = rest.find("{{setting:") {
+                    let after = &rest[i + 10..];
+                    match after.find("}}") {
+                        Some(j) => {
+                            out.push(after[..j].to_string());
+                            rest = &after[j + 2..];
+                        }
+                        None => break,
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    walk(v, &mut out);
+    out
+}
+
+/// Fills a body template: `{{title}}`, `{{content}}`, `{{kind}}`,
+/// `{{channel}}`, `{{setting:<key>}}`. Values are inserted as text inside
+/// JSON strings, so they can never add keys or change the shape.
+pub fn render_body(
+    v: &serde_json::Value,
+    fields: &BTreeMap<&str, String>,
+    settings: &BTreeMap<String, String>,
+) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => {
+            let mut out = s.clone();
+            for (k, val) in fields {
+                out = out.replace(&format!("{{{{{k}}}}}"), val);
+            }
+            for (k, val) in settings {
+                out = out.replace(&format!("{{{{setting:{k}}}}}"), val);
+            }
+            serde_json::Value::String(out)
+        }
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.iter().map(|x| render_body(x, fields, settings)).collect())
+        }
+        serde_json::Value::Object(o) => serde_json::Value::Object(
+            o.iter()
+                .map(|(k, x)| (k.clone(), render_body(x, fields, settings)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Parses and checks a manifest. Every problem is listed, in plain words.
@@ -450,6 +518,25 @@ impl Manifest {
                             match t.url.as_deref().map(url::Url::parse) {
                                 Some(Ok(u)) if u.scheme() == "https" && u.host_str().is_some() && u.username().is_empty() => {}
                                 _ => p.push(format!("HTTP tool {n} needs an https `url`.")),
+                            }
+                            for (h, v) in &t.headers {
+                                let lower = h.to_ascii_lowercase();
+                                let bad_name = h.is_empty() || h.len() > 60 || !h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+                                let forbidden = ["authorization", "cookie", "host", "content-length", "transfer-encoding"].contains(&lower.as_str()) || lower.starts_with("proxy-");
+                                if bad_name || forbidden || v.len() > 200 || v.contains(['\r', '\n']) {
+                                    p.push(format!("HTTP tool {n} has a header ({h}) that isn't allowed. Credentials come from the connection, never the manifest."));
+                                }
+                            }
+                            if let Some(b) = &t.body {
+                                if serde_json::to_string(b).map(|x| x.len()).unwrap_or(0) > 8_000 {
+                                    p.push(format!("HTTP tool {n}'s body is too large."));
+                                }
+                                for key in template_settings(b) {
+                                    match self.setting(&key) {
+                                        Some(st) if !st.sensitive && st.kind == "string" => {}
+                                        _ => p.push(format!("HTTP tool {n}'s body uses setting {key}, which must be a string setting that isn't sensitive.")),
+                                    }
+                                }
                             }
                         }
                         Some("builtin") => match crate::tool_registry::builtin(n) {
@@ -936,5 +1023,54 @@ outputs: [{type: publish, via: get_stats}]
         );
         assert!(eventbridge_cron("0 9 * *").is_none());
         assert!(eventbridge_cron("0 9 * * $(x)").is_none());
+    }
+
+    #[test]
+    fn http_headers_never_carry_credentials_and_templates_stay_text() {
+        let base = r#"
+name: a
+version: 1.0.0
+settings:
+  - {key: c, type: connection, provider: oauth2}
+  - {key: author, type: string}
+  - {key: secret_thing, type: secret, sensitive: true}
+tools:
+  - name: post_it
+    kind: http
+    connection: c
+    method: POST
+    url: "https://x.io/posts"
+    risk: consequential
+    headers: {HEADER}
+    body: {BODY}
+"#;
+        let ok = base.replace("{HEADER}", "{X-Version: \"2\"}").replace(
+            "{BODY}",
+            "{text: \"{{content}}\", by: \"{{setting:author}}\"}",
+        );
+        let m = parse(&ok).unwrap();
+        let fields = BTreeMap::from([("content", "Hi\", \"evil\": \"x".to_string())]);
+        let out = render_body(
+            m.tools[0].body.as_ref().unwrap(),
+            &fields,
+            &BTreeMap::from([("author".into(), "me".into())]),
+        );
+        // The text is inserted as a string: it can't add keys.
+        assert_eq!(out.as_object().unwrap().len(), 2);
+        assert_eq!(out["by"], "me");
+        let bad_header = base
+            .replace("{HEADER}", "{Authorization: \"Bearer x\"}")
+            .replace("{BODY}", "{}");
+        assert!(parse(&bad_header)
+            .unwrap_err()
+            .join(" ")
+            .contains("isn't allowed"));
+        let secret_in_body = base
+            .replace("{HEADER}", "{}")
+            .replace("{BODY}", "{t: \"{{setting:secret_thing}}\"}");
+        assert!(parse(&secret_in_body)
+            .unwrap_err()
+            .join(" ")
+            .contains("isn't sensitive"));
     }
 }

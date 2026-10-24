@@ -806,3 +806,104 @@ async fn results_come_back_as_lessons_for_the_next_run() {
     let sys = run::system_prompt("brief", &snap.manifest, &snap, &lessons, &BTreeMap::new());
     assert!(sys.contains("How earlier published drafts did"));
 }
+
+/// The public example in `plugins/marketing` reads, checks and grants what
+/// its README says.
+#[tokio::test]
+async fn the_example_marketing_plugin_is_valid() {
+    struct Disk(std::path::PathBuf);
+    #[async_trait::async_trait]
+    impl super::package::RepoRead for Disk {
+        async fn resolve(&self, _r: &str) -> Result<String, String> {
+            Ok("0000000".into())
+        }
+        async fn tree(&self, _sha: &str) -> Result<Vec<(String, u64)>, String> {
+            fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, u64)>) {
+                for e in std::fs::read_dir(dir).unwrap().flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(base, &p, out);
+                    } else {
+                        let rel = p
+                            .strip_prefix(base)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        out.push((rel, e.metadata().unwrap().len()));
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&self.0, &self.0.join("plugins"), &mut out);
+            Ok(out)
+        }
+        async fn read(&self, _sha: &str, path: &str) -> Result<String, String> {
+            std::fs::read_to_string(self.0.join(path)).map_err(|e| e.to_string())
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let disk = Disk(root);
+    let tree = super::package::RepoRead::tree(&disk, "x").await.unwrap();
+    assert!(super::package::plugin_roots(&tree).contains(&"plugins/marketing".to_string()));
+    let pkg = super::package::read(&disk, "x", "plugins/marketing")
+        .await
+        .unwrap();
+    let m = &pkg.manifest;
+    assert_eq!(m.id(), "marketing");
+    assert_eq!(
+        pkg.items
+            .iter()
+            .filter(|i| i.kind == crate::skills::Kind::Agent)
+            .count(),
+        2
+    );
+    assert_eq!(
+        pkg.items
+            .iter()
+            .filter(|i| i.kind == crate::skills::Kind::Skill)
+            .count(),
+        2
+    );
+    let g = m.grant();
+    use crate::tool_registry::Risk;
+    assert_eq!(g.risk("publish_post"), Some(Risk::Consequential));
+    assert_eq!(g.risk("send_email"), Some(Risk::Consequential));
+    assert_eq!(g.risk("generate_image"), Some(Risk::Write));
+    assert_eq!(g.risk("sanity__create_draft"), Some(Risk::Write));
+    assert_eq!(g.risk("posthog__query_insight"), Some(Risk::Read));
+    assert!(!g.allows("sanity__delete_document"));
+    assert!(m.results.is_some());
+    // The LinkedIn body fills in the approved text and the author setting.
+    let spec = m.named_tool("publish_post").unwrap();
+    let fields = BTreeMap::from([
+        ("title", "T".to_string()),
+        ("content", "Body".to_string()),
+        ("kind", "social".into()),
+        ("channel", "linkedin".into()),
+    ]);
+    let settings = BTreeMap::from([(
+        "linkedin_author".to_string(),
+        "urn:li:organization:1".to_string(),
+    )]);
+    let body = super::manifest::render_body(spec.body.as_ref().unwrap(), &fields, &settings);
+    assert_eq!(body["commentary"], "Body");
+    assert_eq!(body["author"], "urn:li:organization:1");
+    // No customer names or brand content in the public example.
+    for (path, text) in pkg
+        .items
+        .iter()
+        .map(|i| (i.path.clone(), i.body.clone()))
+        .chain(std::iter::once((
+            "plugin.yaml".into(),
+            pkg.manifest_text.clone(),
+        )))
+    {
+        let lower = text.to_lowercase();
+        for word in ["acme", "@"] {
+            assert!(
+                !lower.contains(word) || word == "@" && !lower.contains(".com>"),
+                "{path} mentions {word}"
+            );
+        }
+    }
+}

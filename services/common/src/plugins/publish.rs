@@ -205,20 +205,36 @@ async fn send(
     let credential = install::open_setting(d.cipher, team, &p, conn)
         .await
         .ok_or_else(|| format!("The {conn} connection isn't set in the plugin's settings."))?;
-    let mut body = json!({
-        "title": v.title,
-        "content": v.content,
-        "kind": a.kind,
-        "channel": a.channel,
-    });
+    let fields = std::collections::BTreeMap::from([
+        ("title", v.title.clone()),
+        ("content", v.content.clone()),
+        ("kind", a.kind.clone()),
+        ("channel", a.channel.clone()),
+    ]);
+    let mut body = match &spec.body {
+        // The plugin's template, with the approved text and the team's
+        // non-sensitive settings filled in as text.
+        Some(t) => super::manifest::render_body(t, &fields, &p.settings),
+        None => json!({
+            "title": v.title,
+            "content": v.content,
+            "kind": a.kind,
+            "channel": a.channel,
+        }),
+    };
     if let (Some(Value::Object(extra)), Some(obj)) = (a.action_args.clone(), body.as_object_mut()) {
-        for (k, val) in extra {
-            obj.entry(k).or_insert(val);
+        if spec.body.is_none() {
+            for (k, val) in extra {
+                obj.entry(k).or_insert(val);
+            }
         }
     }
     let url = spec.url.as_deref().unwrap_or("");
     let method = spec.method.as_deref().unwrap_or("POST");
-    let reply = d.http.send(team, &credential, method, url, &body).await?;
+    let reply = d
+        .http
+        .send(team, &credential, method, url, &spec.headers, &body)
+        .await?;
     if !(200..300).contains(&reply.status) {
         return Err(format!(
             "{} answered {}: {}",

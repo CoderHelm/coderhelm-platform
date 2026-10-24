@@ -1002,6 +1002,54 @@ impl GitHubClient {
         Ok(sha.to_string())
     }
 
+    /// The commit a plugin source's ref points at: "" is the default
+    /// branch, `tags/<name>` a tag (an annotated tag is followed to its
+    /// commit), a hex string of 7 to 40 characters a commit, anything else
+    /// a branch.
+    pub async fn resolve_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let git_ref = git_ref.trim();
+        if git_ref.is_empty() {
+            let branch = self.get_default_branch(owner, repo).await?;
+            return self.get_ref(owner, repo, &branch).await;
+        }
+        if let Some(tag) = git_ref.strip_prefix("tags/") {
+            let url = format!("{API_BASE}/repos/{owner}/{repo}/git/ref/tags/{tag}");
+            let data = self.get(&url).await?;
+            let sha = data
+                .pointer("/object/sha")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing sha in tag ref")?;
+            if data.pointer("/object/type").and_then(|v| v.as_str()) == Some("tag") {
+                let t = self
+                    .get(&format!("{API_BASE}/repos/{owner}/{repo}/git/tags/{sha}"))
+                    .await?;
+                return Ok(t
+                    .pointer("/object/sha")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing sha in tag")?
+                    .to_string());
+            }
+            return Ok(sha.to_string());
+        }
+        if (7..40).contains(&git_ref.len()) && git_ref.chars().all(|c| c.is_ascii_hexdigit()) {
+            let c = self
+                .get(&format!(
+                    "{API_BASE}/repos/{owner}/{repo}/commits/{git_ref}"
+                ))
+                .await?;
+            return Ok(c["sha"]
+                .as_str()
+                .ok_or("Missing sha in commit")?
+                .to_string());
+        }
+        self.get_ref(owner, repo, git_ref).await
+    }
+
     /// The tree SHA at `branch`'s tip. Trees are content-addressed: two equal
     /// tree SHAs mean byte-identical file sets, whatever commits lie between.
     pub async fn get_tree_sha(
