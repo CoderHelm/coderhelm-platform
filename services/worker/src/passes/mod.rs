@@ -734,6 +734,7 @@ pub mod review_risk;
 pub mod review_scope;
 pub mod review_sweep;
 pub mod review_verdict;
+pub mod rewards;
 mod security;
 pub mod skill_compat;
 pub mod skill_suggest;
@@ -1553,6 +1554,19 @@ async fn run_passes(
         }
         None => String::new(),
     };
+    // What outcomes taught the coder in this repository: changes merged as
+    // written and ones closed, rewritten or reverted, and evidence-backed
+    // lessons.
+    let memory_context = format!(
+        "{memory_context}{}",
+        rewards::coder_learning(
+            state,
+            &msg.team_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            &format!("{} {}", msg.title, common::truncate_str(&msg.body, 1500)),
+        )
+        .await
+    );
 
     // --- A continuation of this same run (Lambda time limit, step budget,
     // a transient model error) picks up this run's own triage and plan: the

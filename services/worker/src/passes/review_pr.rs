@@ -1280,10 +1280,24 @@ async fn run_once(
         super::review_lessons::recall(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
     let learning =
         load_learning_context(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    // What outcomes taught: this repo's calibration, the prompt variant the
+    // bandit picked, good and avoid examples, and evidence-backed lessons.
+    let reward_paths: Vec<String> = changed_files(&compare).into_iter().collect();
+    let reward = super::rewards::review_learning(
+        state,
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        &reward_paths,
+        &format!("{title}\n{}", reward_paths.join("\n")),
+    )
+    .await;
     let instructions_block = format!(
-        "{}{org_block}{extra}{learning}{team_lessons}",
-        super::format_instructions_block(&repo_instructions)
+        "{}{org_block}{extra}{learning}{team_lessons}{}{}",
+        super::format_instructions_block(&repo_instructions),
+        reward.context,
+        reward.addendum,
     );
+    let critic_lessons = format!("{team_lessons}{}", reward.context);
     let changed = review_agent::changed_right_lines(&compare);
 
     // Code graph: if this repo is indexed, compute the EXACT impacted-file set
@@ -1610,6 +1624,26 @@ async fn run_once(
     };
     let fixed_threads: Vec<&crate::clients::github::BotReviewThread> =
         settled_prior_threads(&prior_threads, &output.prior);
+    // Comments the code now fixes (or the author accepted) earned reward;
+    // answered-only ones are not counted as acted on.
+    {
+        let acted: Vec<&crate::clients::github::BotReviewThread> = output
+            .prior
+            .iter()
+            .filter(|s| {
+                s.status.eq_ignore_ascii_case("fixed") || s.status.eq_ignore_ascii_case("accepted")
+            })
+            .filter_map(|s| prior_threads.get(s.index).copied())
+            .collect();
+        super::rewards::record_accepted(
+            state,
+            &msg.team_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            msg.pr_number,
+            &acted,
+        )
+        .await;
+    }
     let still_open = prior_threads.len() - fixed_threads.len();
     // Of those, the ones that hold the merge: a question the change doesn't
     // rest on, or an unverified concern, left open is still shown, but
@@ -1659,11 +1693,30 @@ async fn run_once(
             answered: &answered_context,
             live_evidence: &live_evidence,
             team_instructions: &team_instructions,
-            lessons: &team_lessons,
+            lessons: &critic_lessons,
         },
         &mut usage,
     )
     .await;
+    // Categories this repo keeps dismissing are quieted; security and
+    // correctness never are.
+    // A repo that requires tests keeps its tests findings whatever the counts.
+    let calibration: Vec<_> = reward
+        .calibration
+        .iter()
+        .filter(|s| !(cfg.require_tests && s.category.eq_ignore_ascii_case("tests")))
+        .cloned()
+        .collect();
+    let (calib_dropped, calib_downgraded) =
+        super::rewards::apply_calibration(&mut findings, &calibration);
+    if calib_dropped + calib_downgraded > 0 {
+        info!(
+            pr = msg.pr_number,
+            dropped = calib_dropped,
+            downgraded = calib_downgraded,
+            "Reviewer calibration applied"
+        );
+    }
 
     // 2b) A suggestion is a one-click commit of its text over the anchored
     // lines; keep it only when that is a safe in-place edit of the file at this
@@ -2039,6 +2092,14 @@ async fn run_once(
         note_review_standards(state, &msg.team_id, &record_sk, &s.applied_names()).await;
     }
     note_review_details(state, &msg.team_id, &record_sk, title, &findings).await;
+    super::rewards::note_review_variant(
+        state,
+        &msg.team_id,
+        &record_sk,
+        &reward.arm,
+        provider.heavy_model_id(),
+    )
+    .await;
     info!(
         pr = msg.pr_number,
         verdict = verdict,

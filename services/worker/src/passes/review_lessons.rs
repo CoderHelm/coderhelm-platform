@@ -630,6 +630,20 @@ async fn learn(
     let judged = judge(model, &d).await;
     let mut learned = Vec::new();
     for j in &judged {
+        // A comment the team argued with, and the judge agreed: a dismissal.
+        if matches!(j.verdict.as_str(), "reviewer_wrong" | "overstated") {
+            super::rewards::record_dismissed(
+                state,
+                team_id,
+                &format!("{owner}/{name}"),
+                pr_number,
+                &j.category,
+                &j.finding,
+                &j.why,
+                &j.finding.trim().to_ascii_lowercase(),
+            )
+            .await;
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let id = ulid::Ulid::new().to_string();
         let Some(new) = new_lesson(j, owner, name, pr_number, trigger, &id, &now) else {

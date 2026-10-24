@@ -682,7 +682,7 @@ pub async fn approve_task(
     let now = chrono::Utc::now().to_rfc3339();
 
     // 1. Mark task as approved
-    state
+    let out = state
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
@@ -694,12 +694,23 @@ pub async fn approve_task(
         .expression_attribute_values(":now", attr_s(&now))
         .expression_attribute_values(":by", attr_s(&claims.display_name()))
         .condition_expression("attribute_exists(pk)")
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
         .send()
         .await
         .map_err(|e| {
             error!("Failed to approve task: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    record_plan_task_reward(
+        &state,
+        &claims.team_id,
+        &plan_id,
+        &task_id,
+        common::rewards::RewardKind::PlanTaskApproved,
+        out.attributes(),
+        &now,
+    )
+    .await;
 
     // 2. Mark plan as executing (idempotent — may already be executing)
     let plan_sk = format!("PLAN#{plan_id}");
@@ -745,6 +756,40 @@ pub async fn approve_task(
     Ok(Json(json!({ "dispatched": true, "task_id": task_id })))
 }
 
+/// A plan task approved or rejected, as a reward signal for the planner.
+async fn record_plan_task_reward(
+    state: &AppState,
+    team_id: &str,
+    plan_id: &str,
+    task_id: &str,
+    kind: common::rewards::RewardKind,
+    task: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
+    at: &str,
+) {
+    let get = |k: &str| {
+        task.and_then(|t| t.get(k))
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let title = get("title");
+    let ev = common::rewards::RewardEvent::new(
+        team_id,
+        kind,
+        common::rewards::event::AGENT_PLANNER,
+        at,
+        &format!("{}#{plan_id}#{task_id}", kind.key()),
+    )
+    .with_repo(&get("repo"), 0)
+    .with_detail(&format!("Plan task: {title}"))
+    .with_source("dashboard:plan");
+    let store =
+        common::rewards::store::Store::new(&state.dynamo, &state.config.settings_table_name);
+    if let Err(e) = store.record(&ev).await {
+        tracing::warn!(error = %e, "Could not record the plan task outcome");
+    }
+}
+
 /// POST /api/plans/:plan_id/tasks/:task_id/reject — reject a task.
 pub async fn reject_task(
     State(state): State<Arc<AppState>>,
@@ -758,7 +803,7 @@ pub async fn reject_task(
     let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
     let now = chrono::Utc::now().to_rfc3339();
 
-    state
+    let out = state
         .dynamo
         .update_item()
         .table_name(&state.config.plans_table_name)
@@ -770,12 +815,23 @@ pub async fn reject_task(
         .expression_attribute_values(":now", attr_s(&now))
         .expression_attribute_values(":by", attr_s(&claims.display_name()))
         .condition_expression("attribute_exists(pk)")
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
         .send()
         .await
         .map_err(|e| {
             error!("Failed to reject task: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    record_plan_task_reward(
+        &state,
+        &claims.team_id,
+        &plan_id,
+        &task_id,
+        common::rewards::RewardKind::PlanTaskRejected,
+        out.attributes(),
+        &now,
+    )
+    .await;
 
     Ok(StatusCode::OK)
 }

@@ -578,6 +578,17 @@ async fn handle_review_comment(
         is_rereview = ask.rereview,
         "Reviewer: thread reply → review job"
     );
+    if ask.rereview {
+        record_rereview(
+            state,
+            team_id,
+            owner,
+            name,
+            pr_number,
+            &format!("reply#{comment_id}"),
+        )
+        .await;
+    }
     let message = WorkerMessage::Review(ReviewMessage {
         team_id: team_id.to_string(),
         installation_id,
@@ -769,6 +780,17 @@ async fn handle_issue_comment(
                 // the worker runs the review exactly once; a genuinely new
                 // `@coderhelm re-review` comment has a new id and re-runs.
                 let comment_id = payload["comment"]["id"].as_u64().unwrap_or(0);
+                if is_rereview {
+                    record_rereview(
+                        state,
+                        team_id,
+                        owner,
+                        name,
+                        pr_number,
+                        &format!("reply#{comment_id}"),
+                    )
+                    .await;
+                }
                 let message = WorkerMessage::Review(ReviewMessage {
                     team_id: team_id.to_string(),
                     installation_id,
@@ -900,6 +922,15 @@ async fn handle_pull_request(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("pr{pr_number}"));
+        record_rereview(
+            state,
+            team_id,
+            owner,
+            name,
+            pr_number,
+            &format!("rerequest#{req_head}"),
+        )
+        .await;
         let message = WorkerMessage::Review(ReviewMessage {
             team_id: team_id.to_string(),
             installation_id,
@@ -968,6 +999,12 @@ async fn handle_pull_request(
                 warn!(pr_number, error = %e, "Could not record a stopped auto-merge's PR as closed");
             }
         }
+    }
+
+    // A merged revert of one of CoderHelm's pull requests (any author) is a
+    // strong signal against that change.
+    if merged {
+        record_revert(state, payload, team_id).await;
     }
 
     // Only track our PRs
@@ -1052,6 +1089,16 @@ async fn handle_pull_request(
             if let Err(e) = send_to_queue(state, &state.config.ticket_queue_url, &lesson).await {
                 warn!(team_id, run_id, pr_number, status = ?e, "Could not queue the closed PR's lesson");
             }
+            queue_reward_outcome(
+                state,
+                team_id,
+                installation_id,
+                &run_id,
+                owner,
+                name,
+                pr_number,
+            )
+            .await;
             return Ok(StatusCode::OK);
         }
         if !run_id.is_empty() {
@@ -1086,6 +1133,11 @@ async fn handle_pull_request(
             let mut expr =
                 "SET updated_at = :t, pr_outcome = :o, merged_at = :ma, pr_opened_at = :op, merged_by = :mb"
                     .to_string();
+            // The merge commit, so an alert naming it can be tied to this run.
+            if let Some(sha) = pr["merge_commit_sha"].as_str().filter(|s| !s.is_empty()) {
+                expr.push_str(", merge_commit_sha = :mcs");
+                update = update.expression_attribute_values(":mcs", attr_s(sha));
+            }
             // A run a person closed stays closed; the merge is still recorded
             // (analytics count it as merged through `pr_outcome`).
             if merge_sets_status(run_status) {
@@ -1104,6 +1156,16 @@ async fn handle_pull_request(
             } else {
                 info!(team_id, run_id, pr_number, "PR merged — run status updated");
             }
+            queue_reward_outcome(
+                state,
+                team_id,
+                installation_id,
+                &run_id,
+                owner,
+                name,
+                pr_number,
+            )
+            .await;
 
             // ── Plan task dependency continuation ──
             // If this run's issue belongs to a plan task, check for waiting dependents.
@@ -1125,6 +1187,103 @@ async fn handle_pull_request(
     }
 
     Ok(StatusCode::OK)
+}
+
+/// Hands a closed CoderHelm pull request to the worker to score (merged as
+/// written or edited, closed, time to merge, CI rounds, comments left open).
+async fn queue_reward_outcome(
+    state: &AppState,
+    team_id: &str,
+    installation_id: u64,
+    run_id: &str,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+) {
+    let msg = WorkerMessage::RewardOutcome(common::rewards::RewardOutcomeMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        run_id: run_id.to_string(),
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
+    });
+    if let Err(e) = send_to_queue(state, &state.config.ticket_queue_url, &msg).await {
+        warn!(team_id, run_id, pr_number, status = ?e, "Could not queue the PR's reward outcome");
+    }
+}
+
+fn reward_store(state: &AppState) -> common::rewards::store::Store {
+    common::rewards::store::Store::new(&state.dynamo, &state.config.settings_table_name)
+}
+
+/// A re-review ask on a PR CoderHelm reviewed, as a reward signal (weight 0
+/// by default: recorded and shown, scored only if the team chooses).
+pub(crate) async fn record_rereview(
+    state: &AppState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+    dedup: &str,
+) {
+    let ev = common::rewards::RewardEvent::new(
+        team_id,
+        common::rewards::RewardKind::RereviewRequested,
+        common::rewards::event::AGENT_REVIEWER,
+        &chrono::Utc::now().to_rfc3339(),
+        &format!("rereview#{owner}/{name}#{dedup}"),
+    )
+    .with_repo(&format!("{owner}/{name}"), pr_number)
+    .with_detail(&format!("Re-review asked on PR #{pr_number}"))
+    .with_source("webhook:github");
+    if let Err(e) = reward_store(state).record(&ev).await {
+        warn!(error = %e, "Could not record the re-review ask");
+    }
+}
+
+/// When a merged pull request is GitHub's revert of one of CoderHelm's,
+/// records that change as reverted.
+async fn record_revert(state: &AppState, payload: &Value, team_id: &str) {
+    let pr = &payload["pull_request"];
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let full = format!("{owner}/{name}");
+    let Some(target) = common::rewards::mapping::revert_target(
+        pr["title"].as_str().unwrap_or(""),
+        pr["body"].as_str().unwrap_or(""),
+        &full,
+    ) else {
+        return;
+    };
+    let run_id = lookup_run_by_pr(state, team_id, owner, name, target).await;
+    if run_id.is_empty() {
+        return; // not one of CoderHelm's
+    }
+    let at = pr["merged_at"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let mut ev = common::rewards::RewardEvent::new(
+        team_id,
+        common::rewards::RewardKind::PrReverted,
+        common::rewards::event::AGENT_CODER,
+        &at,
+        &format!("reverted#{full}#{target}"),
+    )
+    .with_repo(&full, target)
+    .with_detail(&format!(
+        "PR #{target} was reverted by #{}",
+        pr["number"].as_u64().unwrap_or(0)
+    ))
+    .with_source("webhook:pull_request");
+    ev.run_id = run_id;
+    if let Err(e) = reward_store(state).record(&ev).await {
+        warn!(error = %e, "Could not record the revert");
+    } else {
+        info!(team_id, repo = %full, pr = target, "A CoderHelm change was reverted");
+    }
 }
 
 /// Counts people's commits on a merged pull request. `None` when GitHub
@@ -1290,6 +1449,17 @@ async fn handle_pr_review(
                     is_rereview = ask.rereview,
                     "Reviewer: review body → review job"
                 );
+                if ask.rereview {
+                    record_rereview(
+                        state,
+                        team_id,
+                        owner,
+                        name,
+                        pr_number,
+                        &format!("review#{review_id}"),
+                    )
+                    .await;
+                }
                 let message = WorkerMessage::Review(ReviewMessage {
                     team_id: team_id.to_string(),
                     installation_id,
