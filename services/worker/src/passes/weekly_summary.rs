@@ -153,22 +153,62 @@ pub struct Usage {
     /// The week's days from the same counters; `None` when part of the week
     /// is from before every model call was counted per day.
     pub week_tokens: Option<Tokens>,
-    /// 0 = no limit.
-    pub limit_tokens: u64,
-    /// Whether the limit counts cache tokens (otherwise new input + output).
-    pub limit_counts_cache: bool,
+    /// The team's limits (none set = no limit); each is shown by the rule it
+    /// is enforced with.
+    pub limits: common::token_limits::TokenLimits,
+}
+
+/// One limit's line: the tokens it counts, then "of the … limit used · N%".
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitLine {
+    pub used: u64,
+    pub rest: String,
+    pub pct: u64,
 }
 
 impl Usage {
-    /// What the limit compares with `limit_tokens`, by the same rule the
+    /// Each set limit against the month's counters, by the same rule the
     /// limit is enforced with.
-    pub fn counted(&self) -> u64 {
+    pub fn limit_lines(&self) -> Vec<LimitLine> {
+        use common::token_limits::LimitKind;
         let t = &self.month_tokens;
-        if self.limit_counts_cache {
-            t.total()
-        } else {
-            t.input + t.output
-        }
+        let totals = common::usage::UsageTotals {
+            tokens_in_uncached: t.input,
+            cache_read: t.cache_read,
+            cache_write: t.cache_write,
+            tokens_out: t.output,
+        };
+        self.limits
+            .uses(&totals)
+            .into_iter()
+            .map(|u| {
+                let pct = (u.used as f64 / u.max as f64 * 100.0).round() as u64;
+                let rest = match u.kind {
+                    LimitKind::Legacy { counts_cache } => {
+                        let rule = if counts_cache {
+                            ""
+                        } else {
+                            " (the limit counts new input and output, not cache)"
+                        };
+                        format!("of the {} token limit used · {pct}%{rule}", tokens(u.max))
+                    }
+                    LimitKind::NewTokens => format!(
+                        "of the {} new tokens limit used · {pct}% (new input and output)",
+                        tokens(u.max)
+                    ),
+                    kind => format!(
+                        "of the {} {} limit used · {pct}%",
+                        tokens(u.max),
+                        kind.label()
+                    ),
+                };
+                LimitLine {
+                    used: u.used,
+                    rest,
+                    pct,
+                }
+            })
+            .collect()
     }
 }
 
@@ -1197,27 +1237,19 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
 
     // Usage lines, shared by both parts.
     let month = &u.month;
-    // The limit is shown by the rule it is enforced with: all four kinds of
-    // tokens, or new input + output only.
-    let counted = u.counted();
-    let limit_rule = if u.limit_counts_cache {
-        ""
+    // Each limit is shown by the rule it is enforced with: new input +
+    // output, cache read, cache write, or (the old single limit) all four
+    // kinds or new input + output only.
+    let limit_lines = u.limit_lines();
+    let usage_head = if limit_lines.is_empty() {
+        format!("{} tokens · no monthly limit set", tokens(month_total))
     } else {
-        " (the limit counts new input and output, not cache)"
+        limit_lines
+            .iter()
+            .map(|l| format!("{} {}", tokens(l.used), l.rest))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
-    let usage_head;
-    let mut usage_pct = None;
-    if u.limit_tokens > 0 {
-        let pct = (counted as f64 / u.limit_tokens as f64 * 100.0).round() as u64;
-        usage_pct = Some(pct);
-        usage_head = format!(
-            "{} of the {} token limit used · {pct}%{limit_rule}",
-            tokens(counted),
-            tokens(u.limit_tokens)
-        );
-    } else {
-        usage_head = format!("{} tokens · no monthly limit set", tokens(month_total));
-    }
     let month_line = format!(
         "{} tokens in {month} so far · {}",
         tokens(month_total),
@@ -1442,42 +1474,39 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
         )));
     }
     if has_usage {
-        let (big, small) = match u.limit_tokens {
-            0 => (
-                tokens(month_total),
-                "tokens · no monthly limit set".to_string(),
-            ),
-            limit => (
-                tokens(counted),
-                format!(
-                    "of the {} token limit used · {}%{limit_rule}",
-                    tokens(limit),
-                    usage_pct.unwrap_or(0)
-                ),
-            ),
+        let line = |big: &str, small: &str| {
+            format!(
+                r#"<p style="margin:4px 0 0;font-size:16px;line-height:28px"><span class="t1" style="font-size:22px;font-weight:700;color:{t1};font-variant-numeric:tabular-nums">{big}</span> <span class="t2" style="color:{t2}">{small}</span></p>"#,
+                big = esc(big),
+                small = esc(small),
+                t1 = c::T1,
+                t2 = c::T2,
+            )
         };
-        let bar = usage_pct
-            .map(|pct| {
-                let color = match pct {
-                    0..=79 => c::BLUE,
-                    80..=99 => c::AMBER,
-                    _ => c::RED,
-                };
-                format!(
-                    r#"<div style="margin:12px 0 0">{}</div>"#,
-                    meter(pct, color)
-                )
-            })
-            .unwrap_or_default();
+        let lines = if limit_lines.is_empty() {
+            line(&tokens(month_total), "tokens · no monthly limit set")
+        } else {
+            limit_lines
+                .iter()
+                .map(|l| {
+                    let color = match l.pct {
+                        0..=79 => c::BLUE,
+                        80..=99 => c::AMBER,
+                        _ => c::RED,
+                    };
+                    format!(
+                        r#"{}<div style="margin:12px 0 0">{}</div>"#,
+                        line(&tokens(l.used), &l.rest),
+                        meter(l.pct, color)
+                    )
+                })
+                .collect::<String>()
+        };
         rows.push_str(&block(&format!(
-            r#"{h}<p style="margin:4px 0 0;font-size:16px;line-height:28px"><span class="t1" style="font-size:22px;font-weight:700;color:{t1};font-variant-numeric:tabular-nums">{big}</span> <span class="t2" style="color:{t2}">{small}</span></p>{bar}{split}{more}"#,
+            r#"{h}{lines}{split}{more}"#,
             h = h2("Token usage"),
-            big = esc(&big),
-            small = esc(&small),
             split = token_table(u.week_tokens.as_ref(), &u.month_tokens, month),
             more = more_link("Token limit", &format!("{APP}/settings/budget/")),
-            t1 = c::T1,
-            t2 = c::T2,
         )));
     }
     let _ = write!(
@@ -1704,7 +1733,7 @@ async fn load_usage(
         .get_item()
         .table_name(src.settings_table)
         .key("pk", av(team))
-        .key("sk", av("SETTINGS#TOKEN_LIMIT"))
+        .key("sk", av(common::token_limits::SETTINGS_SK))
         .send()
         .await?;
     let week_tokens = if start >= per_day_counting_from() {
@@ -1725,20 +1754,11 @@ async fn load_usage(
     } else {
         None
     };
-    let limit = limit.item();
-    let team_counts_cache = limit
-        .and_then(|i| i.get("counts_cache"))
-        .and_then(|v| v.as_bool().ok())
-        .copied();
     Ok(Usage {
         month: now.format("%B %Y").to_string(),
         month_tokens: tokens_of(month.as_ref()),
         week_tokens,
-        limit_tokens: limit.map(|i| n(i, "max_tokens") as u64).unwrap_or(0),
-        limit_counts_cache: common::usage::counts_cache_enabled(
-            team_counts_cache,
-            std::env::var("TOKEN_LIMIT_COUNTS_CACHE").ok().as_deref(),
-        ),
+        limits: common::token_limits::TokenLimits::from_item(limit.item()),
     })
 }
 
@@ -2309,8 +2329,7 @@ mod tests {
                     cache_write: 8_800_000,
                     output: 1_000_000,
                 }),
-                limit_tokens: 200_000_000,
-                limit_counts_cache: true,
+                limits: legacy_limit(200_000_000, true),
             },
         }
     }
@@ -2343,8 +2362,7 @@ mod tests {
                     output: 10_000,
                 },
                 week_tokens: None,
-                limit_tokens: 0,
-                limit_counts_cache: false,
+                limits: Default::default(),
             },
         }
     }
@@ -2691,7 +2709,7 @@ mod tests {
     fn the_limit_is_shown_by_the_rule_it_is_enforced_with() {
         let mut sm = sample();
         // Without cache: 2M new input + 2M output of 200M.
-        sm.usage.limit_counts_cache = false;
+        sm.usage.limits = legacy_limit(200_000_000, false);
         let e = render(&sm, Access::Admin, LINK);
         assert!(
             e.text.contains(
@@ -2702,9 +2720,57 @@ mod tests {
         );
         // The month still shows all four kinds.
         assert!(e.text.contains("118M tokens in October so far"));
-        sm.usage.limit_counts_cache = true;
+        sm.usage.limits = legacy_limit(200_000_000, true);
         let e = render(&sm, Access::Admin, LINK);
         assert!(e.text.contains("118M of the 200M token limit used · 59%\n"));
+    }
+
+    fn legacy_limit(max: u64, counts_cache: bool) -> common::token_limits::TokenLimits {
+        common::token_limits::TokenLimits {
+            limits: vec![common::token_limits::Limit {
+                kind: common::token_limits::LimitKind::Legacy { counts_cache },
+                max,
+            }],
+            legacy: true,
+        }
+    }
+
+    #[test]
+    fn each_set_limit_gets_its_own_line_and_meter() {
+        use common::token_limits::{Limit, LimitKind, TokenLimits};
+        let mut sm = sample();
+        sm.usage.limits = TokenLimits {
+            limits: vec![
+                Limit {
+                    kind: LimitKind::NewTokens,
+                    max: 20_000_000,
+                },
+                Limit {
+                    kind: LimitKind::CacheWrite,
+                    max: 14_000_000,
+                },
+            ],
+            legacy: false,
+        };
+        let e = render(&sm, Access::Admin, LINK);
+        // 2M new input + 2M output of 20M; 14M cache write of 14M.
+        assert!(
+            e.text.contains(
+                "TOKEN USAGE\n4M of the 20M new tokens limit used · 20% (new input and output)\n\
+                 14M of the 14M cache write tokens limit used · 100%\n"
+            ),
+            "{}",
+            e.text
+        );
+        assert!(
+            !e.text.contains("cache read tokens limit"),
+            "unset limits are not shown"
+        );
+        assert!(e.html.contains("of the 20M new tokens limit used · 20%"));
+        assert!(e
+            .html
+            .contains("of the 14M cache write tokens limit used · 100%"));
+        assert_eq!(e.html.matches("Token usage").count(), 1);
     }
 
     #[test]

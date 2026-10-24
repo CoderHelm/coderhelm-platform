@@ -124,6 +124,26 @@ export class EmailStack extends cdk.Stack {
       },
     });
 
+    // Token limit emails: one per limit (new tokens, cache read, cache write)
+    // at 80% and at 100%. {{limit_name}} names the limit.
+    new ses.CfnTemplate(this, "TokenWarningTemplate", {
+      template: {
+        templateName: `${prefix}-token-warning`,
+        subjectPart: "Coderhelm: {{usage_pct}}% of your monthly {{limit_name}} limit used",
+        htmlPart: TOKEN_WARNING_HTML,
+        textPart: TOKEN_WARNING_TEXT,
+      },
+    });
+
+    new ses.CfnTemplate(this, "TokenLimitReachedTemplate", {
+      template: {
+        templateName: `${prefix}-token-limit-reached`,
+        subjectPart: "Coderhelm: monthly {{limit_name}} limit reached",
+        htmlPart: TOKEN_LIMIT_REACHED_HTML,
+        textPart: TOKEN_LIMIT_REACHED_TEXT,
+      },
+    });
+
     // Grant SES send permissions to both lambdas
     const sesPolicy = new iam.PolicyStatement({
       actions: ["ses:SendEmail", "ses:SendTemplatedEmail"],
@@ -251,6 +271,40 @@ PRs created: {{prs_created}}
 Total cost: \${{total_cost}}
 
 Dashboard: https://app.coderhelm.com`;
+
+// ─── Token limit templates ──────────────────────────────────────────
+
+const TOKEN_WARNING_HTML = EMAIL_WRAPPER(`
+  <h1 style="color:#f59e0b;font-size:20px;margin:0 0 16px">{{usage_pct}}% of your {{limit_name}} limit used</h1>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    Your team has used <strong style="color:#fff">{{used_tokens}}</strong> of its <strong style="color:#fff">{{limit_tokens}}</strong> monthly {{limit_name}} limit for {{month}}.
+    When it reaches the limit, Coderhelm stops starting new work until the month ends or the limit is raised.
+  </p>
+  <a href="https://app.coderhelm.com/settings/budget" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">Review token limits</a>
+`);
+
+const TOKEN_WARNING_TEXT = `{{usage_pct}}% of your {{limit_name}} limit used
+
+Your team has used {{used_tokens}} of its {{limit_tokens}} monthly {{limit_name}} limit for {{month}}.
+When it reaches the limit, Coderhelm stops starting new work until the month ends or the limit is raised.
+
+Token limits: https://app.coderhelm.com/settings/budget`;
+
+const TOKEN_LIMIT_REACHED_HTML = EMAIL_WRAPPER(`
+  <h1 style="color:#ef4444;font-size:20px;margin:0 0 16px">Monthly {{limit_name}} limit reached</h1>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    Your team has used <strong style="color:#fff">{{used_tokens}}</strong> of its <strong style="color:#fff">{{limit_tokens}}</strong> monthly {{limit_name}} limit for {{month}}.
+    Coderhelm won't start new work until the month ends or an admin raises or clears this limit.
+  </p>
+  <a href="https://app.coderhelm.com/settings/budget" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">Review token limits</a>
+`);
+
+const TOKEN_LIMIT_REACHED_TEXT = `Monthly {{limit_name}} limit reached
+
+Your team has used {{used_tokens}} of its {{limit_tokens}} monthly {{limit_name}} limit for {{month}}.
+Coderhelm won't start new work until the month ends or an admin raises or clears this limit.
+
+Token limits: https://app.coderhelm.com/settings/budget`;
 
 // ─── Account email templates ────────────────────────────────────────
 

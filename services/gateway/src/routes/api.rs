@@ -3644,53 +3644,89 @@ pub async fn regenerate_repo(
     Ok(Json(json!({ "status": "regenerating" })))
 }
 
-/// GET /api/settings/budget — get token limit.
+/// GET /api/settings/budget — the team's monthly token limits.
 pub async fn get_budget(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
-    let result = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s("SETTINGS#TOKEN_LIMIT"))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to fetch token limit: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let max_tokens = result
-        .item()
-        .and_then(|i| i.get("max_tokens"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0); // 0 = unlimited
-    let counts_cache = super::github_webhook::token_limit_counts_cache(result.item());
-
-    Ok(Json(
-        json!({ "max_tokens": max_tokens, "limit_counts_cache": counts_cache }),
-    ))
+    let limits = common::token_limits::load(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to fetch token limit: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(budget_json(&limits)))
 }
 
-/// PUT /api/settings/budget — set monthly token limit.
+/// The limits body: each of the three limits (0 = no limit). A team still on
+/// the old single limit has `legacy: true` and its `max_tokens`; when that
+/// limit counts new input + output only it is also shown as `max_new_tokens`,
+/// which counts the same tokens.
+pub fn budget_json(limits: &common::token_limits::TokenLimits) -> Value {
+    use common::token_limits::LimitKind;
+    let mut body = json!({
+        "legacy": limits.legacy,
+        "max_tokens": 0,
+        "limit_counts_cache": false,
+    });
+    for kind in LimitKind::ALL {
+        body[kind.field()] = json!(limits.get(kind).unwrap_or(0));
+    }
+    for l in &limits.limits {
+        if let LimitKind::Legacy { counts_cache } = l.kind {
+            body["max_tokens"] = json!(l.max);
+            body["limit_counts_cache"] = json!(counts_cache);
+            if !counts_cache {
+                body[LimitKind::NewTokens.field()] = json!(l.max);
+            }
+        }
+    }
+    body
+}
+
+/// PUT /api/settings/budget — set the monthly token limits.
+///
+/// Body: `max_new_tokens`, `max_cache_read_tokens`, `max_cache_write_tokens`
+/// (whole numbers; null or 0 = no limit). Saving them replaces the old single
+/// limit. A body with only `max_tokens` (an older client) still sets the old
+/// limit.
 pub async fn update_budget(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, StatusCode> {
     claims.require_role(3)?; // admin or owner
-    let max_tokens = body["max_tokens"].as_u64().unwrap_or(0);
+    let parsed = common::token_limits::parse_new_limits(&body).map_err(|bad| {
+        warn!(field = bad.0, "Rejected token limit: not a whole number");
+        StatusCode::BAD_REQUEST
+    })?;
+    if let Some(limits) = parsed {
+        common::token_limits::write_new_limits(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &claims.team_id,
+            &limits,
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to update token limits: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        return Ok(StatusCode::OK);
+    }
 
+    let max_tokens = body["max_tokens"].as_u64().unwrap_or(0);
     // An update, not a put: keeps the item's other settings (counts_cache).
     state
         .dynamo
         .update_item()
         .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s("SETTINGS#TOKEN_LIMIT"))
+        .key("sk", attr_s(common::token_limits::SETTINGS_SK))
         .update_expression("SET max_tokens = :m")
         .expression_attribute_values(
             ":m",
@@ -3706,7 +3742,7 @@ pub async fn update_budget(
     Ok(StatusCode::OK)
 }
 
-/// GET /api/usage — token usage for the current month + configured limit.
+/// GET /api/usage — token usage for the current month + configured limits.
 pub async fn get_usage(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -3721,51 +3757,38 @@ pub async fn get_usage(
             .key("team_id", attr_s(&claims.team_id))
             .key("period", attr_s(&month))
             .send(),
-        state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", attr_s(&claims.team_id))
-            .key("sk", attr_s("SETTINGS#TOKEN_LIMIT"))
-            .send()
+        common::token_limits::load(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &claims.team_id,
+        )
     );
 
     let analytics = analytics_result.map_err(|e| {
         error!("Failed to read analytics: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let limit = limit_result.map_err(|e| {
+    let limits = limit_result.map_err(|e| {
         error!("Failed to read token limit: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let counts_cache = super::github_webhook::token_limit_counts_cache(limit.item());
-    Ok(Json(usage_json(
-        &month,
-        analytics.item(),
-        limit.item(),
-        counts_cache,
-    )))
+    Ok(Json(usage_json(&month, analytics.item(), &limits)))
 }
 
-/// The usage body: tokens only (no money). `total_tokens` is all four parts;
-/// `counted_tokens` is what the limit compares with `max_tokens` today.
+/// The usage body: tokens only (no money). `total_tokens` is all four parts.
+/// `limits` lists each set limit with what it counts this month (`kind`:
+/// `new_tokens` = new input + output, `cache_read`, `cache_write`, or
+/// `all_tokens` for an old single limit that counts cache too).
+/// `max_tokens` / `counted_tokens` / `limit_counts_cache` describe the old
+/// single limit for older clients (0 / new input + output once the new limits
+/// are saved).
 pub fn usage_json(
     month: &str,
     analytics: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
-    limit: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
-    counts_cache: bool,
+    limits: &common::token_limits::TokenLimits,
 ) -> Value {
-    let n = |item: Option<
-        &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
-    >,
-             k: &str|
-     -> u64 {
-        item.and_then(|i| i.get(k))
-            .and_then(|v| v.as_n().ok())
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(0)
-    };
+    use common::token_limits::LimitKind;
     let t = common::usage::UsageTotals::from_item(analytics);
     let features: Vec<Value> = common::usage::feature_totals(analytics)
         .into_iter()
@@ -3780,6 +3803,24 @@ pub fn usage_json(
             })
         })
         .collect();
+    let uses = limits.uses(&t);
+    let limit_rows: Vec<Value> = uses
+        .iter()
+        .map(|u| {
+            json!({
+                "kind": u.kind.key(),
+                "max": u.max,
+                "used": u.used,
+            })
+        })
+        .collect();
+    let (max_tokens, counted, counts_cache) = uses
+        .iter()
+        .find_map(|u| match u.kind {
+            LimitKind::Legacy { counts_cache } => Some((u.max, u.used, counts_cache)),
+            _ => None,
+        })
+        .unwrap_or((0, t.uncached_total(), false));
     json!({
         "month": month,
         "total_tokens": t.total(),
@@ -3787,12 +3828,19 @@ pub fn usage_json(
         "cache_read_tokens": t.cache_read,
         "cache_write_tokens": t.cache_write,
         "tokens_out": t.tokens_out,
+        "new_tokens": t.uncached_total(),
         "cache_hit_rate": t.cache_hit_rate(),
-        "counted_tokens": t.counted(counts_cache),
+        "limits": limit_rows,
+        "limits_legacy": limits.legacy,
+        "counted_tokens": counted,
         "limit_counts_cache": counts_cache,
         "features": features,
-        "total_runs": n(analytics, "total_runs"),
-        "max_tokens": n(limit, "max_tokens"),
+        "total_runs": analytics
+            .and_then(|i| i.get("total_runs"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0),
+        "max_tokens": max_tokens,
     })
 }
 
@@ -4580,7 +4628,8 @@ pub async fn reset_account(
 
 #[cfg(test)]
 mod tests {
-    use super::{platform_admin_listed, reset_allowed, usage_json, verified_identity};
+    use super::{budget_json, platform_admin_listed, reset_allowed, usage_json, verified_identity};
+    use serde_json::json;
 
     #[test]
     fn github_only_identities_are_never_platform_admins() {
@@ -4611,8 +4660,10 @@ mod tests {
         analytics.insert("total_runs".into(), A::N("3".into()));
         let mut limit = std::collections::HashMap::new();
         limit.insert("max_tokens".to_string(), A::N("200000000".into()));
+        let legacy =
+            |cc: Option<&str>| common::token_limits::TokenLimits::from_item_with(Some(&limit), cc);
 
-        let off = usage_json("2026-10", Some(&analytics), Some(&limit), false);
+        let off = usage_json("2026-10", Some(&analytics), &legacy(None));
         let parts = [
             "tokens_in",
             "cache_read_tokens",
@@ -4628,16 +4679,91 @@ mod tests {
         );
         assert_eq!(off["limit_counts_cache"], false);
         assert_eq!(off["max_tokens"], 200_000_000u64);
+        assert_eq!(off["limits_legacy"], true);
+        assert_eq!(
+            off["limits"],
+            json!([{ "kind": "new_tokens", "max": 200_000_000u64, "used": 1_120_000u64 }])
+        );
         assert_eq!(off["features"][0]["feature"], "run");
         assert_eq!(off["features"][0]["total_tokens"], 71_320_000u64);
         let rate = off["cache_hit_rate"].as_f64().unwrap();
         assert!((rate - 61_400_000.0 / 70_320_000.0).abs() < 1e-9);
 
-        let on = usage_json("2026-10", Some(&analytics), Some(&limit), true);
+        let on = usage_json("2026-10", Some(&analytics), &legacy(Some("true")));
         assert_eq!(on["counted_tokens"], on["total_tokens"]);
+        assert_eq!(on["limits"][0]["kind"], "all_tokens");
+        assert_eq!(on["limits"][0]["used"], 71_320_000u64);
         // No money on the usage view.
         let text = on.to_string();
         assert!(!text.contains("cost") && !text.contains("usd"), "{text}");
+
+        // The three new limits: only the set ones are listed, each with its
+        // own count.
+        let mut new = std::collections::HashMap::new();
+        new.insert("max_new_tokens".to_string(), A::N("5000000".into()));
+        new.insert("max_cache_read_tokens".to_string(), A::N("0".into()));
+        new.insert("max_cache_write_tokens".to_string(), A::N("9000000".into()));
+        new.insert("max_tokens".to_string(), A::N("1".into()));
+        let split = common::token_limits::TokenLimits::from_item_with(Some(&new), None);
+        let body = usage_json("2026-10", Some(&analytics), &split);
+        assert_eq!(body["limits_legacy"], false);
+        assert_eq!(body["max_tokens"], 0, "old limit not read once split");
+        assert_eq!(
+            body["limits"],
+            json!([
+                { "kind": "new_tokens", "max": 5_000_000u64, "used": 1_120_000u64 },
+                { "kind": "cache_write", "max": 9_000_000u64, "used": 8_800_000u64 },
+            ])
+        );
+        assert_eq!(body["new_tokens"], 1_120_000u64);
+    }
+
+    #[test]
+    fn budget_shows_the_three_limits_and_the_old_one_as_fallback() {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        use common::token_limits::TokenLimits;
+        let item = |pairs: &[(&str, A)]| -> std::collections::HashMap<String, A> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect()
+        };
+
+        let none = budget_json(&TokenLimits::default());
+        assert_eq!(
+            none,
+            json!({
+                "legacy": false, "max_tokens": 0, "limit_counts_cache": false,
+                "max_new_tokens": 0, "max_cache_read_tokens": 0, "max_cache_write_tokens": 0,
+            })
+        );
+
+        // Old limit, new input + output: the same tokens as the new-tokens limit.
+        let old = item(&[("max_tokens", A::N("3000000".into()))]);
+        let b = budget_json(&TokenLimits::from_item_with(Some(&old), None));
+        assert_eq!(b["legacy"], true);
+        assert_eq!(b["max_tokens"], 3_000_000u64);
+        assert_eq!(b["max_new_tokens"], 3_000_000u64);
+        assert_eq!(b["max_cache_read_tokens"], 0);
+
+        // Old limit counting cache too: not shown as a new-tokens limit.
+        let all = item(&[
+            ("max_tokens", A::N("3000000".into())),
+            ("counts_cache", A::Bool(true)),
+        ]);
+        let b = budget_json(&TokenLimits::from_item_with(Some(&all), None));
+        assert_eq!(b["limit_counts_cache"], true);
+        assert_eq!(b["max_new_tokens"], 0);
+
+        let split = item(&[
+            ("max_new_tokens", A::N("0".into())),
+            ("max_cache_read_tokens", A::N("40000000".into())),
+        ]);
+        let b = budget_json(&TokenLimits::from_item_with(Some(&split), None));
+        assert_eq!(b["legacy"], false);
+        assert_eq!(b["max_cache_read_tokens"], 40_000_000u64);
+        assert_eq!(b["max_new_tokens"], 0);
+        assert_eq!(b["max_cache_write_tokens"], 0);
     }
 
     #[test]
