@@ -410,40 +410,41 @@ pub async fn run(
         } else {
             &state.config.mcp_configs_table_name
         };
-        let mcp_plugins = mcp::load_team_plugins(
-            &state.dynamo,
-            &state.kms,
-            mcp_table,
-            &msg.team_id,
-            &super::MCP_CATALOG,
-        )
-        .await;
+        let mcp_plugins = mcp::merge_plugins(
+            mcp::load_team_plugins(
+                &state.dynamo,
+                &state.kms,
+                mcp_table,
+                &msg.team_id,
+                &super::MCP_CATALOG,
+            )
+            .await,
+            mcp::load_remote_plugins(
+                &state.dynamo,
+                &state.kms,
+                &msg.team_id,
+                &mcp::RemoteScope {
+                    table: mcp_table,
+                    key_id: &state.config.secrets_key_id,
+                    user: super::requester_email(msg),
+                    actor: format!("coder, run {}", run_id.unwrap_or("-")),
+                    read_only: false,
+                },
+            )
+            .await,
+        );
 
         for plugin in &mcp_plugins {
-            let schemas = match mcp::load_tool_cache(
+            let Some(schemas) = mcp::schemas_for(
                 &state.s3,
                 &state.config.bucket_name,
-                &plugin.server_id,
+                &state.lambda,
+                &state.config.mcp_proxy_function_name,
+                plugin,
             )
             .await
-            {
-                Some(cache) => cache.tools,
-                None if !state.config.mcp_proxy_function_name.is_empty() => {
-                    match mcp::list_tools(
-                        &state.lambda,
-                        &state.config.mcp_proxy_function_name,
-                        plugin,
-                    )
-                    .await
-                    {
-                        Ok(schemas) => schemas,
-                        Err(e) => {
-                            tracing::warn!(server_id = %plugin.server_id, error = %e, "Failed to list MCP tools, skipping");
-                            continue;
-                        }
-                    }
-                }
-                _ => continue,
+            else {
+                continue;
             };
 
             let mcp_tool_defs = mcp::to_tool_definitions(&plugin.server_id, &schemas);

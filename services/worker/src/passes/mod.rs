@@ -717,6 +717,7 @@ pub mod pr_outcomes;
 mod proof;
 pub mod quarantine;
 pub mod release_notes;
+pub mod remote_mcp;
 pub(crate) mod repo_pick;
 mod resolve;
 pub mod resume;
@@ -748,6 +749,15 @@ pub mod usage_reconcile;
 pub mod web_check;
 pub mod weekly_summary;
 pub mod write_guard;
+
+/// The email of the person a run is for, when the ticket names one: their
+/// own connections to personal MCP servers are used for the run.
+pub fn requester_email(msg: &TicketMessage) -> Option<&str> {
+    msg.requester
+        .as_ref()
+        .map(|r| r.email.trim())
+        .filter(|e| e.contains('@'))
+}
 
 /// Minimal MCP plugin catalog: (server_id, npx_package, env_mapping).
 /// Kept in sync with the full catalog in gateway/routes/plugins.rs.
@@ -1488,14 +1498,29 @@ async fn run_passes(
     } else {
         &state.config.mcp_configs_table_name
     };
-    let mcp_plugins = mcp::load_team_plugins(
-        &state.dynamo,
-        &state.kms,
-        mcp_table,
-        &msg.team_id,
-        &MCP_CATALOG,
-    )
-    .await;
+    let mcp_plugins = mcp::merge_plugins(
+        mcp::load_team_plugins(
+            &state.dynamo,
+            &state.kms,
+            mcp_table,
+            &msg.team_id,
+            &MCP_CATALOG,
+        )
+        .await,
+        mcp::load_remote_plugins(
+            &state.dynamo,
+            &state.kms,
+            &msg.team_id,
+            &mcp::RemoteScope {
+                table: mcp_table,
+                key_id: &state.config.secrets_key_id,
+                user: requester_email(msg),
+                actor: format!("resolver, run {run_id}"),
+                read_only: true,
+            },
+        )
+        .await,
+    );
     let mcp_server_ids: Vec<String> = mcp_plugins.iter().map(|p| p.server_id.clone()).collect();
     if !mcp_server_ids.is_empty() {
         info!(run_id, servers = ?mcp_server_ids, "MCP servers active for run");

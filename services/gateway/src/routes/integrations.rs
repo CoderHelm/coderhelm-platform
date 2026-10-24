@@ -65,19 +65,21 @@ pub fn section_of(id: &str) -> &'static str {
     // A named REST API (`rest:<name>`) sits with the others.
     let id = id.split_once(':').map(|(k, _)| k).unwrap_or(id);
     match id {
-        "github" | "jira" => "code",
+        "github" | "jira" | "atlassian" => "code",
         "aws" | "opensearch" | "rest" => "cloud",
         "newrelic" | "sentry" => "monitoring",
         "confluence" | "notion" | "figma" | "sanity" => "docs",
         "teams" | "slack" => "chat",
+        // Remote MCP servers an admin added by address (`mcp:<id>`).
+        "mcp" => "mcp",
         _ => "other",
     }
 }
 
 /// A card's state, worked out from what is saved. `status` is one of
-/// `connected`, `needs_credentials`, `not_connected`, `error`; `action` is the
-/// card's one primary action: `connect`, `add_credentials`, `check_again` or
-/// `manage`.
+/// `connected`, `needs_credentials`, `needs_reconnect`, `not_connected`,
+/// `error`; `action` is the card's one primary action: `connect`,
+/// `add_credentials`, `reconnect`, `check_again` or `manage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardState {
     pub status: &'static str,
@@ -121,6 +123,54 @@ pub fn plugin_state(
             ),
             _ => cs("connected", "", "manage"),
         },
+    }
+}
+
+/// A remote MCP server, as seen by one person: their own connection on a
+/// personal server, the team's otherwise.
+pub fn remote_state(
+    s: &common::mcp_remote::store::ServerRecord,
+    mine: Option<&common::mcp_remote::store::TokenRecord>,
+) -> CardState {
+    use common::mcp_remote::store::{AuthKind, Sharing, Status};
+    let (status, reason) = if s.auth == AuthKind::OAuth && s.sharing == Sharing::Personal {
+        match mine {
+            None => (
+                Status::NotConnected,
+                "Each person connects their own account. You haven't yet.".to_string(),
+            ),
+            Some(t) => (t.status, t.status_reason.clone()),
+        }
+    } else {
+        (s.status, s.status_reason.clone())
+    };
+    let waiting = common::mcp_remote::tools::awaiting_approval(s).len();
+    match status {
+        Status::Connected if s.allowed.is_empty() => cs(
+            "connected",
+            "No tools are allowed yet, so agents don't get it.",
+            "manage",
+        ),
+        Status::Connected if waiting > 0 => cs(
+            "connected",
+            format!(
+                "{} waiting for another admin to approve.",
+                common::live::count(waiting, "tool")
+            ),
+            "manage",
+        ),
+        Status::Connected => cs("connected", reason, "manage"),
+        Status::NeedsReconnect => cs(
+            "needs_reconnect",
+            if reason.is_empty() {
+                "The sign-in has to be renewed.".to_string()
+            } else {
+                reason
+            },
+            "reconnect",
+        ),
+        Status::Failed => cs("error", reason, "check_again"),
+        Status::NotConnected => cs("not_connected", reason, "connect"),
     }
 }
 
@@ -361,6 +411,22 @@ pub async fn list(
     let plugin_items: Vec<Item> = plugins
         .map(|o| o.items().to_vec())
         .map_err(|e| internal("list plugins", e.to_string()))?;
+    // Remote MCP servers, and this person's own connection to each.
+    let rt = super::mcp_servers::runtime(&state, &team);
+    let remotes = rt
+        .store
+        .list_servers(&team)
+        .await
+        .map_err(|e| internal("list mcp servers", e))?;
+    let mut my_tokens = HashMap::new();
+    for r in &remotes {
+        let owner = r
+            .owner_for(Some(&claims.email))
+            .unwrap_or(common::mcp_remote::store::Owner::Team);
+        if let Ok(Some(t)) = rt.store.get_token(&team, &r.id, &owner).await {
+            my_tokens.insert(r.id.clone(), t);
+        }
+    }
 
     let mut items = Vec::new();
 
@@ -534,7 +600,27 @@ pub async fn list(
             !tested_at.is_empty() && tested_at >= creds_at,
         );
         let custom_prompt = rec.map(|r| s(r, "custom_prompt")).unwrap_or_default();
+        // Connected through the vendor's remote server: that connection's
+        // state is the card's (the key form stays as a fallback).
+        let remote = remotes.iter().find(|r| r.id == id && r.catalog_id == id);
+        // A sign-in started but never finished doesn't hide a key that works.
+        let st = match remote {
+            Some(r) => {
+                let rs = remote_state(r, my_tokens.get(&r.id));
+                if rs.status == "not_connected" && enabled == Some(true) {
+                    st
+                } else {
+                    rs
+                }
+            }
+            None => st,
+        };
+        let tested_at = match remote {
+            Some(r) => r.tools_listed_at.clone(),
+            None => tested_at,
+        };
         let detail = json!({
+            "remote": remote.map(|r| r.public_json(my_tokens.get(&r.id), can_edit)),
             "plugin": p,
             "enabled": enabled.unwrap_or(false),
             "has_credentials": has_creds,
@@ -550,6 +636,23 @@ pub async fn list(
             &tested_at,
             "",
             detail,
+        ));
+    }
+
+    // Servers added by address.
+    for r in remotes.iter().filter(|r| r.catalog_id.is_empty()) {
+        let host = reqwest::Url::parse(&r.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_default();
+        items.push(card(
+            &format!("mcp:{}", r.id),
+            &r.name,
+            &format!("A remote MCP server at {host}. Agents get only the tools you allow."),
+            remote_state(r, my_tokens.get(&r.id)),
+            &r.tools_listed_at,
+            "",
+            json!({ "remote": r.public_json(my_tokens.get(&r.id), can_edit) }),
         ));
     }
 
@@ -752,6 +855,8 @@ mod tests {
         assert_eq!(section_of("teams"), "chat");
         assert_eq!(section_of("slack"), "chat");
         assert_eq!(section_of("linear"), "other");
+        assert_eq!(section_of("mcp:acme-wiki"), "mcp");
+        assert_eq!(section_of("atlassian"), "code");
     }
 
     #[test]
@@ -879,5 +984,44 @@ mod tests {
         assert!(e.contains("typed-name"), "only discovered environments");
         assert!(AbilityChange::parse(&json!({ "metrics": "yes" })).is_err());
         assert!(AbilityChange::parse(&json!({ "airflow_environments": "prod" })).is_err());
+    }
+
+    #[test]
+    fn remote_servers_show_the_viewers_own_connection() {
+        use common::mcp_remote::store::{
+            AuthKind, Owner, ServerRecord, Sharing, Status, TokenRecord,
+        };
+        let mut r = ServerRecord::new("wiki", "Wiki", "https://mcp.example.com/mcp");
+        r.auth = AuthKind::OAuth;
+        r.sharing = Sharing::Personal;
+        r.status = Status::Connected;
+        r.allowed = ["search".to_string()].into();
+        r.approved = r.allowed.clone();
+        assert_eq!(remote_state(&r, None).status, "not_connected");
+        let t = TokenRecord {
+            owner: Owner::user("a@x.com"),
+            sealed: String::new(),
+            expires_at: None,
+            scope: String::new(),
+            version: 1,
+            status: Status::NeedsReconnect,
+            status_reason: "refresh token revoked".into(),
+            step_up: vec![],
+            connected_by: String::new(),
+            connected_at: String::new(),
+        };
+        let st = remote_state(&r, Some(&t));
+        assert_eq!((st.status, st.action), ("needs_reconnect", "reconnect"));
+        assert!(st.reason.contains("revoked"));
+        // A shared server shows the team's connection.
+        r.sharing = Sharing::Shared;
+        assert_eq!(remote_state(&r, None).status, "connected");
+        // Tools waiting for a second admin are said on the card.
+        r.approved.clear();
+        assert!(remote_state(&r, None).reason.contains("waiting"));
+        r.allowed.clear();
+        assert!(remote_state(&r, None).reason.contains("No tools"));
+        r.status = Status::Failed;
+        assert_eq!(remote_state(&r, None).status, "error");
     }
 }

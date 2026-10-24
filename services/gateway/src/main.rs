@@ -568,6 +568,53 @@ async fn main() -> Result<(), Error> {
         )
         .route("/plugins/:id/prompt", put(routes::plugins::update_prompt))
         .route("/plugins/:id/test", post(routes::plugins::test_connection))
+        // Remote MCP servers: by address, OAuth or a key, tools allowed one by one
+        .route(
+            "/mcp-servers",
+            get(routes::mcp_servers::list).post(routes::mcp_servers::create),
+        )
+        .route(
+            "/mcp-servers/detect",
+            post(routes::mcp_servers::detect_auth),
+        )
+        .route(
+            "/mcp-servers/oauth/callback",
+            post(routes::mcp_servers::oauth_callback),
+        )
+        .route(
+            "/mcp-servers/:id",
+            get(routes::mcp_servers::get_one).delete(routes::mcp_servers::remove),
+        )
+        .route(
+            "/mcp-servers/:id/connect",
+            post(routes::mcp_servers::connect),
+        )
+        .route(
+            "/mcp-servers/:id/connection",
+            delete(routes::mcp_servers::disconnect),
+        )
+        .route(
+            "/mcp-servers/:id/client",
+            put(routes::mcp_servers::set_client),
+        )
+        .route("/mcp-servers/:id/key", put(routes::mcp_servers::set_key))
+        .route(
+            "/mcp-servers/:id/tools",
+            put(routes::mcp_servers::set_tools),
+        )
+        .route(
+            "/mcp-servers/:id/approve",
+            post(routes::mcp_servers::approve),
+        )
+        .route("/mcp-servers/:id/check", post(routes::mcp_servers::check))
+        .route(
+            "/mcp-servers/:id/prompt",
+            put(routes::mcp_servers::set_prompt),
+        )
+        .route(
+            "/mcp-servers/:id/activity",
+            get(routes::mcp_servers::activity),
+        )
         // Data sources (read-only lookups for the reviewer)
         .route(
             "/tools",

@@ -156,6 +156,16 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     Capability {
+        key: "mcp_connect",
+        label: "Connect your own account to MCP servers that use personal sign-in",
+        min_role: "member",
+        handlers: &[
+            "mcp_servers::connect",
+            "mcp_servers::oauth_callback",
+            "mcp_servers::disconnect",
+        ],
+    },
+    Capability {
         key: "runs",
         label: "Retry, re-run, re-review, cancel, close or reopen runs",
         min_role: "member",
@@ -292,7 +302,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "integrations",
-        label: "Connect GitHub, Jira, AWS accounts, monitoring and docs tools, Teams and MCP servers, and choose what each may do",
+        label: "Connect GitHub, Jira, AWS accounts, monitoring and docs tools, Teams and MCP servers (and the tools agents get from each), and choose what each may do",
         min_role: "admin",
         handlers: &[
             "github::link_installation",
@@ -313,6 +323,16 @@ pub const CAPABILITIES: &[Capability] = &[
             "plugins::update_credentials",
             "plugins::update_prompt",
             "plugins::test_connection",
+            "mcp_servers::detect_auth",
+            "mcp_servers::create",
+            "mcp_servers::remove",
+            "mcp_servers::set_client",
+            "mcp_servers::set_key",
+            "mcp_servers::set_tools",
+            "mcp_servers::approve",
+            "mcp_servers::check",
+            "mcp_servers::set_prompt",
+            "mcp_servers::activity",
             "integrations::check_aws",
             "integrations::set_aws_abilities",
         ],

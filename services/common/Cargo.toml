@@ -27,6 +27,8 @@ graphql-parser = "0.4"
 url = "2"
 aws-sdk-kms = "1"
 base64 = "0.22"
+# mcp_remote: PKCE verifiers and OAuth state values
+rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 # live: a team's AWS account (logs and databases), through a role it creates
 aws-sdk-sts = "1"
