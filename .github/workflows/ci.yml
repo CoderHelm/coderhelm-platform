@@ -68,5 +68,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: lts/*
-      # Pure rules only (no Forge runtime); `forge lint` needs a login.
+      # Pure rules only (no Forge runtime); `forge lint` needs a login and
+      # runs in the release workflow (jira-app-release.yml).
       - run: npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The release workflow's permission check (scopes, egress, web triggers).
+      - name: Release script tests
+        working-directory: .
+        run: |
+          pip install --quiet pyyaml==6.0.2
+          python3 -m unittest discover -s .github/scripts
