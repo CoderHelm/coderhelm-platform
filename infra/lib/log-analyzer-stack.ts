@@ -9,10 +9,16 @@ import * as logs from "aws-cdk-lib/aws-logs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import { Construct } from "constructs";
+import { ResolvedConfig } from "./config";
+import { repoPath } from "./paths";
+import { modelProviderEnvironment, modelPolicyStatements } from "./service-env";
 import * as path from "path";
 
 interface LogAnalyzerStackProps extends cdk.StackProps {
   stage: string;
+  cfg: ResolvedConfig;
+  /** The dashboard's URL (links in alert messages). */
+  appUrl: string;
   awsInsightsTable: dynamodb.TableV2;
   settingsTable: dynamodb.TableV2;
   /** Opens the sealed Teams/Slack webhooks new findings post to. */
@@ -23,27 +29,32 @@ export class LogAnalyzerStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: LogAnalyzerStackProps) {
     super(scope, id, props);
 
-    const prefix = `coderhelm-${props.stage}`;
+    const prefix = `${props.cfg.prefix}`;
 
-    // --- Public S3 bucket for CloudFormation template ---
-    const publicBucket = new s3.Bucket(this, "PublicBucket", {
-      bucketName: "coderhelm-public",
-      publicReadAccess: true,
-      blockPublicAccess: new s3.BlockPublicAccess({
-        blockPublicAcls: false,
-        ignorePublicAcls: false,
-        blockPublicPolicy: false,
-        restrictPublicBuckets: false,
-      }),
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
+    // --- Public S3 bucket for the CloudFormation templates (optional) ---
+    // The hosted deployment publishes infra/cfn here; a self-hosted one
+    // links to that public copy (logReaderTemplateUrl) unless it names its
+    // own bucket.
+    if (props.cfg.publicBucketName) {
+      const publicBucket = new s3.Bucket(this, "PublicBucket", {
+        bucketName: props.cfg.publicBucketName,
+        publicReadAccess: true,
+        blockPublicAccess: new s3.BlockPublicAccess({
+          blockPublicAcls: false,
+          ignorePublicAcls: false,
+          blockPublicPolicy: false,
+          restrictPublicBuckets: false,
+        }),
+        removalPolicy: cdk.RemovalPolicy.RETAIN,
+      });
 
-    // Deploy the CFn template to the public bucket
-    new s3deploy.BucketDeployment(this, "DeployCfnTemplate", {
-      sources: [s3deploy.Source.asset(path.join(__dirname, "../cfn"))],
-      destinationBucket: publicBucket,
-      destinationKeyPrefix: "cfn",
-    });
+      // Deploy the CFn template to the public bucket
+      new s3deploy.BucketDeployment(this, "DeployCfnTemplate", {
+        sources: [s3deploy.Source.asset(repoPath("infra/cfn"))],
+        destinationBucket: publicBucket,
+        destinationKeyPrefix: "cfn",
+      });
+    }
 
     // --- Log Analyzer Lambda ---
     const analyzerLogGroup = new logs.LogGroup(this, "AnalyzerLogGroup", {
@@ -57,7 +68,7 @@ export class LogAnalyzerStack extends cdk.Stack {
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: "handler.handler",
       code: lambda.Code.fromAsset(
-        path.join(__dirname, "../../lambda/log-analyzer")
+        repoPath("lambda/log-analyzer")
       ),
       memorySize: 256,
       timeout: cdk.Duration.minutes(10),
@@ -67,12 +78,15 @@ export class LogAnalyzerStack extends cdk.Stack {
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
         // Team usage counters: every analysis call is counted (tokens + cost).
         ANALYTICS_TABLE_NAME: `${prefix}-analytics`,
-        MODEL_ID: "claude-sonnet-5-5",
+        MODEL_ID: props.cfg.models.light,
         CODERHELM_ACCOUNT_ID: this.account,
         LOOKBACK_HOURS: "6",
-        DASHBOARD_URL: props.stage === "prod" ? "https://app.coderhelm.com" : "http://localhost:3000",
+        DASHBOARD_URL: props.appUrl,
+        ...modelProviderEnvironment(props.cfg),
       },
     });
+
+    for (const st of modelPolicyStatements(props.cfg, this)) analyzerFunction.addToRolePolicy(st);
 
     // DynamoDB permissions
     props.awsInsightsTable.grantReadWriteData(analyzerFunction);

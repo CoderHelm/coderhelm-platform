@@ -7,9 +7,11 @@ import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as logs from "aws-cdk-lib/aws-logs";
 import { Construct } from "constructs";
+import { ResolvedConfig } from "./config";
 
 interface MonitoringStackProps extends cdk.StackProps {
   stage: string;
+  cfg: ResolvedConfig;
   gatewayFunction: lambda.Function;
   workerFunction: lambda.Function;
   table: dynamodb.TableV2;
@@ -20,7 +22,7 @@ export class MonitoringStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: MonitoringStackProps) {
     super(scope, id, props);
 
-    const prefix = `coderhelm-${props.stage}`;
+    const prefix = `${props.cfg.prefix}`;
 
     // Alert topic
     const alertTopic = new sns.Topic(this, "AlertTopic", {
