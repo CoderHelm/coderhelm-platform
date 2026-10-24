@@ -19,6 +19,10 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], defau
 futures = "0.3"
 # usage: a call whose counters could not be written waits on the tickets queue
 aws-sdk-sqs = "1"
+# plugins: one-off and recurring schedules (publish at a time, schedule triggers)
+aws-sdk-scheduler = "1"
+# plugins: Slack request signatures
+hex = "0.4"
 # embed: Titan embeddings on CoderHelm's own AWS account, metered
 aws-sdk-bedrockruntime = "1"
 tokio = { version = "1", features = ["macros", "time", "net", "rt", "sync"] }

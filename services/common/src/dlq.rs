@@ -56,6 +56,14 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "log_autofix",
     // A model call's usage, held because its counters couldn't be written.
     "usage_record",
+    // Plugins: runs, publishing, source sync and its 15 minute poll,
+    // recurring triggers and reading results back.
+    "plugin_run",
+    "plugin_publish",
+    "plugin_sync",
+    "plugin_sweep",
+    "plugin_trigger",
+    "plugin_results",
 ];
 
 /// Scheduled jobs that act on every team (EventBridge puts them on the ticket

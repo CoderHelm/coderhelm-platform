@@ -516,6 +516,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-scheduler"
+version = "1.97.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2520efef3114265e4753230775f6b6759df03fb900bc1278d884e530c726c8d"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-secretsmanager"
 version = "1.103.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1197,6 +1221,7 @@ dependencies = [
  "aws-sdk-mwaa",
  "aws-sdk-rdsdata",
  "aws-sdk-redshiftdata",
+ "aws-sdk-scheduler",
  "aws-sdk-sqs",
  "aws-sdk-sts",
  "aws-smithy-types",
@@ -1204,6 +1229,7 @@ dependencies = [
  "chrono",
  "futures",
  "graphql-parser",
+ "hex",
  "hmac",
  "quick-xml",
  "regex",
