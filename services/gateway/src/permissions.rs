@@ -150,7 +150,7 @@ pub const CAPABILITIES: &[Capability] = &[
         label: "Ask the company brain, attach files to a question, and rename, share or delete their own threads",
         min_role: "member",
         handlers: &[
-            "brain::brain_stream",
+            "brain::stream_token",
             "brain::create_attachment",
             "brain::update_thread",
             "brain::delete_thread",
@@ -1197,6 +1197,72 @@ mod tests {
         assert!(!customizable(capability("support").unwrap()));
         assert!(!custom(&["support"]).holds("support"));
         assert!(Holder::builtin("admin").holds("support"));
+    }
+
+    #[test]
+    fn brain_and_knowledge_routes_are_decided_by_their_capabilities() {
+        let route = |m: &str, p: &str| routed_handler(m, p);
+        assert_eq!(route("GET", "/knowledge"), Some("knowledge::list_bases"));
+        assert_eq!(
+            route("POST", "/knowledge/:kb_id/files"),
+            Some("knowledge::start_upload")
+        );
+        assert_eq!(route("POST", "/brain/token"), Some("brain::stream_token"));
+        assert_eq!(
+            route("PUT", "/brain/threads/:thread_id"),
+            Some("brain::update_thread")
+        );
+        // A custom role can hold the brain capabilities, and only those it holds.
+        let asker = custom(&["brain_ask"]);
+        assert_eq!(
+            resolve_access(&asker, route("POST", "/brain/token")),
+            Access::Allow {
+                effective_role: "member"
+            }
+        );
+        assert!(matches!(
+            resolve_access(&asker, route("POST", "/knowledge")),
+            Access::Deny { .. }
+        ));
+        let librarian = custom(&["knowledge_manage"]);
+        assert_eq!(
+            resolve_access(
+                &librarian,
+                route("DELETE", "/knowledge/:kb_id/files/:file_id")
+            ),
+            Access::Allow {
+                effective_role: "admin"
+            }
+        );
+        assert!(matches!(
+            resolve_access(&librarian, route("POST", "/brain/attachments")),
+            Access::Deny { .. }
+        ));
+        // Reading is baseline: every role, custom or built-in, reads.
+        assert!(is_baseline(capability("brain_read").unwrap()));
+        assert!(matches!(
+            resolve_access(&custom(&[]), route("GET", "/brain/threads")),
+            Access::Allow { .. }
+        ));
+        // Viewers can't ask; members can't manage; admins do both.
+        assert!(matches!(
+            resolve_access(&Holder::builtin("viewer"), route("POST", "/brain/token")),
+            Access::Deny { .. }
+        ));
+        assert!(matches!(
+            resolve_access(
+                &Holder::builtin("member"),
+                route("PUT", "/knowledge/:kb_id")
+            ),
+            Access::Deny { .. }
+        ));
+        assert!(
+            Holder::builtin("admin").holds("knowledge_manage")
+                && Holder::builtin("admin").holds("brain_ask")
+        );
+        for key in ["brain_ask", "knowledge_manage"] {
+            assert!(customizable(capability(key).unwrap()), "{key}");
+        }
     }
 
     #[test]

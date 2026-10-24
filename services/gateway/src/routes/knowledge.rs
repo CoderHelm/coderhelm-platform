@@ -61,6 +61,19 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// The role a person reads knowledge bases as, from the capabilities they
+/// hold (built-in or custom): managing bases reads everything, asking the
+/// brain reads what members may, anything else what their role allows.
+pub(crate) fn reader_role(holder: &crate::permissions::Holder) -> &'static str {
+    if holder.holds("knowledge_manage") {
+        "admin"
+    } else if holder.holds("brain_ask") {
+        "member"
+    } else {
+        holder.floor()
+    }
+}
+
 // ── Input checks ────────────────────────────────────────────────────────────
 
 /// What a person may set on a base.
@@ -249,14 +262,15 @@ pub async fn list_bases(
         .await
         .map_err(|e| internal("knowledge bases", e))?;
     let mut out = Vec::new();
-    for b in bases.iter().filter(|b| b.readable_by(&claims.role)) {
+    let reader = reader_role(&claims.holder());
+    for b in bases.iter().filter(|b| b.readable_by(reader)) {
         let files = st.files(&claims.team_id, &b.id).await.unwrap_or_default();
         out.push(base_json(b, &files));
     }
     out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Ok(Json(json!({
         "bases": out,
-        "can_manage": kb::role_level(&claims.role) >= 3,
+        "can_manage": claims.holder().holds("knowledge_manage"),
         "limits": limits(),
     })))
 }
@@ -270,7 +284,7 @@ pub async fn get_base(
     let base = get_base_record(&state, &claims.team_id, &kb_id)
         .await
         .map_err(|e| internal("knowledge base", e))?
-        .filter(|b| b.readable_by(&claims.role))
+        .filter(|b| b.readable_by(reader_role(&claims.holder())))
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such knowledge base."))?;
     let mut files = store(&state)
         .files(&claims.team_id, &base.id)
@@ -280,7 +294,7 @@ pub async fn get_base(
     Ok(Json(json!({
         "base": base_json(&base, &files),
         "files": files.iter().map(file_json).collect::<Vec<_>>(),
-        "can_manage": kb::role_level(&claims.role) >= 3,
+        "can_manage": claims.holder().holds("knowledge_manage"),
         "limits": limits(),
     })))
 }
@@ -694,6 +708,35 @@ pub async fn delete_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readers_read_by_the_capabilities_they_hold() {
+        use crate::permissions::Holder;
+        assert_eq!(reader_role(&Holder::builtin("viewer")), "viewer");
+        assert_eq!(reader_role(&Holder::builtin("member")), "member");
+        assert_eq!(reader_role(&Holder::builtin("admin")), "admin");
+        assert_eq!(reader_role(&Holder::builtin("owner")), "admin");
+        let caps = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A custom role holding only brain_read reads what viewers may.
+        assert_eq!(
+            reader_role(&Holder::custom(
+                "r",
+                Some(("Reader", &caps(&["brain_read"])))
+            )),
+            "viewer"
+        );
+        assert_eq!(
+            reader_role(&Holder::custom("a", Some(("Asker", &caps(&["brain_ask"]))))),
+            "member"
+        );
+        assert_eq!(
+            reader_role(&Holder::custom(
+                "k",
+                Some(("Librarian", &caps(&["knowledge_manage"])))
+            )),
+            "admin"
+        );
+    }
 
     #[test]
     fn role_levels_match_the_permissions_table() {
