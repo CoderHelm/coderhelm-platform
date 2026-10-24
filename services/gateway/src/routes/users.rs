@@ -11,8 +11,11 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::models::Claims;
-use crate::permissions::{self, can_grant, can_manage, role_level, VALID_ROLES};
+use crate::permissions::{
+    self, can_grant, can_manage, custom_role_id, role_level, within, VALID_ROLES,
+};
 use crate::routes::auth::{cognito_secret_hash, normalize_email};
+use crate::routes::roles::{self, StoredRole};
 use crate::AppState;
 
 type Item = HashMap<String, AttributeValue>;
@@ -229,6 +232,67 @@ fn active_owner_count(items: &[Item]) -> usize {
         .count()
 }
 
+/// What a role (built-in key or `custom:<id>`) holds; `None` when it is no
+/// role of this team.
+fn role_caps(
+    role: &str,
+    custom: &[StoredRole],
+) -> Option<std::collections::BTreeSet<&'static str>> {
+    match custom_role_id(role) {
+        Some(id) => custom.iter().find(|r| r.id == id).map(|r| r.holder().caps),
+        None if VALID_ROLES.contains(&role) => Some(permissions::builtin_capabilities(role)),
+        None => None,
+    }
+}
+
+/// Whether a role can be given: a built-in role, or a custom role of this
+/// team that only a built-in admin or owner gives, and never more than the
+/// giver holds.
+fn check_grant(claims: &Claims, new_role: &str, custom: &[StoredRole]) -> Result<(), ApiError> {
+    if custom_role_id(new_role).is_some() {
+        if roles::role_manager(claims).is_err() {
+            return Err(fail(
+                StatusCode::FORBIDDEN,
+                "Only admins and owners can give someone a custom role.",
+            ));
+        }
+    } else if !VALID_ROLES.contains(&new_role) {
+        return Err(fail(StatusCode::BAD_REQUEST, "That isn't a role."));
+    }
+    let Some(caps) = role_caps(new_role, custom) else {
+        return Err(fail(StatusCode::BAD_REQUEST, "That role no longer exists."));
+    };
+    if !within(&claims.holder(), &caps) {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "You can't give someone a role that can do more than yours.",
+        ));
+    }
+    Ok(())
+}
+
+/// May the actor manage someone holding `target_role`? The built-in rule
+/// (`can_manage`), and never someone who holds more than the actor.
+fn check_manage(
+    claims: &Claims,
+    target_role: &str,
+    custom: &[StoredRole],
+    refusal: &str,
+) -> Result<(), ApiError> {
+    if !can_manage(&claims.role, target_role) {
+        return Err(fail(StatusCode::FORBIDDEN, refusal));
+    }
+    let target_caps =
+        role_caps(target_role, custom).unwrap_or_else(|| permissions::custom_capabilities([]));
+    if !within(&claims.holder(), &target_caps) {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "Their role can do more than yours, so you can't change it.",
+        ));
+    }
+    Ok(())
+}
+
 /// Role-change rules beyond the route's admin check.
 fn check_role_change(
     claims: &Claims,
@@ -236,8 +300,9 @@ fn check_role_change(
     target_role: &str,
     new_role: &str,
     owners: usize,
+    custom: &[StoredRole],
 ) -> Result<(), ApiError> {
-    if !VALID_ROLES.contains(&new_role) {
+    if custom_role_id(new_role).is_none() && !VALID_ROLES.contains(&new_role) {
         return Err(fail(StatusCode::BAD_REQUEST, "That isn't a role."));
     }
     if bare_id(target_id) == bare_id(&claims.sub) {
@@ -246,18 +311,19 @@ fn check_role_change(
             "You can't change your own role. Ask another owner.",
         ));
     }
-    if !can_manage(&claims.role, target_role) {
-        return Err(fail(
-            StatusCode::FORBIDDEN,
-            "Only an owner can change an admin's or owner's role.",
-        ));
-    }
-    if !can_grant(&claims.role, new_role) {
+    check_manage(
+        claims,
+        target_role,
+        custom,
+        "Only an owner can change an admin's or owner's role.",
+    )?;
+    if custom_role_id(new_role).is_none() && !can_grant(&claims.role, new_role) {
         return Err(fail(
             StatusCode::FORBIDDEN,
             "Only an owner can make someone an admin or owner.",
         ));
     }
+    check_grant(claims, new_role, custom)?;
     if target_role == "owner" && new_role != "owner" && owners <= 1 {
         return Err(fail(
             StatusCode::CONFLICT,
@@ -272,6 +338,7 @@ fn check_removal(
     target_id: &str,
     target: &Item,
     owners: usize,
+    custom: &[StoredRole],
 ) -> Result<(), ApiError> {
     if bare_id(target_id) == bare_id(&claims.sub) {
         return Err(fail(
@@ -286,12 +353,12 @@ fn check_removal(
         return Ok(());
     }
     let target_role = role_of(target);
-    if !can_manage(&claims.role, target_role) {
-        return Err(fail(
-            StatusCode::FORBIDDEN,
-            "Only an owner can remove an admin or owner.",
-        ));
-    }
+    check_manage(
+        claims,
+        target_role,
+        custom,
+        "Only an owner can remove an admin or owner.",
+    )?;
     if target_role == "owner" && status_of(target) == "active" && owners <= 1 {
         return Err(fail(
             StatusCode::CONFLICT,
@@ -357,6 +424,15 @@ fn plan_link(claims: &Claims, person: &Item, github: &Item) -> Result<LinkPlan, 
                 "Only an owner can link records of admins or owners.",
             ));
         }
+    }
+    // "The higher of the two" has no meaning between a custom role and
+    // another role, so those are made the same by hand first.
+    let (a, b) = (role_of(person), role_of(github));
+    if a != b && (custom_role_id(a).is_some() || custom_role_id(b).is_some()) {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "These two records have different roles and one is a custom role. Give them the same role first.",
+        ));
     }
     let role = if role_level(role_of(github)) > role_level(role_of(person)) {
         role_of(github)
@@ -434,19 +510,55 @@ fn require_admin(claims: &Claims) -> Result<(), ApiError> {
 // ── Permissions ──────────────────────────────────────────────────────
 
 /// GET /api/users/permissions — what each role can do, and what you may grant.
-pub async fn get_permissions(Extension(claims): Extension<Claims>) -> Json<Value> {
-    Json(json!({
+///
+/// `your_role` is the role on your record (`custom:<id>` for a custom role);
+/// `acts_as` is the built-in role your requests run as outside your role's
+/// capabilities, and `your_capabilities` what you hold.
+pub async fn get_permissions(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, ApiError> {
+    let holder = claims.holder();
+    let manages_roles = roles::role_manager(&claims).is_ok();
+    let custom = roles::list_stored(&state, &claims.team_id)
+        .await
+        .map_err(|e| internal("Failed to list roles", e))?;
+    let builtin_ok = |key: &str| within(&holder, &permissions::builtin_capabilities(key));
+    let mut grantable: Vec<String> = permissions::grantable_roles(&claims.role)
+        .into_iter()
+        .filter(|k| builtin_ok(k))
+        .map(str::to_string)
+        .collect();
+    let mut manageable: Vec<String> = permissions::ROLES
+        .iter()
+        .filter(|r| can_manage(&claims.role, r.key) && builtin_ok(r.key))
+        .map(|r| r.key.to_string())
+        .collect();
+    for r in &custom {
+        let fits = within(&holder, &r.holder().caps);
+        if manages_roles && fits {
+            grantable.push(r.key());
+        }
+        if can_manage(&claims.role, &r.key()) && fits {
+            manageable.push(r.key());
+        }
+    }
+    Ok(Json(json!({
         "roles": permissions::ROLES,
         "capabilities": permissions::CAPABILITIES,
-        "your_role": claims.role,
-        "grantable_roles": permissions::grantable_roles(&claims.role),
-        "can_manage_invites": permissions::can_manage_invites(&claims.role),
-        "manageable_roles": permissions::ROLES
+        "your_role": claims.session_role(),
+        "acts_as": holder.floor(),
+        "your_custom_role": holder.custom,
+        "your_capabilities": permissions::CAPABILITIES
             .iter()
-            .filter(|r| can_manage(&claims.role, r.key))
-            .map(|r| r.key)
+            .filter(|c| holder.holds(c.key))
+            .map(|c| c.key)
             .collect::<Vec<_>>(),
-    }))
+        "grantable_roles": grantable,
+        "can_manage_invites": permissions::can_manage_invites(&claims.role),
+        "can_manage_roles": manages_roles,
+        "manageable_roles": manageable,
+    })))
 }
 
 // ── List users ───────────────────────────────────────────────────────
@@ -492,15 +604,25 @@ pub async fn invite_user(
             "Invite them as an admin, then make them an owner once they join.",
         ));
     }
-    if !VALID_ROLES.contains(&role) {
-        return Err(fail(StatusCode::BAD_REQUEST, "That isn't a role."));
+    let custom = if custom_role_id(role).is_some() {
+        roles::list_stored(&state, &claims.team_id)
+            .await
+            .map_err(|e| internal("Failed to list roles", e))?
+    } else {
+        Vec::new()
+    };
+    if custom_role_id(role).is_none() {
+        if !VALID_ROLES.contains(&role) {
+            return Err(fail(StatusCode::BAD_REQUEST, "That isn't a role."));
+        }
+        if !can_grant(&claims.role, role) {
+            return Err(fail(
+                StatusCode::FORBIDDEN,
+                "Only an owner can invite an admin.",
+            ));
+        }
     }
-    if !can_grant(&claims.role, role) {
-        return Err(fail(
-            StatusCode::FORBIDDEN,
-            "Only an owner can invite an admin.",
-        ));
-    }
+    check_grant(&claims, role, &custom)?;
     let gsi2pk = format!("EMAIL#{}", normalize_email(&email));
 
     // Already on this team (as a member or an open invite)?
@@ -682,13 +804,55 @@ pub async fn update_role(
         .find(|i| s(i, "sk") == sk)
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "That person isn't on this team."))?;
     let target_role = role_of(target).to_string();
+    let custom = roles::list_stored(&state, &claims.team_id)
+        .await
+        .map_err(|e| internal("Failed to list roles", e))?;
     check_role_change(
         &claims,
         &user_id,
         &target_role,
         &body.role,
         active_owner_count(&items),
+        &custom,
     )?;
+    if body.role != target_role {
+        let name_of = |key: &str| {
+            custom_role_id(key)
+                .and_then(|id| custom.iter().find(|r| r.id == id))
+                .map(|r| r.name.clone())
+                .or_else(|| {
+                    permissions::ROLES
+                        .iter()
+                        .find(|r| r.key == key)
+                        .map(|r| r.label.to_string())
+                })
+                .unwrap_or_else(|| key.to_string())
+        };
+        let person = [
+            s(target, "email"),
+            s(target, "github_login"),
+            s(target, "name"),
+        ]
+        .into_iter()
+        .find(|v| !v.is_empty())
+        .unwrap_or("A member")
+        .to_string();
+        roles::record(
+            &state,
+            &claims,
+            roles::AuditEntry {
+                action: "assigned",
+                role_id: custom_role_id(&body.role).unwrap_or(&body.role),
+                role_name: &name_of(&body.role),
+                detail: format!(
+                    "{person}: {} to {}",
+                    name_of(&target_role),
+                    name_of(&body.role)
+                ),
+            },
+        )
+        .await?;
+    }
 
     let (condition, was) = match s(target, "role") {
         "" => ("attribute_exists(pk) AND attribute_not_exists(#r)", None),
@@ -741,7 +905,16 @@ pub async fn remove_user(
         .iter()
         .find(|i| s(i, "sk") == sk)
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "That person isn't on this team."))?;
-    check_removal(&claims, &user_id, target, active_owner_count(&items))?;
+    let custom = roles::list_stored(&state, &claims.team_id)
+        .await
+        .map_err(|e| internal("Failed to list roles", e))?;
+    check_removal(
+        &claims,
+        &user_id,
+        target,
+        active_owner_count(&items),
+        &custom,
+    )?;
 
     state
         .dynamo
@@ -1187,6 +1360,7 @@ mod tests {
             exp: 0,
             iat: 0,
             support_view: None,
+            custom: None,
         }
     }
 
@@ -1273,49 +1447,139 @@ mod tests {
         assert_eq!(ids, vec!["1", "2", "3", "4", "5"]);
     }
 
+    fn custom_role(id: &str, caps: &[&str]) -> StoredRole {
+        StoredRole {
+            id: id.into(),
+            name: format!("Role {id}"),
+            description: String::new(),
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            template: String::new(),
+            created_at: String::new(),
+            created_by: String::new(),
+            updated_at: String::new(),
+            updated_by: String::new(),
+        }
+    }
+
+    /// Claims as the auth middleware leaves them for a custom-role holder on
+    /// a people route (the `people` capability runs as admin).
+    fn custom_holder_claims(role: &StoredRole) -> Claims {
+        let mut c = claims("USER#me", "admin");
+        c.custom = Some(role.holder());
+        c
+    }
+
+    #[test]
+    fn custom_roles_are_given_only_by_built_in_admins_and_never_past_their_own() {
+        let team = vec![
+            custom_role("qa", &["plans", "runs"]),
+            custom_role("ops", &["repos", "system", "people"]),
+        ];
+        let admin = claims("USER#me", "admin");
+        let owner = claims("USER#me", "owner");
+        assert!(check_role_change(&admin, "x", "member", "custom:qa", 1, &team).is_ok());
+        assert!(check_role_change(&owner, "x", "custom:qa", "custom:ops", 1, &team).is_ok());
+        assert!(check_role_change(&admin, "x", "custom:qa", "viewer", 1, &team).is_ok());
+        // A role of another team (or a deleted one) is no role here.
+        assert_eq!(
+            check_role_change(&admin, "x", "member", "custom:elsewhere", 1, &team)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        // Members and viewers can't give roles at all (the route refuses
+        // them first); a custom-role holder with the people capability can't
+        // give a custom role.
+        let ops_holder = custom_holder_claims(&team[1]);
+        assert_eq!(
+            check_role_change(&ops_holder, "x", "viewer", "custom:qa", 1, &team)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        // Nor a built-in role holding more than theirs (member has plans).
+        assert_eq!(
+            check_role_change(&ops_holder, "x", "viewer", "member", 1, &team)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        // Nor change someone whose role holds more than theirs.
+        assert_eq!(
+            check_role_change(&ops_holder, "x", "custom:qa", "viewer", 1, &team)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(check_removal(
+            &ops_holder,
+            "x",
+            &email_member("USER#x", "custom:qa"),
+            1,
+            &team
+        )
+        .is_err());
+        assert!(check_removal(
+            &ops_holder,
+            "x",
+            &email_member("USER#x", "viewer"),
+            1,
+            &team
+        )
+        .is_ok());
+        // Linking records with different roles where one is custom is refused.
+        let person = email_member("USER#p", "custom:qa");
+        assert_eq!(
+            plan_link(&admin, &person, &github_only("USER#4242", "member"))
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+
     #[test]
     fn role_change_rules() {
         let admin = claims("USER#me", "admin");
         let owner = claims("USER#me", "owner");
-        assert!(check_role_change(&admin, "x", "member", "viewer", 1).is_ok());
+        assert!(check_role_change(&admin, "x", "member", "viewer", 1, &[]).is_ok());
         assert_eq!(
-            check_role_change(&admin, "x", "member", "admin", 1)
+            check_role_change(&admin, "x", "member", "admin", 1, &[])
                 .unwrap_err()
                 .0,
             StatusCode::FORBIDDEN,
             "admins can't promote to admin"
         );
         assert_eq!(
-            check_role_change(&admin, "x", "member", "owner", 1)
+            check_role_change(&admin, "x", "member", "owner", 1, &[])
                 .unwrap_err()
                 .0,
             StatusCode::FORBIDDEN,
             "admins can't promote to owner"
         );
         assert_eq!(
-            check_role_change(&admin, "x", "owner", "member", 2)
+            check_role_change(&admin, "x", "owner", "member", 2, &[])
                 .unwrap_err()
                 .0,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            check_role_change(&admin, "me", "member", "viewer", 1)
+            check_role_change(&admin, "me", "member", "viewer", 1, &[])
                 .unwrap_err()
                 .0,
             StatusCode::BAD_REQUEST,
             "own role, bare id vs USER# sub"
         );
-        assert!(check_role_change(&owner, "x", "member", "owner", 1).is_ok());
-        assert!(check_role_change(&owner, "x", "owner", "admin", 2).is_ok());
+        assert!(check_role_change(&owner, "x", "member", "owner", 1, &[]).is_ok());
+        assert!(check_role_change(&owner, "x", "owner", "admin", 2, &[]).is_ok());
         assert_eq!(
-            check_role_change(&owner, "x", "owner", "admin", 1)
+            check_role_change(&owner, "x", "owner", "admin", 1, &[])
                 .unwrap_err()
                 .0,
             StatusCode::CONFLICT,
             "the last owner can't be demoted"
         );
         assert_eq!(
-            check_role_change(&owner, "x", "member", "root", 1)
+            check_role_change(&owner, "x", "member", "root", 1, &[])
                 .unwrap_err()
                 .0,
             StatusCode::BAD_REQUEST
@@ -1326,22 +1590,22 @@ mod tests {
     fn removal_rules() {
         let admin = claims("USER#me", "admin");
         let owner = claims("USER#me", "owner");
-        assert!(check_removal(&admin, "x", &email_member("USER#x", "viewer"), 1).is_ok());
+        assert!(check_removal(&admin, "x", &email_member("USER#x", "viewer"), 1, &[]).is_ok());
         assert_eq!(
-            check_removal(&admin, "x", &email_member("USER#x", "admin"), 1)
+            check_removal(&admin, "x", &email_member("USER#x", "admin"), 1, &[])
                 .unwrap_err()
                 .0,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            check_removal(&admin, "USER#me", &email_member("USER#me", "admin"), 1)
+            check_removal(&admin, "USER#me", &email_member("USER#me", "admin"), 1, &[])
                 .unwrap_err()
                 .0,
             StatusCode::BAD_REQUEST
         );
-        assert!(check_removal(&owner, "x", &email_member("USER#x", "owner"), 2).is_ok());
+        assert!(check_removal(&owner, "x", &email_member("USER#x", "owner"), 2, &[]).is_ok());
         assert_eq!(
-            check_removal(&owner, "x", &email_member("USER#x", "owner"), 1)
+            check_removal(&owner, "x", &email_member("USER#x", "owner"), 1, &[])
                 .unwrap_err()
                 .0,
             StatusCode::CONFLICT
@@ -1352,7 +1616,7 @@ mod tests {
             ("role", "member"),
         ]);
         assert!(
-            check_removal(&admin, "invite_1", &invite, 1).is_ok(),
+            check_removal(&admin, "invite_1", &invite, 1, &[]).is_ok(),
             "revoke"
         );
     }
@@ -1471,15 +1735,15 @@ mod tests {
             for dates in [&[][..], &old[..], &fresh[..]] {
                 let item = invite(role, dates);
                 assert!(
-                    check_removal(&admin, "invite_01", &item, 1).is_ok(),
+                    check_removal(&admin, "invite_01", &item, 1, &[]).is_ok(),
                     "admin revokes a {role:?} invite ({dates:?})"
                 );
-                assert!(check_removal(&owner, "invite_01", &item, 1).is_ok());
+                assert!(check_removal(&owner, "invite_01", &item, 1, &[]).is_ok());
             }
         }
         // Seated admins and owners are still an owner's call.
         assert_eq!(
-            check_removal(&admin, "x", &email_member("USER#x", "admin"), 1)
+            check_removal(&admin, "x", &email_member("USER#x", "admin"), 1, &[])
                 .unwrap_err()
                 .0,
             StatusCode::FORBIDDEN

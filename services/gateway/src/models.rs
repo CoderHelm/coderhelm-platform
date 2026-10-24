@@ -446,6 +446,11 @@ pub struct Claims {
     /// a normal session token (the auth middleware drops it there).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub support_view: Option<SupportView>,
+    /// Set by the auth middleware, never read from or written to a token: the
+    /// member's custom role when they have one. `role` then holds the built-in
+    /// role this request runs as (see `permissions::resolve_access`).
+    #[serde(skip)]
+    pub custom: Option<crate::permissions::Holder>,
 }
 
 /// What a support-view session may see: one team, until a time, under one
@@ -476,6 +481,19 @@ impl Claims {
     /// Numeric role level: owner=4, admin=3, billing=2, member=1, viewer=0.
     pub fn role_level(&self) -> u8 {
         crate::permissions::role_level(&self.role)
+    }
+
+    /// What this person holds: their custom role, or their built-in role.
+    pub fn holder(&self) -> crate::permissions::Holder {
+        self.custom
+            .clone()
+            .unwrap_or_else(|| crate::permissions::Holder::builtin(&self.role))
+    }
+
+    /// The role on their record (`custom:<id>` for a custom role), for
+    /// anything that mints a token: never the role a request runs as.
+    pub fn session_role(&self) -> &str {
+        self.custom.as_ref().map_or(&self.role, |h| &h.role)
     }
 
     /// Require minimum role level, return 403 if insufficient.
@@ -674,6 +692,7 @@ mod tests {
             exp: 9999999999,
             iat: 1000000000,
             support_view: None,
+            custom: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: Claims = serde_json::from_str(&json).unwrap();

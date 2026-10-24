@@ -525,6 +525,7 @@ mod tests {
             exp: 0,
             iat: 0,
             support_view: None,
+            custom: None,
         }
     }
 
