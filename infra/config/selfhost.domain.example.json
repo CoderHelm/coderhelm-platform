@@ -1,0 +1,24 @@
+{
+  "account": "123456789012",
+  "region": "eu-west-1",
+  "stage": "prod",
+  "domain": {
+    "hostname": "coderhelm.example.com",
+    "hostedZone": "example.com"
+  },
+  "models": {
+    "provider": "bedrock",
+    "bedrockInferencePrefix": "eu."
+  },
+  "email": {
+    "from": "coderhelm@example.com",
+    "identity": "example.com"
+  },
+  "admins": ["you@example.com"],
+  "signup": {
+    "domains": ["example.com"]
+  },
+  "integrations": {
+    "googleSignIn": true
+  }
+}

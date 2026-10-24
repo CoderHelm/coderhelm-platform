@@ -13,9 +13,13 @@ import * as kms from "aws-cdk-lib/aws-kms";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import { Construct } from "constructs";
+import { ResolvedConfig } from "./config";
+import { repoPath } from "./paths";
+import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn } from "./service-env";
 
 interface StreamingStackProps extends cdk.StackProps {
   stage: string;
+  cfg: ResolvedConfig;
   table: dynamodb.TableV2;
   plansTable: dynamodb.TableV2;
   reposTable: dynamodb.TableV2;
@@ -30,13 +34,16 @@ interface StreamingStackProps extends cdk.StackProps {
 
 export class StreamingStack extends cdk.Stack {
   public readonly streamingFunction: lambda.Function;
+  /** The chat stream's function URL (the single-origin web stack forwards to it). */
+  public readonly functionUrl: lambda.FunctionUrl;
 
   constructor(scope: Construct, id: string, props: StreamingStackProps) {
     super(scope, id, props);
 
-    const prefix = `coderhelm-${props.stage}`;
+    const cfg = props.cfg;
+    const prefix = cfg.prefix;
     const gatewayAssetPath =
-      process.env.GATEWAY_ZIP ?? "../services/gateway/target/lambda/gateway";
+      process.env.GATEWAY_ZIP ?? repoPath("services/gateway/target/lambda/gateway");
 
     // --- Lambda Web Adapter Layer ---
     // Enables response streaming for non-Node.js runtimes (Rust/Axum)
@@ -58,7 +65,7 @@ export class StreamingStack extends cdk.Stack {
     const secrets = secretsmanager.Secret.fromSecretNameV2(
       this,
       "Secrets",
-      `coderhelm/${props.stage}/secrets`
+      `${props.cfg.secretName}`
     );
 
     this.streamingFunction = new lambda.Function(this, "Streaming", {
@@ -96,8 +103,8 @@ export class StreamingStack extends cdk.Stack {
         BANNERS_TABLE_NAME: `${prefix}-banners`,
         WAITLIST_TABLE_NAME: `${prefix}-waitlist`,
         BUCKET_NAME: props.bucket.bucketName,
-        SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
-        MODEL_ID: "claude-sonnet-5-5",
+        SECRETS_NAME: `${props.cfg.secretName}`,
+        MODEL_ID: cfg.models.light,
         MCP_PROXY_FUNCTION_NAME: props.mcpProxyFunction.functionName,
         // The plan chat's skills, agents and data source tools run in the
         // worker (by name: the worker stack depends on the API stack).
@@ -112,8 +119,12 @@ export class StreamingStack extends cdk.Stack {
         COGNITO_CLIENT_ID: "unused",
         COGNITO_DOMAIN: "unused",
         RUST_LOG: "info",
+        ...serviceEnvironment(cfg, this.account),
       },
     });
+    for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this)]) {
+      if (st) this.streamingFunction.addToRolePolicy(st);
+    }
 
     // --- Permissions ---
 
@@ -171,24 +182,28 @@ export class StreamingStack extends cdk.Stack {
     const functionUrl = this.streamingFunction.addFunctionUrl({
       authType: lambda.FunctionUrlAuthType.NONE,
       invokeMode: lambda.InvokeMode.RESPONSE_STREAM,
-      cors: {
-        allowedOrigins: props.stage === "prod"
-          ? ["https://app.coderhelm.com", "https://coderhelm.com"]
-          : ["http://localhost:3000", "http://localhost:3001"],
-        allowedMethods: [lambda.HttpMethod.POST],
-        allowedHeaders: ["Content-Type", "Authorization", "Cookie"],
-        allowCredentials: true,
-        maxAge: cdk.Duration.hours(1),
-      },
+      // Cross-origin only in the split layout (single-origin forwards the
+      // stream from the dashboard's own hostname).
+      cors: cfg.split
+        ? {
+            allowedOrigins: cfg.split.streamCorsOrigins,
+            allowedMethods: [lambda.HttpMethod.POST],
+            allowedHeaders: ["Content-Type", "Authorization", "Cookie"],
+            allowCredentials: true,
+            maxAge: cdk.Duration.hours(1),
+          }
+        : undefined,
     });
+    this.functionUrl = functionUrl;
 
-    // --- CloudFront + DNS (prod only) ---
+    // --- CloudFront + DNS (split layout with a stream domain) ---
 
-    if (props.stage === "prod") {
-      const streamDomain = "stream.coderhelm.com";
+    const streamDomainName = cfg.split?.streamDomain;
+    if (streamDomainName && cfg.split?.zone) {
+      const streamDomain = streamDomainName;
 
       const hostedZone = route53.HostedZone.fromLookup(this, "Zone", {
-        domainName: "coderhelm.com",
+        domainName: cfg.split.zone,
       });
 
       const certificate = new acm.Certificate(this, "StreamCertificate", {
@@ -208,9 +223,7 @@ export class StreamingStack extends cdk.Stack {
         {
           responseHeadersPolicyName: `${prefix}-stream-cors`,
           corsBehavior: {
-            accessControlAllowOrigins: props.stage === "prod"
-              ? ["https://app.coderhelm.com", "https://coderhelm.com"]
-              : ["http://localhost:3000", "http://localhost:3001"],
+            accessControlAllowOrigins: cfg.split.streamCorsOrigins,
             accessControlAllowMethods: ["POST", "OPTIONS"],
             accessControlAllowHeaders: [
               "Content-Type",
@@ -248,10 +261,10 @@ export class StreamingStack extends cdk.Stack {
         }
       );
 
-      // DNS: stream.coderhelm.com → CloudFront
+      // DNS: the stream domain → CloudFront
       new route53.ARecord(this, "StreamAliasRecord", {
         zone: hostedZone,
-        recordName: "stream",
+        recordName: recordNameIn(streamDomain, cfg.split.zone),
         target: route53.RecordTarget.fromAlias(
           new targets.CloudFrontTarget(distribution)
         ),
