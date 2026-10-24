@@ -158,7 +158,7 @@ Resources:
             post_build:
               commands:
                 - |
-                  URL=$(node -e 'try{console.log(require("/tmp/ch/.coderhelm/state.json").publicUrl||"")}catch{console.log("")}')
+                  URL=$(node -e 'try{const u=require("/tmp/ch/.coderhelm/state.json").publicUrl||"";console.log(u?u+"/settings/setup/":"")}catch{console.log("")}')
                   if [ -n "$WAIT_URL" ]; then
                     if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then S=SUCCESS; R="CoderHelm is running"; else S=FAILURE; R="The install failed: see the CodeBuild log"; fi
                     curl -fsS -X PUT -H 'Content-Type:' --data-binary "{\"Status\":\"$S\",\"Reason\":\"$R\",\"UniqueId\":\"install\",\"Data\":\"$URL\"}" "$WAIT_URL"
@@ -228,7 +228,7 @@ Resources:
 
 Outputs:
   CoderHelm:
-    Description: Your CoderHelm URL (as {"install":"<url>"}). Open it and sign up with the admin email.
+    Description: Your setup page (as {"install":"<url>"}). Sign up there with the admin email; the checklist walks you through the rest.
     Value: !GetAtt InstallDone.Data
   NextStep:
     Description: Create your GitHub App from a computer with a browser and AWS credentials for this account.

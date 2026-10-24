@@ -9,6 +9,7 @@ import { EmailStack } from "./email-stack";
 import { LogAnalyzerStack } from "./log-analyzer-stack";
 import { StreamingStack } from "./streaming-stack";
 import { WebStack } from "./web-stack";
+import { UpdatesStack } from "./updates-stack";
 
 /** Every stack of one deployment, built from its config. */
 export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
@@ -120,6 +121,18 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
     workerFunction: worker.workerFunction,
   });
 
+  // --- Updates (self-hosted installs) ---
+
+  let updates: UpdatesStack | undefined;
+  if (cfg.updates.enabled) {
+    updates = new UpdatesStack(app, `${prefix}-updates`, {
+      env,
+      cfg,
+      appUrl,
+      settingsTable: database.settingsTable,
+    });
+  }
+
   // --- Monitoring ---
 
   new MonitoringStack(app, `${prefix}-monitoring`, {
@@ -146,5 +159,5 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
     });
   }
 
-  return { database, storage, api, worker, streaming, web };
+  return { database, storage, api, worker, streaming, web, updates };
 }

@@ -15,7 +15,7 @@ import * as cdk from "aws-cdk-lib";
 import { Template } from "aws-cdk-lib/assertions";
 import { buildApp } from "../lib/app";
 import { CoderhelmConfig, loadConfigFile, resolveConfig, ResolvedConfig } from "../lib/config";
-import { API_PATHS, STREAM_PATH } from "../lib/web-stack";
+import { API_PATHS, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
 
 const INFRA = path.join(__dirname, "..", "..");
 
@@ -105,7 +105,7 @@ test("fresh self-host config without a domain: nothing hosted-specific, one Clou
     const s = json(tpl);
     assert.ok(!s.includes("coderhelm.com"), `${name} mentions the hosted domain`);
     assert.ok(!s.includes("654654210434"), `${name} mentions the hosted account`);
-    assert.ok(!s.includes("CoderHelm/coderhelm-platform"), `${name} trusts the hosted repository`);
+    assert.ok(!s.includes("repo:CoderHelm/coderhelm-platform"), `${name} trusts the hosted repository's CI`);
     assert.ok(!s.includes("AWS::Route53::RecordSet"), `${name} creates DNS records`);
     assert.ok(!s.includes("AWS::CertificateManager::Certificate"), `${name} creates certificates`);
   }
@@ -210,4 +210,54 @@ test("a dashboard build is uploaded with the runtime config", () => {
   const deployments = t["coderhelm-prod-web"].findResources("Custom::CDKBucketDeployment");
   assert.equal(Object.keys(deployments).length, 2);
   assert.throws(() => synth(selfHost({ dashboard: { assetDir: STUBS } })), /has no index.html/);
+});
+
+test("updates: on by default for self-host, with a least-privilege build role; off removes them", () => {
+  const cfg = selfHost({ updates: { auto: true, window: "Sat 22:00", timezone: "Europe/Berlin", majors: "ask", webhookUrl: "https://hooks.example.org/x" } });
+  const t = synth(cfg);
+  const u = t["coderhelm-prod-updates"];
+  assert.ok(u, "updates stack");
+  u.hasResourceProperties("AWS::CodeBuild::Project", { Name: "coderhelm-prod-update", ConcurrentBuildLimit: 1 });
+  u.hasResourceProperties("AWS::Events::Rule", { Name: "coderhelm-prod-update-check", ScheduleExpression: "rate(1 hour)" });
+  const updater = envOf(u, "coderhelm-prod-updater");
+  assert.deepEqual(JSON.parse(updater.UPDATE_DEFAULTS as string), { auto: true, channel: "stable", day: "sat", hour: 22, timezone: "Europe/Berlin", majors: "ask" });
+  assert.equal(updater.ADMIN_EMAILS, "owner@example.org");
+  assert.equal(updater.UPDATE_WEBHOOK_URL, "https://hooks.example.org/x");
+  assert.ok(updater.CODERHELM_CONFIG_FINGERPRINT);
+  // The build deploys only through the CDK bootstrap roles: no admin policy.
+  const role = Object.values(u.findResources("AWS::IAM::Role", { Properties: { RoleName: "coderhelm-prod-update-build" } }))[0] as any;
+  assert.equal(role.Properties.ManagedPolicyArns, undefined);
+  const policies = JSON.stringify(u.findResources("AWS::IAM::Policy"));
+  assert.ok(policies.includes(":role/cdk-*"));
+  assert.ok(!policies.includes('"Action":"*"'));
+  // The build checks the release signature before installing it.
+  const spec = JSON.stringify(u.findResources("AWS::CodeBuild::Project"));
+  assert.ok(spec.includes("cosign verify-blob"));
+  assert.ok(spec.includes("--require-signature --auto-rollback"));
+  // The gateway knows the updater and may call it.
+  assert.equal(envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway").UPDATER_FUNCTION_NAME, "coderhelm-prod-updater");
+  assert.ok(json(t["coderhelm-prod-api"]).includes("function:coderhelm-prod-updater"));
+
+  const off = synth(selfHost({ updates: { enabled: false } }));
+  assert.equal(off["coderhelm-prod-updates"], undefined);
+  assert.equal(envOf(off["coderhelm-prod-api"], "coderhelm-prod-gateway").UPDATER_FUNCTION_NAME, undefined);
+});
+
+test("the release stamp reaches the services and the dashboard", () => {
+  process.env.CODERHELM_VERSION = "v1.2.3";
+  process.env.CODERHELM_COMMIT = "abc1234";
+  try {
+    const t = synth(selfHost());
+    const gw = envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway");
+    assert.equal(gw.CODERHELM_VERSION, "v1.2.3");
+    assert.equal(gw.CODERHELM_COMMIT, "abc1234");
+    assert.match(String(gw.CODERHELM_CONFIG_FINGERPRINT), /^[0-9a-f]{12}$/);
+    assert.match(runtimeConfigScript(selfHost()), /"version":"v1\.2\.3"/, "runtime-config.js carries the version");
+  } finally {
+    delete process.env.CODERHELM_VERSION;
+    delete process.env.CODERHELM_COMMIT;
+  }
+  // The hosted deployment is not stamped (its templates stay as they are).
+  const hosted = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
+  assert.equal(hosted.updates.enabled, false);
 });

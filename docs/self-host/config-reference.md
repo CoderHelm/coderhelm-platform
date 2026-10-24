@@ -92,6 +92,20 @@ Sign-up is closed to everyone else. People already on a team invite others from 
 
 See [Integrations](./integrations.md).
 
+## Updates
+
+| Setting | Type | Default | Notes |
+|---|---|---|---|
+| `updates.enabled` | boolean | `true` | Create the updater: the hourly release check, notices, the update build. |
+| `updates.auto` | boolean | `false` | Install new releases on their own, in the window. |
+| `updates.window` | string | `"Sun 03:00"` | Maintenance window: a day (or `daily`) and an hour. |
+| `updates.timezone` | string | `UTC` | IANA time zone of the window. |
+| `updates.channel` | `stable` or `preview` | `stable` | `preview` includes release candidates. |
+| `updates.majors` | `ask` or `auto` | `ask` | `ask`: major releases wait for an admin. |
+| `updates.webhookUrl` | string | | A Slack or Teams incoming webhook for update notices (admins are emailed either way). |
+
+These are the starting point; admins change them in **Settings → System** without a deploy. See [Updates](./updates.md).
+
 ## Everything else
 
 | Setting | Type | Default | Notes |
@@ -118,5 +132,7 @@ The CDK app turns the config into environment variables on the gateway, streamin
 | `CODERHELM_ACCOUNT_ID` | `account` (the account teams' read-only roles trust) |
 | `LOG_READER_TEMPLATE_URL` | `logReaderTemplateUrl` |
 | `PLATFORM_ADMIN_EMAILS` | `admins` |
+| `CODERHELM_VERSION`, `CODERHELM_COMMIT`, `CODERHELM_RELEASED_AT`, `CODERHELM_CONFIG_FINGERPRINT` | The release stamp and a hash of the config |
+| `UPDATER_FUNCTION_NAME` | The updater, when `updates.enabled` |
 | `MODEL_PROVIDER`, `BEDROCK_INFERENCE_PREFIX`, `BEDROCK_MODEL_IDS` | `models` (Bedrock only) |
 | `SES_FROM_ADDRESS`, `SUPPORT_INBOX` | `email` |

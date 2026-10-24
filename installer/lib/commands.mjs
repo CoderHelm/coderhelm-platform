@@ -4,7 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { checkPrereqs } from "./prereqs.mjs";
-import { fetchRelease, latestVersion, releasePaths, verifyAttestation } from "./release.mjs";
+import { fetchRelease, latestVersion, releasePaths, verifySignature } from "./release.mjs";
+import { openBrowser } from "./github-app.mjs";
 import { ensureSecret, hasGithubApp, mergeSecret, readSecret } from "./secrets.mjs";
 import { runManifestFlow, secretKeysFromApp } from "./github-app.mjs";
 import { DEFAULT_TELEMETRY_ENDPOINT, derived, readJson, semverCompare, writeJson } from "./util.mjs";
@@ -69,50 +70,11 @@ export function quickCheck(cfg) {
   return p;
 }
 
-// ── init ─────────────────────────────────────────────────────────────────
-
-export async function init(ctx) {
-  const { flags, runner, ask, log } = ctx;
-  const file = configPath(flags);
-  if (fs.existsSync(file) && !flags.force) {
-    throw new Error(`${file} already exists. Edit it, or pass --force to start over.`);
-  }
-  const { problems, identity } = await checkPrereqs(runner, {});
-  if (problems.length) throw new Error(`Before installing:\n  - ${problems.join("\n  - ")}`);
-
-  log("\nA few questions (Enter keeps the suggestion):\n");
-  const account = flags.account ?? (await ask.ask("AWS account", identity?.Account ?? ""));
-  const region = flags.region ?? (await ask.ask("AWS region", process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1"));
-  const stage = flags.stage ?? (await ask.ask("A short name for this install", "prod"));
-  const hostname = flags.domain ?? (await ask.ask("Your own hostname, e.g. coderhelm.example.com (empty: use a CloudFront URL)", ""));
-  let zone = flags.hostedZone;
-  if (hostname && zone === undefined) {
-    zone = await ask.ask("Its Route 53 hosted zone (empty if your DNS is elsewhere)", hostname.split(".").slice(1).join("."));
-  }
-  const certificateArn = hostname && !zone ? flags.certificateArn ?? (await ask.ask("ACM certificate ARN in us-east-1 for that hostname", "")) : undefined;
-  const provider = flags.provider ?? (await ask.ask("Claude through: anthropic (each team adds a key) or bedrock (this AWS account)", "anthropic"));
-  const admin = flags.admin ?? (await ask.ask("Your email (the first admin)", ""));
-  const emailFrom = flags.emailFrom ?? (await ask.ask("Emails come from", admin ? `coderhelm@${admin.split("@")[1]}` : ""));
-  const signupDomain = flags.signupDomain ?? (await ask.ask("Let anyone with this email domain sign up (empty: only you)", admin ? admin.split("@")[1] : ""));
-  const telemetry = flags.telemetry !== undefined ? flags.telemetry === true || flags.telemetry === "on" : await ask.confirm("Send anonymous install and upgrade pings to CoderHelm (version and region only)?", false);
-
-  const bedrockPrefix = provider === "bedrock" ? flags.bedrockPrefix ?? (await ask.ask("Bedrock inference profile prefix (us., eu., apac., or empty)", "us.")) : undefined;
-  const cfg = buildConfig({ account, region, stage, hostname, zone, certificateArn, provider, bedrockPrefix, admin, emailFrom, signupDomain, telemetry });
-  const problemsCfg = quickCheck(cfg);
-  if (problemsCfg.length) throw new Error(`The config isn't valid yet:\n  - ${problemsCfg.join("\n  - ")}`);
-  if (runner.dryRun) {
-    log(`  [dry run] write ${file}:\n${JSON.stringify(cfg, null, 2)}`);
-  } else {
-    writeJson(file, cfg);
-    log(`\nWrote ${file}. Next: coderhelm-selfhost deploy`);
-  }
-  return cfg;
-}
-
 // ── deploy ───────────────────────────────────────────────────────────────
 
 /** Where the CDK app and the Lambda code come from: a release, or this checkout. */
 export async function resolveSource(ctx, version) {
+  if (ctx.resolveSource) return ctx.resolveSource(ctx, version);
   const { flags, runner, log } = ctx;
   if (flags.source) {
     const root = path.resolve(flags.source);
@@ -122,9 +84,7 @@ export async function resolveSource(ctx, version) {
   const tag = version ?? (runner.dryRun ? "v0.0.0-dry-run" : await latestVersion(ctx.fetchImpl));
   log(`Release ${tag}`);
   const paths = await fetchRelease(tag, { runner, fetchImpl: ctx.fetchImpl, log });
-  if (!runner.dryRun && flags.verifyProvenance !== false) await verifyAttestation(paths, runner, log).catch((e) => {
-    throw new Error(`Provenance check failed: ${e.message}`);
-  });
+  if (!runner.dryRun) await verifySignature(paths, runner, { require: !!flags.requireSignature, log });
   return {
     version: tag,
     infra: paths.infra,
@@ -166,19 +126,24 @@ export async function deploy(ctx) {
     await runner.run("npm", ["ci", "--no-audit", "--no-fund"], { cwd: src.infra });
   }
 
-  log("Bootstrapping CDK (once per account and region)");
-  await cdk(ctx, src, ["bootstrap", `aws://${cfg.account}/${cfg.region}`]);
-  if (cfg.domain?.hostname && cfg.region !== "us-east-1" && !cfg.domain.certificateArn) {
-    await cdk(ctx, src, ["bootstrap", `aws://${cfg.account}/us-east-1`]);
+  if (!flags.skipBootstrap) {
+    log("Bootstrapping CDK (once per account and region)");
+    await cdk(ctx, src, ["bootstrap", `aws://${cfg.account}/${cfg.region}`]);
+    if (cfg.domain?.hostname && cfg.region !== "us-east-1" && !cfg.domain.certificateArn) {
+      await cdk(ctx, src, ["bootstrap", `aws://${cfg.account}/us-east-1`]);
+    }
   }
 
   const outputsFile = path.join(path.dirname(statePath(flags)), "outputs.json");
   log("Deploying (the first time takes about 15 minutes, mostly CloudFront)");
-  await cdk(ctx, src, ["deploy", "--all", "--require-approval", "never", "--outputs-file", outputsFile]);
+  // Live progress: every resource as CloudFormation creates it.
+  await cdk(ctx, src, ["deploy", "--all", "--require-approval", "never", "--progress", "events", "--outputs-file", outputsFile],
+    src.version && src.version !== "source" ? { CODERHELM_VERSION: src.version } : {});
 
   const outputs = runner.dryRun ? {} : readJson(outputsFile, {});
-  const publicUrl = findOutput(outputs, "PublicUrl") ?? (cfg.domain?.hostname ? `https://${cfg.domain.hostname}` : "https://<your CloudFront URL>");
-  const next = { ...state, installId: state.installId ?? crypto.randomUUID(), version: src.version, deployedAt: new Date().toISOString(), publicUrl };
+  const known = findOutput(outputs, "PublicUrl") ?? (cfg.domain?.hostname ? `https://${cfg.domain.hostname}` : state.publicUrl);
+  const publicUrl = known ?? "https://<your CloudFront URL>";
+  const next = { ...state, installId: state.installId ?? crypto.randomUUID(), version: src.version, deployedAt: new Date().toISOString(), ...(known ? { publicUrl: known } : {}) };
   if (state.version && state.version !== src.version) next.previousVersion = state.version;
   saveState(flags, next, runner);
   await saveRemote(ctx, cfg, next);
@@ -195,10 +160,33 @@ export async function deploy(ctx) {
 
   await telemetryPing(ctx, cfg, next, state.version ? "upgrade" : "install");
 
-  log(`\nCoderHelm is running at ${publicUrl}`);
-  log(`Sign up as the first admin (${cfg.admins?.[0] ?? "an admin in your config"}): ${publicUrl}/?signup=1`);
-  log("Then run: coderhelm-selfhost health");
+  if (!flags.quiet) {
+    log(`\nCoderHelm ${src.version} is running at ${publicUrl}`);
+    log(checklist(cfg, publicUrl, await readSecret(runner, d.secretName, cfg.region)));
+    if (ctx.interactive && !runner.dryRun && !publicUrl.includes("<")) (ctx.open ?? openBrowser)(`${publicUrl}/?signup=1`);
+  }
   return { publicUrl, version: src.version };
+}
+
+/** What is done and what is left, after a deploy. */
+export function checklist(cfg, url, secret) {
+  const tick = (ok) => (ok ? "[x]" : "[ ]");
+  const lines = [
+    "",
+    "Checklist",
+    `  ${tick(true)} CoderHelm deployed`,
+    `  ${tick(hasGithubApp(secret))} GitHub App created${hasGithubApp(secret) ? "" : " (coderhelm-selfhost github-app)"}`,
+    `  [ ] Sign up as the first admin (${cfg.admins?.[0] ?? "an admin in your config"}): ${url}/?signup=1`,
+    "  [ ] Install the GitHub App on your repositories",
+    cfg.models?.provider === "bedrock"
+      ? "  [x] Models: Amazon Bedrock (no key needed)"
+      : "  [ ] Add your team's Anthropic key in Settings → AI models",
+    "  [ ] Send a test email from the setup page (new AWS accounts start in the SES sandbox)",
+    `  ${tick(cfg.updates?.auto === true)} Auto-update ${cfg.updates?.auto ? "on" : "off (Settings → System)"}`,
+    "",
+    `The setup page checks each of these live: ${url}/settings/setup/`,
+  ];
+  return lines.join("\n");
 }
 
 export function findOutput(outputs, key) {
@@ -332,32 +320,85 @@ export function migrationNotes(migrations, from, to) {
     .sort((a, b) => semverCompare(a.version, b.version));
 }
 
-export async function upgrade(ctx) {
+/**
+ * Moves the install to a release, safely:
+ *   1. health check first (an unhealthy install isn't updated, unless --force);
+ *   2. the release's checksums and signature (--require-signature refuses
+ *      one that can't be verified);
+ *   3. the migration notes it crosses (action-needed ones stop it without --yes);
+ *   4. deploy;
+ *   5. health check after; when it fails and --auto-rollback is set, the
+ *      previous release is deployed again.
+ * --result-file gets {status, from, to, reason} (the update build reports it).
+ */
+export async function update(ctx) {
   const { flags, runner, log } = ctx;
   const state = loadState(flags);
-  const target = flags.to ?? (runner.dryRun ? "v0.0.0-dry-run" : await latestVersion(ctx.fetchImpl));
-  if (state.version && state.version === target && !flags.force) {
-    log(`Already on ${target}.`);
-    return null;
-  }
-  if (state.version && semverCompare(target, state.version) < 0 && !flags.rollback) {
-    throw new Error(`${target} is older than ${state.version}. Use "coderhelm-selfhost rollback" to go back.`);
-  }
-  log(`Upgrading ${state.version ?? "(unknown)"} → ${target}`);
-  const src = await resolveSource(ctx, target);
-  const migrationsFile = path.join(path.dirname(src.infra), "selfhost", "MIGRATIONS.json");
-  const notes = migrationNotes(runner.dryRun ? [] : readJson(migrationsFile, { releases: [] }).releases, state.version, target);
-  for (const n of notes) log(`  ${n.version}: ${n.notes}${n.breaking ? "  [needs action]" : ""}`);
-  const breaking = notes.filter((n) => n.breaking);
-  if (breaking.length && !flags.yes) {
-    throw new Error(`This upgrade crosses a release that needs action (above). Do it, then run again with --yes.`);
-  }
+  const result = { status: "failed", from: state.version ?? null, to: null, reason: "" };
+  const done = (status, reason) => {
+    Object.assign(result, { status, reason });
+    if (flags.resultFile && !runner.dryRun) writeJson(path.resolve(flags.resultFile), result);
+    return result;
+  };
+  try {
+    const target = flags.to ?? (runner.dryRun ? "v0.0.0-dry-run" : await latestVersion(ctx.fetchImpl));
+    result.to = target;
+    if (state.version && state.version === target && !flags.force) {
+      log(`Already on ${target}.`);
+      return done("succeeded", `already on ${target}`);
+    }
+    if (state.version && semverCompare(target, state.version) < 0 && !flags.rollback) {
+      throw new Error(`${target} is older than ${state.version}. Use "coderhelm-selfhost rollback" to go back.`);
+    }
+    log(`${flags.rollback ? "Rolling back" : "Updating"} ${state.version ?? "(unknown)"} → ${target}`);
 
-  log("Changes this upgrade makes (cdk diff):");
-  await cdk(ctx, src, ["diff", "--all"]).catch(() => null);
-  if (ctx.interactive && !flags.yes && !(await ctx.ask.confirm("Deploy these changes?", true))) return null;
-  return deploy({ ...ctx, flags: { ...flags, version: target, skipGithubApp: true } });
+    if (!flags.skipHealth) {
+      log("Health check before the update");
+      const before = await health({ ...ctx, quiet: true });
+      if (before !== 0 && !flags.force) {
+        throw new Error("The install isn't healthy before the update (see above). Fix it, or pass --force.");
+      }
+    }
+
+    const src = await resolveSource(ctx, target);
+    const migrationsFile = path.join(path.dirname(src.infra), "selfhost", "MIGRATIONS.json");
+    const notes = migrationNotes(runner.dryRun ? [] : readJson(migrationsFile, { releases: [] }).releases, state.version, target);
+    for (const n of notes) log(`  ${n.version}: ${n.notes}${n.breaking ? "  [needs action]" : ""}`);
+    if (notes.some((n) => n.breaking) && !flags.yes) {
+      throw new Error("This update crosses a release that needs action (above). Do it, then run again with --yes.");
+    }
+    if (ctx.interactive && !flags.yes) {
+      log("Changes this update makes (cdk diff):");
+      await cdk(ctx, src, ["diff", "--all"]).catch(() => null);
+      if (!(await ctx.ask.confirm("Deploy these changes?", true))) return done("failed", "cancelled");
+    }
+
+    const deployFlags = { ...flags, version: target, skipGithubApp: true, skipBootstrap: true, quiet: true };
+    await deploy({ ...ctx, flags: deployFlags, resolveSource: async () => src });
+
+    if (!flags.skipHealth) {
+      log("Health check after the update");
+      const after = await health({ ...ctx, quiet: true });
+      if (after !== 0) {
+        if (flags.autoRollback && result.from && result.from !== target) {
+          log(`The new release is unhealthy: rolling back to ${result.from}.`);
+          const back = await resolveSource(ctx, result.from);
+          await deploy({ ...ctx, flags: { ...deployFlags, version: result.from }, resolveSource: async () => back });
+          return done("rolled_back", `health check failed after deploying ${target}; back on ${result.from}`);
+        }
+        return done("failed", `health check failed after deploying ${target}`);
+      }
+    }
+    log(`\nNow on ${target}.`);
+    return done("succeeded", `now on ${target}`);
+  } catch (e) {
+    done("failed", e.message);
+    throw e;
+  }
 }
+
+/** The old name for update. */
+export const upgrade = update;
 
 export async function rollback(ctx) {
   const { flags } = ctx;
@@ -365,7 +406,7 @@ export async function rollback(ctx) {
   const to = flags.to ?? state.previousVersion;
   if (!to) throw new Error("No earlier version is recorded. Pass --to vX.Y.Z.");
   ctx.log(`Rolling back to ${to}. Data written by the newer version stays; releases only add fields, so the older version reads it.`);
-  return upgrade({ ...ctx, flags: { ...flags, to, rollback: true, force: true } });
+  return update({ ...ctx, flags: { ...flags, to, rollback: true, force: true } });
 }
 
 // ── health ───────────────────────────────────────────────────────────────
@@ -405,7 +446,7 @@ export async function health(ctx) {
   check("Email sending", runner.dryRun || !!ses?.ProductionAccessEnabled, ses?.ProductionAccessEnabled ? "production access" : "SES sandbox: email only reaches verified addresses (see docs/self-host/email.md)");
 
   const url = state.publicUrl;
-  if (url && !runner.dryRun) {
+  if (url && !url.includes("<") && !runner.dryRun) {
     const page = await (ctx.fetchImpl ?? fetch)(`${url}/`).catch(() => null);
     check("Dashboard", page?.status === 200, page ? `HTTP ${page.status}` : "unreachable");
     const api = await (ctx.fetchImpl ?? fetch)(`${url}/api/me`).catch(() => null);
@@ -413,6 +454,8 @@ export async function health(ctx) {
   }
 
   for (const x of results) log(`${x.ok ? "ok  " : "FAIL"}  ${x.name.padEnd(18)} ${x.detail}`);
+  const version = state.version ? ` (on ${state.version})` : "";
+  if (!ctx.quiet) log(`Install ${d.prefix}${version}`);
   const failed = results.filter((x) => !x.ok).length;
   log(failed ? `\n${failed} check(s) failed.` : "\nAll checks passed.");
   await telemetryPing(ctx, cfg, state, "health");
@@ -514,3 +557,69 @@ export async function telemetry(ctx) {
 }
 
 export { releasePaths };
+
+// ── version / auto-update ────────────────────────────────────────────────
+
+export async function version(ctx) {
+  const { flags, log } = ctx;
+  const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  log(`Installer   ${pkg.version}`);
+  const state = fs.existsSync(configPath(flags)) ? loadState(flags) : {};
+  log(`Installed   ${state.version ?? "(not deployed from this folder)"}${state.deployedAt ? ` since ${state.deployedAt.slice(0, 10)}` : ""}`);
+  const latest = ctx.runner.dryRun ? null : await latestVersion(ctx.fetchImpl).catch(() => null);
+  log(`Latest      ${latest ?? "(could not check)"}`);
+  if (latest && state.version && semverCompare(latest, state.version) > 0) log(`Update with: coderhelm-selfhost update --to ${latest}`);
+  return { installer: pkg.version, installed: state.version ?? null, latest };
+}
+
+/** `"Sun 03:00"` → { day, hour }; null when it doesn't read. */
+export function parseWindow(w) {
+  const m = String(w ?? "").trim().toLowerCase().match(/^(mon|tue|wed|thu|fri|sat|sun|daily)[a-z]*\s+(\d{1,2}):00$/);
+  if (!m || Number(m[2]) > 23) return null;
+  return { day: m[1], hour: Number(m[2]) };
+}
+
+/**
+ * auto-update on|off [--window "Sun 03:00"] [--timezone Europe/Berlin]
+ * [--channel stable|preview] [--majors ask|auto]: saved in the config (the
+ * starting point of a deploy) and applied to the running updater at once.
+ */
+export async function autoUpdate(ctx) {
+  const { flags, runner, log } = ctx;
+  const cfg = loadConfig(flags);
+  const want = flags._[1];
+  if (!["on", "off", "status"].includes(want ?? "status")) throw new Error('Use "auto-update on", "auto-update off" or "auto-update status".');
+  const u = { ...(cfg.updates ?? {}) };
+  if (!want || want === "status") {
+    log(`Auto-update is ${u.auto ? "on" : "off"}: window ${u.window ?? "Sun 03:00"} ${u.timezone ?? "UTC"}, channel ${u.channel ?? "stable"}, majors ${u.majors ?? "ask"}.`);
+    return u;
+  }
+  u.auto = want === "on";
+  if (flags.window !== undefined) {
+    if (!parseWindow(flags.window)) throw new Error('--window: a day and hour such as "Sun 03:00" or "daily 02:00"');
+    u.window = flags.window;
+  }
+  if (flags.channel !== undefined) {
+    if (!["stable", "preview"].includes(flags.channel)) throw new Error("--channel: stable or preview");
+    u.channel = flags.channel;
+  }
+  if (flags.majors !== undefined) {
+    if (!["ask", "auto"].includes(flags.majors)) throw new Error("--majors: ask or auto");
+    u.majors = flags.majors;
+  }
+  if (flags.timezone !== undefined) u.timezone = flags.timezone;
+  cfg.updates = u;
+  if (runner.dryRun) log(`  [dry run] save updates ${JSON.stringify(u)} in ${configPath(flags)}`);
+  else writeJson(configPath(flags), cfg);
+
+  // The running install, right away (no redeploy needed).
+  const w = parseWindow(u.window ?? "Sun 03:00");
+  const settings = { auto: u.auto, channel: u.channel ?? "stable", day: w.day, hour: w.hour, timezone: u.timezone ?? "UTC", majors: u.majors ?? "ask" };
+  const payload = JSON.stringify({ action: "settings", settings, actor: "coderhelm-selfhost" });
+  const out = await runner.run("aws", [
+    "lambda", "invoke", "--function-name", `${derived(cfg).prefix}-updater`, "--region", cfg.region,
+    "--cli-binary-format", "raw-in-base64-out", "--payload", payload, "/dev/stdout",
+  ], { capture: true, allowFail: true });
+  log(out.code === 0 ? `Auto-update is ${want} on the running install.` : "Saved in the config; it applies on the next deploy (the updater could not be reached).");
+  return settings;
+}

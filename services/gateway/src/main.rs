@@ -126,6 +126,12 @@ async fn main() -> Result<(), Error> {
                 .delete(routes::api::remove_from_allowlist),
         )
         .route("/admin/teams", get(routes::admin::admin_teams))
+        // The install's version and updates (self-hosted installs).
+        .route("/system/version", get(routes::system::version))
+        .route("/system/auto-update", put(routes::system::set_auto_update))
+        .route("/system/update", post(routes::system::update_now))
+        .route("/system/rollback", post(routes::system::rollback))
+        .route("/system/test-email", post(routes::system::test_email))
         // The shared DLQ: every team's failed messages and the global jobs'
         .route("/admin/dlq", get(routes::admin::admin_dlq))
         // The daily check of recorded usage against Anthropic's report

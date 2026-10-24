@@ -32,7 +32,7 @@ CoderHelm runs entirely on AWS serverless services: Lambda, API Gateway, SQS, Dy
 6. [Integrations](./integrations.md)
 7. [Email](./email.md)
 8. [Domains](./domains.md)
-9. [Upgrades and rollbacks](./upgrades.md)
+9. [Updates](./updates.md)
 10. [Backups](./backups.md)
 11. [Security model](./security.md)
 12. [Troubleshooting](./troubleshooting.md)

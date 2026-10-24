@@ -12,7 +12,7 @@ import http from "node:http";
 import { main } from "../lib/cli.mjs";
 import * as cmd from "../lib/commands.mjs";
 import { buildManifest, convertCode, EVENTS, formPage, newAppUrl, PERMISSIONS, runManifestFlow, secretKeysFromApp } from "../lib/github-app.mjs";
-import { parseSums, verifySums } from "../lib/release.mjs";
+import { parseSums, verifySignature, verifySums } from "../lib/release.mjs";
 import { initialSecret, hasGithubApp } from "../lib/secrets.mjs";
 import { checkPrereqs } from "../lib/prereqs.mjs";
 import { redactArg, Runner } from "../lib/runner.mjs";
@@ -327,15 +327,122 @@ test("upgrade refuses to go backwards; rollback needs a recorded version", async
   assert.match(same.out, /Already on v1.4.0/);
 });
 
-test("upgrade --dry-run shows the diff and the deploy", async () => {
+test("update --dry-run: health check, deploy with live progress, health check; no bootstrap", async () => {
   const dir = tmpdir();
   const file = writeConfig(dir);
   const runner = new Runner({ dryRun: true, log: () => {} });
-  await run(["upgrade", "--dry-run", "--config", file, "--to", "v2.0.0"], { runner });
+  await run(["update", "--dry-run", "--config", file, "--to", "v2.0.0"], { runner });
   const lines = runner.commands.map((c) => [c.cmd, ...c.args].join(" "));
-  const diff = lines.findIndex((l) => l.includes("cdk diff --all"));
-  const dep = lines.findIndex((l) => l.includes("cdk deploy --all"));
-  assert.ok(diff >= 0 && dep > diff, lines.join("\n"));
+  const firstHealth = lines.findIndex((l) => l.includes("cloudformation list-stacks"));
+  const dep = lines.findIndex((l) => l.includes("cdk deploy --all") && l.includes("--progress events"));
+  const lastHealth = lines.map((l, i) => (l.includes("cloudformation list-stacks") ? i : -1)).filter((i) => i >= 0).pop();
+  assert.ok(firstHealth >= 0 && dep > firstHealth && lastHealth > dep, lines.join("\n"));
+  assert.ok(!lines.some((l) => l.includes("cdk bootstrap")), "updates never bootstrap");
+});
+
+/** A fake AWS where health passes `healthyCalls` times, then functions report a failed update. */
+function healthyThen(healthyCalls) {
+  let n = 0;
+  const stacks = ["database", "storage", "api", "worker", "streaming", "web", "email", "monitoring"].map((s) => ({ StackName: `coderhelm-prod-${s}`, StackStatus: "UPDATE_COMPLETE" }));
+  return new FakeRunner(awsAnswers({
+    "list-stacks": { StackSummaries: stacks },
+    "get-function-configuration": () => (n++ < healthyCalls ? { State: "Active", LastUpdateStatus: "Successful" } : { State: "Active", LastUpdateStatus: "Failed" }),
+    "get-queue-url": { QueueUrl: "https://q" },
+    "get-queue-attributes": { Attributes: { ApproximateNumberOfMessages: "0" } },
+    "get-secret-value": JSON.stringify(JSON.stringify({ ...initialSecret(), github_app_id: "1", github_private_key: "k" })),
+    "sesv2 get-account": { ProductionAccessEnabled: true },
+  }));
+}
+
+function stateDir(version) {
+  const dir = tmpdir();
+  const file = writeConfig(dir);
+  fs.mkdirSync(path.join(dir, ".coderhelm"));
+  fs.writeFileSync(path.join(dir, ".coderhelm", "state.json"), JSON.stringify({ version, installId: "i" }));
+  return { dir, file };
+}
+
+const fakeSource = (calls) => async (_ctx, version) => {
+  calls.push(version);
+  return { version, infra: path.join(tmpdir(), "infra"), dashboard: null, env: {} };
+};
+
+test("update: an unhealthy new release is rolled back automatically, and the result says so", async () => {
+  const { dir, file } = stateDir("v1.0.0");
+  const runner = healthyThen(3); // the 3 function checks before the update pass, after fail
+  const sources = [];
+  const result = path.join(dir, "result.json");
+  const { code } = await run(["update", "--config", file, "--to", "v1.1.0", "--yes", "--auto-rollback", "--result-file", result],
+    { runner, resolveSource: fakeSource(sources) });
+  assert.equal(code, 1);
+  assert.deepEqual(sources, ["v1.1.0", "v1.0.0"], "the previous release is deployed again");
+  const deploys = runner.commands.filter((c) => c.args.includes("deploy") && c.args.includes("--all"));
+  assert.equal(deploys.length, 2);
+  const r = JSON.parse(fs.readFileSync(result, "utf8"));
+  assert.equal(r.status, "rolled_back");
+  assert.match(r.reason, /health check failed after deploying v1.1.0; back on v1.0.0/);
+});
+
+test("update: a healthy release succeeds; an unhealthy install isn't touched", async () => {
+  const { dir, file } = stateDir("v1.0.0");
+  const result = path.join(dir, "r.json");
+  const ok = await run(["update", "--config", file, "--to", "v1.1.0", "--yes", "--result-file", result], { runner: healthyThen(99), resolveSource: fakeSource([]) });
+  assert.equal(ok.code, 0);
+  assert.equal(JSON.parse(fs.readFileSync(result, "utf8")).status, "succeeded");
+
+  const sick = stateDir("v1.0.0");
+  const runner = healthyThen(0);
+  await assert.rejects(
+    () => main(["update", "--config", sick.file, "--to", "v1.1.0", "--yes", "--result-file", path.join(sick.dir, "r.json")],
+      { runner, resolveSource: fakeSource([]), log: () => {}, interactive: false, ask: quietAsk() }),
+    /isn't healthy before the update/,
+  );
+  assert.ok(!runner.commands.some((c) => c.args.includes("deploy")), "nothing deployed");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(sick.dir, "r.json"), "utf8")).status, "failed");
+});
+
+test("signature: a bad signature refuses the release; --require-signature refuses an unverifiable one", async () => {
+  const dir = tmpdir();
+  fs.writeFileSync(path.join(dir, "SHA256SUMS"), "x");
+  fs.writeFileSync(path.join(dir, "SHA256SUMS.sigstore.json"), "{}");
+  const paths = { dir };
+  const bad = new FakeRunner({ "cosign version": "v2.4.1", "cosign verify-blob": { code: 1, stderr: "none of the expected identities matched" } });
+  await assert.rejects(() => verifySignature(paths, bad, { log: () => {} }), /signature does not verify/);
+  const good = new FakeRunner({ "cosign version": "v2.4.1", "cosign verify-blob": "Verified OK" });
+  assert.equal(await verifySignature(paths, good, { log: () => {} }), "cosign");
+  const verify = good.commands.find((c) => c.args[0] === "verify-blob");
+  assert.ok(verify.args.join(" ").includes("release.yml@refs/tags/v"), "only this repository's release workflow may sign");
+  const none = new FakeRunner({ "cosign version": { code: 127 }, "gh --version": { code: 127 } });
+  await assert.rejects(() => verifySignature(paths, none, { require: true, log: () => {} }), /--require-signature/);
+  assert.equal(await verifySignature(paths, none, { log: () => {} }), null);
+  const ghBad = new FakeRunner({ "cosign version": { code: 127 }, "gh --version": "gh 2", "gh attestation verify": { code: 1 } });
+  fs.rmSync(path.join(dir, "SHA256SUMS.sigstore.json"));
+  await assert.rejects(() => verifySignature(paths, ghBad, { log: () => {} }), /no valid build attestation/);
+});
+
+test("auto-update on with a window: saved in the config and sent to the running updater", async () => {
+  const { file } = stateDir("v1.0.0");
+  const runner = new FakeRunner({ "lambda invoke": "{}" });
+  await run(["auto-update", "on", "--config", file, "--window", "Sat 22:00", "--timezone", "Europe/Berlin", "--channel", "stable", "--majors", "ask"], { runner });
+  const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.deepEqual(cfg.updates, { auto: true, window: "Sat 22:00", channel: "stable", majors: "ask", timezone: "Europe/Berlin" });
+  const inv = runner.commands.find((c) => c.args.includes("invoke"));
+  assert.ok(inv.args.includes("coderhelm-prod-updater"));
+  const payload = JSON.parse(inv.args[inv.args.indexOf("--payload") + 1]);
+  assert.deepEqual(payload.settings, { auto: true, channel: "stable", day: "sat", hour: 22, timezone: "Europe/Berlin", majors: "ask" });
+  await assert.rejects(() => main(["auto-update", "on", "--config", file, "--window", "soon"], { runner, log: () => {}, interactive: false, ask: quietAsk() }), /--window/);
+  await run(["auto-update", "off", "--config", file], { runner });
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).updates.auto, false);
+  assert.deepEqual(cmd.parseWindow("daily 02:00"), { day: "daily", hour: 2 });
+});
+
+test("version shows the installer, the installed and the latest release", async () => {
+  const { file } = stateDir("v1.0.0");
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ tag_name: "v1.2.0" }) });
+  const { out } = await run(["version", "--config", file], { fetchImpl, runner: new FakeRunner() });
+  assert.match(out, /Installed\s+v1\.0\.0/);
+  assert.match(out, /Latest\s+v1\.2\.0/);
+  assert.match(out, /update --to v1\.2\.0/);
 });
 
 // ── health / backup / uninstall ─────────────────────────────────────────

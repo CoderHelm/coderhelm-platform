@@ -6,10 +6,13 @@
 //   dashboard.tar.gz            the dashboard (static export, no API URL baked in)
 //   source.tar.gz               this repository at the tag (the CDK app)
 //   SHA256SUMS                  checksums of all of the above
+//   SHA256SUMS.sigstore.json    cosign's keyless signature of SHA256SUMS,
+//                               made by this repository's release workflow
 //
-// Every file is checked against SHA256SUMS before use. The release is also
-// signed with GitHub artifact attestations (build provenance); `verify`
-// checks that with the GitHub CLI when it is installed.
+// Every file is checked against SHA256SUMS before use, and SHA256SUMS
+// against its signature (cosign) or the files' GitHub build attestations
+// (gh) when either tool is installed. `--require-signature` (the update
+// build always passes it) refuses a release that can't be verified.
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -73,6 +76,9 @@ export async function fetchRelease(tag, { runner, fetchImpl = fetch, log = conso
     if (!r.ok) throw new Error(`Could not download ${n} for ${tag} (${r.status}). Is ${tag} a CoderHelm release?`);
     fs.writeFileSync(path.join(dir, n), Buffer.from(await r.arrayBuffer()));
   }
+  // The signature is optional to download; verifySignature decides if it is needed.
+  const sig = await fetchImpl(`${base}/${SIGNATURE}`, { redirect: "follow" }).catch(() => null);
+  if (sig?.ok) fs.writeFileSync(path.join(dir, SIGNATURE), Buffer.from(await sig.arrayBuffer()));
   verifySums(dir, parseSums(fs.readFileSync(path.join(dir, "SHA256SUMS"), "utf8")));
   fs.mkdirSync(paths.source, { recursive: true });
   fs.mkdirSync(paths.dashboard, { recursive: true });
@@ -94,16 +100,47 @@ export function releasePaths(dir) {
   };
 }
 
-/** Checks the release's build provenance with `gh attestation verify`, when gh is there. */
-export async function verifyAttestation(paths, runner, log = console.log) {
-  const gh = await runner.run("gh", ["--version"], { capture: true, allowFail: true }).catch(() => null);
-  if (!gh || gh.code !== 0) {
-    log("  (GitHub CLI not found: checksums verified, provenance not checked)");
-    return false;
+export const SIGNATURE = "SHA256SUMS.sigstore.json";
+/** Who may have signed a release: this repository's release workflow, on a tag. */
+export const SIGNER_IDENTITY = `^https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/v`;
+export const SIGNER_ISSUER = "https://token.actions.githubusercontent.com";
+
+const has = async (runner, cmd, args) => {
+  const r = await runner.run(cmd, args, { capture: true, allowFail: true }).catch(() => null);
+  return !!r && r.code === 0;
+};
+
+/**
+ * Checks that the release was built and signed by this repository's release
+ * workflow: SHA256SUMS against its cosign signature, or the artifacts'
+ * GitHub attestations. Returns how it was verified, or null when no tool
+ * was there; throws on a bad signature, and when `require` is set and it
+ * couldn't be checked.
+ */
+export async function verifySignature(paths, runner, { require = false, log = console.log } = {}) {
+  const sigFile = path.join(paths.dir, SIGNATURE);
+  if (fs.existsSync(sigFile) && (await has(runner, "cosign", ["version"]))) {
+    const r = await runner.run("cosign", [
+      "verify-blob", "--bundle", sigFile,
+      "--certificate-identity-regexp", SIGNER_IDENTITY,
+      "--certificate-oidc-issuer", SIGNER_ISSUER,
+      path.join(paths.dir, "SHA256SUMS"),
+    ], { capture: true, allowFail: true });
+    if (r.code !== 0) throw new Error(`The release's signature does not verify: not installing it.${r.stderr ? `\n${r.stderr.trim()}` : ""}`);
+    log("  signature verified (cosign: signed by this repository's release workflow)");
+    return "cosign";
   }
-  for (const n of ["gateway.zip", "worker.zip"]) {
-    await runner.run("gh", ["attestation", "verify", path.join(paths.dir, n), "--repo", REPO], { capture: true });
+  if (await has(runner, "gh", ["--version"])) {
+    for (const n of ["gateway.zip", "worker.zip", "source.tar.gz"]) {
+      const r = await runner.run("gh", ["attestation", "verify", path.join(paths.dir, n), "--repo", REPO], { capture: true, allowFail: true });
+      if (r.code !== 0) throw new Error(`${n} has no valid build attestation from ${REPO}: not installing it.`);
+    }
+    log("  provenance verified (gh: built by this repository's release workflow)");
+    return "attestation";
   }
-  log("  provenance verified (built by this repository's release workflow)");
-  return true;
+  if (require) {
+    throw new Error("Can't verify the release's signature (install cosign or the GitHub CLI), and --require-signature is set: not installing it.");
+  }
+  log("  (cosign and gh not found: checksums verified, signature not checked)");
+  return null;
 }

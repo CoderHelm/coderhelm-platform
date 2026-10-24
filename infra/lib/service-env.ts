@@ -6,6 +6,7 @@
 import * as cdk from "aws-cdk-lib";
 import * as iam from "aws-cdk-lib/aws-iam";
 import { ResolvedConfig } from "./config";
+import { releaseStamp, stampEnvironment } from "./release";
 
 /** Environment variables shared by gateway, streaming and worker. */
 export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record<string, string> {
@@ -27,6 +28,12 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
   env.LOG_READER_TEMPLATE_URL = cfg.logReaderTemplateUrl;
   if (cfg.admins.length) env.PLATFORM_ADMIN_EMAILS = cfg.admins.join(",");
   Object.assign(env, modelProviderEnvironment(cfg));
+  // Self-hosted installs: which release this is (Settings → System), and
+  // the updater the system routes ask. The hosted deployment has neither.
+  if (cfg.layout === "single-origin") {
+    Object.assign(env, stampEnvironment(releaseStamp(cfg)));
+    if (cfg.updates.enabled) env.UPDATER_FUNCTION_NAME = `${cfg.prefix}-updater`;
+  }
   // The services read the secret once at start. The installer sets this to
   // the secret's version after it stores new keys (the GitHub App), so the
   // functions restart and read them. Unset in normal deploys.
@@ -77,4 +84,13 @@ export function recordNameIn(host: string, zone: string): string {
   if (host === zone) return "";
   if (!host.endsWith(`.${zone}`)) throw new Error(`${host} is not inside ${zone}`);
   return host.slice(0, -(zone.length + 1));
+}
+
+/** Asking the updater (gateway, when the install has one). */
+export function updaterInvokeStatement(cfg: ResolvedConfig, scope: cdk.Stack): iam.PolicyStatement | undefined {
+  if (!cfg.updates.enabled) return undefined;
+  return new iam.PolicyStatement({
+    actions: ["lambda:InvokeFunction"],
+    resources: [`arn:aws:lambda:${scope.region}:${scope.account}:function:${cfg.prefix}-updater`],
+  });
 }

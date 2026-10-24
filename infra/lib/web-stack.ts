@@ -30,6 +30,7 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { recordNameIn } from "./service-env";
+import { releaseStamp } from "./release";
 
 /** Paths the HTTP API serves (each also matches its sub-paths). */
 export const API_PATHS = ["/api/*", "/auth/*", "/webhooks/*", "/email/*", "/integrations/*"];
@@ -69,6 +70,7 @@ in your config to a dashboard build and deploy again.</p></body></html>`;
 
 /** What the dashboard reads at start (public/runtime-config.js in its build). */
 export function runtimeConfigScript(cfg: ResolvedConfig): string {
+  const stamp = releaseStamp(cfg);
   const value = {
     // Same origin: the dashboard calls /api/... on its own hostname.
     apiUrl: "",
@@ -76,6 +78,10 @@ export function runtimeConfigScript(cfg: ResolvedConfig): string {
     selfHosted: true,
     supportEmail: cfg.email.supportInbox,
     siteUrl: cfg.siteUrl,
+    // Which release this is (shown in the account menu and Settings → System).
+    version: stamp.version,
+    commit: stamp.commit,
+    releasedAt: stamp.releasedAt,
   };
   return `window.__CODERHELM_CONFIG__ = ${JSON.stringify(value)};\n`;
 }

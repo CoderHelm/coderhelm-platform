@@ -89,7 +89,11 @@ jobs:
       - name: Source and installer
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
-          git archive --format=tar.gz --prefix="coderhelm-platform-${TAG#v}/" -o dist/source.tar.gz "$TAG"
+          # The source, plus the release stamp each install shows (Settings → System).
+          SRC="$RUNNER_TEMP/src/coderhelm-platform-${TAG#v}"
+          mkdir -p "$SRC" && git archive --format=tar "$TAG" | tar -x -C "$SRC"
+          printf '{"version":"%s","commit":"%s","releasedAt":"%s"}\n' "$TAG" "$(git rev-parse "$TAG^{commit}")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SRC/selfhost/release.json"
+          tar -czf dist/source.tar.gz -C "$RUNNER_TEMP/src" "coderhelm-platform-${TAG#v}"
           (cd installer && npm version --no-git-tag-version --allow-same-version "${TAG#v}" >/dev/null && npm pack --silent --pack-destination ../dist >/dev/null)
           mv dist/coderhelm-selfhost-*.tgz dist/coderhelm-selfhost.tgz
           cp selfhost/install.sh dist/install.sh
@@ -108,6 +112,12 @@ jobs:
           npm ci
           mkdir -p "$RUNNER_TEMP/dash" && tar -xzf ../dist/dashboard.tar.gz -C "$RUNNER_TEMP/dash"
           CODERHELM_DASHBOARD_DIR="$RUNNER_TEMP/dash" npx cdk synth --all --quiet -c config=config/selfhost.example.json -o "$RUNNER_TEMP/synth"
+
+      # Keyless signature of the checksums: the update build and the
+      # installer check it was made by this workflow, on a tag.
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the checksums
+        run: cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
 
       - uses: actions/attest-build-provenance@v2
         with:

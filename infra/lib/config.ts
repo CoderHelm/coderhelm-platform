@@ -152,6 +152,28 @@ export interface CoderhelmConfig {
     /** A built dashboard (static export) to upload. The installer fills it in. */
     assetDir?: string;
   };
+  /**
+   * Updates (single-origin only). The updater runs in this account: it
+   * checks for releases hourly, emails admins about them, and applies them
+   * when auto-update allows. Admins change these from Settings → System;
+   * the values here are the starting point.
+   */
+  updates?: {
+    /** Create the updater (Lambda, CodeBuild project, hourly check). Default true. */
+    enabled?: boolean;
+    /** Apply new releases on their own. Default false (admins are told and update with one click). */
+    auto?: boolean;
+    /** `stable`, or `preview` for release candidates too. Default `stable`. */
+    channel?: "stable" | "preview";
+    /** Maintenance window: `"Sun 03:00"`, `"daily 02:00"`. Default `"Sun 03:00"`. */
+    window?: string;
+    /** IANA time zone of the window. Default `UTC`. */
+    timezone?: string;
+    /** `ask`: majors wait for an admin; `auto`: majors apply too. Default `ask`. */
+    majors?: "ask" | "auto";
+    /** A Slack or Teams incoming webhook for update notices, besides email to admins. */
+    webhookUrl?: string;
+  };
   /** Anonymous install and upgrade pings from the installer. Off unless set to true. */
   telemetry?: { enabled?: boolean; endpoint?: string };
   /**
@@ -214,6 +236,12 @@ export interface ResolvedConfig {
   signup: { emails: string[]; domains: string[] };
   integrations: Required<NonNullable<CoderhelmConfig["integrations"]>>;
   dashboardAssetDir: string | null;
+  updates: {
+    enabled: boolean;
+    webhookUrl: string | null;
+    /** The updater's starting settings (lambda/updater/handler.py). */
+    defaults: { auto: boolean; channel: "stable" | "preview"; day: string; hour: number; timezone: string; majors: "ask" | "auto" };
+  };
   logReaderTemplateUrl: string;
   publicBucketName: string | null;
   siteUrl: string | null;
@@ -245,7 +273,7 @@ const URL_RE = /^https?:\/\/[^\s/]+(\/[^\s]*)?$/;
 const KNOWN_TOP_KEYS = new Set([
   "$schema", "account", "region", "stage", "resourcePrefix", "globalNameSuffix", "layout",
   "domain", "split", "retainData", "models", "email", "admins", "signup", "integrations",
-  "dashboard", "telemetry", "logReaderTemplateUrl", "publicBucketName", "siteUrl", "ci",
+  "dashboard", "telemetry", "logReaderTemplateUrl", "publicBucketName", "siteUrl", "ci", "updates",
 ]);
 
 /** Every problem with a config, empty when it is valid. */
@@ -423,6 +451,21 @@ export function validateConfig(c: unknown): string[] {
       p.push("telemetry.endpoint: an https URL");
     }
   }
+  if (cfg.updates !== undefined) {
+    const u = cfg.updates;
+    if (typeof u !== "object" || u === null) p.push("updates: an object");
+    else {
+      for (const k of ["enabled", "auto"] as const) {
+        if (u[k] !== undefined && typeof u[k] !== "boolean") p.push(`updates.${k}: true or false`);
+      }
+      if (u.channel !== undefined && u.channel !== "stable" && u.channel !== "preview") p.push('updates.channel: "stable" or "preview"');
+      if (u.majors !== undefined && u.majors !== "ask" && u.majors !== "auto") p.push('updates.majors: "ask" or "auto"');
+      if (u.window !== undefined && !parseWindow(String(u.window))) p.push('updates.window: a day and time such as "Sun 03:00" or "daily 02:00"');
+      if (u.timezone !== undefined && !/^(UTC|[A-Za-z_]+(\/[A-Za-z0-9_+-]+)+)$/.test(String(u.timezone))) p.push("updates.timezone: an IANA time zone such as Europe/Berlin");
+      if (u.webhookUrl !== undefined && !/^https:\/\/\S+$/.test(String(u.webhookUrl))) p.push("updates.webhookUrl: an https URL");
+      if (layout === "split" && u.enabled) p.push('updates.enabled: only for layout "single-origin" (the hosted deployment deploys from CI)');
+    }
+  }
   if (cfg.logReaderTemplateUrl !== undefined && !/^https:\/\/[^\s]+\.ya?ml$/.test(String(cfg.logReaderTemplateUrl))) {
     p.push("logReaderTemplateUrl: an https URL of a .yaml template in S3");
   }
@@ -525,6 +568,22 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
       weeklySummaryListedTeamsOnly: i.weeklySummaryListedTeamsOnly ?? false,
     },
     dashboardAssetDir: cfg.dashboard?.assetDir ?? null,
+    updates: (() => {
+      const u = cfg.updates ?? {};
+      const w = parseWindow(u.window ?? "Sun 03:00") ?? { day: "sun", hour: 3 };
+      return {
+        enabled: layout === "single-origin" && u.enabled !== false,
+        webhookUrl: u.webhookUrl ?? null,
+        defaults: {
+          auto: u.auto ?? false,
+          channel: u.channel ?? "stable",
+          day: w.day,
+          hour: w.hour,
+          timezone: u.timezone ?? "UTC",
+          majors: u.majors ?? "ask",
+        },
+      };
+    })(),
     logReaderTemplateUrl: cfg.logReaderTemplateUrl ?? DEFAULT_LOG_READER_TEMPLATE_URL,
     publicBucketName: cfg.publicBucketName ?? null,
     siteUrl: cfg.siteUrl ?? null,
@@ -535,6 +594,14 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
     sandboxBucketName: `${prefix}-sandbox${suffix}`,
     cognitoDomainPrefix: `${prefix}${suffix}`,
   };
+}
+
+/** `"Sun 03:00"` → { day: "sun", hour: 3 }; `"daily 02:00"` → { day: "daily", hour: 2 }. */
+export function parseWindow(w: string): { day: string; hour: number } | null {
+  const m = w.trim().toLowerCase().match(/^(mon|tue|wed|thu|fri|sat|sun|daily)[a-z]*\s+(\d{1,2}):00$/);
+  if (!m) return null;
+  const hour = Number(m[2]);
+  return hour <= 23 ? { day: m[1], hour } : null;
 }
 
 /** `coderhelm/<stage>` for the default prefix, else the prefix itself. */

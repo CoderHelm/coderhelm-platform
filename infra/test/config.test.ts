@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  parseWindow,
   CoderhelmConfig,
   ConfigError,
   chooseConfigFile,
@@ -235,4 +236,18 @@ test("which config file: -c config, then CODERHELM_CONFIG, then the hosted files
   assert.equal(chooseConfigFile({ envConfig: "b.json", infraDir: "/i" }).file, path.resolve("b.json"));
   assert.equal(chooseConfigFile({ infraDir: "/i" }).file, "/i/config/hosted.prod.json");
   assert.deepEqual(chooseConfigFile({ stage: "dev", infraDir: "/i" }), { file: "/i/config/local.json", stage: "dev" });
+});
+
+test("updates settings", () => {
+  assert.deepEqual(parseWindow("Sun 03:00"), { day: "sun", hour: 3 });
+  assert.deepEqual(parseWindow("daily 23:00"), { day: "daily", hour: 23 });
+  assert.equal(parseWindow("Sun 3pm"), null);
+  assert.equal(parseWindow("Sun 24:00"), null);
+  hasProblem(base({ updates: { window: "whenever" } }), /updates.window/);
+  hasProblem(base({ updates: { channel: "beta" as never } }), /updates.channel/);
+  hasProblem(base({ updates: { majors: "never" as never } }), /updates.majors/);
+  hasProblem(base({ updates: { webhookUrl: "http://x" } }), /updates.webhookUrl/);
+  const r = resolveConfig(base());
+  assert.equal(r.updates.enabled, true);
+  assert.deepEqual(r.updates.defaults, { auto: false, channel: "stable", day: "sun", hour: 3, timezone: "UTC", majors: "ask" });
 });

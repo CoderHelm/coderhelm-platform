@@ -19,7 +19,7 @@ import * as targets from "aws-cdk-lib/aws-events-targets";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
-import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn } from "./service-env";
+import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn, updaterInvokeStatement } from "./service-env";
 
 interface ApiStackProps extends cdk.StackProps {
   stage: string;
@@ -432,7 +432,7 @@ export class ApiStack extends cdk.Stack {
         ...serviceEnvironment(cfg, this.account),
       },
     });
-    for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this)]) {
+    for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this), updaterInvokeStatement(cfg, this)]) {
       if (st) this.gatewayFunction.addToRolePolicy(st);
     }
 
