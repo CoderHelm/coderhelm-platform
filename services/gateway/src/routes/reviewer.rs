@@ -1280,6 +1280,25 @@ mod tests {
     }
 
     #[test]
+    fn open_pr_rows_keep_what_the_picker_shows() {
+        let gh = json!([
+            {"number": 42, "title": "Fix login", "user": {"login": "dev1"}, "draft": false, "updated_at": "2026-10-20T10:00:00Z", "body": "long"},
+            {"number": 7, "title": "WIP", "user": null, "draft": true},
+            {"title": "not a pr"}
+        ]);
+        let rows = open_pr_rows(&gh);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            json!({"number": 42, "title": "Fix login", "author": "dev1", "draft": false, "updated_at": "2026-10-20T10:00:00Z"})
+        );
+        assert_eq!(rows[1]["author"], "");
+        assert_eq!(rows[1]["draft"], true);
+        // An error object from GitHub is no rows, not a panic.
+        assert!(open_pr_rows(&json!({"message": "Not Found"})).is_empty());
+    }
+
+    #[test]
     fn validate_repo_accepts_normal_and_rejects_injection() {
         assert!(validate_repo("Example-Org/web-app").is_ok());
         assert!(validate_repo("a_b.c/d-e").is_ok());
@@ -1476,6 +1495,85 @@ pub async fn re_review(
         "Reviewer: dashboard re-review → review job"
     );
     Ok(Json(json!({ "status": "queued" })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct OpenPrsQuery {
+    repo: String,
+}
+
+/// Most open PRs `GET /api/reviewer/open-prs` returns (one GitHub page).
+const OPEN_PRS_MAX: usize = 100;
+
+/// Pure: the dashboard's rows from GitHub's `GET /repos/{o}/{n}/pulls`
+/// answer. Number, title, author, draft flag and last update; anything that
+/// isn't a PR object is skipped.
+fn open_pr_rows(pulls: &Value) -> Vec<Value> {
+    pulls
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| {
+            let number = p.get("number")?.as_u64()?;
+            Some(json!({
+                "number": number,
+                "title": p.get("title").and_then(Value::as_str).unwrap_or(""),
+                "author": p.pointer("/user/login").and_then(Value::as_str).unwrap_or(""),
+                "draft": p.get("draft").and_then(Value::as_bool).unwrap_or(false),
+                "updated_at": p.get("updated_at").and_then(Value::as_str).unwrap_or(""),
+            }))
+        })
+        .take(OPEN_PRS_MAX)
+        .collect()
+}
+
+/// GET /api/reviewer/open-prs?repo=owner/name — the repo's open pull
+/// requests, most recently updated first, read with the team's GitHub app
+/// installation. Feeds the "Review a PR" picker so nobody types a number.
+/// A repo the installation can't see answers 404.
+pub async fn open_prs(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<OpenPrsQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    validate_repo(&q.repo)?;
+    let (owner, name) = q.repo.split_once('/').ok_or(StatusCode::BAD_REQUEST)?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let installation_id = super::api::get_team_installation_id(&state, &claims.team_id).await?;
+    let token = crate::auth::github_app::get_installation_token(&state, installation_id)
+        .await
+        .map_err(|e| {
+            error!("open-prs: installation token failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+    let url = format!(
+        "https://api.github.com/repos/{owner}/{name}/pulls?state=open&sort=updated&direction=desc&per_page={OPEN_PRS_MAX}"
+    );
+    let resp = state
+        .http
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Coderhelm-bot")
+        .send()
+        .await
+        .map_err(|e| {
+            error!("open-prs: GitHub request failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+    match resp.status().as_u16() {
+        200 => {}
+        404 | 403 => return Err(StatusCode::NOT_FOUND),
+        s => {
+            error!(owner, name, status = s, "open-prs: GitHub refused");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    }
+    let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+    Ok(Json(json!({ "prs": open_pr_rows(&body) })))
 }
 
 /// GET /api/releases?repo=owner/name&cursor= — release-notes records, newest
