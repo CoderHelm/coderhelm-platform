@@ -66,6 +66,8 @@ pub mod pr_outcome;
 pub mod jira_text;
 /// Anthropic API or Amazon Bedrock, and Bedrock's model ids.
 pub mod model_provider;
+/// Plugins: packages of skills, agents, tools, triggers and outputs a team installs.
+pub mod plugins;
 /// Where this deployment's dashboard and API are (links, redirects, webhooks).
 pub mod public_urls;
 /// Who asked for a run: one identity per person, for per-person analytics.

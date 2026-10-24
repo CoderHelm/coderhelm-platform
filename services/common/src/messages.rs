@@ -139,6 +139,91 @@ pub enum WorkerMessage {
     /// passing needs nobody to click anything).
     #[serde(rename = "agent_resume_sweep")]
     AgentResumeSweep,
+    /// One plugin run: a brief, a schedule or a release (see
+    /// `plugins::run`).
+    #[serde(rename = "plugin_run")]
+    PluginRun(PluginRunMessage),
+    /// Run an approved draft's consequential tool (now, or when its one-off
+    /// schedule fires).
+    #[serde(rename = "plugin_publish")]
+    PluginPublish(PluginPublishMessage),
+    /// Read a plugin source again, and offer its plugins' new versions (a
+    /// push webhook, or an admin's "Sync now").
+    #[serde(rename = "plugin_sync")]
+    PluginSync(PluginSyncMessage),
+    /// Every 15 minutes (EventBridge → SQS): poll the plugin sources that
+    /// no webhook covers.
+    #[serde(rename = "plugin_sweep")]
+    PluginSweep,
+    /// A plugin's recurring `schedule` trigger fired.
+    #[serde(rename = "plugin_trigger")]
+    PluginTrigger(PluginTriggerMessage),
+    /// Read a published draft's numbers back, as a lesson for later runs.
+    #[serde(rename = "plugin_results")]
+    PluginResults(PluginResultsMessage),
+}
+
+/// One plugin run. `hash` is the plugin version it was asked against; the
+/// run refuses when the plugin moved to another version meanwhile.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct PluginRunMessage {
+    pub team_id: String,
+    pub run_id: String,
+    pub plugin_id: String,
+    #[serde(default)]
+    pub hash: String,
+    /// `manual`, `schedule` or `release`.
+    pub trigger: String,
+    /// The brief form's values, or the release's notes.
+    #[serde(default)]
+    pub inputs: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The repository the run is about, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// An email, `slack:<user>`, `teams:<user>`, `schedule` or `release`.
+    pub requested_by: String,
+    /// The agent the trigger names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+/// Publish one approved draft version.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct PluginPublishMessage {
+    pub team_id: String,
+    pub artifact_id: String,
+    pub version: u32,
+    pub approval_id: String,
+}
+
+/// Sync a plugin source (and offer its plugins' new versions), or one
+/// installed plugin. `reason`: `webhook`, `admin` or `poll`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct PluginSyncMessage {
+    pub team_id: String,
+    #[serde(default)]
+    pub source_id: String,
+    #[serde(default)]
+    pub plugin_id: String,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// A plugin's recurring schedule fired: trigger `trigger` of its manifest.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct PluginTriggerMessage {
+    pub team_id: String,
+    pub plugin_id: String,
+    pub trigger: usize,
+}
+
+/// Read a published draft's results.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct PluginResultsMessage {
+    pub team_id: String,
+    pub artifact_id: String,
 }
 
 /// A ticket comment to read (gateway → worker). `action` is what it would
@@ -252,6 +337,12 @@ impl WorkerMessage {
             | WorkerMessage::KnowledgeSyncSweep
             | WorkerMessage::AgentResumeSweep
             | WorkerMessage::LogAutofix => f::OTHER,
+            WorkerMessage::PluginRun(_)
+            | WorkerMessage::PluginPublish(_)
+            | WorkerMessage::PluginSync(_)
+            | WorkerMessage::PluginSweep
+            | WorkerMessage::PluginTrigger(_)
+            | WorkerMessage::PluginResults(_) => f::PLUGIN,
         }
     }
 
@@ -297,6 +388,11 @@ impl WorkerMessage {
                 Some((&m.team_id, "Try a team agent".into(), String::new()))
             }
             WorkerMessage::TestAction(m) => Some((&m.team_id, "A test fix".into(), String::new())),
+            WorkerMessage::PluginRun(m) => Some((
+                &m.team_id,
+                format!("Plugin {} run", m.plugin_id),
+                m.run_id.clone(),
+            )),
             _ => None,
         }
     }
