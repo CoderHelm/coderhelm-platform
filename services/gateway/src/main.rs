@@ -52,6 +52,8 @@ async fn main() -> Result<(), Error> {
     let kms = aws_sdk_kms::Client::new(&aws_config);
     let sts = aws_sdk_sts::Client::new(&aws_config);
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
+    // Claude through Bedrock when the deployment says so (MODEL_PROVIDER).
+    common::model_provider::set_bedrock_client(bedrock.clone());
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
     // Where this deployment's dashboard and API are (config, or SSM).
     common::public_urls::init(common::public_urls::ssm::Client::new(&aws_config)).await;
@@ -823,6 +825,9 @@ async fn main() -> Result<(), Error> {
             "/api/plans/chat/stream",
             post(routes::plans::plan_chat_stream),
         )
+        // Opt-in pings from self-host installers: public, no session, a
+        // fixed set of non-identifying fields (routes::telemetry).
+        .route("/api/telemetry/ping", post(routes::telemetry::ping))
         .nest("/webhooks", webhook_routes)
         .route(
             "/integrations/jira/forge-register",

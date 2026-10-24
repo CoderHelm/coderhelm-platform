@@ -3,9 +3,13 @@
 //! The only gateway file allowed to call a model (a test in
 //! `common::model_call_sites` holds it to that). Each call is streamed and
 //! recorded per attempt through `common::model_stream`, under feature `chat`.
+//! When the deployment uses Amazon Bedrock (`common::model_provider`), the
+//! same requests go to Bedrock and its events are read as the same SSE.
 
-use common::model_retry::ModelCallError;
-use common::model_stream::{send_metered, InFlight};
+use futures::StreamExt;
+
+use common::model_retry::{ModelCallError, ModelErrorKind};
+use common::model_stream::{send_metered, InFlight, SseParser};
 use common::usage::{feature, with_feature, UsageMeter};
 use serde_json::{json, Value};
 
@@ -28,6 +32,35 @@ pub async fn chat_turn(
     meter: &UsageMeter,
     model_id: &str,
 ) -> Result<Value, ModelCallError> {
+    if common::model_provider::is_bedrock() {
+        let (mut stream, mut flight) = open_bedrock_stream(body, meter, model_id).await?;
+        let mut parser = SseParser::default();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(c) => {
+                    for ev in parser.push(&c) {
+                        flight.acc.feed(&ev);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        flight.finish().await;
+        let acc = std::mem::take(&mut flight.acc);
+        if let Some(err) = acc.stream_error() {
+            return Err(ModelCallError::new(
+                ModelErrorKind::Network,
+                err.to_string(),
+            ));
+        }
+        if !acc.finished() {
+            return Err(ModelCallError::new(
+                ModelErrorKind::Network,
+                "the Bedrock reply broke off",
+            ));
+        }
+        return Ok(acc.into_message());
+    }
     let mut body = body.clone();
     body["stream"] = json!(true);
     let bytes = serde_json::to_vec(&body).unwrap_or_default();
@@ -60,7 +93,10 @@ pub async fn open_chat_stream(
     body: &Value,
     meter: &UsageMeter,
     model_id: &str,
-) -> Result<(reqwest::Response, InFlight), ModelCallError> {
+) -> Result<(ChatBytes, InFlight), ModelCallError> {
+    if common::model_provider::is_bedrock() {
+        return open_bedrock_stream(body, meter, model_id).await;
+    }
     let bytes = serde_json::to_vec(body).unwrap_or_default();
     let resp = common::model_retry::send_streaming(
         || {
@@ -84,5 +120,80 @@ pub async fn open_chat_stream(
         InFlight::new(meter, model_id, request_id, bytes.len() as u64)
     })
     .await;
-    Ok((resp, flight))
+    let stream = resp
+        .bytes_stream()
+        .map(|r| r.map(|b| b.to_vec()).map_err(|e| e.to_string()));
+    Ok((Box::pin(stream), flight))
+}
+
+/// A plan chat reply's bytes as Anthropic SSE text.
+pub type ChatBytes = std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, String>> + Send>>;
+
+/// The same request through Bedrock's streaming call, retried by status
+/// until a stream starts. Bedrock's events are framed as SSE, so callers
+/// read them exactly like the Anthropic API's.
+async fn open_bedrock_stream(
+    body: &Value,
+    meter: &UsageMeter,
+    model_id: &str,
+) -> Result<(ChatBytes, InFlight), ModelCallError> {
+    use aws_sdk_bedrockruntime::types::ResponseStream;
+    use common::model_retry::{backoff, is_transient_status, INTERACTIVE_BACKOFF_SECS};
+    let Some(client) = common::model_provider::bedrock_client() else {
+        return Err(ModelCallError::new(
+            ModelErrorKind::Network,
+            "Bedrock is the model provider but no client was set up",
+        ));
+    };
+    let bytes = serde_json::to_vec(&common::model_provider::bedrock_body(body)).unwrap_or_default();
+    let bedrock_id = common::model_provider::bedrock_model_id(model_id);
+    let mut attempt = 0;
+    let out = loop {
+        let result = client
+            .invoke_model_with_response_stream()
+            .model_id(&bedrock_id)
+            .content_type("application/json")
+            .accept("application/json")
+            .body(aws_smithy_types::Blob::new(bytes.clone()))
+            .send()
+            .await;
+        match result {
+            Ok(out) => break out,
+            Err(e) => {
+                let status = e.raw_response().map(|r| r.status().as_u16());
+                let text = aws_sdk_bedrockruntime::error::DisplayErrorContext(&e).to_string();
+                if !status.is_none_or(is_transient_status)
+                    || attempt >= INTERACTIVE_BACKOFF_SECS.len()
+                {
+                    return Err(ModelCallError::new(
+                        status.map_or(ModelErrorKind::Network, ModelErrorKind::Status),
+                        text,
+                    ));
+                }
+                tracing::warn!(model = %bedrock_id, attempt, status = ?status, "Bedrock stream failed to start — retrying");
+                tokio::time::sleep(backoff(&INTERACTIVE_BACKOFF_SECS, attempt, None)).await;
+                attempt += 1;
+            }
+        }
+    };
+    let flight = with_feature(feature::CHAT, async {
+        InFlight::new(meter, model_id, None, bytes.len() as u64)
+    })
+    .await;
+    let events = futures::stream::unfold(Some(out.body), |rx| async move {
+        let mut rx = rx?;
+        match rx.recv().await {
+            Ok(Some(ResponseStream::Chunk(part))) => {
+                let raw = part.bytes.map(|b| b.into_inner()).unwrap_or_default();
+                Some((Ok(common::model_provider::sse_frame(&raw)), Some(rx)))
+            }
+            Ok(Some(_)) => Some((Ok(Vec::new()), Some(rx))),
+            Ok(None) => None,
+            Err(e) => Some((
+                Err(aws_sdk_bedrockruntime::error::DisplayErrorContext(&e).to_string()),
+                None,
+            )),
+        }
+    });
+    Ok((Box::pin(events), flight))
 }

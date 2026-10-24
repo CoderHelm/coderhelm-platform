@@ -1007,7 +1007,7 @@ async fn send_bedrock(
     loop {
         let result = bedrock
             .invoke_model()
-            .model_id(&request.model)
+            .model_id(common::model_provider::bedrock_model_id(&request.model))
             .content_type("application/json")
             .accept("application/json")
             .body(aws_smithy_types::Blob::new(body.clone()))

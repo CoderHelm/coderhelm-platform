@@ -9,7 +9,7 @@
 const api = require("@forge/api");
 const { storage, webTrigger, route } = api;
 
-const GATEWAY_URL = "https://api.coderhelm.com";
+const { GATEWAY_URL } = require("./gateway");
 
 /** The site's address (e.g. https://yourcompany.atlassian.net), or "". */
 async function siteUrl() {

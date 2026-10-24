@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Installs CoderHelm in this AWS account. A CodeBuild project runs the
+  CoderHelm installer (coderhelm-selfhost) for the release you pick: it
+  bootstraps CDK, deploys every CoderHelm stack and uploads the dashboard.
+  This stack finishes when the install does (about 20-30 minutes) and shows
+  your CoderHelm URL. Then create your GitHub App with the command in the
+  NextStep output. Deleting this stack does not remove CoderHelm (use
+  "coderhelm-selfhost uninstall").
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Required" }
+        Parameters: [AdminEmail, EmailFrom]
+      - Label: { default: "Your own domain (optional; leave empty for a CloudFront URL)" }
+        Parameters: [Hostname, HostedZone]
+      - Label: { default: "Models" }
+        Parameters: [ModelProvider, BedrockInferencePrefix]
+      - Label: { default: "More" }
+        Parameters: [Stage, SignupDomain, Version, Telemetry]
+
+Parameters:
+  AdminEmail:
+    Type: String
+    Description: Your email. You become the first admin.
+    AllowedPattern: "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
+  EmailFrom:
+    Type: String
+    Description: The address CoderHelm sends email from (its domain gets an SES identity).
+    AllowedPattern: "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
+  Hostname:
+    Type: String
+    Default: ""
+    Description: e.g. coderhelm.example.com. Empty for CloudFront's default URL.
+    AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
+  HostedZone:
+    Type: String
+    Default: ""
+    Description: The Route 53 public hosted zone the hostname is in, e.g. example.com.
+    AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
+  ModelProvider:
+    Type: String
+    Default: anthropic
+    AllowedValues: [anthropic, bedrock]
+    Description: anthropic (each team adds its own Anthropic API key) or bedrock (Claude on Amazon Bedrock in this account).
+  BedrockInferencePrefix:
+    Type: String
+    Default: "us."
+    AllowedValues: ["us.", "eu.", "apac.", "global.", ""]
+    Description: Bedrock only. The cross-region inference profile prefix for your region.
+  Stage:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[a-z][a-z0-9-]{0,19}$"
+    Description: A short name for this install (resource names start with coderhelm-<stage>).
+  SignupDomain:
+    Type: String
+    Default: ""
+    Description: Let anyone with an email at this domain sign up (empty, only the admin).
+    AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
+  Version:
+    Type: String
+    Default: latest
+    Description: The CoderHelm release to install, e.g. v1.2.0, or latest.
+    AllowedPattern: "^(latest|v\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.]+)?)$"
+  Telemetry:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: Send anonymous install pings (release and region only) to CoderHelm.
+
+Conditions:
+  HasHostname: !Not [!Equals [!Ref Hostname, ""]]
+
+Resources:
+  InstallerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: CoderHelm installer (CodeBuild). Deploys CDK stacks, so it needs broad rights.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess
+
+  InstallerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/coderhelm-${Stage}-installer
+      RetentionInDays: 30
+
+  InstallerProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub coderhelm-${Stage}-installer
+      Description: Runs coderhelm-selfhost deploy. Start a build with VERSION set to a newer release to upgrade.
+      ServiceRole: !GetAtt InstallerRole.Arn
+      TimeoutInMinutes: 90
+      Artifacts: { Type: NO_ARTIFACTS }
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref InstallerLogs
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: VERSION, Value: !Ref Version }
+          - { Name: STAGE, Value: !Ref Stage }
+          - { Name: ADMIN_EMAIL, Value: !Ref AdminEmail }
+          - { Name: EMAIL_FROM, Value: !Ref EmailFrom }
+          - { Name: HOSTNAME_ARG, Value: !Ref Hostname }
+          - { Name: HOSTED_ZONE, Value: !Ref HostedZone }
+          - { Name: MODEL_PROVIDER, Value: !Ref ModelProvider }
+          - { Name: BEDROCK_PREFIX, Value: !Ref BedrockInferencePrefix }
+          - { Name: SIGNUP_DOMAIN, Value: !Ref SignupDomain }
+          - { Name: TELEMETRY, Value: !Ref Telemetry }
+          - { Name: WAIT_URL, Value: "" }
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 20
+            build:
+              commands:
+                - set -eu
+                - REPO=CoderHelm/coderhelm-platform
+                - |
+                  if [ "$VERSION" = "latest" ]; then
+                    VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).tag_name))')
+                  fi
+                - echo "Installing CoderHelm $VERSION"
+                - mkdir -p /tmp/ch && cd /tmp/ch
+                - curl -fsSLo coderhelm-selfhost.tgz "https://github.com/$REPO/releases/download/$VERSION/coderhelm-selfhost.tgz"
+                - curl -fsSLo SHA256SUMS "https://github.com/$REPO/releases/download/$VERSION/SHA256SUMS"
+                - grep ' coderhelm-selfhost.tgz$' SHA256SUMS | sha256sum -c -
+                - npm install -g ./coderhelm-selfhost.tgz
+                - |
+                  ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+                  REGION="$AWS_REGION"
+                  if ! coderhelm-selfhost pull --stage "$STAGE" --region "$REGION"; then
+                    set -- --yes --account "$ACCOUNT" --region "$REGION" --stage "$STAGE" \
+                      --admin "$ADMIN_EMAIL" --email-from "$EMAIL_FROM" --provider "$MODEL_PROVIDER" \
+                      --signup-domain "$SIGNUP_DOMAIN" --telemetry "$TELEMETRY"
+                    if [ -n "$HOSTNAME_ARG" ]; then set -- "$@" --domain "$HOSTNAME_ARG" --hosted-zone "$HOSTED_ZONE"; fi
+                    if [ "$MODEL_PROVIDER" = "bedrock" ]; then set -- "$@" --bedrock-prefix "$BEDROCK_PREFIX"; fi
+                    coderhelm-selfhost init "$@"
+                  fi
+                - coderhelm-selfhost deploy --yes --version "$VERSION" --skip-github-app
+            post_build:
+              commands:
+                - |
+                  URL=$(node -e 'try{console.log(require("/tmp/ch/.coderhelm/state.json").publicUrl||"")}catch{console.log("")}')
+                  if [ -n "$WAIT_URL" ]; then
+                    if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then S=SUCCESS; R="CoderHelm is running"; else S=FAILURE; R="The install failed: see the CodeBuild log"; fi
+                    curl -fsS -X PUT -H 'Content-Type:' --data-binary "{\"Status\":\"$S\",\"Reason\":\"$R\",\"UniqueId\":\"install\",\"Data\":\"$URL\"}" "$WAIT_URL"
+                  fi
+
+  StarterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartInstaller
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt InstallerProject.Arn
+
+  StarterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Starts the CoderHelm installer build once, when this stack is created.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt StarterRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, cfnresponse
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Create":
+                      p = event["ResourceProperties"]
+                      boto3.client("codebuild").start_build(
+                          projectName=p["Project"],
+                          environmentVariablesOverride=[{"name": "WAIT_URL", "value": p["WaitUrl"], "type": "PLAINTEXT"}],
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "installer")
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)[:200]}, "installer")
+
+  InstallDoneHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  StartInstall:
+    Type: Custom::StartInstaller
+    Properties:
+      ServiceToken: !GetAtt StarterFunction.Arn
+      Project: !Ref InstallerProject
+      WaitUrl: !Ref InstallDoneHandle
+
+  InstallDone:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: StartInstall
+    Properties:
+      Handle: !Ref InstallDoneHandle
+      Timeout: "5400"
+      Count: 1
+
+Outputs:
+  CoderHelm:
+    Description: Your CoderHelm URL (as {"install":"<url>"}). Open it and sign up with the admin email.
+    Value: !GetAtt InstallDone.Data
+  NextStep:
+    Description: Create your GitHub App from a computer with a browser and AWS credentials for this account.
+    Value: !Sub "npx -y github:CoderHelm/coderhelm-platform pull --stage ${Stage} --region ${AWS::Region} && npx -y github:CoderHelm/coderhelm-platform github-app"
+  Domain:
+    Condition: HasHostname
+    Description: The hostname CoderHelm answers on.
+    Value: !Sub "https://${Hostname}"
+  InstallerLogs:
+    Description: The installer's build log.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codebuild/projects/coderhelm-${Stage}-installer/history"

@@ -432,3 +432,61 @@ class StoreFindings(unittest.TestCase):
         self.assertEqual(card["attachments"][0]["content"]["actions"][0]["url"], "https://app/logs")
         slack = h.recommendations_slack("1", [{"title": "a"}], "https://app")
         self.assertEqual(slack["blocks"][-1]["elements"][0]["url"], "https://app/logs")
+
+
+class BedrockProvider(unittest.TestCase):
+    """MODEL_PROVIDER=bedrock: the same call through Bedrock, metered the same."""
+
+    def setUp(self):
+        import usage
+        self.u = usage
+
+    def test_switch_and_model_ids(self):
+        self.assertTrue(self.u.is_bedrock({"MODEL_PROVIDER": "Bedrock"}))
+        self.assertFalse(self.u.is_bedrock({}))
+        env = {"BEDROCK_INFERENCE_PREFIX": "eu."}
+        self.assertEqual(self.u.bedrock_model_id("claude-sonnet-5-5", env), "eu.anthropic.claude-sonnet-5-5")
+        self.assertEqual(self.u.bedrock_model_id("claude-haiku-4-5", env),
+                         "eu.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual(self.u.bedrock_model_id("us.anthropic.x", env), "us.anthropic.x")
+        env["BEDROCK_MODEL_IDS"] = '{"claude-sonnet-5-5": "arn:aws:bedrock:eu-west-1:1:application-inference-profile/p"}'
+        self.assertTrue(self.u.bedrock_model_id("claude-sonnet-5-5", env).startswith("arn:"))
+
+    def test_body(self):
+        b = self.u.bedrock_body({"model": "m", "stream": True, "max_tokens": 5})
+        self.assertEqual(b, {"max_tokens": 5, "anthropic_version": "bedrock-2023-05-31"})
+
+    def test_stream_is_read_and_recorded(self):
+        import json as _j
+        events = [
+            {"type": "message_start", "message": {"usage": {"input_tokens": 10, "output_tokens": 1}}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "[]"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}},
+            {"type": "message_stop"},
+        ]
+        seen = {}
+
+        class Bedrock:
+            def invoke_model_with_response_stream(self, **kw):
+                seen.update(kw)
+                return {"ResponseMetadata": {"RequestId": "r1"},
+                        "body": [{"chunk": {"bytes": _j.dumps(e).encode()}} for e in events]}
+
+        recorded = []
+        orig = self.u._record_attempt
+        self.u._record_attempt = lambda *a: recorded.append(a)
+        try:
+            msg = self.u.call_messages_bedrock({"model": "claude-sonnet-5-5", "max_tokens": 5}, "claude-sonnet-5-5",
+                                               None, "t", "team1", "log_analysis", bedrock=Bedrock(),
+                                               sleep=lambda s: None)
+        finally:
+            self.u._record_attempt = orig
+        self.assertEqual(msg["content"][0]["text"], "[]")
+        self.assertEqual(msg["stop_reason"], "end_turn")
+        self.assertTrue(seen["modelId"].endswith("anthropic.claude-sonnet-5-5"))
+        self.assertNotIn(b'"model"', seen["body"])
+        self.assertEqual(len(recorded), 1)
+        u, call_id, estimated = recorded[0][5], recorded[0][6], recorded[0][7]
+        self.assertEqual((u["uncached_input"], u["output"], call_id, estimated), (10, 3, "r1", False))

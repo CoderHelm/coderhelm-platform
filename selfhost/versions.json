@@ -1,0 +1,4 @@
+{
+  "about": "The dashboard commit each platform release ships. The release workflow builds this commit of CoderHelm/coderhelm (dashboard/) into dashboard.tar.gz. Move it forward in the same PR as any API change the dashboard needs.",
+  "dashboardRef": "main"
+}

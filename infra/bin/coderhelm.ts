@@ -24,6 +24,13 @@ try {
   if (choice.stage && choice.stage !== cfg.stage) {
     cfg = resolveConfig({ ...cfg.raw, stage: choice.stage });
   }
+  // The installer passes the dashboard build it downloaded for the release.
+  if (process.env.CODERHELM_DASHBOARD_DIR) {
+    cfg = resolveConfig({
+      ...cfg.raw,
+      dashboard: { ...cfg.raw.dashboard, assetDir: process.env.CODERHELM_DASHBOARD_DIR },
+    });
+  }
 } catch (err) {
   if (err instanceof ConfigError) {
     console.error(`${choice.file}\n${err.message}`);

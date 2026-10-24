@@ -690,6 +690,11 @@ export class ApiStack extends cdk.Stack {
       value: userPoolClient.userPoolClientId,
     });
 
+    // Self-hosted installs: the sign-in domain Google's OAuth client needs.
+    if (cfg.layout === "single-origin") {
+      new cdk.CfnOutput(this, "SignInDomain", { value: userPoolDomain.baseUrl() });
+    }
+
     // --- Custom domain for the API (split layout) ---
     const apiDomainName = cfg.split?.apiDomain;
     if (apiDomainName && cfg.split?.zone) {

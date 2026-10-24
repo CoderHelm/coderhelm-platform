@@ -277,7 +277,7 @@ export class WebStack extends cdk.Stack {
     }
 
     new cdk.CfnOutput(this, "PublicUrl", { value: this.publicUrl, description: "Open this to use CoderHelm" });
-    new cdk.CfnOutput(this, "SignUpUrl", { value: `${this.publicUrl}/signup/`, description: "The first admin signs up here" });
+    new cdk.CfnOutput(this, "SignUpUrl", { value: `${this.publicUrl}/?signup=1`, description: "The first admin signs up here" });
     new cdk.CfnOutput(this, "GithubWebhookUrl", { value: `${this.publicUrl}/webhooks/github` });
     new cdk.CfnOutput(this, "DistributionId", { value: this.distribution.distributionId });
     new cdk.CfnOutput(this, "DashboardBucketName", { value: bucket.bucketName });

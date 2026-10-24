@@ -14,14 +14,25 @@ Backend services for [CoderHelm](https://coderhelm.com) — the autonomous AI co
    - **Self-Review** — reviews its own diff, fixes issues before requesting human review
 4. A draft PR is opened with a summary, linked ticket, and progress notes
 
+## Run it in your own AWS account
+
+```sh
+npx -y github:CoderHelm/coderhelm-platform init     # a few questions → coderhelm.config.json
+npx -y github:CoderHelm/coderhelm-platform deploy   # deploy, upload the dashboard, create your GitHub App
+```
+
+No Rust, Docker or domain needed: releases ship built Lambda code, and without a domain CoderHelm runs on a CloudFront URL. Models through your teams' Anthropic keys or Bedrock in your account. Guides: [`docs/self-host/`](docs/self-host/index.md).
+
 ## Architecture
 
 ```
 services/gateway/    Rust Lambda — GitHub & Jira webhooks, OAuth, REST API, SQS dispatch
 services/worker/     Rust Lambda — AI orchestration (triage → plan → implement → review)
 coderhelm-jira/      Atlassian Forge app — bridges Jira Cloud events to the gateway
-infra/               AWS CDK v2 — all cloud infrastructure (API Gateway, Lambda, SQS, DynamoDB, S3, CloudFront)
-docs/                Integration guides and internal docs
+infra/               AWS CDK v2 — all cloud infrastructure, built from one config file (infra/config/)
+installer/           coderhelm-selfhost: install, upgrade, health, backup, uninstall
+selfhost/            Release metadata: migration notes, the dashboard version, install.sh
+docs/self-host/      Self-hosting guides
 ```
 
 ### Data Flow
@@ -81,29 +92,21 @@ Build the Rust workspace:
 cd services && cargo zigbuild --workspace --release --target aarch64-unknown-linux-musl
 ```
 
-Synthesise the CDK app:
+Synthesise the CDK app (the hosted deployment's config by default; `-c config=<file>` for another):
 
 ```bash
 cd infra && npx cdk synth
+npm test   # config validation and synth tests
 ```
 
-## Secrets
+## Config and secrets
 
-All sensitive values are stored in **AWS Secrets Manager** under the path `coderhelm/<stage>/secrets` (e.g. `coderhelm/prod/secrets`).
+Every deployment is built from one JSON config: the hosted one is `infra/config/hosted.prod.json`, a self-hosted one is the `coderhelm.config.json` the installer writes. See [docs/self-host/config-reference.md](docs/self-host/config-reference.md).
 
-The secret must be a JSON object with the following keys:
-
-```json
-{
-  "github_app_id": "<your-github-app-id>",
-  "github_private_key": "<PEM private key>",
-  "github_webhook_secret": "<webhook-secret>",
-  "github_client_id": "<oauth-client-id>",
-  "github_client_secret": "<oauth-client-secret>",
-  "jwt_secret": "<random-256-bit-hex>"
-}
-```
+Sensitive values are in **AWS Secrets Manager** at `coderhelm/<stage>/secrets`, a JSON object with `github_app_id`, `github_private_key`, `github_webhook_secret`, `github_client_id`, `github_client_secret` and `jwt_secret` (plus optional `google_client_id` / `google_client_secret`). Self-hosted installs get it created and filled by the installer.
 
 ## Deploy
 
-Pushing to `main` automatically triggers `.github/workflows/deploy.yml`, which builds the Rust workspace, packages the Lambda artifacts, and runs `cdk deploy --all` in the target AWS account.
+`.github/workflows/deploy.yml` deploys `main` to the hosted account (batched every 10 minutes), with `infra/config/hosted.prod.json`.
+
+A `vX.Y.Z` tag runs `.github/workflows/release.yml`, which publishes a self-host release: prebuilt Lambda zips, the dashboard, the source, the installer, `install.sh` and the Launch Stack template, with checksums and build provenance.

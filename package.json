@@ -1,0 +1,11 @@
+{
+  "name": "coderhelm-selfhost",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Run CoderHelm in your own AWS account: npx github:CoderHelm/coderhelm-platform init",
+  "bin": {
+    "coderhelm-selfhost": "installer/bin/coderhelm.mjs"
+  },
+  "files": ["installer/bin", "installer/lib", "installer/package.json"],
+  "engines": { "node": ">=20" }
+}

@@ -27,6 +27,12 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
   env.LOG_READER_TEMPLATE_URL = cfg.logReaderTemplateUrl;
   if (cfg.admins.length) env.PLATFORM_ADMIN_EMAILS = cfg.admins.join(",");
   Object.assign(env, modelProviderEnvironment(cfg));
+  // The services read the secret once at start. The installer sets this to
+  // the secret's version after it stores new keys (the GitHub App), so the
+  // functions restart and read them. Unset in normal deploys.
+  if (process.env.CODERHELM_SECRETS_REVISION) {
+    env.SECRETS_REVISION = process.env.CODERHELM_SECRETS_REVISION;
+  }
   return env;
 }
 

@@ -80,3 +80,47 @@ jobs:
         run: |
           pip install --quiet pyyaml==6.0.2
           python3 -m unittest discover -s .github/scripts
+
+  infra:
+    name: Infra (config, synth)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: infra/package-lock.json
+      - run: npm ci
+      # Config validation, hosted and self-host synth, the Launch Stack template.
+      - run: npm test
+      # A fresh self-host config with no domain synthesizes with the real CLI.
+      # Stub Lambda code: synth only hashes it.
+      - name: Synthesize the self-host example config
+        run: |
+          mkdir -p ../services/gateway/target/lambda/gateway ../services/worker/target/lambda/worker ../lambda/mcp-proxy/dist
+          echo stub > ../services/gateway/target/lambda/gateway/bootstrap
+          echo stub > ../services/worker/target/lambda/worker/bootstrap
+          echo 'exports.handler = async () => {}' > ../lambda/mcp-proxy/dist/handler.js
+          npx cdk synth --all --quiet -c config=config/selfhost.example.json -o "$RUNNER_TEMP/selfhost-synth"
+          ls "$RUNNER_TEMP/selfhost-synth"/*.template.json
+          if grep -l "coderhelm\.com" "$RUNNER_TEMP/selfhost-synth"/*.template.json; then
+            echo "A self-host template mentions the hosted domain"; exit 1
+          fi
+
+  installer:
+    name: Self-host installer
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: installer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - run: npm test
+      - run: sh -n ../selfhost/install.sh

@@ -1,0 +1,16 @@
+{
+  "name": "coderhelm-selfhost",
+  "version": "0.1.0",
+  "description": "Install, upgrade and check CoderHelm in your own AWS account",
+  "license": "UNLICENSED",
+  "type": "module",
+  "bin": {
+    "coderhelm-selfhost": "bin/coderhelm.mjs",
+    "create-coderhelm": "bin/coderhelm.mjs"
+  },
+  "files": ["bin", "lib", "README.md"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

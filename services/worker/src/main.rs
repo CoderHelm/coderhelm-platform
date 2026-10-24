@@ -39,6 +39,8 @@ async fn main() -> Result<(), Error> {
     let s3 = aws_sdk_s3::Client::new(&aws_config);
     let ses = aws_sdk_sesv2::Client::new(&aws_config);
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
+    // Claude through Bedrock when the deployment says so (MODEL_PROVIDER).
+    common::model_provider::set_bedrock_client(bedrock.clone());
     let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
     let sqs = aws_sdk_sqs::Client::new(&aws_config);
     let codebuild = aws_sdk_codebuild::Client::new(&aws_config);
