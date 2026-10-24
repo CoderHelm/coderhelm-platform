@@ -1,4 +1,4 @@
-//! The gateway's model calls (plan chat), every one metered.
+//! The gateway's model calls (plan chat and the brain chat), every one metered.
 //!
 //! The only gateway file allowed to call a model (a test in
 //! `common::model_call_sites` holds it to that). Each call is streamed and
@@ -33,7 +33,8 @@ pub async fn chat_turn(
     model_id: &str,
 ) -> Result<Value, ModelCallError> {
     if common::model_provider::is_bedrock() {
-        let (mut stream, mut flight) = open_bedrock_stream(body, meter, model_id).await?;
+        let (mut stream, mut flight) =
+            open_bedrock_stream(body, meter, model_id, feature::CHAT).await?;
         let mut parser = SseParser::default();
         while let Some(chunk) = stream.next().await {
             match chunk {
@@ -94,8 +95,30 @@ pub async fn open_chat_stream(
     meter: &UsageMeter,
     model_id: &str,
 ) -> Result<(ChatBytes, InFlight), ModelCallError> {
+    open_stream(http, api_key, body, meter, model_id, feature::CHAT).await
+}
+
+/// [`open_chat_stream`] for the brain chat: recorded under feature `brain`.
+pub async fn open_brain_stream(
+    http: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+    meter: &UsageMeter,
+    model_id: &str,
+) -> Result<(ChatBytes, InFlight), ModelCallError> {
+    open_stream(http, api_key, body, meter, model_id, feature::BRAIN).await
+}
+
+async fn open_stream(
+    http: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+    meter: &UsageMeter,
+    model_id: &str,
+    feature_tag: &'static str,
+) -> Result<(ChatBytes, InFlight), ModelCallError> {
     if common::model_provider::is_bedrock() {
-        return open_bedrock_stream(body, meter, model_id).await;
+        return open_bedrock_stream(body, meter, model_id, feature_tag).await;
     }
     let bytes = serde_json::to_vec(body).unwrap_or_default();
     let resp = common::model_retry::send_streaming(
@@ -116,7 +139,7 @@ pub async fn open_chat_stream(
         .get("request-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
-    let flight = with_feature(feature::CHAT, async {
+    let flight = with_feature(feature_tag, async {
         InFlight::new(meter, model_id, request_id, bytes.len() as u64)
     })
     .await;
@@ -136,6 +159,7 @@ async fn open_bedrock_stream(
     body: &Value,
     meter: &UsageMeter,
     model_id: &str,
+    feature_tag: &'static str,
 ) -> Result<(ChatBytes, InFlight), ModelCallError> {
     use aws_sdk_bedrockruntime::types::ResponseStream;
     use common::model_retry::{backoff, is_transient_status, INTERACTIVE_BACKOFF_SECS};
@@ -176,7 +200,7 @@ async fn open_bedrock_stream(
             }
         }
     };
-    let flight = with_feature(feature::CHAT, async {
+    let flight = with_feature(feature_tag, async {
         InFlight::new(meter, model_id, None, bytes.len() as u64)
     })
     .await;

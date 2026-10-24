@@ -47,6 +47,9 @@ pub mod feature {
     pub const INFRA: &str = "infra";
     /// Plan chat in the dashboard.
     pub const CHAT: &str = "chat";
+    /// The company brain chat in the dashboard (questions answered from
+    /// knowledge bases, connections, code, memory and data sources).
+    pub const BRAIN: &str = "brain";
     /// Executing an approved plan's tasks.
     pub const PLAN: &str = "plan";
     /// The scheduled log analyzer.

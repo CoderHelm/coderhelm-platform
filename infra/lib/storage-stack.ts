@@ -33,6 +33,21 @@ export class StorageStack extends cdk.Stack {
         ? cdk.RemovalPolicy.RETAIN
         : cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: !props.cfg.retainData,
+      // Knowledge base files and brain chat attachments are uploaded from
+      // the browser with short-lived signed PUT URLs (bound to the object's
+      // key, size and type by the gateway); nothing else is allowed. The
+      // dashboard's origins when known at synth; otherwise any origin, since
+      // the signed URL itself is the credential.
+      cors: [
+        {
+          allowedMethods: [s3.HttpMethods.PUT],
+          allowedOrigins:
+            props.cfg.split?.corsOrigins ??
+            (props.cfg.appUrl ? [props.cfg.appUrl] : ["*"]),
+          allowedHeaders: ["content-type", "x-amz-*"],
+          maxAge: 3000,
+        },
+      ],
       lifecycleRules: [
         {
           // Clean up old versions after 30 days

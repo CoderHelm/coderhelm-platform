@@ -592,6 +592,13 @@ Then the ```fix_location.json block described above."#,
         s.record_applied(state).await;
     }
 
+    // Knowledge bases the team attached to the planner.
+    let knowledge = super::knowledge::KnowledgeTools::load(state, &msg.team_id, "planner").await;
+    if let Some(k) = &knowledge {
+        tools.extend(k.tools());
+        full_system.push_str(&k.prompt_section());
+    }
+
     let executor = CombinedToolExecutor {
         read_only: ReadOnlyToolExecutor {
             github,
@@ -609,6 +616,7 @@ Then the ```fix_location.json block described above."#,
         ops: ops.as_ref(),
         live: live.as_ref(),
         skills: skills.as_ref(),
+        knowledge: knowledge.as_ref(),
         web: Some(&web),
         state,
     };
@@ -1381,6 +1389,8 @@ struct CombinedToolExecutor<'a> {
     web: Option<&'a super::web_check::WebCheck>,
     /// The team's written skills, read-only.
     skills: Option<&'a super::skills::TeamSkills>,
+    /// Knowledge bases attached to the planner.
+    knowledge: Option<&'a super::knowledge::KnowledgeTools>,
     state: &'a WorkerState,
 }
 
@@ -1391,6 +1401,11 @@ impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(k) = self.knowledge {
+            if let Some(out) = k.handle(self.state, name, input).await {
+                return Ok(serde_json::json!(out));
+            }
+        }
         if let Some(graphs) = self.graphs {
             if let Some(out) = graphs.handle(self.state, name, input).await {
                 return Ok(serde_json::json!(out));

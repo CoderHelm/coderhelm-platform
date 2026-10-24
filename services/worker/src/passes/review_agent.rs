@@ -926,6 +926,8 @@ pub struct PrReviewToolExecutor<'a> {
     pub web: Option<&'a super::web_check::WebCheck>,
     /// The team's remote MCP servers, read-only tools only.
     pub mcp: Option<&'a super::remote_mcp::RemoteMcp>,
+    /// Knowledge bases attached to the reviewer.
+    pub knowledge: Option<&'a super::knowledge::KnowledgeTools>,
 }
 
 #[async_trait::async_trait]
@@ -935,6 +937,11 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(k) = self.knowledge {
+            if let Some(out) = k.handle(self.state, name, input).await {
+                return Ok(json!(out));
+            }
+        }
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
         // Graph lookups share one implementation with every other agent.
         if let Some(graphs) = self.graph {
@@ -1392,6 +1399,7 @@ pub async fn generate_review(
     skills: Option<&super::skills::TeamSkills>,
     web: Option<&super::web_check::WebCheck>,
     mcp: Option<&super::remote_mcp::RemoteMcp>,
+    knowledge: Option<&super::knowledge::KnowledgeTools>,
     usage: &mut TokenUsage,
 ) -> Result<ReviewOutput, String> {
     let graph_tools = graph.map(|g| g.tools()).unwrap_or_default();
@@ -1405,7 +1413,8 @@ pub async fn generate_review(
     ) + &ops.map(|o| o.prompt_section()).unwrap_or_default();
     let skills_context = skills.map(|s| s.prompt_section()).unwrap_or_default()
         + &web.map(|w| w.prompt_section()).unwrap_or_default()
-        + &mcp.map(|m| m.prompt_section()).unwrap_or_default();
+        + &mcp.map(|m| m.prompt_section()).unwrap_or_default()
+        + &knowledge.map(|k| k.prompt_section()).unwrap_or_default();
     let prompt = review_user_prompt(
         title,
         pr_body,
@@ -1429,8 +1438,12 @@ pub async fn generate_review(
         skills,
         web,
         mcp,
+        knowledge,
     };
     let mut tools = review_tools();
+    if let Some(k) = knowledge {
+        tools.extend(k.tools());
+    }
     if web.is_some() {
         tools.push(super::web_check::tool());
     }
