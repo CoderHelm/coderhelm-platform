@@ -5212,72 +5212,45 @@ async fn complete_run(
     Ok(())
 }
 
-/// Check if the team has exceeded their configured monthly token limit.
-/// Returns Some(reason) if exceeded, None if within budget or no limit set.
+/// Check if the team has reached any of its monthly token limits (new
+/// tokens, cache read, cache write, or the old single limit), each on its own.
+/// Returns Some(reason) naming the limit reached, None if within every limit
+/// or none is set.
 pub(crate) async fn check_budget_exceeded(state: &WorkerState, team_id: &str) -> Option<String> {
-    // Load token limit
-    let limit = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key(
-            "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
-        )
-        .key(
-            "sk",
-            aws_sdk_dynamodb::types::AttributeValue::S("SETTINGS#TOKEN_LIMIT".to_string()),
-        )
-        .send()
-        .await
-        .ok()?
-        .item()
-        .and_then(|item| item.get("max_tokens").cloned())
-        .and_then(|v| v.as_n().ok().cloned())
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    if limit == 0 {
+    let limits =
+        common::token_limits::load(&state.dynamo, &state.config.settings_table_name, team_id)
+            .await
+            .ok()?;
+    if limits.is_empty() {
         return None; // No limit configured
     }
-
-    // Load current month usage
     let month = chrono::Utc::now().format("%Y-%m").to_string();
-    let total_used = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.analytics_table_name)
-        .key(
-            "team_id",
-            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
-        )
-        .key("period", aws_sdk_dynamodb::types::AttributeValue::S(month))
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned())
-        .map(|item| {
-            let ti = item
-                .get("total_tokens_in")
-                .and_then(|v| v.as_n().ok())
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0);
-            let to = item
-                .get("total_tokens_out")
-                .and_then(|v| v.as_n().ok())
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0);
-            ti + to
-        })
-        .unwrap_or(0);
+    // A failed usage read counts as no usage, as before.
+    let totals = common::token_limits::load_month_usage(
+        &state.dynamo,
+        &state.config.analytics_table_name,
+        team_id,
+        &month,
+    )
+    .await
+    .unwrap_or_default();
+    limits.reached(&totals).map(|hit| budget_reason(&hit))
+}
 
-    if total_used >= limit {
-        Some(format!(
-            "Monthly token limit exceeded ({} / {} tokens). Increase your limit in Settings → AI Models.",
-            total_used, limit
-        ))
-    } else {
-        None
+/// The run failure reason for a reached limit, naming which one.
+fn budget_reason(hit: &common::token_limits::LimitUse) -> String {
+    use common::token_limits::LimitKind;
+    match hit.kind {
+        LimitKind::Legacy { .. } => format!(
+            "Monthly token limit exceeded ({} / {} tokens). Increase your limit in Settings → Token Limit.",
+            hit.used, hit.max
+        ),
+        kind => format!(
+            "Monthly {label} limit exceeded ({} / {} {label}). Raise or clear that limit in Settings → Token Limit.",
+            hit.used,
+            hit.max,
+            label = kind.label(),
+        ),
     }
 }
 
@@ -7649,130 +7622,63 @@ async fn update_progress_comment(
     }
 }
 
+/// After a run: for each set limit on its own, email the team once a month
+/// when it passes 80% and once when it reaches 100%.
 async fn check_token_usage_warning(state: &WorkerState, team_id: &str, _usage: &TokenUsage) {
-    use crate::clients::email::EmailEvent;
+    use common::token_limits::{warning_level, warning_sk};
 
-    // Get team's token limit
-    let limit = match state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key(
-            "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
-        )
-        .key(
-            "sk",
-            aws_sdk_dynamodb::types::AttributeValue::S("SETTINGS#TOKEN_LIMIT".to_string()),
-        )
-        .send()
-        .await
-    {
-        Ok(r) => r
-            .item()
-            .and_then(|item| item.get("max_tokens"))
-            .and_then(|v| v.as_n().ok())
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or(0),
-        Err(_) => return,
+    let Ok(limits) =
+        common::token_limits::load(&state.dynamo, &state.config.settings_table_name, team_id).await
+    else {
+        return;
     };
-
-    if limit == 0 {
+    if limits.is_empty() {
         return;
     }
 
-    // Get current month usage from analytics
     let month = chrono::Utc::now().format("%Y-%m").to_string();
-    let total_used = match state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.analytics_table_name)
-        .key(
-            "team_id",
-            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
-        )
-        .key(
-            "period",
-            aws_sdk_dynamodb::types::AttributeValue::S(month.clone()),
-        )
-        .send()
-        .await
-    {
-        Ok(r) => {
-            let item = r.item();
-            let ti = item
-                .and_then(|i| i.get("total_tokens_in"))
-                .and_then(|v| v.as_n().ok())
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0);
-            let to = item
-                .and_then(|i| i.get("total_tokens_out"))
-                .and_then(|v| v.as_n().ok())
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0);
-            ti + to
-        }
-        Err(_) => return,
-    };
-
-    let usage_pct = ((total_used as f64 / limit as f64) * 100.0) as u8;
-
-    // Check if we already sent a warning this month (prevent spamming)
-    let warning_sk = format!(
-        "TOKEN_WARNING#{}#{}",
-        month,
-        if usage_pct >= 100 { "100" } else { "80" }
-    );
-    let already_sent = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key(
-            "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
-        )
-        .key(
-            "sk",
-            aws_sdk_dynamodb::types::AttributeValue::S(warning_sk.clone()),
-        )
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned())
-        .is_some();
-
-    if already_sent {
+    let Ok(totals) = common::token_limits::load_month_usage(
+        &state.dynamo,
+        &state.config.analytics_table_name,
+        team_id,
+        &month,
+    )
+    .await
+    else {
         return;
-    }
-
-    fn format_tokens(n: u64) -> String {
-        if n >= 1_000_000 {
-            format!("{:.1}M", n as f64 / 1_000_000.0)
-        } else if n >= 1_000 {
-            format!("{:.1}K", n as f64 / 1_000.0)
-        } else {
-            n.to_string()
-        }
-    }
-
-    let event = if usage_pct >= 100 {
-        Some(EmailEvent::TokenLimitReached {
-            month: month.clone(),
-            used_tokens: format_tokens(total_used),
-            limit_tokens: format_tokens(limit),
-        })
-    } else if usage_pct >= 80 {
-        Some(EmailEvent::TokenWarning80 {
-            month: month.clone(),
-            used_tokens: format_tokens(total_used),
-            limit_tokens: format_tokens(limit),
-            usage_pct,
-        })
-    } else {
-        None
     };
 
-    if let Some(event) = event {
+    for u in limits.uses(&totals) {
+        let Some(level) = warning_level(&u) else {
+            continue;
+        };
+        // Once per limit, level and month (prevents spamming).
+        let warning_sk = warning_sk(&month, u.kind, level);
+        let already_sent = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key(
+                "pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
+            )
+            .key(
+                "sk",
+                aws_sdk_dynamodb::types::AttributeValue::S(warning_sk.clone()),
+            )
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item().cloned())
+            .is_some();
+        if already_sent {
+            continue;
+        }
+
+        let Some(event) = token_warning_event(&month, &u) else {
+            continue;
+        };
+
         // Mark warning as sent
         let _ = state
             .dynamo
@@ -7792,6 +7698,115 @@ async fn check_token_usage_warning(state: &WorkerState, team_id: &str, _usage: &
 
         if let Err(e) = email::send_notification(state, team_id, event).await {
             error!("Failed to send token warning email: {e}");
+        }
+    }
+}
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// The email for one limit at its warning level (100% reached, or 80%).
+fn token_warning_event(
+    month: &str,
+    u: &common::token_limits::LimitUse,
+) -> Option<crate::clients::email::EmailEvent> {
+    use crate::clients::email::EmailEvent;
+    let limit_name = match u.kind {
+        common::token_limits::LimitKind::Legacy { .. } => "token".to_string(),
+        k => k.label().to_string(),
+    };
+    match common::token_limits::warning_level(u)? {
+        100 => Some(EmailEvent::TokenLimitReached {
+            month: month.to_string(),
+            limit_name,
+            used_tokens: format_tokens(u.used),
+            limit_tokens: format_tokens(u.max),
+        }),
+        _ => Some(EmailEvent::TokenWarning80 {
+            month: month.to_string(),
+            limit_name,
+            used_tokens: format_tokens(u.used),
+            limit_tokens: format_tokens(u.max),
+            usage_pct: u.pct().min(99) as u8,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod token_limit_tests {
+    use super::{budget_reason, token_warning_event};
+    use crate::clients::email::EmailEvent;
+    use common::token_limits::{LimitKind, LimitUse};
+
+    fn at(kind: LimitKind, used: u64, max: u64) -> LimitUse {
+        LimitUse { kind, max, used }
+    }
+
+    #[test]
+    fn the_reason_names_the_limit_reached() {
+        let r = budget_reason(&at(LimitKind::CacheRead, 60, 50));
+        assert!(
+            r.starts_with("Monthly cache read tokens limit exceeded (60 / 50"),
+            "{r}"
+        );
+        let r = budget_reason(&at(LimitKind::NewTokens, 9, 9));
+        assert!(r.contains("new tokens limit"), "{r}");
+        // The old single limit keeps its wording.
+        let r = budget_reason(&at(
+            LimitKind::Legacy {
+                counts_cache: false,
+            },
+            12,
+            10,
+        ));
+        assert!(
+            r.starts_with("Monthly token limit exceeded (12 / 10 tokens)."),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn warnings_go_out_per_limit_at_80_and_100() {
+        assert!(token_warning_event("2026-10", &at(LimitKind::CacheWrite, 79, 100)).is_none());
+        match token_warning_event("2026-10", &at(LimitKind::CacheWrite, 85, 100)) {
+            Some(EmailEvent::TokenWarning80 {
+                limit_name,
+                usage_pct,
+                ..
+            }) => {
+                assert_eq!(limit_name, "cache write tokens");
+                assert_eq!(usage_pct, 85);
+            }
+            _ => panic!("expected an 80% warning"),
+        }
+        match token_warning_event("2026-10", &at(LimitKind::NewTokens, 3_000_000, 2_000_000)) {
+            Some(EmailEvent::TokenLimitReached {
+                limit_name,
+                used_tokens,
+                limit_tokens,
+                ..
+            }) => {
+                assert_eq!(limit_name, "new tokens");
+                assert_eq!(used_tokens, "3.0M");
+                assert_eq!(limit_tokens, "2.0M");
+            }
+            _ => panic!("expected a limit-reached email"),
+        }
+        match token_warning_event(
+            "2026-10",
+            &at(LimitKind::Legacy { counts_cache: true }, 100, 100),
+        ) {
+            Some(EmailEvent::TokenLimitReached { limit_name, .. }) => {
+                assert_eq!(limit_name, "token")
+            }
+            _ => panic!("expected a limit-reached email"),
         }
     }
 }

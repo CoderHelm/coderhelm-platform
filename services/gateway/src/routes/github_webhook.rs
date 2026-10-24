@@ -3155,78 +3155,85 @@ fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValu
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
 }
 
-/// Whether a team's token limit counts cache tokens: `counts_cache` on its
-/// `SETTINGS#TOKEN_LIMIT` item, else the `TOKEN_LIMIT_COUNTS_CACHE` env default.
-pub fn token_limit_counts_cache(
-    limit_item: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
-) -> bool {
-    let team = limit_item
-        .and_then(|i| i.get("counts_cache"))
-        .and_then(|v| v.as_bool().ok())
-        .copied();
-    common::usage::counts_cache_enabled(
-        team,
-        std::env::var("TOKEN_LIMIT_COUNTS_CACHE").ok().as_deref(),
-    )
+/// Why a reached limit stops new work, naming the limit. The old single
+/// limit keeps its old wording.
+pub fn limit_reason(hit: &common::token_limits::LimitUse) -> String {
+    use common::token_limits::{short_tokens, LimitKind};
+    let settings = "[Settings → Token Limit](https://app.coderhelm.com/settings/budget)";
+    match hit.kind {
+        LimitKind::Legacy { .. } => {
+            let limit_label = if hit.max >= 1_000_000 {
+                format!("{}M", hit.max / 1_000_000)
+            } else {
+                format!("{}K", hit.max / 1_000)
+            };
+            format!(
+                "You've used all **{limit_label}** tokens this month. \
+                 Increase your token limit in {settings} to continue.",
+            )
+        }
+        kind => format!(
+            "You've reached this month's **{}** limit ({} of {}). \
+             Raise or clear that limit in {settings} to continue.",
+            kind.label(),
+            short_tokens(hit.used),
+            short_tokens(hit.max),
+        ),
+    }
 }
 
-/// Check whether this team has budget remaining. Returns Some(reason) if blocked.
+/// Check whether this team has budget remaining. Returns Some(reason) if
+/// blocked: each set limit (new tokens, cache read, cache write, or the old
+/// single limit) is checked on its own, and the reason names the one reached.
 pub async fn check_run_budget(state: &AppState, team_id: &str) -> Option<String> {
-    // 1. Read configured token limit from settings
-    let limit = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(team_id))
-        .key("sk", attr_s("SETTINGS#TOKEN_LIMIT"))
-        .send()
-        .await
-        .ok()?;
-
-    let max_tokens: u64 = limit
-        .item()
-        .and_then(|i| i.get("max_tokens"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
-
-    // 0 = unlimited
-    if max_tokens == 0 {
+    let limits =
+        common::token_limits::load(&state.dynamo, &state.config.settings_table_name, team_id)
+            .await
+            .ok()?;
+    if limits.is_empty() {
         return None;
     }
-
-    // 2. Read current month's token usage from analytics
     let month = chrono::Utc::now().format("%Y-%m").to_string();
-    let analytics = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.analytics_table_name)
-        .key("team_id", attr_s(team_id))
-        .key("period", attr_s(&month))
-        .send()
-        .await
-        .ok()?;
+    let totals = common::token_limits::load_month_usage(
+        &state.dynamo,
+        &state.config.analytics_table_name,
+        team_id,
+        &month,
+    )
+    .await
+    .ok()?;
+    limits.reached(&totals).map(|hit| limit_reason(&hit))
+}
 
-    // All four parts (new input, cache read, cache write, output) when the
-    // team's limit counts cache tokens; the old rule (new input + output)
-    // until then. See common::usage::counts_cache_enabled.
-    let counts_cache = token_limit_counts_cache(limit.item());
-    let totals = common::usage::UsageTotals::from_item(analytics.item());
-    let total_tokens = totals.counted(counts_cache);
+#[cfg(test)]
+mod limit_reason_tests {
+    use super::limit_reason;
+    use common::token_limits::{LimitKind, LimitUse};
 
-    if total_tokens >= max_tokens {
-        let limit_label = if max_tokens >= 1_000_000 {
-            format!("{}M", max_tokens / 1_000_000)
-        } else {
-            format!("{}K", max_tokens / 1_000)
-        };
-        return Some(format!(
-            "You've used all **{limit_label}** tokens this month. \
-             Increase your token limit in [Settings → Token Limit](https://app.coderhelm.com/settings/budget) to continue.",
-        ));
+    #[test]
+    fn the_skip_comment_names_the_limit_reached() {
+        let r = limit_reason(&LimitUse {
+            kind: LimitKind::CacheRead,
+            max: 50_000_000,
+            used: 51_200_000,
+        });
+        assert!(
+            r.starts_with(
+                "You've reached this month's **cache read tokens** limit (51.2M of 50M)."
+            ),
+            "{r}"
+        );
+        // The old single limit keeps its old wording.
+        let r = limit_reason(&LimitUse {
+            kind: LimitKind::Legacy { counts_cache: true },
+            max: 200_000_000,
+            used: 200_000_001,
+        });
+        assert!(
+            r.starts_with("You've used all **200M** tokens this month. Increase your token limit"),
+            "{r}"
+        );
     }
-
-    None
 }
 
 /// Post a comment on a GitHub issue explaining why the run was skipped.

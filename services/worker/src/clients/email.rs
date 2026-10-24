@@ -8,12 +8,16 @@ use crate::WorkerState;
 pub enum EmailEvent {
     TokenWarning80 {
         month: String,
+        /// Which limit: "new tokens", "cache read tokens", "cache write
+        /// tokens", or "token" for the old single limit.
+        limit_name: String,
         used_tokens: String,
         limit_tokens: String,
         usage_pct: u8,
     },
     TokenLimitReached {
         month: String,
+        limit_name: String,
         used_tokens: String,
         limit_tokens: String,
     },
@@ -32,6 +36,7 @@ pub async fn send_notification(
     let (template_suffix, pref_field, template_data) = match &event {
         EmailEvent::TokenWarning80 {
             month,
+            limit_name,
             used_tokens,
             limit_tokens,
             usage_pct,
@@ -40,6 +45,7 @@ pub async fn send_notification(
             "email_token_warning",
             json!({
                 "month": month,
+                "limit_name": limit_name,
                 "used_tokens": used_tokens,
                 "limit_tokens": limit_tokens,
                 "usage_pct": usage_pct,
@@ -48,6 +54,7 @@ pub async fn send_notification(
         ),
         EmailEvent::TokenLimitReached {
             month,
+            limit_name,
             used_tokens,
             limit_tokens,
         } => (
@@ -55,6 +62,7 @@ pub async fn send_notification(
             "email_token_warning",
             json!({
                 "month": month,
+                "limit_name": limit_name,
                 "used_tokens": used_tokens,
                 "limit_tokens": limit_tokens,
             })

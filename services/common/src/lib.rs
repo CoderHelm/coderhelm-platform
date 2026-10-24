@@ -69,6 +69,8 @@ pub mod skill_compat;
 pub mod skills;
 /// A ticket's comments as CoderHelm read them, and whether its work is done.
 pub mod ticket_state;
+/// A team's monthly token limits: new tokens, cache read, cache write.
+pub mod token_limits;
 /// Signed links that turn off one email for one person, without signing in.
 pub mod unsubscribe;
 /// Model usage accounting: every model call is counted here, once.
