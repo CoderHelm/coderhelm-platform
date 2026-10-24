@@ -197,6 +197,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Lesson failed: {e:?}");
             }
         }
+        models::WorkerMessage::RewardOutcome(msg) => {
+            info!(team_id = %msg.team_id, run_id = %msg.run_id, pr = msg.pr_number, "Scoring a closed pull request");
+            if let Err(e) = passes::rewards::score_outcome(&state, msg).await {
+                error!("Reward outcome failed: {e}");
+            }
+        }
         models::WorkerMessage::ReviewLesson(msg) => {
             info!(team_id = %msg.team_id, pr = msg.pr_number, trigger = %msg.trigger, "Judging pushback on a review");
             if let Err(e) = passes::review_lessons::run(&state, msg).await {

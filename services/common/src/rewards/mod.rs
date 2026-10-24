@@ -29,3 +29,16 @@ pub mod store;
 pub mod summary;
 
 pub use event::{RewardEvent, RewardKind};
+
+/// The outcome of a CoderHelm pull request to score (gateway → worker, on
+/// the `pull_request.closed` webhook). The worker reads the PR, its commits
+/// and CoderHelm's open review threads, and records the events.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct RewardOutcomeMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub run_id: String,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+}

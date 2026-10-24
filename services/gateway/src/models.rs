@@ -186,6 +186,9 @@ pub enum WorkerMessage {
     /// reviewer was wrong and keeps the lesson.
     #[serde(rename = "review_lesson")]
     ReviewLesson(ReviewLessonMessage),
+    /// CoderHelm's PR closed: the worker scores what happened to it.
+    #[serde(rename = "reward_outcome")]
+    RewardOutcome(common::rewards::RewardOutcomeMessage),
     /// A person commented on a ticket CoderHelm worked on: the worker reads
     /// what the comment is before anything runs.
     #[serde(rename = "jira_comment")]
