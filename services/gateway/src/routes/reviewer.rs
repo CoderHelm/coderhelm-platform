@@ -1425,6 +1425,7 @@ pub async fn re_review(
         dedup_key: format!("dashboard#pr{}#{window}", body.pr),
         reply_to_comment_id: None,
         requested_by: String::new(),
+        ..Default::default()
     });
     super::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &message).await?;
     info!(
@@ -1540,6 +1541,7 @@ pub async fn send_release(
         resend: resend.to_string(),
         // Asked for explicitly from the dashboard: no branch check.
         check_branch: false,
+        ..Default::default()
     });
     super::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &message).await?;
     info!(

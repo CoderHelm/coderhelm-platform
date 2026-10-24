@@ -749,99 +749,6 @@ pub mod web_check;
 pub mod weekly_summary;
 pub mod write_guard;
 
-/// Minimal MCP plugin catalog: (server_id, npx_package, env_mapping).
-/// Kept in sync with the full catalog in gateway/routes/plugins.rs.
-#[allow(clippy::type_complexity)]
-pub const MCP_CATALOG: [(&str, &str, &[(&str, &str)]); 17] = [
-    (
-        "figma",
-        "figma-developer-mcp",
-        &[("api_token", "FIGMA_API_KEY")],
-    ),
-    (
-        "sentry",
-        "@sentry/mcp-server",
-        &[
-            ("auth_token", "SENTRY_AUTH_TOKEN"),
-            ("org_slug", "SENTRY_ORG"),
-        ],
-    ),
-    (
-        "linear",
-        "@linear/mcp-server",
-        &[("api_key", "LINEAR_API_KEY")],
-    ),
-    (
-        "notion",
-        "@notionhq/notion-mcp-server",
-        &[("api_key", "OPENAPI_MCP_HEADERS")],
-    ),
-    (
-        "vercel",
-        "@vercel/mcp",
-        &[("api_token", "VERCEL_API_TOKEN")],
-    ),
-    ("stripe", "@stripe/mcp", &[("api_key", "STRIPE_SECRET_KEY")]),
-    (
-        "cloudflare",
-        "@cloudflare/mcp-server-cloudflare",
-        &[
-            ("api_token", "CLOUDFLARE_API_TOKEN"),
-            ("account_id", "CLOUDFLARE_ACCOUNT_ID"),
-        ],
-    ),
-    (
-        "posthog",
-        "@nicholasoxford/posthog-mcp",
-        &[("api_key", "POSTHOG_API_KEY"), ("host", "POSTHOG_HOST")],
-    ),
-    (
-        "gitlab",
-        "@anthropic-ai/gitlab-mcp-server",
-        &[("api_token", "GITLAB_TOKEN"), ("base_url", "GITLAB_URL")],
-    ),
-    (
-        "neon",
-        "@neondatabase/mcp-server-neon",
-        &[("api_key", "NEON_API_KEY")],
-    ),
-    (
-        "turso",
-        "@tursodatabase/turso-mcp",
-        &[("api_token", "TURSO_API_TOKEN"), ("org_name", "TURSO_ORG")],
-    ),
-    ("snyk", "snyk-mcp-server", &[("api_token", "SNYK_TOKEN")]),
-    (
-        "launchdarkly",
-        "@launchdarkly/mcp-server",
-        &[("api_key", "LAUNCHDARKLY_ACCESS_TOKEN")],
-    ),
-    (
-        "mongodb",
-        "mongodb-mcp-server",
-        &[
-            ("public_key", "MDB_MCP_API_PUBLIC_KEY"),
-            ("private_key", "MDB_MCP_API_PRIVATE_KEY"),
-            ("group_id", "MDB_MCP_API_GROUP_ID"),
-        ],
-    ),
-    (
-        "grafana",
-        "mcp-grafana",
-        &[("api_key", "GRAFANA_API_KEY"), ("base_url", "GRAFANA_URL")],
-    ),
-    (
-        "redis",
-        "@redis/mcp-server",
-        &[("connection_url", "REDIS_URL")],
-    ),
-    (
-        "upstash",
-        "@anthropic-ai/upstash-mcp-server",
-        &[("email", "UPSTASH_EMAIL"), ("api_key", "UPSTASH_API_KEY")],
-    ),
-];
-
 /// Main orchestration: run all passes for a new ticket.
 pub async fn orchestrate_ticket(
     state: &WorkerState,
@@ -1488,14 +1395,8 @@ async fn run_passes(
     } else {
         &state.config.mcp_configs_table_name
     };
-    let mcp_plugins = mcp::load_team_plugins(
-        &state.dynamo,
-        &state.kms,
-        mcp_table,
-        &msg.team_id,
-        &MCP_CATALOG,
-    )
-    .await;
+    let mcp_plugins =
+        mcp::load_team_plugins(&state.dynamo, &state.kms, mcp_table, &msg.team_id).await;
     let mcp_server_ids: Vec<String> = mcp_plugins.iter().map(|p| p.server_id.clone()).collect();
     if !mcp_server_ids.is_empty() {
         info!(run_id, servers = ?mcp_server_ids, "MCP servers active for run");

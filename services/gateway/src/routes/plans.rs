@@ -3315,98 +3315,6 @@ async fn load_mcp_tool_cache(
     parsed["tools"].as_array().cloned()
 }
 
-/// Gateway plugin catalog — maps server_id to (npx_package, env_mapping).
-/// env_mapping: &[(cred_field_key, env_var_name)]
-#[allow(clippy::type_complexity)]
-const GATEWAY_MCP_CATALOG: &[(&str, &str, &[(&str, &str)])] = &[
-    (
-        "figma",
-        "figma-developer-mcp",
-        &[("api_token", "FIGMA_API_KEY")],
-    ),
-    (
-        "sentry",
-        "@sentry/mcp-server",
-        &[
-            ("auth_token", "SENTRY_ACCESS_TOKEN"),
-            ("org_slug", "SENTRY_ORG"),
-        ],
-    ),
-    (
-        "linear",
-        "@linear/mcp-server",
-        &[("api_key", "LINEAR_API_KEY")],
-    ),
-    (
-        "notion",
-        "@notionhq/notion-mcp-server",
-        &[("api_key", "OPENAPI_MCP_HEADERS")],
-    ),
-    (
-        "vercel",
-        "@vercel/mcp-adapter",
-        &[("api_token", "VERCEL_TOKEN")],
-    ),
-    ("stripe", "@stripe/mcp", &[("api_key", "STRIPE_SECRET_KEY")]),
-    // Cloudflare removed — their MCP server moved to remote OAuth-only
-    (
-        "posthog",
-        "@nicobailon/posthog-mcp",
-        &[
-            ("api_key", "POSTHOG_API_KEY"),
-            ("project_id", "POSTHOG_PROJECT_ID"),
-            ("host", "POSTHOG_HOST"),
-        ],
-    ),
-    (
-        "gitlab",
-        "@nicobailon/gitlab-mcp",
-        &[
-            ("personal_token", "GITLAB_TOKEN"),
-            ("gitlab_url", "GITLAB_URL"),
-        ],
-    ),
-    (
-        "neon",
-        "@nicobailon/neon-mcp",
-        &[("api_key", "NEON_API_KEY")],
-    ),
-    (
-        "turso",
-        "@nicobailon/turso-mcp",
-        &[("api_token", "TURSO_AUTH_TOKEN"), ("org_name", "TURSO_ORG")],
-    ),
-    (
-        "snyk",
-        "@nicobailon/snyk-mcp",
-        &[("api_token", "SNYK_TOKEN"), ("org_id", "SNYK_ORG_ID")],
-    ),
-    (
-        "launchdarkly",
-        "@nicobailon/launchdarkly-mcp",
-        &[("api_key", "LD_API_KEY"), ("project_key", "LD_PROJECT_KEY")],
-    ),
-    (
-        "mongodb",
-        "@nicobailon/mongodb-mcp",
-        &[("connection_string", "MDB_MCP_CONNECTION_STRING")],
-    ),
-    (
-        "grafana",
-        "@nicobailon/grafana-mcp",
-        &[("api_token", "GRAFANA_TOKEN"), ("url", "GRAFANA_URL")],
-    ),
-    ("redis", "@nicobailon/redis-mcp", &[("url", "REDIS_URL")]),
-    (
-        "upstash",
-        "@nicobailon/upstash-mcp",
-        &[
-            ("api_key", "UPSTASH_EMAIL"),
-            ("api_token", "UPSTASH_API_KEY"),
-        ],
-    ),
-];
-
 /// Invoke an MCP tool via the MCP proxy Lambda.
 async fn invoke_mcp_tool(
     state: &AppState,
@@ -3416,17 +3324,16 @@ async fn invoke_mcp_tool(
     tool_input: &Value,
 ) -> Result<Value, String> {
     // Find catalog entry for this server
-    let (_, npx_package, env_mapping) = GATEWAY_MCP_CATALOG
-        .iter()
-        .find(|(id, _, _)| *id == server_id)
+    let entry = common::mcp_catalog::find(server_id)
         .ok_or_else(|| format!("Unknown MCP server: {server_id}"))?;
+    let (npx_package, env_mapping) = (entry.npx_package, entry.env_mapping);
 
     // Open the saved values for this call only.
     let creds = super::plugins::load_credentials(state, team_id, server_id).await?;
 
     // Map credential fields to env vars
     let mut env_vars = serde_json::Map::new();
-    for (cred_key, env_var) in *env_mapping {
+    for (cred_key, env_var) in env_mapping {
         if let Some(val) = creds.get(*cred_key) {
             env_vars.insert(env_var.to_string(), json!(val));
         }

@@ -438,6 +438,7 @@ async fn process_jira_payload(
                         review_body: format!("Jira ticket edited by {sender}: {note}"),
                         comments: vec![],
                         trigger_author: String::new(),
+                        ..Default::default()
                     },
                 ))),
             });
@@ -573,6 +574,7 @@ async fn process_jira_payload(
         sender,
         requester,
         image_attachments,
+        ..Default::default()
     });
 
     let result = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
@@ -906,6 +908,7 @@ async fn handle_jira_comment(
             comments: vec![],
             // Not a GitHub comment: nobody to address on the PR.
             trigger_author: String::new(),
+            ..Default::default()
         })
     } else {
         let extended_body = if comment_body.is_empty() {
@@ -934,6 +937,7 @@ async fn handle_jira_comment(
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or_default()
             },
+            ..Default::default()
         })
     };
 

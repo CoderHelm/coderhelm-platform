@@ -410,14 +410,8 @@ pub async fn run(
         } else {
             &state.config.mcp_configs_table_name
         };
-        let mcp_plugins = mcp::load_team_plugins(
-            &state.dynamo,
-            &state.kms,
-            mcp_table,
-            &msg.team_id,
-            &super::MCP_CATALOG,
-        )
-        .await;
+        let mcp_plugins =
+            mcp::load_team_plugins(&state.dynamo, &state.kms, mcp_table, &msg.team_id).await;
 
         for plugin in &mcp_plugins {
             let schemas = match mcp::load_tool_cache(

@@ -24,7 +24,6 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message, MessageHeader};
 use chrono::{DateTime, Datelike, Duration, SecondsFormat, TimeZone, Utc};
 use common::unsubscribe;
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::WorkerState;
@@ -48,11 +47,7 @@ const UNSUBSCRIBE_MAILTO: &str =
     "mailto:support@coderhelm.com?subject=Unsubscribe%20from%20weekly%20summaries";
 
 /// Send one test email for a team to one address.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct WeeklySummaryTestMessage {
-    pub team_id: String,
-    pub to: String,
-}
+pub use common::messages::WeeklySummaryTestMessage;
 
 // ── What goes in it ───────────────────────────────────────────────────────
 

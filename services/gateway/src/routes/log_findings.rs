@@ -375,6 +375,7 @@ impl StartEnv for GatewayEnv<'_> {
                 &self.claims.email,
             ),
             image_attachments: vec![],
+            ..Default::default()
         });
         let body = serde_json::to_string(&message).map_err(|e| e.to_string())?;
         self.state

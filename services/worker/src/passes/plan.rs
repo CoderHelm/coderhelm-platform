@@ -352,14 +352,8 @@ Then the ```fix_location.json block described above."#,
         } else {
             &state.config.mcp_configs_table_name
         };
-        let mcp_plugins = mcp::load_team_plugins(
-            &state.dynamo,
-            &state.kms,
-            mcp_table,
-            &msg.team_id,
-            &super::MCP_CATALOG,
-        )
-        .await;
+        let mcp_plugins =
+            mcp::load_team_plugins(&state.dynamo, &state.kms, mcp_table, &msg.team_id).await;
 
         for plugin in &mcp_plugins {
             // Try S3 cache first, then invoke proxy to list tools
@@ -394,23 +388,9 @@ Then the ```fix_location.json block described above."#,
             loaded_mcp_plugins.push(plugin.clone());
         }
 
-        // Filter MCP tools for plan pass — only keep read-only tools
-        tools.retain(|t| {
-            // Keep all built-in tools (no server_id__ prefix)
-            if !t.name.contains("__") {
-                return true;
-            }
-            // For MCP tools, only keep read-like operations
-            let tool_name = t.name.split("__").last().unwrap_or(&t.name);
-            tool_name.starts_with("get_")
-                || tool_name.starts_with("list_")
-                || tool_name.starts_with("search_")
-                || tool_name.starts_with("read_")
-                || tool_name.starts_with("query_")
-                || tool_name.starts_with("fetch_")
-                || tool_name.starts_with("find_")
-                || tool_name.starts_with("describe_")
-        });
+        // The plan pass only reads: every tool keeps its risk from the one
+        // registry, and only read-only connection tools stay.
+        tools.retain(|t| !t.name.contains("__") || common::tool_registry::is_read_only(&t.name));
     }
 
     // Add MCP context to system prompt if we have active plugins
