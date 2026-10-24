@@ -32,6 +32,20 @@ export class StorageStack extends cdk.Stack {
           ? cdk.RemovalPolicy.RETAIN
           : cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: props.stage !== "prod",
+      // Knowledge base files and brain chat attachments are uploaded from
+      // the browser with short-lived signed PUT URLs (bound to the object's
+      // key, size and type by the gateway); nothing else is allowed.
+      cors: [
+        {
+          allowedMethods: [s3.HttpMethods.PUT],
+          allowedOrigins:
+            props.stage === "prod"
+              ? ["https://app.coderhelm.com"]
+              : ["http://localhost:3000"],
+          allowedHeaders: ["content-type", "x-amz-*"],
+          maxAge: 3000,
+        },
+      ],
       lifecycleRules: [
         {
           // Clean up old versions after 30 days

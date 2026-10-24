@@ -19,6 +19,8 @@ pub struct ChatScope {
     pub branch: String,
     /// The chat's first message: the standards it was given are logged then.
     pub first: bool,
+    /// The brain chat (its worker calls are metered as the brain's).
+    pub brain: bool,
 }
 
 /// The worker's tools for this chat message, and what's told to the model.
@@ -79,6 +81,7 @@ pub async fn setup(state: &AppState, scope: &ChatScope) -> WorkerTools {
             "repo": scope.repo,
             "branch": scope.branch,
             "record_applied": scope.first,
+            "feature": if scope.brain { "brain" } else { "" },
         }),
     )
     .await;
@@ -143,6 +146,7 @@ pub async fn call(
             "input": input,
             "reads_used": used.reads,
             "asks_used": used.asks,
+            "feature": if scope.brain { "brain" } else { "" },
         }),
     )
     .await;
