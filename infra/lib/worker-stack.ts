@@ -93,6 +93,8 @@ export class WorkerStack extends cdk.Stack {
         // Connected AWS accounts and what each can do (logs, metrics, Airflow).
         AWS_INSIGHTS_TABLE_NAME: `coderhelm-${props.stage}-aws-insights`,
         MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
+        // Seals a remote MCP server's renewed sign-in (see the grant below).
+        SECRETS_KEY_ID: props.secretsKey.keyId,
         INFRA_TABLE_NAME: props.infraTable.tableName,
         BILLING_TABLE_NAME: props.billingTable.tableName, // Retained for CF migration
         TRACES_TABLE_NAME: props.tracesTable.tableName,
@@ -148,7 +150,8 @@ export class WorkerStack extends cdk.Stack {
     props.settingsTable.grantReadWriteData(this.workerFunction);
     props.testsTable.grantReadWriteData(this.workerFunction);
     // Data-source keys and MCP server credentials: the worker opens them to
-    // run lookups and tool calls, never seals or writes them.
+    // run lookups and tool calls. It seals only renewed remote MCP sign-ins
+    // (below).
     props.secretsKey.grantDecrypt(this.workerFunction);
 
     // Data sources in a team's own AWS account (logs, a database): the agents
@@ -160,7 +163,21 @@ export class WorkerStack extends cdk.Stack {
         resources: ["arn:aws:iam::*:role/CoderHelmLogReader", "arn:aws:iam::*:role/CoderhelmReadOnly*"],
       }),
     );
-    props.mcpConfigsTable.grantReadData(this.workerFunction);
+    // MCP servers: read their settings; write back a remote server's renewed
+    // tokens, its status and the tool-call audit trail.
+    props.mcpConfigsTable.grantReadWriteData(this.workerFunction);
+    // A renewed remote MCP sign-in is sealed before it is saved. The worker
+    // may seal only that kind of value: nothing else it could encrypt would
+    // carry this purpose in its encryption context.
+    this.workerFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["kms:Encrypt"],
+        resources: [props.secretsKey.keyArn],
+        conditions: {
+          StringEquals: { "kms:EncryptionContext:purpose": "mcp-oauth-token" },
+        },
+      }),
+    );
     props.infraTable.grantReadWriteData(this.workerFunction);
     props.billingTable.grantReadWriteData(this.workerFunction); // Retained for CF migration
     props.tracesTable.grantReadWriteData(this.workerFunction);

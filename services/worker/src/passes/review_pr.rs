@@ -947,6 +947,20 @@ async fn run_once(
             Some(l) => format!("{system}{}", l.prompt_section()),
             None => system,
         };
+        let mcp = super::remote_mcp::RemoteMcp::load(
+            state,
+            &msg.team_id,
+            None,
+            format!(
+                "reviewer, {}/{}#{}",
+                msg.repo_owner, msg.repo_name, msg.pr_number
+            ),
+        )
+        .await;
+        let system = match &mcp {
+            Some(m) => format!("{system}{}", m.prompt_section()),
+            None => system,
+        };
         let history = super::github_history::GithubHistory::new(
             &msg.team_id,
             &format!("{}/{}", msg.repo_owner, msg.repo_name),
@@ -1033,6 +1047,7 @@ async fn run_once(
             live: live.as_ref(),
             skills: skills.as_ref(),
             web: Some(&web),
+            mcp: mcp.as_ref(),
         };
         let mut tools = review_agent::review_tools();
         tools.push(super::github_history::tool());
@@ -1043,6 +1058,9 @@ async fn run_once(
         }
         if let Some(l) = &live {
             tools.extend(l.tools());
+        }
+        if let Some(m) = &mcp {
+            tools.extend(m.tools());
         }
         if let Some(s) = &skills {
             tools.extend(s.tools());
@@ -1481,6 +1499,18 @@ async fn run_once(
         msg.pr_number,
     )
     .await;
+    // Shared remote MCP servers, read-only tools only (a review is for no
+    // one person, so personal connections aren't used).
+    let mcp = super::remote_mcp::RemoteMcp::load(
+        state,
+        &msg.team_id,
+        None,
+        format!(
+            "reviewer, {}/{}#{}",
+            msg.repo_owner, msg.repo_name, msg.pr_number
+        ),
+    )
+    .await;
     let skills = super::skills::TeamSkills::load(
         state,
         &msg.team_id,
@@ -1565,6 +1595,7 @@ async fn run_once(
         live.as_ref(),
         skills.as_ref(),
         Some(&web),
+        mcp.as_ref(),
         &mut usage,
     )
     .await;

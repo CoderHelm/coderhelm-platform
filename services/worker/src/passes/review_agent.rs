@@ -924,6 +924,8 @@ pub struct PrReviewToolExecutor<'a> {
     pub skills: Option<&'a super::skills::TeamSkills>,
     /// `check_url` on the team's own public pages.
     pub web: Option<&'a super::web_check::WebCheck>,
+    /// The team's remote MCP servers, read-only tools only.
+    pub mcp: Option<&'a super::remote_mcp::RemoteMcp>,
 }
 
 #[async_trait::async_trait]
@@ -957,6 +959,11 @@ impl<'a> ToolExecutor for PrReviewToolExecutor<'a> {
         }
         if let Some(live) = self.live {
             if let Some(out) = live.handle(self.state, name, input).await {
+                return Ok(json!(out));
+            }
+        }
+        if let Some(mcp) = self.mcp {
+            if let Some(out) = mcp.handle(self.state, name, input).await {
                 return Ok(json!(out));
             }
         }
@@ -1384,6 +1391,7 @@ pub async fn generate_review(
     live: Option<&super::live_sources::LiveSources>,
     skills: Option<&super::skills::TeamSkills>,
     web: Option<&super::web_check::WebCheck>,
+    mcp: Option<&super::remote_mcp::RemoteMcp>,
     usage: &mut TokenUsage,
 ) -> Result<ReviewOutput, String> {
     let graph_tools = graph.map(|g| g.tools()).unwrap_or_default();
@@ -1396,7 +1404,8 @@ pub async fn generate_review(
         live.map(|l| l.prompt_section()).unwrap_or_default()
     ) + &ops.map(|o| o.prompt_section()).unwrap_or_default();
     let skills_context = skills.map(|s| s.prompt_section()).unwrap_or_default()
-        + &web.map(|w| w.prompt_section()).unwrap_or_default();
+        + &web.map(|w| w.prompt_section()).unwrap_or_default()
+        + &mcp.map(|m| m.prompt_section()).unwrap_or_default();
     let prompt = review_user_prompt(
         title,
         pr_body,
@@ -1419,6 +1428,7 @@ pub async fn generate_review(
         live,
         skills,
         web,
+        mcp,
     };
     let mut tools = review_tools();
     if web.is_some() {
@@ -1433,6 +1443,9 @@ pub async fn generate_review(
     }
     if let Some(live) = live {
         tools.extend(live.tools());
+    }
+    if let Some(m) = mcp {
+        tools.extend(m.tools());
     }
     if let Some(s) = skills {
         tools.extend(s.tools());

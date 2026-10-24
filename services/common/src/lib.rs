@@ -33,6 +33,8 @@ pub mod live;
 pub mod log_findings;
 /// Sealed credentials for a team's MCP servers (KMS, bound to team and server).
 pub mod mcp_credentials;
+/// Remote MCP servers over HTTP: OAuth sign-in, tokens, allowed tools.
+pub mod mcp_remote;
 pub mod memory_meta;
 /// The auto-merge gate's per-PR record: keys and states (the worker runs the
 /// gate, the gateway re-arms it on GitHub events).

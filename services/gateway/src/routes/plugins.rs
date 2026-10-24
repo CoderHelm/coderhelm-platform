@@ -35,6 +35,10 @@ struct PluginDef {
     npx_package: &'static str,
     /// Maps credential_field.key → env var name the MCP server expects.
     env_mapping: &'static [(&'static str, &'static str)],
+    /// The vendor's own remote MCP server, signed in to with OAuth (see
+    /// `mcp_servers`). Empty when the vendor runs none. Checked 2026-10-24:
+    /// each answers 401 with OAuth metadata and offers registration.
+    remote_url: &'static str,
 }
 
 #[derive(serde::Serialize)]
@@ -65,6 +69,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Figma MCP to extract design tokens, component details, and layout information from design files. Reference specific frames and layers by name. Do not modify or delete any Figma data.",
         recommended_permissions: "Read-only file access",
         npx_package: "figma-developer-mcp",
+        remote_url: "https://mcp.figma.com/mcp",
         env_mapping: &[("api_token", "FIGMA_API_KEY")],
     },
     PluginDef {
@@ -93,6 +98,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Sentry MCP to investigate production errors. Query recent issues, inspect stack traces, and correlate errors with recent deployments. Do not resolve or delete issues unless explicitly asked.",
         recommended_permissions: "Read-only: event:read, issue:read, project:read",
         npx_package: "@sentry/mcp-server",
+        remote_url: "https://mcp.sentry.dev/mcp",
         env_mapping: &[("auth_token", "SENTRY_ACCESS_TOKEN"), ("org_slug", "SENTRY_ORG")],
     },
     PluginDef {
@@ -113,6 +119,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Linear MCP to manage issues and projects. Create issues with proper labels and priorities, update status, and query project progress. Do not delete issues or modify team settings.",
         recommended_permissions: "Read + write issues only",
         npx_package: "@linear/mcp-server",
+        remote_url: "https://mcp.linear.app/mcp",
         env_mapping: &[("api_key", "LINEAR_API_KEY")],
     },
     PluginDef {
@@ -133,6 +140,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Notion MCP to search documentation, read database entries, and reference wiki pages for project context. Do not create, modify, or delete pages unless explicitly asked.",
         recommended_permissions: "Read content only — no insert capabilities",
         npx_package: "@notionhq/notion-mcp-server",
+        remote_url: "https://mcp.notion.com/mcp",
         env_mapping: &[("api_key", "OPENAPI_MCP_HEADERS")],
     },
 
@@ -156,6 +164,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Vercel MCP to check deployment statuses, manage environment variables, and inspect build logs. Do not trigger deployments or modify production settings without confirmation.",
         recommended_permissions: "Read-only token — no deploy access",
         npx_package: "@vercel/mcp",
+        remote_url: "https://mcp.vercel.com",
         env_mapping: &[("api_token", "VERCEL_API_TOKEN")],
     },
     PluginDef {
@@ -176,6 +185,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Stripe MCP to query customers, list recent charges, and inspect subscription statuses. Never create charges, refunds, or modify billing data.",
         recommended_permissions: "Restricted key: read-only charges, customers, subscriptions",
         npx_package: "@stripe/mcp",
+        remote_url: "https://mcp.stripe.com",
         env_mapping: &[("api_key", "STRIPE_SECRET_KEY")],
     },
     // Cloudflare removed — their MCP server moved to remote OAuth-only (*.mcp.cloudflare.com)
@@ -205,6 +215,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the PostHog MCP to query user analytics events, check feature flag statuses, and analyze user funnels. Do not modify feature flags or delete data.",
         recommended_permissions: "Read-only personal API key",
         npx_package: "@nicholasoxford/posthog-mcp",
+        remote_url: "https://mcp.posthog.com/mcp",
         env_mapping: &[("api_key", "POSTHOG_API_KEY"), ("host", "POSTHOG_HOST")],
     },
 
@@ -234,6 +245,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the GitLab MCP to list merge requests, check pipeline statuses, and query issues. Do not push code, merge MRs, or modify project settings.",
         recommended_permissions: "read_api scope only",
         npx_package: "@anthropic-ai/gitlab-mcp-server",
+        remote_url: "https://gitlab.com/api/v4/mcp",
         env_mapping: &[("api_token", "GITLAB_TOKEN"), ("base_url", "GITLAB_URL")],
     },
     PluginDef {
@@ -254,6 +266,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Neon MCP to inspect Postgres schemas and run read-only queries. Do not run DDL statements, drop tables, or modify data without explicit approval.",
         recommended_permissions: "Read-only database role — no DDL, no deletes",
         npx_package: "@neondatabase/mcp-server-neon",
+        remote_url: "https://mcp.neon.tech/mcp",
         env_mapping: &[("api_key", "NEON_API_KEY")],
     },
     PluginDef {
@@ -282,6 +295,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Turso MCP to inspect LibSQL schemas and run read-only queries. Do not execute DDL or destructive operations without explicit approval.",
         recommended_permissions: "Read-only API token",
         npx_package: "@tursodatabase/turso-mcp",
+        remote_url: "https://mcp.turso.ai/mcp",
         env_mapping: &[("api_token", "TURSO_API_TOKEN"), ("org_name", "TURSO_ORG")],
     },
     // Tier 3 — Nice to have
@@ -303,6 +317,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Snyk MCP to scan for vulnerabilities, check dependency health, and list security issues. Do not modify project settings or ignore policies.",
         recommended_permissions: "Read-only: view org, view project",
         npx_package: "snyk-mcp-server",
+        remote_url: "",
         env_mapping: &[("api_token", "SNYK_TOKEN")],
     },
     PluginDef {
@@ -323,6 +338,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the LaunchDarkly MCP to check feature flag statuses across environments. Do not toggle flags or modify targeting rules without explicit confirmation.",
         recommended_permissions: "Reader role — no write access",
         npx_package: "@launchdarkly/mcp-server",
+        remote_url: "https://mcp.launchdarkly.com/mcp/launchdarkly",
         env_mapping: &[("api_key", "LAUNCHDARKLY_ACCESS_TOKEN")],
     },
     PluginDef {
@@ -357,6 +373,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the MongoDB MCP to query collections and inspect document schemas. Do not drop collections, modify indexes, or delete data.",
         recommended_permissions: "Project Read Only role",
         npx_package: "mongodb-mcp-server",
+        remote_url: "",
         env_mapping: &[("public_key", "MDB_MCP_API_PUBLIC_KEY"), ("private_key", "MDB_MCP_API_PRIVATE_KEY"), ("group_id", "MDB_MCP_API_GROUP_ID")],
     },
     PluginDef {
@@ -385,6 +402,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Grafana MCP to query dashboards, check alert statuses, and explore data sources. Do not modify dashboards or silence alerts.",
         recommended_permissions: "Viewer role service account",
         npx_package: "mcp-grafana",
+        remote_url: "https://mcp.grafana.com/mcp",
         env_mapping: &[("api_key", "GRAFANA_API_KEY"), ("base_url", "GRAFANA_URL")],
     },
     PluginDef {
@@ -405,6 +423,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Redis MCP to inspect keys and run read-only commands. Do not run FLUSHDB, DEL, or any destructive commands.",
         recommended_permissions: "Read-only user — no write commands",
         npx_package: "@redis/mcp-server",
+        remote_url: "",
         env_mapping: &[("connection_url", "REDIS_URL")],
     },
     PluginDef {
@@ -433,6 +452,7 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Upstash MCP to inspect Redis databases and read data. Do not delete databases, flush data, or modify configurations.",
         recommended_permissions: "Read-only API key",
         npx_package: "@anthropic-ai/upstash-mcp-server",
+        remote_url: "https://mcp.upstash.com/mcp",
         env_mapping: &[("email", "UPSTASH_EMAIL"), ("api_key", "UPSTASH_API_KEY")],
     },
 
@@ -462,9 +482,26 @@ const CATALOG: &[PluginDef] = &[
         default_prompt: "Use the Sanity MCP to query documents and read content schemas. Do not create, publish, or delete documents without explicit approval.",
         recommended_permissions: "Viewer token — read-only access",
         npx_package: "sanity-mcp-server",
+        remote_url: "https://mcp.sanity.io",
         env_mapping: &[("api_token", "SANITY_API_TOKEN"), ("project_id", "SANITY_PROJECT_ID")],
     },
 
+    PluginDef {
+        id: "atlassian",
+        name: "Atlassian",
+        description: "Search and read Jira issues and Confluence pages through Atlassian's remote MCP server.",
+        category: "Project Management",
+        tier: 2,
+        icon: "atlassian",
+        credential_fields: &[],
+        docs_url: "https://support.atlassian.com/atlassian-rovo-mcp-server/",
+        repo_url: "https://support.atlassian.com/atlassian-rovo-mcp-server/",
+        default_prompt: "Use the Atlassian MCP to read Jira issues and Confluence pages for context. Do not create, edit or transition issues or pages unless explicitly asked.",
+        recommended_permissions: "Sign in with an account that can read the projects and spaces agents need",
+        npx_package: "",
+        env_mapping: &[],
+        remote_url: "https://mcp.atlassian.com/v1/mcp",
+    },
 ];
 
 // ── Handlers ────────────────────────────────────────────────────────
@@ -638,9 +675,12 @@ pub async fn enable_plugin(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Validate plugin exists in catalog
-    if !CATALOG.iter().any(|p| p.id == plugin_id) {
-        return Err(StatusCode::NOT_FOUND);
+    // Validate plugin exists in catalog, and runs locally with a key (a
+    // remote-only entry connects through `mcp_servers` instead).
+    match CATALOG.iter().find(|p| p.id == plugin_id) {
+        None => return Err(StatusCode::NOT_FOUND),
+        Some(p) if p.npx_package.is_empty() => return Err(StatusCode::BAD_REQUEST),
+        Some(_) => {}
     }
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -836,7 +876,7 @@ pub async fn test_connection(
     claims.require_role(3)?; // admin+
     let plugin_def = CATALOG
         .iter()
-        .find(|p| p.id == plugin_id)
+        .find(|p| p.id == plugin_id && !p.npx_package.is_empty())
         .ok_or(StatusCode::NOT_FOUND)?;
 
     // Open the saved values for this call only.

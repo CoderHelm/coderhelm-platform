@@ -2036,6 +2036,7 @@ struct PlanChatContext {
 async fn load_plan_chat_context(
     state: &AppState,
     team_id: &str,
+    user_email: &str,
     messages_input: &[Value],
     body: &Value,
 ) -> Result<PlanChatContext, StatusCode> {
@@ -2235,6 +2236,34 @@ async fn load_plan_chat_context(
         }
     }
 
+    // Remote MCP servers this person may use (the team's shared ones, and
+    // their own personal connections): only allowed, approved tools. A
+    // remote connection takes the place of the same catalog server's key.
+    let remote = super::mcp_servers::runtime(state, team_id)
+        .usable(Some(user_email))
+        .await;
+    mcp_tools.retain(|t| !remote.iter().any(|(r, _)| r.id == t.server_id));
+    let mut remote_lines = Vec::new();
+    for (r, _) in &remote {
+        for (name, description, input_schema) in common::mcp_remote::tools::agent_tools(r, false) {
+            let tool = name
+                .split_once("__")
+                .map(|(_, t)| t.to_string())
+                .unwrap_or_default();
+            mcp_tools.push(McpToolDef {
+                server_id: r.id.clone(),
+                name: tool,
+                description,
+                input_schema,
+            });
+        }
+        let mut line = format!("- {} ({}, connected)", r.id, r.name);
+        if !r.custom_prompt.trim().is_empty() {
+            line.push_str(&format!(" — {}", r.custom_prompt.trim()));
+        }
+        remote_lines.push(line);
+    }
+
     // Build system prompt
     let mut system_prompt = PLAN_CHAT_SYSTEM.to_string();
     if !org_context.is_empty() {
@@ -2257,9 +2286,9 @@ async fn load_plan_chat_context(
         ));
     }
     if !mcp_tools.is_empty() {
-        let plugin_lines: Vec<String> = enabled_plugins
+        let mut plugin_lines: Vec<String> = enabled_plugins
             .iter()
-            .filter(|(_, has_creds, _)| *has_creds)
+            .filter(|(id, has_creds, _)| *has_creds && !remote.iter().any(|(r, _)| &r.id == id))
             .map(|(id, _, custom_prompt)| {
                 let mut line = format!("- {id} (connected)");
                 if let Some(prompt) = custom_prompt {
@@ -2268,6 +2297,7 @@ async fn load_plan_chat_context(
                 line
             })
             .collect();
+        plugin_lines.extend(remote_lines);
         system_prompt.push_str(&format!(
             "\n\nYou have tool-call access to the following MCP servers.\n\
              CRITICAL tool-use rules for MCP servers:\n\
@@ -2422,7 +2452,14 @@ pub async fn plan_chat(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input, &body).await?;
+    let ctx = load_plan_chat_context(
+        &state,
+        &claims.team_id,
+        &claims.email,
+        messages_input,
+        &body,
+    )
+    .await?;
     let mut api_messages = ctx.messages;
 
     // Load team's Anthropic API key
@@ -2562,6 +2599,7 @@ pub async fn plan_chat(
             let tool_use_id = tu["id"].as_str().unwrap_or("").to_string();
             let state_ref = &state;
             let team_id_ref = &claims.team_id;
+            let email_ref = &claims.email;
             async move {
                 let result = if let Some((server_id, tool_name)) = full_name.split_once("__") {
                     if server_id == "github" {
@@ -2572,7 +2610,7 @@ pub async fn plan_chat(
                         ).await;
                         (Some("github".to_string()), json!(output))
                     } else {
-                        match invoke_mcp_tool(state_ref, team_id_ref, server_id, tool_name, &input).await {
+                        match invoke_mcp_tool(state_ref, team_id_ref, email_ref, server_id, tool_name, &input).await {
                             Ok(result) => (Some(server_id.to_string()), result),
                             Err(e) => {
                                 warn!(tool = full_name.as_str(), error = %e, "MCP tool call failed");
@@ -2660,6 +2698,7 @@ async fn run_anthropic_stream(
     tools: &[Value],
     messages: &mut Vec<Value>,
     team_id: &str,
+    user_email: &str,
     github_token: &Option<String>,
     repo_branches: &std::collections::HashMap<String, String>,
     worker: &super::plan_chat_tools::WorkerTools,
@@ -2918,7 +2957,9 @@ async fn run_anthropic_stream(
                             .await;
                     json!(output)
                 } else {
-                    match invoke_mcp_tool(state, team_id, server_id, tool_name, &input).await {
+                    match invoke_mcp_tool(state, team_id, user_email, server_id, tool_name, &input)
+                        .await
+                    {
                         Ok(r) => r,
                         Err(e) => {
                             warn!(tool = tu_name.as_str(), error = %e, "MCP tool call failed");
@@ -3031,7 +3072,7 @@ pub async fn plan_chat_stream(
         "plan_chat_stream: starting"
     );
 
-    let ctx = load_plan_chat_context(&state, &claims.team_id, messages_input, &body).await.inspect_err(|&s| {
+    let ctx = load_plan_chat_context(&state, &claims.team_id, &claims.email, messages_input, &body).await.inspect_err(|&s| {
         error!(status = %s, team_id = %claims.team_id, "plan_chat_stream: load_plan_chat_context failed");
     })?;
     let mut api_messages = ctx.messages;
@@ -3068,6 +3109,7 @@ pub async fn plan_chat_stream(
 
     // Move everything into the streaming task
     let team_id = claims.team_id.clone();
+    let user_email = claims.email.clone();
     let system_prompt = ctx.system_prompt;
     let tools = ctx.tools;
     let github_token = ctx.github_token;
@@ -3099,6 +3141,7 @@ pub async fn plan_chat_stream(
                 &tools,
                 &mut api_messages,
                 &team_id,
+                &user_email,
                 &github_token,
                 &repo_branches,
                 &worker,
@@ -3411,10 +3454,34 @@ const GATEWAY_MCP_CATALOG: &[(&str, &str, &[(&str, &str)])] = &[
 async fn invoke_mcp_tool(
     state: &AppState,
     team_id: &str,
+    user_email: &str,
     server_id: &str,
     tool_name: &str,
     tool_input: &Value,
 ) -> Result<Value, String> {
+    // A remote server this person may use: through its own connection,
+    // allowed tools only, audited.
+    let rt = super::mcp_servers::runtime(state, team_id);
+    if let Some((server, owner)) = rt
+        .usable(Some(user_email))
+        .await
+        .into_iter()
+        .find(|(r, _)| r.id == server_id)
+    {
+        let out = rt
+            .call_tool(
+                &server,
+                &owner,
+                tool_name,
+                tool_input,
+                &format!("plan chat ({user_email})"),
+            )
+            .await?;
+        return Ok(json!({
+            "content": [{"type": "text", "text": out.text}],
+            "isError": out.is_error,
+        }));
+    }
     // Find catalog entry for this server
     let (_, npx_package, env_mapping) = GATEWAY_MCP_CATALOG
         .iter()

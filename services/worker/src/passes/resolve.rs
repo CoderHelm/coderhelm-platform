@@ -25,26 +25,16 @@ pub async fn run(
     let mut loaded_plugins: Vec<mcp::McpPlugin> = Vec::new();
 
     for plugin in mcp_plugins {
-        let schemas = match mcp::load_tool_cache(
+        let Some(schemas) = mcp::schemas_for(
             &state.s3,
             &state.config.bucket_name,
-            &plugin.server_id,
+            &state.lambda,
+            &state.config.mcp_proxy_function_name,
+            plugin,
         )
         .await
-        {
-            Some(cache) => cache.tools,
-            None if !state.config.mcp_proxy_function_name.is_empty() => {
-                match mcp::list_tools(&state.lambda, &state.config.mcp_proxy_function_name, plugin)
-                    .await
-                {
-                    Ok(schemas) => schemas,
-                    Err(e) => {
-                        tracing::warn!(server_id = %plugin.server_id, error = %e, "Failed to list MCP tools for resolve");
-                        continue;
-                    }
-                }
-            }
-            _ => continue,
+        else {
+            continue;
         };
 
         let mcp_tool_defs = mcp::to_tool_definitions(&plugin.server_id, &schemas);

@@ -26,6 +26,10 @@ pub struct Config {
     pub ses_from_address: String,
     pub ses_template_prefix: String,
     pub mcp_proxy_function_name: String,
+    /// The KMS key a refreshed remote MCP token is sealed with. Empty: the
+    /// worker can't renew a sign-in (agents skip that server until it's
+    /// renewed in the dashboard).
+    pub secrets_key_id: String,
     pub ci_fix_queue_url: String,
     pub ticket_queue_url: String,
     pub feedback_queue_url: String,
@@ -78,6 +82,7 @@ impl Config {
             ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")
                 .unwrap_or_else(|_| "coderhelm-prod".to_string()),
             mcp_proxy_function_name: std::env::var("MCP_PROXY_FUNCTION_NAME").unwrap_or_default(),
+            secrets_key_id: std::env::var("SECRETS_KEY_ID").unwrap_or_default(),
             ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").unwrap_or_default(),
             ticket_queue_url: std::env::var("TICKET_QUEUE_URL").unwrap_or_default(),
             feedback_queue_url: std::env::var("FEEDBACK_QUEUE_URL").unwrap_or_default(),

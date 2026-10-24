@@ -95,7 +95,7 @@ async fn open_key(
         .map_err(|e| internal("open data source key", e))
 }
 
-async fn admin_count(state: &AppState, team: &str) -> usize {
+pub(crate) async fn admin_count(state: &AppState, team: &str) -> usize {
     let r = state
         .dynamo
         .query()
