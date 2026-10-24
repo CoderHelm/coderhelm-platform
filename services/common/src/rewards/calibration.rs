@@ -38,6 +38,8 @@ const EXEMPT: &[&str] = &[
     "injection",
     "concurrency",
     "source-data-override",
+    // A question asks a person to confirm something the change rests on.
+    "question",
 ];
 
 /// Is `category` one the reviewer must keep raising whatever the team does?
@@ -282,6 +284,7 @@ mod tests {
             "data_loss",
             "sql-injection-vuln",
             "auth",
+            "question",
             "",
         ] {
             assert!(is_exempt(cat), "{cat}");

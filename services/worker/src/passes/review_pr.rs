@@ -1700,8 +1700,15 @@ async fn run_once(
     .await;
     // Categories this repo keeps dismissing are quieted; security and
     // correctness never are.
+    // A repo that requires tests keeps its tests findings whatever the counts.
+    let calibration: Vec<_> = reward
+        .calibration
+        .iter()
+        .filter(|s| !(cfg.require_tests && s.category.eq_ignore_ascii_case("tests")))
+        .cloned()
+        .collect();
     let (calib_dropped, calib_downgraded) =
-        super::rewards::apply_calibration(&mut findings, &reward.calibration);
+        super::rewards::apply_calibration(&mut findings, &calibration);
     if calib_dropped + calib_downgraded > 0 {
         info!(
             pr = msg.pr_number,
