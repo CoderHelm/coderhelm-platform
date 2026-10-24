@@ -108,6 +108,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "reviewer::list_reviews",
             "reviewer::get_review",
             "review_lessons::list_lessons",
+            "learning::get_learning",
             "tests::summary",
             "tests::list_tests",
         ],
@@ -278,6 +279,17 @@ pub const CAPABILITIES: &[Capability] = &[
             "reviewer::update_org_config",
             "reviewer::update_config",
             "review_lessons::delete_lesson",
+        ],
+    },
+    Capability {
+        key: "learning",
+        label: "Pin a prompt variant, revert or restore what Coderhelm learned, and tune the reward weights",
+        min_role: "admin",
+        handlers: &[
+            "learning::pin_variant",
+            "learning::revert_change",
+            "learning::restore_change",
+            "learning::put_weights",
         ],
     },
     Capability {

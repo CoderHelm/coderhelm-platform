@@ -10,7 +10,7 @@ use axum::{http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::models::{Claims, ReleaseNotesMessage, ReviewMessage, TagSweepMessage, WorkerMessage};
 use crate::AppState;
@@ -1108,10 +1108,43 @@ pub async fn rate_review(
         expr.push_str("ADD ");
         expr.push_str(&add_parts.join(", "));
     }
-    req = req.update_expression(expr);
+    req = req
+        .update_expression(expr)
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew);
 
     match req.send().await {
-        Ok(_) => {
+        Ok(out) => {
+            // A rating is a reward signal: one per person, review and
+            // direction, with the reason they gave.
+            let kind = match rating {
+                "up" => Some(common::rewards::RewardKind::RatingUp),
+                "down" => Some(common::rewards::RewardKind::RatingDown),
+                _ => None,
+            };
+            if let (Some(kind), Some(review)) = (kind, out.attributes()) {
+                let by = claims.display_name();
+                let ev = common::rewards::mapping::review_event(
+                    &claims.team_id,
+                    kind,
+                    &body.sk,
+                    review,
+                    &chrono::Utc::now().to_rfc3339(),
+                    &format!("rating#{}#{by}#{rating}", body.sk),
+                )
+                .with_detail(if comment.is_empty() {
+                    "Rated on the dashboard"
+                } else {
+                    comment
+                })
+                .with_source("dashboard:rate");
+                let store = common::rewards::store::Store::new(
+                    &state.dynamo,
+                    &state.config.settings_table_name,
+                );
+                if let Err(e) = store.record(&ev).await {
+                    warn!(error = %e, "Could not record the rating as a reward signal");
+                }
+            }
             // Keep the analytics copy in step. Older reviews may have none yet
             // (the backfill copies their ratings), so a miss is fine.
             let field = match rating {
