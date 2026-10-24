@@ -11,7 +11,6 @@ use tracing::{info, warn};
 
 use crate::models::TokenUsage;
 
-static ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 static ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Reusable Anthropic client.
@@ -24,6 +23,8 @@ pub struct AnthropicClient {
     /// Counts every response into the team's analytics counters. Required:
     /// a client can't be built without saying where its usage goes.
     meter: common::usage::UsageMeter,
+    /// Another Messages endpoint (tests: a local fake server).
+    url: Option<String>,
 }
 
 impl AnthropicClient {
@@ -36,7 +37,15 @@ impl AnthropicClient {
             api_key,
             bedrock: None,
             meter,
+            url: None,
         }
+    }
+
+    /// The same client against another Messages endpoint (tests).
+    #[cfg(test)]
+    fn at(mut self, url: &str) -> Self {
+        self.url = Some(url.to_string());
+        self
     }
 
     /// The same Messages requests, sent through Amazon Bedrock with the AWS
@@ -50,19 +59,6 @@ impl AnthropicClient {
             ..Self::new(String::new(), meter)
         }
     }
-}
-
-/// The one place a response's usage is counted: into the run's own totals
-/// (`usage`) and, once, into the team's analytics counters (the meter).
-async fn account(
-    client: &AnthropicClient,
-    model_id: &str,
-    api_usage: &ApiUsage,
-    usage: &mut TokenUsage,
-) {
-    let call = api_usage.call();
-    usage.add_call(model_id, &call);
-    client.meter.record(model_id, &call).await;
 }
 
 // --- Request/Response types ---
@@ -383,8 +379,7 @@ pub async fn converse_simple(
     };
     apply_model_family(&mut request, None, false);
 
-    let resp = send_request(client, &request).await?;
-    account(client, model_id, &resp.usage, usage).await;
+    let resp = send_request(client, &request, usage).await?;
     if let Some(refusal) = resp.refusal() {
         return Err(refusal.into());
     }
@@ -451,8 +446,7 @@ pub async fn converse_json_shared(
         effort,
         max_tokens,
     );
-    let resp = send_request(client, &request).await?;
-    account(client, model_id, &resp.usage, usage).await;
+    let resp = send_request(client, &request, usage).await?;
     let kinds: Vec<&str> = resp
         .content
         .iter()
@@ -744,10 +738,7 @@ pub async fn converse_tool_loop(
         };
         apply_model_family(&mut request, effort, true);
 
-        let response = send_request(client, &request).await?;
-
-        // Track usage
-        account(client, model_id, &response.usage, usage).await;
+        let response = send_request(client, &request, usage).await?;
 
         if let Some(refusal) = response.refusal() {
             return Err(refusal.into());
@@ -924,33 +915,59 @@ fn truncate_input_summary(input: &Value) -> String {
     summary
 }
 
-/// Sends one Messages request. Transient failures (any 5xx including the
-/// Cloudflare 520-524 errors, 408, 429, 529 overloaded, and requests that got
-/// no response) are retried with backoff by status, not by error text; the
-/// error returned after that is final for this call.
+/// Sends one Messages request, streamed, and counts it: every attempt into
+/// the team's counters as it happens (`common::model_stream`, a reply that
+/// broke off and was retried included), and into the run's own totals
+/// (`usage`). Transient failures (any 5xx including the Cloudflare 520-524
+/// errors, 408, 429, 529 overloaded, requests that got no response, and
+/// replies cut off mid-stream) are retried with backoff by status, not by
+/// error text; the error returned after that is final for this call.
 async fn send_request(
     client: &AnthropicClient,
     request: &MessagesRequest,
+    usage: &mut TokenUsage,
 ) -> Result<MessagesResponse, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(bedrock) = &client.bedrock {
-        return api_result(send_bedrock(bedrock, request).await?);
+        let resp = send_bedrock(client, bedrock, request).await?;
+        usage.add_call(&request.model, &resp.usage.call());
+        return Ok(resp);
     }
-    let reply = common::model_retry::send(
+    let mut body = serde_json::to_value(request)?;
+    body["stream"] = json!(true);
+    let body = serde_json::to_vec(&body)?;
+    let url = client
+        .url
+        .as_deref()
+        .unwrap_or("https://api.anthropic.com/v1/messages");
+    let streamed = common::model_stream::send_metered(
         || {
             client
                 .http
-                .post(ANTHROPIC_API_URL)
+                .post(url)
                 .header("x-api-key", &client.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("anthropic-beta", beta_header(request))
-                .json(request)
+                .header("content-type", "application/json")
+                .body(body.clone())
         },
         &common::model_retry::WORKER_BACKOFF_SECS,
         &request.model,
+        &client.meter,
+        &request.model,
+        body.len() as u64,
     )
     .await
     .map_err(Box::new)?;
-    api_result(reply)
+    for broken in &streamed.retried {
+        usage.add_call(&request.model, broken);
+    }
+    usage.add_call(&request.model, &streamed.usage);
+    serde_json::from_value(streamed.message).map_err(|e| {
+        Box::new(common::model_retry::ModelCallError::new(
+            common::model_retry::ModelErrorKind::Network,
+            format!("the response couldn't be read: {e}"),
+        )) as Box<dyn std::error::Error + Send + Sync>
+    })
 }
 
 /// The Bedrock body for a Messages request: the same fields, with the model
@@ -974,18 +991,21 @@ fn bedrock_body(request: &MessagesRequest) -> Result<Value, serde_json::Error> {
 }
 
 /// One Messages request through Bedrock's InvokeModel, retried on the same
-/// transient statuses and schedule as the Anthropic API path.
+/// transient statuses and schedule as the Anthropic API path, and recorded
+/// on the client's meter. Used only by the reviewer evals (CI), which call
+/// Bedrock without a key.
 async fn send_bedrock(
-    client: &aws_sdk_bedrockruntime::Client,
+    client: &AnthropicClient,
+    bedrock: &aws_sdk_bedrockruntime::Client,
     request: &MessagesRequest,
-) -> Result<common::model_retry::Reply, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<MessagesResponse, Box<dyn std::error::Error + Send + Sync>> {
     use common::model_retry::{
         backoff, is_transient_status, ModelCallError, ModelErrorKind, Reply, WORKER_BACKOFF_SECS,
     };
     let body = serde_json::to_vec(&bedrock_body(request)?)?;
     let mut attempt = 0;
     loop {
-        let result = client
+        let result = bedrock
             .invoke_model()
             .model_id(&request.model)
             .content_type("application/json")
@@ -995,10 +1015,13 @@ async fn send_bedrock(
             .await;
         let (status, text) = match result {
             Ok(out) => {
-                return Ok(Reply {
+                let resp = api_result(Reply {
                     status: 200,
                     body: out.body.into_inner(),
-                })
+                })?;
+                let meter = &client.meter;
+                meter.record(&request.model, &resp.usage.call()).await;
+                return Ok(resp);
             }
             Err(e) => (
                 e.raw_response().map(|r| r.status().as_u16()),
@@ -1279,20 +1302,86 @@ mod tests {
         assert!(resp.refusal().is_none());
     }
 
+    /// A whole streamed reply: "hello", with every usage part.
+    fn whole_reply() -> String {
+        [
+            json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"x","content":[],"stop_reason":null,
+                "usage":{"input_tokens":7,"output_tokens":1,"cache_read_input_tokens":9000,"cache_creation_input_tokens":1200,
+                "cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":200}}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":300}}),
+            json!({"type":"message_stop"}),
+        ]
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .collect()
+    }
+
+    /// A fake Messages endpoint: each request gets the next streamed body
+    /// (the last repeats), and the connection closes after it.
+    async fn sse_server(bodies: Vec<String>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut n = 0;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = bodies.get(n).or(bodies.last()).unwrap().clone();
+                n += 1;
+                let mut buf = vec![0u8; 1 << 16];
+                let _ = sock.read(&mut buf).await;
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}/v1/messages")
+    }
+
+    #[tokio::test]
+    async fn a_broken_reply_retried_counts_both_attempts_in_the_run_and_the_team() {
+        let broken = whole_reply()
+            .split("event: content_block_stop")
+            .next()
+            .unwrap()
+            .to_string();
+        let url = sse_server(vec![broken, whole_reply()]).await;
+        let (meter, calls) = common::usage::UsageMeter::memory("team-1");
+        let client = AnthropicClient::new("k".into(), meter).at(&url);
+        let mut usage = TokenUsage::default();
+        let mut request = request("claude-opus-5-5");
+        request.max_tokens = 100;
+        // The worker's backoff waits 2s before the retry.
+        let resp = send_request(&client, &request, &mut usage).await.unwrap();
+        assert_eq!(resp.stop_reason.as_deref(), Some("end_turn"));
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(got.len(), 2);
+        assert!(got[0].estimated);
+        // "hello" is 5 bytes: 2 tokens estimated.
+        assert_eq!(got[0].usage.output, 2);
+        let team_total: u64 = got.iter().map(|c| c.usage.total()).sum();
+        assert_eq!(team_total, usage.total_tokens());
+    }
+
     #[tokio::test]
     async fn each_response_reaches_the_run_and_the_team_counters_exactly_once() {
+        let url = sse_server(vec![whole_reply()]).await;
         let (meter, calls) = common::usage::UsageMeter::memory("team-1");
-        let client = AnthropicClient::new("k".into(), meter);
+        let client = AnthropicClient::new("k".into(), meter).at(&url);
         let mut usage = TokenUsage::default();
-        let api: ApiUsage = serde_json::from_value(json!({
-            "input_tokens": 7, "output_tokens": 300,
-            "cache_read_input_tokens": 9000, "cache_creation_input_tokens": 1200,
-            "cache_creation": {"ephemeral_5m_input_tokens": 1000, "ephemeral_1h_input_tokens": 200}
-        }))
-        .unwrap();
         common::usage::with_feature(common::usage::feature::RUN, async {
-            account(&client, "claude-opus-5-5", &api, &mut usage).await;
-            account(&client, "claude-sonnet-5-5", &api, &mut usage).await;
+            for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+                let text = converse_simple(&client, model, "sys", "hi", &mut usage)
+                    .await
+                    .unwrap();
+                assert_eq!(text, "hello");
+            }
         })
         .await;
         let got = calls.lock().unwrap().clone();

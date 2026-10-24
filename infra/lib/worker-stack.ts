@@ -180,19 +180,13 @@ export class WorkerStack extends cdk.Stack {
       })
     );
 
-    // Bedrock: converse + invoke model
+    // Bedrock: Titan embeddings only (agent memory, metered in
+    // common::embed). Claude is called through the Anthropic API with the
+    // team's key; the Bedrock Claude path is the nightly evals' own role.
     this.workerFunction.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: [
-          "bedrock:InvokeModel",
-          "bedrock:InvokeModelWithResponseStream",
-          "bedrock:Converse",
-          "bedrock:ConverseStream",
-        ],
-        resources: [
-          `arn:aws:bedrock:*::foundation-model/*`,
-          `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
-        ],
+        actions: ["bedrock:InvokeModel"],
+        resources: [`arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0`],
       })
     );
 

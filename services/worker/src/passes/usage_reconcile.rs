@@ -227,6 +227,10 @@ pub async fn run(
         Err(e) => {
             info!(secret = %secret_name, error = %aws_sdk_secretsmanager::error::DisplayErrorContext(&e),
                 "Usage reconciliation is off: no Anthropic admin-key secret");
+            let off = common::usage::UsageCheck::Off {
+                secret: secret_name.clone(),
+            };
+            store_check(state, &off).await;
             return Ok(());
         }
     };
@@ -238,6 +242,7 @@ pub async fn run(
     let start = format!("{day}T00:00:00Z");
     let end = format!("{}T00:00:00Z", day + chrono::Duration::days(1));
 
+    let (mut checked_teams, mut flagged_total, mut failed_teams) = (0u64, 0u64, 0u64);
     for (team_id, key) in &teams {
         if key.admin_key.trim().is_empty() {
             continue;
@@ -273,6 +278,7 @@ pub async fn run(
         .await
         {
             warn!(team_id, error = %e, "Anthropic usage report failed");
+            failed_teams += 1;
             continue;
         }
         // The cost report has no api_key filter: compare cost only when the
@@ -351,6 +357,8 @@ pub async fn run(
             "flagged_models".into(),
             AttributeValue::N(flagged.to_string()),
         );
+        checked_teams += 1;
+        flagged_total += flagged;
         if let Err(e) = state
             .dynamo
             .put_item()
@@ -362,7 +370,29 @@ pub async fn run(
             warn!(team_id, error = %e, "Couldn't store the reconciliation result");
         }
     }
+    let ran = common::usage::UsageCheck::Ran {
+        day: day.to_string(),
+        teams: checked_teams,
+        flagged: flagged_total,
+        failed: failed_teams,
+    };
+    store_check(state, &ran).await;
     Ok(())
+}
+
+/// Keep this run's outcome where the admin page reads it.
+async fn store_check(state: &WorkerState, check: &common::usage::UsageCheck) {
+    let item = common::usage::usage_check_item(check, &chrono::Utc::now().to_rfc3339());
+    if let Err(e) = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.analytics_table_name)
+        .set_item(Some(item))
+        .send()
+        .await
+    {
+        warn!(error = %e, "Couldn't store the usage check status");
+    }
 }
 
 #[cfg(test)]

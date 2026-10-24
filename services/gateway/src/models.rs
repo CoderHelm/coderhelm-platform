@@ -190,6 +190,10 @@ pub enum WorkerMessage {
     /// what the comment is before anything runs.
     #[serde(rename = "jira_comment")]
     JiraComment(JiraCommentMessage),
+    /// A model call whose usage couldn't be written when it was made, for the
+    /// worker to add (once, by its call id). Sent by `common::usage::SqsFallback`.
+    #[serde(rename = "usage_record")]
+    UsageRecord(common::usage::CallRecord),
 }
 
 /// A ticket comment for the worker to read (must match the worker's

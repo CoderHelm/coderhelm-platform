@@ -12,6 +12,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 mod auth;
 mod clients;
 mod middleware;
+mod model_call;
 mod models;
 mod permissions;
 mod routes;
@@ -59,6 +60,11 @@ async fn main() -> Result<(), Error> {
     let secrets = models::Secrets::load(&sm, &secrets_name).await?;
 
     let config = models::Config::from_env();
+    // A model call whose usage can't be written waits on the tickets queue.
+    common::usage::set_fallback(Arc::new(common::usage::SqsFallback {
+        sqs: sqs.clone(),
+        queue_url: config.ticket_queue_url.clone(),
+    }));
 
     // Only needed for the main gateway, not the streaming Lambda
     let cognito_client_secret = if std::env::var("STREAMING_MODE").is_ok() {
@@ -118,6 +124,8 @@ async fn main() -> Result<(), Error> {
         .route("/admin/teams", get(routes::admin::admin_teams))
         // The shared DLQ: every team's failed messages and the global jobs'
         .route("/admin/dlq", get(routes::admin::admin_dlq))
+        // The daily check of recorded usage against Anthropic's report
+        .route("/admin/usage-check", get(routes::admin::admin_usage_check))
         .route("/admin/dlq/delete", post(routes::admin::admin_dlq_delete))
         .route("/admin/beta-signups", get(routes::admin::beta_signups))
         .route(

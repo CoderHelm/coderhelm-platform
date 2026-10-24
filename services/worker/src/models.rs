@@ -207,6 +207,11 @@ pub enum WorkerMessage {
     /// usage and cost report. Off unless the admin-key secret exists.
     #[serde(rename = "usage_reconcile")]
     UsageReconcile(UsageReconcileMessage),
+    /// A model call whose usage couldn't be written when it was made (the
+    /// worker or gateway queued it, `common::usage::SqsFallback`). Added to
+    /// the team's counters once, ever, by its call id.
+    #[serde(rename = "usage_record")]
+    UsageRecord(common::usage::CallRecord),
     /// A lesson on where a fix belonged: CoderHelm's PR was closed without
     /// merging, or a person said the fix was outside the code.
     #[serde(rename = "lesson")]
@@ -330,6 +335,7 @@ impl WorkerMessage {
             | WorkerMessage::WeeklySummary
             | WorkerMessage::WeeklySummaryTest(_)
             | WorkerMessage::UsageReconcile(_)
+            | WorkerMessage::UsageRecord(_)
             | WorkerMessage::DlqCleanup
             | WorkerMessage::LogAutofix => f::OTHER,
         }

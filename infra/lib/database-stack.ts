@@ -179,6 +179,9 @@ export class DatabaseStack extends cdk.Stack {
       pointInTimeRecoverySpecification: {
         pointInTimeRecoveryEnabled: true,
       },
+      // Only the once-only markers of model calls (`USAGE_CALL#<id>`) carry
+      // `expires_at` (35 days); team counters never expire.
+      timeToLiveAttribute: "expires_at",
       deletionProtection: isProd,
       removalPolicy: isProd
         ? cdk.RemovalPolicy.RETAIN

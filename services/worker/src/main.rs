@@ -49,6 +49,11 @@ async fn main() -> Result<(), Error> {
 
     let config = models::Config::from_env();
     let secrets = models::Secrets::load(&sm, &config.secrets_name).await?;
+    // A model call whose usage can't be written waits on the tickets queue.
+    common::usage::set_fallback(Arc::new(common::usage::SqsFallback {
+        sqs: sqs.clone(),
+        queue_url: config.ticket_queue_url.clone(),
+    }));
 
     let state = Arc::new(WorkerState {
         dynamo,
@@ -82,15 +87,32 @@ async fn handle_event(
     event: LambdaEvent<serde_json::Value>,
 ) -> Result<serde_json::Value, Error> {
     let (payload, context) = event.into_parts();
-    if let Some(req) = payload.get("plan_chat") {
+    // In-flight model calls are cancelled (and their usage recorded) this
+    // long before the Lambda's own deadline, leaving time for the writes.
+    common::model_stream::set_deadline_epoch_ms(Some(
+        context.deadline as i64 - MODEL_DEADLINE_MARGIN_MS,
+    ));
+    let out = if let Some(req) = payload.get("plan_chat") {
         let req: passes::plan_chat::Request = serde_json::from_value(req.clone())?;
         let call = passes::plan_chat::handle(&state, req);
-        return Ok(common::usage::with_feature(common::usage::feature::CHAT, call).await);
-    }
-    let sqs: SqsEvent = serde_json::from_value(payload)?;
-    handle_sqs(state, LambdaEvent::new(sqs, context)).await?;
-    Ok(serde_json::Value::Null)
+        Ok(common::usage::with_feature(common::usage::feature::CHAT, call).await)
+    } else {
+        let sqs: SqsEvent = serde_json::from_value(payload)?;
+        handle_sqs(state, LambdaEvent::new(sqs, context))
+            .await
+            .map(|_| serde_json::Value::Null)
+    };
+    // A call dropped mid-reply (an outer timeout) records itself in the
+    // background: finish those writes before the Lambda is frozen.
+    common::model_stream::settle_dropped_calls().await;
+    out
 }
+
+/// How long before the Lambda deadline in-flight model calls are cancelled.
+/// Ticket runs stop at 870s (30s before the 900s limit); a call still in
+/// flight then is dropped and records itself, and this catches every other
+/// path before the hard stop.
+const MODEL_DEADLINE_MARGIN_MS: i64 = 20_000;
 
 async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Result<(), Error> {
     for record in event.payload.records {
@@ -98,6 +120,17 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
         info!("Processing SQS message");
 
         let message: models::WorkerMessage = serde_json::from_str(&body)?;
+        // A held usage record: added once by its call id. A failure fails
+        // the message, so SQS delivers it again (and the DLQ keeps it).
+        if let models::WorkerMessage::UsageRecord(rec) = &message {
+            let store = common::usage::DynamoStore {
+                dynamo: state.dynamo.clone(),
+                table: state.config.analytics_table_name.clone(),
+            };
+            let added = common::usage::replay(&store, rec).await?;
+            info!(call_id = %rec.call_id, team_id = %rec.team_id, ?added, "Recovered model usage");
+            continue;
+        }
         // Every model call made while handling this message is counted under
         // the message's feature (spawned tasks fall back to "other").
         let feature = message.usage_feature();
@@ -375,6 +408,8 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Usage reconciliation failed: {e}");
             }
         }
+        // Handled in `handle_sqs`, where a failure fails the message.
+        models::WorkerMessage::UsageRecord(_) => {}
     }
 }
 

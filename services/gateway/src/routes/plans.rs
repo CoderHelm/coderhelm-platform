@@ -1,4 +1,5 @@
 use axum::{extract::State, http::StatusCode, Extension, Json};
+use common::model_stream::accumulate_delta;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -2460,6 +2461,7 @@ pub async fn plan_chat(
     let max_turns = 5;
     let mut mcp_servers_used: std::collections::HashSet<String> = std::collections::HashSet::new();
     let http = reqwest::Client::new();
+    let meter = crate::model_call::chat_meter(&state, &claims.team_id);
     let mut worker_used = super::plan_chat_tools::Used::default();
     let mut used_items: Vec<Value> = Vec::new();
 
@@ -2479,40 +2481,15 @@ pub async fn plan_chat(
             body["tools"] = json!(ctx.tools);
         }
 
-        // Transient failures (5xx incl. 520-524, 408, 429, 529, no response)
-        // are retried by status; a person is waiting, so the waits are short.
-        let resp = common::model_retry::send(
-            || {
-                http.post("https://api.anthropic.com/v1/messages")
-                    .header("x-api-key", &api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .header("anthropic-beta", "prompt-caching-2024-07-31")
-                    .json(&body)
-            },
-            &common::model_retry::INTERACTIVE_BACKOFF_SECS,
-            "plan_chat",
-        )
-        .await
-        .map_err(|e| {
-            error!("Anthropic request failed: {e}");
-            StatusCode::BAD_GATEWAY
-        })?;
-
-        if !resp.is_success() {
-            let e = resp.into_error();
-            error!(status = ?e.status(), transient = e.is_transient(), "{e}");
-            return Err(StatusCode::BAD_GATEWAY);
-        }
-
-        let response: Value = serde_json::from_slice(&resp.body).map_err(|e| {
-            error!("Failed to parse Anthropic response: {e}");
-            StatusCode::BAD_GATEWAY
-        })?;
-
-        // Count this call, once, as it happens.
-        if let Some(usage) = response.get("usage") {
-            count_chat_call(&state, &claims.team_id, &model_id, usage).await;
-        }
+        // Transient failures (5xx incl. 520-524, 408, 429, 529, no response,
+        // a reply cut off) are retried; a person is waiting, so the waits are
+        // short. Every attempt is counted as it happens, broken ones too.
+        let response = crate::model_call::chat_turn(&http, &api_key, &body, &meter, &model_id)
+            .await
+            .map_err(|e| {
+                error!(status = ?e.status(), transient = e.is_transient(), "Anthropic request failed: {e}");
+                StatusCode::BAD_GATEWAY
+            })?;
 
         let content = response["content"].as_array().cloned().unwrap_or_default();
         let stop_reason = response["stop_reason"].as_str().unwrap_or("");
@@ -2690,6 +2667,7 @@ async fn run_anthropic_stream(
     let mut worker_used = super::plan_chat_tools::Used::default();
 
     let http = reqwest::Client::new();
+    let meter = crate::model_call::chat_meter(state, team_id);
     let max_turns = 5;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
@@ -2720,17 +2698,8 @@ async fn run_anthropic_stream(
 
         // Retried by status until a stream starts (5xx incl. 520-524, 408,
         // 429, 529, no response); a stream already flowing is never resent.
-        let resp = match common::model_retry::send_streaming(
-            || {
-                http.post("https://api.anthropic.com/v1/messages")
-                    .header("x-api-key", api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .header("anthropic-beta", "prompt-caching-2024-07-31")
-                    .header("content-type", "application/json")
-                    .json(&body)
-            },
-            &common::model_retry::INTERACTIVE_BACKOFF_SECS,
-            "plan_chat_stream",
+        let (resp, mut flight) = match crate::model_call::open_chat_stream(
+            &http, api_key, &body, &meter, model_id,
         )
         .await
         {
@@ -2774,8 +2743,6 @@ async fn run_anthropic_stream(
         let mut blocks: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
         let mut block_json: std::collections::HashMap<u64, String> =
             std::collections::HashMap::new();
-        // This turn's usage: message_start's, updated by message_delta.
-        let mut turn_usage = json!({});
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -2800,6 +2767,8 @@ async fn run_anthropic_stream(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                // The call's usage (and the estimate if the stream breaks).
+                flight.acc.feed(&event);
 
                 match event["type"].as_str() {
                     Some("content_block_start") => {
@@ -2872,30 +2841,18 @@ async fn run_anthropic_stream(
                         if let Some(sr) = event["delta"]["stop_reason"].as_str() {
                             stop_reason = sr.to_string();
                         }
-                        // Counts here are cumulative for the message: take
-                        // the latest value of each, never add them up.
-                        if let Some(u) = event.get("usage").and_then(|u| u.as_object()) {
-                            for (k, v) in u {
-                                if !v.is_null() {
-                                    turn_usage[k] = v.clone();
-                                }
-                            }
-                        }
-                    }
-                    Some("message_start") => {
-                        if let Some(u) = event.get("message").and_then(|m| m.get("usage")) {
-                            turn_usage = u.clone();
-                        }
                     }
                     _ => {}
                 }
             }
         }
 
-        // Count this call, once, even if the stream broke off.
-        total_input_tokens += turn_usage["input_tokens"].as_u64().unwrap_or(0);
-        total_output_tokens += turn_usage["output_tokens"].as_u64().unwrap_or(0);
-        count_chat_call(state, team_id, model_id, &turn_usage).await;
+        // Count this call, once, even if the stream broke off: a missing
+        // final output count is estimated from what arrived (marked so),
+        // never message_start's placeholder.
+        let (turn_usage, _estimated) = flight.finish().await;
+        total_input_tokens += turn_usage.uncached_input;
+        total_output_tokens += turn_usage.output;
 
         // Assistant turn for conversation state: every block, in order, verbatim.
         let assistant_content: Vec<Value> = blocks.into_values().collect();
@@ -3207,24 +3164,6 @@ fn compact_tool_result_for_model(result: &Value) -> String {
     }
     let truncated: String = s.chars().take(max_chars).collect();
     format!("{truncated}… [truncated]")
-}
-
-/// Count one plan chat model call in the team's usage counters (all four
-/// token parts, priced per model). Never fails the chat.
-async fn count_chat_call(state: &AppState, team_id: &str, model_id: &str, usage: &Value) {
-    let call = common::usage::CallUsage::from_api(usage, common::usage::CacheTtl::FiveMinutes);
-    if let Err(e) = common::usage::record(
-        &state.dynamo,
-        &state.config.analytics_table_name,
-        team_id,
-        common::usage::feature::CHAT,
-        model_id,
-        &call,
-    )
-    .await
-    {
-        warn!(team_id, error = %e, "Couldn't record plan chat usage");
-    }
 }
 
 async fn load_allow_plan_log_analyzer(state: &AppState, team_id: &str) -> bool {
@@ -3713,28 +3652,6 @@ async fn github_list_directory(
         Ok(r) if r.status().as_u16() == 404 => format!("Directory not found: {path}"),
         Ok(r) => format!("GitHub API error: {}", r.status()),
         Err(e) => format!("Request failed: {e}"),
-    }
-}
-
-/// Apply one streaming `content_block_delta` to the block it belongs to.
-/// Tool input arrives as partial JSON and is parsed at `content_block_stop`.
-fn accumulate_delta(block: &mut Value, delta: &Value, partial_json: &mut String) {
-    let append = |block: &mut Value, field: &str, piece: &str| {
-        let cur = block[field].as_str().unwrap_or("").to_string();
-        block[field] = Value::String(cur + piece);
-    };
-    match delta["type"].as_str() {
-        Some("text_delta") => append(block, "text", delta["text"].as_str().unwrap_or("")),
-        Some("thinking_delta") => {
-            append(block, "thinking", delta["thinking"].as_str().unwrap_or(""))
-        }
-        Some("signature_delta") => {
-            block["signature"] = delta["signature"].clone();
-        }
-        Some("input_json_delta") => {
-            partial_json.push_str(delta["partial_json"].as_str().unwrap_or(""));
-        }
-        _ => {}
     }
 }
 

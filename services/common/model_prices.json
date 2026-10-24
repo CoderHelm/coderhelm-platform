@@ -24,5 +24,9 @@
                           "long_prompt": {"over_tokens": 100000, "input": 0.50, "output": 2.50, "cache_read": 0.05, "cache_write_5m": 0.625, "cache_write_1h": 1.0}},
     "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0,  "cache_read": 0.10, "cache_write_5m": 1.25,  "cache_write_1h": 2.0},
     "claude-haiku-3-5":  {"input": 0.80, "output": 4.0,  "cache_read": 0.08, "cache_write_5m": 1.0,   "cache_write_1h": 1.6}
+  },
+  "embedding_models_source": "https://aws.amazon.com/bedrock/pricing/ (Amazon Titan Text Embeddings V2, on-demand: $0.00002 per 1,000 input tokens)",
+  "embedding_models": {
+    "amazon.titan-embed-text-v2": {"input": 0.02}
   }
 }

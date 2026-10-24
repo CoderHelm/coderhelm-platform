@@ -22,6 +22,8 @@ const MIN_RELEVANCE: f32 = 0.02;
 pub struct AgentMemory {
     db: MenteDb,
     bedrock: aws_sdk_bedrockruntime::Client,
+    /// Meters this team's Titan embeddings (billed to CoderHelm).
+    embed_meter: common::usage::UsageMeter,
     local_dir: PathBuf,
     team_id: String,
     repo_owner: String,
@@ -277,7 +279,13 @@ impl AgentMemory {
             }
         };
 
-        let bedrock_embedder = embedder::BedrockEmbedder::new(state.bedrock.clone());
+        let embed_meter = common::usage::UsageMeter::dynamo(
+            state.dynamo.clone(),
+            &state.config.analytics_table_name,
+            team_id,
+        );
+        let bedrock_embedder =
+            embedder::BedrockEmbedder::new(state.bedrock.clone(), embed_meter.clone());
         match open_db(&local_dir, Box::new(bedrock_embedder)) {
             Ok(db) => {
                 info!(
@@ -287,6 +295,7 @@ impl AgentMemory {
                 Some(Self {
                     db,
                     bedrock: state.bedrock.clone(),
+                    embed_meter,
                     local_dir,
                     team_id: team_id.to_string(),
                     repo_owner: repo_owner.to_string(),
@@ -315,7 +324,7 @@ impl AgentMemory {
     /// Recall relevant memories for a given query text.
     /// Returns formatted context suitable for injection into prompts.
     pub async fn recall_context(&mut self, query: &str, k: usize) -> String {
-        let embedding = match embed_async(&self.bedrock, query).await {
+        let embedding = match embed_async(&self.bedrock, &self.embed_meter, query).await {
             Ok(emb) => emb,
             Err(e) => {
                 warn!(error = %e, "Failed to embed recall query");
@@ -348,7 +357,7 @@ impl AgentMemory {
         tags: Vec<String>,
     ) {
         // Generate embedding via async Bedrock call
-        let embedding = match embed_async(&self.bedrock, content).await {
+        let embedding = match embed_async(&self.bedrock, &self.embed_meter, content).await {
             Ok(emb) => emb,
             Err(e) => {
                 warn!(error = %e, "Failed to embed memory content");
@@ -428,8 +437,7 @@ impl AgentMemory {
             return; // too little content to extract from
         }
 
-        let extraction_prompt = format!(
-            "Analyze this AI coding agent conversation and extract ONLY genuinely useful learnings about this repository. \
+        let instructions = "Analyze this AI coding agent conversation and extract ONLY genuinely useful learnings about this repository. \
              Output a JSON array of objects with \"type\" and \"content\" fields.\n\n\
              Types:\n\
              - \"style\": Code style preferences (naming conventions, formatting, patterns used)\n\
@@ -442,60 +450,30 @@ impl AgentMemory {
              - Each learning must be useful for future runs on this same repo\n\
              - Max 5 learnings. Quality over quantity. Return [] if nothing worth remembering.\n\
              - Content should be concise (1-2 sentences max)\n\n\
-             Conversation:\n{summary}\n\n\
-             JSON array:"
-        );
+             Answer with only the JSON array.";
+        let conversation = format!("Conversation:\n{summary}\n\nJSON array:");
 
-        let client = reqwest::Client::new();
-        let resp = match client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&{
-                let mut body = serde_json::json!({
-                    // Team-configured model — the hardcoded model id silently
-                    // broke extraction for teams whose keys lack access to it.
-                    "model": model_id,
-                    "max_tokens": 4096,
-                    "messages": [{"role": "user", "content": extraction_prompt}],
-                });
-                if common::is_always_thinking_model(model_id) {
-                    body["output_config"] = serde_json::json!({"effort": "low"});
-                }
-                body
-            })
-            .send()
-            .await
+        // Through the team's metered client (team-configured model; counted
+        // under `memory` in the team's counters, not the run's totals).
+        let mut scratch = crate::models::TokenUsage::default();
+        let text = match common::usage::with_feature(
+            common::usage::feature::MEMORY,
+            crate::agent::anthropic::converse_simple(
+                &provider.client(),
+                model_id,
+                instructions,
+                &conversation,
+                &mut scratch,
+            ),
+        )
+        .await
         {
-            Ok(r) => r,
+            Ok(t) => t,
             Err(e) => {
-                warn!(error = %e, "Memory extraction API call failed");
+                warn!(error = %e, "Memory extraction call failed");
                 return;
             }
         };
-
-        let body: serde_json::Value = match resp.json().await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(error = %e, "Failed to parse memory extraction response");
-                return;
-            }
-        };
-        // Count the call (after the run: the team's counters, not the run's).
-        if let (Some(meter), Some(u)) = (&provider.meter, body.get("usage")) {
-            let call = common::usage::CallUsage::from_api(u, common::usage::CacheTtl::FiveMinutes);
-            meter
-                .record_as(common::usage::feature::MEMORY, model_id, &call)
-                .await;
-        }
-
-        // First TEXT block — thinking models lead with a `thinking` block.
-        let text = body["content"]
-            .as_array()
-            .and_then(|arr| arr.iter().find(|b| b["type"] == "text"))
-            .and_then(|b| b["text"].as_str())
-            .unwrap_or("");
 
         // Parse the JSON array from the response (handle markdown fences)
         let clean = text

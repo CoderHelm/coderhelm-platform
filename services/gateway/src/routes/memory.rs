@@ -563,41 +563,26 @@ pub async fn memory_stats(
 /// Longest memory a person can write: memories are short, single facts.
 const MAX_MEMORY_CHARS: usize = 1_000;
 
-async fn embed(state: &AppState, text: &str) -> Result<Vec<f32>, (StatusCode, String)> {
-    let payload = serde_json::json!({ "inputText": text, "dimensions": 1024, "normalize": true });
-    let out = state
-        .bedrock
-        .invoke_model()
-        .model_id("amazon.titan-embed-text-v2:0")
-        .content_type("application/json")
-        .body(aws_smithy_types::Blob::new(
-            serde_json::to_vec(&payload).unwrap_or_default(),
-        ))
-        .send()
+/// The Titan embedding of `text`, metered for `team_id` as CoderHelm's own
+/// cost (`common::embed`).
+async fn embed(
+    state: &AppState,
+    team_id: &str,
+    text: &str,
+) -> Result<Vec<f32>, (StatusCode, String)> {
+    let meter = common::usage::UsageMeter::dynamo(
+        state.dynamo.clone(),
+        &state.config.analytics_table_name,
+        team_id,
+    );
+    common::embed::titan_embed(&state.bedrock, &meter, text)
         .await
         .map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
                 format!("Couldn't read the memory's meaning: {e}"),
             )
-        })?;
-    let body: serde_json::Value = serde_json::from_slice(out.body().as_ref())
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Embedding response: {e}")))?;
-    let v: Vec<f32> = body["embedding"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_f64().map(|f| f as f32))
-                .collect()
         })
-        .unwrap_or_default();
-    if v.is_empty() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            "The embedding came back empty".into(),
-        ));
-    }
-    Ok(v)
 }
 
 fn type_for_topic(topic: &str) -> MemoryType {
@@ -718,7 +703,7 @@ pub async fn create_memory(
     }
     let (owner, name) = parse_repo(&body.repo)?;
     let content = clean_content(&body.content)?;
-    let embedding = embed(&state, &content).await?;
+    let embedding = embed(&state, &claims.team_id, &content).await?;
     let mut tags = common::memory_meta::person_tags(&body.topic, &claims.email, body.pinned);
     tags.push(format!("repo:{owner}/{name}"));
     let memory_type = type_for_topic(&body.topic);
@@ -785,7 +770,7 @@ pub async fn update_memory(
     let content = body.content.as_deref().map(clean_content).transpose()?;
     // Embed before taking the lock, so a slow embedding never holds it.
     let embedding = match &content {
-        Some(c) => Some(embed(&state, c).await?),
+        Some(c) => Some(embed(&state, &claims.team_id, c).await?),
         None => None,
     };
     let editor = claims.email.clone();
@@ -851,7 +836,7 @@ pub async fn preview_recall(
         ));
     }
     let text = common::truncate_str(text, 4_000).to_string();
-    let embedding = embed(&state, &text).await?;
+    let embedding = embed(&state, &claims.team_id, &text).await?;
     let usage = load_usage(&state, &claims.team_id, owner, name).await;
     let (db, dir) = open_db(
         &state.s3,

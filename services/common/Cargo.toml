@@ -14,8 +14,14 @@ ulid = "1"
 tracing = "0.1"
 # alert_notify: Teams cards for alerts
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-tokio = { version = "1", features = ["macros", "time", "net", "rt"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+# model_stream: Anthropic SSE responses read as they arrive
+futures = "0.3"
+# usage: a call whose counters could not be written waits on the tickets queue
+aws-sdk-sqs = "1"
+# embed: Titan embeddings on CoderHelm's own AWS account, metered
+aws-sdk-bedrockruntime = "1"
+tokio = { version = "1", features = ["macros", "time", "net", "rt", "sync"] }
 # live: read-only lookups against a team's own systems
 graphql-parser = "0.4"
 url = "2"
@@ -44,6 +50,6 @@ quick-xml = "0.37"
 
 [dev-dependencies]
 # model_retry: a local fake server in the tests
-tokio = { version = "1", features = ["macros", "time", "net", "rt", "io-util"] }
+tokio = { version = "1", features = ["macros", "time", "net", "rt", "rt-multi-thread", "io-util", "sync"] }
 # live: the ignored tests against a real AWS account
 aws-config = { version = "1", features = ["behavior-version-latest"] }

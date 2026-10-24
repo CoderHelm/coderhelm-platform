@@ -144,8 +144,8 @@ class UsageAccounting(unittest.TestCase):
         self.u.record_usage(Client(), "t", "team1", "log_analysis", "claude-sonnet-5-5", {})  # empty: skipped
         self.assertEqual(len(calls), 1)
         items = calls[0]["TransactItems"]
-        self.assertEqual(len(items), 3)  # month, all time, day
-        upd = items[0]["Update"]
+        self.assertEqual(len(items), 4)  # the once-only marker, month, all time, day
+        upd = items[1]["Update"]
         attrs = {upd["ExpressionAttributeNames"][k]: upd["ExpressionAttributeValues"][k.replace("#a", ":v")]["N"]
                  for k in upd["ExpressionAttributeNames"]}
         self.assertEqual(attrs["total_tokens"], "23")
@@ -162,45 +162,139 @@ class UsageAccounting(unittest.TestCase):
         self.u.record_usage(Broken(), "t", "team1", "log_analysis", "claude-sonnet-5-5", {"input_tokens": 1})
 
 
-class ModelRetryTest(unittest.TestCase):
-    """Transient failures are retried by status; others fail at once."""
+class ModelCallTest(unittest.TestCase):
+    """The Anthropic call is streamed; every attempt is counted, broken ones
+    with the output estimated; transient failures are retried by status."""
 
-    def _opener(self, codes):
+    def setUp(self):
+        import usage
+        self.u = usage
+
+    @staticmethod
+    def ev(v):
+        import json
+        return ("data: " + json.dumps(v) + "\n\n").encode()
+
+    def start(self, inp=10, read=2000):
+        return self.ev({"type": "message_start", "message": {"usage": {
+            "input_tokens": inp, "cache_read_input_tokens": read, "output_tokens": 1}}})
+
+    def text(self, t):
+        return (self.ev({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+                + self.ev({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}}))
+
+    def end(self, out):
+        return (self.ev({"type": "content_block_stop", "index": 0})
+                + self.ev({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": out}}))
+
+    def opener(self, replies):
+        """Each reply: an int status (an HTTPError) or bytes (a 200 stream,
+        which may stop early), or an exception to raise mid-stream after bytes."""
         import io
         from urllib.error import HTTPError
 
         calls = []
 
+        class Resp(io.BytesIO):
+            def __init__(self, body, boom=None, rid=None):
+                super().__init__(body)
+                self.boom = boom
+                self.headers = {"request-id": rid}
+
+            def __iter__(self):
+                for line in self.read().splitlines(keepends=True):
+                    yield line
+                if self.boom:
+                    raise self.boom
+
         def opener(req, timeout=None):
-            code = codes[min(len(calls), len(codes) - 1)]
-            calls.append(code)
-            if code != 200:
-                raise HTTPError("u", code, "x", {}, io.BytesIO(b"error code: 520"))
-            return io.BytesIO(b'{"ok": true}')
+            r = replies[min(len(calls), len(replies) - 1)]
+            calls.append(r)
+            if isinstance(r, int):
+                raise HTTPError("u", r, "x", {}, io.BytesIO(b"error code: 520"))
+            body, boom = r if isinstance(r, tuple) else (r, None)
+            return Resp(body, boom, f"req_{len(calls)}")
 
         return opener, calls
 
+    def client(self):
+        writes = []
+
+        class Client:
+            def transact_write_items(self, **kw):
+                writes.append(kw["TransactItems"])
+
+        return Client(), writes
+
+    def counted(self, items):
+        upd = items[1]["Update"]
+        return {upd["ExpressionAttributeNames"][k]: upd["ExpressionAttributeValues"][k.replace("#a", ":v").replace("#x", ":x")]["N"]
+                for k in upd["ExpressionAttributeNames"]}
+
+    def call(self, replies, backoff=()):
+        opener, calls = self.opener(replies)
+        c, writes = self.client()
+        out = self.u.call_messages("k", {"model": "m", "messages": []}, "claude-sonnet-5-5", c, "t",
+                                   "team1", "log_analysis", backoff=backoff, sleep=lambda s: None,
+                                   opener=opener)
+        return out, calls, writes
+
+    def test_a_whole_reply_is_counted_exactly(self):
+        out, _, writes = self.call([self.start() + self.text("[]") + self.end(42)])
+        self.assertEqual(out["content"][0]["text"], "[]")
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][0]["Put"]["Item"]["team_id"]["S"], "USAGE_CALL#req_1")
+        a = self.counted(writes[0])
+        self.assertEqual(a["total_tokens_out"], "42")
+        self.assertEqual(a["cache_read_tokens"], "2000")
+        self.assertNotIn("estimated_calls", a)
+
+    def test_a_drop_after_message_start_counts_input_and_estimates_output(self):
+        with self.assertRaises(self.u.StreamBroke):
+            self.call([(self.start() + self.text("x" * 30), TimeoutError("read timed out"))])
+
+    def test_a_broken_reply_retried_counts_both_attempts(self):
+        broken = (self.start() + self.text("x" * 30), ConnectionResetError("reset"))
+        out, calls, writes = self.call([broken, self.start() + self.text("[]") + self.end(5)], backoff=(0,))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(writes), 2)
+        first = self.counted(writes[0])
+        self.assertEqual(first["total_tokens_in"], "10")
+        self.assertEqual(first["total_tokens_out"], "10")  # 30 bytes / 3
+        self.assertEqual(first["estimated_calls"], "1")
+        self.assertEqual(self.counted(writes[1])["total_tokens_out"], "5")
+
     def test_a_520_is_retried(self):
-        opener, calls = self._opener([520, 529, 200])
-        body = h.send_with_retry(object(), backoff=(0, 0, 0), sleep=lambda s: None, opener=opener)
-        self.assertEqual(body, b'{"ok": true}')
-        self.assertEqual(calls, [520, 529, 200])
+        out, calls, writes = self.call([520, 529, self.start() + self.end(3)], backoff=(0, 0, 0))
+        self.assertEqual(calls[:2], [520, 529])
+        self.assertEqual(len(writes), 1)  # an error status is not billed
 
     def test_a_client_error_is_not_retried(self):
         from urllib.error import HTTPError
 
-        opener, calls = self._opener([400, 200])
         with self.assertRaises(HTTPError):
-            h.send_with_retry(object(), backoff=(0, 0), sleep=lambda s: None, opener=opener)
-        self.assertEqual(calls, [400])
+            self.call([400, 200], backoff=(0, 0))
 
     def test_statuses(self):
         for c in (408, 429, 500, 502, 503, 504, 520, 524, 529):
-            self.assertTrue(h.is_transient_status(c), c)
+            self.assertTrue(self.u.is_transient_status(c), c)
         for c in (200, 400, 401, 404, 413):
-            self.assertFalse(h.is_transient_status(c), c)
+            self.assertFalse(self.u.is_transient_status(c), c)
 
+    def test_a_replayed_call_is_counted_once(self):
+        class Cancelled(Exception):
+            response = {"CancellationReasons": [{"Code": "ConditionalCheckFailed"}, {"Code": "None"}]}
 
+        tries = []
+
+        class Client:
+            def transact_write_items(self, **kw):
+                tries.append(kw)
+                raise Cancelled()
+
+        self.u.record_call(Client(), "t", "team1", "log_analysis", "m",
+                           self.u.call_usage({"input_tokens": 1}), call_id="req_1", sleep=lambda s: None)
+        self.assertEqual(len(tries), 1, "already counted: not retried, not logged as lost")
 class Slack(unittest.TestCase):
     SLACK = "https://hooks.slack.com/services/T0001/B0001/abcdefghijklmnop"
     TEAMS = "https://prod-1.westus.logic.azure.com/workflows/t"
