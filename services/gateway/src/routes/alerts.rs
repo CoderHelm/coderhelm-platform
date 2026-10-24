@@ -685,8 +685,78 @@ async fn handle_notification(
     };
     let repo = rule.map(|r| r.repo.as_str()).unwrap_or("");
     record_event(state, msg, route, repo, &alert, &tid, outcome).await;
+    if alert.actionable && alert.recovers.is_none() && !repo.is_empty() {
+        link_incident(state, &route.team_id, repo, &alert).await;
+    }
     notify_channels(state, msg, route, repo, &alert, outcome, opened.as_ref()).await;
     result.map(|_| StatusCode::OK)
+}
+
+/// When an alert names a merged CoderHelm pull request of `repo` (its URL
+/// or its merge commit, as deploy markers print them), records the incident
+/// against that change. Only runs the repo's latest 50 are looked at.
+async fn link_incident(state: &AppState, team_id: &str, repo: &str, alert: &Alert) {
+    use common::rewards::mapping::{alert_pr_refs, alert_sha_refs, sha_matches};
+    let text = format!("{}\n{}", alert.title, alert.body);
+    let prs = alert_pr_refs(&text, repo);
+    let shas = alert_sha_refs(&text);
+    if prs.is_empty() && shas.is_empty() {
+        return;
+    }
+    let Ok(out) = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .index_name("repo-index")
+        .key_condition_expression("team_repo = :tr")
+        .filter_expression("pr_outcome = :m")
+        .expression_attribute_values(":tr", attr_s(&format!("{team_id}#{repo}")))
+        .expression_attribute_values(":m", attr_s("merged"))
+        .scan_index_forward(false)
+        .limit(50)
+        .send()
+        .await
+    else {
+        return;
+    };
+    for run in out.items() {
+        let get = |k: &str| {
+            run.get(k)
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let pr: u64 = run
+            .get("pr_number")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let merge_sha = get("merge_commit_sha");
+        let named =
+            (pr > 0 && prs.contains(&pr)) || shas.iter().any(|s| sha_matches(s, &merge_sha));
+        if !named {
+            continue;
+        }
+        let run_id = get("run_id");
+        let mut ev = common::rewards::RewardEvent::new(
+            team_id,
+            common::rewards::RewardKind::IncidentLinked,
+            common::rewards::event::AGENT_CODER,
+            &chrono::Utc::now().to_rfc3339(),
+            &format!("incident#{}#{run_id}", alert.fingerprint),
+        )
+        .with_repo(repo, pr)
+        .with_detail(&format!("Alert \"{}\" names PR #{pr}", alert.title))
+        .with_source("alerts:sns");
+        ev.run_id = run_id;
+        let store =
+            common::rewards::store::Store::new(&state.dynamo, &state.config.settings_table_name);
+        if let Err(e) = store.record(&ev).await {
+            warn!(error = %e, "Could not record the alert against the change");
+        } else {
+            info!(team_id, repo, pr, "Alert tied to a merged CoderHelm change");
+        }
+    }
 }
 
 /// Pure: the card's line on what CoderHelm did. None = don't notify (a repeat

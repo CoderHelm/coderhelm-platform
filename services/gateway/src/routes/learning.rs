@@ -78,7 +78,8 @@ pub async fn get_learning(
             .map_err(internal)?;
         arms.push((agent.to_string(), st.pin(team, agent).await, stats));
     }
-    let can_manage = crate::permissions::role_level(&claims.role) >= 3;
+    // Custom roles included: whoever holds the "learning" capability.
+    let can_manage = claims.holder().holds("learning");
     Ok(Json(summary::build(&summary::Inputs {
         team_id: team,
         days,

@@ -2731,6 +2731,28 @@ impl GitHubClient {
             .unwrap_or_default())
     }
 
+    /// Lines added plus removed between two commits (the compare's files).
+    pub async fn compare_line_changes(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/compare/{base}...{head}");
+        let data = self.get(&url).await?;
+        Ok(data["files"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|f| {
+                        f["additions"].as_u64().unwrap_or(0) + f["deletions"].as_u64().unwrap_or(0)
+                    })
+                    .sum()
+            })
+            .unwrap_or(0))
+    }
+
     /// Find the most recent closed-but-unmerged PR for a head branch.
     /// A branch force-reset to base auto-closes its PR ("all commits
     /// removed"); reopening that PR preserves its number, comments, and

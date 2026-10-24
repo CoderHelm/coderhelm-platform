@@ -1460,6 +1460,15 @@ pub async fn re_review(
         requested_by: String::new(),
     });
     super::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &message).await?;
+    super::github_webhook::record_rereview(
+        &state,
+        &claims.team_id,
+        owner,
+        name,
+        body.pr,
+        &format!("dashboard#{window}"),
+    )
+    .await;
     info!(
         owner,
         name,
