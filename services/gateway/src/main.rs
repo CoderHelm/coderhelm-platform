@@ -290,6 +290,12 @@ async fn main() -> Result<(), Error> {
             "/reviewer/lessons",
             get(routes::review_lessons::list_lessons).delete(routes::review_lessons::delete_lesson),
         )
+        // What CoderHelm learned from outcomes, and the admin controls
+        .route("/learning", get(routes::learning::get_learning))
+        .route("/learning/pin", post(routes::learning::pin_variant))
+        .route("/learning/revert", post(routes::learning::revert_change))
+        .route("/learning/restore", post(routes::learning::restore_change))
+        .route("/learning/weights", put(routes::learning::put_weights))
         .route("/releases", get(routes::reviewer::list_releases))
         .route("/releases/send", post(routes::reviewer::send_release))
         .route("/releases/pending", get(routes::reviewer::pending_releases))
