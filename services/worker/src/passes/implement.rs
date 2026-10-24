@@ -652,6 +652,12 @@ pub async fn run(
         &tasks_key,
         &plan.tasks,
     );
+    // Knowledge bases the team attached to the coder.
+    let knowledge = super::knowledge::KnowledgeTools::load(state, &msg.team_id, "coder").await;
+    if let Some(k) = &knowledge {
+        tools.extend(k.tools());
+        full_system.push_str(&k.prompt_section());
+    }
     let executor = CombinedWriteToolExecutor {
         write_executor: WriteToolExecutor {
             github,
@@ -689,6 +695,7 @@ pub async fn run(
         ops: ops.as_ref(),
         live: live.as_ref(),
         skills: skills.as_ref(),
+        knowledge: knowledge.as_ref(),
         web: Some(&web),
         state,
     };
@@ -2400,6 +2407,8 @@ struct CombinedWriteToolExecutor<'a> {
     web: Option<&'a super::web_check::WebCheck>,
     /// The team's written skills, read-only.
     skills: Option<&'a super::skills::TeamSkills>,
+    /// Knowledge bases attached to the coder.
+    knowledge: Option<&'a super::knowledge::KnowledgeTools>,
     state: &'a WorkerState,
 }
 
@@ -2410,6 +2419,11 @@ impl<'a> ToolExecutor for CombinedWriteToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(k) = self.knowledge {
+            if let Some(out) = k.handle(self.state, name, input).await {
+                return Ok(serde_json::json!(out));
+            }
+        }
         if let Some(history) = self.history {
             if let Some(out) = history
                 .handle(self.state, self.write_executor.github, name, input)

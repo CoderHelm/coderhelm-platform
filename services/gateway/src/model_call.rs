@@ -1,4 +1,4 @@
-//! The gateway's model calls (plan chat), every one metered.
+//! The gateway's model calls (plan chat and the brain chat), every one metered.
 //!
 //! The only gateway file allowed to call a model (a test in
 //! `common::model_call_sites` holds it to that). Each call is streamed and
@@ -61,6 +61,28 @@ pub async fn open_chat_stream(
     meter: &UsageMeter,
     model_id: &str,
 ) -> Result<(reqwest::Response, InFlight), ModelCallError> {
+    open_stream(http, api_key, body, meter, model_id, feature::CHAT).await
+}
+
+/// [`open_chat_stream`] for the brain chat: recorded under feature `brain`.
+pub async fn open_brain_stream(
+    http: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+    meter: &UsageMeter,
+    model_id: &str,
+) -> Result<(reqwest::Response, InFlight), ModelCallError> {
+    open_stream(http, api_key, body, meter, model_id, feature::BRAIN).await
+}
+
+async fn open_stream(
+    http: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+    meter: &UsageMeter,
+    model_id: &str,
+    feature_tag: &'static str,
+) -> Result<(reqwest::Response, InFlight), ModelCallError> {
     let bytes = serde_json::to_vec(body).unwrap_or_default();
     let resp = common::model_retry::send_streaming(
         || {
@@ -80,7 +102,7 @@ pub async fn open_chat_stream(
         .get("request-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
-    let flight = with_feature(feature::CHAT, async {
+    let flight = with_feature(feature_tag, async {
         InFlight::new(meter, model_id, request_id, bytes.len() as u64)
     })
     .await;

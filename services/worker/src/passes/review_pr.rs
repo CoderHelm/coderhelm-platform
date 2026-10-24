@@ -1021,6 +1021,12 @@ async fn run_once(
                 super::code_graph::prompt_line(super::code_graph::Role::Reviewer)
             )
         };
+        let knowledge =
+            super::knowledge::KnowledgeTools::load(state, &msg.team_id, "reviewer").await;
+        let system = match &knowledge {
+            Some(k) => format!("{system}{}", k.prompt_section()),
+            None => system,
+        };
         let executor = review_agent::PrReviewToolExecutor {
             github: &github,
             owner: &msg.repo_owner,
@@ -1033,8 +1039,12 @@ async fn run_once(
             live: live.as_ref(),
             skills: skills.as_ref(),
             web: Some(&web),
+            knowledge: knowledge.as_ref(),
         };
         let mut tools = review_agent::review_tools();
+        if let Some(k) = &knowledge {
+            tools.extend(k.tools());
+        }
         tools.push(super::github_history::tool());
         tools.push(super::web_check::tool());
         tools.extend(graph_tools);
@@ -1545,6 +1555,8 @@ async fn run_once(
     };
     let extra_context = format!("{extra_context}{agent_notes}");
 
+    // Knowledge bases the team attached to the reviewer.
+    let knowledge = super::knowledge::KnowledgeTools::load(state, &msg.team_id, "reviewer").await;
     // 1) High-recall generation with repo-walking tools.
     let output = review_agent::generate_review(
         state,
@@ -1565,6 +1577,7 @@ async fn run_once(
         live.as_ref(),
         skills.as_ref(),
         Some(&web),
+        knowledge.as_ref(),
         &mut usage,
     )
     .await;

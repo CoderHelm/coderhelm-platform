@@ -113,6 +113,18 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     Capability {
+        key: "brain_read",
+        label: "Read knowledge bases open to their role and threads shared with the team",
+        min_role: "viewer",
+        handlers: &[
+            "knowledge::list_bases",
+            "knowledge::get_base",
+            "brain::list_threads",
+            "brain::get_thread",
+            "brain::sources",
+        ],
+    },
+    Capability {
         key: "view_team",
         label: "See who is on the team",
         min_role: "viewer",
@@ -131,6 +143,17 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     // ── Members ─────────────────────────────────────────────────────
+    Capability {
+        key: "brain_ask",
+        label: "Ask the company brain, attach files to a question, and rename, share or delete their own threads",
+        min_role: "member",
+        handlers: &[
+            "brain::brain_stream",
+            "brain::create_attachment",
+            "brain::update_thread",
+            "brain::delete_thread",
+        ],
+    },
     Capability {
         key: "plans",
         label: "Create, edit, approve and run plans and templates",
@@ -213,6 +236,19 @@ pub const CAPABILITIES: &[Capability] = &[
         handlers: &["integrations::list"],
     },
     // ── Admins ──────────────────────────────────────────────────────
+    Capability {
+        key: "knowledge_manage",
+        label: "Create, change and delete knowledge bases, upload and remove their files, and attach them to agents",
+        min_role: "admin",
+        handlers: &[
+            "knowledge::create_base",
+            "knowledge::update_base",
+            "knowledge::delete_base",
+            "knowledge::start_upload",
+            "knowledge::finish_upload",
+            "knowledge::delete_file",
+        ],
+    },
     Capability {
         key: "people",
         label: "Invite people, resend or revoke any pending invite, link GitHub accounts, and change or remove members and viewers",

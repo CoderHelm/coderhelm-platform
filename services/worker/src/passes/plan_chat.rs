@@ -49,6 +49,10 @@ pub struct Request {
     pub reads_used: usize,
     #[serde(default)]
     pub asks_used: usize,
+    /// "brain" when the brain chat asks: its calls are metered as the
+    /// brain's, and it searches knowledge bases itself (no knowledge tool here).
+    #[serde(default)]
+    pub feature: String,
 }
 
 /// Where the chat's records say they came from.
@@ -67,6 +71,8 @@ struct Loaded {
     ops: Option<OpsTools>,
     /// The code graph of the chat's repository (and the team's others).
     graphs: Option<RepoGraphs>,
+    /// Knowledge bases attached to the plan chat.
+    knowledge: Option<super::knowledge::KnowledgeTools>,
 }
 
 async fn load(state: &WorkerState, req: &Request) -> Loaded {
@@ -99,11 +105,17 @@ async fn load(state: &WorkerState, req: &Request) -> Loaded {
     } else {
         None
     };
+    let knowledge = if req.feature == "brain" {
+        None
+    } else {
+        super::knowledge::KnowledgeTools::load(state, &req.team_id, "plan_chat").await
+    };
     Loaded {
         skills,
         live,
         ops,
         graphs,
+        knowledge,
     }
 }
 
@@ -120,6 +132,9 @@ fn defs(l: &Loaded) -> Vec<ToolDefinition> {
     }
     if let Some(g) = &l.graphs {
         tools.extend(g.tools());
+    }
+    if let Some(k) = &l.knowledge {
+        tools.extend(k.tools());
     }
     tools.retain(|t| !writes(&t.name));
     tools
@@ -216,6 +231,9 @@ pub async fn handle(state: &WorkerState, req: Request) -> Value {
             if let Some(o) = &l.ops {
                 prompt.push_str(&o.prompt_section());
             }
+            if let Some(k) = &l.knowledge {
+                prompt.push_str(&k.prompt_section());
+            }
             if l.graphs.as_ref().is_some_and(|g| !g.tools().is_empty()) {
                 prompt.push_str(super::code_graph::prompt_line(
                     super::code_graph::Role::Planner,
@@ -284,6 +302,11 @@ async fn call(state: &WorkerState, req: &Request, l: &Loaded) -> Value {
             return json!({ "text": text, "used": used });
         }
     }
+    if let Some(k) = &l.knowledge {
+        if let Some(text) = k.handle(state, name, input).await {
+            return json!({ "text": text, "used": used("source", "Knowledge bases", "/brain/knowledge") });
+        }
+    }
     let sources = Sources {
         live: l.live.as_ref(),
         ops: l.ops.as_ref(),
@@ -344,6 +367,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!((r.reads_used, r.asks_used, r.record_applied), (0, 0, false));
+        assert_eq!(r.feature, "");
         assert_eq!(origin(" c1 "), "plan chat c1");
     }
 

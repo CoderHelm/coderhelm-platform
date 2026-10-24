@@ -883,6 +883,55 @@ pub async fn preview_recall(
 /// Matches the worker's MIN_RELEVANCE.
 const RECALL_FLOOR: f32 = 0.02;
 
+/// One memory the brain chat recalled: its text and when it was learned.
+pub(crate) struct Recalled {
+    pub content: String,
+    pub created: String,
+    pub id: String,
+}
+
+/// The team's memories of `repo` closest to `text` (at most `k`), for the
+/// brain chat. Read-only: the snapshot is opened and closed, never written.
+pub(crate) async fn recall_for_brain(
+    state: &AppState,
+    team_id: &str,
+    repo: &str,
+    text: &str,
+    k: usize,
+) -> Result<Vec<Recalled>, String> {
+    let (owner, name) = parse_repo(repo).map_err(|(_, m)| m)?;
+    let text = common::truncate_str(text.trim(), 4_000).to_string();
+    let embedding = embed(state, team_id, &text).await.map_err(|(_, m)| m)?;
+    let (db, dir) = open_db(&state.s3, &state.config.bucket_name, team_id, owner, name)
+        .await
+        .map_err(|(_, m)| m)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    let mut out = Vec::new();
+    if let Ok(results) = db.recall_hybrid_at(&embedding, Some(&text), k, now, None, None, None) {
+        for (id, score) in results {
+            if score < RECALL_FLOOR {
+                continue;
+            }
+            if let Ok(node) = db.get_memory(id) {
+                let created = chrono::DateTime::from_timestamp_micros(node.created_at as i64)
+                    .map(|t| t.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                out.push(Recalled {
+                    content: node.content.clone(),
+                    created,
+                    id: id.to_string(),
+                });
+            }
+        }
+    }
+    let _ = db.close();
+    cleanup(&dir);
+    Ok(out)
+}
+
 // ── Agent profiles ──────────────────────────────────────────────────────────
 
 /// One line in "what it knows".

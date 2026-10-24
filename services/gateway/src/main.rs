@@ -411,6 +411,39 @@ async fn main() -> Result<(), Error> {
             "/plans",
             get(routes::plans::list_plans).post(routes::plans::create_plan),
         )
+        // Knowledge bases (admins manage; readers see what their role may read)
+        .route(
+            "/knowledge",
+            get(routes::knowledge::list_bases).post(routes::knowledge::create_base),
+        )
+        .route(
+            "/knowledge/:kb_id",
+            get(routes::knowledge::get_base)
+                .put(routes::knowledge::update_base)
+                .delete(routes::knowledge::delete_base),
+        )
+        .route(
+            "/knowledge/:kb_id/files",
+            post(routes::knowledge::start_upload),
+        )
+        .route(
+            "/knowledge/:kb_id/files/:file_id/uploaded",
+            post(routes::knowledge::finish_upload),
+        )
+        .route(
+            "/knowledge/:kb_id/files/:file_id",
+            delete(routes::knowledge::delete_file),
+        )
+        // The company brain chat (asking streams from /api/brain/stream)
+        .route("/brain/threads", get(routes::brain::list_threads))
+        .route(
+            "/brain/threads/:thread_id",
+            get(routes::brain::get_thread)
+                .put(routes::brain::update_thread)
+                .delete(routes::brain::delete_thread),
+        )
+        .route("/brain/sources", get(routes::brain::sources))
+        .route("/brain/attachments", post(routes::brain::create_attachment))
         .route("/plans/chat", post(routes::plans::plan_chat))
         .route("/plans/chat/token", post(routes::plans::stream_token))
         // Template endpoints (must be before /plans/:plan_id to avoid wildcard capture)
@@ -768,6 +801,7 @@ async fn main() -> Result<(), Error> {
             "/api/plans/chat/stream",
             post(routes::plans::plan_chat_stream),
         )
+        .route("/api/brain/stream", post(routes::brain::brain_stream))
         .nest("/webhooks", webhook_routes)
         .route(
             "/integrations/jira/forge-register",

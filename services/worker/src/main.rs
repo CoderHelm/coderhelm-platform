@@ -81,7 +81,8 @@ async fn main() -> Result<(), Error> {
 }
 
 /// An SQS batch (the queues), or a direct call from the gateway: the plan
-/// chat's skills, agents and data source tools, answered right away.
+/// chat's (and brain chat's) skills, agents and data source tools, answered
+/// right away, or a knowledge base file to read.
 async fn handle_event(
     state: Arc<WorkerState>,
     event: LambdaEvent<serde_json::Value>,
@@ -94,8 +95,19 @@ async fn handle_event(
     ));
     let out = if let Some(req) = payload.get("plan_chat") {
         let req: passes::plan_chat::Request = serde_json::from_value(req.clone())?;
+        // The brain chat uses the same tools; its calls count as the brain's.
+        let feature = if req.feature == "brain" {
+            common::usage::feature::BRAIN
+        } else {
+            common::usage::feature::CHAT
+        };
         let call = passes::plan_chat::handle(&state, req);
-        Ok(common::usage::with_feature(common::usage::feature::CHAT, call).await)
+        Ok(common::usage::with_feature(feature, call).await)
+    } else if let Some(req) = payload.get("knowledge_ingest") {
+        // A knowledge base file the browser finished uploading (called
+        // asynchronously by the gateway).
+        let req: passes::knowledge::IngestRequest = serde_json::from_value(req.clone())?;
+        Ok(passes::knowledge::ingest(&state, req).await)
     } else {
         let sqs: SqsEvent = serde_json::from_value(payload)?;
         handle_sqs(state, LambdaEvent::new(sqs, context))

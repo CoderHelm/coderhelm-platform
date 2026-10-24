@@ -47,6 +47,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 serde_yaml = "0.9"
 # e2e: JUnit XML test reports
 quick-xml = "0.37"
+aws-sdk-s3 = "1"
+lopdf = { version = "0.46", default-features = false }
 
 [dev-dependencies]
 # model_retry: a local fake server in the tests
