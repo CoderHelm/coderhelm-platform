@@ -8,7 +8,8 @@
     "cdk": "cdk",
     "synth": "cdk synth",
     "deploy": "cdk deploy --all",
-    "diff": "cdk diff"
+    "diff": "cdk diff",
+    "test": "rm -rf dist && tsc && node --test \"dist/test/**/*.test.js\""
   },
   "dependencies": {
     "aws-cdk-lib": "^2.247.0",
