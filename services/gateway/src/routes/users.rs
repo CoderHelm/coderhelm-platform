@@ -555,7 +555,7 @@ pub async fn get_permissions(
             .map(|c| c.key)
             .collect::<Vec<_>>(),
         "grantable_roles": grantable,
-        "can_manage_invites": permissions::can_manage_invites(&claims.role),
+        "can_manage_invites": holder.holds("people"),
         "can_manage_roles": manages_roles,
         "manageable_roles": manageable,
     })))
@@ -569,7 +569,8 @@ pub async fn list_users(
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, ApiError> {
     let items = team_items(&state, &claims.team_id).await?;
-    let show_invites = permissions::can_manage_invites(&claims.role);
+    // Whoever holds `people` handles invites, whatever role this read runs as.
+    let show_invites = claims.holder().holds("people");
     let now = chrono::Utc::now();
     let mut users: Vec<Value> = items
         .iter()
@@ -1758,11 +1759,11 @@ mod tests {
                 StatusCode::FORBIDDEN,
                 "{role:?}"
             );
-            assert!(!permissions::can_manage_invites(role));
+            assert!(!permissions::Holder::builtin(role).holds("people"));
         }
         for role in ["admin", "owner"] {
             assert!(require_admin(&claims("USER#me", role)).is_ok());
-            assert!(permissions::can_manage_invites(role));
+            assert!(permissions::Holder::builtin(role).holds("people"));
         }
     }
 

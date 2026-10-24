@@ -178,6 +178,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "reviewer::rate_review",
             "reviewer::send_release",
             "reviewer::release_now",
+            "reviewer::control_gate",
         ],
     },
     Capability {
@@ -418,6 +419,14 @@ pub const CAPABILITIES: &[Capability] = &[
         min_role: "admin",
         handlers: &["api::update_budget"],
     },
+    Capability {
+        key: "support",
+        label: "Let Coderhelm support into the workspace, and manage every support ticket the team files",
+        min_role: "admin",
+        // Enforced inside the support handlers by the built-in role, so it
+        // stays with built-in admins and owners (`NEVER_IN_CUSTOM_ROLES`).
+        handlers: &[],
+    },
     // ── Owners ──────────────────────────────────────────────────────
     Capability {
         key: "manage_admins",
@@ -454,13 +463,6 @@ pub fn can_manage(actor_role: &str, target_role: &str) -> bool {
     actor >= 4 || (actor >= 3 && role_level(target_role) <= 2)
 }
 
-/// May `actor_role` see, resend and revoke pending invites? Any admin or owner,
-/// for every invite: an invite grants nothing until it is accepted, so this is
-/// not limited by the role the invite offers (unlike `can_manage`).
-pub fn can_manage_invites(actor_role: &str) -> bool {
-    role_level(actor_role) >= 3
-}
-
 /// May `actor_role` give someone `new_role`? Same split as `can_manage`.
 pub fn can_grant(actor_role: &str, new_role: &str) -> bool {
     VALID_ROLES.contains(&new_role) && can_manage(actor_role, new_role)
@@ -490,8 +492,9 @@ pub fn grantable_roles(actor_role: &str) -> Vec<&'static str> {
 pub const CUSTOM_PREFIX: &str = "custom:";
 
 /// Capabilities a custom role can never hold, whatever the table says about
-/// them: managing roles stays with built-in admins and owners.
-pub const NEVER_IN_CUSTOM_ROLES: &[&str] = &["roles"];
+/// them: managing roles, and support (checked by built-in role inside the
+/// support handlers), stay with built-in admins and owners.
+pub const NEVER_IN_CUSTOM_ROLES: &[&str] = &["roles", "support"];
 
 /// The id in a `custom:<id>` role, or `None` for a built-in role.
 pub fn custom_role_id(role: &str) -> Option<&str> {
@@ -825,6 +828,7 @@ mod tests {
         push("if !is_admin_or_owner(&claims.role) {", 3);
         push("admin(&claims)?", 3);
         push("role_manager(&claims)?", 3);
+        push("authorize_gate_control(claims.role_level()", 1);
         push(
             "if claims.role != \"owner\" && claims.role != \"admin\" {",
             3,
@@ -1017,7 +1021,7 @@ mod tests {
         let everything = custom(&all);
         for cap in CAPABILITIES {
             let owner_only = role_level(cap.min_role) >= role_level("owner");
-            if owner_only || cap.key == "roles" {
+            if owner_only || NEVER_IN_CUSTOM_ROLES.contains(&cap.key) {
                 assert!(!customizable(cap), "{}", cap.key);
                 assert!(!everything.holds(cap.key), "{}", cap.key);
                 for h in cap.handlers {
@@ -1088,6 +1092,28 @@ mod tests {
         // Every custom role fits inside a built-in admin.
         let all: Vec<&str> = CAPABILITIES.iter().map(|c| c.key).collect();
         assert!(within(&admin, &custom(&all).caps));
+    }
+
+    #[test]
+    fn checks_inside_handlers_follow_the_capability_too() {
+        // The auto-merge gate's control runs as a member for a role holding
+        // reviews, whatever its floor, and is refused without it.
+        let reviewer = custom(&["reviews"]);
+        assert_eq!(reviewer.floor(), "viewer");
+        assert_eq!(
+            resolve_access(&reviewer, Some("reviewer::control_gate")),
+            Access::Allow {
+                effective_role: "member"
+            }
+        );
+        assert!(matches!(
+            resolve_access(&custom(&["repos"]), Some("reviewer::control_gate")),
+            Access::Deny { .. }
+        ));
+        // Support stays with built-in admins and owners.
+        assert!(!customizable(capability("support").unwrap()));
+        assert!(!custom(&["support"]).holds("support"));
+        assert!(Holder::builtin("admin").holds("support"));
     }
 
     #[test]
@@ -1162,11 +1188,11 @@ mod tests {
 
         // Invites are not seats: an admin manages every pending invite,
         // including an admin invite an owner sent.
-        assert!(can_manage_invites("admin"));
-        assert!(can_manage_invites("owner"));
-        assert!(!can_manage_invites("billing"));
-        assert!(!can_manage_invites("member"));
-        assert!(!can_manage_invites("viewer"));
+        assert!(Holder::builtin("admin").holds("people"));
+        assert!(Holder::builtin("owner").holds("people"));
+        assert!(!Holder::builtin("billing").holds("people"));
+        assert!(!Holder::builtin("member").holds("people"));
+        assert!(!Holder::builtin("viewer").holds("people"));
     }
 
     #[test]

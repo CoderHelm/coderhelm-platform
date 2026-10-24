@@ -932,7 +932,8 @@ pub async fn get_gate(
         live.as_ref(),
         now,
     );
-    out["can_control"] = json!(claims.role_level() >= 1);
+    // From what the person holds, not the role this read runs as.
+    out["can_control"] = json!(claims.holder().holds("reviews"));
     Ok(Json(out))
 }
 

@@ -301,7 +301,7 @@ pub async fn list(
         return Err(fail(code, "Ask a member of the team to open this page."));
     }
     let team = claims.team_id.clone();
-    let can_edit = crate::permissions::role_level(&claims.role) >= 3;
+    let can_edit = claims.holder().holds("integrations");
 
     // AWS accounts: fold old connections in, then check stale ones.
     let mut accounts =
