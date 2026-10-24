@@ -327,7 +327,7 @@ pub async fn list_threads(
     threads.truncate(200);
     Ok(Json(json!({
         "threads": threads.iter().map(|t| thread_json(t, &claims.sub)).collect::<Vec<_>>(),
-        "can_ask": kb::role_level(&claims.role) >= 1,
+        "can_ask": claims.holder().holds("brain_ask"),
     })))
 }
 
@@ -349,7 +349,7 @@ pub async fn get_thread(
     Ok(Json(json!({
         "thread": thread_json(&t, &claims.sub),
         "messages": messages,
-        "can_ask": can_write(&t, &claims.sub) && kb::role_level(&claims.role) >= 1,
+        "can_ask": can_write(&t, &claims.sub) && claims.holder().holds("brain_ask"),
     })))
 }
 
@@ -495,7 +495,7 @@ pub async fn sources(
     for b in bases
         .map_err(|e| internal("knowledge bases", e))?
         .into_iter()
-        .filter(|b| b.readable_by(&claims.role))
+        .filter(|b| b.readable_by(super::knowledge::reader_role(&claims.holder())))
     {
         let files = st.files(&claims.team_id, &b.id).await.unwrap_or_default();
         let ready = files.iter().filter(|f| f.ready_version > 0).count();
@@ -516,8 +516,32 @@ pub async fn sources(
         "knowledge": knowledge,
         "connections": connections,
         "repos": repo_names,
-        "can_ask": kb::role_level(&claims.role) >= 1,
+        "can_ask": claims.holder().holds("brain_ask"),
     })))
+}
+
+/// POST /api/brain/token — a five-minute token for `/api/brain/stream`,
+/// minted only for someone holding `brain_ask` (the auth middleware decides
+/// this route from its capability). Its audience is the brain's own, so it
+/// is never accepted as a session or a plan chat token.
+pub async fn stream_token(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    if claims.require_role(1).is_err() {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "Your role can't ask the brain.",
+        ));
+    }
+    let token = crate::auth::jwt::create_scoped_token(
+        &claims,
+        crate::auth::jwt::BRAIN_AUDIENCE,
+        &state.secrets.jwt_secret,
+        300,
+    )
+    .map_err(|e| internal("brain token", e.to_string()))?;
+    Ok(Json(json!({ "token": token })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1061,7 +1085,9 @@ async fn connection_tools(state: &AppState, team_id: &str) -> Vec<Value> {
 /// POST /api/brain/stream — ask a question; the answer streams back as
 /// server-sent events (`thread`, `retrieved`, `tool_start`, `tool_result`,
 /// `text_delta`, `answer`, `done`, or `error`). Authorized by the short-lived
-/// token from `/api/plans/chat/token`.
+/// token from `/api/brain/token` (its own audience); what the asker holds
+/// is read again here, so the stream is decided by capability like every
+/// other route.
 #[allow(clippy::type_complexity)]
 pub async fn brain_stream(
     State(state): State<Arc<AppState>>,
@@ -1080,14 +1106,23 @@ pub async fn brain_stream(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "Sign in again."))?;
-    let claims = crate::auth::jwt::validate_token(token, &state.secrets.jwt_secret)
-        .map_err(|_| fail(StatusCode::UNAUTHORIZED, "Sign in again."))?;
-    if claims.require_role(1).is_err() {
+    let mut claims = crate::auth::jwt::validate_scoped_token(
+        token,
+        crate::auth::jwt::BRAIN_AUDIENCE,
+        &state.secrets.jwt_secret,
+    )
+    .map_err(|_| fail(StatusCode::UNAUTHORIZED, "Sign in again."))?;
+    // The token carries the member's stored role; what it holds is read now,
+    // so a role changed since the token was minted is honored.
+    let holder = super::roles::holder_for(&state, &claims).await;
+    if !holder.holds("brain_ask") {
         return Err(fail(
             StatusCode::FORBIDDEN,
-            "Viewers can read shared threads but can't ask.",
+            "Your role can read shared threads but can't ask the brain.",
         ));
     }
+    let reader = super::knowledge::reader_role(&holder);
+    claims.role = holder.floor().to_string();
     let question = body.question.trim().to_string();
     if question.is_empty() || question.chars().count() > MAX_QUESTION_CHARS {
         return Err(fail(
@@ -1136,7 +1171,7 @@ pub async fn brain_stream(
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|b| b.readable_by(&claims.role) && picks.knowledge.contains(&b.id))
+        .filter(|b| b.readable_by(reader) && picks.knowledge.contains(&b.id))
         .map(|b| b.id)
         .collect();
     let repos = load_repos(&state, &claims.team_id).await;

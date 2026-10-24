@@ -443,6 +443,7 @@ async fn main() -> Result<(), Error> {
                 .delete(routes::brain::delete_thread),
         )
         .route("/brain/sources", get(routes::brain::sources))
+        .route("/brain/token", post(routes::brain::stream_token))
         .route("/brain/attachments", post(routes::brain::create_attachment))
         .route("/plans/chat", post(routes::plans::plan_chat))
         .route("/plans/chat/token", post(routes::plans::stream_token))
