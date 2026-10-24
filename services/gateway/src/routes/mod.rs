@@ -25,6 +25,7 @@ pub mod plans;
 pub mod plugins;
 pub mod review_lessons;
 pub mod reviewer;
+pub mod roles;
 pub mod run_close;
 pub mod run_search;
 pub mod search;

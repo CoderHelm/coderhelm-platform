@@ -21,6 +21,7 @@ pub fn create_token(
         iat: now,
         exp: now + ttl_secs,
         support_view: None,
+        custom: None,
     };
     encode(
         &Header::default(),

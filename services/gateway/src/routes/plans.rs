@@ -1976,11 +1976,13 @@ pub async fn stream_token(
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(1)?; // member+ (viewers are read-only)
                              // Mint a short-lived token (5 minutes) scoped for streaming
+                             // The record's role, never the role this request runs as: the token
+                             // must not carry more than the member's own role.
     let token = crate::auth::jwt::create_token(
         &claims.sub,
         &claims.team_id,
         &claims.email,
-        &claims.role,
+        claims.session_role(),
         claims.github_login.as_deref(),
         &state.secrets.jwt_secret,
         300, // 5 minutes

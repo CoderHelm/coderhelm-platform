@@ -52,7 +52,7 @@ pub async fn summary(
         )
     };
     let skills = st.access_counts(&since).await.map_err(failed)?;
-    let lookups = if matches!(claims.role.as_str(), "admin" | "owner") {
+    let lookups = if claims.holder().holds("data_sources") {
         let (ok, refused, failed_n) =
             common::live::store::count_activity(&state.dynamo, table, &claims.team_id, &since)
                 .await

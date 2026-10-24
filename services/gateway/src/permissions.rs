@@ -8,6 +8,8 @@
 //! actually enforces.
 
 use serde::Serialize;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::OnceLock;
 
 /// Numeric role level: owner=4, admin=3, billing=2, member=1, viewer=0.
 /// Unknown roles get the lowest level.
@@ -74,7 +76,7 @@ pub const ROLES: &[RoleInfo] = &[
     },
 ];
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capability {
     pub key: &'static str,
     pub label: &'static str,
@@ -82,7 +84,6 @@ pub struct Capability {
     pub min_role: &'static str,
     /// Route handlers (`file::function`) whose role check this row describes.
     #[serde(skip)]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub handlers: &'static [&'static str],
 }
 
@@ -115,7 +116,7 @@ pub const CAPABILITIES: &[Capability] = &[
         key: "view_team",
         label: "See who is on the team",
         min_role: "viewer",
-        handlers: &["users::list_users"],
+        handlers: &["users::list_users", "roles::list_roles"],
     },
     Capability {
         key: "own_account",
@@ -177,6 +178,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "reviewer::rate_review",
             "reviewer::send_release",
             "reviewer::release_now",
+            "reviewer::control_gate",
         ],
     },
     Capability {
@@ -221,6 +223,19 @@ pub const CAPABILITIES: &[Capability] = &[
             "users::update_role",
             "users::remove_user",
             "users::link_github",
+        ],
+    },
+    Capability {
+        key: "roles",
+        label: "Create, edit and delete custom roles, give people a custom role, and see the log of role changes",
+        min_role: "admin",
+        // Each of these also checks for a built-in admin or owner itself
+        // (`roles::role_manager`): a custom role never manages roles.
+        handlers: &[
+            "roles::create_role",
+            "roles::update_role",
+            "roles::delete_role",
+            "roles::list_audit",
         ],
     },
     Capability {
@@ -404,6 +419,14 @@ pub const CAPABILITIES: &[Capability] = &[
         min_role: "admin",
         handlers: &["api::update_budget"],
     },
+    Capability {
+        key: "support",
+        label: "Let Coderhelm support into the workspace, and manage every support ticket the team files",
+        min_role: "admin",
+        // Enforced inside the support handlers by the built-in role, so it
+        // stays with built-in admins and owners (`NEVER_IN_CUSTOM_ROLES`).
+        handlers: &[],
+    },
     // ── Owners ──────────────────────────────────────────────────────
     Capability {
         key: "manage_admins",
@@ -440,13 +463,6 @@ pub fn can_manage(actor_role: &str, target_role: &str) -> bool {
     actor >= 4 || (actor >= 3 && role_level(target_role) <= 2)
 }
 
-/// May `actor_role` see, resend and revoke pending invites? Any admin or owner,
-/// for every invite: an invite grants nothing until it is accepted, so this is
-/// not limited by the role the invite offers (unlike `can_manage`).
-pub fn can_manage_invites(actor_role: &str) -> bool {
-    role_level(actor_role) >= 3
-}
-
 /// May `actor_role` give someone `new_role`? Same split as `can_manage`.
 pub fn can_grant(actor_role: &str, new_role: &str) -> bool {
     VALID_ROLES.contains(&new_role) && can_manage(actor_role, new_role)
@@ -461,10 +477,342 @@ pub fn grantable_roles(actor_role: &str) -> Vec<&'static str> {
         .collect()
 }
 
+// ── Custom roles ────────────────────────────────────────────────────
+//
+// A team's admins can make their own roles: a name, a description and a set
+// of capabilities picked from `CAPABILITIES`. A member's record then holds
+// `custom:<id>` as its role. Every request to the protected API goes through
+// `resolve_access` (called once, from the auth middleware), which decides from
+// the capability the routed handler belongs to. Built-in roles get the same
+// decision their handler's own check makes; a custom role is let through only
+// to handlers whose capability it holds, and the handler then sees the lowest
+// built-in role that capability needs.
+
+/// The role a member record holds when it has a custom role.
+pub const CUSTOM_PREFIX: &str = "custom:";
+
+/// Capabilities a custom role can never hold, whatever the table says about
+/// them: managing roles, and support (checked by built-in role inside the
+/// support handlers), stay with built-in admins and owners.
+pub const NEVER_IN_CUSTOM_ROLES: &[&str] = &["roles", "support"];
+
+/// The id in a `custom:<id>` role, or `None` for a built-in role.
+pub fn custom_role_id(role: &str) -> Option<&str> {
+    role.strip_prefix(CUSTOM_PREFIX).filter(|id| !id.is_empty())
+}
+
+pub fn capability(key: &str) -> Option<&'static Capability> {
+    CAPABILITIES.iter().find(|c| c.key == key)
+}
+
+/// Everyone on the team has these (seeing the workspace and the team, and
+/// managing their own account); a custom role always includes them.
+pub fn is_baseline(cap: &Capability) -> bool {
+    role_level(cap.min_role) == 0
+}
+
+/// May this capability be picked for a custom role? Not the owner-only ones
+/// (account-level changes, managing admins and owners) and not role
+/// management. A capability added to the table later is customizable by
+/// default, so it shows up in the role editor without other changes.
+pub fn customizable(cap: &Capability) -> bool {
+    role_level(cap.min_role) < role_level("owner") && !NEVER_IN_CUSTOM_ROLES.contains(&cap.key)
+}
+
+/// What a built-in role holds: every capability at or below its level.
+pub fn builtin_capabilities(role: &str) -> BTreeSet<&'static str> {
+    let level = role_level(role);
+    CAPABILITIES
+        .iter()
+        .filter(|c| role_level(c.min_role) <= level)
+        .map(|c| c.key)
+        .collect()
+}
+
+/// What a stored custom role holds: the keys it lists that are still in the
+/// table and still customizable, plus the baseline. A key that was dropped
+/// from the table or made owner-only since is ignored, never trusted.
+pub fn custom_capabilities<'a>(
+    stored: impl IntoIterator<Item = &'a str>,
+) -> BTreeSet<&'static str> {
+    let mut out: BTreeSet<&'static str> = CAPABILITIES
+        .iter()
+        .filter(|c| is_baseline(c))
+        .map(|c| c.key)
+        .collect();
+    for key in stored {
+        if let Some(cap) = capability(key).filter(|c| customizable(c)) {
+            out.insert(cap.key);
+        }
+    }
+    out
+}
+
+/// The highest built-in role whose capabilities are all in `caps`. A handler
+/// outside the table (or in a baseline capability) runs as this role, so
+/// whatever it does by role never goes past what the holder has.
+pub fn floor_role(caps: &BTreeSet<&'static str>) -> &'static str {
+    ["owner", "admin", "member"]
+        .into_iter()
+        .find(|r| builtin_capabilities(r).is_subset(caps))
+        .unwrap_or("viewer")
+}
+
+/// The capability a routed handler (`file::function`) belongs to.
+pub fn handler_capability(handler: &str) -> Option<&'static Capability> {
+    CAPABILITIES.iter().find(|c| c.handlers.contains(&handler))
+}
+
+/// What someone holds: their stored role and the capabilities it gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holder {
+    /// The role on their record: a built-in key or `custom:<id>`.
+    pub role: String,
+    pub caps: BTreeSet<&'static str>,
+    /// Set for a custom role: its id and name.
+    pub custom: Option<CustomRoleRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CustomRoleRef {
+    pub id: String,
+    pub name: String,
+}
+
+impl Holder {
+    pub fn builtin(role: &str) -> Self {
+        Self {
+            role: role.to_string(),
+            caps: builtin_capabilities(role),
+            custom: None,
+        }
+    }
+
+    /// A custom role. `stored` is `None` when the role no longer exists:
+    /// then only the baseline is held.
+    pub fn custom(id: &str, stored: Option<(&str, &[String])>) -> Self {
+        let (name, caps) = match stored {
+            Some((name, caps)) => (name, custom_capabilities(caps.iter().map(String::as_str))),
+            None => ("Removed role", custom_capabilities([])),
+        };
+        Self {
+            role: format!("{CUSTOM_PREFIX}{id}"),
+            caps,
+            custom: Some(CustomRoleRef {
+                id: id.to_string(),
+                name: name.to_string(),
+            }),
+        }
+    }
+
+    pub fn floor(&self) -> &'static str {
+        match &self.custom {
+            None if VALID_ROLES.contains(&self.role.as_str()) => ROLES
+                .iter()
+                .find(|r| r.key == self.role)
+                .map_or("viewer", |r| r.key),
+            None => "viewer",
+            Some(_) => floor_role(&self.caps),
+        }
+    }
+
+    pub fn holds(&self, cap: &str) -> bool {
+        self.caps.contains(cap)
+    }
+
+    /// Built-in admins and owners only. Custom roles never manage roles.
+    pub fn manages_roles(&self) -> bool {
+        self.custom.is_none() && role_level(&self.role) >= role_level("admin")
+    }
+}
+
+/// The decision for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Go on. For a custom role the handler runs as `effective_role`.
+    Allow { effective_role: &'static str },
+    /// The holder lacks the capability this handler belongs to.
+    Deny { capability: &'static Capability },
+}
+
+/// The one place a request is decided. `handler` is the routed handler
+/// (`file::function`), `None` when the route is not known.
+///
+/// A handler in no capability, or in a baseline one, is allowed and runs as
+/// the holder's floor role (its own checks apply on top). A handler in a
+/// capability the holder has is allowed and runs as the higher of the floor
+/// and the capability's role; anything else is refused.
+pub fn resolve_access(holder: &Holder, handler: Option<&str>) -> Access {
+    let floor = holder.floor();
+    let Some(cap) = handler.and_then(handler_capability) else {
+        return Access::Allow {
+            effective_role: floor,
+        };
+    };
+    if !holder.holds(cap.key) {
+        return Access::Deny { capability: cap };
+    }
+    let need = ROLES
+        .iter()
+        .find(|r| r.key == cap.min_role)
+        .map_or("viewer", |r| r.key);
+    Access::Allow {
+        effective_role: if role_level(need) > role_level(floor) {
+            need
+        } else {
+            floor
+        },
+    }
+}
+
+/// Why a set of capabilities can't be a custom role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleCapError {
+    Unknown(String),
+    /// Owner-only or role management.
+    NotAllowed(&'static Capability),
+    /// The person making the role doesn't hold it.
+    MoreThanYouHave(&'static Capability),
+}
+
+impl RoleCapError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Unknown(k) => format!("\"{k}\" isn't something a role can do."),
+            Self::NotAllowed(c) if role_level(c.min_role) >= role_level("owner") => format!(
+                "\"{}\" stays with owners and can't go into a custom role.",
+                c.label
+            ),
+            Self::NotAllowed(c) => format!(
+                "\"{}\" stays with admins and owners and can't go into a custom role.",
+                c.label
+            ),
+            Self::MoreThanYouHave(c) => format!(
+                "You can't give a role \"{}\", because your own role doesn't include it.",
+                c.label
+            ),
+        }
+    }
+}
+
+/// The capabilities a new or edited custom role will hold, checked: every key
+/// is in the table, customizable, and held by `actor`. The baseline is added.
+pub fn checked_role_capabilities(
+    actor: &Holder,
+    requested: &[String],
+) -> Result<BTreeSet<&'static str>, RoleCapError> {
+    for key in requested {
+        let cap = capability(key).ok_or_else(|| RoleCapError::Unknown(key.clone()))?;
+        if !customizable(cap) {
+            return Err(RoleCapError::NotAllowed(cap));
+        }
+        if !actor.holds(cap.key) {
+            return Err(RoleCapError::MoreThanYouHave(cap));
+        }
+    }
+    Ok(custom_capabilities(requested.iter().map(String::as_str)))
+}
+
+/// May `actor` give someone a role holding `target_caps`? Only when the actor
+/// holds all of it: nobody hands out more than they have.
+pub fn within(actor: &Holder, target_caps: &BTreeSet<&'static str>) -> bool {
+    target_caps.is_subset(&actor.caps)
+}
+
+/// A built-in role a custom role can start from: the role's capabilities
+/// that a custom role may hold.
+pub fn template_capabilities(role: &str) -> Option<Vec<&'static str>> {
+    ROLES.iter().find(|r| r.key == role && r.assignable)?;
+    Some(
+        CAPABILITIES
+            .iter()
+            .filter(|c| role_level(c.min_role) <= role_level(role) && customizable(c))
+            .map(|c| c.key)
+            .collect(),
+    )
+}
+
+// ── Routed handlers ─────────────────────────────────────────────────
+
+/// `(METHOD, path)` → `file::function` for every route of the protected API
+/// router, read from `main.rs` once. Paths are as written there (without the
+/// `/api` prefix the router is nested under).
+pub fn api_route_handlers() -> &'static HashMap<(String, String), String> {
+    static ROUTES: OnceLock<HashMap<(String, String), String>> = OnceLock::new();
+    ROUTES.get_or_init(|| parse_api_routes(include_str!("main.rs")))
+}
+
+/// The handler a request was routed to, from its method and matched path.
+pub fn routed_handler(method: &str, matched_path: &str) -> Option<&'static str> {
+    let routes = api_route_handlers();
+    let find = |p: &str| {
+        routes
+            .get(&(method.to_ascii_uppercase(), p.to_string()))
+            .map(String::as_str)
+    };
+    find(matched_path).or_else(|| matched_path.strip_prefix("/api").and_then(find))
+}
+
+fn parse_api_routes(src: &str) -> HashMap<(String, String), String> {
+    let mut out = HashMap::new();
+    let Some(start) = src.find("let api_routes") else {
+        return out;
+    };
+    let end = src[start..]
+        .find("middleware::auth::require_auth")
+        .map_or(src.len(), |e| start + e);
+    let mut rest = &src[start..end];
+    while let Some(i) = rest.find(".route(") {
+        rest = &rest[i + ".route(".len()..];
+        let mut depth = 1;
+        let mut close = rest.len();
+        for (k, ch) in rest.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = k;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let call = &rest[..close];
+        rest = &rest[close..];
+        let Some(q1) = call.find('"') else { continue };
+        let Some(len) = call[q1 + 1..].find('"') else {
+            continue;
+        };
+        let path = &call[q1 + 1..q1 + 1 + len];
+        let handlers = &call[q1 + 2 + len..];
+        for method in ["get", "post", "put", "delete", "patch"] {
+            let word = format!("{method}(routes::");
+            for (at, _) in handlers.match_indices(&word) {
+                if at > 0 && handlers[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let name: String = handlers[at + word.len()..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                    .collect();
+                if name.contains("::") {
+                    out.insert(
+                        (method.to_ascii_uppercase(), path.to_string()),
+                        name.trim_end_matches(':').to_string(),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     /// The role check a handler body starts with, as a level. `None` = no check.
     fn guard_level(body: &str) -> Option<u8> {
@@ -479,6 +827,8 @@ mod tests {
         }
         push("if !is_admin_or_owner(&claims.role) {", 3);
         push("admin(&claims)?", 3);
+        push("role_manager(&claims)?", 3);
+        push("authorize_gate_control(claims.role_level()", 1);
         push(
             "if claims.role != \"owner\" && claims.role != \"admin\" {",
             3,
@@ -572,6 +922,235 @@ mod tests {
         }
     }
 
+    fn custom(caps: &[&str]) -> Holder {
+        let caps: Vec<String> = caps.iter().map(|c| c.to_string()).collect();
+        Holder::custom("r1", Some(("QA", &caps)))
+    }
+
+    #[test]
+    fn built_in_roles_resolve_like_their_handlers_check() {
+        // For every handler in the table, a built-in role is let through
+        // exactly when its level reaches the capability's.
+        for role in ["viewer", "member", "billing", "admin", "owner"] {
+            let holder = Holder::builtin(role);
+            for cap in CAPABILITIES {
+                for h in cap.handlers {
+                    let allowed = matches!(resolve_access(&holder, Some(h)), Access::Allow { .. });
+                    assert_eq!(
+                        allowed,
+                        role_level(role) >= role_level(cap.min_role),
+                        "{role} on {h}"
+                    );
+                }
+            }
+        }
+        // Handlers outside the table are left to their own checks.
+        assert_eq!(
+            resolve_access(&Holder::builtin("viewer"), Some("api::me")),
+            Access::Allow {
+                effective_role: "viewer"
+            }
+        );
+        assert_eq!(
+            resolve_access(&Holder::builtin("admin"), None),
+            Access::Allow {
+                effective_role: "admin"
+            }
+        );
+    }
+
+    #[test]
+    fn a_custom_role_runs_only_what_it_holds_at_that_capabilitys_role() {
+        let qa = custom(&["plans", "runs", "tests"]);
+        // Plans and runs are member capabilities, tests an admin one.
+        assert_eq!(
+            resolve_access(&qa, Some("plans::create_plan")),
+            Access::Allow {
+                effective_role: "member"
+            }
+        );
+        assert_eq!(
+            resolve_access(&qa, Some("tests::quarantine")),
+            Access::Allow {
+                effective_role: "admin"
+            }
+        );
+        // Not held: refused, naming the capability.
+        match resolve_access(&qa, Some("api::sync_repos")) {
+            Access::Deny { capability } => assert_eq!(capability.key, "repos"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            resolve_access(&qa, Some("reviewer::rate_review")),
+            Access::Deny { .. }
+        ));
+        // Everyone sees the workspace and manages their own account.
+        assert!(matches!(
+            resolve_access(&qa, Some("api::list_runs")),
+            Access::Allow { .. }
+        ));
+        assert!(matches!(
+            resolve_access(&qa, Some("users::change_password")),
+            Access::Allow { .. }
+        ));
+        // Outside the table it runs as its floor: it lacks some member
+        // capabilities, so it is a viewer there.
+        assert_eq!(qa.floor(), "viewer");
+        assert_eq!(
+            resolve_access(&qa, Some("api::me")),
+            Access::Allow {
+                effective_role: "viewer"
+            }
+        );
+        // With every member capability its floor is member, never more.
+        let mut keys: Vec<&str> = builtin_capabilities("member").into_iter().collect();
+        keys.push("repos");
+        let wide = custom(&keys);
+        assert_eq!(wide.floor(), "member");
+        assert_eq!(
+            resolve_access(&wide, Some("api::sync_repos")),
+            Access::Allow {
+                effective_role: "admin"
+            }
+        );
+    }
+
+    #[test]
+    fn a_custom_role_never_holds_owner_only_capabilities_or_role_management() {
+        let all: Vec<&str> = CAPABILITIES.iter().map(|c| c.key).collect();
+        let everything = custom(&all);
+        for cap in CAPABILITIES {
+            let owner_only = role_level(cap.min_role) >= role_level("owner");
+            if owner_only || NEVER_IN_CUSTOM_ROLES.contains(&cap.key) {
+                assert!(!customizable(cap), "{}", cap.key);
+                assert!(!everything.holds(cap.key), "{}", cap.key);
+                for h in cap.handlers {
+                    assert!(
+                        matches!(resolve_access(&everything, Some(h)), Access::Deny { .. }),
+                        "{h}"
+                    );
+                }
+            } else {
+                assert!(everything.holds(cap.key), "{}", cap.key);
+            }
+        }
+        // The owner-only ones the team page names.
+        for key in ["manage_admins", "team_name", "disconnect", "reset"] {
+            assert!(!customizable(capability(key).unwrap()), "{key}");
+        }
+        assert!(!everything.manages_roles());
+        assert!(Holder::builtin("admin").manages_roles());
+        assert!(Holder::builtin("owner").manages_roles());
+        assert!(!Holder::builtin("member").manages_roles());
+        assert!(!Holder::builtin("viewer").manages_roles());
+        // Asking for them is refused, by name.
+        let owner = Holder::builtin("owner");
+        for key in ["reset", "team_name", "manage_admins", "disconnect", "roles"] {
+            assert!(
+                matches!(
+                    checked_role_capabilities(&owner, &[key.to_string()]),
+                    Err(RoleCapError::NotAllowed(_))
+                ),
+                "{key}"
+            );
+        }
+        assert!(matches!(
+            checked_role_capabilities(&owner, &["superpowers".to_string()]),
+            Err(RoleCapError::Unknown(_))
+        ));
+        // Templates drop them too.
+        assert!(!template_capabilities("admin").unwrap().contains(&"roles"));
+        assert!(template_capabilities("owner")
+            .unwrap()
+            .iter()
+            .all(|k| customizable(capability(k).unwrap())));
+        assert!(template_capabilities("billing").is_none());
+    }
+
+    #[test]
+    fn nobody_makes_or_gives_a_role_with_more_than_they_hold() {
+        let admin = Holder::builtin("admin");
+        let ok = checked_role_capabilities(&admin, &["plans".into(), "repos".into()]).unwrap();
+        assert!(ok.contains("plans") && ok.contains("repos"));
+        // The baseline is always added.
+        assert!(ok.contains("view") && ok.contains("own_account"));
+
+        // A custom-role holder (were it ever let in) can't go past itself.
+        let qa = custom(&["plans", "people"]);
+        match checked_role_capabilities(&qa, &["plans".into(), "repos".into()]) {
+            Err(RoleCapError::MoreThanYouHave(c)) => assert_eq!(c.key, "repos"),
+            other => panic!("{other:?}"),
+        }
+        assert!(checked_role_capabilities(&qa, &["plans".into()]).is_ok());
+
+        // Giving a role: only one that fits inside your own.
+        assert!(within(&admin, &builtin_capabilities("member")));
+        assert!(!within(&admin, &builtin_capabilities("owner")));
+        assert!(!within(&qa, &builtin_capabilities("member")));
+        assert!(within(&qa, &custom(&["plans"]).caps));
+        assert!(!within(&qa, &custom(&["runs"]).caps));
+        // Every custom role fits inside a built-in admin.
+        let all: Vec<&str> = CAPABILITIES.iter().map(|c| c.key).collect();
+        assert!(within(&admin, &custom(&all).caps));
+    }
+
+    #[test]
+    fn checks_inside_handlers_follow_the_capability_too() {
+        // The auto-merge gate's control runs as a member for a role holding
+        // reviews, whatever its floor, and is refused without it.
+        let reviewer = custom(&["reviews"]);
+        assert_eq!(reviewer.floor(), "viewer");
+        assert_eq!(
+            resolve_access(&reviewer, Some("reviewer::control_gate")),
+            Access::Allow {
+                effective_role: "member"
+            }
+        );
+        assert!(matches!(
+            resolve_access(&custom(&["repos"]), Some("reviewer::control_gate")),
+            Access::Deny { .. }
+        ));
+        // Support stays with built-in admins and owners.
+        assert!(!customizable(capability("support").unwrap()));
+        assert!(!custom(&["support"]).holds("support"));
+        assert!(Holder::builtin("admin").holds("support"));
+    }
+
+    #[test]
+    fn stored_keys_are_read_through_the_table() {
+        // A key that is gone from the table, or owner-only, is dropped.
+        let caps = custom_capabilities(["plans", "no_such_thing", "reset"]);
+        assert!(caps.contains("plans"));
+        assert!(!caps.contains("no_such_thing"));
+        assert!(!caps.contains("reset"));
+        assert_eq!(custom_role_id("custom:abc"), Some("abc"));
+        assert_eq!(custom_role_id("custom:"), None);
+        assert_eq!(custom_role_id("admin"), None);
+    }
+
+    #[test]
+    fn every_table_handler_is_found_from_its_route() {
+        let routes = api_route_handlers();
+        assert!(routes.len() > 150, "read {} routes", routes.len());
+        let routed: BTreeSet<&str> = routes.values().map(String::as_str).collect();
+        for cap in CAPABILITIES {
+            for h in cap.handlers {
+                assert!(routed.contains(h), "{h} has no route in the API router");
+            }
+        }
+        assert_eq!(
+            routed_handler("PUT", "/users/:user_id/role"),
+            Some("users::update_role")
+        );
+        assert_eq!(
+            routed_handler("delete", "/api/roles/:role_id"),
+            Some("roles::delete_role")
+        );
+        assert_eq!(routed_handler("GET", "/roles"), Some("roles::list_roles"));
+        assert_eq!(routed_handler("POST", "/roles"), Some("roles::create_role"));
+        assert_eq!(routed_handler("GET", "/nope"), None);
+    }
+
     #[test]
     fn capabilities_ascend_by_role() {
         let levels: Vec<u8> = CAPABILITIES
@@ -609,11 +1188,11 @@ mod tests {
 
         // Invites are not seats: an admin manages every pending invite,
         // including an admin invite an owner sent.
-        assert!(can_manage_invites("admin"));
-        assert!(can_manage_invites("owner"));
-        assert!(!can_manage_invites("billing"));
-        assert!(!can_manage_invites("member"));
-        assert!(!can_manage_invites("viewer"));
+        assert!(Holder::builtin("admin").holds("people"));
+        assert!(Holder::builtin("owner").holds("people"));
+        assert!(!Holder::builtin("billing").holds("people"));
+        assert!(!Holder::builtin("member").holds("people"));
+        assert!(!Holder::builtin("viewer").holds("people"));
     }
 
     #[test]

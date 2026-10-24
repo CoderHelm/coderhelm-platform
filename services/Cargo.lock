@@ -1830,6 +1830,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tower 0.5.3",
  "tower-http",
  "tracing",
  "tracing-subscriber",

@@ -89,7 +89,7 @@ pub async fn list(
     Ok(Json(json!({
         "repos": repos.iter().map(|r| r.json()).collect::<Vec<_>>(),
         "items": items.iter().map(|i| i.json()).collect::<Vec<_>>(),
-        "can_manage": matches!(claims.role.as_str(), "admin" | "owner"),
+        "can_manage": claims.holder().holds("data_sources"),
     })))
 }
 

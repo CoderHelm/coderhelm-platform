@@ -103,7 +103,19 @@ pub async fn me(
         "github_login": claims.github_login,
         "email": claims.email,
         "avatar_url": item.get("avatar_url").and_then(|v| v.as_s().ok()),
-        "role": item.get("role").and_then(|v| v.as_s().ok()).unwrap_or(&claims.role),
+        // For a custom role, `role` is the built-in role the member's requests
+        // run as outside their role's capabilities (pages check it), and
+        // `custom_role` and `capabilities` say what they hold.
+        "role": match &claims.custom {
+            Some(h) => h.floor(),
+            None => item.get("role").and_then(|v| v.as_s().ok()).map_or(claims.role.as_str(), |r| r.as_str()),
+        },
+        "custom_role": claims.custom.as_ref().and_then(|h| h.custom.clone()),
+        "capabilities": crate::permissions::CAPABILITIES
+            .iter()
+            .filter(|c| claims.holder().holds(c.key))
+            .map(|c| c.key)
+            .collect::<Vec<_>>(),
         "status": team_status,
         "auth_provider": auth_provider,
         "mfa_enabled": mfa_enabled,

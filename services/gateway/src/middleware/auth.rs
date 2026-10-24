@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::auth::jwt;
-use crate::routes::support_access;
+use crate::permissions::{self, Access, Capability};
+use crate::routes::{roles, support_access};
 use crate::AppState;
 
 /// Session TTL: 7 days. Used by both token creation and cookie Max-Age.
@@ -98,6 +99,23 @@ pub async fn require_auth(
     let token_age = now.saturating_sub(claims.iat);
     let needs_refresh = token_age > SESSION_TTL_SECS / 2;
 
+    // Every request is decided here, from the capability its handler belongs
+    // to (`permissions::resolve_access`), for built-in and custom roles alike.
+    let handler = req
+        .extensions()
+        .get::<MatchedPath>()
+        .and_then(|m| permissions::routed_handler(req.method().as_str(), m.as_str()));
+    let holder = roles::holder_for(&state, &claims).await;
+    match permissions::resolve_access(&holder, handler) {
+        Access::Deny { capability } => return Ok(refused_for(capability)),
+        Access::Allow { effective_role } => {
+            if holder.custom.is_some() {
+                claims.role = effective_role.to_string();
+                claims.custom = Some(holder);
+            }
+        }
+    }
+
     note_activity(&state, &claims.team_id, &claims.sub).await;
     req.extensions_mut().insert(claims.clone());
     let mut response = next.run(req).await;
@@ -131,6 +149,21 @@ pub async fn require_auth(
     }
 
     Ok(response)
+}
+
+/// The answer when someone's role doesn't include what they asked for.
+fn refused_for(capability: &Capability) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({
+            "error": format!(
+                "Your role doesn't include this ({}). Ask an admin or owner if you need it.",
+                capability.label
+            ),
+            "capability": capability.key,
+        })),
+    )
+        .into_response()
 }
 
 /// A support-view answer with its credential fields hidden
@@ -275,6 +308,56 @@ mod tests {
             a(),
             t0 + SEEN_EVERY + Duration::from_secs(1)
         ));
+    }
+
+    /// The middleware finds the routed handler from the matched path it sees
+    /// as a layer of the nested API router, the way main.rs builds it.
+    #[tokio::test]
+    async fn the_middleware_sees_which_handler_a_request_is_routed_to() {
+        use axum::{body::Body, routing::put, Router};
+        use tower::ServiceExt;
+
+        async fn seen(req: Request, next: Next) -> Response {
+            let handler = req
+                .extensions()
+                .get::<MatchedPath>()
+                .and_then(|m| permissions::routed_handler(req.method().as_str(), m.as_str()))
+                .unwrap_or("none")
+                .to_string();
+            let mut res = next.run(req).await;
+            res.headers_mut()
+                .insert("x-handler", handler.parse().unwrap());
+            res
+        }
+        let api = Router::new()
+            .route("/users/:user_id/role", put(|| async { "ok" }))
+            .route("/roles/:role_id", put(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(seen));
+        let app = Router::new().nest("/api", api);
+        for (path, want) in [
+            ("/api/users/u1/role", "users::update_role"),
+            ("/api/roles/r1", "roles::update_role"),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.headers()["x-handler"], want, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_the_missing_capability() {
+        let cap = permissions::capability("repos").unwrap();
+        let res = refused_for(cap);
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

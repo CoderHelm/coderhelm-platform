@@ -79,3 +79,5 @@ tar = "0.4"
 [dev-dependencies]
 # rsa 0.9 key generation needs the rand 0.8 RNG traits (tests only)
 rand08 = { package = "rand", version = "0.8" }
+# middleware tests drive a small router
+tower = { version = "0.5", features = ["util"] }
