@@ -16,6 +16,8 @@
 //! People on a ticket: the person who filed it, plus up to
 //! [`MAX_PARTICIPANTS`] others kept on the ticket record (and so on its queue
 //! copy): members of the same team, or outside addresses copied by email.
+//! They can be named when the ticket is opened or added later; both go
+//! through the same team check and land as `added:` events in the thread.
 //! Everyone on it is emailed when support replies or the status changes.
 //!
 //! Isolation: every customer read and write is keyed by the caller's own
@@ -437,6 +439,10 @@ pub struct NewTicket {
     /// Items the filer attached.
     #[serde(default)]
     pub items: Vec<ItemRef>,
+    /// People to put on the ticket as it opens: members by id, or addresses.
+    /// Checked the same way as adding them later ([`add_participant`]).
+    #[serde(default)]
+    pub people: Vec<PersonRef>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -711,6 +717,43 @@ async fn ticket_for<S: Store>(
         Side::Team => open_for_team(store, caller, id).await.map(|(t, _)| t),
         Side::Support => admin_open(store, caller, id).await.map(|(t, _)| t),
     }
+}
+
+/// The people a new ticket names, checked like [`add_participant`] checks
+/// one: members of the caller's own team by id (never another team's), or
+/// valid addresses, an address that belongs to a member being that member.
+/// The filer is on every ticket already, so naming them is skipped, and so
+/// is naming someone twice. Nothing is written; any refusal names the
+/// person and refuses the whole ticket.
+pub async fn people_for_new<M: Members>(
+    members: &M,
+    caller: &Caller,
+    refs: &[PersonRef],
+) -> Result<Vec<Participant>, Fail> {
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if refs.len() > MAX_PARTICIPANTS * 2 {
+        return Err(Fail::BadRequest(format!(
+            "A ticket can have at most {MAX_PARTICIPANTS} people besides the person who filed it."
+        )));
+    }
+    let mut out: Vec<Participant> = Vec::new();
+    for who in refs {
+        let p = person_for(members, &caller.team_id, who).await?;
+        let filer = (!p.user_id.is_empty() && same_user(&p.user_id, &caller.user_id))
+            || (!caller.email.is_empty() && p.email.eq_ignore_ascii_case(&caller.email));
+        if filer || out.iter().any(|q| q.is(&p)) {
+            continue;
+        }
+        out.push(p);
+    }
+    if out.len() > MAX_PARTICIPANTS {
+        return Err(Fail::BadRequest(format!(
+            "A ticket can have at most {MAX_PARTICIPANTS} people besides the person who filed it."
+        )));
+    }
+    Ok(out)
 }
 
 fn caller_label(caller: &Caller) -> String {
@@ -1167,10 +1210,14 @@ fn by_recent(mut v: Vec<Ticket>) -> Vec<Ticket> {
 }
 
 /// Open a ticket for the caller's team, within the hourly limits, with the
-/// items attached that the team's records confirm.
-pub async fn create<S: Store, L: ItemLookup>(
+/// items attached that the team's records confirm and the people it names
+/// ([`people_for_new`]) already on it. Each person put on it counts toward
+/// the team's hourly additions and is an `added:` event in the thread, as
+/// if they were added just after it opened.
+pub async fn create<S: Store, L: ItemLookup, M: Members>(
     store: &S,
     lookup: &L,
+    members: &M,
     caller: &Caller,
     req: &NewTicket,
     team_name: &str,
@@ -1188,6 +1235,7 @@ pub async fn create<S: Store, L: ItemLookup>(
     let body = check_body(&req.body, "The description")?;
     let refs: Vec<ItemRef> = req.item.iter().chain(req.items.iter()).cloned().collect();
     let items = resolve_items(lookup, &caller.team_id, &refs, &[]).await?;
+    let mut people = people_for_new(members, caller, &req.people).await?;
 
     // The person's allowance first, so one busy person does not use up the
     // team's.
@@ -1221,7 +1269,29 @@ pub async fn create<S: Store, L: ItemLookup>(
             "Your team has opened a lot of tickets in the last hour. Add to an open ticket, or try again later.".into(),
         ));
     }
+    for _ in &people {
+        if !store
+            .take(
+                &caller.team_id,
+                &format!("people:{hour}"),
+                TEAM_PEOPLE_ADDS_PER_HOUR,
+                ttl,
+            )
+            .await
+            .map_err(Fail::Internal)?
+        {
+            return Err(Fail::TooMany(
+                "A lot of people were added to your team's tickets in the last hour. Send the ticket without them, or try again later."
+                    .into(),
+            ));
+        }
+    }
     let now = now_iso();
+    let by = caller_label(caller);
+    for p in people.iter_mut() {
+        p.added_by = by.clone();
+        p.added_at = now.clone();
+    }
     let ticket = Ticket {
         id: new_id(),
         team_id: caller.team_id.clone(),
@@ -1243,7 +1313,7 @@ pub async fn create<S: Store, L: ItemLookup>(
         updated_at: now.clone(),
         last_actor: "customer".into(),
         message_count: 1,
-        participants: Vec::new(),
+        participants: people,
         last_snippet: String::new(),
         last_author_name: String::new(),
     };
@@ -1264,6 +1334,22 @@ pub async fn create<S: Store, L: ItemLookup>(
         .append(&ticket.team_id, &ticket.id, &first)
         .await
         .map_err(Fail::Internal)?;
+    // After the first message, so the thread reads: asked, then added.
+    for p in &ticket.participants {
+        store
+            .append(
+                &ticket.team_id,
+                &ticket.id,
+                &event(
+                    "customer",
+                    caller,
+                    &format!("added:{}", p.label()),
+                    &first.created_at,
+                ),
+            )
+            .await
+            .map_err(Fail::Internal)?;
+    }
     Ok((ticket, first))
 }
 
@@ -1710,6 +1796,9 @@ fn context_lines(t: &Ticket) -> Vec<(String, String)> {
     }
     for item in attachments(t) {
         lines.push(("Attached".to_string(), item_words(&item)));
+    }
+    if !t.participants.is_empty() {
+        lines.push(("People".to_string(), people_words(t)));
     }
     lines
 }
@@ -2238,12 +2327,17 @@ pub async fn create_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let lookup = DynamoLookup { state: &state };
-    let (ticket, first) = create(&store(&state), &lookup, &caller, &req, &name, ua)
+    let roster = DynamoMembers { state: &state };
+    let st = store(&state);
+    let (ticket, first) = create(&st, &lookup, &roster, &caller, &req, &name, ua)
         .await
         .map_err(Fail::reply)?;
-    info!(team = %caller.team_id, ticket = %ticket.id, "support ticket opened");
+    info!(team = %caller.team_id, ticket = %ticket.id, people = ticket.participants.len(), "support ticket opened");
     send(&state, mail_new_ticket(&inbox(), &ticket, &first.body)).await;
-    team_detail(&state, ticket, vec![first]).await
+    let (ticket, thread) = open_for_team(&st, &caller, &ticket.id)
+        .await
+        .map_err(Fail::reply)?;
+    team_detail(&state, ticket, thread).await
 }
 
 /// GET /api/support/tickets/:id — one of the team's tickets and its thread.
@@ -2691,6 +2785,7 @@ mod tests {
             page: Some("/runs/detail/?id=01RUN".into()),
             item: None,
             items: Vec::new(),
+            people: Vec::new(),
         }
     }
 
@@ -2698,6 +2793,7 @@ mod tests {
         create(
             store,
             &none(),
+            &roster(),
             who,
             &ask(subject),
             "acme-web",
@@ -2868,7 +2964,7 @@ mod tests {
         for i in 0..USER_TICKETS_PER_HOUR {
             file(&store, &alice, &format!("Ticket {i}")).await;
         }
-        let err = create(&store, &none(), &alice, &ask("One more"), "", "")
+        let err = create(&store, &none(), &roster(), &alice, &ask("One more"), "", "")
             .await
             .unwrap_err();
         assert!(matches!(err, Fail::TooMany(_)));
@@ -2884,7 +2980,7 @@ mod tests {
         }
         let fresh = person("alpha", "newcomer");
         assert!(matches!(
-            create(&store, &none(), &fresh, &ask("Late"), "", "")
+            create(&store, &none(), &roster(), &fresh, &ask("Late"), "", "")
                 .await
                 .unwrap_err(),
             Fail::TooMany(_)
@@ -2893,6 +2989,7 @@ mod tests {
         assert!(create(
             &store,
             &none(),
+            &roster(),
             &person("beta", "bea"),
             &ask("Mine"),
             "",
@@ -2914,10 +3011,19 @@ mod tests {
             page: Some("/releases/?repo=acme/web&q=v1#top".into()),
             item: None,
             items: Vec::new(),
+            people: Vec::new(),
         };
-        let (t, m) = create(&store, &none(), &alice, &req, "acme", "Browser/1.0")
-            .await
-            .unwrap();
+        let (t, m) = create(
+            &store,
+            &none(),
+            &roster(),
+            &alice,
+            &req,
+            "acme",
+            "Browser/1.0",
+        )
+        .await
+        .unwrap();
         assert_eq!(t.subject, "Deploy fails");
         assert_eq!(t.context.page, "/releases/");
         assert_eq!(t.priority, "urgent");
@@ -2929,6 +3035,7 @@ mod tests {
         assert!(create(
             &store,
             &none(),
+            &roster(),
             &alice,
             &NewTicket {
                 body: "x".into(),
@@ -2945,7 +3052,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            create(&store, &none(), &alice, &long, "", "")
+            create(&store, &none(), &roster(), &alice, &long, "", "")
                 .await
                 .unwrap_err(),
             Fail::BadRequest(_)
@@ -3024,7 +3131,7 @@ mod tests {
         });
         let items = Items::default();
         items.add("alpha", "run", "01RUN", "Fix login", "failed");
-        let (t, first) = create(&store, &items, &alice, &req, "acme", "")
+        let (t, first) = create(&store, &items, &roster(), &alice, &req, "acme", "")
             .await
             .unwrap();
 
@@ -3104,7 +3211,7 @@ mod tests {
                 repo: None,
             },
         ];
-        let (t, first) = create(&store, &items, &alice, &req, "acme", "")
+        let (t, first) = create(&store, &items, &roster(), &alice, &req, "acme", "")
             .await
             .unwrap();
         assert_eq!(t.context.items.len(), 2);
@@ -3122,7 +3229,7 @@ mod tests {
             repo: None,
         }];
         let before = store.list_team(&alice.team_id).await.unwrap().len();
-        let err = create(&store, &items, &alice, &theirs, "acme", "")
+        let err = create(&store, &items, &roster(), &alice, &theirs, "acme", "")
             .await
             .unwrap_err();
         assert_eq!(
@@ -3206,13 +3313,15 @@ mod tests {
         let mut req = ask("Many");
         req.items = refs(0..11);
         assert!(matches!(
-            create(&store, &items, &alice, &req, "", "")
+            create(&store, &items, &roster(), &alice, &req, "", "")
                 .await
                 .unwrap_err(),
             Fail::BadRequest(_)
         ));
         req.items = refs(0..9);
-        let (t, _) = create(&store, &items, &alice, &req, "", "").await.unwrap();
+        let (t, _) = create(&store, &items, &roster(), &alice, &req, "", "")
+            .await
+            .unwrap();
         let (t, _) = reply_as_customer(&store, &items, &alice, &t.id, "one more", &refs(9..10))
             .await
             .unwrap();
@@ -3743,5 +3852,265 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(customer_ticket(t).last_author_name, "Coderhelm support");
+    }
+
+    // ── People named as a ticket opens ───────────────────────────────────
+
+    fn ask_with(subject: &str, people: Vec<PersonRef>) -> NewTicket {
+        NewTicket {
+            people,
+            ..ask(subject)
+        }
+    }
+
+    #[tokio::test]
+    async fn people_named_on_a_new_ticket_are_on_it_from_the_start() {
+        let store = Mem::default();
+        let alice = person("alpha", "alice");
+        let req = ask_with(
+            "Deploys hang",
+            vec![
+                uid("bob"),
+                // A teammate's address is that teammate.
+                addr(" Carol@Example.com "),
+                // Anyone else's address is copied by email only.
+                addr("guest@example.org"),
+                // The filer is on every ticket already, and twice is once.
+                uid("alice"),
+                addr("alice@example.com"),
+                PersonRef {
+                    user_id: Some("bob".into()),
+                    email: None,
+                },
+                addr("GUEST@example.org"),
+            ],
+        );
+        let (t, first) = create(&store, &none(), &roster(), &alice, &req, "acme", "")
+            .await
+            .unwrap();
+        let who: Vec<(&str, &str, bool)> = t
+            .participants
+            .iter()
+            .map(|p| (p.user_id.as_str(), p.email.as_str(), p.outside))
+            .collect();
+        assert_eq!(
+            who,
+            [
+                ("USER#bob", "bob@example.com", false),
+                ("USER#carol", "carol@example.com", false),
+                ("", "guest@example.org", true),
+            ]
+        );
+        assert!(t
+            .participants
+            .iter()
+            .all(|p| p.added_by == "alice" && p.added_at == t.created_at));
+        assert_eq!(t.participants[0].name, "bob name");
+
+        // The thread reads: the question, then who was added, as events.
+        let (saved, thread) = open_for_team(&store, &alice, &t.id).await.unwrap();
+        assert_eq!(saved, t);
+        assert_eq!(thread[0], first);
+        assert_eq!(
+            events(&thread),
+            [
+                "added:bob name",
+                "added:carol name",
+                "added:guest@example.org"
+            ]
+        );
+        assert!(thread[1..]
+            .iter()
+            .all(|m| m.author == "customer" && m.author_email == "alice@example.com"));
+        // The queue copy carries the same people.
+        assert_eq!(store.queue_entry(&t.id).await.unwrap().unwrap(), t);
+
+        // They get the same emails as people added later, and support sees
+        // who is on it from the first email.
+        let to: Vec<String> = recipients(&t).into_iter().map(|r| r.email).collect();
+        assert_eq!(
+            to,
+            [
+                "alice@example.com",
+                "bob@example.com",
+                "carol@example.com",
+                "guest@example.org"
+            ]
+        );
+        let new = mail_new_ticket("inbox@example.com", &t, &first.body);
+        assert!(new
+            .text
+            .contains("People: alice (filed), bob name, carol name, guest@example.org (copied)"));
+
+        // And they can be taken off the same way.
+        let t2 = remove_participant(&store, &alice, Side::Team, &t.id, &uid("bob"))
+            .await
+            .unwrap();
+        assert_eq!(t2.participants.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_new_ticket_never_names_another_teams_member_and_writes_nothing_when_refused() {
+        let store = Mem::default();
+        let alice = person("alpha", "alice");
+
+        // Another team's member, by id: refused, and the ticket is not opened.
+        assert_eq!(
+            create(
+                &store,
+                &none(),
+                &roster(),
+                &alice,
+                &ask_with("Billing", vec![uid("bob"), uid("mallory")]),
+                "",
+                ""
+            )
+            .await
+            .unwrap_err(),
+            Fail::BadRequest("That person is not on this team.".into())
+        );
+        // A bad address, or an entry with neither: the same.
+        for (bad, why) in [
+            (addr("nope@"), "Enter a valid email address."),
+            (
+                addr("x@example.com, y@example.com"),
+                "Enter a valid email address.",
+            ),
+            (
+                PersonRef::default(),
+                "Choose someone on the team, or enter an email address.",
+            ),
+        ] {
+            assert_eq!(
+                create(
+                    &store,
+                    &none(),
+                    &roster(),
+                    &alice,
+                    &ask_with("Billing", vec![bad]),
+                    "",
+                    ""
+                )
+                .await
+                .unwrap_err(),
+                Fail::BadRequest(why.into())
+            );
+        }
+        assert!(store.list_team("TEAM#alpha").await.unwrap().is_empty());
+        assert!(store.list_queue().await.unwrap().is_empty());
+        // Refusals use none of the hourly allowance: five tickets still open.
+        for i in 0..USER_TICKETS_PER_HOUR {
+            create(
+                &store,
+                &none(),
+                &roster(),
+                &alice,
+                &ask(&format!("Ticket {i}")),
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+        }
+
+        // Another team filing names only its own members: alpha's people by
+        // id are refused, and an alpha address is only an outside copy.
+        let mallory = Caller {
+            role: "owner".into(),
+            ..person("beta", "mallory")
+        };
+        assert_eq!(
+            create(
+                &store,
+                &none(),
+                &roster(),
+                &mallory,
+                &ask_with("Theirs", vec![uid("alice")]),
+                "",
+                ""
+            )
+            .await
+            .unwrap_err(),
+            Fail::BadRequest("That person is not on this team.".into())
+        );
+        let (t, _) = create(
+            &store,
+            &none(),
+            &roster(),
+            &mallory,
+            &ask_with("Theirs", vec![addr("alice@example.com")]),
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(t.participants[0].outside, "no access to beta's ticket");
+        assert!(t.participants[0].user_id.is_empty());
+        // Alpha's people still cannot read it.
+        assert_eq!(
+            open_for_team(&store, &alice, &t.id).await.unwrap_err(),
+            Fail::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_ticket_has_at_most_twenty_people_and_they_count_toward_the_hourly_additions() {
+        let store = Mem::default();
+        let alice = person("alpha", "alice");
+        let guests = |n: usize, tag: &str| -> Vec<PersonRef> {
+            (0..n)
+                .map(|i| addr(&format!("{tag}{i}@example.org")))
+                .collect()
+        };
+        assert_eq!(
+            create(
+                &store,
+                &none(),
+                &roster(),
+                &alice,
+                &ask_with("Too many", guests(MAX_PARTICIPANTS + 1, "g")),
+                "",
+                ""
+            )
+            .await
+            .unwrap_err(),
+            Fail::BadRequest(format!(
+                "A ticket can have at most {MAX_PARTICIPANTS} people besides the person who filed it."
+            ))
+        );
+        let (t, _) = create(
+            &store,
+            &none(),
+            &roster(),
+            &alice,
+            &ask_with("Twenty", guests(MAX_PARTICIPANTS, "g")),
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(t.participants.len(), MAX_PARTICIPANTS);
+        // The ticket is full, as if they had been added one by one.
+        assert!(matches!(
+            add_participant(&store, &roster(), &alice, Side::Team, &t.id, &uid("bob")).await,
+            Err(Fail::BadRequest(_))
+        ));
+
+        // Twenty of the team's hourly thirty are used: another twenty are refused.
+        let bob = person("alpha", "bob");
+        assert!(matches!(
+            create(
+                &store,
+                &none(),
+                &roster(),
+                &bob,
+                &ask_with("Twenty more", guests(MAX_PARTICIPANTS, "h")),
+                "",
+                ""
+            )
+            .await,
+            Err(Fail::TooMany(_))
+        ));
+        assert_eq!(store.list_team("TEAM#alpha").await.unwrap().len(), 1);
     }
 }
