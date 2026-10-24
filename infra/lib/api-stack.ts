@@ -484,14 +484,12 @@ export class ApiStack extends cdk.Stack {
       })
     );
 
-    // Bedrock access for plan chat
+    // Bedrock: Titan embeddings only (memory pages, metered in
+    // common::embed). Plan chat calls Anthropic directly with the team's key.
     this.gatewayFunction.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ["bedrock:InvokeModel", "bedrock:Converse"],
-        resources: [
-          `arn:aws:bedrock:*::foundation-model/*`,
-          `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
-        ],
+        actions: ["bedrock:InvokeModel"],
+        resources: [`arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0`],
       })
     );
 

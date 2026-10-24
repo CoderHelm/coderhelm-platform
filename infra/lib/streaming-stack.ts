@@ -11,6 +11,7 @@ import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as kms from "aws-cdk-lib/aws-kms";
 import * as logs from "aws-cdk-lib/aws-logs";
+import * as sqs from "aws-cdk-lib/aws-sqs";
 import { Construct } from "constructs";
 
 interface StreamingStackProps extends cdk.StackProps {
@@ -23,6 +24,8 @@ interface StreamingStackProps extends cdk.StackProps {
   bucket: s3.Bucket;
   mcpProxyFunction: lambda.Function;
   secretsKey: kms.Key;
+  /** Where a plan chat call whose usage couldn't be written is queued. */
+  ticketQueue: sqs.IQueue;
 }
 
 export class StreamingStack extends cdk.Stack {
@@ -99,8 +102,10 @@ export class StreamingStack extends cdk.Stack {
         // The plan chat's skills, agents and data source tools run in the
         // worker (by name: the worker stack depends on the API stack).
         WORKER_FUNCTION_NAME: `${prefix}-worker`,
+        // A model call whose usage couldn't be written waits here
+        // (`usage_record`), for the worker to add once.
+        TICKET_QUEUE_URL: props.ticketQueue.queueUrl,
         // Unused by streaming but required by shared binary
-        TICKET_QUEUE_URL: "unused",
         CI_FIX_QUEUE_URL: "unused",
         FEEDBACK_QUEUE_URL: "unused",
         COGNITO_USER_POOL_ID: "unused",
@@ -138,19 +143,15 @@ export class StreamingStack extends cdk.Stack {
       })
     );
 
-    // Bedrock streaming access
+    props.ticketQueue.grantSendMessages(this.streamingFunction);
+
+    // Bedrock: Titan embeddings only (the shared gateway binary's memory
+    // routes, metered in common::embed). Plan chat calls Anthropic directly
+    // with the team's key; no Claude model on Bedrock is called from here.
     this.streamingFunction.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: [
-          "bedrock:InvokeModel",
-          "bedrock:InvokeModelWithResponseStream",
-          "bedrock:Converse",
-          "bedrock:ConverseStream",
-        ],
-        resources: [
-          `arn:aws:bedrock:*::foundation-model/*`,
-          `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
-        ],
+        actions: ["bedrock:InvokeModel"],
+        resources: [`arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0`],
       })
     );
 

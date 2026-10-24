@@ -975,6 +975,32 @@ pub async fn admin_dlq(
     super::dlq::admin_list(&state).await.map(Json)
 }
 
+/// GET /api/admin/usage-check — the daily check of recorded model usage
+/// against Anthropic's own report (`usage_reconcile` in the worker): whether
+/// it is on, and its last result. Platform admin only.
+pub async fn admin_usage_check(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    if !is_platform_admin(&claims) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (pk, sk) = common::usage::usage_check_key();
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.analytics_table_name)
+        .key("team_id", AttributeValue::S(pk))
+        .key("period", AttributeValue::S(sk))
+        .send()
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Couldn't read the usage check status");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(common::usage::usage_check_json(item.item())))
+}
+
 /// POST /api/admin/dlq/delete — delete any one message from the shared queue
 /// by `message_id`. Platform admin only; logged with the admin's email.
 pub async fn admin_dlq_delete(
@@ -1236,6 +1262,6 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 5);
+        assert_eq!(checked, 6);
     }
 }

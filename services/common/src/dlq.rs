@@ -54,6 +54,8 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "jira_comment",
     "dlq_cleanup",
     "log_autofix",
+    // A model call's usage, held because its counters couldn't be written.
+    "usage_record",
 ];
 
 /// Scheduled jobs that act on every team (EventBridge puts them on the ticket

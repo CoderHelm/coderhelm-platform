@@ -9,6 +9,8 @@ team's month, all-time and day counters in one transaction.
 import json
 import logging
 import os
+import time
+import uuid
 from datetime import datetime, timezone
 
 logger = logging.getLogger()
@@ -142,26 +144,255 @@ def periods(now=None):
     return [now.strftime("%Y-%m"), "ALL_TIME", "DAY#" + now.strftime("%Y-%m-%d")]
 
 
-def record_usage(client, table, team_id, feature, model_id, usage):
-    """ADD one response's usage to the team's counters. Never raises."""
-    try:
-        u = call_usage(usage)
-        if not table or not team_id or total_tokens(u) == 0:
+# How long a call's once-only marker is kept (as services/common/src/usage.rs).
+CALL_MARKER_DAYS = 35
+# Waits (seconds) before each retry of a failed counter write.
+WRITE_RETRY_SECS = (0.1, 0.4, 1.6)
+
+
+def _transaction(table, team_id, call_id, at, expr, names, values):
+    """The marker (first, so its cancellation reason is index 0) and the
+    month, all-time and day updates: one transaction, once per call id."""
+    marker = {
+        "Put": {
+            "TableName": table,
+            "Item": {
+                "team_id": {"S": f"USAGE_CALL#{call_id}"},
+                "period": {"S": "CALL"},
+                "for_team": {"S": team_id},
+                "expires_at": {"N": str(int(at.timestamp()) + CALL_MARKER_DAYS * 86400)},
+            },
+            "ConditionExpression": "attribute_not_exists(team_id)",
+        }
+    }
+    return [marker] + [
+        {
+            "Update": {
+                "TableName": table,
+                "Key": {"team_id": {"S": team_id}, "period": {"S": p}},
+                "UpdateExpression": expr,
+                "ExpressionAttributeNames": names,
+                "ExpressionAttributeValues": values,
+            }
+        }
+        for p in periods(at)
+    ]
+
+
+def _already_counted(e):
+    """A cancelled transaction whose marker already existed."""
+    resp = getattr(e, "response", None) or {}
+    reasons = resp.get("CancellationReasons") or []
+    return bool(reasons) and (reasons[0] or {}).get("Code") == "ConditionalCheckFailed"
+
+
+def record_call(client, table, team_id, feature, model_id, u, call_id=None, estimated=False,
+                at=None, sleep=time.sleep, retry=WRITE_RETRY_SECS):
+    """ADD one call (four token parts in `u`) to the team's counters, exactly
+    once per `call_id`. A failed write is retried; if it still fails, the
+    whole record is logged as an error (`usage_lost`) to be added by hand.
+    Never raises."""
+    if not table or not team_id or total_tokens(u) == 0:
+        return
+    call_id = call_id or uuid.uuid4().hex
+    at = at or datetime.now(timezone.utc)
+    expr, names, values = add_expression(feature, model_id, u)
+    if estimated:
+        expr += ", #x0 :x0"
+        names["#x0"] = "estimated_calls"
+        values[":x0"] = {"N": "1"}
+    items = _transaction(table, team_id, call_id, at, expr, names, values)
+    last = None
+    for attempt in range(len(retry) + 1):
+        try:
+            client.transact_write_items(TransactItems=items)
             return
-        expr, names, values = add_expression(feature, model_id, u)
-        client.transact_write_items(
-            TransactItems=[
-                {
-                    "Update": {
-                        "TableName": table,
-                        "Key": {"team_id": {"S": team_id}, "period": {"S": p}},
-                        "UpdateExpression": expr,
-                        "ExpressionAttributeNames": names,
-                        "ExpressionAttributeValues": values,
-                    }
-                }
-                for p in periods()
-            ]
-        )
-    except Exception as e:  # never fail the analysis over accounting
+        except Exception as e:  # never fail the analysis over accounting
+            if _already_counted(e):
+                return
+            last = e
+        if attempt < len(retry):
+            sleep(retry[attempt])
+    logger.error(json.dumps({
+        "event": "usage_lost", "team_id": team_id, "call_id": call_id, "feature": feature,
+        "model": model_id, "estimated": estimated, "at_ms": int(at.timestamp() * 1000),
+        "usage": u, "error": str(last),
+    }))
+
+
+def record_usage(client, table, team_id, feature, model_id, usage, call_id=None):
+    """ADD one response's `usage` object to the team's counters. Never raises."""
+    try:
+        record_call(client, table, team_id, feature, model_id, call_usage(usage), call_id=call_id)
+    except Exception as e:
         logger.warning(f"Couldn't record model usage for {team_id}: {e}")
+
+
+# ── The one Anthropic call, streamed and metered per attempt ─────────────
+
+# Bytes of streamed text, thinking or tool-input JSON per output token, for
+# a reply that broke off before its final count (same ratio and reasoning as
+# services/common/src/model_stream.rs: ~3.5 chars per token on prose, fewer
+# on code; 3 errs toward counting more, never less).
+BYTES_PER_OUTPUT_TOKEN = 3
+# Request bytes per input token, only when no message_start arrived.
+BYTES_PER_INPUT_TOKEN = 4
+
+
+class Accumulator:
+    """One streamed reply, rebuilt event by event."""
+
+    def __init__(self):
+        self.started = False
+        self.finished = False
+        self.blocks = {}
+        self.raw_json = {}
+        self.usage = {}
+        self.delta_output = None
+        self.received_bytes = 0
+        self.stop_reason = None
+        self.error = None
+
+    def feed(self, ev):
+        t = ev.get("type")
+        if t == "message_start":
+            self.started = True
+            self.usage = dict((ev.get("message") or {}).get("usage") or {})
+        elif t == "content_block_start":
+            self.blocks[ev.get("index", 0)] = dict(ev.get("content_block") or {})
+        elif t == "content_block_delta":
+            i, d = ev.get("index", 0), ev.get("delta") or {}
+            b = self.blocks.setdefault(i, {})
+            dt = d.get("type")
+            for kind, field in (("text_delta", "text"), ("thinking_delta", "thinking")):
+                if dt == kind:
+                    piece = d.get(field, "")
+                    b[field] = b.get(field, "") + piece
+                    self.received_bytes += len(piece.encode("utf-8"))
+            if dt == "signature_delta":
+                b["signature"] = d.get("signature")
+            if dt == "input_json_delta":
+                piece = d.get("partial_json", "")
+                self.raw_json[i] = self.raw_json.get(i, "") + piece
+                self.received_bytes += len(piece.encode("utf-8"))
+        elif t == "content_block_stop":
+            i = ev.get("index", 0)
+            if self.blocks.get(i, {}).get("type") == "tool_use" and i in self.raw_json:
+                try:
+                    self.blocks[i]["input"] = json.loads(self.raw_json[i])
+                except ValueError:
+                    self.blocks[i]["input"] = {}
+        elif t == "message_delta":
+            sr = (ev.get("delta") or {}).get("stop_reason")
+            if sr:
+                self.stop_reason = sr
+                self.finished = True
+            for k, v in (ev.get("usage") or {}).items():
+                if v is not None:
+                    self.usage[k] = v
+            if isinstance((ev.get("usage") or {}).get("output_tokens"), int):
+                self.delta_output = ev["usage"]["output_tokens"]
+        elif t == "error":
+            self.error = ev.get("error") or {}
+
+    def call(self, request_bytes):
+        """(four token parts, estimated): exact with the final message_delta;
+        otherwise message_start's input and the output estimated from the
+        bytes received (or the last cumulative count, whichever is larger)."""
+        u = call_usage(self.usage)
+        if self.finished:
+            return u, False
+        estimate = -(-self.received_bytes // BYTES_PER_OUTPUT_TOKEN)
+        u["output"] = max(self.delta_output or 0, estimate)
+        if not self.started:
+            u = {"uncached_input": -(-request_bytes // BYTES_PER_INPUT_TOKEN), "cache_read": 0,
+                 "cache_write_5m": 0, "cache_write_1h": 0, "output": u["output"]}
+        return u, True
+
+    def message(self):
+        return {
+            "content": [self.blocks[i] for i in sorted(self.blocks)],
+            "stop_reason": self.stop_reason,
+            "usage": self.usage,
+        }
+
+
+def is_transient_status(code):
+    """True for statuses that may succeed when sent again: every 5xx
+    (Cloudflare's 520-524 included), 408, 429 and 529."""
+    return code in (408, 429) or 500 <= code <= 599
+
+
+class StreamBroke(Exception):
+    """The reply ended before its final usage (counted, estimated)."""
+
+
+def call_messages(api_key, body, model_id, client, table, team_id, feature,
+                  backoff=(2, 4, 8, 16, 32), sleep=time.sleep, opener=None, timeout=120):
+    """One Anthropic Messages call, streamed, every attempt recorded on the
+    team's counters as its own call (a broken reply with its output
+    estimated). Retries transient statuses, network errors and broken
+    replies after each wait in `backoff`; the last failure is raised.
+    Returns the rebuilt message (content, stop_reason, usage)."""
+    import random
+    import urllib.error
+    from urllib.request import Request, urlopen
+
+    opener = opener or urlopen
+    data = json.dumps(dict(body, stream=True)).encode("utf-8")
+    for attempt in range(len(backoff) + 1):
+        last = attempt == len(backoff)
+        req = Request(
+            "https://api.anthropic.com/v1/messages",
+            data=data,
+            headers={"Content-Type": "application/json", "x-api-key": api_key,
+                     "anthropic-version": "2023-06-01"},
+            method="POST",
+        )
+        try:
+            resp = opener(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if last or not is_transient_status(e.code):
+                raise
+            logger.warning(f"Anthropic transient status {e.code}, retrying (attempt {attempt + 1})")
+            sleep(backoff[attempt] * random.uniform(0.75, 1.25))
+            continue
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if last:
+                raise
+            logger.warning(f"Anthropic request failed ({e}), retrying (attempt {attempt + 1})")
+            sleep(backoff[attempt] * random.uniform(0.75, 1.25))
+            continue
+        acc = Accumulator()
+        headers = getattr(resp, "headers", None)
+        call_id = headers.get("request-id") if headers is not None else None
+        broke = None
+        try:
+            with resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line.startswith("data:"):
+                        try:
+                            acc.feed(json.loads(line[5:].strip()))
+                        except ValueError:
+                            continue
+                    if acc.error is not None:
+                        break
+        except Exception as e:  # timeout or cut connection mid-reply
+            broke = e
+        u, estimated = acc.call(len(data))
+        _record_attempt(client, table, team_id, feature, model_id, u, call_id, estimated)
+        if not estimated and acc.error is None:
+            return acc.message()
+        err = StreamBroke(f"reply broke off: {broke or acc.error or 'no final usage'}")
+        if last:
+            raise err
+        logger.warning(f"{err}, retrying (attempt {attempt + 1})")
+        sleep(backoff[attempt] * random.uniform(0.75, 1.25))
+    raise StreamBroke("unreachable")
+
+
+def _record_attempt(client, table, team_id, feature, model_id, u, call_id, estimated):
+    if estimated:
+        logger.warning(f"Anthropic reply broke off; recording {u} with the output estimated")
+    record_call(client, table, team_id, feature, model_id, u, call_id=call_id, estimated=estimated)

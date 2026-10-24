@@ -35,8 +35,6 @@ MODEL_ID = os.environ.get("MODEL_ID", "claude-sonnet-4-6")
 CODERHELM_ACCOUNT_ID = os.environ["CODERHELM_ACCOUNT_ID"]
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://app.coderhelm.com")
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_VERSION = "2023-06-01"
 # Team usage counters (empty: usage isn't counted).
 ANALYTICS_TABLE = os.environ.get("ANALYTICS_TABLE_NAME", "")
 
@@ -526,40 +524,6 @@ def parse_recommendations(output_text):
     return [r for r in recs if isinstance(r, dict)][:10]
 
 
-# Waits (seconds) before each retry of a model call that failed transiently.
-RETRY_BACKOFF_SECS = (2, 4, 8, 16, 32)
-
-
-def is_transient_status(code):
-    """True for statuses that may succeed when sent again: every 5xx
-    (Cloudflare's 520-524 included), 408, 429 and 529."""
-    return code in (408, 429) or 500 <= code <= 599
-
-
-def send_with_retry(req, backoff=RETRY_BACKOFF_SECS, sleep=time.sleep, opener=None):
-    """POST `req` and return the response body. Retries transient statuses
-    and network errors (classified by status / exception type, never by
-    message text) after each wait in `backoff`, with jitter; anything else,
-    or the last failure, is raised."""
-    import random
-    import urllib.error
-
-    opener = opener or urlopen
-    for attempt in range(len(backoff) + 1):
-        last = attempt == len(backoff)
-        try:
-            with opener(req, timeout=120) as resp:
-                return resp.read()
-        except HTTPError as e:
-            if last or not is_transient_status(e.code):
-                raise
-            logger.warning(f"Anthropic transient status {e.code}, retrying (attempt {attempt + 1})")
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            if last:
-                raise
-            logger.warning(f"Anthropic request failed ({e}), retrying (attempt {attempt + 1})")
-        sleep(backoff[attempt] * random.uniform(0.75, 1.25))
-
 
 def analyze_with_anthropic(query_results, account_id, api_key, existing=None, team_id=None):
     """Send log error summaries to Anthropic Claude for analysis."""
@@ -632,25 +596,11 @@ Rules:
 Return ONLY the JSON array, no surrounding text."""
 
     try:
-        request_body = json.dumps(build_request_body(prompt)).encode("utf-8")
-
-        req = Request(
-            ANTHROPIC_API_URL,
-            data=request_body,
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": ANTHROPIC_VERSION,
-            },
-            method="POST",
-        )
-
-        response_data = json.loads(send_with_retry(req).decode("utf-8"))
-
-        # Count the call once in the team's usage counters (tokens + cost).
-        usage.record_usage(
+        # Streamed; every attempt (a broken or retried one too) is counted in
+        # the team's usage counters as it happens (usage.call_messages).
+        response_data = usage.call_messages(
+            api_key, build_request_body(prompt), MODEL_ID,
             dynamodb_client, ANALYTICS_TABLE, team_id, usage.FEATURE_LOG_ANALYSIS,
-            MODEL_ID, response_data.get("usage"),
         )
 
         recommendations = parse_recommendations(response_text(response_data))

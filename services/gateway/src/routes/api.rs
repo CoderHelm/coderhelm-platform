@@ -2956,6 +2956,18 @@ pub async fn delete_repo(
     Ok(StatusCode::OK)
 }
 
+/// A whole-number counter on an analytics item (0 when absent).
+fn n_attr(
+    item: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
+    key: &str,
+) -> u64 {
+    item.and_then(|i| i.get(key))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<f64>().ok())
+        .map(|f| f.max(0.0) as u64)
+        .unwrap_or(0)
+}
+
 /// GET /api/stats — pre-computed analytics (O(1) read from analytics table).
 pub async fn get_stats(
     State(state): State<Arc<AppState>>,
@@ -3037,6 +3049,10 @@ pub async fn get_stats(
             "cache_write_tokens": t.cache_write,
             "total_tokens": t.total(),
             "cache_hit_rate": t.cache_hit_rate(),
+            // Calls whose reply broke off, their output estimated, and calls
+            // added later from the fallback queue (common::usage).
+            "estimated_calls": n_attr(item, common::usage::ESTIMATED_CALLS),
+            "recovered_calls": n_attr(item, common::usage::RECOVERED_CALLS),
             "merge_rate": if total > 0 { completed as f64 / total as f64 } else { 0.0 },
         })
     };

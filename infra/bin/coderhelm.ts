@@ -125,4 +125,5 @@ new StreamingStack(app, `${prefix}-streaming`, {
   bucket: storage.bucket,
   mcpProxyFunction: api.mcpProxyFunction,
   secretsKey: database.secretsKey,
+  ticketQueue: api.ticketQueue,
 });

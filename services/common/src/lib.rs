@@ -39,6 +39,13 @@ pub mod memory_meta;
 pub mod merge_gate;
 /// Retrying model API calls on transient failures, classified by status.
 pub mod model_retry;
+// Anthropic SSE calls, metered per attempt (drops, retries, the deadline)
+pub mod model_stream;
+// Titan embeddings, metered as CoderHelm's own cost
+pub mod embed;
+// The test that every model call site is a metered helper
+#[cfg(test)]
+mod model_call_sites;
 /// Paginated DynamoDB lookups (follow LastEvaluatedKey to a match).
 pub mod paged;
 /// What happened to a PR Coderhelm opened, read from GitHub.
