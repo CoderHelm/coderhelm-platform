@@ -57,7 +57,6 @@ const META_PREFIX: &str = "SUPPORT#";
 const MSG_PREFIX: &str = "SUPPORT_MSG#";
 const RATE_PREFIX: &str = "SUPPORT_RATE#";
 
-const APP: &str = "https://app.coderhelm.com";
 const DEFAULT_INBOX: &str = "support@coderhelm.com";
 
 pub const MAX_SUBJECT: usize = 150;
@@ -1706,11 +1705,13 @@ fn esc(v: &str) -> String {
 }
 
 fn customer_link(id: &str) -> String {
-    format!("{APP}/support/ticket/?id={id}")
+    let app = common::public_urls::app_url_from_env();
+    format!("{app}/support/ticket/?id={id}")
 }
 
 fn admin_link(id: &str) -> String {
-    format!("{APP}/admin/tickets/?id={id}")
+    let app = common::public_urls::app_url_from_env();
+    format!("{app}/admin/tickets/?id={id}")
 }
 
 fn item_words(item: &RelatedItem) -> String {

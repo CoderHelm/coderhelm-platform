@@ -788,11 +788,7 @@ pub fn notify_line(outcome: Outcome, repo: &str, post_recoveries: bool) -> Optio
 }
 
 fn dashboard_base(state: &AppState) -> &'static str {
-    if state.config.stage == "prod" {
-        "https://app.coderhelm.com"
-    } else {
-        "http://localhost:3000"
-    }
+    common::public_urls::app_url(&state.config.stage)
 }
 
 /// The secrets key, for sealing and opening saved webhooks.

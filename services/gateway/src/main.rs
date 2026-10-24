@@ -53,6 +53,8 @@ async fn main() -> Result<(), Error> {
     let sts = aws_sdk_sts::Client::new(&aws_config);
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
+    // Where this deployment's dashboard and API are (config, or SSM).
+    common::public_urls::init(common::public_urls::ssm::Client::new(&aws_config)).await;
 
     // Load secrets from Secrets Manager
     let secrets_name =
@@ -833,6 +835,13 @@ async fn main() -> Result<(), Error> {
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
             header::HeaderValue::from_static("no-store"),
+        ))
+        // The public URL, if it couldn't be read at start (first deploy).
+        .layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                common::public_urls::ensure().await;
+                next.run(req).await
+            },
         ))
         .with_state(state);
 

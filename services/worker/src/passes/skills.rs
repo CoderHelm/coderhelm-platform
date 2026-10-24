@@ -1673,11 +1673,7 @@ fn clip(text: &str) -> String {
 
 /// Where links to the dashboard point.
 pub fn app_url(stage: &str) -> &'static str {
-    if stage == "prod" {
-        "https://app.coderhelm.com"
-    } else {
-        "http://localhost:3000"
-    }
+    common::public_urls::app_url(stage)
 }
 
 /// One team agent asked during a piece of work.

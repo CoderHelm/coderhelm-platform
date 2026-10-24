@@ -21,7 +21,13 @@ pub const VALID_SECS: i64 = 365 * 86_400;
 /// Longest token accepted; real ones are well under this.
 const MAX_TOKEN_LEN: usize = 1024;
 /// Where the links point.
-pub const BASE_URL: &str = "https://api.coderhelm.com/email/unsubscribe";
+/// Where unsubscribe links point: the API's `/email/unsubscribe`.
+pub fn base_url() -> String {
+    format!(
+        "{}/email/unsubscribe",
+        crate::public_urls::api_url_from_env()
+    )
+}
 /// The token a test email carries when its address is not on the team.
 pub const TEST_TOKEN: &str = "test";
 
@@ -104,7 +110,7 @@ pub fn verify(
 
 /// The link for a token.
 pub fn url(token: &str) -> String {
-    format!("{BASE_URL}?t={token}")
+    format!("{}?t={token}", base_url())
 }
 
 #[cfg(test)]

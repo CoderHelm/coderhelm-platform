@@ -1879,9 +1879,12 @@ pub async fn get_jira_integration_check(
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let webhook_url = team_secret
-        .as_ref()
-        .map(|(token, _)| format!("https://api.coderhelm.com/webhooks/jira/{token}"));
+    let webhook_url = team_secret.as_ref().map(|(token, _)| {
+        format!(
+            "{}/webhooks/jira/{token}",
+            common::public_urls::api_url(&state.config.stage)
+        )
+    });
 
     // Load or generate forge_secret for the Forge app integration
     let jira_config = state

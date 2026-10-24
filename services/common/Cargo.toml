@@ -38,6 +38,8 @@ aws-sdk-cloudwatchlogs = "1"
 # live: CloudWatch metrics and Airflow (MWAA) through the team's log reader role
 aws-sdk-cloudwatch = "1"
 aws-sdk-mwaa = "1"
+# public_urls: the deployment's URL when CloudFront picked it (single origin)
+aws-sdk-ssm = "1"
 aws-smithy-types = "1"
 # live: fakes stand in for the HTTP and AWS calls in tests
 async-trait = "0.1"

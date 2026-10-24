@@ -32,7 +32,10 @@ use crate::WorkerState;
 type Item = HashMap<String, AttributeValue>;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
-const APP: &str = "https://app.coderhelm.com";
+/// The dashboard's base URL (links in the email).
+fn app() -> &'static str {
+    common::public_urls::app_url_from_env()
+}
 const MAX_PAGES: usize = 40;
 /// Runs older than this can't have merged in the window in any way we report.
 const RUN_LOOKBACK_DAYS: i64 = 30;
@@ -44,8 +47,33 @@ const TOP_ATTENTION: usize = 5;
 const SENT_MARKER_SECS: u64 = 14 * 86_400;
 /// Mail apps read this address for the `mailto:` unsubscribe; requests that
 /// land there are handled by hand.
-const UNSUBSCRIBE_MAILTO: &str =
-    "mailto:support@coderhelm.com?subject=Unsubscribe%20from%20weekly%20summaries";
+fn unsubscribe_mailto() -> String {
+    let inbox = std::env::var("SUPPORT_INBOX")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "support@coderhelm.com".to_string());
+    format!("mailto:{inbox}?subject=Unsubscribe%20from%20weekly%20summaries")
+}
+
+/// The email's last line (HTML): the product, and the site and its privacy
+/// page when the deployment has a site.
+fn site_line_html(t3: &str) -> String {
+    match common::public_urls::site_url() {
+        Some(site) => format!(
+            "Coderhelm&nbsp;·&nbsp;<a href=\"{site}\" class=\"t3\" style=\"color:{t3};text-decoration:none\">{host}</a>&nbsp;·&nbsp;<a href=\"{site}/privacy\" class=\"t3\" style=\"color:{t3};text-decoration:none\">Privacy</a>",
+            host = common::public_urls::host_of(site),
+        ),
+        None => "Coderhelm".to_string(),
+    }
+}
+
+/// The email's last line (text).
+fn site_line_text() -> String {
+    match common::public_urls::site_url() {
+        Some(site) => format!("Coderhelm · {site}"),
+        None => "Coderhelm".to_string(),
+    }
+}
 
 /// Send one test email for a team to one address.
 #[derive(Serialize, Deserialize, Debug)]
@@ -348,6 +376,7 @@ fn pr_key(r: &Item) -> String {
 /// * CI: fixes pushed in the week (`ci_fixes_at`), the PRs they were on, and
 ///   PRs handed to a person in the week (`handed_off_at`).
 pub fn run_stats(rows: &[Item], start: DateTime<Utc>, end: DateTime<Utc>) -> RunStats {
+    let app = app();
     let mut out = RunStats::default();
     let mut prs: HashMap<String, PrRuns> = HashMap::new();
     let mut latest_of_ticket: HashMap<(String, String), String> = HashMap::new();
@@ -452,7 +481,7 @@ pub fn run_stats(rows: &[Item], start: DateTime<Utc>, end: DateTime<Utc>) -> Run
             continue;
         }
         let url = match s(r, "pr_url") {
-            u if u.is_empty() => format!("{APP}/runs/detail/?id={}", s(r, "run_id")),
+            u if u.is_empty() => format!("{app}/runs/detail/?id={}", s(r, "run_id")),
             u => u,
         };
         waiting.push((
@@ -923,6 +952,7 @@ fn meter(pct: u64, color: &str) -> String {
 }
 
 fn details(sm: &Summary, access: Access) -> Vec<Detail> {
+    let app = app();
     let mut out = Vec::new();
     let v = &sm.reviews;
     if v.posted > 0 {
@@ -958,7 +988,7 @@ fn details(sm: &Summary, access: Access) -> Vec<Detail> {
                 t2 = c::T2
             ),
             link_label: "View",
-            link: format!("{APP}/reviewer/"),
+            link: format!("{app}/reviewer/"),
         });
     }
     let r = &sm.runs;
@@ -982,7 +1012,7 @@ fn details(sm: &Summary, access: Access) -> Vec<Detail> {
             line: parts.join(" · "),
             extra: String::new(),
             link_label: "View",
-            link: format!("{APP}/analytics/"),
+            link: format!("{app}/analytics/"),
         });
     }
     let a = &sm.alerts;
@@ -1004,7 +1034,7 @@ fn details(sm: &Summary, access: Access) -> Vec<Detail> {
             line,
             extra: String::new(),
             link_label: "View",
-            link: format!("{APP}/alerts/"),
+            link: format!("{app}/alerts/"),
         });
     }
     if sm.skill_reads + sm.agent_asks > 0 {
@@ -1017,7 +1047,7 @@ fn details(sm: &Summary, access: Access) -> Vec<Detail> {
             ),
             extra: String::new(),
             link_label: "View",
-            link: format!("{APP}/skills/?tab=activity&range=7d"),
+            link: format!("{app}/skills/?tab=activity&range=7d"),
         });
     }
     let l = &sm.lookups;
@@ -1026,10 +1056,10 @@ fn details(sm: &Summary, access: Access) -> Vec<Detail> {
         let (link_label, link) = if problems > 0 {
             (
                 "See problems",
-                format!("{APP}/data-sources/activity/?outcome=problems&range=7d"),
+                format!("{app}/data-sources/activity/?outcome=problems&range=7d"),
             )
         } else {
-            ("View", format!("{APP}/data-sources/activity/?range=7d"))
+            ("View", format!("{app}/data-sources/activity/?range=7d"))
         };
         out.push(Detail {
             name: "Data lookups",
@@ -1188,6 +1218,7 @@ fn preheader(text: &str) -> String {
 }
 
 pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
+    let app = app();
     let r = &sm.runs;
     let u = &sm.usage;
     let cs = cards(sm, access);
@@ -1300,7 +1331,7 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
         }
         let more = r.attention_total.saturating_sub(r.attention.len() as u64);
         if more > 0 {
-            let _ = writeln!(text, "  and {} more: {APP}/", num(more));
+            let _ = writeln!(text, "  and {} more: {app}/", num(more));
         }
     }
     if !r.top_merged.is_empty() {
@@ -1321,7 +1352,7 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
         }
         let more = r.merged.saturating_sub(r.top_merged.len() as u64);
         if more > 0 {
-            let _ = writeln!(text, "  and {} more: {APP}/", num(more));
+            let _ = writeln!(text, "  and {} more: {app}/", num(more));
         }
     }
     if !ds.is_empty() {
@@ -1344,14 +1375,15 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
     if has_usage {
         let _ = writeln!(
             text,
-            "\nTOKEN USAGE\n{usage_head}\n{month_line}{week_line}\nToken limit: {APP}/settings/budget/"
+            "\nTOKEN USAGE\n{usage_head}\n{month_line}{week_line}\nToken limit: {app}/settings/budget/"
         );
     }
     let _ = write!(
         text,
-        "\nOpen Coderhelm: {APP}/\n\n--\nYou get this every Monday because weekly summaries are on \
-         for your Coderhelm account.\nManage notifications: {APP}/settings/notifications/\n\
-         Unsubscribe from weekly summaries: {unsubscribe_url}\nCoderhelm · https://coderhelm.com\n"
+        "\nOpen Coderhelm: {app}/\n\n--\nYou get this every Monday because weekly summaries are on \
+         for your Coderhelm account.\nManage notifications: {app}/settings/notifications/\n\
+         Unsubscribe from weekly summaries: {unsubscribe_url}\n{site}\n",
+        site = site_line_text(),
     );
 
     // ── HTML ──
@@ -1410,7 +1442,7 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
             .collect();
         let more = r.attention_total.saturating_sub(r.attention.len() as u64);
         let tail = if more > 0 {
-            more_link(&format!("and {} more", num(more)), &format!("{APP}/"))
+            more_link(&format!("and {} more", num(more)), &format!("{app}/"))
         } else {
             String::new()
         };
@@ -1437,9 +1469,9 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
             .collect();
         let more = r.merged.saturating_sub(r.top_merged.len() as u64);
         let tail = if more > 0 {
-            more_link(&format!("and {} more", num(more)), &format!("{APP}/"))
+            more_link(&format!("and {} more", num(more)), &format!("{app}/"))
         } else {
-            more_link("See all runs", &format!("{APP}/"))
+            more_link("See all runs", &format!("{app}/"))
         };
         rows.push_str(&block(&format!(
             "{}{}{tail}",
@@ -1506,13 +1538,13 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
             r#"{h}{lines}{split}{more}"#,
             h = h2("Token usage"),
             split = token_table(u.week_tokens.as_ref(), &u.month_tokens, month),
-            more = more_link("Token limit", &format!("{APP}/settings/budget/")),
+            more = more_link("Token limit", &format!("{app}/settings/budget/")),
         )));
     }
     let _ = write!(
         rows,
         r#"<tr><td class="px" style="padding:4px 40px 40px">{}</td></tr>"#,
-        button("Open Coderhelm", &format!("{APP}/"))
+        button("Open Coderhelm", &format!("{app}/"))
     );
 
     let html = format!(
@@ -1546,7 +1578,7 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" class="t3" style="padding:28px 24px 0;font-size:13px;line-height:20px;color:{t3}">
 <p style="margin:0">You get this every Monday because weekly summaries are on for your Coderhelm account.</p>
 <p style="margin:8px 0 0"><a href="{app}/settings/notifications/" class="t2" style="color:{t2};text-decoration:underline;white-space:nowrap">Manage notifications</a> &nbsp;·&nbsp; <a href="{unsub}" class="t2" style="color:{t2};text-decoration:underline;white-space:nowrap">Unsubscribe from weekly summaries</a></p>
-<p style="margin:16px 0 0">Coderhelm&nbsp;·&nbsp;<a href="https://coderhelm.com" class="t3" style="color:{t3};text-decoration:none">coderhelm.com</a>&nbsp;·&nbsp;<a href="https://coderhelm.com/privacy" class="t3" style="color:{t3};text-decoration:none">Privacy</a></p>
+<p style="margin:16px 0 0">{site_line}</p>
 </td></tr></table>
 </div>
 <!--[if mso]></td></tr></table><![endif]-->
@@ -1566,8 +1598,9 @@ pub fn render(sm: &Summary, access: Access, unsubscribe_url: &str) -> Rendered {
         t3 = c::T3,
         blue = c::BLUE,
         when = esc(&when),
-        app = APP,
+        app = app,
         unsub = esc(unsubscribe_url),
+        site_line = site_line_html(c::T3),
     );
     Rendered {
         subject,
@@ -1969,7 +2002,7 @@ pub fn unsubscribe_headers(link: &str) -> [(&'static str, String); 2] {
     [
         (
             "List-Unsubscribe",
-            format!("<{link}>, <{UNSUBSCRIBE_MAILTO}>"),
+            format!("<{link}>, <{}>", unsubscribe_mailto()),
         ),
         (
             "List-Unsubscribe-Post",
@@ -2256,6 +2289,7 @@ mod tests {
     }
 
     fn sample() -> Summary {
+        let app = app();
         let (start, end) = week();
         Summary {
             team_name: "Example Team".into(),
@@ -2289,7 +2323,7 @@ mod tests {
                     Attention {
                         title: "Which region should the new queue live in?".into(),
                         repo: "example/api".into(),
-                        url: format!("{APP}/runs/detail/?id=01JABC"),
+                        url: format!("{app}/runs/detail/?id=01JABC"),
                         why: Waiting::Input,
                     },
                 ],

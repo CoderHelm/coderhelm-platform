@@ -3329,7 +3329,10 @@ fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValu
 /// limit keeps its old wording.
 pub fn limit_reason(hit: &common::token_limits::LimitUse) -> String {
     use common::token_limits::{short_tokens, LimitKind};
-    let settings = "[Settings → Token Limit](https://app.coderhelm.com/settings/budget)";
+    let settings = format!(
+        "[Settings → Token Limit]({}/settings/budget)",
+        common::public_urls::app_url_from_env()
+    );
     match hit.kind {
         LimitKind::Legacy { .. } => {
             let limit_label = if hit.max >= 1_000_000 {

@@ -46,6 +46,8 @@ async fn main() -> Result<(), Error> {
     let kms = aws_sdk_kms::Client::new(&aws_config);
     let sts = aws_sdk_sts::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
+    // Where this deployment's dashboard and API are (config, or SSM).
+    common::public_urls::init(common::public_urls::ssm::Client::new(&aws_config)).await;
 
     let config = models::Config::from_env();
     let secrets = models::Secrets::load(&sm, &config.secrets_name).await?;
@@ -87,6 +89,7 @@ async fn handle_event(
     event: LambdaEvent<serde_json::Value>,
 ) -> Result<serde_json::Value, Error> {
     let (payload, context) = event.into_parts();
+    common::public_urls::ensure().await;
     // In-flight model calls are cancelled (and their usage recorded) this
     // long before the Lambda's own deadline, leaving time for the writes.
     common::model_stream::set_deadline_epoch_ms(Some(

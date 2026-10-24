@@ -189,7 +189,10 @@ pub async fn create_connection(
         warn!(role_arn = body.role_arn, error = %e, "AssumeRole validation failed");
         return Ok(Json(json!({
             "error": "unable_to_assume_role",
-            "message": "Could not assume the provided role. Make sure the trust policy includes our account ID (654654210434) and the External ID matches.",
+            "message": format!(
+                "Could not assume the provided role. Make sure the trust policy includes our account ID ({}) and the External ID matches.",
+                common::public_urls::platform_account_id()
+            ),
             "external_id": external_id,
         })));
     }
@@ -685,14 +688,15 @@ pub async fn get_cfn_url(
     }
 
     let external_id = team_external_id(&state, &claims.team_id).await?;
-    let template_url = "https://coderhelm-public.s3.amazonaws.com/cfn/coderhelm-log-reader.yaml";
+    let template_url = common::public_urls::log_reader_template_url();
     let stack_name = "CoderHelmLogReader";
 
     let cfn_url = format!(
-        "https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?stackName={}&templateURL={}&param_ExternalId={}&param_CoderHelmAccountId=654654210434",
+        "https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?stackName={}&templateURL={}&param_ExternalId={}&param_CoderHelmAccountId={}",
         stack_name,
-        urlencoding::encode(template_url),
+        urlencoding::encode(&template_url),
         external_id,
+        common::public_urls::platform_account_id(),
     );
 
     Ok(Json(json!({
