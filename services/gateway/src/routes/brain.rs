@@ -504,11 +504,19 @@ pub async fn sources(
         }));
     }
     knowledge.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-    let connections: Vec<Value> = plugins
+    let remote = super::mcp_servers::runtime(&state, &claims.team_id)
+        .usable(Some(&claims.email))
+        .await;
+    let mut connections: Vec<Value> = remote
         .iter()
-        .filter(|(_, creds, _)| *creds)
-        .map(|(id, _, _)| json!({ "id": id }))
+        .map(|(r, _)| json!({ "id": r.id, "name": r.name }))
         .collect();
+    connections.extend(
+        plugins
+            .iter()
+            .filter(|(id, creds, _)| *creds && !remote.iter().any(|(r, _)| &r.id == id))
+            .map(|(id, _, _)| json!({ "id": id })),
+    );
     let mut repo_names: Vec<&String> = repos.keys().collect();
     repo_names.sort();
     Ok(Json(json!({
@@ -643,6 +651,8 @@ pub fn retrieval_query(question: &str, history: &[Message]) -> String {
 struct Run {
     state: Arc<AppState>,
     team_id: String,
+    /// The asker: remote connections run as them.
+    user_email: String,
     api_key: String,
     model_id: String,
     picks: Picks,
@@ -869,7 +879,9 @@ async fn run_tool(
                         .await
                     )
                 } else {
-                    match invoke_mcp_tool(state, &run.team_id, server, tool, input).await {
+                    match invoke_mcp_tool(state, &run.team_id, &run.user_email, server, tool, input)
+                        .await
+                    {
                         Ok(r) => r,
                         Err(e) => json!(format!("Error: {e}")),
                     }
@@ -1056,15 +1068,29 @@ async fn github_token(state: &AppState, team_id: &str) -> Option<String> {
         .ok()
 }
 
-/// The connections' tools (cached schemas), named `server__tool`.
-async fn connection_tools(state: &AppState, team_id: &str) -> Vec<Value> {
+/// The connections' tools, named `server__tool`: the remote MCP servers
+/// this person may use (the team's shared ones and their own connections,
+/// allowed tools only, as in the plan chat), and the catalog servers with a
+/// saved key (cached schemas). A remote connection takes the place of the
+/// same catalog server's key.
+async fn connection_tools(state: &AppState, team_id: &str, user_email: &str) -> Vec<Value> {
+    let remote = super::mcp_servers::runtime(state, team_id)
+        .usable(Some(user_email))
+        .await;
+    let mut out = Vec::new();
+    for (r, _) in &remote {
+        for (name, description, input_schema) in common::mcp_remote::tools::agent_tools(r, false) {
+            out.push(
+                json!({ "name": name, "description": description, "input_schema": input_schema }),
+            );
+        }
+    }
     if state.config.mcp_proxy_function_name.is_empty() {
-        return Vec::new();
+        return out;
     }
     let plugins = load_enabled_plugins(state, team_id).await;
-    let mut out = Vec::new();
     for (server, creds, _) in plugins {
-        if !creds {
+        if !creds || remote.iter().any(|(r, _)| r.id == server) {
             continue;
         }
         if let Some(tools) =
@@ -1211,7 +1237,7 @@ pub async fn brain_stream(
         },
         async {
             if picks.connections {
-                connection_tools(&state, &claims.team_id).await
+                connection_tools(&state, &claims.team_id, &claims.email).await
             } else {
                 Vec::new()
             }
@@ -1220,6 +1246,7 @@ pub async fn brain_stream(
     let run = Run {
         state: state.clone(),
         team_id: claims.team_id.clone(),
+        user_email: claims.email.clone(),
         api_key: api_key.unwrap_or_default(),
         model_id,
         picks: picks.clone(),
