@@ -29,6 +29,7 @@
 //! - [`signed`]: signed email approval links.
 //! - [`chat`]: Slack and Teams cards, and signature checks on what they send.
 //! - [`connect`]: the seam to connections (MCP servers, OAuth tokens).
+//! - [`remote`]: remote MCP servers (OAuth or a key) behind that seam.
 //! - [`brain`]: plugins as a source in the brain chat.
 //!
 //! Everything sits behind the team's `plugins` flag ([`flag`]), off by
@@ -48,6 +49,7 @@ pub mod package;
 pub mod publish;
 #[cfg(test)]
 mod release_check;
+pub mod remote;
 pub mod run;
 pub mod schedule;
 pub mod signed;

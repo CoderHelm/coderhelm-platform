@@ -63,6 +63,32 @@ fn cipher(state: &WorkerState) -> common::mcp_credentials::Kms<'_> {
     }
 }
 
+/// The team's remote MCP servers (Connections page, OAuth or a key) for a
+/// plugin run, publish or results check.
+fn remote(
+    state: &WorkerState,
+    team: &str,
+    user: Option<&str>,
+    actor: String,
+) -> common::plugins::remote::RemoteMcp {
+    let table = if state.config.mcp_configs_table_name.is_empty() {
+        &state.config.settings_table_name
+    } else {
+        &state.config.mcp_configs_table_name
+    };
+    common::plugins::remote::RemoteMcp {
+        rt: common::mcp_remote::runtime::Runtime::aws(
+            state.dynamo.clone(),
+            table,
+            state.kms.clone(),
+            &state.config.secrets_key_id,
+            team,
+        ),
+        user: user.filter(|u| u.contains('@')).map(str::to_string),
+        actor,
+    }
+}
+
 fn runs_table(state: &WorkerState) -> run::RunsTable {
     run::RunsTable {
         client: state.dynamo.clone(),
@@ -521,8 +547,17 @@ fn knowledge() -> run::NoKnowledge {
 pub async fn run_plugin(state: &WorkerState, msg: PluginRunMessage) -> Res {
     let kv = kv(state);
     let usage = usage(state);
-    let conns = CatalogConnections { state };
-    let remote = connect::NoRemote;
+    let local = CatalogConnections { state };
+    let remote = remote(
+        state,
+        &msg.team_id,
+        Some(&msg.requested_by),
+        format!("plugin:{}, run {}", msg.plugin_id, msg.run_id),
+    );
+    let conns = common::plugins::remote::Layered {
+        remote: &remote,
+        local: &local,
+    };
     let http = connect::Https {
         http: &state.http,
         remote: &remote,
@@ -596,7 +631,7 @@ fn publish_deps<'a>(
     kv: &'a kv::Dynamo,
     sched: &'a schedule::EventBridge,
     http: &'a connect::Https<'a>,
-    conns: &'a CatalogConnections<'a>,
+    conns: &'a dyn Connections,
     cipher: &'a common::mcp_credentials::Kms<'a>,
 ) -> publish::Deps<'a> {
     publish::Deps {
@@ -612,12 +647,21 @@ fn publish_deps<'a>(
 pub async fn publish(state: &WorkerState, msg: PluginPublishMessage) -> Res {
     let kv = kv(state);
     let sched = scheduler(state);
-    let remote = connect::NoRemote;
+    let remote = remote(
+        state,
+        &msg.team_id,
+        None,
+        format!("plugin publish {}", msg.artifact_id),
+    );
     let http = connect::Https {
         http: &state.http,
         remote: &remote,
     };
-    let conns = CatalogConnections { state };
+    let local = CatalogConnections { state };
+    let conns = common::plugins::remote::Layered {
+        remote: &remote,
+        local: &local,
+    };
     let cipher = cipher(state);
     let out = publish::run(
         &publish_deps(&kv, &sched, &http, &conns, &cipher),
@@ -633,12 +677,21 @@ pub async fn publish(state: &WorkerState, msg: PluginPublishMessage) -> Res {
 pub async fn results(state: &WorkerState, msg: PluginResultsMessage) -> Res {
     let kv = kv(state);
     let sched = scheduler(state);
-    let remote = connect::NoRemote;
+    let remote = remote(
+        state,
+        &msg.team_id,
+        None,
+        format!("plugin results {}", msg.artifact_id),
+    );
     let http = connect::Https {
         http: &state.http,
         remote: &remote,
     };
-    let conns = CatalogConnections { state };
+    let local = CatalogConnections { state };
+    let conns = common::plugins::remote::Layered {
+        remote: &remote,
+        local: &local,
+    };
     let cipher = cipher(state);
     match publish::results(&publish_deps(&kv, &sched, &http, &conns, &cipher), &msg).await {
         Ok(l) => {

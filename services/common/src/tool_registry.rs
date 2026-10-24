@@ -450,6 +450,9 @@ mod tests {
                 collect(&p, out);
             } else if p.extension().map(|x| x == "rs").unwrap_or(false)
                 && !p.ends_with("tool_registry.rs")
+                // A remote server's own tools (and its tests' samples) are
+                // classified by name at run time, not listed here.
+                && !p.to_string_lossy().contains("mcp_remote")
             {
                 out.push(p);
             }
