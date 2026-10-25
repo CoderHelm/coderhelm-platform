@@ -680,7 +680,7 @@ impl GitHubClient {
     /// none`); those are read from their git blob. A file with bytes is never
     /// returned as an empty string: callers write what they read back to the
     /// branch, and an empty read once replaced a 28,915-line lockfile.
-    async fn read_file_live(
+    pub async fn read_file_live(
         &self,
         owner: &str,
         repo: &str,

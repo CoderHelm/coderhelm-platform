@@ -15,6 +15,8 @@
 //! | `T#{team}#RECS` | `{id}` | a test recommendation |
 //! | `T#{team}#PR#{repo}#{pr}` | `{sha}` | E2E triage for a PR head (expires) |
 //! | `T#{team}` | `COVERAGE#{repo}` | areas, their tests and untested routes |
+//! | `T#{team}` | `CI#{repo}` | results and quarantine calls seen per workflow |
+//! | `T#{team}` | `SETUP#{repo}` | the setup pull request and the last workflow check |
 //!
 //! Every item keeps its payload as JSON in `data`.
 
@@ -25,6 +27,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use super::ci_setup::{CiState, SetupPr};
 use super::model::{IngestOutcome, Recommendation, Run, Settings, TestRecord};
 
 /// Runs, run keys and PR triage expire after this.
@@ -284,6 +287,53 @@ impl<'a> Store<'a> {
                 Some((team, data::<Value>(i)?))
             })
             .collect())
+    }
+
+    // ── CI setup ────────────────────────────────────────────────────────
+
+    /// Results and quarantine calls seen for a repo.
+    pub async fn ci_state(&self, team: &str, repo: &str) -> Result<CiState, String> {
+        Ok(self
+            .get(&team_pk(team), &format!("CI#{repo}"))
+            .await?
+            .and_then(|i| data(&i))
+            .unwrap_or_default())
+    }
+
+    /// Reads, changes and writes a repo's CI state. Two runs finishing at
+    /// once can lose one count; the next run corrects it.
+    pub async fn update_ci_state(
+        &self,
+        team: &str,
+        repo: &str,
+        change: impl FnOnce(&mut CiState),
+    ) -> Result<(), String> {
+        let mut ci = self.ci_state(team, repo).await?;
+        change(&mut ci);
+        self.put(&team_pk(team), &format!("CI#{repo}"), &ci, vec![])
+            .await
+    }
+
+    /// The setup pull request of a repo and the last check of its workflow
+    /// (`{"pr": SetupPr, "check": {...}, "checked_at": ...}`).
+    pub async fn setup(&self, team: &str, repo: &str) -> Result<Value, String> {
+        Ok(self
+            .get(&team_pk(team), &format!("SETUP#{repo}"))
+            .await?
+            .and_then(|i| data(&i))
+            .unwrap_or_else(|| json!({})))
+    }
+
+    pub async fn put_setup(&self, team: &str, repo: &str, v: &Value) -> Result<(), String> {
+        self.put(&team_pk(team), &format!("SETUP#{repo}"), v, vec![])
+            .await
+    }
+
+    /// Changes only the pull request part of a repo's setup record.
+    pub async fn put_setup_pr(&self, team: &str, repo: &str, pr: &SetupPr) -> Result<(), String> {
+        let mut v = self.setup(team, repo).await?;
+        v["pr"] = json!(pr);
+        self.put_setup(team, repo, &v).await
     }
 
     // ── runs ────────────────────────────────────────────────────────────

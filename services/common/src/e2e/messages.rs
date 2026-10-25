@@ -46,9 +46,12 @@ fn one() -> u32 {
 pub struct TestAction {
     pub team_id: String,
     pub repo: String,
-    /// `fix` | `generate` | `ticket`
+    /// `fix` | `generate` | `ticket` | `setup`
     pub action: String,
     /// The test (fix, ticket) or recommendation (generate) it is about.
     pub target_id: String,
     pub actor: String,
+    /// For `setup`: the workflow to change and how.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<super::ci_setup::SetupRequest>,
 }

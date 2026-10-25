@@ -1002,6 +1002,8 @@ async fn handle_pull_request(
     if action != "closed" {
         return Ok(StatusCode::OK);
     }
+    // A Tests setup pull request: record it and check the workflow again.
+    super::tests_setup::on_pr_closed(state, payload, installation_id, team_id, merged).await;
 
     // A stopped auto-merge has no loop running to see the PR close: record it
     // here (any PR, not only CoderHelm's).

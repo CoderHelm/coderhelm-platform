@@ -799,6 +799,9 @@ async fn main() -> Result<(), Error> {
             "/tests/recommendations/:id/dismiss",
             post(routes::tests::dismiss_recommendation),
         )
+        .route("/tests/setup", get(routes::tests_setup::status))
+        .route("/tests/setup/preview", post(routes::tests_setup::preview))
+        .route("/tests/setup/pr", post(routes::tests_setup::open_pr))
         .route("/tests", get(routes::tests::list_tests))
         .route("/tests/:id", get(routes::tests::get_test))
         .route("/tests/:id/quarantine", post(routes::tests::quarantine))

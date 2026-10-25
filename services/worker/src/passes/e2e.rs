@@ -246,6 +246,24 @@ fn scoped_id(repo: &str, t: &ParsedTest) -> String {
     common::content_hash(&format!("{repo}|{}", t.id()))[..20].to_string()
 }
 
+/// Keeps what this run sent, so the Tests setup page can say whether results
+/// arrive from the workflow ("added but nothing received" after empty runs).
+async fn note_ci(st: &Store<'_>, msg: &TestIngest, repo: &str, at: &str, tests: Option<u32>) {
+    let workflow = if msg.upload_key.is_some() {
+        ""
+    } else {
+        msg.workflow_path.as_str()
+    };
+    if let Err(e) = st
+        .update_ci_state(&msg.team_id, repo, |ci| {
+            ci.note_run(workflow, &msg.html_url, at, &msg.conclusion, tests)
+        })
+        .await
+    {
+        warn!(error = %e, "Could not record what the run sent");
+    }
+}
+
 async fn read_first(
     gh: &GitHubClient,
     owner: &str,
@@ -313,6 +331,7 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
                 &IngestOutcome::NoTests,
             )
             .await;
+        note_ci(&st, &msg, &repo, &started_at, None).await;
         return Ok(());
     }
 
@@ -576,6 +595,14 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
         )
         .await;
     info!(run_key, repo = %repo, passed, failed, flaky, bad_run, rescued = run.rescued, "E2E run read");
+    note_ci(
+        &st,
+        &msg,
+        &repo,
+        &started_at,
+        Some(passed + failed + flaky + skipped),
+    )
+    .await;
 
     if let Some(pr) = pr {
         save_triage(&st, &msg, &run, pr, &lines).await;
@@ -607,6 +634,7 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
             action: "fix".into(),
             target_id: id,
             actor: "Coderhelm (automatic)".into(),
+            setup: None,
         });
         if let Err(e) = enqueue(state, action).await {
             warn!(error = %e, "Could not start an automatic fix");
@@ -1647,6 +1675,10 @@ async fn enqueue(state: &WorkerState, m: crate::models::WorkerMessage) -> Result
 // ── actions people ask for ───────────────────────────────────────────────
 
 pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
+    // Setting a repo up needs no E2E record yet: its results haven't arrived.
+    if a.action == "setup" {
+        return super::e2e_setup::run(state, a).await;
+    }
     let st = store(state);
     let Some(repo_rec) = st.repo(&a.team_id, &a.repo).await? else {
         return Err(format!("no E2E repo {}", a.repo).into());

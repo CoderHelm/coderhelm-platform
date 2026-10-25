@@ -113,6 +113,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "tests::summary",
             "tests::list_tests",
             "api::get_usage",
+            "tests_setup::status",
         ],
     },
     Capability {
@@ -445,10 +446,12 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "tests",
-        label: "Change test settings; quarantine, pin and fix tests",
+        label: "Change test settings; quarantine, pin and fix tests; open setup pull requests",
         min_role: "admin",
         handlers: &[
             "tests::put_settings",
+            "tests_setup::preview",
+            "tests_setup::open_pr",
             "tests::quarantine",
             "tests::pin",
             "tests::fix",

@@ -99,7 +99,7 @@ pub async fn enqueue_ingest(
     let wf = &payload["workflow_run"];
     let conclusion = wf["conclusion"].as_str().unwrap_or("");
     // Nothing ran, so there is nothing to read.
-    if matches!(conclusion, "skipped" | "neutral" | "stale" | "") {
+    if matches!(conclusion, "neutral" | "stale" | "") {
         return;
     }
     let repo = &payload["repository"];
@@ -116,6 +116,22 @@ pub async fn enqueue_ingest(
         }
     };
     if !settings.covers(full) {
+        return;
+    }
+    if conclusion == "skipped" {
+        // Nothing to read, but the Tests setup page counts it: a skipped
+        // E2E workflow is why results don't arrive.
+        let path = wf["path"].as_str().unwrap_or("");
+        let url = wf["html_url"].as_str().unwrap_or("");
+        let at = wf["updated_at"].as_str().unwrap_or("");
+        if let Err(e) = st
+            .update_ci_state(team_id, full, |ci| {
+                ci.note_run(path, url, at, "skipped", None)
+            })
+            .await
+        {
+            warn!(error = %e, "Could not record a skipped run");
+        }
         return;
     }
     let default_branch = repo["default_branch"]
@@ -659,6 +675,7 @@ pub async fn fix(
             action: "fix".into(),
             target_id: id,
             actor: claims.email.clone(),
+            setup: None,
         }),
         0,
     )
@@ -775,6 +792,7 @@ pub async fn accept_recommendation(
             action: "generate".into(),
             target_id: id,
             actor: claims.email.clone(),
+            setup: None,
         }),
         0,
     )
@@ -1172,7 +1190,26 @@ pub async fn ci_quarantine(
     let teams = teams_for(&state, &claims).await?;
     let st = store(&state)?;
     let mut tests = Vec::new();
-    for (team, _) in teams {
+    let now = chrono::Utc::now().to_rfc3339();
+    let run_url = format!(
+        "https://github.com/{}/actions/runs/{}",
+        claims.repository, claims.run_id
+    );
+    for (team, rec) in teams {
+        // The Tests setup page shows that the quarantine step works.
+        let repo = rec["repo"]
+            .as_str()
+            .unwrap_or(&claims.repository)
+            .to_string();
+        if let Err(e) = st
+            .update_ci_state(&team, &repo, |ci| {
+                ci.quarantine_fetched_at = Some(now.clone());
+                ci.quarantine_run_url = Some(run_url.clone());
+            })
+            .await
+        {
+            warn!(error = %e, "Could not record a quarantine call");
+        }
         let all = st
             .summaries(&team, Some(&claims.repository))
             .await
