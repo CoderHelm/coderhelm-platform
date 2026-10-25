@@ -231,10 +231,16 @@ fn forget(team_id: &str, id: &str) {
 /// session's team), so a role id from another team holds nothing here. When
 /// the role is gone or can't be read, only the baseline is held.
 pub async fn holder_for(state: &AppState, claims: &Claims) -> Holder {
-    let Some(id) = custom_role_id(&claims.role) else {
-        return Holder::builtin(&claims.role);
+    holder_for_role(state, &claims.team_id, &claims.role).await
+}
+
+/// What a member holds from the role on their record, in `team_id`. Used
+/// where a person acts without a session (a signed email link).
+pub async fn holder_for_role(state: &AppState, team_id: &str, role: &str) -> Holder {
+    let Some(id) = custom_role_id(role) else {
+        return Holder::builtin(role);
     };
-    let key = role_record_key(&claims.team_id, id);
+    let key = role_record_key(team_id, id);
     let cached = cache()
         .lock()
         .ok()
@@ -242,7 +248,7 @@ pub async fn holder_for(state: &AppState, claims: &Claims) -> Holder {
         .filter(|(at, _)| at.elapsed() < CACHE_FOR);
     let stored = match cached {
         Some((_, stored)) => stored,
-        None => match load_role(state, &claims.team_id, id).await {
+        None => match load_role(state, team_id, id).await {
             Ok(stored) => {
                 if let Ok(mut c) = cache().lock() {
                     if c.len() > 5_000 {
@@ -253,7 +259,7 @@ pub async fn holder_for(state: &AppState, claims: &Claims) -> Holder {
                 stored
             }
             Err(e) => {
-                warn!(error = %e, team_id = %claims.team_id, "Custom role not read; baseline only");
+                warn!(error = %e, team_id = %team_id, "Custom role not read; baseline only");
                 None
             }
         },

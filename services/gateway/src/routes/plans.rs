@@ -2850,6 +2850,26 @@ pub async fn plan_chat(
     )
     .await?;
     let mut api_messages = ctx.messages;
+    // Agent permissions: every call is asked of the gate; a connection the
+    // person can't use yet is offered as a sign-in card.
+    let mut ctx_tools = ctx.tools.clone();
+    let missing =
+        super::chat_policy::missing_connections(&state, &claims.team_id, &claims.email).await;
+    if let Some(t) = super::chat_policy::sign_in_tool(&missing) {
+        ctx_tools.insert(0, t);
+    }
+    let gate = super::chat_policy::gate(
+        &state,
+        &claims.team_id,
+        &claims.email,
+        &ctx.scope.chat_id,
+        &ctx.scope.repo,
+        &ctx_tools,
+    );
+    let thread = gate.ctx.thread_id.clone();
+    super::chat_policy::settle_connected(&state, &claims.team_id, &thread, &claims.email).await;
+    let is_admin = claims.holder().holds("integrations");
+    let mut cards: Vec<Value> = Vec::new();
 
     // Load team's Anthropic API key
     let provider_result = state
@@ -2907,8 +2927,8 @@ pub async fn plan_chat(
         if common::is_always_thinking_model(&model_id) {
             body["output_config"] = json!({"effort": "medium"});
         }
-        if !ctx.tools.is_empty() {
-            body["tools"] = json!(ctx.tools);
+        if !ctx_tools.is_empty() {
+            body["tools"] = json!(ctx_tools);
         }
 
         // Transient failures (5xx incl. 520-524, 408, 429, 529, no response,
@@ -2950,14 +2970,53 @@ pub async fn plan_chat(
 
             let servers: Vec<&str> = mcp_servers_used.iter().map(|s| s.as_str()).collect();
             return Ok(Json(
-                json!({ "content": text, "mcp_servers": servers, "used": used_items }),
+                json!({ "content": text, "mcp_servers": servers, "used": used_items, "cards": cards }),
             ));
         }
 
-        // The team's skills, agents and data sources run in the worker, one
-        // at a time so their limits hold.
+        // Every call is asked of the policy gate first. Calls it doesn't let
+        // run get its answer instead of a result (and a card when it asks).
         let mut worker_results: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut allowed: Vec<Value> = Vec::new();
+        for tu in &tool_uses {
+            let name = tu["name"].as_str().unwrap_or("");
+            let id = tu["id"].as_str().unwrap_or("").to_string();
+            if name == super::chat_policy::SIGN_IN_TOOL {
+                let (text, event) = super::chat_policy::sign_in(
+                    &state,
+                    &claims.team_id,
+                    &thread,
+                    &missing,
+                    is_admin,
+                    &tu["input"],
+                )
+                .await;
+                if let Some((kind, v)) = event {
+                    cards.push(json!({ "kind": kind, "data": v }));
+                }
+                worker_results.insert(id, text);
+                continue;
+            }
+            match super::chat_policy::check(&gate, name, &tu["input"]).await {
+                super::chat_policy::Checked::Run => allowed.push(tu.clone()),
+                super::chat_policy::Checked::Answer { text, event } => {
+                    if let Some((kind, v)) = event {
+                        cards.push(json!({ "kind": kind, "data": v }));
+                    }
+                    worker_results.insert(id, text);
+                }
+                super::chat_policy::Checked::Stop(note) => {
+                    return Ok(Json(
+                        json!({ "content": note, "mcp_servers": [], "used": used_items, "cards": cards }),
+                    ));
+                }
+            }
+        }
+        let tool_uses = allowed;
+
+        // The team's skills, agents and data sources run in the worker, one
+        // at a time so their limits hold.
         for tu in &tool_uses {
             let name = tu["name"].as_str().unwrap_or("");
             if ctx.worker.names.contains(name) {
@@ -3080,6 +3139,14 @@ pub(crate) fn sse_event(
 /// Anthropic SSE streaming for plan chat.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::collapsible_match)]
+/// The plan chat's agent permissions for one message.
+struct ChatPolicy {
+    gate: common::agent_policy::Gate,
+    missing: Vec<super::chat_policy::Missing>,
+    is_admin: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_anthropic_stream(
     state: &Arc<AppState>,
     tx: &tokio::sync::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,
@@ -3094,6 +3161,7 @@ async fn run_anthropic_stream(
     repo_branches: &std::collections::HashMap<String, String>,
     worker: &super::plan_chat_tools::WorkerTools,
     scope: &super::plan_chat_tools::ChatScope,
+    policy: &ChatPolicy,
 ) {
     use futures::StreamExt;
     let mut worker_used = super::plan_chat_tools::Used::default();
@@ -3334,6 +3402,54 @@ async fn run_anthropic_stream(
                 ))
                 .await;
 
+            // Asked of the policy gate first: an ask shows a card in the
+            // chat, a refusal is the tool's answer, a pause ends the reply.
+            let verdict = if tu_name == super::chat_policy::SIGN_IN_TOOL {
+                let (text, event) = super::chat_policy::sign_in(
+                    state,
+                    team_id,
+                    &policy.gate.ctx.thread_id,
+                    &policy.missing,
+                    policy.is_admin,
+                    &input,
+                )
+                .await;
+                super::chat_policy::Checked::Answer { text, event }
+            } else {
+                super::chat_policy::check(&policy.gate, tu_name, &input).await
+            };
+            match verdict {
+                super::chat_policy::Checked::Run => {}
+                super::chat_policy::Checked::Answer { text, event } => {
+                    if let Some((kind, v)) = event {
+                        let _ = tx.send(sse_event(&kind, v)).await;
+                    }
+                    let _ = tx
+                        .send(sse_event(
+                            "tool_result",
+                            json!({"id": tu_id, "name": tu_name, "status": "error", "summary": common::truncate_str(&text, 120), "used": null}),
+                        ))
+                        .await;
+                    tool_results.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": tu_id,
+                        "content": text,
+                        "is_error": true
+                    }));
+                    continue;
+                }
+                super::chat_policy::Checked::Stop(note) => {
+                    let _ = tx
+                        .send(sse_event(
+                            "text_delta",
+                            json!({"text": format!("\n\n{note}")}),
+                        ))
+                        .await;
+                    let _ = tx.send(sse_event("done", json!({}))).await;
+                    return;
+                }
+            }
+
             let mut used = None;
             let result = if worker.names.contains(tu_name.as_str()) {
                 let (text, u) =
@@ -3509,6 +3625,33 @@ pub async fn plan_chat_stream(
     let repo_branches = ctx.repo_branches;
     let worker = ctx.worker;
     let scope = ctx.scope;
+    // Agent permissions: the gate, and the sign-in card's connections.
+    let missing =
+        super::chat_policy::missing_connections(&state, &claims.team_id, &claims.email).await;
+    let mut tools = tools;
+    if let Some(t) = super::chat_policy::sign_in_tool(&missing) {
+        tools.insert(0, t);
+    }
+    let gate = super::chat_policy::gate(
+        &state,
+        &claims.team_id,
+        &claims.email,
+        &scope.chat_id,
+        &scope.repo,
+        &tools,
+    );
+    super::chat_policy::settle_connected(
+        &state,
+        &claims.team_id,
+        &gate.ctx.thread_id,
+        &claims.email,
+    )
+    .await;
+    let chat_policy = ChatPolicy {
+        gate,
+        missing,
+        is_admin: claims.holder().holds("integrations"),
+    };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<
         Result<axum::response::sse::Event, std::convert::Infallible>,
@@ -3539,6 +3682,7 @@ pub async fn plan_chat_stream(
                 &repo_branches,
                 &worker,
                 &scope,
+                &chat_policy,
             )
             .await;
         } else {

@@ -55,6 +55,8 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "jira_comment",
     "dlq_cleanup",
     "log_autofix",
+    // Resumes agent work kept while a team's agents were paused.
+    "agent_resume_sweep",
     // A model call's usage, held because its counters couldn't be written.
     "usage_record",
 ];
@@ -68,6 +70,7 @@ pub const GLOBAL_MESSAGE_TYPES: &[&str] = &[
     "usage_reconcile",
     "dlq_cleanup",
     "log_autofix",
+    "agent_resume_sweep",
 ];
 
 /// The DLQ keeps a message this long, counted from when it was first sent

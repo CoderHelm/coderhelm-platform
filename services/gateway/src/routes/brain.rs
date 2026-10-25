@@ -663,6 +663,9 @@ struct Run {
     mcp_tools: Vec<Value>,
     worker: WorkerTools,
     scope: ChatScope,
+    /// Connections the asker can't use yet (offered as a sign-in card).
+    missing: Vec<super::chat_policy::Missing>,
+    is_admin: bool,
 }
 
 /// The tools this question may call.
@@ -1256,6 +1259,9 @@ pub async fn brain_stream(
         mcp_tools,
         worker,
         scope,
+        missing: super::chat_policy::missing_connections(&state, &claims.team_id, &claims.email)
+            .await,
+        is_admin: claims.holder().holds("integrations"),
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
@@ -1452,7 +1458,23 @@ async fn answer(
         })))
         .await;
 
-    let tools = tool_defs(run);
+    let mut tools = tool_defs(run);
+    // Agent permissions: a connection the asker can't use yet is offered as
+    // a sign-in card, and every call is asked of the gate first.
+    if let Some(t) = super::chat_policy::sign_in_tool(&run.missing) {
+        tools.insert(0, t);
+    }
+    let gate = super::chat_policy::gate_for(
+        state,
+        common::agent_policy::Agent::BrainChat,
+        &run.team_id,
+        &run.user_email,
+        &run.scope.chat_id,
+        &run.scope.repo,
+        &tools,
+    );
+    super::chat_policy::settle_connected(state, &run.team_id, &gate.ctx.thread_id, &run.user_email)
+        .await;
     // Nothing found and nothing to look up: say so without a model call.
     if reg.is_empty() && tools.is_empty() {
         return Some((finalize("", &reg), used_tools));
@@ -1562,8 +1584,37 @@ async fn answer(
             let name = tu["name"].as_str().unwrap_or("");
             let input = &tu["input"];
             let label = tool_label(name, input);
-            let (text, summary, is_error) =
-                run_tool(run, &mut reg, &mut worker_used, name, input).await;
+            let verdict = if name == super::chat_policy::SIGN_IN_TOOL {
+                let (text, event) = super::chat_policy::sign_in(
+                    state,
+                    &run.team_id,
+                    &gate.ctx.thread_id,
+                    &run.missing,
+                    run.is_admin,
+                    input,
+                )
+                .await;
+                super::chat_policy::Checked::Answer { text, event }
+            } else {
+                super::chat_policy::check(&gate, name, input).await
+            };
+            let (text, summary, is_error) = match verdict {
+                super::chat_policy::Checked::Run => {
+                    run_tool(run, &mut reg, &mut worker_used, name, input).await
+                }
+                super::chat_policy::Checked::Answer { text, event } => {
+                    if let Some((kind, v)) = event {
+                        let _ = tx.send(sse_event(&kind, v)).await;
+                    }
+                    (text, "Not run".to_string(), true)
+                }
+                super::chat_policy::Checked::Stop(note) => {
+                    let _ = tx
+                        .send(sse_event("text_delta", json!({ "text": note })))
+                        .await;
+                    return Some((finalize(&note, &reg), used_tools));
+                }
+            };
             let _ = tx
                 .send(sse_event(
                     "tool_result",

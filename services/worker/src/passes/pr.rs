@@ -323,6 +323,7 @@ Return ONLY the markdown body text."#,
     let mut body_text = provider::converse(
         state,
         provider,
+        common::agent_policy::Agent::Coder,
         model_id,
         &system,
         &mut messages,
@@ -376,6 +377,7 @@ Return ONLY the markdown body text."#,
             match provider::converse(
                 state,
                 provider,
+                common::agent_policy::Agent::Coder,
                 model_id,
                 &system,
                 &mut messages,
@@ -1008,6 +1010,7 @@ pub async fn resolve_conflicts(
         let merged_content = provider::converse(
             state,
             provider,
+            common::agent_policy::Agent::Coder,
             model_id,
             &system,
             &mut messages,
@@ -1430,6 +1433,7 @@ Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet 
     let text = match provider::converse(
         state,
         provider,
+        common::agent_policy::Agent::Coder,
         provider.primary_model_id(),
         &format!(
             "You keep pull request descriptions accurate to their code.{}",

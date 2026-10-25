@@ -298,6 +298,23 @@ export class ApiStack extends cdk.Stack {
       ],
     });
 
+    // Paused agent work: every 5 min, send again the work kept while a
+    // team's agents were paused once the pause has ended (an until-time
+    // passing needs nobody to click anything). Does nothing when no team is
+    // paused.
+    new events.Rule(this, "AgentResumeSweepSchedule", {
+      ruleName: `${prefix}-agent-resume-sweep`,
+      description: "Resume agent work kept while a team's agents were paused",
+      schedule: events.Schedule.rate(cdk.Duration.minutes(5)),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "agent_resume_sweep",
+          }),
+        }),
+      ],
+    });
+
     // Weekly summary email: Mondays 13:00 UTC, one constant message on the
     // ticket queue; the worker sends each team's summary to members who have
     // it on. Ships disabled (see flags.ts) until a test email is approved.

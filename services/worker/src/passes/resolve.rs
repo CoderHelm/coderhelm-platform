@@ -101,6 +101,7 @@ pub async fn run(
     let response = match provider::converse(
         state,
         provider,
+        common::agent_policy::Agent::Coder,
         model_id,
         &system,
         &mut messages,

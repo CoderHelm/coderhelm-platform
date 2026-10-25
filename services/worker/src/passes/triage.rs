@@ -175,6 +175,7 @@ Rules:
     let response = provider::converse(
         state,
         provider,
+        common::agent_policy::Agent::Planner,
         model_id,
         system,
         &mut messages,
@@ -570,6 +571,7 @@ Then on the LAST line, return ONLY the repository in `owner/name` format (or `NO
     let response = provider::converse(
         state,
         provider,
+        common::agent_policy::Agent::Planner,
         model_id,
         system,
         &mut messages,

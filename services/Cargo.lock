@@ -1326,6 +1326,7 @@ dependencies = [
  "tracing",
  "ulid",
  "url",
+ "urlencoding",
  "yaml-rust2",
  "zip",
 ]

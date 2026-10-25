@@ -1126,6 +1126,19 @@ pub async fn orchestrate_ticket(
     Ok(())
 }
 
+/// The agent a ticket run belongs to as a whole, when it isn't the planner
+/// and coder: a fix started by a log finding is log auto-fix's, one started
+/// by an alert is the alert fixer's.
+fn run_origin_agent(msg: &TicketMessage) -> Option<common::agent_policy::Agent> {
+    match msg.source {
+        crate::models::TicketSource::Alert if msg.sender == "log finding" => {
+            Some(common::agent_policy::Agent::LogAutofix)
+        }
+        crate::models::TicketSource::Alert => Some(common::agent_policy::Agent::AlertFixer),
+        _ => None,
+    }
+}
+
 async fn run_passes(
     state: &WorkerState,
     msg: &mut TicketMessage,
@@ -1143,13 +1156,30 @@ async fn run_passes(
         );
     }
 
-    // Load team's Anthropic API key (required)
+    // Load team's Anthropic API key (required). Every agent loop in the run
+    // is gated for this run, its repository and the person who asked.
     let provider = crate::agent::provider::ModelProvider::load_for_team(
         &state.dynamo,
         &state.config.settings_table_name,
         &msg.team_id,
     )
-    .await?;
+    .await?
+    .for_run(
+        run_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        msg.requester.as_ref().map_or("", |r| r.email.as_str()),
+        &msg.title,
+    )
+    .with_origin(run_origin_agent(msg));
+    // Connections this run could use that its person hasn't made: a sign-in
+    // prompt on the run page and in Slack or Teams (the run goes on without).
+    crate::agent::policy::sign_in_prompts_for_run(
+        state,
+        &msg.team_id,
+        run_id,
+        msg.requester.as_ref().map_or("", |r| r.email.as_str()),
+    )
+    .await;
 
     // File read cache shared across passes to avoid redundant GitHub fetches
     let file_cache = FileCache::new();
@@ -5303,6 +5333,12 @@ async fn fail_run(
     usage: &TokenUsage,
     duration: u64,
 ) {
+    // A loop stopped (agents paused, or an approval nobody answered): the
+    // run ends with that note instead of failing.
+    if let Some(stop) = crate::agent::policy::claim_stop(run_id) {
+        crate::agent::policy::end_run_for_stop(state, &msg.team_id, run_id, &stop).await;
+        return;
+    }
     let cost = usage.estimated_cost();
 
     // The one failed-status write: reason, and the pass the record names.
@@ -7176,6 +7212,7 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
         match provider::converse(
             state,
             provider,
+            common::agent_policy::Agent::Planner,
             provider.primary_model_id(),
             system,
             &mut messages,
@@ -8232,6 +8269,7 @@ If everything is clean, respond with "CLEAN" and nothing else."#,
     let response = match provider::converse(
         state,
         provider,
+        common::agent_policy::Agent::Reviewer,
         model_id,
         &system,
         &mut messages,

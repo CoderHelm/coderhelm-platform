@@ -110,6 +110,7 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
     let response = provider::converse(
         state,
         provider,
+        common::agent_policy::Agent::Reviewer,
         model_id,
         &system,
         &mut messages,

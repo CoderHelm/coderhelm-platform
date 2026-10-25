@@ -16,13 +16,19 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut usage = TokenUsage::default();
 
-    // Load team's Anthropic API key (required)
+    // Load team's Anthropic API key (required), gated for this run.
     let provider = ModelProvider::load_for_team(
         &state.dynamo,
         &state.config.settings_table_name,
         &msg.team_id,
     )
-    .await?;
+    .await?
+    .for_run(
+        &msg.run_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        "",
+        &format!("Feedback on pull request #{}", msg.pr_number),
+    );
 
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
@@ -677,6 +683,7 @@ Rules:
     let response = provider::converse(
         state,
         &provider,
+        common::agent_policy::Agent::Coder,
         model_id,
         &full_system,
         &mut messages,
