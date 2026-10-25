@@ -2491,6 +2491,7 @@ async fn load_plan_chat_context(
         branch: repo_branches.get(&chat_repo).cloned().unwrap_or_default(),
         repo: chat_repo,
         first: messages_input.len() <= 1,
+        brain: false,
     };
     let worker = super::plan_chat_tools::setup(state, &scope).await;
 
@@ -3033,7 +3034,7 @@ pub async fn plan_chat(
 // ---------------------------------------------------------------------------
 
 /// Send a single SSE event formatted as `event: {type}\ndata: {json}\n\n`.
-fn sse_event(
+pub(crate) fn sse_event(
     event_type: &str,
     data: Value,
 ) -> Result<axum::response::sse::Event, std::convert::Infallible> {
@@ -3531,7 +3532,7 @@ pub async fn plan_chat_stream(
 }
 
 /// Check if a tool result is effectively empty (no meaningful data returned).
-fn is_empty_tool_result(result: &Value) -> bool {
+pub(crate) fn is_empty_tool_result(result: &Value) -> bool {
     // Notion-style: {"object":"list","results":[]}
     if let Some(arr) = result.get("results").and_then(|v| v.as_array()) {
         if arr.is_empty() {
@@ -3549,7 +3550,7 @@ fn is_empty_tool_result(result: &Value) -> bool {
 }
 
 /// Produce a short summary of a tool result for the UI.
-fn summarize_tool_result(result: &Value) -> String {
+pub(crate) fn summarize_tool_result(result: &Value) -> String {
     let s = result.to_string();
     if s.len() <= 120 {
         s
@@ -3559,7 +3560,7 @@ fn summarize_tool_result(result: &Value) -> String {
 }
 
 /// Keep tool results compact before feeding back into the model to avoid runaway context growth.
-fn compact_tool_result_for_model(result: &Value) -> String {
+pub(crate) fn compact_tool_result_for_model(result: &Value) -> String {
     let s = result.to_string();
     let max_chars = 3000usize;
     if s.chars().count() <= max_chars {
@@ -3642,11 +3643,11 @@ async fn load_log_analyzer_context(state: &AppState, team_id: &str) -> String {
 // MCP tool helpers for plan_chat
 // ---------------------------------------------------------------------------
 
-struct McpToolDef {
-    server_id: String,
-    name: String,
-    description: String,
-    input_schema: Value,
+pub(crate) struct McpToolDef {
+    pub(crate) server_id: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) input_schema: Value,
 }
 
 /// Return the MCP configs table name, falling back to settings table for migration compat.
@@ -3660,7 +3661,7 @@ fn mcp_table(state: &AppState) -> &str {
 }
 
 /// Load enabled plugins for the team, returning (server_id, has_credentials, custom_prompt).
-async fn load_enabled_plugins(
+pub(crate) async fn load_enabled_plugins(
     state: &AppState,
     team_id: &str,
 ) -> Vec<(String, bool, Option<String>)> {
@@ -3704,7 +3705,7 @@ async fn load_enabled_plugins(
 }
 
 /// Load cached MCP tool schemas from S3 for a given server.
-async fn load_mcp_tool_cache(
+pub(crate) async fn load_mcp_tool_cache(
     s3: &aws_sdk_s3::Client,
     bucket: &str,
     server_id: &str,
@@ -3809,7 +3810,7 @@ const GATEWAY_MCP_CATALOG: &[(&str, &str, &[(&str, &str)])] = &[
 ];
 
 /// Invoke an MCP tool via the MCP proxy Lambda.
-async fn invoke_mcp_tool(
+pub(crate) async fn invoke_mcp_tool(
     state: &AppState,
     team_id: &str,
     user_email: &str,
@@ -3896,7 +3897,7 @@ async fn invoke_mcp_tool(
 
 /// Execute a built-in GitHub codebase tool (search_code, read_file, list_directory).
 /// Uses the GitHub REST API directly with the team's installation token.
-async fn execute_github_tool(
+pub(crate) async fn execute_github_tool(
     http: &reqwest::Client,
     github_token: &Option<String>,
     repo_branches: &std::collections::HashMap<String, String>,

@@ -116,6 +116,18 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     Capability {
+        key: "brain_read",
+        label: "Read knowledge bases open to their role and threads shared with the team",
+        min_role: "viewer",
+        handlers: &[
+            "knowledge::list_bases",
+            "knowledge::get_base",
+            "brain::list_threads",
+            "brain::get_thread",
+            "brain::sources",
+        ],
+    },
+    Capability {
         key: "view_team",
         label: "See who is on the team",
         min_role: "viewer",
@@ -134,6 +146,17 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     // ── Members ─────────────────────────────────────────────────────
+    Capability {
+        key: "brain_ask",
+        label: "Ask the company brain, attach files to a question, and rename, share or delete their own threads",
+        min_role: "member",
+        handlers: &[
+            "brain::stream_token",
+            "brain::create_attachment",
+            "brain::update_thread",
+            "brain::delete_thread",
+        ],
+    },
     Capability {
         key: "plans",
         label: "Create, edit, approve and run plans and templates",
@@ -226,6 +249,19 @@ pub const CAPABILITIES: &[Capability] = &[
         handlers: &["integrations::list"],
     },
     // ── Admins ──────────────────────────────────────────────────────
+    Capability {
+        key: "knowledge_manage",
+        label: "Create, change and delete knowledge bases, upload and remove their files, and attach them to agents",
+        min_role: "admin",
+        handlers: &[
+            "knowledge::create_base",
+            "knowledge::update_base",
+            "knowledge::delete_base",
+            "knowledge::start_upload",
+            "knowledge::finish_upload",
+            "knowledge::delete_file",
+        ],
+    },
     Capability {
         key: "people",
         label: "Invite people, resend or revoke any pending invite, link GitHub accounts, and change or remove members and viewers",
@@ -1171,6 +1207,72 @@ mod tests {
         assert!(!customizable(capability("support").unwrap()));
         assert!(!custom(&["support"]).holds("support"));
         assert!(Holder::builtin("admin").holds("support"));
+    }
+
+    #[test]
+    fn brain_and_knowledge_routes_are_decided_by_their_capabilities() {
+        let route = |m: &str, p: &str| routed_handler(m, p);
+        assert_eq!(route("GET", "/knowledge"), Some("knowledge::list_bases"));
+        assert_eq!(
+            route("POST", "/knowledge/:kb_id/files"),
+            Some("knowledge::start_upload")
+        );
+        assert_eq!(route("POST", "/brain/token"), Some("brain::stream_token"));
+        assert_eq!(
+            route("PUT", "/brain/threads/:thread_id"),
+            Some("brain::update_thread")
+        );
+        // A custom role can hold the brain capabilities, and only those it holds.
+        let asker = custom(&["brain_ask"]);
+        assert_eq!(
+            resolve_access(&asker, route("POST", "/brain/token")),
+            Access::Allow {
+                effective_role: "member"
+            }
+        );
+        assert!(matches!(
+            resolve_access(&asker, route("POST", "/knowledge")),
+            Access::Deny { .. }
+        ));
+        let librarian = custom(&["knowledge_manage"]);
+        assert_eq!(
+            resolve_access(
+                &librarian,
+                route("DELETE", "/knowledge/:kb_id/files/:file_id")
+            ),
+            Access::Allow {
+                effective_role: "admin"
+            }
+        );
+        assert!(matches!(
+            resolve_access(&librarian, route("POST", "/brain/attachments")),
+            Access::Deny { .. }
+        ));
+        // Reading is baseline: every role, custom or built-in, reads.
+        assert!(is_baseline(capability("brain_read").unwrap()));
+        assert!(matches!(
+            resolve_access(&custom(&[]), route("GET", "/brain/threads")),
+            Access::Allow { .. }
+        ));
+        // Viewers can't ask; members can't manage; admins do both.
+        assert!(matches!(
+            resolve_access(&Holder::builtin("viewer"), route("POST", "/brain/token")),
+            Access::Deny { .. }
+        ));
+        assert!(matches!(
+            resolve_access(
+                &Holder::builtin("member"),
+                route("PUT", "/knowledge/:kb_id")
+            ),
+            Access::Deny { .. }
+        ));
+        assert!(
+            Holder::builtin("admin").holds("knowledge_manage")
+                && Holder::builtin("admin").holds("brain_ask")
+        );
+        for key in ["brain_ask", "knowledge_manage"] {
+            assert!(customizable(capability(key).unwrap()), "{key}");
+        }
     }
 
     #[test]

@@ -45,6 +45,9 @@ pub mod model_retry;
 pub mod model_stream;
 // Titan embeddings, metered as CoderHelm's own cost
 pub mod embed;
+/// Knowledge bases: files a team uploads, read into cited passages that the
+/// brain chat and the team's agents search.
+pub mod knowledge;
 // The test that every model call site is a metered helper
 #[cfg(test)]
 mod model_call_sites;

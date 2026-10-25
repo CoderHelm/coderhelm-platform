@@ -131,7 +131,9 @@ export class StreamingStack extends cdk.Stack {
     props.table.grantReadData(this.streamingFunction);
     props.plansTable.grantReadWriteData(this.streamingFunction);
     props.reposTable.grantReadData(this.streamingFunction);
-    props.settingsTable.grantReadData(this.streamingFunction);
+    // Read: plan chat settings. Write: the brain chat keeps its threads and
+    // messages here (BRAIN#T# / BRAIN#M# records).
+    props.settingsTable.grantReadWriteData(this.streamingFunction);
     props.mcpConfigsTable.grantReadData(this.streamingFunction);
     // Plan chat opens a team's sealed MCP credentials for a tool call; it
     // never seals (the gateway does), so decrypt only.
