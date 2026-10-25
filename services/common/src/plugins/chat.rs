@@ -30,12 +30,10 @@ type HmacSha256 = Hmac<Sha256>;
 /// Slack requests older than this are refused (replays).
 pub const SLACK_MAX_AGE_SECS: i64 = 300;
 
-/// The dashboard's address for a stage.
+/// The dashboard's address for this deployment (a self-hosted install's
+/// own address, or the stage's).
 pub fn dashboard(stage: &str) -> &'static str {
-    match stage {
-        "prod" | "production" => "https://app.coderhelm.com",
-        _ => "https://app.dev.coderhelm.com",
-    }
+    crate::public_urls::app_url(stage)
 }
 
 /// The card for a draft waiting for review.

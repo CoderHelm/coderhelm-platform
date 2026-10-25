@@ -22,8 +22,9 @@ type HmacSha256 = Hmac<Sha256>;
 /// Three days.
 pub const VALID_SECS: i64 = 3 * 86_400;
 const MAX_TOKEN_LEN: usize = 1024;
-/// Where the links point (a page on the API that asks once more).
-pub const BASE_URL: &str = "https://api.coderhelm.com/plugins/approve";
+/// The path the links point at, on this deployment's API (a page that asks
+/// once more).
+pub const PATH: &str = "/plugins/approve";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalLink {
@@ -102,7 +103,10 @@ pub fn verify(secret: &str, token: &str, now: i64) -> Result<ApprovalLink, Token
 }
 
 pub fn url(token: &str) -> String {
-    format!("{BASE_URL}?t={token}")
+    format!(
+        "{}{PATH}?t={token}",
+        crate::public_urls::api_url_from_env().trim_end_matches('/')
+    )
 }
 
 #[cfg(test)]
