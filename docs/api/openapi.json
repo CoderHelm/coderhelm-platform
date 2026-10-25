@@ -518,6 +518,10 @@
             ],
             "type": "string"
           },
+          "flags": {
+            "$ref": "#/components/schemas/MeFlags",
+            "description": "The team's feature flags (the dashboard reads them on every page)."
+          },
           "github_login": {
             "description": "The person's GitHub login. For an API key, its maker's.",
             "examples": [
@@ -579,7 +583,8 @@
           "status",
           "auth_provider",
           "mfa_enabled",
-          "platform_admin"
+          "platform_admin",
+          "flags"
         ],
         "type": "object"
       },
@@ -632,6 +637,19 @@
           "name",
           "created_by",
           "rate_limit_per_minute"
+        ],
+        "type": "object"
+      },
+      "MeFlags": {
+        "description": "A team's feature flags.",
+        "properties": {
+          "plugins": {
+            "description": "Plugins are turned on for the team.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "plugins"
         ],
         "type": "object"
       },
