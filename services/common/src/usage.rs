@@ -66,6 +66,8 @@ pub mod feature {
     pub const MEMORY: &str = "memory";
     /// Titan embeddings for memory (billed to CoderHelm, not the team).
     pub const EMBEDDING: &str = "embedding";
+    /// A plugin's run (the plugin itself is the call's tag, `plugin:<id>`).
+    pub const PLUGIN: &str = "plugin";
     /// A call made outside any known scope (still counted in every total).
     pub const OTHER: &str = "other";
 }
@@ -82,6 +84,37 @@ pub async fn with_feature<F: std::future::Future>(feature: &'static str, fut: F)
 /// The feature of the current task, or [`feature::OTHER`].
 pub fn current_feature() -> &'static str {
     FEATURE.try_with(|f| *f).unwrap_or(feature::OTHER)
+}
+
+tokio::task_local! {
+    static TAG: String;
+}
+
+/// Run `fut` with every model call inside it also tagged `tag` (for a
+/// plugin run, `plugin:<id>`). A tagged call still counts in every team
+/// total and limit; the tag adds its own counters next to them.
+pub async fn with_tag<F: std::future::Future>(tag: String, fut: F) -> F::Output {
+    TAG.scope(tag, fut).await
+}
+
+/// The current task's tag, or "" when it has none.
+pub fn current_tag() -> String {
+    TAG.try_with(|t| t.clone()).unwrap_or_default()
+}
+
+/// The tag of a plugin's calls.
+pub fn plugin_tag(plugin_id: &str) -> String {
+    format!("plugin:{plugin_id}")
+}
+
+/// Attribute name of a per-plugin counter, e.g. `plugin#marketing#tokens_out`.
+pub fn plugin_attr(plugin_id: &str, field: &str) -> String {
+    format!("plugin#{}#{field}", key_part(plugin_id))
+}
+
+/// The plugin a tag names (`plugin:<id>`), if it names one.
+pub fn tag_plugin(tag: &str) -> Option<&str> {
+    tag.strip_prefix("plugin:").filter(|p| !p.is_empty())
 }
 
 // ── Prices ──────────────────────────────────────────────────────────────────
@@ -437,6 +470,11 @@ pub struct CallRecord {
     #[serde(default)]
     pub estimated: bool,
     pub usage: CallUsage,
+    /// A tag the call also counts under (`plugin:<id>`), or "". Its own
+    /// counters are added next to the team's; the team's totals and limits
+    /// count the call either way.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag: String,
 }
 
 impl CallRecord {
@@ -451,6 +489,7 @@ impl CallRecord {
             billed_to: BilledTo::Team,
             estimated: false,
             usage,
+            tag: current_tag(),
         }
     }
 
@@ -563,6 +602,26 @@ pub fn record_expression(
         BilledTo::Team => add_expression(&rec.feature, &rec.model, &rec.usage),
         BilledTo::Coderhelm => own_add_expression(&rec.feature, &rec.model, &rec.usage),
     };
+    let mut expr = expr;
+    // A plugin's calls also add to that plugin's own counters (the per-plugin
+    // monthly limit reads them), never instead of the team's.
+    if let (BilledTo::Team, Some(plugin)) = (rec.billed_to, tag_plugin(&rec.tag)) {
+        let cost = rec.usage.cost_usd(&rec.model);
+        let adds = [
+            ("tokens_in", rec.usage.uncached_input.to_string()),
+            ("cache_read", rec.usage.cache_read.to_string()),
+            ("cache_write", rec.usage.cache_write().to_string()),
+            ("tokens_out", rec.usage.output.to_string()),
+            ("cost_usd", cost_n(cost)),
+            ("calls", "1".to_string()),
+        ];
+        for (i, (field, n)) in adds.into_iter().enumerate() {
+            let (name, value) = (format!("#p{i}"), format!(":p{i}"));
+            expr.push_str(&format!(", {name} {value}"));
+            names.insert(name, plugin_attr(plugin, field));
+            values.insert(value, AttributeValue::N(n));
+        }
+    }
     let mut extra = Vec::new();
     if rec.estimated {
         extra.push(ESTIMATED_CALLS);
@@ -570,7 +629,6 @@ pub fn record_expression(
     if recovered {
         extra.push(RECOVERED_CALLS);
     }
-    let mut expr = expr;
     for (i, attr) in extra.into_iter().enumerate() {
         let (n, v) = (format!("#x{i}"), format!(":x{i}"));
         expr.push_str(&format!(", {n} {v}"));
@@ -1477,5 +1535,58 @@ mod tests {
             include_str!("../../../lambda/log-analyzer/model_prices.json"),
             "copy services/common/model_prices.json to lambda/log-analyzer/"
         );
+    }
+
+    #[test]
+    fn a_plugin_tagged_call_counts_for_the_team_and_for_the_plugin() {
+        let usage = CallUsage {
+            uncached_input: 100,
+            cache_read: 10,
+            cache_write_5m: 5,
+            cache_write_1h: 0,
+            output: 50,
+        };
+        let mut rec = CallRecord::now("TEAM#a", feature::PLUGIN, "claude-sonnet-5-5", usage);
+        assert_eq!(rec.tag, "", "no tag outside a tagged task");
+        rec.tag = plugin_tag("marketing");
+        let (expr, names, _) = record_expression(&rec, false);
+        let attrs: Vec<&String> = names.values().collect();
+        // The team's own totals, which its three limits read, are still added.
+        assert!(attrs.iter().any(|a| *a == "total_tokens_in"));
+        assert!(attrs.iter().any(|a| *a == "cache_read_tokens"));
+        assert!(attrs
+            .iter()
+            .any(|a| a.as_str() == feature_attr("plugin", "tokens_in")));
+        // And the plugin's own counters next to them.
+        for f in [
+            "tokens_in",
+            "cache_read",
+            "cache_write",
+            "tokens_out",
+            "cost_usd",
+            "calls",
+        ] {
+            assert!(
+                attrs
+                    .iter()
+                    .any(|a| a.as_str() == plugin_attr("marketing", f)),
+                "{f}"
+            );
+        }
+        assert!(expr.starts_with("ADD "));
+        // A call billed to CoderHelm never adds plugin counters.
+        rec.billed_to = BilledTo::Coderhelm;
+        let (_, names, _) = record_expression(&rec, false);
+        assert!(!names.values().any(|a| a.starts_with("plugin#")));
+    }
+
+    #[tokio::test]
+    async fn the_tag_follows_the_task() {
+        let tag = with_tag(plugin_tag("p1"), async { current_tag() }).await;
+        assert_eq!(tag, "plugin:p1");
+        assert_eq!(current_tag(), "");
+        assert_eq!(tag_plugin("plugin:p1"), Some("p1"));
+        assert_eq!(tag_plugin("plugin:"), None);
+        assert_eq!(tag_plugin("other"), None);
     }
 }

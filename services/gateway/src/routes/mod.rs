@@ -30,6 +30,7 @@ pub mod merge_control;
 pub mod paging;
 pub mod plan_chat_tools;
 pub mod plans;
+pub mod plugin_pkgs;
 pub mod plugins;
 pub mod review_lessons;
 pub mod reviewer;

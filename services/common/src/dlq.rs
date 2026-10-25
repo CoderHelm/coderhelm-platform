@@ -62,6 +62,14 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     // Knowledge sources: the scheduled sweep, and one source's sync.
     "knowledge_sync_sweep",
     "knowledge_sync",
+    // Plugins: runs, publishing, source sync and its 15 minute poll,
+    // recurring triggers and reading results back.
+    "plugin_run",
+    "plugin_publish",
+    "plugin_sync",
+    "plugin_sweep",
+    "plugin_trigger",
+    "plugin_results",
 ];
 
 /// Scheduled jobs that act on every team (EventBridge puts them on the ticket

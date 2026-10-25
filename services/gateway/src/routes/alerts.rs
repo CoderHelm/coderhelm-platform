@@ -1231,6 +1231,7 @@ async fn start_run(
             common::requester::ALERT,
         )),
         image_attachments: vec![],
+        ..Default::default()
     });
     let body = serde_json::to_string(&message).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     state

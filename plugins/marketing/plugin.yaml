@@ -1,0 +1,106 @@
+# The marketing reference plugin. A generic example: every brand document,
+# connection and approver lives in your team's settings, never here.
+name: marketing
+version: 1.0.0
+description: Drafts launch posts, emails and blog updates from releases and briefs, for a person to approve before anything goes out.
+
+skills: [skills/*/SKILL.md]
+agents: [agents/*.md]
+
+settings:
+  - key: brand_voice_doc
+    type: string
+    description: A link to your brand voice document, or a few sentences about how you sound.
+  - key: product_name
+    type: string
+    description: The product's name as it should appear in posts.
+  - key: linkedin_author
+    type: string
+    description: The LinkedIn organization or person URN posts are made as (urn:li:organization:123).
+  - key: linkedin
+    type: connection
+    provider: oauth2
+    scopes: [w_member_social, w_organization_social]
+    sensitive: true
+    description: The LinkedIn connection posts are published with.
+  - key: email
+    type: connection
+    provider: key
+    sensitive: true
+    description: The email service's API key, for sending the launch email.
+  - key: images
+    type: connection
+    provider: key
+    sensitive: true
+    description: The image service's API key, for header images.
+
+tools:
+  # The CMS (Sanity on the Connections page): read content, write drafts.
+  - ref: "mcp:sanity"
+    allow: [get_*, list_*, query_*, create_draft]
+  # Analytics (PostHog on the Connections page): read only.
+  - ref: "mcp:posthog"
+    allow: [query_*, get_*]
+  # Publishing a LinkedIn post: only after a person approves the version.
+  - name: publish_post
+    kind: http
+    connection: linkedin
+    method: POST
+    url: "https://api.linkedin.com/rest/posts"
+    risk: consequential
+    description: Publish an approved post on LinkedIn.
+    headers:
+      LinkedIn-Version: "202406"
+      X-Restli-Protocol-Version: "2.0.0"
+    body:
+      author: "{{setting:linkedin_author}}"
+      commentary: "{{content}}"
+      visibility: PUBLIC
+      distribution:
+        feedDistribution: MAIN_FEED
+      lifecycleState: PUBLISHED
+  # Sending the launch email: also only after approval.
+  - name: send_email
+    kind: http
+    connection: email
+    method: POST
+    url: "https://api.sendgrid.com/v3/mail/send"
+    risk: consequential
+    description: Send an approved launch email to the list your team set up.
+  # A header image for a draft. It makes an image; it publishes nothing.
+  - name: generate_image
+    kind: http
+    connection: images
+    method: POST
+    url: "https://api.openai.com/v1/images/generations"
+    risk: write
+    description: Make a header image from a prompt, for a draft. Save the link it returns in an image draft.
+
+triggers:
+  - on: github.release
+    agent: launch-writer
+  - on: schedule
+    cron: "0 14 * * MON"
+    agent: weekly-roundup
+  - on: manual
+    agent: launch-writer
+    form:
+      brief: text
+      channels: [linkedin, blog, email]
+
+outputs:
+  - type: draft
+    kinds: [blog, social, email, image]
+  - type: publish
+    via: publish_post
+    approval: {role: marketing_editor, min: 1}
+
+# A week after a post goes out, its numbers come back as a lesson the next
+# runs read.
+results:
+  via: "mcp:posthog"
+  tool: query_insight
+  after_days: 7
+
+budget:
+  monthly_tokens: 2000000

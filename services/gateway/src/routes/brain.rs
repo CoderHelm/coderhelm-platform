@@ -108,6 +108,11 @@ pub const SOURCE_KINDS: &[SourceKind] = &[
         label: "Team know-how",
         about: "Your team's written skills and helpers",
     },
+    SourceKind {
+        key: common::plugins::brain::SOURCE_KEY,
+        label: common::plugins::brain::SOURCE_LABEL,
+        about: common::plugins::brain::SOURCE_ABOUT,
+    },
 ];
 
 /// What one question may read.
@@ -126,6 +131,9 @@ pub struct Picks {
     pub data_sources: bool,
     #[serde(default)]
     pub skills: bool,
+    /// Installed plugins (ids) the question may ask; only active ones are used.
+    #[serde(default)]
+    pub plugins: Vec<String>,
     /// The repository code, memories and data sources are read for.
     #[serde(default)]
     pub repo: Option<String>,
@@ -140,6 +148,7 @@ impl Picks {
             "memories" => self.memories,
             "data_sources" => self.data_sources,
             "skills" => self.skills,
+            common::plugins::brain::SOURCE_KEY => !self.plugins.is_empty(),
             _ => false,
         }
     }
@@ -151,6 +160,7 @@ pub fn kind_of_tool(name: &str) -> &'static str {
         KNOWLEDGE_TOOL => "knowledge",
         MEMORY_TOOL => "memories",
         "read_skill" | "read_skill_file" | "ask_team_agent" => "skills",
+        common::plugins::brain::ASK_TOOL => common::plugins::brain::SOURCE_KEY,
         n if n.starts_with("github__") || n.starts_with("graph_") => "code",
         n if n.contains("__") => "connections",
         _ => "data_sources",
@@ -527,8 +537,14 @@ pub async fn sources(
     );
     let mut repo_names: Vec<&String> = repos.keys().collect();
     repo_names.sort();
+    let plugins = common::plugins::brain::sources(&plugin_kv(&state), &claims.team_id).await;
+    let kinds: Vec<&SourceKind> = SOURCE_KINDS
+        .iter()
+        .filter(|k| k.key != common::plugins::brain::SOURCE_KEY || !plugins.is_empty())
+        .collect();
     Ok(Json(json!({
-        "kinds": SOURCE_KINDS,
+        "kinds": kinds,
+        "plugins": plugins,
         "knowledge": knowledge,
         "connections": connections,
         "repos": repo_names,
@@ -933,6 +949,8 @@ struct Run {
     repos: HashMap<String, String>,
     github_token: Option<String>,
     mcp_tools: Vec<Value>,
+    /// Active plugins among those picked.
+    plugin_ids: Vec<String>,
     worker: WorkerTools,
     scope: ChatScope,
     /// Connections the asker can't use yet (offered as a sign-in card).
@@ -988,6 +1006,9 @@ fn tool_defs(run: &Run) -> Vec<Value> {
     if run.picks.connections {
         tools.extend(run.mcp_tools.iter().cloned());
     }
+    if !run.plugin_ids.is_empty() {
+        tools.push(common::plugins::brain::ask_tool(&run.plugin_ids));
+    }
     tools.extend(
         run.worker
             .tools
@@ -1013,6 +1034,7 @@ fn tool_label(name: &str, input: &Value) -> String {
             common::truncate_str(&s("query"), 60)
         ),
         MEMORY_TOOL => format!("Searched memories of {}", s("repo")),
+        common::plugins::brain::ASK_TOOL => format!("Asked the {} plugin", s("plugin")),
         "github__search_code" => format!("Searched code in {}", s("repo")),
         "github__read_file" => format!("Read {}", s("path")),
         n if n.starts_with("graph_") => format!("Code graph: {}", n.trim_start_matches("graph_")),
@@ -1022,6 +1044,27 @@ fn tool_label(name: &str, input: &Value) -> String {
         }
         n => n.replace('_', " "),
     }
+}
+
+/// The plugins store (settings table), for the plugins source.
+fn plugin_kv(state: &AppState) -> common::plugins::kv::Dynamo {
+    common::plugins::kv::Dynamo {
+        client: state.dynamo.clone(),
+        table: state.config.settings_table_name.clone(),
+    }
+}
+
+/// The picked plugins that are installed and active (flag on).
+async fn active_plugins(state: &AppState, team_id: &str, picked: &[String]) -> Vec<String> {
+    if picked.is_empty() {
+        return Vec::new();
+    }
+    common::plugins::brain::sources(&plugin_kv(state), team_id)
+        .await
+        .into_iter()
+        .filter_map(|v| v["id"].as_str().map(str::to_string))
+        .filter(|id| picked.iter().any(|p| p == id))
+        .collect()
 }
 
 fn live_stamp() -> String {
@@ -1087,6 +1130,32 @@ async fn run_tool(
                         true,
                     )
                 }
+            }
+        }
+        common::plugins::brain::ASK_TOOL => {
+            let plugin = input["plugin"].as_str().unwrap_or("");
+            if !run.plugin_ids.iter().any(|p| p == plugin) {
+                return (
+                    "Error: pick one of the listed plugins.".into(),
+                    "Unknown plugin".into(),
+                    true,
+                );
+            }
+            // Read only: the plugin's own skills (no draft, no tool call).
+            match common::plugins::brain::context(&plugin_kv(state), &run.team_id, plugin).await {
+                Ok(text) => {
+                    let id = reg.add(SourceRef {
+                        kind: "plugin".into(),
+                        title: format!("Plugin {plugin}"),
+                        loc: plugin.to_string(),
+                        as_of: live_stamp(),
+                        passage: text,
+                        href: Some(format!("/plugins/plugin?id={plugin}")),
+                        ..Default::default()
+                    });
+                    (reg.render(&[id]), "Read the plugin's skills".into(), false)
+                }
+                Err(e) => (format!("Error: {e}"), "Plugin unavailable".into(), true),
             }
         }
         MEMORY_TOOL => {
@@ -1518,6 +1587,7 @@ pub async fn brain_stream(
             }
         },
     );
+    let plugin_ids = active_plugins(&state, &claims.team_id, &picks.plugins).await;
     let run = Run {
         state: state.clone(),
         team_id: claims.team_id.clone(),
@@ -1529,6 +1599,7 @@ pub async fn brain_stream(
         repos,
         github_token: github,
         mcp_tools,
+        plugin_ids,
         worker,
         scope,
         missing: super::chat_policy::missing_connections(&state, &claims.team_id, &claims.email)
@@ -1920,6 +1991,25 @@ mod tests {
             shared,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn plugins_are_their_own_source() {
+        use common::plugins::brain::{ASK_TOOL, SOURCE_KEY};
+        assert_eq!(kind_of_tool(ASK_TOOL), SOURCE_KEY);
+        assert!(SOURCE_KINDS.iter().any(|k| k.key == SOURCE_KEY));
+        let mut picks = Picks::default();
+        assert!(!picks.allows(SOURCE_KEY));
+        picks.plugins = vec!["marketing".into()];
+        assert!(picks.allows(SOURCE_KEY));
+        assert!(
+            !picks.allows("connections"),
+            "picking a plugin turns on nothing else"
+        );
+        assert_eq!(
+            tool_label(ASK_TOOL, &json!({"plugin": "marketing"})),
+            "Asked the marketing plugin"
+        );
     }
 
     #[test]

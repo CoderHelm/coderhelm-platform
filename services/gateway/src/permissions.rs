@@ -147,6 +147,24 @@ pub const CAPABILITIES: &[Capability] = &[
             "api::update_notification_prefs",
         ],
     },
+    Capability {
+        key: "plugins.view",
+        label: "See installed plugins, their runs, drafts and approvals",
+        min_role: "viewer",
+        handlers: &[
+            "plugin_pkgs::get_flag",
+            "plugin_pkgs::get_settings",
+            "plugin_pkgs::list_sources",
+            "plugin_pkgs::available",
+            "plugin_pkgs::list_installed",
+            "plugin_pkgs::get_installed",
+            "plugin_pkgs::list_runs",
+            "plugin_pkgs::get_run",
+            "plugin_pkgs::list_drafts",
+            "plugin_pkgs::get_draft",
+            "plugin_pkgs::brain_sources",
+        ],
+    },
     // ── Members ─────────────────────────────────────────────────────
     Capability {
         key: "brain_ask",
@@ -257,6 +275,27 @@ pub const CAPABILITIES: &[Capability] = &[
         label: "See integrations, what each can do and whether it works",
         min_role: "member",
         handlers: &["integrations::list"],
+    },
+    Capability {
+        key: "plugins.run",
+        label: "Start plugin runs from a brief, edit drafts and send them for review",
+        min_role: "member",
+        handlers: &[
+            "plugin_pkgs::start_run",
+            "plugin_pkgs::edit_draft",
+            "plugin_pkgs::submit_draft",
+        ],
+    },
+    Capability {
+        key: "plugins.approve",
+        label: "Approve, reject, stop or cancel plugin drafts (only for plugins that name you as an approver, or as an admin when a plugin names none)",
+        min_role: "member",
+        handlers: &[
+            "plugin_pkgs::approve_draft",
+            "plugin_pkgs::reject_draft",
+            "plugin_pkgs::stop_draft",
+            "plugin_pkgs::cancel_draft",
+        ],
     },
     // ── Admins ──────────────────────────────────────────────────────
     Capability {
@@ -551,6 +590,36 @@ pub const CAPABILITIES: &[Capability] = &[
             "system::update_now",
             "system::rollback",
             "system::test_email",
+        ],
+    },
+    Capability {
+        key: "plugins.install",
+        label: "Add plugin sources, install, update, pin or roll back plugins, and set their settings, approvers and limits",
+        min_role: "admin",
+        handlers: &[
+            "plugin_pkgs::put_settings",
+            "plugin_pkgs::add_source",
+            "plugin_pkgs::sync_source",
+            "plugin_pkgs::remove_source",
+            "plugin_pkgs::install_plugin",
+            "plugin_pkgs::approve_pending",
+            "plugin_pkgs::decline_pending",
+            "plugin_pkgs::set_options",
+            "plugin_pkgs::rollback",
+            "plugin_pkgs::sync_plugin",
+            "plugin_pkgs::set_plugin_settings",
+            "plugin_pkgs::set_limit",
+            "plugin_pkgs::set_approvers",
+            "plugin_pkgs::set_enabled",
+            "plugin_pkgs::uninstall",
+        ],
+    },
+    Capability {
+        key: "plugins.audit",
+        label: "Read the audit log",
+        min_role: "admin",
+        handlers: &[
+            "plugin_pkgs::audit_log",
         ],
     },
     // ── Owners ──────────────────────────────────────────────────────

@@ -27,7 +27,7 @@ pub const MAX_FIX_ROUNDS: u32 = 1;
 /// change shipped resting on a guess.
 pub const CODER_RULES: &str = "
 ## Prove what the change rests on (every change)
-- Prove an assumption before you write code on it. When the fix relies on a field, value or behaviour of a system this code doesn't own (a vendor API, another service, a table another system writes), confirm it from the real thing first: one read through a connected data source (a live lookup, `rest_get`, a database query, a search) or that system's own data in the warehouse. Read an actual payload or row; a type, a schema or a name in the code is not proof of what the field holds.
+- Prove an assumption before you write code on it. When the fix relies on a field, value or behaviour of a system this code doesn't own (a vendor API, another service, a table another system writes), confirm it from the real thing first: one read through a connected data source (a live lookup, `api_get`, a database query, a search) or that system's own data in the warehouse. Read an actual payload or row; a type, a schema or a name in the code is not proof of what the field holds.
 - Measure the impact when the data is in a connected source: count the records the change affects, with a query, and note a few concrete examples (ids or names).
 - Logging: INFO only for actual changes and decisions; diagnostics go to DEBUG. Never add an INFO log that fires for every record or on every scheduled run.
 - Never leave \"unconfirmed\", \"not verified\" or \"not measured\" for something a connected source could answer: look it up. When no connected source can reach it, say exactly which source is missing.

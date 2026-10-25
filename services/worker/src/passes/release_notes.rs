@@ -917,6 +917,17 @@ async fn run_locked(
         save_record(state, &msg.team_id, &record_sk, tag, &rec).await;
     }
     info!(%tag, repo = %format!("{owner}/{repo}"), "Release notes published");
+    // Plugins with a release trigger (a marketing plugin's launch posts)
+    // start from these notes. Only the first publish, never a re-send.
+    if msg.resend.is_empty() {
+        let text = if notes.github_release_md.trim().is_empty() {
+            notes.entry_md.clone()
+        } else {
+            notes.github_release_md.clone()
+        };
+        super::plugins::on_release(state, &msg.team_id, &format!("{owner}/{repo}"), tag, &text)
+            .await;
+    }
     Ok(())
 }
 

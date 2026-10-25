@@ -66,6 +66,26 @@ pub struct Me {
     /// Set only when the caller is an API key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<MeApiKey>,
+    /// The team's feature flags (the dashboard reads them on every page).
+    pub flags: MeFlags,
+}
+
+/// A team's feature flags.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct MeFlags {
+    /// Plugins are turned on for the team.
+    #[schema(example = false)]
+    pub plugins: bool,
+}
+
+async fn me_flags(state: &AppState, team_id: &str) -> MeFlags {
+    let kv = common::plugins::kv::Dynamo {
+        client: state.dynamo.clone(),
+        table: state.config.settings_table_name.clone(),
+    };
+    MeFlags {
+        plugins: common::plugins::flag::enabled(&kv, team_id).await,
+    }
 }
 
 /// The API key a request was made with.
@@ -148,6 +168,7 @@ pub async fn me(
                 expires_at: key.expires_at.clone(),
                 rate_limit_per_minute: key.rate_limit_per_minute,
             }),
+            flags: me_flags(&state, &claims.team_id).await,
         }));
     }
     // A support-view session is no person on the team: answer for the view
@@ -168,6 +189,7 @@ pub async fn me(
             platform_admin: false,
             support_view: Some(json!({ "team_id": sv.team_id, "until": sv.until })),
             api_key: None,
+            flags: me_flags(&state, &claims.team_id).await,
         }));
     }
     let result = state
@@ -249,6 +271,7 @@ pub async fn me(
         platform_admin: is_platform_admin(&claims),
         support_view: None,
         api_key: None,
+        flags: me_flags(&state, &claims.team_id).await,
     }))
 }
 
@@ -1616,6 +1639,7 @@ pub async fn retry_run(
             .and_then(|v| v.as_s().ok())
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default(),
+        ..Default::default()
     });
 
     let body = serde_json::to_string(&message).map_err(|e| {
@@ -1861,6 +1885,7 @@ pub async fn reset_and_rerun(
             .and_then(|v| v.as_s().ok())
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default(),
+        ..Default::default()
     });
     let body = serde_json::to_string(&message).map_err(|e| {
         error!("Failed to serialize reset message: {e}");
@@ -1981,6 +2006,7 @@ pub async fn re_review_run(
         comments: vec![],
         // Not a GitHub comment: nobody to address on the PR.
         trigger_author: String::new(),
+        ..Default::default()
     });
 
     let body = serde_json::to_string(&message).map_err(|e| {

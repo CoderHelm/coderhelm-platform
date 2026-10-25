@@ -16,6 +16,7 @@ import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as ses from "aws-cdk-lib/aws-ses";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
+import * as scheduler from "aws-cdk-lib/aws-scheduler";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
@@ -282,6 +283,38 @@ export class ApiStack extends cdk.Stack {
       ],
     });
 
+    // Plugins: one-off schedules (publish an approved draft at its time,
+    // read results back) and recurring schedule triggers live in one
+    // EventBridge Scheduler group and send to the ticket queue with a role
+    // that may only do that. The gateway and worker create and delete them.
+    new scheduler.CfnScheduleGroup(this, "PluginScheduleGroup", {
+      name: `${prefix}-plugins`,
+    });
+    const pluginSchedulerRole = new iam.Role(this, "PluginSchedulerRole", {
+      roleName: `${prefix}-plugin-scheduler`,
+      assumedBy: new iam.ServicePrincipal("scheduler.amazonaws.com", {
+        conditions: { StringEquals: { "aws:SourceAccount": this.account } },
+      }),
+      description: "Lets plugin schedules send their message to the ticket queue",
+    });
+    this.ticketQueue.grantSendMessages(pluginSchedulerRole);
+
+    // Plugin sources: every 15 min, poll the sources no webhook covers
+    // (public repositories, and installation ones as a backstop). Does
+    // nothing for teams whose plugins flag is off.
+    new events.Rule(this, "PluginSweepSchedule", {
+      ruleName: `${prefix}-plugin-sweep`,
+      description: "Poll plugin sources for new versions",
+      schedule: events.Schedule.rate(cdk.Duration.minutes(15)),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "plugin_sweep",
+          }),
+        }),
+      ],
+    });
+
     // Stuck-review sweep (permanent): every 15 min, re-run the review of open
     // PRs whose standing CoderHelm review didn't finish (a service error),
     // once per head. Idempotent: a head is re-run at most once a day.
@@ -448,6 +481,9 @@ export class ApiStack extends cdk.Stack {
         BUCKET_NAME: props.bucket.bucketName,
         WAITLIST_TABLE_NAME: props.waitlistTable.tableName,
         TICKET_QUEUE_URL: this.ticketQueue.queueUrl,
+        TICKET_QUEUE_ARN: this.ticketQueue.queueArn,
+        PLUGIN_SCHEDULE_GROUP: `${prefix}-plugins`,
+        PLUGIN_SCHEDULER_ROLE_ARN: pluginSchedulerRole.roleArn,
         CI_FIX_QUEUE_URL: this.ciFixQueue.queueUrl,
         FEEDBACK_QUEUE_URL: this.feedbackQueue.queueUrl,
         DLQ_URL: dlq.queueUrl,
@@ -516,6 +552,23 @@ export class ApiStack extends cdk.Stack {
     props.waitlistTable.grantReadWriteData(this.gatewayFunction);
     props.bucket.grantReadWrite(this.gatewayFunction);
     this.ticketQueue.grantSendMessages(this.gatewayFunction);
+    // Plugin schedules: create and delete in the plugins group only, and
+    // hand them the scheduler role.
+    this.gatewayFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["scheduler:CreateSchedule", "scheduler:DeleteSchedule", "scheduler:GetSchedule"],
+        resources: [
+          `arn:aws:scheduler:${this.region}:${this.account}:schedule/${prefix}-plugins/*`,
+        ],
+      })
+    );
+    this.gatewayFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["iam:PassRole"],
+        conditions: { StringEquals: { "iam:PassedToService": "scheduler.amazonaws.com" } },
+        resources: [pluginSchedulerRole.roleArn],
+      })
+    );
     this.ciFixQueue.grantSendMessages(this.gatewayFunction);
     this.feedbackQueue.grantSendMessages(this.gatewayFunction);
     dlq.grantConsumeMessages(this.gatewayFunction);

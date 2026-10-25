@@ -34,6 +34,8 @@ pub mod git_conventions;
 pub mod live;
 /// Log findings and the fix runs started from them.
 pub mod log_findings;
+/// The MCP servers a team can switch on: one catalog for gateway and worker.
+pub mod mcp_catalog;
 /// Sealed credentials for a team's MCP servers (KMS, bound to team and server).
 pub mod mcp_credentials;
 /// Remote MCP servers over HTTP: OAuth sign-in, tokens, allowed tools.
@@ -42,6 +44,8 @@ pub mod memory_meta;
 /// The auto-merge gate's per-PR record: keys and states (the worker runs the
 /// gate, the gateway re-arms it on GitHub events).
 pub mod merge_gate;
+/// Every message on the worker queues: one enum the gateway and worker share.
+pub mod messages;
 /// Retrying model API calls on transient failures, classified by status.
 pub mod model_retry;
 // Anthropic SSE calls, metered per attempt (drops, retries, the deadline)
@@ -62,6 +66,8 @@ pub mod pr_outcome;
 pub mod jira_text;
 /// Anthropic API or Amazon Bedrock, and Bedrock's model ids.
 pub mod model_provider;
+/// Plugins: packages of skills, agents, tools, triggers and outputs a team installs.
+pub mod plugins;
 /// Where this deployment's dashboard and API are (links, redirects, webhooks).
 pub mod public_urls;
 /// Who asked for a run: one identity per person, for per-person analytics.
@@ -86,6 +92,8 @@ pub mod skills;
 pub mod ticket_state;
 /// A team's monthly token limits: new tokens, cache read, cache write.
 pub mod token_limits;
+/// Every tool an agent can be given, with its risk (read, write, consequential).
+pub mod tool_registry;
 /// Signed links that turn off one email for one person, without signing in.
 pub mod unsubscribe;
 /// Model usage accounting: every model call is counted here, once.
