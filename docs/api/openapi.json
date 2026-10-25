@@ -1871,6 +1871,9 @@
           },
           "policy_approval": {
             "description": "The approval card that timed out, when one did.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1878,6 +1881,9 @@
           },
           "policy_note": {
             "description": "Why an agent loop stopped: agents were paused, or an approval nobody\nanswered in time.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1967,6 +1973,9 @@
           },
           "sign_in_prompts": {
             "description": "Sign-in prompts the run raised: connections it could have used that\nits person hadn't made (or the team hadn't set up).",
+            "examples": [
+              []
+            ],
             "items": {
               "type": "object"
             },

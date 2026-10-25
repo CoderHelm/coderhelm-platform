@@ -944,12 +944,14 @@ pub struct Run {
     pub error: Option<String>,
     /// Why an agent loop stopped: agents were paused, or an approval nobody
     /// answered in time.
+    #[schema(example = json!(null))]
     pub policy_note: Option<String>,
     /// The approval card that timed out, when one did.
+    #[schema(example = json!(null))]
     pub policy_approval: Option<String>,
     /// Sign-in prompts the run raised: connections it could have used that
     /// its person hadn't made (or the team hadn't set up).
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<Object>, example = json!([]))]
     pub sign_in_prompts: Vec<Value>,
     /// Where the fix belongs: `code`, or somewhere outside the code.
     #[schema(example = "code")]
