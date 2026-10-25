@@ -37,6 +37,7 @@ pub mod roles;
 pub mod run_close;
 pub mod run_search;
 pub mod search;
+pub mod setup;
 pub mod skills;
 pub mod sns;
 pub mod support;

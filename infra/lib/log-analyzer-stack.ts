@@ -45,6 +45,10 @@ export class LogAnalyzerStack extends cdk.Stack {
           blockPublicPolicy: false,
           restrictPublicBuckets: false,
         }),
+        // The install guide (docs.coderhelm.com) reads launch/latest.json
+        // from the browser; the Launch Stack templates under launch/<tag>/
+        // are written by the release workflow, not by this stack.
+        cors: [{ allowedMethods: [s3.HttpMethods.GET, s3.HttpMethods.HEAD], allowedOrigins: ["*"], maxAge: 300 }],
         removalPolicy: cdk.RemovalPolicy.RETAIN,
       });
 

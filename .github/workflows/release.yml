@@ -2,7 +2,8 @@ name: Release
 
 # A tag vX.Y.Z publishes a self-host release: prebuilt Lambda code (no Rust
 # toolchain needed to install), the dashboard build, the CDK app's source,
-# the installer, the install script and the Launch Stack template, with
+# the installer, the install script and the Launch Stack template (also
+# published to S3 for the Launch Stack link), with
 # SHA256SUMS and build provenance (GitHub artifact attestations: Sigstore,
 # no keys to manage). The hosted deployment is not touched by this workflow.
 on:
@@ -97,8 +98,11 @@ jobs:
           (cd installer && npm version --no-git-tag-version --allow-same-version "${TAG#v}" >/dev/null && npm pack --silent --pack-destination ../dist >/dev/null)
           mv dist/coderhelm-selfhost-*.tgz dist/coderhelm-selfhost.tgz
           cp selfhost/install.sh dist/install.sh
-          cp infra/cfn/coderhelm-selfhost-launch.yaml dist/launch-stack.yaml
-          (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh launch-stack.yaml > SHA256SUMS)
+          # The Launch Stack template, pinned to this release, and the
+          # installer its CodeBuild project runs (checked against SHA256SUMS).
+          node selfhost/launch/stamp-template.mjs infra/cfn/coderhelm-selfhost-launch.yaml "$TAG" > dist/launch-stack.yaml
+          cp selfhost/launch/bootstrap.mjs dist/launch-bootstrap.mjs
+          (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh launch-stack.yaml launch-bootstrap.mjs > SHA256SUMS)
           cat dist/SHA256SUMS
 
       # The release's own CDK app synthesizes for a fresh self-host config.
@@ -128,6 +132,8 @@ jobs:
             dist/dashboard.tar.gz
             dist/source.tar.gz
             dist/coderhelm-selfhost.tgz
+            dist/launch-bootstrap.mjs
+            dist/launch-stack.yaml
 
       - name: Publish the release
         env:
@@ -139,4 +145,48 @@ jobs:
             gh release upload "$TAG" dist/* --clobber
           else
             gh release create "$TAG" dist/* --title "$TAG" --notes "$NOTES" --verify-tag
+          fi
+
+  # CloudFormation's Launch Stack links only open templates stored in S3, so
+  # the release's template also goes to the hosted deployment's public bucket
+  # (infra/lib/log-analyzer-stack.ts), by version, and latest.json names the
+  # newest stable one for the install guide (docs.coderhelm.com/self-host/install).
+  # A separate job: the GitHub release is published even if this one fails,
+  # and re-running it later is safe.
+  launch-template:
+    name: Publish the Launch Stack template
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PUBLIC_BUCKET: coderhelm-public
+    steps:
+      - id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      # The role only tag builds of this repository may assume, and only to
+      # write launch/* in the public bucket (infra/lib/worker-stack.ts,
+      # ReleasePublisherRole). The hosted deploy creates it.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-release-publisher
+          role-duration-seconds: 3600
+          aws-region: us-east-1
+      - name: Upload the template and latest.json
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          node selfhost/launch/stamp-template.mjs infra/cfn/coderhelm-selfhost-launch.yaml "$TAG" > launch.yaml
+          aws s3 cp launch.yaml "s3://$PUBLIC_BUCKET/launch/$TAG/coderhelm-launch.yaml" --content-type text/yaml --cache-control "public, max-age=31536000, immutable"
+          # Pre-releases (v1.2.3-rc.1) are published by version but never become latest.
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            node -e 'import("./selfhost/launch/stamp-template.mjs").then(m=>process.stdout.write(JSON.stringify(m.latestDoc(process.argv[1]))))' "$TAG" > latest.json
+            aws s3 cp latest.json "s3://$PUBLIC_BUCKET/launch/latest.json" --content-type application/json --cache-control "public, max-age=300"
           fi

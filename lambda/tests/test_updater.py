@@ -174,3 +174,44 @@ class Handler(unittest.TestCase):
         with self.assertRaises(ValueError):
             u.handle({"action": "settings", "settings": {"hour": 99}}, self.env, self.store, SUNDAY_3AM, self.fetch)
         self.assertIsNone(self.store.get("AUTO_UPDATE"))
+
+
+class FakeLambda:
+    def __init__(self, conflicts=0):
+        self.env = {"f-gateway": {"A": "1"}, "f-worker": {}}
+        self.conflicts = conflicts
+        self.updates = []
+
+    def get_function_configuration(self, FunctionName):
+        return {"Environment": {"Variables": dict(self.env[FunctionName])}}
+
+    def update_function_configuration(self, FunctionName, Environment):
+        if self.conflicts:
+            self.conflicts -= 1
+            raise type("ResourceConflictException", (Exception,), {})("an update is in progress")
+        self.env[FunctionName] = Environment["Variables"]
+        self.updates.append(FunctionName)
+
+
+class RefreshSecrets(unittest.TestCase):
+    def test_stamps_each_function_and_keeps_its_settings(self):
+        lam = FakeLambda()
+        self.assertEqual(u.refresh_functions(lam, ["f-gateway", "f-worker"], "v1", sleep=lambda s: None), ["f-gateway", "f-worker"])
+        self.assertEqual(lam.env["f-gateway"], {"A": "1", "SECRETS_REVISION": "v1"})
+        self.assertEqual(lam.env["f-worker"], {"SECRETS_REVISION": "v1"})
+
+    def test_waits_out_an_update_in_progress(self):
+        lam = FakeLambda(conflicts=2)
+        self.assertEqual(u.refresh_functions(lam, ["f-gateway"], "v2", sleep=lambda s: None), ["f-gateway"])
+
+    def test_the_action_uses_the_configured_functions_and_a_clean_revision(self):
+        lam = FakeLambda()
+        u._clients["lambda"] = lam
+        try:
+            env = {"REFRESH_FUNCTIONS": "f-gateway,f-worker", "SETTINGS_TABLE_NAME": "t"}
+            store = u.Store(FakeDynamo(), "t")
+            out = u.handle({"action": "refresh_secrets", "revision": "abc-123;rm -rf"}, env, store, SUNDAY_3AM)
+        finally:
+            u._clients.pop("lambda", None)
+        self.assertEqual(out, {"refreshed": ["f-gateway", "f-worker"]})
+        self.assertEqual(lam.env["f-worker"]["SECRETS_REVISION"], "abc-123rm-rf")

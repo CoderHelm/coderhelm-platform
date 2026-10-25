@@ -983,6 +983,12 @@ async fn main() -> Result<(), Error> {
         // Opt-in pings from self-host installers: public, no session, a
         // fixed set of non-identifying fields (routes::telemetry).
         .route("/api/telemetry/ping", post(routes::telemetry::ping))
+        // Where GitHub's app manifest flow lands on a self-hosted install
+        // (routes::setup). 404 on hosted.
+        .route(
+            "/api/setup/github/callback",
+            get(routes::setup::github_callback),
+        )
         .route("/api/brain/stream", post(routes::brain::brain_stream))
         .nest("/webhooks", webhook_routes)
         .route(

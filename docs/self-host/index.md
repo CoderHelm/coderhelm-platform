@@ -6,6 +6,8 @@ order: 0
 
 CoderHelm runs entirely on AWS serverless services: Lambda, API Gateway, SQS, DynamoDB, S3, CloudFront, Cognito, SES, EventBridge and CodeBuild. Self-hosting puts all of it in your AWS account. Your code, tickets, logs and model calls never pass through CoderHelm's own account.
 
+**The fastest way:** the [install guide](https://docs.coderhelm.com/self-host/install/) installs CoderHelm from your browser with one click into your AWS account, then checks every step against your own install. Prefer a terminal? Use the [quick start](./quick-start.md).
+
 ## How it works
 
 - **One config file.** `coderhelm.config.json` holds everything that differs between installs: account, region, a short name, your domain (or none), the model provider, the email sender and which optional parts run. The hosted CoderHelm deployment is built from the same code with its own config.

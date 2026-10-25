@@ -124,3 +124,21 @@ jobs:
           node-version: lts/*
       - run: npm test
       - run: sh -n ../selfhost/install.sh
+
+  launch:
+    name: Launch Stack (template and installer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      # The installer the stack runs, and the release's template stamping.
+      - run: node --test selfhost/launch/*.test.mjs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: cfn-lint the CloudFormation templates
+        run: |
+          pip install --quiet cfn-lint==1.58.0
+          cfn-lint infra/cfn/*.yaml

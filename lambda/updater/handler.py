@@ -12,6 +12,9 @@ Actions (the `action` field of the event):
 - update_now  starts the update build for a version (default: the latest).
 - rollback  starts the build for the version before the last update.
 - finished  the update build reports its result; history and notices.
+- refresh_secrets  the gateway stored new keys in the install's secret (the
+            GitHub App, from the install guide): restart the services that
+            read it at start, by stamping SECRETS_REVISION on each.
 
 The build itself (CodeBuild, infra/lib/updates-stack.ts) runs
 `coderhelm-selfhost update`: health check, checksum and signature check,
@@ -313,6 +316,28 @@ def start_build(env, version, actor, mode, history_id):
     return r["build"]["id"]
 
 
+def refresh_functions(lam, names, revision, sleep=time.sleep, tries=5):
+    """Sets SECRETS_REVISION on each function (its other settings unchanged),
+    so its next request starts a fresh instance that reads the secret again.
+    Retries while an earlier change to the function is still applying."""
+    done = []
+    for name in names:
+        for attempt in range(tries):
+            try:
+                cfg = lam.get_function_configuration(FunctionName=name)
+                variables = dict((cfg.get("Environment") or {}).get("Variables") or {})
+                variables["SECRETS_REVISION"] = revision
+                lam.update_function_configuration(FunctionName=name, Environment={"Variables": variables})
+                done.append(name)
+                break
+            except Exception as e:  # ResourceConflictException while an update applies
+                if "ResourceConflict" not in type(e).__name__ + str(e) or attempt == tries - 1:
+                    logger.error("refresh %s failed: %s", name, e)
+                    break
+                sleep(2 * (attempt + 1))
+    return done
+
+
 # ── Actions ───────────────────────────────────────────────────────────────
 
 def app_url(env):
@@ -410,6 +435,11 @@ def handle(event, env, store, now, fetch=fetch_releases):
             env,
         )
         return {"status": status, "version": version}
+
+    if action == "refresh_secrets":
+        revision = re.sub(r"[^A-Za-z0-9-]", "", str(event.get("revision") or uuid.uuid4().hex))[:64] or uuid.uuid4().hex
+        names = [n for n in (env.get("REFRESH_FUNCTIONS") or "").split(",") if n]
+        return {"refreshed": refresh_functions(client("lambda"), names, revision)}
 
     if action == "tick":
         rel = releases_cached(store, repo, now.timestamp(), fetch)

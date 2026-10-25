@@ -300,3 +300,55 @@ test("every public API path, and the OpenAPI document itself, has an HTTP API ro
 test("self-host serves the OpenAPI document through CloudFront", () => {
   assert.ok(API_PATHS.includes("/openapi.json"));
 });
+
+test("the manifest landing: self-host only, may write only this install's secret", () => {
+  const t = synth(selfHost({ models: { provider: "bedrock" } }));
+  const api = t["coderhelm-prod-api"];
+  const gw = envOf(api, "coderhelm-prod-gateway");
+  assert.equal(gw.SETUP_ENDPOINTS, "1");
+  const policies = JSON.stringify(api.findResources("AWS::IAM::Policy"));
+  assert.ok(policies.includes("SetupStoresGithubAppKeys"));
+  assert.ok(policies.includes("secret:coderhelm/prod/secrets-??????"), "only this install's secret");
+
+  // The updater may restart exactly the functions that read the secret.
+  const u = t["coderhelm-prod-updates"];
+  assert.equal(envOf(u, "coderhelm-prod-updater").REFRESH_FUNCTIONS, "coderhelm-prod-gateway,coderhelm-prod-streaming,coderhelm-prod-worker");
+  const up = JSON.stringify(u.findResources("AWS::IAM::Policy"));
+  assert.ok(up.includes("RestartSecretReaders"));
+  assert.ok(up.includes("function:coderhelm-prod-worker"));
+
+  const hostedCfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
+  const hosted = synth(hostedCfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"));
+  assert.equal(envOf(hosted["coderhelm-prod-api"], "coderhelm-prod-gateway").SETUP_ENDPOINTS, undefined);
+  assert.ok(!JSON.stringify(hosted["coderhelm-prod-api"].findResources("AWS::IAM::Policy")).includes("SetupStoresGithubAppKeys"));
+  // The install guide reads launch/latest.json from the public bucket in the browser.
+  hosted["coderhelm-prod-log-analyzer"].hasResourceProperties("AWS::S3::Bucket", {
+    BucketName: "coderhelm-public",
+    CorsConfiguration: { CorsRules: [{ AllowedMethods: ["GET", "HEAD"], AllowedOrigins: ["*"] }] },
+  });
+});
+
+test("the release publisher: only v* tag builds of the platform repo, only launch/* in the public bucket", () => {
+  const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
+  const t = synth(cfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"));
+  const w = t["coderhelm-prod-worker"];
+  const role = Object.values(w.findResources("AWS::IAM::Role", { Properties: { RoleName: "coderhelm-prod-release-publisher" } }))[0] as any;
+  assert.ok(role, "the role exists on hosted");
+  assert.equal(role.Properties.MaxSessionDuration, 3600);
+  const [st] = role.Properties.AssumeRolePolicyDocument.Statement;
+  assert.equal(st.Action, "sts:AssumeRoleWithWebIdentity");
+  assert.deepEqual(st.Condition, {
+    StringEquals: { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+    StringLike: { "token.actions.githubusercontent.com:sub": "repo:CoderHelm/coderhelm-platform:ref:refs/tags/v*" },
+  });
+  const policies = Object.values(w.findResources("AWS::IAM::Policy")) as any[];
+  const mine = policies.filter((p) => JSON.stringify(p.Properties.Roles).includes("ReleasePublisherRole"));
+  assert.equal(mine.length, 1);
+  assert.deepEqual(mine[0].Properties.PolicyDocument.Statement, [
+    { Action: "s3:PutObject", Effect: "Allow", Resource: "arn:aws:s3:::coderhelm-public/launch/*" },
+  ]);
+  w.hasOutput("ReleasePublisherRoleArn", {});
+  // Self-host installs have no publisher.
+  const sh = synth(selfHost());
+  assert.ok(!json(sh["coderhelm-prod-worker"]).includes("release-publisher"));
+});
