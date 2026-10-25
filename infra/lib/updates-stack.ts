@@ -32,6 +32,11 @@ import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
 import { releaseStamp, stampEnvironment } from "./release";
 
+/** The functions that read the install's secret once, at start. */
+export function secretReaders(prefix: string): string[] {
+  return [`${prefix}-gateway`, `${prefix}-streaming`, `${prefix}-worker`];
+}
+
 /** The cosign release the update build installs (checked against its checksums). */
 export const COSIGN_VERSION = "v2.4.1";
 
@@ -194,6 +199,8 @@ export class UpdatesStack extends cdk.Stack {
         SES_FROM_ADDRESS: cfg.email.from,
         APP_URL: props.appUrl,
         RELEASE_REPO: "CoderHelm/coderhelm-platform",
+        // Restarted after the gateway stores new keys (refresh_secrets).
+        REFRESH_FUNCTIONS: secretReaders(prefix).join(","),
         ...(cfg.updates.webhookUrl ? { UPDATE_WEBHOOK_URL: cfg.updates.webhookUrl } : {}),
         ...stampEnvironment(stamp),
       },
@@ -207,6 +214,14 @@ export class UpdatesStack extends cdk.Stack {
       actions: ["ses:SendEmail"],
       resources: ["*"],
       conditions: { StringEquals: { "ses:FromAddress": cfg.email.from } },
+    }));
+
+    // refresh_secrets: stamp SECRETS_REVISION on the functions that read
+    // the secret at start (nothing else about them can change this way).
+    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+      sid: "RestartSecretReaders",
+      actions: ["lambda:GetFunctionConfiguration", "lambda:UpdateFunctionConfiguration"],
+      resources: secretReaders(prefix).map((f) => `arn:aws:lambda:${this.region}:${this.account}:function:${f}`),
     }));
 
     new events.Rule(this, "UpdateCheck", {

@@ -20,7 +20,7 @@ import * as scheduler from "aws-cdk-lib/aws-scheduler";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
-import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn, updaterInvokeStatement } from "./service-env";
+import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn, setupEnvironment, setupStatements, updaterInvokeStatement } from "./service-env";
 
 interface ApiStackProps extends cdk.StackProps {
   stage: string;
@@ -504,6 +504,11 @@ export class ApiStack extends cdk.Stack {
     for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this), updaterInvokeStatement(cfg, this)]) {
       if (st) this.gatewayFunction.addToRolePolicy(st);
     }
+    // A self-hosted install's GitHub App manifest landing (routes/setup.rs,
+    // docs/self-host/setup-checks.md): stores the new app's keys in this
+    // install's secret.
+    for (const [k, v] of Object.entries(setupEnvironment(cfg))) this.gatewayFunction.addEnvironment(k, v);
+    for (const st of setupStatements(cfg, this)) this.gatewayFunction.addToRolePolicy(st);
 
     // Permissions
     props.table.grantReadWriteData(this.gatewayFunction);

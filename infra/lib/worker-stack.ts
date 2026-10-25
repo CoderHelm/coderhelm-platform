@@ -44,6 +44,9 @@ interface WorkerStackProps extends cdk.StackProps {
   secretsKey: kms.Key;
 }
 
+
+/** The repository whose tag builds publish releases (release.yml). */
+export const RELEASE_REPO = "CoderHelm/coderhelm-platform";
 export class WorkerStack extends cdk.Stack {
   public readonly workerFunction: lambda.Function;
 
@@ -532,6 +535,31 @@ export class WorkerStack extends cdk.Stack {
         }),
       );
       new cdk.CfnOutput(this, "ReviewerEvalsRoleArn", { value: evalRole.roleArn });
+
+      // ── Release publishing (.github/workflows/release.yml, launch-template job) ──
+      // A tag's Launch Stack template goes to the public bucket under
+      // launch/<tag>/ (CloudFormation only opens templates stored in S3).
+      // Only tag builds of the platform repository may assume it, and it may
+      // only write objects under launch/ (the bucket's policy makes them
+      // public; no ACLs).
+      if (cfg.publicBucketName) {
+        const publisher = new iam.Role(this, "ReleasePublisherRole", {
+          roleName: `${prefix}-release-publisher`,
+          description: "Release workflow (GitHub Actions, v* tags): publishes the Launch Stack template to the public bucket",
+          maxSessionDuration: cdk.Duration.hours(1),
+          assumedBy: new iam.WebIdentityPrincipal(githubOidc.openIdConnectProviderArn, {
+            StringEquals: { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+            StringLike: { "token.actions.githubusercontent.com:sub": `repo:${RELEASE_REPO}:ref:refs/tags/v*` },
+          }),
+        });
+        publisher.addToPolicy(
+          new iam.PolicyStatement({
+            actions: ["s3:PutObject"],
+            resources: [`arn:aws:s3:::${cfg.publicBucketName}/launch/*`],
+          }),
+        );
+        new cdk.CfnOutput(this, "ReleasePublisherRoleArn", { value: publisher.roleArn });
+      }
     }
   }
 }

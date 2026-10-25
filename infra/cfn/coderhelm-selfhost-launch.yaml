@@ -1,83 +1,152 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Installs CoderHelm in this AWS account. A CodeBuild project runs the
-  CoderHelm installer (coderhelm-selfhost) for the release you pick: it
-  bootstraps CDK, deploys every CoderHelm stack and uploads the dashboard.
-  This stack finishes when the install does (about 20-30 minutes) and shows
-  your CoderHelm URL. Then create your GitHub App with the command in the
-  NextStep output. Deleting this stack does not remove CoderHelm (use
-  "coderhelm-selfhost uninstall").
+  Installs CoderHelm in this AWS account. A CodeBuild project downloads the
+  release you pick, checks its signature, and deploys every CoderHelm stack
+  (about 20 minutes). Nothing to install on your computer. This stack
+  finishes when CoderHelm is running and shows its URL. The install guide
+  (docs.coderhelm.com/self-host/install) follows along and walks you through
+  GitHub and models. Deleting this stack does not remove CoderHelm.
 
 Metadata:
+  # E6101: cfn-lint types a WaitCondition's Data as an object; it is a JSON
+  # string, and an output of it is the documented pattern.
+  cfn-lint:
+    config:
+      ignore_checks: [E6101]
   AWS::CloudFormation::Interface:
     ParameterGroups:
-      - Label: { default: "Required" }
-        Parameters: [AdminEmail, EmailFrom]
-      - Label: { default: "Your own domain (optional; leave empty for a CloudFront URL)" }
+      - Label: { default: "You" }
+        Parameters: [AdminEmail]
+      - Label: { default: "Install" }
+        Parameters: [Stage, ModelProvider, Version]
+      - Label: { default: "Optional: your own domain (leave empty to use a free CloudFront address)" }
         Parameters: [Hostname, HostedZone]
-      - Label: { default: "Models" }
-        Parameters: [ModelProvider, BedrockInferencePrefix]
-      - Label: { default: "More" }
-        Parameters: [Stage, SignupDomain, Version, Telemetry]
+      - Label: { default: "Optional" }
+        Parameters: [EmailFrom, SignupDomain, BedrockInferencePrefix, Telemetry]
+      - Label: { default: "Filled in by the install guide (leave as they are)" }
+        Parameters: [StatusId, SetupToken]
+    ParameterLabels:
+      AdminEmail: { default: "Your email" }
+      Stage: { default: "Install name" }
+      ModelProvider: { default: "Models" }
+      Version: { default: "CoderHelm release" }
+      Hostname: { default: "Hostname" }
+      HostedZone: { default: "Route 53 hosted zone" }
+      EmailFrom: { default: "Send email from" }
+      SignupDomain: { default: "Who else may sign up" }
+      BedrockInferencePrefix: { default: "Bedrock inference profile" }
+      Telemetry: { default: "Anonymous install pings" }
+      StatusId: { default: "Progress ID" }
+      SetupToken: { default: "Setup key" }
 
 Parameters:
   AdminEmail:
     Type: String
-    Description: Your email. You become the first admin.
+    Description: You become the first admin. Sign up with this address when the install finishes.
     AllowedPattern: "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
-  EmailFrom:
+    ConstraintDescription: an email address
+  Stage:
     Type: String
-    Description: The address CoderHelm sends email from (its domain gets an SES identity).
-    AllowedPattern: "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
+    Default: prod
+    AllowedPattern: "^[a-z][a-z0-9-]{0,19}$"
+    ConstraintDescription: lowercase letters, digits and hyphens, starting with a letter, at most 20
+    Description: A short name for this install. Resource names start with coderhelm-<name>.
+  ModelProvider:
+    Type: String
+    Default: bedrock
+    AllowedValues: [bedrock, anthropic]
+    Description: bedrock (Claude on Amazon Bedrock in this account, no API key) or anthropic (each team adds its own Anthropic API key).
+  Version:
+    Type: String
+    # Stamped with the release's own tag when the release is published
+    # (selfhost/launch/stamp-template.mjs); "latest" in the repository.
+    Default: latest
+    Description: The CoderHelm release to install, e.g. v0.7.0.
+    AllowedPattern: "^(latest|v\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.]+)?)$"
   Hostname:
     Type: String
     Default: ""
-    Description: e.g. coderhelm.example.com. Empty for CloudFront's default URL.
+    Description: e.g. coderhelm.example.com. Empty for a free CloudFront address (you can add a domain later).
     AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
   HostedZone:
     Type: String
     Default: ""
     Description: The Route 53 public hosted zone the hostname is in, e.g. example.com.
     AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
-  ModelProvider:
+  EmailFrom:
     Type: String
-    Default: anthropic
-    AllowedValues: [anthropic, bedrock]
-    Description: anthropic (each team adds its own Anthropic API key) or bedrock (Claude on Amazon Bedrock in this account).
-  BedrockInferencePrefix:
-    Type: String
-    Default: "us."
-    AllowedValues: ["us.", "eu.", "apac.", "global.", ""]
-    Description: Bedrock only. The cross-region inference profile prefix for your region.
-  Stage:
-    Type: String
-    Default: prod
-    AllowedPattern: "^[a-z][a-z0-9-]{0,19}$"
-    Description: A short name for this install (resource names start with coderhelm-<stage>).
+    Default: ""
+    Description: The address CoderHelm sends email from. Empty uses your email (AWS emails it a link to confirm; no DNS needed).
+    AllowedPattern: "^$|^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
   SignupDomain:
     Type: String
     Default: ""
-    Description: Let anyone with an email at this domain sign up (empty, only the admin).
+    Description: Let anyone with an email at this domain sign up, e.g. example.com. Empty for only you (you can invite people later).
     AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
-  Version:
+  BedrockInferencePrefix:
     Type: String
-    Default: latest
-    Description: The CoderHelm release to install, e.g. v1.2.0, or latest.
-    AllowedPattern: "^(latest|v\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.]+)?)$"
+    Default: auto
+    AllowedValues: ["auto", "us.", "eu.", "apac.", "global.", ""]
+    Description: Bedrock only. auto picks the cross-region inference profile for this region.
   Telemetry:
     Type: String
     Default: "off"
     AllowedValues: ["off", "on"]
     Description: Send anonymous install pings (release and region only) to CoderHelm.
+  StatusId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9]{16}$"
+    Description: >
+      Lets the install guide in your browser show progress. The installer writes
+      its phase and your CoderHelm URL (nothing else) to a small bucket in this
+      account that the guide reads. Empty for none.
+  SetupToken:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[A-Za-z0-9]{32,64}$"
+    Description: >
+      A one-time key from the install guide. It lets the guide hand your new
+      GitHub App's keys straight to your install. It stops working once the
+      app exists. Empty to create the GitHub App with the CLI instead.
 
 Conditions:
   HasHostname: !Not [!Equals [!Ref Hostname, ""]]
+  HasStatus: !Not [!Equals [!Ref StatusId, ""]]
 
 Resources:
+  # Progress for the install guide: one public file, status.json, with the
+  # phase, a plain message and the install's URL. The bucket outlives the
+  # stack so a failed install's reason stays readable; the file expires.
+  StatusBucket:
+    Type: AWS::S3::Bucket
+    Condition: HasStatus
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub coderhelm-setup-${StatusId}
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, HEAD]
+            AllowedOrigins: ["*"]
+            MaxAge: 300
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-progress
+            Status: Enabled
+            ExpirationInDays: 30
+
   InstallerRole:
     Type: AWS::IAM::Role
     Properties:
-      Description: CoderHelm installer (CodeBuild). Deploys CDK stacks, so it needs broad rights.
+      Description: CoderHelm installer (CodeBuild). Deploys CDK stacks (roles, functions, tables), so it needs broad rights.
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -87,24 +156,16 @@ Resources:
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess
 
-  InstallerLogs:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/codebuild/coderhelm-${Stage}-installer
-      RetentionInDays: 30
-
+  # No log group resource: CodeBuild creates /aws/codebuild/<project> itself,
+  # so the log stays when this stack is rolled back or deleted.
   InstallerProject:
     Type: AWS::CodeBuild::Project
     Properties:
-      Name: !Sub coderhelm-${Stage}-installer
-      Description: Runs coderhelm-selfhost deploy. Start a build with VERSION set to a newer release to upgrade.
+      Name: !Sub ${AWS::StackName}-installer
+      Description: Installs CoderHelm from a signed release (coderhelm-selfhost deploy). Updates later run from Settings, System.
       ServiceRole: !GetAtt InstallerRole.Arn
       TimeoutInMinutes: 90
       Artifacts: { Type: NO_ARTIFACTS }
-      LogsConfig:
-        CloudWatchLogs:
-          Status: ENABLED
-          GroupName: !Ref InstallerLogs
       Environment:
         Type: LINUX_CONTAINER
         ComputeType: BUILD_GENERAL1_SMALL
@@ -120,47 +181,54 @@ Resources:
           - { Name: BEDROCK_PREFIX, Value: !Ref BedrockInferencePrefix }
           - { Name: SIGNUP_DOMAIN, Value: !Ref SignupDomain }
           - { Name: TELEMETRY, Value: !Ref Telemetry }
+          - { Name: STATUS_BUCKET, Value: !If [HasStatus, !Ref StatusBucket, ""] }
+          - { Name: SETUP_TOKEN, Value: !Ref SetupToken }
           - { Name: WAIT_URL, Value: "" }
       Source:
         Type: NO_SOURCE
         BuildSpec: |
           version: 0.2
+          env:
+            shell: bash
           phases:
             install:
               runtime-versions:
                 nodejs: 20
+              commands:
+                - set -euo pipefail
+                # cosign, checked against its own release's checksums.
+                - curl -fsSLo /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64
+                - curl -fsSLo /tmp/cosign_checksums.txt https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign_checksums.txt
+                - (cd /tmp && grep ' cosign-linux-amd64$' cosign_checksums.txt | sed 's/cosign-linux-amd64$/cosign/' | sha256sum -c -)
+                - install -m 0755 /tmp/cosign /usr/local/bin/cosign
             build:
               commands:
-                - set -eu
+                - set -euo pipefail
                 - REPO=CoderHelm/coderhelm-platform
                 - |
                   if [ "$VERSION" = "latest" ]; then
                     VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).tag_name))')
+                    export VERSION
                   fi
                 - echo "Installing CoderHelm $VERSION"
                 - mkdir -p /tmp/ch && cd /tmp/ch
-                - curl -fsSLo coderhelm-selfhost.tgz "https://github.com/$REPO/releases/download/$VERSION/coderhelm-selfhost.tgz"
-                - curl -fsSLo SHA256SUMS "https://github.com/$REPO/releases/download/$VERSION/SHA256SUMS"
-                - grep ' coderhelm-selfhost.tgz$' SHA256SUMS | sha256sum -c -
-                - npm install -g ./coderhelm-selfhost.tgz
-                - |
-                  ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-                  REGION="$AWS_REGION"
-                  if ! coderhelm-selfhost pull --stage "$STAGE" --region "$REGION"; then
-                    set -- --yes --account "$ACCOUNT" --region "$REGION" --stage "$STAGE" \
-                      --admin "$ADMIN_EMAIL" --email-from "$EMAIL_FROM" --provider "$MODEL_PROVIDER" \
-                      --signup-domain "$SIGNUP_DOMAIN" --telemetry "$TELEMETRY"
-                    if [ -n "$HOSTNAME_ARG" ]; then set -- "$@" --domain "$HOSTNAME_ARG" --hosted-zone "$HOSTED_ZONE"; fi
-                    if [ "$MODEL_PROVIDER" = "bedrock" ]; then set -- "$@" --bedrock-prefix "$BEDROCK_PREFIX"; fi
-                    coderhelm-selfhost init "$@"
-                  fi
-                - coderhelm-selfhost deploy --yes --version "$VERSION" --skip-github-app
+                - B="https://github.com/$REPO/releases/download/$VERSION"
+                - for f in SHA256SUMS SHA256SUMS.sigstore.json coderhelm-selfhost.tgz launch-bootstrap.mjs; do curl -fsSLo "$f" "$B/$f"; done
+                # The checksums were signed by this repository's release workflow, on a tag.
+                - cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity-regexp '^https://github.com/CoderHelm/coderhelm-platform/.github/workflows/release.yml@refs/tags/v' --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+                - grep -E ' (coderhelm-selfhost\.tgz|launch-bootstrap\.mjs)$' SHA256SUMS | sha256sum -c -
+                - node launch-bootstrap.mjs
             post_build:
               commands:
                 - |
-                  URL=$(node -e 'try{const u=require("/tmp/ch/.coderhelm/state.json").publicUrl||"";console.log(u?u+"/settings/setup/":"")}catch{console.log("")}')
+                  if [ ! -s /tmp/coderhelm-final.json ] && [ -n "$STATUS_BUCKET" ]; then
+                    printf '{"schema":1,"phase":"failed","message":"The installer stopped before it could start: the release could not be downloaded or its signature did not check out.","fix":"Check that the release exists, then launch again.","version":"%s","stage":"%s","region":"%s","updatedAt":"%s"}' "$VERSION" "$STAGE" "$AWS_REGION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/coderhelm-final.json
+                    aws s3 cp /tmp/coderhelm-final.json "s3://$STATUS_BUCKET/status.json" --content-type application/json --cache-control no-store --only-show-errors || true
+                  fi
+                - |
+                  URL=$(node -e 'try{console.log(require("/tmp/coderhelm-final.json").url||"")}catch{console.log("")}')
                   if [ -n "$WAIT_URL" ]; then
-                    if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then S=SUCCESS; R="CoderHelm is running"; else S=FAILURE; R="The install failed: see the CodeBuild log"; fi
+                    if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ] && [ -n "$URL" ]; then S=SUCCESS; R="CoderHelm is running"; else S=FAILURE; R="The install failed: open the installer log (CloudWatch, /aws/codebuild/${CODEBUILD_BUILD_ID%%:*})"; fi
                     curl -fsS -X PUT -H 'Content-Type:' --data-binary "{\"Status\":\"$S\",\"Reason\":\"$R\",\"UniqueId\":\"install\",\"Data\":\"$URL\"}" "$WAIT_URL"
                   fi
 
@@ -183,22 +251,50 @@ Resources:
               - Effect: Allow
                 Action: codebuild:StartBuild
                 Resource: !GetAtt InstallerProject.Arn
+              - Effect: Allow
+                Action: [s3:PutBucketPolicy, s3:PutObject]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::coderhelm-setup-*
+                  - !Sub arn:${AWS::Partition}:s3:::coderhelm-setup-*/status.json
 
   StarterFunction:
     Type: AWS::Lambda::Function
     Properties:
-      Description: Starts the CoderHelm installer build once, when this stack is created.
+      Description: Opens the progress file to the install guide and starts the CoderHelm installer once, when this stack is created.
       Runtime: python3.12
       Handler: index.handler
       Timeout: 60
       Role: !GetAtt StarterRole.Arn
       Code:
         ZipFile: |
-          import boto3, cfnresponse
+          import json, time, boto3, cfnresponse
+
+          def public_status(bucket, p):
+              """Lets anyone read status.json (only that file). Account-wide
+              Block Public Access may refuse it: the guide then asks for the
+              URL from this stack's Outputs instead, and the install goes on."""
+              s3 = boto3.client("s3")
+              try:
+                  s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({
+                      "Version": "2012-10-17",
+                      "Statement": [{"Sid": "InstallGuideReadsProgress", "Effect": "Allow", "Principal": "*",
+                                     "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket}/status.json"}]}))
+              except Exception as e:
+                  print("progress file stays private:", e)
+              s3.put_object(Bucket=bucket, Key="status.json", ContentType="application/json", CacheControl="no-store",
+                            Body=json.dumps({"schema": 1, "phase": "starting", "message": "Starting the installer",
+                                             "version": p["Version"], "stage": p["Stage"], "region": p["Region"],
+                                             "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}))
+
           def handler(event, context):
               try:
                   if event["RequestType"] == "Create":
                       p = event["ResourceProperties"]
+                      if p.get("Bucket"):
+                          try:
+                              public_status(p["Bucket"], p)
+                          except Exception as e:
+                              print("progress file not written:", e)
                       boto3.client("codebuild").start_build(
                           projectName=p["Project"],
                           environmentVariablesOverride=[{"name": "WAIT_URL", "value": p["WaitUrl"], "type": "PLAINTEXT"}],
@@ -217,6 +313,10 @@ Resources:
       ServiceToken: !GetAtt StarterFunction.Arn
       Project: !Ref InstallerProject
       WaitUrl: !Ref InstallDoneHandle
+      Bucket: !If [HasStatus, !Ref StatusBucket, ""]
+      Version: !Ref Version
+      Stage: !Ref Stage
+      Region: !Ref AWS::Region
 
   InstallDone:
     Type: AWS::CloudFormation::WaitCondition
@@ -228,9 +328,13 @@ Resources:
 
 Outputs:
   CoderHelm:
-    Description: Your setup page (as {"install":"<url>"}). Sign up there with the admin email; the checklist walks you through the rest.
+    Description: Your CoderHelm (as {"install":"<url>"}). Sign up there with your email.
     Value: !GetAtt InstallDone.Data
-  NextStep:
+  InstallGuide:
+    Condition: HasStatus
+    Description: Back to the install guide, which checks every step and walks you through GitHub and models.
+    Value: !Sub "https://docs.coderhelm.com/self-host/install/?id=${StatusId}&region=${AWS::Region}&stage=${Stage}"
+  GitHubAppWithoutTheGuide:
     Description: Create your GitHub App from a computer with a browser and AWS credentials for this account.
     Value: !Sub "npx -y github:CoderHelm/coderhelm-platform pull --stage ${Stage} --region ${AWS::Region} && npx -y github:CoderHelm/coderhelm-platform github-app"
   Domain:
@@ -238,5 +342,5 @@ Outputs:
     Description: The hostname CoderHelm answers on.
     Value: !Sub "https://${Hostname}"
   InstallerLogs:
-    Description: The installer's build log.
-    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codebuild/projects/coderhelm-${Stage}-installer/history"
+    Description: The installer's log (kept after this stack is deleted).
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Fcodebuild$252F${AWS::StackName}-installer"

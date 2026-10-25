@@ -94,3 +94,27 @@ export function updaterInvokeStatement(cfg: ResolvedConfig, scope: cdk.Stack): i
     resources: [`arn:aws:lambda:${scope.region}:${scope.account}:function:${cfg.prefix}-updater`],
   });
 }
+
+/**
+ * The gateway's GitHub App manifest landing (self-hosted installs only):
+ * the switch that turns it on. Unset on the hosted deployment (404).
+ */
+export function setupEnvironment(cfg: ResolvedConfig): Record<string, string> {
+  if (cfg.layout !== "single-origin") return {};
+  return { SETUP_ENDPOINTS: "1" };
+}
+
+/**
+ * What the manifest landing may do: store the new GitHub App's keys in this
+ * install's secret (and read it). Self-hosted installs only.
+ */
+export function setupStatements(cfg: ResolvedConfig, scope: cdk.Stack): iam.PolicyStatement[] {
+  if (cfg.layout !== "single-origin") return [];
+  return [
+    new iam.PolicyStatement({
+      sid: "SetupStoresGithubAppKeys",
+      actions: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"],
+      resources: [`arn:aws:secretsmanager:${scope.region}:${scope.account}:secret:${cfg.secretName}-??????`],
+    }),
+  ];
+}

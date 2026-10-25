@@ -4,7 +4,9 @@ description: The guided install, screen by screen. About 30 minutes, most of it 
 order: 1
 ---
 
-You need an AWS account you can administer, Node.js 20 or newer and the AWS CLI v2. The guided install checks both and tells you how to fix anything missing. See [Requirements](./requirements.md).
+**No terminal?** The [install guide](https://docs.coderhelm.com/self-host/install/) installs CoderHelm from your browser: one click opens AWS with everything filled in, then it creates your GitHub App, checks model access and confirms every step against your own install. You only need to be signed in to AWS and GitHub.
+
+The rest of this page is the terminal install. You need an AWS account you can administer, Node.js 20 or newer and the AWS CLI v2. The guided install checks both and tells you how to fix anything missing. See [Requirements](./requirements.md).
 
 ```sh
 mkdir coderhelm && cd coderhelm
@@ -166,13 +168,15 @@ npx -y github:CoderHelm/coderhelm-platform init --yes \
 
 ## Launch Stack
 
-To install from the AWS console instead, create a stack from the template the release publishes:
+The [install guide](https://docs.coderhelm.com/self-host/install/) builds this link for you and follows the install. To use the template directly:
 
-- Template URL: `https://coderhelm-public.s3.amazonaws.com/cfn/coderhelm-selfhost-launch.yaml`
-- One-click link (us-east-1; change the region in the console):
-  `https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=CoderHelmInstaller&templateURL=https://coderhelm-public.s3.amazonaws.com/cfn/coderhelm-selfhost-launch.yaml`
+- Template URL, by release: `https://coderhelm-public.s3.amazonaws.com/launch/v0.7.0/coderhelm-launch.yaml` (the newest stable release is named in `https://coderhelm-public.s3.amazonaws.com/launch/latest.json`)
+- Quick-create link (replace both regions with yours):
+  `https://us-east-1.console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?stackName=coderhelm-prod&templateURL=https://coderhelm-public.s3.amazonaws.com/launch/v0.7.0/coderhelm-launch.yaml&param_AdminEmail=you@example.com`
 
-The stack asks the same questions, runs the installer in a CodeBuild project in your account, and finishes with a link to the setup page. Creating the GitHub App needs a browser, so the **NextStep** output gives the two commands to run from your computer (`pull`, then `github-app`).
+Only your email is required. Tick the box that lets the stack create IAM roles and press **Create stack**. A CodeBuild project in your account downloads the release, checks its signature and checksums, deploys every CoderHelm stack (about 20 minutes) and finishes with your URL in the stack's **Outputs**. Its log stays in CloudWatch under `/aws/codebuild/<stack name>-installer`, also if the stack is rolled back.
+
+Without the guide's setup key, create the GitHub App from your computer with the two commands in the **GitHubAppWithoutTheGuide** output (`pull`, then `github-app`).
 
 ## Check it
 
