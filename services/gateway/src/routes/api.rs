@@ -74,6 +74,7 @@ pub struct Me {
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct MeFlags {
     /// Plugins are turned on for the team.
+    #[schema(example = false)]
     pub plugins: bool,
 }
 

@@ -645,6 +645,9 @@
         "properties": {
           "plugins": {
             "description": "Plugins are turned on for the team.",
+            "examples": [
+              false
+            ],
             "type": "boolean"
           }
         },
