@@ -467,7 +467,12 @@ async fn main() -> Result<(), Error> {
                 .put(routes::brain::update_thread)
                 .delete(routes::brain::delete_thread),
         )
+        .route(
+            "/brain/threads/:thread_id/messages/:seq/feedback",
+            put(routes::brain::rate_message),
+        )
         .route("/brain/sources", get(routes::brain::sources))
+        .route("/brain/starters", get(routes::brain::starters))
         .route("/brain/token", post(routes::brain::stream_token))
         .route("/brain/attachments", post(routes::brain::create_attachment))
         .route("/plans/chat", post(routes::plans::plan_chat))

@@ -118,7 +118,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "brain_read",
-        label: "Read knowledge bases open to their role and threads shared with the team",
+        label: "Read knowledge open to their role and chats shared with the team",
         min_role: "viewer",
         handlers: &[
             "knowledge::list_bases",
@@ -126,6 +126,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "brain::list_threads",
             "brain::get_thread",
             "brain::sources",
+            "brain::starters",
         ],
     },
     Capability {
@@ -149,13 +150,14 @@ pub const CAPABILITIES: &[Capability] = &[
     // ── Members ─────────────────────────────────────────────────────
     Capability {
         key: "brain_ask",
-        label: "Ask the company brain, attach files to a question, and rename, share or delete their own threads",
+        label: "Ask questions in Chat, attach files, rate answers, and rename, share or delete their own chats",
         min_role: "member",
         handlers: &[
             "brain::stream_token",
             "brain::create_attachment",
             "brain::update_thread",
             "brain::delete_thread",
+            "brain::rate_message",
         ],
     },
     Capability {
@@ -1237,6 +1239,74 @@ mod tests {
         assert!(Holder::builtin("admin").holds("support"));
     }
 
+    /// The chat is called Chat and its sources Knowledge. The old product
+    /// name stays only in identifiers (routes, keys, module names), never in
+    /// words people read: capability labels, messages, the model's own name
+    /// for itself, or the public API document.
+    #[test]
+    fn the_old_chat_name_is_never_in_words_people_read() {
+        // Built from parts so this test's own source doesn't trip it.
+        let word = format!("{}{}", "bra", "in");
+        let re = regex::Regex::new(&format!(
+            r"(?i)(^|[^A-Za-z0-9_/#:\-]){word}([^A-Za-z0-9_/#:\-]|$)"
+        ))
+        .unwrap();
+        for c in CAPABILITIES {
+            assert!(
+                !re.is_match(c.label),
+                "capability {} label: {}",
+                c.key,
+                c.label
+            );
+        }
+        let literal = regex::Regex::new(r#""((?:[^"\\]|\\.)*)""#).unwrap();
+        let sources: &[(&str, &str)] = &[
+            ("permissions.rs", include_str!("permissions.rs")),
+            ("routes/brain.rs", include_str!("routes/brain.rs")),
+            ("routes/knowledge.rs", include_str!("routes/knowledge.rs")),
+            (
+                "routes/chat_policy.rs",
+                include_str!("routes/chat_policy.rs"),
+            ),
+            ("openapi.rs", include_str!("openapi.rs")),
+            (
+                "common agent_policy/model.rs",
+                include_str!("../../common/src/agent_policy/model.rs"),
+            ),
+            (
+                "common knowledge/answer.rs",
+                include_str!("../../common/src/knowledge/answer.rs"),
+            ),
+        ];
+        let mut found = Vec::new();
+        for (file, src) in sources {
+            for (n, line) in src.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for m in literal.captures_iter(line) {
+                    let text = &m[1];
+                    // A bare key (the usage feature) or a source file name is an identifier.
+                    if text.eq_ignore_ascii_case(&word) || text.ends_with(".rs") {
+                        continue;
+                    }
+                    if re.is_match(text) {
+                        found.push(format!("{file}:{}: {text}", n + 1));
+                    }
+                }
+            }
+        }
+        let doc = include_str!("../../../docs/api/openapi.json");
+        if re.is_match(doc) {
+            found.push("docs/api/openapi.json".into());
+        }
+        assert!(
+            found.is_empty(),
+            "say Chat or Knowledge instead:\n{}",
+            found.join("\n")
+        );
+    }
+
     #[test]
     fn brain_and_knowledge_routes_are_decided_by_their_capabilities() {
         let route = |m: &str, p: &str| routed_handler(m, p);
@@ -1250,6 +1320,24 @@ mod tests {
             route("PUT", "/brain/threads/:thread_id"),
             Some("brain::update_thread")
         );
+        assert_eq!(route("GET", "/brain/starters"), Some("brain::starters"));
+        assert_eq!(
+            route("PUT", "/brain/threads/:thread_id/messages/:seq/feedback"),
+            Some("brain::rate_message")
+        );
+        assert_eq!(
+            resolve_access(&Holder::builtin("viewer"), route("GET", "/brain/starters")),
+            Access::Allow {
+                effective_role: "viewer"
+            }
+        );
+        assert!(matches!(
+            resolve_access(
+                &Holder::builtin("viewer"),
+                route("PUT", "/brain/threads/:thread_id/messages/:seq/feedback")
+            ),
+            Access::Deny { .. }
+        ));
         // A custom role can hold the brain capabilities, and only those it holds.
         let asker = custom(&["brain_ask"]);
         assert_eq!(
