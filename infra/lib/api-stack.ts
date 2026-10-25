@@ -644,6 +644,20 @@ export class ApiStack extends cdk.Stack {
       integration: lambdaIntegration,
     });
 
+    // CI uploads and the quarantine list, signed with a GitHub Actions OIDC token
+    httpApi.addRoutes({
+      path: "/webhooks/ci/{proxy+}",
+      methods: [apigatewayv2.HttpMethod.GET, apigatewayv2.HttpMethod.POST],
+      integration: lambdaIntegration,
+    });
+
+    // The public API's OpenAPI document (public, no credentials)
+    httpApi.addRoutes({
+      path: "/openapi.json",
+      methods: [apigatewayv2.HttpMethod.GET],
+      integration: lambdaIntegration,
+    });
+
     httpApi.addRoutes({
       path: "/integrations/jira/forge-register",
       methods: [apigatewayv2.HttpMethod.POST],

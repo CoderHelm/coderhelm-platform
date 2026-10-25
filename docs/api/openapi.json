@@ -36,6 +36,9 @@
         "properties": {
           "description": {
             "description": "More about it, in Markdown.",
+            "examples": [
+              "Brute-force attempts are showing up in the auth logs."
+            ],
             "type": [
               "string",
               "null"
@@ -54,6 +57,9 @@
           },
           "repo": {
             "description": "The repository its tasks work in, `owner/name`, unless a task names its own.",
+            "examples": [
+              "acme/web"
+            ],
             "type": [
               "string",
               "null"
@@ -61,6 +67,15 @@
           },
           "tasks": {
             "description": "The plan's tasks, in order. Each starts as `draft`.",
+            "examples": [
+              [
+                {
+                  "acceptance_criteria": "The 11th attempt within 15 minutes gets 429 and a Retry-After header.",
+                  "description": "Allow 10 attempts per IP per 15 minutes; answer 429 after that.",
+                  "title": "Limit login attempts per IP"
+                }
+              ]
+            ],
             "items": {
               "$ref": "#/components/schemas/NewPlanTask"
             },
@@ -71,6 +86,9 @@
           },
           "title": {
             "description": "What the plan is for. 1 to 500 characters.",
+            "examples": [
+              "Rate-limit the login form"
+            ],
             "type": "string"
           }
         },
@@ -100,10 +118,16 @@
         "properties": {
           "id": {
             "description": "The role's id.",
+            "examples": [
+              "01JB7Z2R4T6V8X0Z2B4D6F8H0K"
+            ],
             "type": "string"
           },
           "name": {
             "description": "The role's name, as the team page shows it.",
+            "examples": [
+              "Release manager"
+            ],
             "type": "string"
           }
         },
@@ -125,14 +149,23 @@
         "properties": {
           "code": {
             "description": "What went wrong, for programs. One of: `bad_request`,\n`invalid_api_key`, `api_key_revoked`, `api_key_expired`,\n`api_key_owner_left`, `unauthorized`, `forbidden`, `missing_scope`,\n`not_available_to_api_keys`, `not_found`, `conflict`,\n`payload_too_large`, `rate_limited`, `token_limit_reached`,\n`internal_error`, `unavailable`. New codes may be added.",
+            "examples": [
+              "missing_scope"
+            ],
             "type": "string"
           },
           "error": {
             "description": "A sentence to show a person.",
+            "examples": [
+              "This API key doesn't have the \"runs\" scope (Retry, re-run, re-review, cancel, close or reopen runs)."
+            ],
             "type": "string"
           },
           "scope": {
             "description": "With `missing_scope`: the scope the key would need.",
+            "examples": [
+              "runs"
+            ],
             "type": [
               "string",
               "null"
@@ -142,6 +175,117 @@
         "required": [
           "error",
           "code"
+        ],
+        "type": "object"
+      },
+      "JiraComment": {
+        "description": "The comment in a Jira comment event.",
+        "properties": {
+          "author": {
+            "$ref": "#/components/schemas/JiraUser"
+          },
+          "body": {
+            "description": "What the comment says. It is sent to the run as feedback.",
+            "examples": [
+              "Please cover the signup form too."
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "body",
+          "author"
+        ],
+        "type": "object"
+      },
+      "JiraIssue": {
+        "description": "The issue in a Jira event (the fields CoderHelm reads).",
+        "properties": {
+          "fields": {
+            "$ref": "#/components/schemas/JiraIssueFields"
+          },
+          "key": {
+            "description": "The issue key.",
+            "examples": [
+              "WEB-42"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "fields"
+        ],
+        "type": "object"
+      },
+      "JiraIssueFields": {
+        "description": "The issue fields CoderHelm reads.",
+        "properties": {
+          "assignee": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JiraUser",
+                "description": "Who the issue is assigned to."
+              }
+            ]
+          },
+          "description": {
+            "description": "The body. The coder reads it as the ticket.",
+            "examples": [
+              "Brute-force attempts are showing up in the auth logs. Limit attempts per IP."
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "labels": {
+            "description": "Labels. `coderhelm`, or one starting `coderhelm:`, starts a run.",
+            "examples": [
+              [
+                "coderhelm"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "project": {
+            "$ref": "#/components/schemas/JiraProject",
+            "description": "The project. It must be switched on for the team."
+          },
+          "summary": {
+            "description": "The title. It becomes the run's title.",
+            "examples": [
+              "Add rate limiting to the login form"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "labels",
+          "project"
+        ],
+        "type": "object"
+      },
+      "JiraProject": {
+        "description": "A Jira project.",
+        "properties": {
+          "key": {
+            "description": "The project key.",
+            "examples": [
+              "WEB"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
         ],
         "type": "object"
       },
@@ -166,6 +310,22 @@
         "required": [
           "repo_owner",
           "repo_name"
+        ],
+        "type": "object"
+      },
+      "JiraUser": {
+        "description": "A Jira user.",
+        "properties": {
+          "displayName": {
+            "description": "The user's name. An issue assigned to a user whose name contains\n\"CoderHelm\" starts a run.",
+            "examples": [
+              "Dana Developer"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "displayName"
         ],
         "type": "object"
       },
@@ -202,15 +362,19 @@
             ]
           },
           "comment": {
-            "description": "For comment events: the comment, with `body` and `author`.",
-            "type": [
-              "object",
-              "null"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JiraComment",
+                "description": "For comment events: the comment."
+              }
             ]
           },
           "issue": {
-            "description": "The issue, with `key` and `fields` (summary, description, labels,\nassignee, project). A run starts when the issue has the label\n`coderhelm` (or one starting `coderhelm:`), or is assigned to a user\nwhose name contains \"CoderHelm\", in a project the team switched on.",
-            "type": "object"
+            "$ref": "#/components/schemas/JiraIssue",
+            "description": "The issue. A run starts when it has the label `coderhelm` (or one\nstarting `coderhelm:`), or is assigned to a user whose name contains\n\"CoderHelm\", in a project the team switched on."
           },
           "webhookEvent": {
             "description": "The event, such as `jira:issue_created`, `jira:issue_updated` or\n`comment_created`. An event whose name contains `comment` retries a\nfailed run or sends feedback to an open pull request; other issue\nevents can start a run.",
@@ -249,6 +413,9 @@
           },
           "avatar_url": {
             "description": "The person's picture. Always null for an API key.",
+            "examples": [
+              "https://avatars.githubusercontent.com/u/583231"
+            ],
             "type": [
               "string",
               "null"
@@ -300,10 +467,16 @@
           },
           "mfa_enabled": {
             "description": "Whether the person turned on two-factor sign-in.",
+            "examples": [
+              false
+            ],
             "type": "boolean"
           },
           "platform_admin": {
             "description": "Whether the caller administers the whole CoderHelm install (its\noperators, set in the install's configuration). Always false for an\nAPI key.",
+            "examples": [
+              false
+            ],
             "type": "boolean"
           },
           "role": {
@@ -404,6 +577,9 @@
         "properties": {
           "acceptance_criteria": {
             "description": "How to tell it is done.",
+            "examples": [
+              "The 11th attempt within 15 minutes gets 429 and a Retry-After header."
+            ],
             "type": [
               "string",
               "null"
@@ -411,6 +587,9 @@
           },
           "description": {
             "description": "How, in Markdown. The coder reads it as the ticket body.",
+            "examples": [
+              "Allow 10 attempts per IP per 15 minutes; answer 429 after that."
+            ],
             "type": [
               "string",
               "null"
@@ -429,6 +608,9 @@
           },
           "jira_project": {
             "description": "With `jira`: the Jira project key to file the ticket in.",
+            "examples": [
+              "WEB"
+            ],
             "type": [
               "string",
               "null"
@@ -436,6 +618,9 @@
           },
           "repo": {
             "description": "The repository for this task, `owner/name`, when not the plan's.",
+            "examples": [
+              "acme/web"
+            ],
             "type": [
               "string",
               "null"
@@ -443,6 +628,9 @@
           },
           "title": {
             "description": "What to do. Defaults to \"Untitled task\".",
+            "examples": [
+              "Limit login attempts per IP"
+            ],
             "type": [
               "string",
               "null"
@@ -456,6 +644,9 @@
         "properties": {
           "chat_id": {
             "description": "The plan chat it came from.",
+            "examples": [
+              "01JB8TZ6C8E0G2J4L6N8Q0S2U4"
+            ],
             "type": [
               "string",
               "null"
@@ -473,6 +664,9 @@
           },
           "description": {
             "description": "More about it, in Markdown.",
+            "examples": [
+              "Brute-force attempts are showing up in the auth logs."
+            ],
             "type": [
               "string",
               "null"
@@ -490,6 +684,9 @@
           },
           "executed_at": {
             "description": "When it started running (RFC 3339).",
+            "examples": [
+              "2026-10-22T13:55:00+00:00"
+            ],
             "type": [
               "string",
               "null"
@@ -497,6 +694,9 @@
           },
           "executed_by": {
             "description": "Who started it running.",
+            "examples": [
+              "octocat"
+            ],
             "type": [
               "string",
               "null"
@@ -504,6 +704,11 @@
           },
           "mcp_servers": {
             "description": "MCP servers used while planning.",
+            "examples": [
+              [
+                "docs-search"
+              ]
+            ],
             "items": {
               "type": "string"
             },
@@ -563,6 +768,9 @@
           },
           "tokens_in": {
             "description": "Input tokens its runs used so far.",
+            "examples": [
+              412300
+            ],
             "format": "int64",
             "minimum": 0,
             "type": [
@@ -572,6 +780,9 @@
           },
           "tokens_out": {
             "description": "Output tokens its runs used so far.",
+            "examples": [
+              38120
+            ],
             "format": "int64",
             "minimum": 0,
             "type": [
@@ -581,6 +792,9 @@
           },
           "updated_at": {
             "description": "When it last changed (RFC 3339).",
+            "examples": [
+              "2026-10-22T13:55:00+00:00"
+            ],
             "type": [
               "string",
               "null"
@@ -630,6 +844,9 @@
         "properties": {
           "acceptance_criteria": {
             "description": "How to tell it is done.",
+            "examples": [
+              "The 11th attempt within 15 minutes gets 429 and a Retry-After header."
+            ],
             "type": [
               "string",
               "null"
@@ -637,6 +854,9 @@
           },
           "approved_at": {
             "description": "When it was approved (RFC 3339).",
+            "examples": [
+              "2026-10-22T13:54:10+00:00"
+            ],
             "type": [
               "string",
               "null"
@@ -644,6 +864,9 @@
           },
           "approved_by": {
             "description": "Who approved it.",
+            "examples": [
+              "octocat"
+            ],
             "type": [
               "string",
               "null"
@@ -651,6 +874,9 @@
           },
           "created_at": {
             "description": "When it was made (RFC 3339).",
+            "examples": [
+              "2026-10-22T13:40:00+00:00"
+            ],
             "type": [
               "string",
               "null"
@@ -658,6 +884,9 @@
           },
           "depends_on": {
             "description": "The task it waits for, when it depends on one.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -665,6 +894,9 @@
           },
           "description": {
             "description": "How, in Markdown.",
+            "examples": [
+              "Allow 10 attempts per IP per 15 minutes; answer 429 after that."
+            ],
             "type": [
               "string",
               "null"
@@ -672,6 +904,9 @@
           },
           "destination": {
             "description": "`github` or `jira`.",
+            "examples": [
+              "github"
+            ],
             "type": [
               "string",
               "null"
@@ -679,6 +914,9 @@
           },
           "issue_number": {
             "description": "The GitHub issue it became.",
+            "examples": [
+              412
+            ],
             "format": "int64",
             "minimum": 0,
             "type": [
@@ -688,6 +926,9 @@
           },
           "issue_url": {
             "description": "That issue's address.",
+            "examples": [
+              "https://github.com/acme/web/issues/412"
+            ],
             "type": [
               "string",
               "null"
@@ -695,6 +936,9 @@
           },
           "jira_project": {
             "description": "The Jira project it is filed in.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -702,6 +946,9 @@
           },
           "jira_ticket_key": {
             "description": "The Jira ticket it became.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -709,6 +956,9 @@
           },
           "jira_ticket_url": {
             "description": "That ticket's address.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -725,6 +975,9 @@
           },
           "plan_id": {
             "description": "The plan it belongs to.",
+            "examples": [
+              "01JB8V0K3M5P7R9T1W3Y5A7C9E"
+            ],
             "type": [
               "string",
               "null"
@@ -732,6 +985,9 @@
           },
           "pr_url": {
             "description": "The pull request that run opened.",
+            "examples": [
+              "https://github.com/acme/web/pull/318"
+            ],
             "type": [
               "string",
               "null"
@@ -739,6 +995,9 @@
           },
           "rejected_at": {
             "description": "When it was rejected (RFC 3339).",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -746,6 +1005,9 @@
           },
           "rejected_by": {
             "description": "Who rejected it.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -753,6 +1015,9 @@
           },
           "repo": {
             "description": "Its repository, when not the plan's.",
+            "examples": [
+              "acme/web"
+            ],
             "type": [
               "string",
               "null"
@@ -843,6 +1108,9 @@
           "next_cursor": {
             "deprecated": true,
             "description": "The same as `next`, kept for older clients.",
+            "examples": [
+              "PLAN#01JB8V0K3M5P7R9T1W3Y5A7C9E"
+            ],
             "type": [
               "string",
               "null"
@@ -904,10 +1172,16 @@
           },
           "id": {
             "description": "CoderHelm's id for the test.",
+            "examples": [
+              "e2e/checkout.spec.ts::checkout › applies a discount code"
+            ],
             "type": "string"
           },
           "project": {
             "description": "The Playwright project, when there is one.",
+            "examples": [
+              "chromium"
+            ],
             "type": [
               "string",
               "null"
@@ -934,6 +1208,9 @@
         "properties": {
           "at": {
             "description": "When (RFC 3339).",
+            "examples": [
+              "2026-10-22T15:01:44+00:00"
+            ],
             "type": "string"
           },
           "by": {
@@ -988,6 +1265,9 @@
           },
           "onboard_error": {
             "description": "Why reading it failed, when it did.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1050,10 +1330,18 @@
         "properties": {
           "action_summary": {
             "description": "What the reviewer did besides reviewing, such as arming auto-merge.",
+            "examples": [
+              "Requested changes; auto-merge stays off until they are fixed."
+            ],
             "type": "string"
           },
           "applied_standards": {
             "description": "The team standards the review was given in full (\"always apply\").",
+            "examples": [
+              [
+                "api-error-format"
+              ]
+            ],
             "items": {
               "type": "string"
             },
@@ -1061,6 +1349,9 @@
           },
           "body": {
             "description": "The review as posted, in Markdown. Cut to about 4,000 characters in a list.",
+            "examples": [
+              "**Request changes.** The attempt counter is never reset after a successful login, so a user who mistypes their password nine times is locked out on their next good attempt."
+            ],
             "type": "string"
           },
           "created_at": {
@@ -1072,6 +1363,23 @@
           },
           "findings": {
             "description": "The structured findings. Null in a list (get the review for them) and\non older reviews.",
+            "examples": [
+              [
+                {
+                  "blocks": false,
+                  "body": "After a good password the counter for the IP stays where it was.",
+                  "category": "bug",
+                  "end_line": 44,
+                  "evidence": "verified-defect",
+                  "file": "src/auth/login.ts",
+                  "line": 42,
+                  "lookups": [],
+                  "severity": "high",
+                  "suggestion": "attempts.delete(ip);",
+                  "title": "The attempt counter is never reset after a successful login"
+                }
+              ]
+            ],
             "items": {
               "$ref": "#/components/schemas/ReviewFinding"
             },
@@ -1140,12 +1448,18 @@
           },
           "thumbs_down": {
             "description": "Thumbs down from the team.",
+            "examples": [
+              0
+            ],
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
           "thumbs_up": {
             "description": "Thumbs up from the team.",
+            "examples": [
+              2
+            ],
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -1190,6 +1504,9 @@
         "properties": {
           "blocks": {
             "description": "For a question: whether the change's correctness depends on the answer.",
+            "examples": [
+              false
+            ],
             "type": [
               "boolean",
               "null"
@@ -1197,6 +1514,9 @@
           },
           "body": {
             "description": "The explanation, in Markdown.",
+            "examples": [
+              "After a good password the counter for the IP stays where it was, so the next mistake can lock the person out."
+            ],
             "type": "string"
           },
           "category": {
@@ -1208,6 +1528,9 @@
           },
           "end_line": {
             "description": "The last line, when it spans several.",
+            "examples": [
+              44
+            ],
             "format": "int64",
             "minimum": 0,
             "type": [
@@ -1243,6 +1566,9 @@
           },
           "lookups": {
             "description": "The lookups the finding rests on.",
+            "examples": [
+              []
+            ],
             "items": {
               "type": "string"
             },
@@ -1257,6 +1583,9 @@
           },
           "suggestion": {
             "description": "Replacement text for the line(s), when there is a concrete fix.",
+            "examples": [
+              "attempts.delete(ip);"
+            ],
             "type": [
               "string",
               "null"
@@ -1286,6 +1615,9 @@
         "properties": {
           "next": {
             "description": "Pass as `cursor` to read the next page; null on the last page.",
+            "examples": [
+              "1729605605|REVIEW#acme/web#318#2026-10-22T14:20:05Z"
+            ],
             "type": [
               "string",
               "null"
@@ -1309,6 +1641,11 @@
         "properties": {
           "applied_standards": {
             "description": "The team standards the run was given in full (\"always apply\").",
+            "examples": [
+              [
+                "api-error-format"
+              ]
+            ],
             "items": {
               "type": "string"
             },
@@ -1326,6 +1663,11 @@
           },
           "branches": {
             "description": "Their branches, in the same order.",
+            "examples": [
+              [
+                "coderhelm/web-42-login-rate-limit"
+              ]
+            ],
             "items": {
               "type": "string"
             },
@@ -1354,6 +1696,9 @@
           },
           "close_reason": {
             "description": "Why it was closed.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1361,6 +1706,9 @@
           },
           "closed_at": {
             "description": "When it was closed (RFC 3339).",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1368,6 +1716,9 @@
           },
           "closed_by": {
             "description": "Who closed the run on purpose.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1375,6 +1726,9 @@
           },
           "closed_from": {
             "description": "The status it had when it was closed.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1422,6 +1776,9 @@
           },
           "error": {
             "description": "Why the run failed, when it did.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1445,6 +1802,9 @@
           },
           "fix_location": {
             "description": "Where the fix belongs: `code`, or somewhere outside the code.",
+            "examples": [
+              "code"
+            ],
             "type": [
               "string",
               "null"
@@ -1452,6 +1812,9 @@
           },
           "lesson": {
             "description": "A lesson recorded for the repository when the fix was elsewhere.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1459,6 +1822,9 @@
           },
           "mcp_servers": {
             "description": "The MCP servers the run used.",
+            "examples": [
+              []
+            ],
             "items": {
               "type": "string"
             },
@@ -1469,6 +1835,9 @@
           },
           "outside_change_report": {
             "description": "The report written when (part of) the fix is a change outside the code.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1476,6 +1845,22 @@
           },
           "pass_history": {
             "description": "The steps it went through, in order.",
+            "examples": [
+              [
+                {
+                  "pass": "triage",
+                  "started_at": "2026-10-22T14:03:11Z"
+                },
+                {
+                  "pass": "implement",
+                  "started_at": "2026-10-22T14:05:40Z"
+                },
+                {
+                  "pass": "pr",
+                  "started_at": "2026-10-22T14:14:50Z"
+                }
+              ]
+            ],
             "items": {
               "$ref": "#/components/schemas/RunPass"
             },
@@ -1498,6 +1883,11 @@
           },
           "pr_numbers": {
             "description": "Their numbers, in the same order.",
+            "examples": [
+              [
+                318
+              ]
+            ],
             "items": {
               "format": "int64",
               "minimum": 0,
@@ -1520,6 +1910,11 @@
           },
           "pr_urls": {
             "description": "Every pull request, when the work spans several repositories.",
+            "examples": [
+              [
+                "https://github.com/acme/web/pull/318"
+              ]
+            ],
             "items": {
               "type": "string"
             },
@@ -1530,6 +1925,14 @@
           },
           "progress_notes": {
             "description": "Notes it wrote while working, in order.",
+            "examples": [
+              [
+                {
+                  "message": "Tests pass; opening the pull request.",
+                  "timestamp": "2026-10-22T14:15:02Z"
+                }
+              ]
+            ],
             "items": {
               "$ref": "#/components/schemas/RunNote"
             },
@@ -1903,26 +2306,44 @@
         "properties": {
           "Message": {
             "description": "The message: a CloudWatch alarm, an AWS Chatbot custom notification,\nan EventBridge event (as JSON text) or plain text.",
+            "examples": [
+              "{\"AlarmName\":\"api-5xx\",\"NewStateValue\":\"ALARM\"}"
+            ],
             "type": "string"
           },
           "MessageId": {
             "description": "SNS's id for the message.",
+            "examples": [
+              "6c3f7c6e-2f4b-5b8e-9b0e-1f0a2b3c4d5e"
+            ],
             "type": "string"
           },
           "Signature": {
             "description": "SNS's signature over the message's fields.",
+            "examples": [
+              "EXAMPLEpH+DcEwjAPg8O9mY8dReBSwksfg2S7WKQcikcNKWLQjwu6A4VbeS0QHVCkhRS7fUQvi2egU3N858fiTDN6bkkOxYDVrY0Ad8L10Hs3zH81mtnPk5uvvolIC1CXGu43obcgFxeL3khZl8IKvO61GWB6jI9b5+gLPoBc1Q="
+            ],
             "type": "string"
           },
           "SignatureVersion": {
             "description": "`1` (SHA1) or `2` (SHA256).",
+            "examples": [
+              "2"
+            ],
             "type": "string"
           },
           "SigningCertURL": {
             "description": "The certificate that signed it; must be served by SNS.",
+            "examples": [
+              "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-0000000000000000000000.pem"
+            ],
             "type": "string"
           },
           "Subject": {
             "description": "The subject, when the publisher set one.",
+            "examples": [
+              "ALARM: \"api-5xx\" in US East (N. Virginia)"
+            ],
             "type": [
               "string",
               "null"
@@ -1930,6 +2351,9 @@
           },
           "SubscribeURL": {
             "description": "For a subscription confirmation: the address CoderHelm visits to confirm.",
+            "examples": [
+              null
+            ],
             "type": [
               "string",
               "null"
@@ -1937,10 +2361,16 @@
           },
           "Timestamp": {
             "description": "When SNS sent it.",
+            "examples": [
+              "2026-10-22T14:00:00.000Z"
+            ],
             "type": "string"
           },
           "TopicArn": {
             "description": "The topic. It must have an enabled alert route in the dashboard.",
+            "examples": [
+              "arn:aws:sns:us-east-1:123456789012:prod-alarms"
+            ],
             "type": "string"
           },
           "Type": {
@@ -2010,6 +2440,9 @@
           },
           "limit_counts_cache": {
             "description": "Whether the older single limit counts cache tokens (kept for older clients).",
+            "examples": [
+              false
+            ],
             "type": "boolean"
           },
           "limits": {
@@ -2021,6 +2454,9 @@
           },
           "limits_legacy": {
             "description": "True when the limits were read from the older single-limit setting.",
+            "examples": [
+              false
+            ],
             "type": "boolean"
           },
           "max_tokens": {
