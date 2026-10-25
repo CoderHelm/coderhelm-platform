@@ -53,6 +53,10 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("github__read_file", Risk::Read),
     ("github__search_code", Risk::Read),
     ("github__list_directory", Risk::Read),
+    // Chat's code tools (gateway/src/routes/chat_code.rs).
+    ("github__list_repos", Risk::Read),
+    ("github__repo_overview", Risk::Read),
+    ("github__list_files", Risk::Read),
     ("graph_definition", Risk::Read),
     ("graph_callers", Risk::Read),
     ("graph_impact", Risk::Read),

@@ -55,6 +55,8 @@ pub mod embed;
 /// Knowledge bases: files a team uploads, read into cited passages that the
 /// brain chat and the team's agents search.
 pub mod knowledge;
+// Reading the team's repositories for Chat (overview, files, search).
+pub mod repo_read;
 // The test that every model call site is a metered helper
 #[cfg(test)]
 mod model_call_sites;
