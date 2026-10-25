@@ -6,6 +6,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+license = "FSL-1.1-ALv2"
+
 # Shared release profile — optimises binary size (Lambda cold start) and build speed.
 [profile.release]
 opt-level = 3

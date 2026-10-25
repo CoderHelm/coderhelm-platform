@@ -2,7 +2,7 @@
   "name": "coderhelm-selfhost",
   "version": "0.1.0",
   "description": "Install, upgrade and check CoderHelm in your own AWS account",
-  "license": "UNLICENSED",
+  "license": "FSL-1.1-ALv2",
   "type": "module",
   "bin": {
     "coderhelm-selfhost": "bin/coderhelm.mjs",

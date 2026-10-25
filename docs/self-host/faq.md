@@ -29,7 +29,7 @@ AWS usage plus model calls. See [Requirements](./requirements.md#what-it-costs).
 `npx -y github:CoderHelm/coderhelm-platform uninstall` deletes the stacks. With `retainData` (the default), tables, the data bucket, KMS keys, the user pool and the secret stay until you delete them. Uninstall your GitHub App from GitHub too.
 
 **What license is the code under?**
-The repositories are public so you can read, review and deploy the code. Check the repository for its license terms before using it in production; there is no separate self-host license key or license check in the code.
+FSL-1.1-ALv2, the Functional Source License with Apache 2.0 as the future license. You can run, change and self-host CoderHelm for your own company; you can't offer it as a competing hosted product; each release becomes Apache 2.0 two years after it ships. There is no license key or license check in the code. The full terms are in [LICENSE.md](../../LICENSE.md).
 
 **Where do I get help?**
 Open an issue on [CoderHelm/coderhelm-platform](https://github.com/CoderHelm/coderhelm-platform/issues) with the output of `health` (it contains no secrets).

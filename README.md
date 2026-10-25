@@ -110,3 +110,13 @@ Sensitive values are in **AWS Secrets Manager** at `coderhelm/<stage>/secrets`, 
 `.github/workflows/deploy.yml` deploys `main` to the hosted account (batched every 10 minutes), with `infra/config/hosted.prod.json`.
 
 A `vX.Y.Z` tag runs `.github/workflows/release.yml`, which publishes a self-host release: prebuilt Lambda zips, the dashboard, the source, the installer, `install.sh` and the Launch Stack template, with checksums and build provenance.
+
+## License
+
+CoderHelm is licensed under the [Functional Source License, Version 1.1, with Apache 2.0 as the future license](LICENSE.md) (FSL-1.1-ALv2). In plain words:
+
+- You can run it, change it and self-host it for your own company.
+- You can't offer it, or something built from it, as a competing hosted product.
+- Each release becomes Apache 2.0 two years after it ships.
+
+The full terms are in [LICENSE.md](LICENSE.md).

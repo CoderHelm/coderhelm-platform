@@ -37,3 +37,13 @@ CoderHelm runs entirely on AWS serverless services: Lambda, API Gateway, SQS, Dy
 11. [Security model](./security.md)
 12. [Troubleshooting](./troubleshooting.md)
 13. [FAQ](./faq.md)
+
+## License
+
+CoderHelm is licensed under the [Functional Source License, Version 1.1, with Apache 2.0 as the future license](../../LICENSE.md) (FSL-1.1-ALv2). In plain words:
+
+- You can run it, change it and self-host it for your own company.
+- You can't offer it, or something built from it, as a competing hosted product.
+- Each release becomes Apache 2.0 two years after it ships.
+
+The full terms are in [LICENSE.md](../../LICENSE.md).
