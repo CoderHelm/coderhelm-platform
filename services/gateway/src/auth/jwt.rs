@@ -54,6 +54,9 @@ pub fn create_scoped_token(
         exp: now + ttl_secs,
         support_view: None,
         custom: None,
+        // A scoped token is minted from a signed-in session; it never
+        // carries an API key, which only reaches the public routes.
+        api_key: None,
     };
     encode(
         &Header::default(),
