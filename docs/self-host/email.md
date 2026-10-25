@@ -11,13 +11,13 @@ CoderHelm sends run results, invites, token limit warnings, the weekly summary a
 The deploy creates an SES identity for `email.identity` (by default the domain of `email.from`):
 
 - **A domain in the same Route 53 zone as your CoderHelm domain:** its DKIM records are created for you, and it verifies in a few minutes.
-- **Any other domain:** SES shows three DKIM CNAME records in the console (**SES → Identities → your domain**). Add them at your DNS provider.
+- **Any other domain:** SES shows three DKIM CNAME records in the console (**SES, Identities, your domain**). Add them at your DNS provider.
 - **One address** (`"identity": "coderhelm@example.com"`): SES emails it a confirmation link. Good for trying CoderHelm out.
 - **null:** you manage the identity yourself.
 
 ## Leaving the SES sandbox
 
-New AWS accounts are in the SES sandbox: email only reaches verified addresses, at most 200 a day. Request production access in the SES console (**Account dashboard → Request production access**), saying CoderHelm sends transactional email to your own team. `coderhelm-selfhost health` tells you which mode you are in.
+New AWS accounts are in the SES sandbox: email only reaches verified addresses, at most 200 a day. Request production access in the SES console (**Account dashboard, Request production access**), saying CoderHelm sends transactional email to your own team. The doctor (`coderhelm-selfhost doctor`) and **Settings, then Setup** tell you which mode you are in and print the DKIM records to add.
 
 ## Sign-up and password emails
 

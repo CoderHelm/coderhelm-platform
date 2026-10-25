@@ -12,7 +12,7 @@ CoderHelm uses Claude for every run, review, plan chat and log analysis. You pic
 "models": { "provider": "anthropic" }
 ```
 
-Each team adds its own Anthropic API key in **Settings → Model Provider**, and picks its models there. Calls go from your Lambda functions straight to `api.anthropic.com`; the key is stored on the team's settings item in your DynamoDB table (encrypted with your KMS key) and is never sent anywhere else.
+Each team adds its own Anthropic API key in **Settings, AI models**, and picks its models there. Calls go from your Lambda functions straight to `api.anthropic.com`; the key is stored on the team's settings item in your DynamoDB table (encrypted with your KMS key) and is never sent anywhere else.
 
 ## Amazon Bedrock
 
@@ -43,7 +43,7 @@ The gateway, streaming, worker and log analyzer functions call Bedrock with thei
 
 **What the roles may call:** `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on Anthropic foundation models and your account's inference profiles, nothing else.
 
-With Bedrock, the **Settings → Model Provider** page says the install uses Bedrock and no key is needed; teams can still choose which models they use.
+With Bedrock, the **Settings, AI models** page says the install uses Bedrock and no key is needed; teams can still choose which models they use.
 
 ## Which to choose
 
@@ -51,7 +51,7 @@ With Bedrock, the **Settings → Model Provider** page says the install uses Bed
 |---|---|---|
 | Keys | One per team | None |
 | Billing | Each team's Anthropic account | Your AWS bill |
-| Data path | Your AWS → Anthropic | Stays in AWS |
+| Data path | Your AWS, then Anthropic | Stays in AWS |
 | New models | Available on release day | When Bedrock adds them in your region |
 | Setup | Nothing at deploy | Enable model access first |
 

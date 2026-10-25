@@ -383,6 +383,9 @@ def handle(event, env, store, now, fetch=fetch_releases):
             "update_available": latest is not None,
             "settings": settings,
             "running": running(state, now),
+            # Releases whose last try failed or rolled back: the dashboard's
+            # update preflight shows them with the reason from history.
+            "failed_versions": sorted(state.get("failed_versions") or []),
             "history": store.history(),
         }
 

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { checkPrereqs } from "./prereqs.mjs";
-import { fetchRelease, latestVersion, releasePaths, verifySignature } from "./release.mjs";
+import { fetchRelease, latestVersion, releasePaths, releasesDir, verifySignature } from "./release.mjs";
 import { openBrowser } from "./github-app.mjs";
 import { ensureSecret, hasGithubApp, mergeSecret, readSecret } from "./secrets.mjs";
 import { runManifestFlow, secretKeysFromApp } from "./github-app.mjs";
@@ -161,8 +161,8 @@ export async function deploy(ctx) {
   await telemetryPing(ctx, cfg, next, state.version ? "upgrade" : "install");
 
   if (!flags.quiet) {
-    log(`\nCoderHelm ${src.version} is running at ${publicUrl}`);
-    log(checklist(cfg, publicUrl, await readSecret(runner, d.secretName, cfg.region)));
+    log(`\nCoderHelm ${src.version} is deployed at ${publicUrl}`);
+    if (!flags.quietReady) log(checklist(cfg, publicUrl, await readSecret(runner, d.secretName, cfg.region)));
     if (ctx.interactive && !runner.dryRun && !publicUrl.includes("<")) (ctx.open ?? openBrowser)(`${publicUrl}/?signup=1`);
   }
   return { publicUrl, version: src.version };
@@ -180,11 +180,12 @@ export function checklist(cfg, url, secret) {
     "  [ ] Install the GitHub App on your repositories",
     cfg.models?.provider === "bedrock"
       ? "  [x] Models: Amazon Bedrock (no key needed)"
-      : "  [ ] Add your team's Anthropic key in Settings → AI models",
+      : "  [ ] Add your team's Anthropic key in Settings, AI models",
     "  [ ] Send a test email from the setup page (new AWS accounts start in the SES sandbox)",
-    `  ${tick(cfg.updates?.auto === true)} Auto-update ${cfg.updates?.auto ? "on" : "off (Settings → System)"}`,
+    `  ${tick(cfg.updates?.auto === true)} Auto-update ${cfg.updates?.auto ? "on" : "off (Settings, System)"}`,
     "",
     `The setup page checks each of these live: ${url}/settings/setup/`,
+    `Check everything from here: ${CHECK_CMD}`,
   ];
   return lines.join("\n");
 }
@@ -350,22 +351,32 @@ export async function update(ctx) {
     if (state.version && semverCompare(target, state.version) < 0 && !flags.rollback) {
       throw new Error(`${target} is older than ${state.version}. Use "coderhelm-selfhost rollback" to go back.`);
     }
-    log(`${flags.rollback ? "Rolling back" : "Updating"} ${state.version ?? "(unknown)"} → ${target}`);
+    log(`${flags.rollback ? "Rolling back" : "Updating"} ${state.version ?? "(unknown)"} to ${target}`);
 
+    // Preflight: what would stop the update, each with its fix, before
+    // anything is downloaded or changed.
+    log("\nBefore the update");
+    const pre = preflightProblems(loadConfig(flags), { freeBytes: ctx.freeBytes });
+    for (const p of pre) log(`  FAIL  ${p.what}\n        How to fix: ${p.fix}`);
+    if (pre.length && !flags.force) throw plainError(`The update can't start: ${pre.length} problem${pre.length === 1 ? "" : "s"} above. Fix ${pre.length === 1 ? "it" : "them"}, then run the update again.`);
     if (!flags.skipHealth) {
       log("Health check before the update");
       const before = await health({ ...ctx, quiet: true });
       if (before !== 0 && !flags.force) {
-        throw new Error("The install isn't healthy before the update (see above). Fix it, or pass --force.");
+        throw plainError(`The install isn't healthy before the update (see above), so it wasn't touched. Fix what failed (each FAIL says how), check with "${CHECK_CMD}", then run the update again. --force updates anyway.`);
       }
     }
 
     const src = await resolveSource(ctx, target);
     const migrationsFile = path.join(path.dirname(src.infra), "selfhost", "MIGRATIONS.json");
     const notes = migrationNotes(runner.dryRun ? [] : readJson(migrationsFile, { releases: [] }).releases, state.version, target);
-    for (const n of notes) log(`  ${n.version}: ${n.notes}${n.breaking ? "  [needs action]" : ""}`);
+    if (notes.length) log("Release notes this update crosses:");
+    for (const n of notes) {
+      log(`  ${n.version}${n.breaking ? "  NEEDS ACTION" : ""}: ${n.notes}`);
+      if (n.breaking && n.action) log(`        What to do: ${n.action}`);
+    }
     if (notes.some((n) => n.breaking) && !flags.yes) {
-      throw new Error("This update crosses a release that needs action (above). Do it, then run again with --yes.");
+      throw plainError("This update crosses a release that needs action (marked above). Do what it says, then run the update again with --yes.");
     }
     if (ctx.interactive && !flags.yes) {
       log("Changes this update makes (cdk diff):");
@@ -384,8 +395,10 @@ export async function update(ctx) {
           log(`The new release is unhealthy: rolling back to ${result.from}.`);
           const back = await resolveSource(ctx, result.from);
           await deploy({ ...ctx, flags: { ...deployFlags, version: result.from }, resolveSource: async () => back });
+          log(afterFailure(target, result.from, true));
           return done("rolled_back", `health check failed after deploying ${target}; back on ${result.from}`);
         }
+        log(afterFailure(target, result.from, false));
         return done("failed", `health check failed after deploying ${target}`);
       }
     }
@@ -396,6 +409,64 @@ export async function update(ctx) {
     throw e;
   }
 }
+
+const CHECK_CMD = "npx -y github:CoderHelm/coderhelm-platform doctor";
+
+function plainError(message) {
+  return Object.assign(new Error(message), { plain: true });
+}
+
+/** Room for a release (about 400 MB unpacked, plus the CDK's build output). */
+export const MIN_FREE_BYTES = 1.5 * 1024 ** 3;
+
+/** Config and disk problems that would stop an update, each with its fix. */
+export function preflightProblems(cfg, { freeBytes } = {}) {
+  const out = quickCheck(cfg).map((p) => ({ what: `Config: ${p}.`, fix: `Edit ${"coderhelm.config.json"} (docs/self-host/config-reference.md).` }));
+  let free = freeBytes;
+  if (free === undefined) {
+    try {
+      const dir = fs.existsSync(releasesDir()) ? releasesDir() : path.dirname(releasesDir());
+      const st = fs.statfsSync(fs.existsSync(dir) ? dir : process.cwd());
+      free = st.bavail * st.bsize;
+    } catch {
+      free = Infinity;
+    }
+  }
+  if (free < MIN_FREE_BYTES) {
+    out.push({
+      what: `Only ${(free / 1024 ** 3).toFixed(1)} GB free where releases are kept (${releasesDir()}); an update needs about 1.5 GB.`,
+      fix: `Delete old releases there (keep the one you run), or set CODERHELM_HOME to a folder on a bigger disk.`,
+    });
+  }
+  return out;
+}
+
+/** What went wrong after a deploy, and what to do, in plain words. */
+export function afterFailure(target, from, rolledBack) {
+  return [
+    "",
+    rolledBack
+      ? `The update to ${target} deployed, but the install wasn't healthy afterwards, so it went back to ${from}. Your data is untouched.`
+      : `The update to ${target} deployed, but the install isn't healthy now.`,
+    "What to do:",
+    `  1. See what fails and how to fix it: ${CHECK_CMD}`,
+    "  2. If a stack failed, its Events tab in the CloudFormation console shows the first error.",
+    rolledBack
+      ? `  3. Then try again: npx -y github:CoderHelm/coderhelm-platform update --to ${target}`
+      : `  3. Go back to the version before: npx -y github:CoderHelm/coderhelm-platform rollback${from ? ` --to ${from}` : ""}`,
+    "  Auto-update skips this release until an admin updates to it by hand.",
+  ].join("\n");
+}
+
+/** How to fix each health check that fails. */
+const HEALTH_FIX = {
+  Stacks: "Open the failed stack's Events tab in the CloudFormation console for the first error, fix it, then deploy again.",
+  "Dead-letter queue": "Open the failed events page in the dashboard (/admin/queue/) to retry or clear them.",
+  "GitHub App keys": "Create the app: npx -y github:CoderHelm/coderhelm-platform github-app",
+  "Email sending": "Request SES production access in the SES console (Account dashboard). Not needed for the update itself.",
+  Dashboard: "Deploy again; the dashboard files are uploaded with it.",
+  API: "Check the gateway function's logs in CloudWatch, then deploy again.",
+};
 
 /** The old name for update. */
 export const upgrade = update;
@@ -453,11 +524,15 @@ export async function health(ctx) {
     check("API", api?.status === 401 || api?.status === 200, api ? `HTTP ${api.status} (401 = up, not signed in)` : "unreachable");
   }
 
-  for (const x of results) log(`${x.ok ? "ok  " : "FAIL"}  ${x.name.padEnd(18)} ${x.detail}`);
+  for (const x of results) {
+    log(`${x.ok ? "ok  " : "FAIL"}  ${x.name.padEnd(18)} ${x.detail}`);
+    const fix = HEALTH_FIX[x.name] ?? (x.name.startsWith("Function") ? "Deploy again; it replaces the function: npx -y github:CoderHelm/coderhelm-platform deploy" : null);
+    if (!x.ok && fix) log(`      How to fix: ${fix}`);
+  }
   const version = state.version ? ` (on ${state.version})` : "";
   if (!ctx.quiet) log(`Install ${d.prefix}${version}`);
   const failed = results.filter((x) => !x.ok).length;
-  log(failed ? `\n${failed} check(s) failed.` : "\nAll checks passed.");
+  log(failed ? `\n${failed} check(s) failed. For every check with its fix: ${CHECK_CMD}` : "\nAll checks passed.");
   await telemetryPing(ctx, cfg, state, "health");
   return failed ? 1 : 0;
 }
@@ -572,7 +647,7 @@ export async function version(ctx) {
   return { installer: pkg.version, installed: state.version ?? null, latest };
 }
 
-/** `"Sun 03:00"` → { day, hour }; null when it doesn't read. */
+/** `"Sun 03:00"` becomes { day, hour }; null when it doesn't read. */
 export function parseWindow(w) {
   const m = String(w ?? "").trim().toLowerCase().match(/^(mon|tue|wed|thu|fri|sat|sun|daily)[a-z]*\s+(\d{1,2}):00$/);
   if (!m || Number(m[2]) > 23) return null;

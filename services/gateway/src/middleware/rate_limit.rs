@@ -53,6 +53,19 @@ pub async fn rate_limit_email(
     Ok(next.run(req).await)
 }
 
+/// The install wizard's public progress view: 120 requests per IP per 5
+/// minutes (a poll every few seconds), counted on its own. The handler
+/// calls it with the request's headers.
+pub fn allow_setup_poll(headers: &axum::http::HeaderMap) -> Result<(), StatusCode> {
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    check_rate_limit(&ip, "setup", 120, 300)
+}
+
 /// In-memory sliding window rate limiter.
 /// Zero latency, no external calls. Resets on cold start.
 fn check_rate_limit(

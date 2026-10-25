@@ -604,6 +604,16 @@ export class ApiStack extends cdk.Stack {
       })
     );
 
+    // The setup checklist (Settings, then Setup): the sender identity's
+    // verification and DKIM, and whether the account left the SES sandbox.
+    // Read only; these actions take no resource-level scoping.
+    this.gatewayFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["ses:GetAccount", "ses:GetEmailIdentity"],
+        resources: ["*"],
+      })
+    );
+
     // Cognito access for auth flows
     this.gatewayFunction.addToRolePolicy(
       new iam.PolicyStatement({

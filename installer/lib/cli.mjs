@@ -1,7 +1,9 @@
 // coderhelm-selfhost: install and run CoderHelm in your own AWS account.
 import * as cmd from "./commands.mjs";
 import { wizard } from "./wizard.mjs";
+import { doctor } from "./doctor.mjs";
 import fs from "node:fs";
+import path from "node:path";
 import { Runner } from "./runner.mjs";
 import { parseArgs, prompter } from "./util.mjs";
 
@@ -12,8 +14,14 @@ Usage: coderhelm-selfhost <command> [options]
 Commands
   init          The guided install: checks, a few questions with explanations,
                 a cost estimate, then deploy, GitHub App and first sign-up.
-                Resumable; "back" returns to the previous step; flags or
-                --answers <file> answer it without a terminal
+                Every step checks what you did and shows how to fix what
+                isn't right. Resumable; "back" returns to the previous step;
+                flags or --answers <file> answer it without a terminal
+  doctor        Check everything about an install: AWS sign-in and
+                permissions, region, CDK, DNS and certificate, stacks,
+                functions, queues, the GitHub App (keys, permissions, webhook
+                deliveries), email (SES identity, DKIM, sandbox) and a real
+                model call. Each problem comes with its fix. --json for scripts
   deploy        Deploy (or redeploy) the release your config names, then
                 create your GitHub App if there isn't one yet
   github-app    Create the GitHub App (one click on github.com) and store its keys
@@ -23,7 +31,7 @@ Commands
   rollback      Go back to the previous release (or --to vX.Y.Z)
   auto-update   on | off | status [--window "Sun 03:00"] [--timezone UTC]
                 [--channel stable|preview] [--majors ask|auto]
-  health        Check the stacks, functions, queues, keys, email and URLs
+  health        The quick health check the updater runs (doctor checks more)
   backup        Take on-demand backups of every table
   uninstall     Delete the stacks (tables, bucket and secret are kept)
   telemetry     on | off | status: anonymous install and upgrade pings (off by default)
@@ -46,6 +54,10 @@ Options
   --require-signature update/deploy: refuse a release whose signature can't be checked
   --auto-rollback     update: deploy the previous release again if health fails
   --result-file <f>   update: write {status, from, to, reason} to this file
+  --skip-checks <ids> init: go on past these failed checks (comma-separated
+                      ids, or "all"); without a terminal a failed check stops
+  --verbose           Show full error details (they are always saved to a
+                      log file under .coderhelm/logs)
 
 Docs: https://github.com/CoderHelm/coderhelm-platform/tree/main/docs/self-host
 `;
@@ -56,13 +68,21 @@ export async function main(argv, deps = {}) {
   // this folder already has an install.
   const command = flags._[0] ?? (flags.version === true ? "version" : fs.existsSync(cmd.configPath(flags)) || flags.help ? "help" : "init");
   if (typeof flags.version !== "string") delete flags.version;
-  const log = deps.log ?? console.log;
+  const transcript = [];
+  const baseLog = deps.log ?? console.log;
+  const log = (m) => {
+    transcript.push(String(m));
+    baseLog(m);
+  };
   const interactive = deps.interactive ?? (process.stdin.isTTY && !flags.yes && !flags.dryRun);
   const runner = deps.runner ?? new Runner({ dryRun: !!flags.dryRun, log });
   const ask = deps.ask ?? prompter({ interactive });
   const ctx = {
     flags, runner, ask, log, interactive,
     fetchImpl: deps.fetchImpl ?? fetch,
+    dns: deps.dns,
+    nodeVersion: deps.nodeVersion,
+    freeBytes: deps.freeBytes,
     manifestFlow: deps.manifestFlow,
     resolveSource: deps.resolveSource,
     open: deps.open,
@@ -96,6 +116,9 @@ export async function main(argv, deps = {}) {
         return 0;
       case "health":
         return await cmd.health(ctx);
+      case "doctor":
+      case "check":
+        return await doctor(ctx);
       case "backup":
         await cmd.backup(ctx);
         return 0;
@@ -119,7 +142,36 @@ export async function main(argv, deps = {}) {
         log(HELP);
         return 2;
     }
+  } catch (err) {
+    // A plain message by default; the details go to a log file (and to the
+    // terminal with --verbose). Tests pass deps.log and get the error back.
+    if (deps.log && !deps.handleErrors) throw err;
+    const file = saveLog(flags, command, transcript, err);
+    const msg = String(err?.message ?? err);
+    baseLog(`\n${err?.plain || flags.verbose ? msg : firstLines(msg)}`);
+    if (flags.verbose && err?.stack) baseLog(err.stack);
+    if (file) baseLog(`\nFull details: ${file}${flags.verbose ? "" : " (or run again with --verbose)"}`);
+    return 1;
   } finally {
     ask.close?.();
+  }
+}
+
+/** The first lines of a long error (a failed command's whole stderr goes to the log). */
+export function firstLines(msg, n = 6) {
+  const lines = msg.split("\n");
+  return lines.length <= n ? msg : `${lines.slice(0, n).join("\n")}\n  ...`;
+}
+
+/** Writes what this run printed, and the error with its stack, to .coderhelm/logs. */
+export function saveLog(flags, command, transcript, err) {
+  try {
+    const dir = path.join(path.dirname(cmd.configPath(flags)), cmd.STATE_DIR, "logs");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${command}-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.log`);
+    fs.writeFileSync(file, `${transcript.join("\n")}\n\n--- error ---\n${err?.stack ?? err}\n`);
+    return file;
+  } catch {
+    return null;
   }
 }

@@ -1,7 +1,7 @@
 ---
 title: FAQ
 description: Short answers about self-hosting CoderHelm.
-order: 13
+order: 14
 ---
 
 **Does any of my code or data go to CoderHelm the company?**

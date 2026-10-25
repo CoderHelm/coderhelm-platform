@@ -138,6 +138,12 @@ async fn main() -> Result<(), Error> {
         .route("/system/update", post(routes::system::update_now))
         .route("/system/rollback", post(routes::system::rollback))
         .route("/system/test-email", post(routes::system::test_email))
+        // Setup checks and update readiness, each with its fix (install admins).
+        .route("/system/checks", get(routes::setup_checks::checks))
+        .route(
+            "/system/preflight",
+            get(routes::setup_checks::preflight_route),
+        )
         .route(
             "/admin/teams/:team_id/flags",
             put(routes::admin::set_team_flags),
@@ -1119,6 +1125,10 @@ async fn main() -> Result<(), Error> {
             "/api/setup/github/callback",
             get(routes::setup::github_callback),
         )
+        // A self-hosted install's setup status for the install guide: public,
+        // ids, labels, statuses and codes only, and only until the first
+        // person has an account (routes::setup_checks). 404 on hosted.
+        .route("/api/setup/status", get(routes::setup_checks::status))
         .route("/api/brain/stream", post(routes::brain::brain_stream))
         .nest("/webhooks", webhook_routes)
         .route(

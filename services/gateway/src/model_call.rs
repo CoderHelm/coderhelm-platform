@@ -83,6 +83,32 @@ pub async fn chat_turn(
     Ok(with_feature(feature::CHAT, call).await?.message)
 }
 
+/// The setup checklist's test call: one turn, at most one token out,
+/// metered like any chat turn. Tells whether the deployment can call
+/// `model` with this key (or through Bedrock).
+pub async fn probe(
+    http: &reqwest::Client,
+    api_key: &str,
+    meter: &UsageMeter,
+    model: &str,
+) -> crate::routes::setup_checks::ModelProbe {
+    use crate::routes::setup_checks::ModelProbe;
+    let body = json!({
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{ "role": "user", "content": "Reply with OK." }],
+    });
+    match chat_turn(http, api_key, &body, meter, model).await {
+        Ok(_) => ModelProbe::Ok,
+        // The token limit is the point of a one-token call.
+        Err(e) if e.kind == ModelErrorKind::Truncated => ModelProbe::Ok,
+        Err(e) => match e.kind {
+            ModelErrorKind::Status(code) => ModelProbe::Refused(code, e.message),
+            _ => ModelProbe::Unreachable(e.message),
+        },
+    }
+}
+
 /// Open a plan chat stream for the caller to relay event by event. The
 /// returned [`InFlight`] must see every event (`flight.acc.feed`) and is
 /// recorded by `flight.finish().await`, or on drop if the caller stops.

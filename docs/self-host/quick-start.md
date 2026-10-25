@@ -13,7 +13,24 @@ mkdir coderhelm && cd coderhelm
 npx -y github:CoderHelm/coderhelm-platform
 ```
 
-The guided install runs one step at a time. Each step explains what it asks and suggests an answer (press Enter to keep it). Type `back` at any question to return to the previous step. Your answers are saved after each step: if you stop, running the same command again picks up where you left off (`--restart` starts over).
+The guided install runs one step at a time. Each step explains what it asks and suggests an answer (press Enter to keep it), then **checks what you did before it moves on**. Type `back` at any question to return to the previous step.
+
+## When a check fails
+
+Every check prints `PASS`, `WARN` or `FAIL`. A failure says what is wrong, why it matters and how to fix it, with a command to copy or a link, and waits:
+
+```text
+  FAIL  AWS permissions for the install
+        What's wrong: Your AWS identity isn't allowed 2 things the install does: iam:PassRole, ecr:CreateRepository.
+        Why it matters: The deploy stops halfway at the first of them.
+        How to fix: Ask your AWS admin to allow them, or sign in with a role that has AdministratorAccess, then check again.
+          https://console.aws.amazon.com/iam/home#/roles
+Fix it, then press Enter to check again ("skip" to go on anyway, "back" to change an answer):
+  Checking again...
+  PASS  AWS permissions for the install  (18 actions allowed for Developer)
+```
+
+Fix it and press **Enter**: it checks again without starting over. Warnings (`WARN`) don't stop the install; fix them when you can. Every check and its fix is in [Check your install](./check-your-install.md). Your answers are saved after each step: if you stop, running the same command again picks up where you left off (`--restart` starts over).
 
 ## Step 1: your machine and AWS sign-in
 
@@ -28,7 +45,7 @@ Sign in now with `aws sso login --profile prod-admin`? (yes/no) [yes]:
   Signed in to account 123456789012 as arn:aws:sts::123456789012:assumed-role/Admin/you
 ```
 
-Node.js and the AWS CLI are checked first. If you aren't signed in, it lists your AWS profiles, and for an SSO profile it runs `aws sso login` for you.
+Node.js, the AWS CLI and tar are checked first. If you aren't signed in, it lists your AWS profiles, and for an SSO profile it runs `aws sso login` for you. If the sign-in still fails (an expired session, the wrong profile), it shows the command to run and waits.
 
 ## Step 2: where to install
 
@@ -41,6 +58,12 @@ A short name for this install [prod]:
 
 The account must be the one you're signed in to. The short name prefixes every resource (`coderhelm-prod-...`), so two installs can share an account.
 
+Then it checks:
+
+- **The region has every service** the install uses.
+- **Your permissions:** it simulates the actions the deploy needs with `iam:SimulatePrincipalPolicy` and lists any you're missing.
+- **CDK is set up** in the account and region (`cdk bootstrap`). If not, the deploy runs it, or you can run the command it shows now.
+
 ## Step 3: web address
 
 ```
@@ -51,7 +74,7 @@ Hostname (empty for the CloudFront address) [coderhelm.example.com]:
   example.com is in Route 53: the certificate and DNS records are created for you.
 ```
 
-Leave it empty to use CloudFront's address. A hostname outside Route 53 asks for an ACM certificate in us-east-1; see [Domains](./domains.md).
+Leave it empty to use CloudFront's address. With a Route 53 zone it checks the zone exists and that **your domain's name servers point at it**: when they don't, it prints the four NS records to set at your registrar and what public DNS answers now. A hostname outside Route 53 asks for an ACM certificate in us-east-1 and checks it covers the hostname and is issued (or prints the validation records to add); see [Domains](./domains.md).
 
 ## Step 4: Claude access
 
@@ -59,12 +82,17 @@ Leave it empty to use CloudFront's address. A hostname outside Route 53 asks for
 Step 4 of 8 [████████░░░░░░░░] Claude access
 Claude through anthropic or bedrock [anthropic]: bedrock
 Bedrock inference profile prefix [eu.]:
-  ok   anthropic.claude-opus-5-5
-  TODO anthropic.claude-sonnet-5-5 is not enabled in this region
-  Enable model access here before your first run: https://console.aws.amazon.com/bedrock/home?region=eu-west-1#/modelaccess
+  Checking Bedrock in this region...
+  PASS  Region eu-west-1 has every service
+  FAIL  Claude models enabled in Bedrock
+        What's wrong: Not enabled in eu-west-1: Claude Opus 5.5 (anthropic.claude-opus-5-5), Claude Sonnet 5.5 (anthropic.claude-sonnet-5-5).
+        Why it matters: Every run calls these models; none can start until Bedrock allows them.
+        How to fix: Open Model access, choose Modify model access, tick these models, submit, then check again (it usually takes a minute).
+          https://console.aws.amazon.com/bedrock/home?region=eu-west-1#/modelaccess
+Fix it, then press Enter to check again ("skip" to go on anyway, "back" to change an answer):
 ```
 
-With `anthropic`, you can paste a key to check it with one free call to Anthropic. The key is not saved: teams add their own in **Settings → AI models**. With `bedrock`, it checks that each model is enabled in your region. See [Model providers](./model-providers.md).
+With `anthropic`, you can paste a key to check it with a real one-token call to Anthropic (it costs a fraction of a cent). The key is not saved: teams add their own in **Settings, AI models**. With `bedrock`, it checks that each model is enabled in your region and names any that aren't. See [Model providers](./model-providers.md).
 
 ## Step 5: you and email
 
@@ -77,18 +105,18 @@ Emails come from [coderhelm@example.com]:
 Let anyone with this email domain sign up (empty: only you) [example.com]:
 ```
 
-You become the first admin. It checks the sender's SES identity and whether the account is still in the SES sandbox. See [Email](./email.md).
+You become the first admin. It checks the sender's SES identity (verified, with DKIM; when not, it prints the three DNS records to add) and whether the account is still in the SES sandbox (a warning, with the link to request production access). See [Email](./email.md).
 
 ## Step 6: optional extras
 
 ```
 Step 6 of 8 [████████████░░░░] Optional extras
-  Jira: connect from Settings → Jira after sign-up ...
+  Jira: connect from Settings, Integrations, Jira after sign-up ...
 A Slack or Teams incoming webhook for update notices (empty: email only):
 Turn on Sign in with Google (needs a Google OAuth client)? (yes/no) [no]:
 ```
 
-Google's client id and secret go straight into Secrets Manager, never into a file. See [Integrations](./integrations.md).
+A Slack or Teams webhook is checked to still exist. Google's client id and secret go straight into Secrets Manager, never into a file. See [Integrations](./integrations.md).
 
 ## Step 7: updates
 
@@ -100,7 +128,7 @@ Time zone of the window [Europe/Berlin]:
 Major releases: ask (wait for an admin) or auto [ask]:
 ```
 
-You can change these any time in **Settings → System**. See [Updates](./updates.md).
+You can change these any time in **Settings, then System**. See [Updates](./updates.md).
 
 ## Step 8: summary and cost
 
@@ -112,9 +140,9 @@ Here is what will be installed:
   Claude             Amazon Bedrock (eu.)
   ...
 Estimated AWS cost per month for a small team (USD):
-  Lambda, API Gateway, SQS, DynamoDB, EventBridge    2–15
+  Lambda, API Gateway, SQS, DynamoDB, EventBridge    2 to 15
   ...
-  Total                                              about 11–62
+  Total                                              about 11 to 62
   Not included: Claude on Bedrock: per token, on this AWS bill.
 Save this and deploy now? ("back" to change something) (yes/no) [yes]:
 ```
@@ -126,39 +154,33 @@ It saves `coderhelm.config.json` (every setting is in the [Config reference](./c
 The deploy shows each resource as CloudFormation creates it; the first one takes 20 to 30 minutes. Then:
 
 1. Your browser opens a page that creates your GitHub App. Press **Create GitHub App** on github.com. The keys go into Secrets Manager. See [The GitHub App](./github-app.md).
-2. The sign-up page opens. Sign up with the admin email.
-3. The terminal prints a checklist:
+2. It runs every check against the running install (the same as the `doctor` command): DNS and the certificate, the stacks and functions, the GitHub App's keys, permissions and webhook deliveries, email, and a real model call. Anything that fails says how to fix it, and you press **Enter** to check again.
+3. Only when nothing fails does it say so:
 
 ```
-CoderHelm v1.0.0 is running at https://coderhelm.example.com
+Your install is ready.
 
-Checklist
-  [x] CoderHelm deployed
-  [x] GitHub App created
-  [ ] Sign up as the first admin (you@example.com): https://coderhelm.example.com/?signup=1
-  [ ] Install the GitHub App on your repositories
-  [x] Models: Amazon Bedrock (no key needed)
-  [ ] Send a test email from the setup page (new AWS accounts start in the SES sandbox)
-  [x] Auto-update on
+  Dashboard: https://coderhelm.example.com
 
-The setup page checks each of these live: https://coderhelm.example.com/settings/setup/
+Next steps
+  1. Sign up as the first admin: https://coderhelm.example.com/?signup=1
+  2. Turn CoderHelm on for a repository in Settings, Repositories
+  3. Assign an issue to CoderHelm, or add the "coderhelm" label
+  4. Settings, then Setup shows these checks live: https://coderhelm.example.com/settings/setup/
+
+Check again any time: npx -y github:CoderHelm/coderhelm-platform doctor
 ```
 
 ## The setup page
 
-After you sign up, the dashboard shows the setup checklist to the first admin, at **Settings → Setup**. Each item checks itself live and links to where you fix it:
+After you sign up, **Settings, then Setup** shows two lists to install admins:
 
-- GitHub App connected
-- repositories enabled
-- model provider working
-- email working (it sends you a test)
-- Jira or Slack connected (optional)
-- auto-update on
-- first run tried
+- **Install checks:** the install checks itself (the web address, the GitHub App's keys, permissions, installations and webhook deliveries, the email sender and DKIM, the SES sandbox, a real model call, failed events, the updater, and Slack, Teams and Jira when you use them). Each problem says what is wrong, why it matters and how to fix it, with a command to copy or a link. **Check again** reruns them.
+- **Getting started:** repositories turned on, a test email, your first run, and the optional extras.
 
 ## Without a terminal (CI)
 
-Every question has a flag, and `--answers <file>` reads them from JSON. A bad answer stops with the reason:
+Every question has a flag, and `--answers <file>` reads them from JSON. A bad answer, or a check that fails, stops with the reason and the fix (`--skip-checks <id>` goes past a check):
 
 ```sh
 npx -y github:CoderHelm/coderhelm-platform init --yes \
@@ -181,5 +203,7 @@ Without the guide's setup key, create the GitHub App from your computer with the
 ## Check it
 
 ```sh
-npx -y github:CoderHelm/coderhelm-platform health
+npx -y github:CoderHelm/coderhelm-platform doctor
 ```
+
+See [Check your install](./check-your-install.md).

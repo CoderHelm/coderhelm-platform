@@ -37,8 +37,9 @@ CoderHelm runs entirely on AWS serverless services: Lambda, API Gateway, SQS, Dy
 9. [Updates](./updates.md)
 10. [Backups](./backups.md)
 11. [Security model](./security.md)
-12. [Troubleshooting](./troubleshooting.md)
-13. [FAQ](./faq.md)
+12. [Check your install](./check-your-install.md)
+13. [Troubleshooting](./troubleshooting.md)
+14. [FAQ](./faq.md)
 
 ## License
 

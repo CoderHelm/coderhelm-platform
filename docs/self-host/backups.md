@@ -26,8 +26,8 @@ takes an on-demand backup of every table of the install. They are kept until you
 
 ## Restore
 
-- **A table to a point in time:** DynamoDB console → the table → **Backups → Restore to point in time**, into a new table name. Then swap: delete the old table (turn off deletion protection first) and restore again under the original name, or copy the items back.
-- **A bucket object:** S3 console → **Show versions** → restore the version you want.
+- **A table to a point in time:** DynamoDB console, the table, then **Backups, Restore to point in time**, into a new table name. Then swap: delete the old table (turn off deletion protection first) and restore again under the original name, or copy the items back.
+- **A bucket object:** S3 console, **Show versions**, then restore the version you want.
 - **The whole install in a new account:** restore the tables and copy the bucket into the new account with the original names, set `account` in the config, and deploy. The secret and the GitHub App move with `github-app --app-id ...` (see [The GitHub App](./github-app.md#github-enterprise-server)), or create a new app.
 
 Cognito user pools can't be backed up with passwords; people reset their passwords after a move to a new pool.

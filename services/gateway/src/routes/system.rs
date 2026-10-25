@@ -45,8 +45,13 @@ fn allowed(claims: &Claims) -> Result<(), StatusCode> {
     Ok(())
 }
 
+/// Whether this install has an updater (self-hosted installs do).
+pub fn has_updater() -> bool {
+    updater().is_some()
+}
+
 /// The updater's answer, or the status code that stands for its failure.
-async fn call(state: &AppState, payload: Value) -> Result<Value, StatusCode> {
+pub(crate) async fn call(state: &AppState, payload: Value) -> Result<Value, StatusCode> {
     let Some(name) = updater() else {
         return Err(StatusCode::NOT_FOUND);
     };
