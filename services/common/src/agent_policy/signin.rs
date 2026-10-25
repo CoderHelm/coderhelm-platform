@@ -83,10 +83,7 @@ pub fn prompt(
     } else {
         server_name.trim()
     };
-    let settings = format!(
-        "/settings/integrations/mcp?server={}",
-        urlencoding::encode(server_id)
-    );
+    let settings = "/settings/integrations/#mcp-servers".to_string();
     match need {
         Need::Personal => Prompt {
             server_id: server_id.into(),

@@ -1025,10 +1025,11 @@ pub fn link_view(
         Ok(c) => match c.channel {
             Channel::Slack | Channel::Teams => (
                 LinkView::Open(format!(
-                    "{}/settings/agents/?approval={}&do={}",
+                    "{}/settings/agents/?approval={}&do={}&via={}",
                     dashboard_origin(stage),
                     urlencoding::encode(&c.approval_id),
-                    if action == "deny" { "deny" } else { "approve" }
+                    if action == "deny" { "deny" } else { "approve" },
+                    c.channel.key()
                 )),
                 Some(c),
             ),
@@ -1324,7 +1325,7 @@ mod tests {
                 LinkView::Open(to) => {
                     assert_eq!(
                         to,
-                        "https://app.coderhelm.com/settings/agents/?approval=ap_1&do=deny"
+                        format!("https://app.coderhelm.com/settings/agents/?approval=ap_1&do=deny&via={}", ch.key())
                     )
                 }
                 _ => panic!("expected a redirect"),

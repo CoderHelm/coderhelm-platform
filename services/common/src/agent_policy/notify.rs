@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(m.buttons[0].title, "Connect");
         assert!(m.buttons[0]
             .url
-            .starts_with("https://app.coderhelm.com/settings/integrations/mcp"));
+            .starts_with("https://app.coderhelm.com/settings/integrations/#mcp-servers"));
         assert_eq!(p.message, "Sign in to Figma to let me read this file.");
     }
 }
