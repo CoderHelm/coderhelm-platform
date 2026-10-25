@@ -45,6 +45,8 @@ aws-smithy-types = "1"
 async-trait = "0.1"
 sqlparser = { version = "0.59", features = ["visitor"] }
 regex = "1"
+# agent_policy: links in approval and sign-in messages
+urlencoding = "2"
 # e2e: Playwright HTML reports carry their results as an embedded zip
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # live::tools: tool definitions written as YAML in a repo

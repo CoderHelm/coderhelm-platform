@@ -17,6 +17,9 @@ pub mod code_graph;
 /// worker can read it, and when the cleanup archives it.
 pub mod dlq;
 
+/// Agent permissions: one policy engine (allow, ask, deny) every agent loop
+/// asks before every call, approval cards, sign-in prompts and the pause.
+pub mod agent_policy;
 /// Alert notifications: which channels an alert posts to, and its messages.
 pub mod alert_notify;
 /// Chat notifications (Teams and Slack): one message model, a renderer per
