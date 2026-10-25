@@ -9,7 +9,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "FSL-1.1-ALv2",
   "type": "commonjs",
   "dependencies": {
     "@forge/bridge": "^5.14.1",
