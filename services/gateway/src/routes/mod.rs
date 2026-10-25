@@ -3,6 +3,7 @@ pub mod admin;
 pub mod alerts;
 pub mod analytics;
 pub mod api;
+pub mod api_keys;
 pub mod auth;
 pub mod banners;
 pub mod connectors;

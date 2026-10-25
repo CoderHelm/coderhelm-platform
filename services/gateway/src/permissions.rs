@@ -111,6 +111,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "learning::get_learning",
             "tests::summary",
             "tests::list_tests",
+            "api::get_usage",
         ],
     },
     Capability {
@@ -248,6 +249,12 @@ pub const CAPABILITIES: &[Capability] = &[
             "roles::delete_role",
             "roles::list_audit",
         ],
+    },
+    Capability {
+        key: "api_keys",
+        label: "Create and revoke the team's API keys, each with scopes no wider than your own",
+        min_role: "admin",
+        handlers: &["api_keys::list", "api_keys::create", "api_keys::revoke"],
     },
     Capability {
         key: "delete_plans",
@@ -619,9 +626,12 @@ pub struct Holder {
     pub custom: Option<CustomRoleRef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// A custom role, by id and name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct CustomRoleRef {
+    /// The role's id.
     pub id: String,
+    /// The role's name, as the team page shows it.
     pub name: String,
 }
 

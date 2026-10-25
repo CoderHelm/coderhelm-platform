@@ -17,6 +17,9 @@ tower-http = { version = "0.6", features = ["set-header"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The public API's OpenAPI document, generated from the handlers and their
+# types (src/openapi.rs); docs/api/openapi.json is checked against it.
+utoipa = { version = "5.5", features = ["preserve_order", "preserve_path_order"] }
 
 # AWS SDK
 aws-config = { version = "1", features = ["behavior-version-latest"] }

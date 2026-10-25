@@ -454,6 +454,23 @@ pub struct Claims {
     /// role this request runs as (see `permissions::resolve_access`).
     #[serde(skip)]
     pub custom: Option<crate::permissions::Holder>,
+    /// Set by the auth middleware on a request made with a team API key,
+    /// never read from or written to a token. `sub` is then `APIKEY#<id>`,
+    /// and `email` and `github_login` are those of the admin who made it.
+    #[serde(skip)]
+    pub api_key: Option<ApiKeyRef>,
+}
+
+/// The API key a request was made with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyRef {
+    pub id: String,
+    pub name: String,
+    /// What the key holds on this request (its scopes cut to its maker).
+    pub scopes: Vec<String>,
+    pub rate_limit_per_minute: u32,
+    pub expires_at: Option<String>,
+    pub created_by: String,
 }
 
 /// What a support-view session may see: one team, until a time, under one
@@ -696,6 +713,7 @@ mod tests {
             iat: 1000000000,
             support_view: None,
             custom: None,
+            api_key: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: Claims = serde_json::from_str(&json).unwrap();

@@ -526,6 +526,7 @@ mod tests {
             iat: 0,
             support_view: None,
             custom: None,
+            api_key: None,
         }
     }
 

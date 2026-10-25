@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::api_keys::{self, Outcome, RateWindow};
 use crate::auth::jwt;
+use crate::models::{ApiKeyRef, Claims};
+use crate::openapi;
 use crate::permissions::{self, Access, Capability};
 use crate::routes::{roles, support_access};
 use crate::AppState;
@@ -29,6 +32,12 @@ pub async fn require_auth(
     mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    // A team API key: its own path, and never a session's (no cookies, no
+    // support view, no sliding refresh).
+    if let Some(token) = api_keys::bearer_key(req.headers()).map(str::to_string) {
+        return Ok(api_key_request(&state, req, next, &token).await);
+    }
+
     let cookie_header = req
         .headers()
         .get("cookie")
@@ -149,6 +158,187 @@ pub async fn require_auth(
     }
 
     Ok(response)
+}
+
+/// A request made with a team API key. The key is checked and counted
+/// against its rate limit; only the public routes are open to it; and what it
+/// may do there is decided by `permissions::resolve_access` from its scopes,
+/// cut down to what the admin who made it holds now. Every error it gets has
+/// a JSON body with `error` and `code`.
+async fn api_key_request(
+    state: &Arc<AppState>,
+    mut req: Request,
+    next: Next,
+    token: &str,
+) -> Response {
+    let now = chrono::Utc::now();
+    let store = api_keys::store(state);
+    let accepted = match api_keys::authenticate(&store, token, now).await {
+        Ok(Outcome::Accepted(a)) => *a,
+        Ok(Outcome::Refused(r)) => {
+            return key_error(StatusCode::UNAUTHORIZED, r.code(), r.message(), None)
+        }
+        Ok(Outcome::RateLimited(w)) => {
+            let mut res = key_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                &format!(
+                    "This API key may make {} requests a minute. Try again in {} seconds.",
+                    w.limit, w.reset_secs
+                ),
+                None,
+            );
+            if let Ok(v) = w.reset_secs.to_string().parse() {
+                res.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+            }
+            return with_rate_headers(res, &w);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "API key check failed");
+            return key_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "CoderHelm couldn't check this API key just now. Try again shortly.",
+                None,
+            );
+        }
+    };
+    let (key, maker, rate) = (accepted.key, accepted.maker, accepted.rate);
+
+    let method = req.method().as_str().to_ascii_uppercase();
+    let handler = req
+        .extensions()
+        .get::<MatchedPath>()
+        .and_then(|m| permissions::routed_handler(&method, m.as_str()));
+    if !openapi::is_key_route(&method, handler) {
+        return with_rate_headers(
+            key_error(
+                StatusCode::FORBIDDEN,
+                "not_available_to_api_keys",
+                "API keys can call only the public endpoints listed at https://docs.coderhelm.com/api. This one is for the dashboard.",
+                None,
+            ),
+            &rate,
+        );
+    }
+
+    // What the key's maker holds right now (their custom role included).
+    let maker_claims = Claims {
+        sub: key.created_by.clone(),
+        team_id: key.team_id.clone(),
+        email: maker.email.clone(),
+        role: maker.role.clone(),
+        github_login: maker.github_login.clone(),
+        aud: "coderhelm-dashboard".into(),
+        exp: 0,
+        iat: 0,
+        support_view: None,
+        custom: None,
+        api_key: None,
+    };
+    let maker_holder = roles::holder_for(state, &maker_claims).await;
+    let holder = api_keys::key_holder(&key, &maker_holder);
+    let effective_role = match permissions::resolve_access(&holder, handler) {
+        Access::Deny { capability } => {
+            return with_rate_headers(
+                key_error(
+                    StatusCode::FORBIDDEN,
+                    "missing_scope",
+                    &format!(
+                        "This API key doesn't have the \"{}\" scope ({}).",
+                        capability.key, capability.label
+                    ),
+                    Some(capability.key),
+                ),
+                &rate,
+            )
+        }
+        Access::Allow { effective_role } => effective_role,
+    };
+    let at = now.timestamp().max(0) as u64;
+    let claims = Claims {
+        sub: format!("APIKEY#{}", key.id),
+        team_id: key.team_id.clone(),
+        email: maker.email,
+        role: effective_role.to_string(),
+        github_login: maker.github_login,
+        aud: "coderhelm-api".into(),
+        exp: at,
+        iat: at,
+        support_view: None,
+        api_key: Some(ApiKeyRef {
+            id: key.id.clone(),
+            name: key.name.clone(),
+            scopes: holder.caps.iter().map(|c| c.to_string()).collect(),
+            rate_limit_per_minute: key.rate_limit_per_minute,
+            expires_at: key.expires_at.clone(),
+            created_by: key.created_by_name.clone(),
+        }),
+        custom: Some(holder),
+    };
+    req.extensions_mut().insert(claims);
+    let response = next.run(req).await;
+    with_rate_headers(json_error_body(response).await, &rate)
+}
+
+/// An error for an API key request.
+fn key_error(status: StatusCode, code: &str, message: &str, scope: Option<&str>) -> Response {
+    let body = openapi::ErrorBody {
+        error: message.to_string(),
+        code: code.to_string(),
+        scope: scope.map(str::to_string),
+    };
+    (status, axum::Json(body)).into_response()
+}
+
+fn with_rate_headers(mut res: Response, w: &RateWindow) -> Response {
+    let h = res.headers_mut();
+    for (name, value) in [
+        ("ratelimit-limit", u64::from(w.limit)),
+        ("ratelimit-remaining", u64::from(w.remaining)),
+        ("ratelimit-reset", w.reset_secs),
+    ] {
+        if let Ok(v) = value.to_string().parse() {
+            h.insert(name, v);
+        }
+    }
+    res
+}
+
+/// For an API key request, an error answer always has a JSON body with
+/// `error` and `code`: an empty body gets one from its status, and a JSON
+/// body without `code` gets the status's code.
+async fn json_error_body(response: Response) -> Response {
+    let status = response.status();
+    if status.as_u16() < 400 {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let mut value = if bytes.is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(v) if v.is_object() => v,
+            // Plain text: keep it as the message.
+            _ => serde_json::json!({ "error": String::from_utf8_lossy(&bytes).trim() }),
+        }
+    };
+    if value["error"].as_str().is_none_or(str::is_empty) {
+        value["error"] = serde_json::json!(status.canonical_reason().unwrap_or("Error"));
+    }
+    if value["code"].as_str().is_none() {
+        value["code"] = serde_json::json!(openapi::default_code(status));
+    }
+    let out = serde_json::to_vec(&value).unwrap_or_default();
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    parts.headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    Response::from_parts(parts, axum::body::Body::from(out))
 }
 
 /// The answer when someone's role doesn't include what they asked for.

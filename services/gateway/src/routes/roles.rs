@@ -837,7 +837,18 @@ pub async fn list_audit(
                 "action": s(i, "action"),
                 "role_id": s(i, "role_id"),
                 "role_name": s(i, "role_name"),
-                "detail": s(i, "detail"),
+                // A key's use summary keeps a count; its sentence is made here.
+                "detail": if s(i, "action") == "api_key_used" {
+                    crate::api_keys::use_summary_detail(
+                        i.get("minutes")
+                            .and_then(|v| v.as_n().ok())
+                            .and_then(|n| n.parse().ok())
+                            .unwrap_or(1),
+                        s(i, "at"),
+                    )
+                } else {
+                    s(i, "detail").to_string()
+                },
             })
         })
         .collect();
@@ -861,6 +872,7 @@ mod tests {
             iat: 0,
             support_view: None,
             custom: None,
+            api_key: None,
         }
     }
 

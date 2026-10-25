@@ -62,11 +62,72 @@ async fn acquire_ticket_lock(state: &AppState, team_id: &str, ticket_id: &str) -
     }
 }
 
+/// The body of a Jira webhook, as Jira sends it. Only the fields CoderHelm
+/// reads are listed; the rest are accepted and ignored.
+#[derive(utoipa::ToSchema)]
+#[schema(example = json!({
+    "webhookEvent": "jira:issue_updated",
+    "issue": { "key": "WEB-42", "fields": { "summary": "Add rate limiting to the login form", "labels": ["coderhelm"] } },
+    "coderhelm": { "repo_owner": "acme", "repo_name": "web" }
+}))]
+#[allow(dead_code)]
+pub struct JiraWebhookBody {
+    /// The event, such as `jira:issue_created`, `jira:issue_updated` or
+    /// `comment_created`. An event whose name contains `comment` retries a
+    /// failed run or sends feedback to an open pull request; other issue
+    /// events can start a run.
+    #[schema(rename = "webhookEvent", example = "jira:issue_updated")]
+    webhook_event: String,
+    /// The issue, with `key` and `fields` (summary, description, labels,
+    /// assignee, project). A run starts when the issue has the label
+    /// `coderhelm` (or one starting `coderhelm:`), or is assigned to a user
+    /// whose name contains "CoderHelm", in a project the team switched on.
+    #[schema(value_type = Object)]
+    issue: (),
+    /// For comment events: the comment, with `body` and `author`.
+    #[schema(value_type = Option<Object>)]
+    comment: (),
+    /// Optional: pin the ticket to a repository, from an automation.
+    coderhelm: Option<JiraRepoPin>,
+}
+
+/// Which repository a Jira ticket goes to. May also be sent at the top level.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct JiraRepoPin {
+    /// The repository's owner.
+    #[schema(example = "acme")]
+    repo_owner: String,
+    /// The repository's name.
+    #[schema(example = "web")]
+    repo_name: String,
+}
+
 /// Jira webhook handler — `/webhooks/jira/:token`
 ///
 /// The token is an opaque random string that maps to a team (stored in the jira-tokens table).
 /// Additionally, if the team has a webhook_secret configured, we verify the `X-Hub-Signature`
 /// header (HMAC-SHA256) for defense-in-depth.
+#[utoipa::path(
+    post,
+    path = "/webhooks/jira/{token}",
+    tag = "Webhooks",
+    operation_id = "receiveJiraWebhook",
+    summary = "Jira webhook",
+    description = "For a plain Jira webhook, when the CoderHelm Jira app can't be installed. The \
+        URL holds a token generated for your team on the Jira page of the dashboard. If you also \
+        generated a secret there, every request must carry `X-Hub-Signature`: `sha256=` and the hex \
+        HMAC-SHA256 of the raw body, keyed with that secret. Jira Cloud signs webhooks this way \
+        when you set the secret on the webhook; a Jira automation can send the header itself.",
+    params(("token" = String, Path, description = "The webhook token from the Jira page of the dashboard.")),
+    request_body(content = JiraWebhookBody, description = "The Jira event.", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Accepted (whether or not it started anything)."),
+        (status = 400, description = "The body is not JSON."),
+        (status = 401, description = "Unknown token, or the signature is missing or wrong."),
+    ),
+    security(("jira_signature" = []), ()),
+)]
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(token): axum::extract::Path<String>,

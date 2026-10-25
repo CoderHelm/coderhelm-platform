@@ -1,0 +1,4395 @@
+{
+  "components": {
+    "schemas": {
+      "CiUploadResult": {
+        "description": "A report that was taken in.",
+        "properties": {
+          "ok": {
+            "description": "Always true: the report is stored and queued for reading.",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
+      "CreatePlan": {
+        "description": "A new plan.",
+        "examples": [
+          {
+            "description": "Brute-force attempts are showing up in the auth logs.",
+            "repo": "acme/web",
+            "tasks": [
+              {
+                "acceptance_criteria": "The 11th attempt within 15 minutes gets 429 and a Retry-After header.",
+                "description": "Allow 10 attempts per IP per 15 minutes; answer 429 after that.",
+                "title": "Limit login attempts per IP"
+              }
+            ],
+            "title": "Rate-limit the login form"
+          }
+        ],
+        "properties": {
+          "description": {
+            "description": "More about it, in Markdown.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "destination": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanDestination",
+                "description": "Where each task becomes a ticket: a GitHub issue (`github`, the\ndefault) or a Jira ticket (`jira`)."
+              }
+            ]
+          },
+          "repo": {
+            "description": "The repository its tasks work in, `owner/name`, unless a task names its own.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tasks": {
+            "description": "The plan's tasks, in order. Each starts as `draft`.",
+            "items": {
+              "$ref": "#/components/schemas/NewPlanTask"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "What the plan is for. 1 to 500 characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      },
+      "CreatedPlan": {
+        "description": "The plan that was made.",
+        "properties": {
+          "plan_id": {
+            "description": "The new plan's id.",
+            "examples": [
+              "01JB8V0K3M5P7R9T1W3Y5A7C9E"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan_id"
+        ],
+        "type": "object"
+      },
+      "CustomRoleRef": {
+        "description": "A custom role, by id and name.",
+        "properties": {
+          "id": {
+            "description": "The role's id.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The role's name, as the team page shows it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "ErrorBody": {
+        "description": "The body of every error an API key request gets.",
+        "examples": [
+          {
+            "code": "missing_scope",
+            "error": "This API key doesn't have the \"runs\" scope (Retry, re-run, re-review, cancel, close or reopen runs).",
+            "scope": "runs"
+          }
+        ],
+        "properties": {
+          "code": {
+            "description": "What went wrong, for programs. One of: `bad_request`,\n`invalid_api_key`, `api_key_revoked`, `api_key_expired`,\n`api_key_owner_left`, `unauthorized`, `forbidden`, `missing_scope`,\n`not_available_to_api_keys`, `not_found`, `conflict`,\n`payload_too_large`, `rate_limited`, `token_limit_reached`,\n`internal_error`, `unavailable`. New codes may be added.",
+            "type": "string"
+          },
+          "error": {
+            "description": "A sentence to show a person.",
+            "type": "string"
+          },
+          "scope": {
+            "description": "With `missing_scope`: the scope the key would need.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "error",
+          "code"
+        ],
+        "type": "object"
+      },
+      "JiraRepoPin": {
+        "description": "Which repository a Jira ticket goes to. May also be sent at the top level.",
+        "properties": {
+          "repo_name": {
+            "description": "The repository's name.",
+            "examples": [
+              "web"
+            ],
+            "type": "string"
+          },
+          "repo_owner": {
+            "description": "The repository's owner.",
+            "examples": [
+              "acme"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_owner",
+          "repo_name"
+        ],
+        "type": "object"
+      },
+      "JiraWebhookBody": {
+        "description": "The body of a Jira webhook, as Jira sends it. Only the fields CoderHelm\nreads are listed; the rest are accepted and ignored.",
+        "examples": [
+          {
+            "coderhelm": {
+              "repo_name": "web",
+              "repo_owner": "acme"
+            },
+            "issue": {
+              "fields": {
+                "labels": [
+                  "coderhelm"
+                ],
+                "summary": "Add rate limiting to the login form"
+              },
+              "key": "WEB-42"
+            },
+            "webhookEvent": "jira:issue_updated"
+          }
+        ],
+        "properties": {
+          "coderhelm": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JiraRepoPin",
+                "description": "Optional: pin the ticket to a repository, from an automation."
+              }
+            ]
+          },
+          "comment": {
+            "description": "For comment events: the comment, with `body` and `author`.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "issue": {
+            "description": "The issue, with `key` and `fields` (summary, description, labels,\nassignee, project). A run starts when the issue has the label\n`coderhelm` (or one starting `coderhelm:`), or is assigned to a user\nwhose name contains \"CoderHelm\", in a project the team switched on.",
+            "type": "object"
+          },
+          "webhookEvent": {
+            "description": "The event, such as `jira:issue_created`, `jira:issue_updated` or\n`comment_created`. An event whose name contains `comment` retries a\nfailed run or sends feedback to an open pull request; other issue\nevents can start a run.",
+            "examples": [
+              "jira:issue_updated"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhookEvent",
+          "issue"
+        ],
+        "type": "object"
+      },
+      "Me": {
+        "description": "Who is calling: a person signed in to the dashboard, or a team API key.",
+        "properties": {
+          "api_key": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MeApiKey",
+                "description": "Set only when the caller is an API key."
+              }
+            ]
+          },
+          "auth_provider": {
+            "description": "How the caller signed in: `email`, `google`, `github`, or `api_key`.",
+            "examples": [
+              "api_key"
+            ],
+            "type": "string"
+          },
+          "avatar_url": {
+            "description": "The person's picture. Always null for an API key.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capabilities": {
+            "description": "The capability keys held. For an API key, its scopes as they stand on\nthis request: never more than its maker holds now.",
+            "examples": [
+              [
+                "view",
+                "runs"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "custom_role": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CustomRoleRef",
+                "description": "The person's custom role, when they have one. Null for an API key."
+              }
+            ]
+          },
+          "email": {
+            "description": "The person's email. For an API key, its maker's.",
+            "examples": [
+              "dev@example.com"
+            ],
+            "type": "string"
+          },
+          "github_login": {
+            "description": "The person's GitHub login. For an API key, its maker's.",
+            "examples": [
+              "octocat"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mfa_enabled": {
+            "description": "Whether the person turned on two-factor sign-in.",
+            "type": "boolean"
+          },
+          "platform_admin": {
+            "description": "Whether the caller administers the whole CoderHelm install (its\noperators, set in the install's configuration). Always false for an\nAPI key.",
+            "type": "boolean"
+          },
+          "role": {
+            "description": "The built-in role requests run as: `viewer`, `member`, `admin` or\n`owner`. For a custom role or an API key, the highest built-in role\nwhose capabilities are all held; `capabilities` says exactly what is.",
+            "examples": [
+              "viewer"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "description": "The team's account status: `active` or `suspended`.",
+            "examples": [
+              "active"
+            ],
+            "type": "string"
+          },
+          "team_id": {
+            "description": "The team every request acts on.",
+            "examples": [
+              "TEAM#4817263"
+            ],
+            "type": "string"
+          },
+          "user_id": {
+            "description": "The caller's id: `USER#...` for a person, `APIKEY#<id>` for an API key.",
+            "examples": [
+              "APIKEY#01jb8x6f4m2c9qz3t7v5w1k0ha"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "team_id",
+          "email",
+          "role",
+          "status",
+          "auth_provider",
+          "mfa_enabled",
+          "platform_admin"
+        ],
+        "type": "object"
+      },
+      "MeApiKey": {
+        "description": "The API key a request was made with.",
+        "properties": {
+          "created_by": {
+            "description": "Who made it. The key acts within that person's access.",
+            "examples": [
+              "dev@example.com"
+            ],
+            "type": "string"
+          },
+          "expires_at": {
+            "description": "When it stops working (RFC 3339), or null if it doesn't expire.",
+            "examples": [
+              "2027-01-01T00:00:00Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "The key's id, the part after `chk_` and before the next `_`.",
+            "examples": [
+              "01jb8x6f4m2c9qz3t7v5w1k0ha"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "description": "The name the admin gave it.",
+            "examples": [
+              "Deploy pipeline"
+            ],
+            "type": "string"
+          },
+          "rate_limit_per_minute": {
+            "description": "Requests the key may make in a minute.",
+            "examples": [
+              600
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_by",
+          "rate_limit_per_minute"
+        ],
+        "type": "object"
+      },
+      "NewPlanTask": {
+        "description": "A task in a new plan.",
+        "properties": {
+          "acceptance_criteria": {
+            "description": "How to tell it is done.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "How, in Markdown. The coder reads it as the ticket body.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "destination": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanDestination",
+                "description": "Where this task becomes a ticket, when not where the plan's do."
+              }
+            ]
+          },
+          "jira_project": {
+            "description": "With `jira`: the Jira project key to file the ticket in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo": {
+            "description": "The repository for this task, `owner/name`, when not the plan's.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "What to do. Defaults to \"Untitled task\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "Plan": {
+        "description": "A plan.",
+        "properties": {
+          "chat_id": {
+            "description": "The plan chat it came from.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "description": "When it was made (RFC 3339).",
+            "examples": [
+              "2026-10-22T13:40:00+00:00"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "More about it, in Markdown.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "destination": {
+            "description": "`github` or `jira`: where its tasks become tickets.",
+            "examples": [
+              "github"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "executed_at": {
+            "description": "When it started running (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "executed_by": {
+            "description": "Who started it running.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mcp_servers": {
+            "description": "MCP servers used while planning.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "plan_id": {
+            "description": "The plan's id.",
+            "examples": [
+              "01JB8V0K3M5P7R9T1W3Y5A7C9E"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo": {
+            "description": "The repository its tasks work in, `owner/name`.",
+            "examples": [
+              "acme/web"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`draft`, `executing` or `completed`.",
+            "examples": [
+              "draft"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_count": {
+            "description": "How many tasks it has.",
+            "examples": [
+              3
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "title": {
+            "description": "What the plan is for.",
+            "examples": [
+              "Rate-limit the login form"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tokens_in": {
+            "description": "Input tokens its runs used so far.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tokens_out": {
+            "description": "Output tokens its runs used so far.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "description": "When it last changed (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "task_count"
+        ],
+        "type": "object"
+      },
+      "PlanDestination": {
+        "description": "Where a plan's tasks become tickets: `github` (GitHub issues) or `jira`.",
+        "enum": [
+          "github",
+          "jira"
+        ],
+        "type": "string"
+      },
+      "PlanExecution": {
+        "description": "A plan that started running.",
+        "properties": {
+          "status": {
+            "description": "Always `executing`.",
+            "examples": [
+              "executing"
+            ],
+            "type": "string"
+          },
+          "tasks_queued": {
+            "description": "How many tasks were queued.",
+            "examples": [
+              3
+            ],
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "tasks_queued"
+        ],
+        "type": "object"
+      },
+      "PlanTask": {
+        "description": "A task in a plan.",
+        "properties": {
+          "acceptance_criteria": {
+            "description": "How to tell it is done.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_at": {
+            "description": "When it was approved (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_by": {
+            "description": "Who approved it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "description": "When it was made (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "depends_on": {
+            "description": "The task it waits for, when it depends on one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "How, in Markdown.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "destination": {
+            "description": "`github` or `jira`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "issue_number": {
+            "description": "The GitHub issue it became.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "issue_url": {
+            "description": "That issue's address.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "jira_project": {
+            "description": "The Jira project it is filed in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "jira_ticket_key": {
+            "description": "The Jira ticket it became.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "jira_ticket_url": {
+            "description": "That ticket's address.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "order": {
+            "description": "Its place in the plan, from 0.",
+            "examples": [
+              0
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "plan_id": {
+            "description": "The plan it belongs to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pr_url": {
+            "description": "The pull request that run opened.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rejected_at": {
+            "description": "When it was rejected (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rejected_by": {
+            "description": "Who rejected it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo": {
+            "description": "Its repository, when not the plan's.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "description": "The run working on it.",
+            "examples": [
+              "01JB8X6F4M2C9QZ3T7V5W1K0HA"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`draft`, `approved`, `rejected`, `queued`, `waiting` (on a task it\ndepends on), `running`, `completed` or `failed`.",
+            "examples": [
+              "queued"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_id": {
+            "description": "The task's id.",
+            "examples": [
+              "01JB8V0P8Q2S4U6W8Y0A2C4E6G"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "What to do.",
+            "examples": [
+              "Limit login attempts per IP"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "order"
+        ],
+        "type": "object"
+      },
+      "PlanWithTasks": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Plan"
+          },
+          {
+            "properties": {
+              "tasks": {
+                "description": "The plan's tasks, in order.",
+                "items": {
+                  "$ref": "#/components/schemas/PlanTask"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "tasks"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "A plan with its tasks."
+      },
+      "PlansPage": {
+        "description": "A page of plans.",
+        "properties": {
+          "next": {
+            "description": "Pass as `cursor` to read the next page; null on the last page.",
+            "examples": [
+              "PLAN#01JB8V0K3M5P7R9T1W3Y5A7C9E"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_cursor": {
+            "deprecated": true,
+            "description": "The same as `next`, kept for older clients.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plans": {
+            "description": "Plans, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/Plan"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "plans"
+        ],
+        "type": "object"
+      },
+      "Quarantine": {
+        "description": "The tests quarantined for the calling repository.",
+        "properties": {
+          "playwright_grep_invert": {
+            "description": "A pattern for Playwright's `--grep-invert` that skips them; empty when none are.",
+            "examples": [
+              "checkout applies a discount code"
+            ],
+            "type": "string"
+          },
+          "tests": {
+            "description": "Every quarantined test.",
+            "items": {
+              "$ref": "#/components/schemas/QuarantinedTest"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tests",
+          "playwright_grep_invert"
+        ],
+        "type": "object"
+      },
+      "QuarantinedTest": {
+        "description": "A quarantined test.",
+        "properties": {
+          "file": {
+            "description": "Its file.",
+            "examples": [
+              "e2e/checkout.spec.ts"
+            ],
+            "type": "string"
+          },
+          "framework": {
+            "description": "`playwright`, `cucumber` or `junit`.",
+            "examples": [
+              "playwright"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "description": "CoderHelm's id for the test.",
+            "type": "string"
+          },
+          "project": {
+            "description": "The Playwright project, when there is one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "Its title, `describe › title`.",
+            "examples": [
+              "checkout › applies a discount code"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "file",
+          "framework"
+        ],
+        "type": "object"
+      },
+      "RatingComment": {
+        "description": "A rating someone on the team gave a review, with their comment.",
+        "properties": {
+          "at": {
+            "description": "When (RFC 3339).",
+            "type": "string"
+          },
+          "by": {
+            "description": "Who rated it.",
+            "examples": [
+              "octocat"
+            ],
+            "type": "string"
+          },
+          "rating": {
+            "description": "`up`, `down` or `none` (a comment without a rating).",
+            "examples": [
+              "up"
+            ],
+            "type": "string"
+          },
+          "text": {
+            "description": "What they said.",
+            "examples": [
+              "Good catch on the counter."
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "by",
+          "text",
+          "rating",
+          "at"
+        ],
+        "type": "object"
+      },
+      "Repo": {
+        "description": "A repository connected to the team.",
+        "properties": {
+          "enabled": {
+            "description": "Whether CoderHelm works on it.",
+            "examples": [
+              true
+            ],
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "`owner/name`.",
+            "examples": [
+              "acme/web"
+            ],
+            "type": "string"
+          },
+          "onboard_error": {
+            "description": "Why reading it failed, when it did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "onboard_status": {
+            "description": "How far CoderHelm got reading it when it was connected, such as\n`pending`, `ready` or `failed`.",
+            "examples": [
+              "ready"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "description": "What the repository is for, as the team set it, such as `web` or `backend`.",
+            "examples": [
+              "web"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ticket_source": {
+            "description": "Where its tickets come from: `github` or `jira`.",
+            "examples": [
+              "github"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "ReposList": {
+        "description": "The team's repositories.",
+        "properties": {
+          "repos": {
+            "description": "Every connected repository, in name order.",
+            "items": {
+              "$ref": "#/components/schemas/Repo"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "repos"
+        ],
+        "type": "object"
+      },
+      "Review": {
+        "description": "A pull request review by CoderHelm's reviewer.",
+        "properties": {
+          "action_summary": {
+            "description": "What the reviewer did besides reviewing, such as arming auto-merge.",
+            "type": "string"
+          },
+          "applied_standards": {
+            "description": "The team standards the review was given in full (\"always apply\").",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "body": {
+            "description": "The review as posted, in Markdown. Cut to about 4,000 characters in a list.",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "When it was written (RFC 3339).",
+            "examples": [
+              "2026-10-22T14:20:05Z"
+            ],
+            "type": "string"
+          },
+          "findings": {
+            "description": "The structured findings. Null in a list (get the review for them) and\non older reviews.",
+            "items": {
+              "$ref": "#/components/schemas/ReviewFinding"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "head_sha": {
+            "description": "The commit reviewed.",
+            "examples": [
+              "9fceb02d0ae598e95dc970b74767f19372d61af8"
+            ],
+            "type": "string"
+          },
+          "posted_as": {
+            "description": "The GitHub review event it was posted as: `APPROVE`,\n`REQUEST_CHANGES` or `COMMENT`.",
+            "examples": [
+              "REQUEST_CHANGES"
+            ],
+            "type": "string"
+          },
+          "pr_number": {
+            "description": "The pull request number.",
+            "examples": [
+              318
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pr_title": {
+            "description": "The pull request's title. Empty on older reviews.",
+            "examples": [
+              "Rate-limit the login form"
+            ],
+            "type": "string"
+          },
+          "rating_comments": {
+            "description": "Ratings with comments.",
+            "items": {
+              "$ref": "#/components/schemas/RatingComment"
+            },
+            "type": "array"
+          },
+          "repo": {
+            "description": "The repository, `owner/name`.",
+            "examples": [
+              "acme/web"
+            ],
+            "type": "string"
+          },
+          "risk": {
+            "description": "The risk the reviewer gave the change: `LOW`, `MEDIUM` or `HIGH`.",
+            "examples": [
+              "MEDIUM"
+            ],
+            "type": "string"
+          },
+          "sk": {
+            "description": "The review's key: pass it as `sk` to get the review.",
+            "examples": [
+              "REVIEW#acme/web#318#2026-10-22T14:20:05Z"
+            ],
+            "type": "string"
+          },
+          "thumbs_down": {
+            "description": "Thumbs down from the team.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "thumbs_up": {
+            "description": "Thumbs up from the team.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "trigger": {
+            "description": "What asked for it, such as `label`, `rerequest`, `reply` or `sweep`.",
+            "examples": [
+              "label"
+            ],
+            "type": "string"
+          },
+          "verdict": {
+            "description": "The reviewer's verdict: `APPROVE` or `REQUEST_CHANGES`.",
+            "examples": [
+              "REQUEST_CHANGES"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "sk",
+          "repo",
+          "pr_number",
+          "head_sha",
+          "verdict",
+          "risk",
+          "body",
+          "posted_as",
+          "trigger",
+          "action_summary",
+          "thumbs_up",
+          "thumbs_down",
+          "rating_comments",
+          "created_at",
+          "pr_title",
+          "applied_standards"
+        ],
+        "type": "object"
+      },
+      "ReviewFinding": {
+        "description": "One finding in a review. Kept as the reviewer wrote it; fields beyond\nthese may appear.",
+        "properties": {
+          "blocks": {
+            "description": "For a question: whether the change's correctness depends on the answer.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "body": {
+            "description": "The explanation, in Markdown.",
+            "type": "string"
+          },
+          "category": {
+            "description": "What kind of finding, such as `bug`, `security` or `manual-check`.",
+            "examples": [
+              "bug"
+            ],
+            "type": "string"
+          },
+          "end_line": {
+            "description": "The last line, when it spans several.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "evidence": {
+            "description": "What it rests on: `verified-defect`, `unverified-concern` or `question`.\nOnly a verified defect holds the merge.",
+            "examples": [
+              "verified-defect"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file": {
+            "description": "The file, relative to the repository root.",
+            "examples": [
+              "src/auth/login.ts"
+            ],
+            "type": "string"
+          },
+          "line": {
+            "description": "The line it is about.",
+            "examples": [
+              42
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lookups": {
+            "description": "The lookups the finding rests on.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "severity": {
+            "description": "`blocking`, `high`, `medium`, `low` or `nit`.",
+            "examples": [
+              "high"
+            ],
+            "type": "string"
+          },
+          "suggestion": {
+            "description": "Replacement text for the line(s), when there is a concrete fix.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "One line on what is wrong.",
+            "examples": [
+              "The attempt counter is never reset after a successful login"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "line",
+          "severity",
+          "category",
+          "title",
+          "body",
+          "lookups"
+        ],
+        "type": "object"
+      },
+      "ReviewsPage": {
+        "description": "A page of reviews.",
+        "properties": {
+          "next": {
+            "description": "Pass as `cursor` to read the next page; null on the last page.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reviews": {
+            "description": "Reviews, newest first. Findings are left out here.",
+            "items": {
+              "$ref": "#/components/schemas/Review"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "reviews"
+        ],
+        "type": "object"
+      },
+      "Run": {
+        "description": "One run, in full.",
+        "properties": {
+          "applied_standards": {
+            "description": "The team standards the run was given in full (\"always apply\").",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "branch": {
+            "description": "The branch the run pushed.",
+            "examples": [
+              "coderhelm/web-42-login-rate-limit"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branches": {
+            "description": "Their branches, in the same order.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "description": "Tokens read from the prompt cache.",
+            "examples": [
+              905112
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cache_write_tokens": {
+            "description": "Tokens written to the prompt cache.",
+            "examples": [
+              64002
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "close_reason": {
+            "description": "Why it was closed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closed_at": {
+            "description": "When it was closed (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closed_by": {
+            "description": "Who closed the run on purpose.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closed_from": {
+            "description": "The status it had when it was closed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cost_usd": {
+            "description": "What the run cost in model usage, in US dollars, as recorded.",
+            "examples": [
+              1.42
+            ],
+            "format": "double",
+            "type": "number"
+          },
+          "created_at": {
+            "description": "When the run started (RFC 3339).",
+            "examples": [
+              "2026-10-22T14:03:11Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_pass": {
+            "description": "The step the run is on or ended on.",
+            "examples": [
+              "pr"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "duration_s": {
+            "description": "How long the run took, in seconds.",
+            "examples": [
+              734
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Why the run failed, when it did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "files_modified": {
+            "description": "The files the run changed.",
+            "examples": [
+              [
+                "src/auth/login.ts",
+                "src/auth/login.test.ts"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "fix_location": {
+            "description": "Where the fix belongs: `code`, or somewhere outside the code.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lesson": {
+            "description": "A lesson recorded for the repository when the fix was elsewhere.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mcp_servers": {
+            "description": "The MCP servers the run used.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "outside_change_report": {
+            "description": "The report written when (part of) the fix is a change outside the code.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pass_history": {
+            "description": "The steps it went through, in order.",
+            "items": {
+              "$ref": "#/components/schemas/RunPass"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "pr_number": {
+            "description": "That pull request's number.",
+            "examples": [
+              318
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pr_numbers": {
+            "description": "Their numbers, in the same order.",
+            "items": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "pr_url": {
+            "description": "The pull request the run opened.",
+            "examples": [
+              "https://github.com/acme/web/pull/318"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pr_urls": {
+            "description": "Every pull request, when the work spans several repositories.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "progress_notes": {
+            "description": "Notes it wrote while working, in order.",
+            "items": {
+              "$ref": "#/components/schemas/RunNote"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "repo": {
+            "description": "The repository, `owner/name`.",
+            "examples": [
+              "acme/web"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,\n`failed`, `needs_input`, `needs_outside_change`, `cancelled`,\n`retried` or `closed`. Treat a value you don't know as in progress.",
+            "examples": [
+              "completed"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ticket_id": {
+            "description": "The ticket's key or issue number in its source.",
+            "examples": [
+              "WEB-42"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ticket_source": {
+            "description": "What started it, such as `github`, `jira` or `alert`.",
+            "examples": [
+              "jira"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "The ticket's title.",
+            "examples": [
+              "Add rate limiting to the login form"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tokens_in": {
+            "description": "Input tokens, not counting cache reads and writes.",
+            "examples": [
+              182340
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_out": {
+            "description": "Output tokens.",
+            "examples": [
+              20511
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated_at": {
+            "description": "When it last changed (RFC 3339).",
+            "examples": [
+              "2026-10-22T14:15:25Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tokens_in",
+          "tokens_out",
+          "cache_read_tokens",
+          "cache_write_tokens",
+          "cost_usd",
+          "applied_standards"
+        ],
+        "type": "object"
+      },
+      "RunActionResult": {
+        "description": "What a run action did.",
+        "properties": {
+          "status": {
+            "description": "`retrying` after a retry, `cancelled` after a cancel.",
+            "examples": [
+              "retrying"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "RunNote": {
+        "description": "A note the run wrote while it worked.",
+        "properties": {
+          "message": {
+            "description": "What it said.",
+            "examples": [
+              "Tests pass; opening the pull request."
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timestamp": {
+            "description": "When (RFC 3339).",
+            "examples": [
+              "2026-10-22T14:15:02Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "RunPass": {
+        "description": "One step a run went through.",
+        "properties": {
+          "pass": {
+            "description": "The step, such as `triage`, `plan`, `implement`, `test`, `security`,\n`pr`, `review`, `feedback` or `ci_fix`.",
+            "examples": [
+              "implement"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "description": "When it started (RFC 3339).",
+            "examples": [
+              "2026-10-22T14:05:40Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "RunSummary": {
+        "description": "One run in a list.",
+        "properties": {
+          "cost_usd": {
+            "description": "What the run cost in model usage, in US dollars, as recorded.",
+            "examples": [
+              1.42
+            ],
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "created_at": {
+            "description": "When the run started (RFC 3339).",
+            "examples": [
+              "2026-10-22T14:03:11Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_pass": {
+            "description": "The step the run is on or ended on, such as `triage`, `plan`,\n`implement`, `review` or `pr`.",
+            "examples": [
+              "pr"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "duration_s": {
+            "description": "How long the run took, in seconds.",
+            "examples": [
+              734
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pr_number": {
+            "description": "That pull request's number.",
+            "examples": [
+              318
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pr_url": {
+            "description": "The pull request the run opened.",
+            "examples": [
+              "https://github.com/acme/web/pull/318"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo": {
+            "description": "The repository, `owner/name`.",
+            "examples": [
+              "acme/web"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "description": "The run's id, a ULID. Newer runs sort after older ones.",
+            "examples": [
+              "01JB8X6F4M2C9QZ3T7V5W1K0HA"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,\n`failed`, `needs_input`, `needs_outside_change`, `cancelled`,\n`retried` or `closed`. Treat a value you don't know as in progress.",
+            "examples": [
+              "completed"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ticket_id": {
+            "description": "The ticket's key or issue number in its source.",
+            "examples": [
+              "WEB-42"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ticket_source": {
+            "description": "What started it, such as `github`, `jira` or `alert`.",
+            "examples": [
+              "jira"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "The ticket's title.",
+            "examples": [
+              "Add rate limiting to the login form"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tokens_in": {
+            "description": "Input tokens used.",
+            "examples": [
+              182340
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tokens_out": {
+            "description": "Output tokens used.",
+            "examples": [
+              20511
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "RunsPage": {
+        "description": "A page of runs.",
+        "properties": {
+          "next": {
+            "description": "Pass as `cursor` to read on; null when there are no older runs.",
+            "examples": [
+              "01JB8W2Q7N4D6R8S0T2V4X6Z8A"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runs": {
+            "description": "Runs that match, newest first. Can be short, or empty, while `next`\nis set: older runs are still unread.",
+            "items": {
+              "$ref": "#/components/schemas/RunSummary"
+            },
+            "type": "array"
+          },
+          "scanned": {
+            "description": "How many runs were read to fill this page (searches and filters skip some).",
+            "examples": [
+              50
+            ],
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runs",
+          "scanned"
+        ],
+        "type": "object"
+      },
+      "SnsEnvelope": {
+        "description": "An Amazon SNS message, as SNS posts it to an HTTPS subscription.",
+        "examples": [
+          {
+            "Message": "{\"AlarmName\":\"api-5xx\",\"NewStateValue\":\"ALARM\"}",
+            "MessageId": "6c3f7c6e-2f4b-5b8e-9b0e-1f0a2b3c4d5e",
+            "Signature": "EXAMPLE...",
+            "SignatureVersion": "2",
+            "SigningCertURL": "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-0000.pem",
+            "Subject": "ALARM: \"api-5xx\" in US East (N. Virginia)",
+            "Timestamp": "2026-10-22T14:00:00.000Z",
+            "TopicArn": "arn:aws:sns:us-east-1:123456789012:prod-alarms",
+            "Type": "Notification"
+          }
+        ],
+        "properties": {
+          "Message": {
+            "description": "The message: a CloudWatch alarm, an AWS Chatbot custom notification,\nan EventBridge event (as JSON text) or plain text.",
+            "type": "string"
+          },
+          "MessageId": {
+            "description": "SNS's id for the message.",
+            "type": "string"
+          },
+          "Signature": {
+            "description": "SNS's signature over the message's fields.",
+            "type": "string"
+          },
+          "SignatureVersion": {
+            "description": "`1` (SHA1) or `2` (SHA256).",
+            "type": "string"
+          },
+          "SigningCertURL": {
+            "description": "The certificate that signed it; must be served by SNS.",
+            "type": "string"
+          },
+          "Subject": {
+            "description": "The subject, when the publisher set one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "SubscribeURL": {
+            "description": "For a subscription confirmation: the address CoderHelm visits to confirm.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "Timestamp": {
+            "description": "When SNS sent it.",
+            "type": "string"
+          },
+          "TopicArn": {
+            "description": "The topic. It must have an enabled alert route in the dashboard.",
+            "type": "string"
+          },
+          "Type": {
+            "description": "`SubscriptionConfirmation`, `Notification` or `UnsubscribeConfirmation`.",
+            "examples": [
+              "Notification"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "Type",
+          "MessageId",
+          "TopicArn",
+          "Message",
+          "Timestamp",
+          "SignatureVersion",
+          "Signature",
+          "SigningCertURL"
+        ],
+        "type": "object"
+      },
+      "Usage": {
+        "description": "The team's token usage this month.",
+        "properties": {
+          "cache_hit_rate": {
+            "description": "Cache reads divided by all input, from 0 to 1.",
+            "examples": [
+              0.77
+            ],
+            "format": "double",
+            "type": "number"
+          },
+          "cache_read_tokens": {
+            "description": "Tokens read from the prompt cache.",
+            "examples": [
+              13100400
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cache_write_tokens": {
+            "description": "Tokens written to the prompt cache.",
+            "examples": [
+              822392
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "counted_tokens": {
+            "description": "What the older single limit counts (kept for older clients).",
+            "examples": [
+              4310227
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "features": {
+            "description": "Usage per feature.",
+            "items": {
+              "$ref": "#/components/schemas/UsageFeature"
+            },
+            "type": "array"
+          },
+          "limit_counts_cache": {
+            "description": "Whether the older single limit counts cache tokens (kept for older clients).",
+            "type": "boolean"
+          },
+          "limits": {
+            "description": "Each limit that is set, in display order. Empty when none is.",
+            "items": {
+              "$ref": "#/components/schemas/UsageLimit"
+            },
+            "type": "array"
+          },
+          "limits_legacy": {
+            "description": "True when the limits were read from the older single-limit setting.",
+            "type": "boolean"
+          },
+          "max_tokens": {
+            "description": "The older single limit, 0 when it isn't used (kept for older clients).",
+            "examples": [
+              0
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "month": {
+            "description": "The month, `YYYY-MM` (UTC).",
+            "examples": [
+              "2026-10"
+            ],
+            "type": "string"
+          },
+          "new_tokens": {
+            "description": "New input plus output: what the `new_tokens` limit counts.",
+            "examples": [
+              4310227
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_in": {
+            "description": "New input tokens (not from the cache).",
+            "examples": [
+              3011022
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_out": {
+            "description": "Output tokens.",
+            "examples": [
+              1299205
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_runs": {
+            "description": "Runs started this month.",
+            "examples": [
+              37
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "description": "All tokens: new input, cache reads, cache writes and output.",
+            "examples": [
+              18233019
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "month",
+          "total_tokens",
+          "tokens_in",
+          "cache_read_tokens",
+          "cache_write_tokens",
+          "tokens_out",
+          "new_tokens",
+          "cache_hit_rate",
+          "limits",
+          "limits_legacy",
+          "counted_tokens",
+          "limit_counts_cache",
+          "features",
+          "total_runs",
+          "max_tokens"
+        ],
+        "type": "object"
+      },
+      "UsageFeature": {
+        "description": "One feature's share of the month's tokens.",
+        "properties": {
+          "cache_read_tokens": {
+            "description": "Tokens read from the prompt cache.",
+            "examples": [
+              1900410
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cache_write_tokens": {
+            "description": "Tokens written to the prompt cache.",
+            "examples": [
+              151002
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "feature": {
+            "description": "The feature, such as `coder`, `reviewer`, `plan_chat` or `log_analyzer`.",
+            "examples": [
+              "reviewer"
+            ],
+            "type": "string"
+          },
+          "tokens_in": {
+            "description": "New input tokens (not from the cache).",
+            "examples": [
+              301200
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_out": {
+            "description": "Output tokens.",
+            "examples": [
+              57410
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "description": "All four parts together.",
+            "examples": [
+              2410022
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "feature",
+          "total_tokens",
+          "tokens_in",
+          "cache_read_tokens",
+          "cache_write_tokens",
+          "tokens_out"
+        ],
+        "type": "object"
+      },
+      "UsageLimit": {
+        "description": "One limit the team set, and what it counts this month.",
+        "properties": {
+          "kind": {
+            "description": "What it counts: `new_tokens` (new input and output), `cache_read`,\n`cache_write`, or `all_tokens` (an older single limit that counts cache too).",
+            "examples": [
+              "new_tokens"
+            ],
+            "type": "string"
+          },
+          "max": {
+            "description": "The limit.",
+            "examples": [
+              20000000
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "used": {
+            "description": "What it counts so far this month.",
+            "examples": [
+              4310227
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "max",
+          "used"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "api_key": {
+        "bearerFormat": "chk_<id>_<secret>",
+        "description": "A team API key, made by an admin under Settings, API keys. Send it as `Authorization: Bearer chk_...`.",
+        "scheme": "bearer",
+        "type": "http"
+      },
+      "github_oidc": {
+        "bearerFormat": "JWT",
+        "description": "A GitHub Actions OIDC token requested with the audience `coderhelm`, from a workflow run of a repository connected to your team.",
+        "scheme": "bearer",
+        "type": "http"
+      },
+      "github_signature": {
+        "description": "`sha256=` and the hex HMAC-SHA256 of the raw body, keyed with the GitHub App's webhook secret.",
+        "in": "header",
+        "name": "X-Hub-Signature-256",
+        "type": "apiKey"
+      },
+      "jira_signature": {
+        "description": "Only when the team generated a webhook secret: `sha256=` and the hex HMAC-SHA256 of the raw body, keyed with that secret.",
+        "in": "header",
+        "name": "X-Hub-Signature",
+        "type": "apiKey"
+      }
+    }
+  },
+  "info": {
+    "contact": {
+      "name": "CoderHelm support",
+      "url": "https://docs.coderhelm.com/api"
+    },
+    "description": "The CoderHelm API lets your own programs start and follow CoderHelm's work: list and inspect runs, retry or cancel them, create and run plans, read the reviewer's reviews, and check token usage.\n\nEvery request is authenticated with a team API key sent as a bearer token. Admins create keys in the dashboard under Settings, API keys. A key holds scopes, never more than the admin who made it, and has its own rate limit.\n\nCI jobs upload test reports with a GitHub Actions OIDC token instead of a key, and the webhooks are verified by their signatures.",
+    "license": {
+      "identifier": "MIT",
+      "name": "MIT"
+    },
+    "title": "CoderHelm API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/me": {
+      "get": {
+        "description": "Returns who the request is authenticated as. With an API key this is the key itself: its name, who made it, when it expires, its rate limit, and in `capabilities` the scopes it holds right now (cut down to what its maker holds). Call it first to check a key works.",
+        "operationId": "getMe",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            },
+            "description": "The caller.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ],
+        "summary": "Get the caller",
+        "tags": [
+          "Account"
+        ]
+      }
+    },
+    "/api/plans": {
+      "get": {
+        "description": "Lists the team's plans, newest first, one page at a time. A listed plan has no tasks; get one plan for its tasks.",
+        "operationId": "listPlans",
+        "parameters": [
+          {
+            "description": "Plans per page, 1 to 100. Default 20.",
+            "example": 20,
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`next` from the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlansPage"
+                }
+              }
+            },
+            "description": "A page of plans.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "view"
+            ]
+          }
+        ],
+        "summary": "List plans",
+        "tags": [
+          "Plans"
+        ]
+      },
+      "post": {
+        "description": "Creates a plan, with its tasks if you send them. The plan and its tasks start as `draft`; nothing runs until the plan is executed. Not idempotent: sending the same request twice makes two plans.",
+        "operationId": "createPlan",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePlan"
+              }
+            }
+          },
+          "description": "The plan.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedPlan"
+                }
+              }
+            },
+            "description": "The plan was made.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is not valid JSON, or the title is missing or longer than 500 characters."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "plans"
+            ]
+          }
+        ],
+        "summary": "Create a plan",
+        "tags": [
+          "Plans"
+        ]
+      }
+    },
+    "/api/plans/{plan_id}": {
+      "get": {
+        "description": "Returns one plan with its tasks in order. Once the plan runs, each task shows the ticket it became and the run working on it (`run_id`), which you can follow with `GET /api/runs/{run_id}`.",
+        "operationId": "getPlan",
+        "parameters": [
+          {
+            "description": "The plan's id.",
+            "example": "01JB8V0K3M5P7R9T1W3Y5A7C9E",
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanWithTasks"
+                }
+              }
+            },
+            "description": "The plan and its tasks.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The id is not a plan id."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No plan with this id in the team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "view"
+            ]
+          }
+        ],
+        "summary": "Get a plan",
+        "tags": [
+          "Plans"
+        ]
+      }
+    },
+    "/api/plans/{plan_id}/approve-and-execute": {
+      "post": {
+        "description": "Approves every `draft` task of the plan and runs the plan: each approved task becomes a GitHub issue or Jira ticket and is queued as a run, in task order. The plan becomes `executing`. Rejected tasks are skipped. Answers `400` when no task is left to run, so calling it again after a successful call does not run anything twice.",
+        "operationId": "approveAndExecutePlan",
+        "parameters": [
+          {
+            "description": "The plan's id.",
+            "example": "01JB8V0K3M5P7R9T1W3Y5A7C9E",
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanExecution"
+                }
+              }
+            },
+            "description": "The plan is running.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The id is not a plan id, or the plan has no draft or approved tasks."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "plans"
+            ]
+          }
+        ],
+        "summary": "Approve and run a plan",
+        "tags": [
+          "Plans"
+        ]
+      }
+    },
+    "/api/repos": {
+      "get": {
+        "description": "Lists the repositories connected to the team through the CoderHelm GitHub App, whether CoderHelm works on each, and where its tickets come from. Not paged: a team's repositories come back in one answer.",
+        "operationId": "listRepos",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReposList"
+                }
+              }
+            },
+            "description": "The team's repositories.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "view"
+            ]
+          }
+        ],
+        "summary": "List repositories",
+        "tags": [
+          "Repositories"
+        ]
+      }
+    },
+    "/api/reviewer/review": {
+      "get": {
+        "description": "Returns one review in full: the whole body, the structured findings with file, line, severity and what each rests on, and the team's ratings.",
+        "operationId": "getReview",
+        "parameters": [
+          {
+            "description": "The review's `sk`, from a list of reviews.",
+            "example": "REVIEW#acme/web#318#2026-10-22T14:20:05Z",
+            "in": "query",
+            "name": "sk",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Review"
+                }
+              }
+            },
+            "description": "The review.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "`sk` is not a review key."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No such review in the team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "view"
+            ]
+          }
+        ],
+        "summary": "Get a review",
+        "tags": [
+          "Reviews"
+        ]
+      }
+    },
+    "/api/reviewer/reviews": {
+      "get": {
+        "description": "Lists the reviewer's pull request reviews, newest first, one page at a time, for the whole team or one repository. Bodies are cut to about 4,000 characters and findings are left out; get a review by its `sk` for both.",
+        "operationId": "listReviews",
+        "parameters": [
+          {
+            "description": "Only this repository, `owner/name`. Omit for the whole team.",
+            "example": "acme/web",
+            "in": "query",
+            "name": "repo",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Reviews per page, 1 to 200. Default 50.",
+            "example": 50,
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`next` from the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewsPage"
+                }
+              }
+            },
+            "description": "A page of reviews.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "`repo` is not `owner/name`."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "view"
+            ]
+          }
+        ],
+        "summary": "List reviews",
+        "tags": [
+          "Reviews"
+        ]
+      }
+    },
+    "/api/runs": {
+      "get": {
+        "description": "Lists the team's runs, newest first, one page at a time. Search with `q` and filter by `status`, `source` and `repo`. Each page reads at most a few hundred runs, so a page can come back short, or empty, with `next` set: keep reading until `next` is null.",
+        "operationId": "listRuns",
+        "parameters": [
+          {
+            "description": "Only runs from this source, such as `github`, `jira` or `alert`.",
+            "example": "jira",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Runs per page, 1 to 100. Default 50.",
+            "example": 20,
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`next` from the previous page (the last run id it covered).",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Search words: ticket key or number, title, repo, PR number, status.",
+            "example": "WEB-42",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated exact statuses, e.g. `failed,cancelled`.",
+            "example": "failed,cancelled",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "One repo, `owner/name` (exact, case-insensitive).",
+            "example": "acme/web",
+            "in": "query",
+            "name": "repo",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunsPage"
+                }
+              }
+            },
+            "description": "A page of runs.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "view"
+            ]
+          }
+        ],
+        "summary": "List runs",
+        "tags": [
+          "Runs"
+        ]
+      }
+    },
+    "/api/runs/{run_id}": {
+      "get": {
+        "description": "Returns one run in full: its status and current step, the pull requests and branches it opened, the files it changed, token use and cost, and the notes it wrote while working. Poll it to follow a run; a few seconds apart is plenty.",
+        "operationId": "getRun",
+        "parameters": [
+          {
+            "description": "The run's id.",
+            "example": "01JB8X6F4M2C9QZ3T7V5W1K0HA",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            },
+            "description": "The run.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No run with this id in the team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "view"
+            ]
+          }
+        ],
+        "summary": "Get a run",
+        "tags": [
+          "Runs"
+        ]
+      }
+    },
+    "/api/runs/{run_id}/cancel": {
+      "post": {
+        "description": "Stops a run that is `running`. The run becomes `cancelled`, and the work it has not done yet is dropped; a pull request it already opened stays open. A run in any other state answers `400`, so cancelling twice is harmless.",
+        "operationId": "cancelRun",
+        "parameters": [
+          {
+            "description": "The run's id.",
+            "example": "01JB8X6F4M2C9QZ3T7V5W1K0HA",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "status": "cancelled"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/RunActionResult"
+                }
+              }
+            },
+            "description": "The run is cancelled.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The run is not running (or doesn't exist)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "runs"
+            ]
+          }
+        ],
+        "summary": "Cancel a run",
+        "tags": [
+          "Runs"
+        ]
+      }
+    },
+    "/api/runs/{run_id}/retry": {
+      "post": {
+        "description": "Starts the run's ticket again as a new run. Only a run that is `failed`, `needs_input`, `needs_outside_change`, `cancelled` or `closed` can be retried; the old run becomes `retried`, so retrying it twice is refused with `400`. Find the new run with `GET /api/runs?q=<ticket id>`.",
+        "operationId": "retryRun",
+        "parameters": [
+          {
+            "description": "The run's id.",
+            "example": "01JB8X6F4M2C9QZ3T7V5W1K0HA",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "status": "retrying"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/RunActionResult"
+                }
+              }
+            },
+            "description": "The ticket is queued again.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The run is not in a state that can be retried."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No run with this id in the team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "runs"
+            ]
+          }
+        ],
+        "summary": "Retry a run",
+        "tags": [
+          "Runs"
+        ]
+      }
+    },
+    "/api/usage": {
+      "get": {
+        "description": "Returns the tokens the team used this calendar month (UTC), split into new input, output, cache reads and cache writes, per feature, and against each limit the team set. When a limit is reached, endpoints that start work answer `429` with `token_limit_reached` until the month turns or an admin raises it.",
+        "operationId": "getUsage",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Usage"
+                }
+              }
+            },
+            "description": "This month's usage.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "view"
+            ]
+          }
+        ],
+        "summary": "Get this month's usage",
+        "tags": [
+          "Usage"
+        ]
+      }
+    },
+    "/webhooks/alerts/sns": {
+      "post": {
+        "description": "Subscribe CoderHelm to an SNS topic with an HTTPS subscription to this address and add the topic under Alert routes in the dashboard. Every message's SNS signature is checked (signature versions 1 and 2) and the signing certificate must come from SNS. The subscription is confirmed automatically once the topic has an enabled route; messages from topics without one are accepted and ignored. A message that matches one of the route's rules becomes a run that opens a pull request.",
+        "operationId": "receiveSnsAlert",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SnsEnvelope"
+              }
+            }
+          },
+          "description": "The SNS message.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted."
+          },
+          "400": {
+            "description": "Not an SNS message."
+          },
+          "403": {
+            "description": "The SNS signature did not verify."
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "AWS SNS alerts",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    },
+    "/webhooks/ci/tests/quarantine": {
+      "get": {
+        "description": "Returns the tests quarantined for the repository the OIDC token was issued to, so a CI step can keep their failures from failing the build. For Playwright, pass `playwright_grep_invert` to `--grep-invert`.",
+        "operationId": "listQuarantinedTests",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Quarantine"
+                }
+              }
+            },
+            "description": "The quarantined tests."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The token is not a valid GitHub Actions OIDC token for CoderHelm."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The repository is not connected, or E2E results are off."
+          }
+        },
+        "security": [
+          {
+            "github_oidc": []
+          }
+        ],
+        "summary": "List quarantined tests",
+        "tags": [
+          "CI"
+        ]
+      }
+    },
+    "/webhooks/ci/tests/results": {
+      "post": {
+        "description": "Takes one test report from a CI job whose results never reach GitHub (a device farm, say), signed with the job's GitHub Actions OIDC token instead of a CoderHelm secret. Request the token with the audience `coderhelm`. CoderHelm checks it was issued for a workflow run of a repository connected to your team with E2E results turned on, then reads the report like one from GitHub: flaky tests, failure groups and quarantine.",
+        "operationId": "uploadTestResults",
+        "parameters": [
+          {
+            "description": "The report's file name. Must end in `.json` (Playwright or Cucumber JSON) or `.xml` (JUnit XML). Default `report.json`.",
+            "example": "results.json",
+            "in": "query",
+            "name": "name",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "The report file, at most 6 MB.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CiUploadResult"
+                }
+              }
+            },
+            "description": "The report is stored and queued."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Not a report CoderHelm can read, or it has no tests."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The token is not a valid GitHub Actions OIDC token for CoderHelm."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The repository is not connected, or E2E results are off."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Empty, or larger than 6 MB."
+          }
+        },
+        "security": [
+          {
+            "github_oidc": []
+          }
+        ],
+        "summary": "Upload a test report",
+        "tags": [
+          "CI"
+        ]
+      }
+    },
+    "/webhooks/github": {
+      "post": {
+        "description": "Where GitHub sends every event of the CoderHelm GitHub App. Installing the app sets this up; you only call it yourself when you self-host. Each request is signed with the app's webhook secret in `X-Hub-Signature-256` (`sha256=` and the hex HMAC-SHA256 of the raw body), compared in constant time. The event type comes from `X-GitHub-Event` and the body must name an installation. Events CoderHelm doesn't act on, and events from an installation not linked to a team, are accepted with `200` and ignored.",
+        "operationId": "receiveGithubEvent",
+        "parameters": [
+          {
+            "description": "The event type, such as `issues`, `pull_request` or `push`.",
+            "example": "issues",
+            "in": "header",
+            "name": "X-GitHub-Event",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "GitHub's id for this delivery.",
+            "in": "header",
+            "name": "X-GitHub-Delivery",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "The event payload, as GitHub defines it for each event type. It must include `installation.id`.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted."
+          },
+          "400": {
+            "description": "The body is not JSON or names no installation."
+          },
+          "401": {
+            "description": "The signature is missing or wrong."
+          }
+        },
+        "security": [
+          {
+            "github_signature": []
+          }
+        ],
+        "summary": "GitHub App events",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    },
+    "/webhooks/jira/{token}": {
+      "post": {
+        "description": "For a plain Jira webhook, when the CoderHelm Jira app can't be installed. The URL holds a token generated for your team on the Jira page of the dashboard. If you also generated a secret there, every request must carry `X-Hub-Signature`: `sha256=` and the hex HMAC-SHA256 of the raw body, keyed with that secret. Jira Cloud signs webhooks this way when you set the secret on the webhook; a Jira automation can send the header itself.",
+        "operationId": "receiveJiraWebhook",
+        "parameters": [
+          {
+            "description": "The webhook token from the Jira page of the dashboard.",
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JiraWebhookBody"
+              }
+            }
+          },
+          "description": "The Jira event.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted (whether or not it started anything)."
+          },
+          "400": {
+            "description": "The body is not JSON."
+          },
+          "401": {
+            "description": "Unknown token, or the signature is missing or wrong."
+          }
+        },
+        "security": [
+          {
+            "jira_signature": []
+          },
+          {}
+        ],
+        "summary": "Jira webhook",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    }
+  },
+  "servers": [
+    {
+      "description": "Production",
+      "url": "https://api.coderhelm.com"
+    }
+  ],
+  "tags": [
+    {
+      "description": "Who a key belongs to and what it may do.",
+      "name": "Account",
+      "x-displayName": "Account"
+    },
+    {
+      "description": "A run is one piece of work by CoderHelm's coder: a ticket or task turned into a pull request. Runs are listed newest first.",
+      "name": "Runs",
+      "x-displayName": "Runs"
+    },
+    {
+      "description": "A plan is a set of tasks, each of which becomes a run once the plan is executed.",
+      "name": "Plans",
+      "x-displayName": "Plans"
+    },
+    {
+      "description": "The repositories connected to the team through the CoderHelm GitHub App.",
+      "name": "Repositories",
+      "x-displayName": "Repositories"
+    },
+    {
+      "description": "Pull request reviews written by CoderHelm's reviewer.",
+      "name": "Reviews",
+      "x-displayName": "Reviews"
+    },
+    {
+      "description": "Tokens used this month and the team's limits.",
+      "name": "Usage",
+      "x-displayName": "Usage"
+    },
+    {
+      "description": "Endpoints a CI job calls with its GitHub Actions OIDC token, so no CoderHelm secret is stored in CI.",
+      "name": "CI",
+      "x-displayName": "CI"
+    },
+    {
+      "description": "Events CoderHelm receives from GitHub, Jira and AWS SNS. Each is verified before anything happens.",
+      "name": "Webhooks",
+      "x-displayName": "Webhooks"
+    }
+  ]
+}

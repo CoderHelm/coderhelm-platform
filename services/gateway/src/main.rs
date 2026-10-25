@@ -9,11 +9,13 @@ use std::sync::Arc;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod api_keys;
 mod auth;
 mod clients;
 mod middleware;
 mod model_call;
 mod models;
+mod openapi;
 mod permissions;
 mod routes;
 
@@ -406,6 +408,12 @@ async fn main() -> Result<(), Error> {
             get(routes::roles::list_roles).post(routes::roles::create_role),
         )
         .route("/roles/audit", get(routes::roles::list_audit))
+        // Team API keys: admins make, list and revoke them (dashboard only)
+        .route(
+            "/api-keys",
+            get(routes::api_keys::list).post(routes::api_keys::create),
+        )
+        .route("/api-keys/:key_id", delete(routes::api_keys::revoke))
         .route(
             "/roles/:role_id",
             put(routes::roles::update_role).delete(routes::roles::delete_role),
@@ -826,6 +834,8 @@ async fn main() -> Result<(), Error> {
                 axum::Json(serde_json::json!({ "service": "coderhelm", "status": "ok" }))
             }),
         )
+        // The public API's OpenAPI document (src/openapi.rs)
+        .route("/openapi.json", get(openapi::serve))
         // Streaming endpoint uses Bearer JWT, not cookies — must be outside require_auth
         .route(
             "/api/plans/chat/stream",
