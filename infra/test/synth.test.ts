@@ -261,3 +261,42 @@ test("the release stamp reaches the services and the dashboard", () => {
   const hosted = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
   assert.equal(hosted.updates.enabled, false);
 });
+
+/** Does an HTTP API route key (`GET /api/{proxy+}`) take this request? */
+function routeTakes(routeKey: string, method: string, requestPath: string): boolean {
+  const [m, pattern] = routeKey.split(" ");
+  if (m !== method && m !== "ANY") return false;
+  const want = pattern.split("/");
+  const got = requestPath.split("/");
+  for (let i = 0; i < want.length; i++) {
+    if (want[i] === "{proxy+}") return got.length > i;
+    if (got[i] === undefined) return false;
+    if (/^\{[^}]+\}$/.test(want[i])) continue;
+    if (want[i] !== got[i]) return false;
+  }
+  return want.length === got.length;
+}
+
+test("every public API path, and the OpenAPI document itself, has an HTTP API route to the gateway", () => {
+  const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
+  const api = synth(cfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"))["coderhelm-prod-api"];
+  const keys = Object.values(api.findResources("AWS::ApiGatewayV2::Route")).map((r: any) => String(r.Properties.RouteKey));
+  const spec = JSON.parse(fs.readFileSync(path.join(INFRA, "..", "docs", "api", "openapi.json"), "utf8"));
+  const wanted: [string, string][] = [["GET", "/openapi.json"]];
+  for (const [p, item] of Object.entries<Record<string, unknown>>(spec.paths)) {
+    for (const m of Object.keys(item)) {
+      // A path parameter stands for one segment: fill it with a sample value.
+      wanted.push([m.toUpperCase(), p.replace(/\{[^}]+\}/g, "x")]);
+    }
+  }
+  const missing = wanted.filter(([m, p]) => !keys.some((k) => routeTakes(k, m, p)));
+  assert.deepEqual(missing, [], `no HTTP API route for: ${missing.map((w) => w.join(" ")).join(", ")}`);
+  // The matcher itself.
+  assert.ok(routeTakes("GET /api/{proxy+}", "GET", "/api/runs/x"));
+  assert.ok(!routeTakes("GET /api/{proxy+}", "GET", "/api"));
+  assert.ok(!routeTakes("POST /webhooks/github", "POST", "/webhooks/ci/tests/results"));
+});
+
+test("self-host serves the OpenAPI document through CloudFront", () => {
+  assert.ok(API_PATHS.includes("/openapi.json"));
+});

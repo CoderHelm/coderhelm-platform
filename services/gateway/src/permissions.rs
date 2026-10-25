@@ -667,8 +667,10 @@ pub struct Holder {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct CustomRoleRef {
     /// The role's id.
+    #[schema(example = "01JB7Z2R4T6V8X0Z2B4D6F8H0K")]
     pub id: String,
     /// The role's name, as the team page shows it.
+    #[schema(example = "Release manager")]
     pub name: String,
 }
 

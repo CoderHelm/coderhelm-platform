@@ -146,6 +146,9 @@ pub fn is_key_route(method: &str, handler: Option<&str>) -> bool {
 }))]
 pub struct ErrorBody {
     /// A sentence to show a person.
+    #[schema(
+        example = "This API key doesn't have the \"runs\" scope (Retry, re-run, re-review, cancel, close or reopen runs)."
+    )]
     pub error: String,
     /// What went wrong, for programs. One of: `bad_request`,
     /// `invalid_api_key`, `api_key_revoked`, `api_key_expired`,
@@ -153,9 +156,11 @@ pub struct ErrorBody {
     /// `not_available_to_api_keys`, `not_found`, `conflict`,
     /// `payload_too_large`, `rate_limited`, `token_limit_reached`,
     /// `internal_error`, `unavailable`. New codes may be added.
+    #[schema(example = "missing_scope")]
     pub code: String,
     /// With `missing_scope`: the scope the key would need.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "runs")]
     pub scope: Option<String>,
 }
 
@@ -628,6 +633,34 @@ mod tests {
                 }
             }
         }
+        // Every field has an example, so sample responses and requests show
+        // real values instead of "string" and 0. A field that only points at
+        // another schema is covered by that schema's own fields.
+        let is_ref = |p: &serde_json::Value| {
+            let refs = |v: &serde_json::Value| v.get("$ref").is_some();
+            refs(p)
+                || ["allOf", "oneOf", "anyOf"]
+                    .iter()
+                    .any(|k| p[*k].as_array().is_some_and(|l| l.iter().any(refs)))
+                || p.get("items").is_some_and(refs)
+        };
+        let mut missing = Vec::new();
+        for (name, schema) in doc["components"]["schemas"].as_object().unwrap() {
+            let parts =
+                std::iter::once(schema).chain(schema["allOf"].as_array().into_iter().flatten());
+            for part in parts {
+                for (field, prop) in part["properties"].as_object().into_iter().flatten() {
+                    if !is_ref(prop) && prop.get("examples").is_none() {
+                        missing.push(format!("{name}.{field}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these public fields have no example (add #[schema(example = ...)]): {}",
+            missing.join(", ")
+        );
         // Schema examples are in the JSON Schema form.
         let run_id = &doc["components"]["schemas"]["RunSummary"]["properties"]["run_id"];
         assert!(run_id.get("example").is_none());

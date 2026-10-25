@@ -550,32 +550,47 @@ pub struct SnsEnvelope {
     #[schema(rename = "Type", example = "Notification")]
     kind: String,
     /// SNS's id for the message.
-    #[schema(rename = "MessageId")]
+    #[schema(rename = "MessageId", example = "6c3f7c6e-2f4b-5b8e-9b0e-1f0a2b3c4d5e")]
     message_id: String,
     /// The topic. It must have an enabled alert route in the dashboard.
-    #[schema(rename = "TopicArn")]
+    #[schema(
+        rename = "TopicArn",
+        example = "arn:aws:sns:us-east-1:123456789012:prod-alarms"
+    )]
     topic_arn: String,
     /// The subject, when the publisher set one.
-    #[schema(rename = "Subject")]
+    #[schema(
+        rename = "Subject",
+        example = "ALARM: \"api-5xx\" in US East (N. Virginia)"
+    )]
     subject: Option<String>,
     /// The message: a CloudWatch alarm, an AWS Chatbot custom notification,
     /// an EventBridge event (as JSON text) or plain text.
-    #[schema(rename = "Message")]
+    #[schema(
+        rename = "Message",
+        example = "{\"AlarmName\":\"api-5xx\",\"NewStateValue\":\"ALARM\"}"
+    )]
     message: String,
     /// When SNS sent it.
-    #[schema(rename = "Timestamp")]
+    #[schema(rename = "Timestamp", example = "2026-10-22T14:00:00.000Z")]
     timestamp: String,
     /// `1` (SHA1) or `2` (SHA256).
-    #[schema(rename = "SignatureVersion")]
+    #[schema(rename = "SignatureVersion", example = "2")]
     signature_version: String,
     /// SNS's signature over the message's fields.
-    #[schema(rename = "Signature")]
+    #[schema(
+        rename = "Signature",
+        example = "EXAMPLEpH+DcEwjAPg8O9mY8dReBSwksfg2S7WKQcikcNKWLQjwu6A4VbeS0QHVCkhRS7fUQvi2egU3N858fiTDN6bkkOxYDVrY0Ad8L10Hs3zH81mtnPk5uvvolIC1CXGu43obcgFxeL3khZl8IKvO61GWB6jI9b5+gLPoBc1Q="
+    )]
     signature: String,
     /// The certificate that signed it; must be served by SNS.
-    #[schema(rename = "SigningCertURL")]
+    #[schema(
+        rename = "SigningCertURL",
+        example = "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-0000000000000000000000.pem"
+    )]
     signing_cert_url: String,
     /// For a subscription confirmation: the address CoderHelm visits to confirm.
-    #[schema(rename = "SubscribeURL")]
+    #[schema(rename = "SubscribeURL", example = json!(null))]
     subscribe_url: Option<String>,
 }
 

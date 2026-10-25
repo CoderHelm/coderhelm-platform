@@ -33,7 +33,7 @@ import { recordNameIn } from "./service-env";
 import { releaseStamp } from "./release";
 
 /** Paths the HTTP API serves (each also matches its sub-paths). */
-export const API_PATHS = ["/api/*", "/auth/*", "/webhooks/*", "/email/*", "/integrations/*"];
+export const API_PATHS = ["/api/*", "/auth/*", "/webhooks/*", "/email/*", "/integrations/*", "/openapi.json"];
 /** The chat stream (SSE, served by the streaming function). */
 export const STREAM_PATH = "/api/plans/chat/stream";
 

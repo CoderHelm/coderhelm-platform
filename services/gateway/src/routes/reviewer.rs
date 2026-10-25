@@ -507,6 +507,7 @@ pub struct ReviewFinding {
     #[schema(example = 42)]
     line: u64,
     /// The last line, when it spans several.
+    #[schema(example = 44)]
     end_line: Option<u64>,
     /// `blocking`, `high`, `medium`, `low` or `nit`.
     #[schema(example = "high")]
@@ -518,16 +519,22 @@ pub struct ReviewFinding {
     #[schema(example = "The attempt counter is never reset after a successful login")]
     title: String,
     /// The explanation, in Markdown.
+    #[schema(
+        example = "After a good password the counter for the IP stays where it was, so the next mistake can lock the person out."
+    )]
     body: String,
     /// Replacement text for the line(s), when there is a concrete fix.
+    #[schema(example = "attempts.delete(ip);")]
     suggestion: Option<String>,
     /// What it rests on: `verified-defect`, `unverified-concern` or `question`.
     /// Only a verified defect holds the merge.
     #[schema(example = "verified-defect")]
     evidence: Option<String>,
     /// The lookups the finding rests on.
+    #[schema(example = json!([]))]
     lookups: Vec<String>,
     /// For a question: whether the change's correctness depends on the answer.
+    #[schema(example = false)]
     blocks: Option<bool>,
 }
 
@@ -545,6 +552,7 @@ pub struct RatingComment {
     #[schema(example = "up")]
     rating: String,
     /// When (RFC 3339).
+    #[schema(example = "2026-10-22T15:01:44+00:00")]
     at: String,
 }
 
@@ -570,6 +578,9 @@ pub struct Review {
     #[schema(example = "MEDIUM")]
     pub risk: String,
     /// The review as posted, in Markdown. Cut to about 4,000 characters in a list.
+    #[schema(
+        example = "**Request changes.** The attempt counter is never reset after a successful login, so a user who mistypes their password nine times is locked out on their next good attempt."
+    )]
     pub body: String,
     /// The GitHub review event it was posted as: `APPROVE`,
     /// `REQUEST_CHANGES` or `COMMENT`.
@@ -579,10 +590,13 @@ pub struct Review {
     #[schema(example = "label")]
     pub trigger: String,
     /// What the reviewer did besides reviewing, such as arming auto-merge.
+    #[schema(example = "Requested changes; auto-merge stays off until they are fixed.")]
     pub action_summary: String,
     /// Thumbs up from the team.
+    #[schema(example = 2)]
     pub thumbs_up: u64,
     /// Thumbs down from the team.
+    #[schema(example = 0)]
     pub thumbs_down: u64,
     /// Ratings with comments.
     #[schema(value_type = Vec<RatingComment>)]
@@ -595,9 +609,10 @@ pub struct Review {
     pub pr_title: String,
     /// The structured findings. Null in a list (get the review for them) and
     /// on older reviews.
-    #[schema(value_type = Option<Vec<ReviewFinding>>)]
+    #[schema(value_type = Option<Vec<ReviewFinding>>, example = json!([{"file": "src/auth/login.ts", "line": 42, "end_line": 44, "severity": "high", "category": "bug", "title": "The attempt counter is never reset after a successful login", "body": "After a good password the counter for the IP stays where it was.", "suggestion": "attempts.delete(ip);", "evidence": "verified-defect", "lookups": [], "blocks": false}]))]
     pub findings: Value,
     /// The team standards the review was given in full ("always apply").
+    #[schema(example = json!(["api-error-format"]))]
     pub applied_standards: Vec<String>,
 }
 
@@ -607,6 +622,7 @@ pub struct ReviewsPage {
     /// Reviews, newest first. Findings are left out here.
     pub reviews: Vec<Review>,
     /// Pass as `cursor` to read the next page; null on the last page.
+    #[schema(example = "1729605605|REVIEW#acme/web#318#2026-10-22T14:20:05Z")]
     pub next: Option<String>,
 }
 

@@ -990,6 +990,7 @@ pub struct CiUploadResult {
 #[allow(dead_code)]
 pub struct QuarantinedTest {
     /// CoderHelm's id for the test.
+    #[schema(example = "e2e/checkout.spec.ts::checkout › applies a discount code")]
     id: String,
     /// Its title, `describe › title`.
     #[schema(example = "checkout › applies a discount code")]
@@ -998,6 +999,7 @@ pub struct QuarantinedTest {
     #[schema(example = "e2e/checkout.spec.ts")]
     file: String,
     /// The Playwright project, when there is one.
+    #[schema(example = "chromium")]
     project: Option<String>,
     /// `playwright`, `cucumber` or `junit`.
     #[schema(example = "playwright")]

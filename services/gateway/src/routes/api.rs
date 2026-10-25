@@ -31,6 +31,7 @@ pub struct Me {
     #[schema(example = "dev@example.com")]
     pub email: String,
     /// The person's picture. Always null for an API key.
+    #[schema(example = "https://avatars.githubusercontent.com/u/583231")]
     pub avatar_url: Option<String>,
     /// The built-in role requests run as: `viewer`, `member`, `admin` or
     /// `owner`. For a custom role or an API key, the highest built-in role
@@ -51,10 +52,12 @@ pub struct Me {
     #[schema(example = "api_key")]
     pub auth_provider: String,
     /// Whether the person turned on two-factor sign-in.
+    #[schema(example = false)]
     pub mfa_enabled: bool,
     /// Whether the caller administers the whole CoderHelm install (its
     /// operators, set in the install's configuration). Always false for an
     /// API key.
+    #[schema(example = false)]
     pub platform_admin: bool,
     /// Set only in a support view (dashboard only).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -898,10 +901,13 @@ pub struct Run {
     #[schema(example = 318)]
     pub pr_number: Option<u64>,
     /// Every pull request, when the work spans several repositories.
+    #[schema(example = json!(["https://github.com/acme/web/pull/318"]))]
     pub pr_urls: Option<Vec<String>>,
     /// Their numbers, in the same order.
+    #[schema(example = json!([318]))]
     pub pr_numbers: Option<Vec<u64>>,
     /// Their branches, in the same order.
+    #[schema(example = json!(["coderhelm/web-42-login-rate-limit"]))]
     pub branches: Option<Vec<String>>,
     /// The step the run is on or ended on.
     #[schema(example = "pr")]
@@ -925,27 +931,37 @@ pub struct Run {
     #[schema(example = json!(["src/auth/login.ts", "src/auth/login.test.ts"]))]
     pub files_modified: Option<Vec<String>>,
     /// The MCP servers the run used.
+    #[schema(example = json!([]))]
     pub mcp_servers: Option<Vec<String>>,
     /// The team standards the run was given in full ("always apply").
+    #[schema(example = json!(["api-error-format"]))]
     pub applied_standards: Vec<String>,
     /// How long the run took, in seconds.
     #[schema(example = 734)]
     pub duration_s: Option<u64>,
     /// Why the run failed, when it did.
+    #[schema(example = json!(null))]
     pub error: Option<String>,
     /// Where the fix belongs: `code`, or somewhere outside the code.
+    #[schema(example = "code")]
     pub fix_location: Option<String>,
     /// The report written when (part of) the fix is a change outside the code.
+    #[schema(example = json!(null))]
     pub outside_change_report: Option<String>,
     /// A lesson recorded for the repository when the fix was elsewhere.
+    #[schema(example = json!(null))]
     pub lesson: Option<String>,
     /// Who closed the run on purpose.
+    #[schema(example = json!(null))]
     pub closed_by: Option<String>,
     /// When it was closed (RFC 3339).
+    #[schema(example = json!(null))]
     pub closed_at: Option<String>,
     /// Why it was closed.
+    #[schema(example = json!(null))]
     pub close_reason: Option<String>,
     /// The status it had when it was closed.
+    #[schema(example = json!(null))]
     pub closed_from: Option<String>,
     /// When the run started (RFC 3339).
     #[schema(example = "2026-10-22T14:03:11Z")]
@@ -954,8 +970,10 @@ pub struct Run {
     #[schema(example = "2026-10-22T14:15:25Z")]
     pub updated_at: Option<String>,
     /// The steps it went through, in order.
+    #[schema(example = json!([{"pass": "triage", "started_at": "2026-10-22T14:03:11Z"}, {"pass": "implement", "started_at": "2026-10-22T14:05:40Z"}, {"pass": "pr", "started_at": "2026-10-22T14:14:50Z"}]))]
     pub pass_history: Option<Vec<RunPass>>,
     /// Notes it wrote while working, in order.
+    #[schema(example = json!([{"message": "Tests pass; opening the pull request.", "timestamp": "2026-10-22T14:15:02Z"}]))]
     pub progress_notes: Option<Vec<RunNote>>,
 }
 
@@ -2063,6 +2081,7 @@ pub struct Repo {
     #[schema(example = "ready")]
     pub onboard_status: Option<String>,
     /// Why reading it failed, when it did.
+    #[schema(example = json!(null))]
     pub onboard_error: Option<String>,
     /// What the repository is for, as the team set it, such as `web` or `backend`.
     #[schema(example = "web")]
@@ -4379,11 +4398,13 @@ pub struct Usage {
     /// Each limit that is set, in display order. Empty when none is.
     pub limits: Vec<UsageLimit>,
     /// True when the limits were read from the older single-limit setting.
+    #[schema(example = false)]
     pub limits_legacy: bool,
     /// What the older single limit counts (kept for older clients).
     #[schema(example = 4310227)]
     pub counted_tokens: u64,
     /// Whether the older single limit counts cache tokens (kept for older clients).
+    #[schema(example = false)]
     pub limit_counts_cache: bool,
     /// Usage per feature.
     pub features: Vec<UsageFeature>,

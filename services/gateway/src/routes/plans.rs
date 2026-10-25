@@ -35,7 +35,7 @@ pub struct PlansPage {
     #[schema(example = "PLAN#01JB8V0K3M5P7R9T1W3Y5A7C9E")]
     pub next: Option<String>,
     /// The same as `next`, kept for older clients.
-    #[schema(deprecated)]
+    #[schema(deprecated, example = "PLAN#01JB8V0K3M5P7R9T1W3Y5A7C9E")]
     pub next_cursor: Option<String>,
 }
 
@@ -156,12 +156,15 @@ fn is_plan_row(sk: &str) -> bool {
 }))]
 pub struct CreatePlan {
     /// What the plan is for. 1 to 500 characters.
+    #[schema(example = "Rate-limit the login form")]
     pub title: String,
     /// More about it, in Markdown.
     #[serde(default)]
+    #[schema(example = "Brute-force attempts are showing up in the auth logs.")]
     pub description: Option<String>,
     /// The repository its tasks work in, `owner/name`, unless a task names its own.
     #[serde(default)]
+    #[schema(example = "acme/web")]
     pub repo: Option<String>,
     /// Where each task becomes a ticket: a GitHub issue (`github`, the
     /// default) or a Jira ticket (`jira`).
@@ -169,6 +172,7 @@ pub struct CreatePlan {
     pub destination: Option<PlanDestination>,
     /// The plan's tasks, in order. Each starts as `draft`.
     #[serde(default)]
+    #[schema(example = json!([{"title": "Limit login attempts per IP", "description": "Allow 10 attempts per IP per 15 minutes; answer 429 after that.", "acceptance_criteria": "The 11th attempt within 15 minutes gets 429 and a Retry-After header."}]))]
     pub tasks: Option<Vec<NewPlanTask>>,
     /// The plan chat it came from (dashboard only).
     #[serde(default)]
@@ -193,21 +197,26 @@ pub enum PlanDestination {
 pub struct NewPlanTask {
     /// What to do. Defaults to "Untitled task".
     #[serde(default)]
+    #[schema(example = "Limit login attempts per IP")]
     pub title: Option<String>,
     /// How, in Markdown. The coder reads it as the ticket body.
     #[serde(default)]
+    #[schema(example = "Allow 10 attempts per IP per 15 minutes; answer 429 after that.")]
     pub description: Option<String>,
     /// How to tell it is done.
     #[serde(default)]
+    #[schema(example = "The 11th attempt within 15 minutes gets 429 and a Retry-After header.")]
     pub acceptance_criteria: Option<String>,
     /// The repository for this task, `owner/name`, when not the plan's.
     #[serde(default)]
+    #[schema(example = "acme/web")]
     pub repo: Option<String>,
     /// Where this task becomes a ticket, when not where the plan's do.
     #[serde(default)]
     pub destination: Option<PlanDestination>,
     /// With `jira`: the Jira project key to file the ticket in.
     #[serde(default)]
+    #[schema(example = "WEB")]
     pub jira_project: Option<String>,
 }
 
@@ -1425,6 +1434,7 @@ pub struct Plan {
     #[schema(example = "Rate-limit the login form")]
     pub title: Option<String>,
     /// More about it, in Markdown.
+    #[schema(example = "Brute-force attempts are showing up in the auth logs.")]
     pub description: Option<String>,
     /// The repository its tasks work in, `owner/name`.
     #[schema(example = "acme/web")]
@@ -1436,24 +1446,31 @@ pub struct Plan {
     #[schema(example = 3)]
     pub task_count: u64,
     /// Input tokens its runs used so far.
+    #[schema(example = 412300)]
     pub tokens_in: Option<u64>,
     /// Output tokens its runs used so far.
+    #[schema(example = 38120)]
     pub tokens_out: Option<u64>,
     /// `github` or `jira`: where its tasks become tickets.
     #[schema(example = "github")]
     pub destination: Option<String>,
     /// MCP servers used while planning.
+    #[schema(example = json!(["docs-search"]))]
     pub mcp_servers: Option<Vec<String>>,
     /// The plan chat it came from.
+    #[schema(example = "01JB8TZ6C8E0G2J4L6N8Q0S2U4")]
     pub chat_id: Option<String>,
     /// When it was made (RFC 3339).
     #[schema(example = "2026-10-22T13:40:00+00:00")]
     pub created_at: Option<String>,
     /// When it last changed (RFC 3339).
+    #[schema(example = "2026-10-22T13:55:00+00:00")]
     pub updated_at: Option<String>,
     /// When it started running (RFC 3339).
+    #[schema(example = "2026-10-22T13:55:00+00:00")]
     pub executed_at: Option<String>,
     /// Who started it running.
+    #[schema(example = "octocat")]
     pub executed_by: Option<String>,
 }
 
@@ -1464,51 +1481,68 @@ pub struct PlanTask {
     #[schema(example = "01JB8V0P8Q2S4U6W8Y0A2C4E6G")]
     pub task_id: Option<String>,
     /// The plan it belongs to.
+    #[schema(example = "01JB8V0K3M5P7R9T1W3Y5A7C9E")]
     pub plan_id: Option<String>,
     /// What to do.
     #[schema(example = "Limit login attempts per IP")]
     pub title: Option<String>,
     /// How, in Markdown.
+    #[schema(example = "Allow 10 attempts per IP per 15 minutes; answer 429 after that.")]
     pub description: Option<String>,
     /// How to tell it is done.
+    #[schema(example = "The 11th attempt within 15 minutes gets 429 and a Retry-After header.")]
     pub acceptance_criteria: Option<String>,
     /// `draft`, `approved`, `rejected`, `queued`, `waiting` (on a task it
     /// depends on), `running`, `completed` or `failed`.
     #[schema(example = "queued")]
     pub status: Option<String>,
     /// Its repository, when not the plan's.
+    #[schema(example = "acme/web")]
     pub repo: Option<String>,
     /// Its place in the plan, from 0.
     #[schema(example = 0)]
     pub order: u64,
     /// The GitHub issue it became.
+    #[schema(example = 412)]
     pub issue_number: Option<u64>,
     /// That issue's address.
+    #[schema(example = "https://github.com/acme/web/issues/412")]
     pub issue_url: Option<String>,
     /// The run working on it.
     #[schema(example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")]
     pub run_id: Option<String>,
     /// The pull request that run opened.
+    #[schema(example = "https://github.com/acme/web/pull/318")]
     pub pr_url: Option<String>,
     /// When it was approved (RFC 3339).
+    #[schema(example = "2026-10-22T13:54:10+00:00")]
     pub approved_at: Option<String>,
     /// Who approved it.
+    #[schema(example = "octocat")]
     pub approved_by: Option<String>,
     /// When it was rejected (RFC 3339).
+    #[schema(example = json!(null))]
     pub rejected_at: Option<String>,
     /// Who rejected it.
+    #[schema(example = json!(null))]
     pub rejected_by: Option<String>,
     /// `github` or `jira`.
+    #[schema(example = "github")]
     pub destination: Option<String>,
     /// The Jira project it is filed in.
+    #[schema(example = json!(null))]
     pub jira_project: Option<String>,
     /// The Jira ticket it became.
+    #[schema(example = json!(null))]
     pub jira_ticket_key: Option<String>,
     /// That ticket's address.
+    #[schema(example = json!(null))]
     pub jira_ticket_url: Option<String>,
     /// The task it waits for, when it depends on one.
+    #[schema(example = json!(null))]
     pub depends_on: Option<String>,
     /// When it was made (RFC 3339).
+    #[schema(example = "2026-10-22T13:40:00+00:00")]
     pub created_at: Option<String>,
 }
 

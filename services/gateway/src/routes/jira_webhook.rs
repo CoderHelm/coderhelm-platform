@@ -78,17 +78,74 @@ pub struct JiraWebhookBody {
     /// events can start a run.
     #[schema(rename = "webhookEvent", example = "jira:issue_updated")]
     webhook_event: String,
-    /// The issue, with `key` and `fields` (summary, description, labels,
-    /// assignee, project). A run starts when the issue has the label
-    /// `coderhelm` (or one starting `coderhelm:`), or is assigned to a user
-    /// whose name contains "CoderHelm", in a project the team switched on.
-    #[schema(value_type = Object)]
-    issue: (),
-    /// For comment events: the comment, with `body` and `author`.
-    #[schema(value_type = Option<Object>)]
-    comment: (),
+    /// The issue. A run starts when it has the label `coderhelm` (or one
+    /// starting `coderhelm:`), or is assigned to a user whose name contains
+    /// "CoderHelm", in a project the team switched on.
+    issue: JiraIssue,
+    /// For comment events: the comment.
+    comment: Option<JiraComment>,
     /// Optional: pin the ticket to a repository, from an automation.
     coderhelm: Option<JiraRepoPin>,
+}
+
+/// The issue in a Jira event (the fields CoderHelm reads).
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct JiraIssue {
+    /// The issue key.
+    #[schema(example = "WEB-42")]
+    key: String,
+    fields: JiraIssueFields,
+}
+
+/// The issue fields CoderHelm reads.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct JiraIssueFields {
+    /// The title. It becomes the run's title.
+    #[schema(example = "Add rate limiting to the login form")]
+    summary: String,
+    /// The body. The coder reads it as the ticket.
+    #[schema(
+        example = "Brute-force attempts are showing up in the auth logs. Limit attempts per IP."
+    )]
+    description: Option<String>,
+    /// Labels. `coderhelm`, or one starting `coderhelm:`, starts a run.
+    #[schema(example = json!(["coderhelm"]))]
+    labels: Vec<String>,
+    /// Who the issue is assigned to.
+    assignee: Option<JiraUser>,
+    /// The project. It must be switched on for the team.
+    project: JiraProject,
+}
+
+/// A Jira user.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct JiraUser {
+    /// The user's name. An issue assigned to a user whose name contains
+    /// "CoderHelm" starts a run.
+    #[schema(rename = "displayName", example = "Dana Developer")]
+    display_name: String,
+}
+
+/// A Jira project.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct JiraProject {
+    /// The project key.
+    #[schema(example = "WEB")]
+    key: String,
+}
+
+/// The comment in a Jira comment event.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct JiraComment {
+    /// What the comment says. It is sent to the run as feedback.
+    #[schema(example = "Please cover the signup form too.")]
+    body: String,
+    author: JiraUser,
 }
 
 /// Which repository a Jira ticket goes to. May also be sent at the top level.
