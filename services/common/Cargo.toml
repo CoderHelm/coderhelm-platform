@@ -53,6 +53,7 @@ serde_yaml = "0.9"
 quick-xml = "0.37"
 aws-sdk-s3 = "1"
 lopdf = { version = "0.46", default-features = false }
+yaml-rust2 = "0.10"
 
 [dev-dependencies]
 # model_retry: a local fake server in the tests

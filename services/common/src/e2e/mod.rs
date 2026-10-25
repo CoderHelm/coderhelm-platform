@@ -8,6 +8,7 @@
 //! - [`coverage`] maps code to the areas tests cover.
 //! - [`store`] keeps runs, tests, failure groups and recommendations.
 
+pub mod ci_setup;
 pub mod coverage;
 pub mod detect;
 pub mod messages;

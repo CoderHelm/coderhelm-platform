@@ -41,6 +41,7 @@ pub mod support_access;
 pub mod system;
 pub mod telemetry;
 pub mod tests;
+pub mod tests_setup;
 pub mod tools;
 pub mod trigger_gate;
 pub mod users;
