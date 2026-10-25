@@ -40,6 +40,29 @@ impl Preset {
     }
 }
 
+/// The build and test commands CoderHelm reads from a repository's own CI
+/// and package scripts. The model never writes these: they come from the
+/// repository. Standard and Autonomous let them run; Cautious asks.
+fn ci_commands_rule(decision: Decision, note: &str, by: &str, now: &str) -> Rule {
+    Rule {
+        id: "preset_ci_commands".into(),
+        scope: Scope::Team,
+        repo: None,
+        agent: None,
+        kind: Some(CallKind::Command),
+        server: None,
+        tool: None,
+        risk: None,
+        command: None,
+        decision,
+        locked: false,
+        note: note.to_string(),
+        source: RuleSource::Preset,
+        created_by: by.to_string(),
+        created_at: now.to_string(),
+    }
+}
+
 fn preset_rule(id: &str, risk: Risk, decision: Decision, note: &str, by: &str, now: &str) -> Rule {
     Rule {
         id: format!("preset_{id}"),
@@ -84,6 +107,12 @@ pub fn apply(policy: &mut TeamPolicy, preset: Preset, by: &str, now: &str) {
                 by,
                 now,
             ));
+            add.push(ci_commands_rule(
+                Decision::Ask,
+                "Cautious: sandbox commands not on a repository's allowlist ask.",
+                by,
+                now,
+            ));
         }
         Preset::Standard => {
             add.push(preset_rule(
@@ -99,6 +128,12 @@ pub fn apply(policy: &mut TeamPolicy, preset: Preset, by: &str, now: &str) {
                 Risk::Consequential,
                 Decision::Ask,
                 "Standard: actions that reach people ask.",
+                by,
+                now,
+            ));
+            add.push(ci_commands_rule(
+                Decision::Allow,
+                "Standard: the repository's own build and test commands run in the sandbox.",
                 by,
                 now,
             ));
@@ -121,6 +156,12 @@ pub fn apply(policy: &mut TeamPolicy, preset: Preset, by: &str, now: &str) {
                     Decision::Ask
                 },
                 "Autonomous: actions that reach people run on their own when the limit allows.",
+                by,
+                now,
+            ));
+            add.push(ci_commands_rule(
+                Decision::Allow,
+                "Autonomous: the repository's own build and test commands run in the sandbox.",
                 by,
                 now,
             ));
@@ -223,7 +264,7 @@ mod tests {
                 .iter()
                 .filter(|r| r.source == RuleSource::Preset)
                 .count(),
-            2
+            3
         );
     }
 }

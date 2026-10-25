@@ -599,6 +599,7 @@ pub async fn converse_tool_loop(
     messages: &mut Vec<(String, Vec<Value>)>, // (role, content blocks as JSON)
     tools: &[ToolDefinition],
     tool_executor: &dyn super::llm::ToolExecutor,
+    gate: &common::agent_policy::Gate,
     usage: &mut TokenUsage,
     max_turns: usize,
     max_tokens: i32,
@@ -812,13 +813,51 @@ pub async fn converse_tool_loop(
             return extract_text(&blocks);
         }
 
-        // Execute tools
+        // What the agent said before its calls: the "why" on an approval card.
+        let why: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Execute tools, each only after the policy gate allows it.
         let mut tool_results: Vec<Value> = Vec::new();
         for (tool_id, tool_name, tool_input) in &tool_uses {
             let tool_start = std::time::Instant::now();
             info!(tool = %tool_name, "Executing tool");
 
-            match tool_executor.execute(tool_name, tool_input).await {
+            let ran = match super::policy::gated_execute(
+                gate,
+                tool_executor,
+                tool_name,
+                tool_input,
+                common::truncate_str(why.trim(), 500),
+            )
+            .await
+            {
+                super::policy::Gated::Ran(r) => r,
+                super::policy::Gated::Refused(message) => {
+                    if let Some(cb) = on_tool_call {
+                        cb(tool_name, 0, &truncate_input_summary(tool_input), true);
+                    }
+                    info!(tool = %tool_name, "Tool not run: the policy gate said no");
+                    tool_results.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": message,
+                        "is_error": true
+                    }));
+                    continue;
+                }
+                super::policy::Gated::Stop(stop) => {
+                    warn!(tool = %tool_name, "Agent loop stopped by the policy gate");
+                    return Err(Box::new(common::agent_policy::AgentStopped(stop)));
+                }
+            };
+            match ran {
                 Ok(result) => {
                     let duration_ms = tool_start.elapsed().as_millis() as u64;
                     usage.record_tool_call(tool_name, duration_ms);

@@ -190,6 +190,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "mcp_servers::connect",
             "mcp_servers::oauth_callback",
             "mcp_servers::disconnect",
+            "agent_policy::decline_sign_in",
         ],
     },
     Capability {
@@ -231,6 +232,12 @@ pub const CAPABILITIES: &[Capability] = &[
             "log_findings::acknowledge_finding",
             "log_findings::reopen_finding",
         ],
+    },
+    Capability {
+        key: "agents.approve",
+        label: "Approve or deny what agents ask to do (once)",
+        min_role: "member",
+        handlers: &["agent_policy::decide"],
     },
     Capability {
         key: "view_alerts",
@@ -334,6 +341,22 @@ pub const CAPABILITIES: &[Capability] = &[
             "reviewer::update_org_config",
             "reviewer::update_config",
             "review_lessons::delete_lesson",
+        ],
+    },
+    Capability {
+        key: "agents.permissions",
+        label: "Edit agent permissions: rules, presets, the autonomy limit, agent switches, pause all agents, sandbox allowlists, and approve \"always\"",
+        min_role: "admin",
+        handlers: &[
+            "agent_policy::save_settings",
+            "agent_policy::add_rule",
+            "agent_policy::remove_rule",
+            "agent_policy::apply_preset",
+            "agent_policy::set_switch",
+            "agent_policy::set_commands",
+            "agent_policy::decide_suggestion",
+            "agent_policy::pause_all",
+            "agent_policy::resume_all",
         ],
     },
     Capability {

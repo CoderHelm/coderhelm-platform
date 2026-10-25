@@ -1514,6 +1514,7 @@ async fn answer_as_agent(
     let call = crate::agent::provider::converse(
         state,
         &provider,
+        common::agent_policy::Agent::Planner,
         &reply.model,
         &system,
         &mut messages,
@@ -2203,6 +2204,7 @@ mod tests {
             primary_model: "team-primary".into(),
             heavy_model: "team-heavy".into(),
             meter: None,
+            scope: Default::default(),
         };
         assert_eq!(pick_model(Some("opus"), &p), "team-heavy");
         assert_eq!(pick_model(Some("sonnet"), &p), "team-primary");

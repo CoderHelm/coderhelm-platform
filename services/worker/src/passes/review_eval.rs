@@ -1050,13 +1050,22 @@ async fn live_review(
         "user".to_string(),
         vec![serde_json::json!({"type": "text", "text": prompt})],
     )];
+    let tools = review_agent::review_tools();
+    // An offline evaluation of saved cases: no team, read-only case files,
+    // gated like every loop (on an in-memory policy, so reads run).
+    let gate = common::agent_policy::Gate::new(
+        std::sync::Arc::new(common::agent_policy::store::MemStore::new()),
+        common::agent_policy::GateCtx::new("review-eval", common::agent_policy::Agent::Reviewer),
+    )
+    .offering(tools.iter().map(|t| t.name.clone()));
     let text = crate::agent::anthropic::converse_tool_loop(
         client,
         model,
         &system,
         &mut messages,
-        &review_agent::review_tools(),
+        &tools,
         &CaseFiles(&lr.files),
+        &gate,
         usage,
         16,
         8192,

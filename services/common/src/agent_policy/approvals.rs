@@ -283,6 +283,9 @@ pub struct Approver {
     pub can_approve: bool,
     /// Holds `agents.permissions`, so may choose "always".
     pub can_edit_rules: bool,
+    /// The request came with a team API key, not a person's session. An API
+    /// key is its own actor: it never answers a card and never writes a rule.
+    pub api_key: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,6 +366,11 @@ pub async fn decide(
     note: &str,
     now: &str,
 ) -> Result<Approval, DecideError> {
+    if approver.api_key {
+        return Err(DecideError::NotAllowed(
+            "An API key can't answer approvals. A person answers them, signed in.".into(),
+        ));
+    }
     if !approver.can_approve {
         return Err(DecideError::NotAllowed(
             "You can't answer approvals. Ask someone who can approve agent actions.".into(),

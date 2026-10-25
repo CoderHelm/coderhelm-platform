@@ -148,13 +148,63 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
             info!(call_id = %rec.call_id, team_id = %rec.team_id, ?added, "Recovered model usage");
             continue;
         }
+        // "Pause all agents": agent work for a paused team is kept exactly as
+        // it came and sent again when the pause ends. Nothing is dropped.
+        let raw: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        let work = message
+            .agent_work()
+            .map(|(t, label, run)| (t.to_string(), label, run));
+        if let Some((team, label, run_id)) = &work {
+            let store = agent::policy::store(&state);
+            if let Some(reason) =
+                common::agent_policy::pause::hold_if_paused(&*store, team, label, run_id, &raw)
+                    .await
+            {
+                info!(team_id = %team, %reason, "Agents paused: work kept for later");
+                continue;
+            }
+        }
         // Every model call made while handling this message is counted under
         // the message's feature (spawned tasks fall back to "other").
         let feature = message.usage_feature();
-        common::usage::with_feature(feature, handle_message(Arc::clone(&state), message)).await;
+        let (_, stopped) = agent::policy::watch_stops(common::usage::with_feature(
+            feature,
+            handle_message(Arc::clone(&state), message),
+        ))
+        .await;
+        // A loop stopped because agents were paused mid-run: keep the work
+        // (as the same run) to pick up again when the pause ends.
+        if let (Some((common::agent_policy::Stop::Paused { .. }, run_id)), Some((team, label, _))) =
+            (stopped, work)
+        {
+            let store = agent::policy::store(&state);
+            let mut again = raw.clone();
+            if !run_id.is_empty() && again.get("type").and_then(|t| t.as_str()) == Some("ticket") {
+                again["continuation_run_id"] = serde_json::json!(run_id);
+            }
+            common::agent_policy::pause::keep(&*store, &team, &label, &run_id, &again).await;
+        }
     }
 
     Ok(())
+}
+
+/// Sends kept work back to the tickets queue.
+struct SqsResender<'a>(&'a WorkerState);
+
+#[async_trait::async_trait]
+impl common::agent_policy::pause::Resender for SqsResender<'_> {
+    async fn send(&self, message: &serde_json::Value) -> Result<(), String> {
+        self.0
+            .sqs
+            .send_message()
+            .queue_url(&self.0.config.ticket_queue_url)
+            .message_body(message.to_string())
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage) {
@@ -181,6 +231,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 }
                 // The error with its causes: the SDK's own text is just
                 // "service error".
+                // A loop stopped (agents paused, an approval nobody
+                // answered): end with its note, not as a failure.
+                if let Some(stop) = agent::policy::claim_stop(&run_id) {
+                    agent::policy::end_run_for_stop(&state, &team_id, &run_id, &stop).await;
+                    return;
+                }
                 let reason = common::run_fail::error_text(err);
                 error!(run_id, error = %reason, "Feedback run failed");
                 // The one failed-status write. It never overwrites a run that
@@ -430,6 +486,11 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             if let Err(e) = passes::usage_reconcile::run(&state, msg).await {
                 error!("Usage reconciliation failed: {e}");
             }
+        }
+        models::WorkerMessage::AgentResumeSweep => {
+            let store = agent::policy::store(&state);
+            let sent = common::agent_policy::pause::sweep(&*store, &SqsResender(&state)).await;
+            info!(sent, "Paused agent work sweep done");
         }
         // Handled in `handle_sqs`, where a failure fails the message.
         models::WorkerMessage::UsageRecord(_) => {}

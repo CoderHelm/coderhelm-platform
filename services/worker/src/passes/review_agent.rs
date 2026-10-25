@@ -1467,6 +1467,7 @@ pub async fn generate_review(
     let reply = provider::converse(
         state,
         provider,
+        common::agent_policy::Agent::Reviewer,
         provider.heavy_model_id(),
         &system,
         &mut messages,
@@ -1875,6 +1876,7 @@ pub fn to_postable(
 /// false failure.
 pub async fn verify_in_sandbox(
     state: &WorkerState,
+    team_id: &str,
     github: &GitHubClient,
     owner: &str,
     repo: &str,
@@ -1909,7 +1911,8 @@ pub async fn verify_in_sandbox(
         &state.logs,
         &state.config.sandbox_bucket_name,
         &state.config.sandbox_project_name,
-    );
+    )
+    .with_egress(crate::agent::policy::sandbox_egress(state, team_id).await);
     let run_id = format!(
         "review-{owner}-{repo}-{}",
         &head_sha[..head_sha.len().min(8)]

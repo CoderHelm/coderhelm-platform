@@ -226,9 +226,39 @@ pub struct SandboxClient<'a> {
     logs: &'a aws_sdk_cloudwatchlogs::Client,
     bucket: &'a str,
     project: &'a str,
+    /// The team's network allowlist (comma separated), when its sandbox
+    /// network is limited. The build starts the allowlist proxy with it.
+    egress: Option<String>,
 }
 
+/// The proxy the build starts when the network is limited.
+const EGRESS_PROXY: &str = include_str!("../../../common/src/agent_policy/egress_proxy.py");
+
 impl<'a> SandboxClient<'a> {
+    /// Limits the build's network to these domains (None: open, the team's
+    /// choice).
+    pub fn with_egress(mut self, allow: Option<Vec<String>>) -> Self {
+        self.egress = allow.map(|a| a.join(","));
+        self
+    }
+
+    /// The environment that turns the allowlist proxy on, when limited.
+    fn egress_env(
+        &self,
+    ) -> Result<Vec<EnvironmentVariable>, Box<dyn std::error::Error + Send + Sync>> {
+        use base64::Engine;
+        let Some(allow) = &self.egress else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![
+            env_var("EGRESS_ALLOW", allow)?,
+            env_var(
+                "EGRESS_PROXY_B64",
+                &base64::engine::general_purpose::STANDARD.encode(EGRESS_PROXY),
+            )?,
+        ])
+    }
+
     pub fn new(
         codebuild: &'a aws_sdk_codebuild::Client,
         s3: &'a aws_sdk_s3::Client,
@@ -242,6 +272,7 @@ impl<'a> SandboxClient<'a> {
             logs,
             bucket,
             project,
+            egress: None,
         }
     }
 
@@ -412,13 +443,16 @@ impl<'a> SandboxClient<'a> {
             env_var("CODEGEN_CMD", codegen_cmd)?,
             env_var("CODEGEN_OUT_KEY", out_key)?,
         ];
+        env.extend(self.egress_env()?);
         if let Some(v) = node_version {
             env.push(env_var("NODE_VERSION", v)?);
         }
         // Repo's public codegen env (e.g. Sanity projectId/dataset). Reserved
         // build vars are protected — an env entry can't hijack the tarball or
         // output location.
-        const RESERVED: [&str; 6] = [
+        const RESERVED: [&str; 8] = [
+            "EGRESS_ALLOW",
+            "EGRESS_PROXY_B64",
             "SANDBOX_BUCKET",
             "SANDBOX_KEY",
             "CODEGEN_CMD",
@@ -618,6 +652,7 @@ impl<'a> SandboxClient<'a> {
             env_var("SANDBOX_KEY", key)?,
             env_var("CHECKS_CMD", checks_cmd)?,
         ];
+        env.extend(self.egress_env()?);
         // The buildspec switches Node to this via `n` before running checks, so
         // "green in the sandbox" tracks the repo's real toolchain (it defaults
         // to 20 when unset). Prevents false REDs like a Next.js repo needing

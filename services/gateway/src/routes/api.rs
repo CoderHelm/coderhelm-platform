@@ -942,6 +942,15 @@ pub struct Run {
     /// Why the run failed, when it did.
     #[schema(example = json!(null))]
     pub error: Option<String>,
+    /// Why an agent loop stopped: agents were paused, or an approval nobody
+    /// answered in time.
+    pub policy_note: Option<String>,
+    /// The approval card that timed out, when one did.
+    pub policy_approval: Option<String>,
+    /// Sign-in prompts the run raised: connections it could have used that
+    /// its person hadn't made (or the team hadn't set up).
+    #[schema(value_type = Vec<Object>)]
+    pub sign_in_prompts: Vec<Value>,
     /// Where the fix belongs: `code`, or somewhere outside the code.
     #[schema(example = "code")]
     pub fix_location: Option<String>,
@@ -1167,6 +1176,13 @@ pub async fn get_run(
             .unwrap_or_default(),
         duration_s: num("duration_s"),
         error: st("error_message"),
+        policy_note: st("policy_note"),
+        policy_approval: st("policy_approval").filter(|s| !s.is_empty()),
+        sign_in_prompts: item
+            .get("sign_in_prompts")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
+            .unwrap_or_default(),
         // Where the fix belongs, and the report when (part of) it is a change
         // outside the code.
         fix_location: st("fix_location"),

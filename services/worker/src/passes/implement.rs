@@ -285,13 +285,16 @@ pub async fn run(
     let sandbox = if !state.config.sandbox_bucket_name.is_empty()
         && !state.config.sandbox_project_name.is_empty()
     {
-        Some(crate::clients::sandbox::SandboxClient::new(
-            &state.codebuild,
-            &state.s3,
-            &state.logs,
-            &state.config.sandbox_bucket_name,
-            &state.config.sandbox_project_name,
-        ))
+        Some(
+            crate::clients::sandbox::SandboxClient::new(
+                &state.codebuild,
+                &state.s3,
+                &state.logs,
+                &state.config.sandbox_bucket_name,
+                &state.config.sandbox_project_name,
+            )
+            .with_egress(crate::agent::policy::sandbox_egress(state, &msg.team_id).await),
+        )
     } else {
         None
     };
@@ -687,6 +690,11 @@ pub async fn run(
             check_budget: std::sync::atomic::AtomicUsize::new(0),
             gen_edit_rejects: std::sync::Mutex::new(std::collections::HashMap::new()),
             deadline,
+            policy: Some(crate::agent::policy::gate(
+                state,
+                provider.scope.ctx(common::agent_policy::Agent::Coder),
+                deadline,
+            )),
             commits: (conventions, tokens),
         },
         mcp_plugins: &loaded_mcp_plugins,
@@ -838,6 +846,7 @@ pub async fn run(
     let closing = provider::converse(
         state,
         provider,
+        common::agent_policy::Agent::Coder,
         model_id,
         &full_system,
         &mut messages,
@@ -895,6 +904,7 @@ pub async fn run(
             if let Err(e) = provider::converse(
                 state,
                 provider,
+                common::agent_policy::Agent::Coder,
                 model_id,
                 &full_system,
                 &mut messages,
@@ -967,6 +977,7 @@ pub async fn run(
         if let Err(e) = provider::converse(
             state,
             provider,
+            common::agent_policy::Agent::Coder,
             model_id,
             &full_system,
             &mut messages,
@@ -1514,6 +1525,9 @@ struct WriteToolExecutor<'a> {
     /// can never deadlock the agent.
     gen_edit_rejects: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     deadline: Option<std::time::Instant>,
+    /// Agent permissions for the sandbox: each command run_checks and
+    /// run_codegen would run is asked of the gate first.
+    policy: Option<common::agent_policy::Gate>,
     /// The team's git conventions and this ticket's tokens: every commit
     /// message follows the team's commit template.
     commits: (
@@ -2134,6 +2148,55 @@ impl<'a> WriteToolExecutor<'a> {
             .await
     }
 
+    /// The check steps the team's agent permissions let run, and why each
+    /// other one didn't. Commands it meets that aren't on the repository's
+    /// allowlist are kept as suggestions for an admin. A stop (agents
+    /// paused, an approval nobody answered) ends the loop.
+    async fn permitted_steps(
+        &self,
+        steps: Vec<super::checks::Step>,
+    ) -> Result<(Vec<super::checks::Step>, Vec<String>), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let Some(gate) = &self.policy else {
+            return Ok((steps, Vec::new()));
+        };
+        let repo = format!("{}/{}", self.owner, self.repo);
+        let policy = gate.policy().await;
+        let found: Vec<common::agent_policy::model::CommandSuggestion> = steps
+            .iter()
+            .filter(|st| {
+                common::agent_policy::sandbox::allowed_entry(&policy.sandbox, &repo, &st.cmd)
+                    .is_none()
+            })
+            .filter(|st| common::agent_policy::sandbox::valid_command(&st.cmd).is_ok())
+            .map(|st| common::agent_policy::model::CommandSuggestion {
+                command: st.cmd.clone(),
+                origin: "CI workflow".into(),
+            })
+            .collect();
+        common::agent_policy::sandbox::remember(&**gate.store(), &gate.ctx.team, &repo, found)
+            .await;
+        let mut kept = Vec::new();
+        let mut skipped = Vec::new();
+        for st in steps {
+            match gate
+                .check_command(&st.cmd, "Run the repository's checks")
+                .await
+            {
+                common::agent_policy::Outcome::Run { .. } => kept.push(st),
+                common::agent_policy::Outcome::Stop(stop) => {
+                    crate::agent::policy::record_stop(&stop);
+                    return Err(Box::new(common::agent_policy::AgentStopped(stop)));
+                }
+                common::agent_policy::Outcome::Refused { message, .. }
+                | common::agent_policy::Outcome::Pending { message, .. } => {
+                    skipped.push(format!("`{}` ({})", st.cmd, message));
+                }
+            }
+        }
+        Ok((kept, skipped))
+    }
+
     /// Run the repo's real checks in the sandbox and return the actual output
     /// for the agent to iterate on. Returns Ok(...) even on a failing build — a
     /// red result is normal feedback, not a tool error.
@@ -2181,6 +2244,17 @@ impl<'a> WriteToolExecutor<'a> {
             .cloned()
             .collect();
         let steps = check_steps(cmd, &self.ci_steps, self.test_cmd.as_deref(), &changed);
+        let (steps, skipped) = match self.permitted_steps(steps).await {
+            Ok(v) => v,
+            Err(stop) => return Err(stop),
+        };
+        if steps.is_empty() {
+            return Ok(json!(format!(
+                "No sandbox command may run under the team's agent permissions: {}. \
+                 Finalize your changes without the sandbox; CI still runs on the PR.",
+                skipped.join("; ")
+            )));
+        }
         let effective_cmd = super::checks::script(&steps);
 
         let source = match self.sandbox_source(sandbox, run_id).await {
@@ -2293,6 +2367,19 @@ impl<'a> WriteToolExecutor<'a> {
         else {
             return Ok(json!("Codegen isn't available for this repo."));
         };
+        if let Some(gate) = &self.policy {
+            match gate.check_command(cmd, "Regenerate generated files").await {
+                common::agent_policy::Outcome::Run { .. } => {}
+                common::agent_policy::Outcome::Stop(stop) => {
+                    crate::agent::policy::record_stop(&stop);
+                    return Err(Box::new(common::agent_policy::AgentStopped(stop)));
+                }
+                common::agent_policy::Outcome::Refused { message, .. }
+                | common::agent_policy::Outcome::Pending { message, .. } => {
+                    return Ok(json!(format!("Codegen didn't run: {message}")));
+                }
+            }
+        }
         let attempt = self.check_budget.fetch_add(1, Ordering::SeqCst);
         if attempt >= MAX_CHECKS_PER_RUN {
             return Ok(json!(format!(

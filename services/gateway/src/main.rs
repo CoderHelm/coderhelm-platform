@@ -813,6 +813,55 @@ async fn main() -> Result<(), Error> {
             get(routes::memory::list_memories).post(routes::memory::create_memory),
         )
         .route("/memories/agents", get(routes::memory::agent_profiles))
+        // Agent permissions: rules, presets, switches, pause, sandbox lists,
+        // the "test a call" box, approval cards and sign-in prompts.
+        .route(
+            "/agents/policy",
+            get(routes::agent_policy::get_policy).put(routes::agent_policy::save_settings),
+        )
+        .route("/agents/policy/rules", post(routes::agent_policy::add_rule))
+        .route(
+            "/agents/policy/rules/:id",
+            delete(routes::agent_policy::remove_rule),
+        )
+        .route(
+            "/agents/policy/preset",
+            post(routes::agent_policy::apply_preset),
+        )
+        .route(
+            "/agents/policy/switches",
+            put(routes::agent_policy::set_switch),
+        )
+        .route(
+            "/agents/policy/commands",
+            put(routes::agent_policy::set_commands),
+        )
+        .route(
+            "/agents/policy/suggestions",
+            post(routes::agent_policy::decide_suggestion),
+        )
+        .route("/agents/policy/test", post(routes::agent_policy::test_call))
+        .route(
+            "/agents/pause",
+            post(routes::agent_policy::pause_all).delete(routes::agent_policy::resume_all),
+        )
+        .route(
+            "/agents/approvals",
+            get(routes::agent_policy::list_approvals),
+        )
+        .route(
+            "/agents/approvals/:id",
+            get(routes::agent_policy::get_approval),
+        )
+        .route(
+            "/agents/approvals/:id/decide",
+            post(routes::agent_policy::decide),
+        )
+        .route("/agents/activity", get(routes::agent_policy::activity))
+        .route(
+            "/agents/sign-in/decline",
+            post(routes::agent_policy::decline_sign_in),
+        )
         .route("/memories/preview", post(routes::memory::preview_recall))
         .route("/memories/stats", get(routes::memory::memory_stats))
         .route(
@@ -864,6 +913,18 @@ async fn main() -> Result<(), Error> {
             middleware::rate_limit::rate_limit_email,
         ));
 
+    // Signed approval links from Slack, Teams and email: public, the signed
+    // token is the credential. Opening one never answers anything.
+    let approval_link_routes = Router::new()
+        .route(
+            "/link",
+            get(routes::agent_policy::link).post(routes::agent_policy::link_answer),
+        )
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit::rate_limit_email,
+        ));
+
     let app = Router::new()
         // Root health/info
         .route(
@@ -890,6 +951,7 @@ async fn main() -> Result<(), Error> {
         )
         .nest("/auth", auth_routes)
         .nest("/email", email_routes)
+        .nest("/agent-approvals", approval_link_routes)
         // Nest protected routes under /api
         .nest("/api", api_routes)
         .layer(SetResponseHeaderLayer::overriding(

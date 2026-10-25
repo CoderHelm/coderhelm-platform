@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod admin;
+pub mod agent_policy;
 pub mod alerts;
 pub mod analytics;
 pub mod api;
@@ -7,6 +8,7 @@ pub mod api_keys;
 pub mod auth;
 pub mod banners;
 pub mod brain;
+pub mod chat_policy;
 pub mod connectors;
 pub mod data_sources;
 pub mod dlq;

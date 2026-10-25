@@ -227,6 +227,44 @@ pub fn new_suggestions(
     out
 }
 
+/// Keeps commands a run met that aren't on the repository's allowlist as
+/// suggestions for an admin to accept (never allowed on their own).
+pub async fn remember(
+    store: &dyn super::store::PolicyStore,
+    team: &str,
+    repo: &str,
+    found: Vec<CommandSuggestion>,
+) {
+    let repo = repo.trim().to_ascii_lowercase();
+    if repo.is_empty() || found.is_empty() {
+        return;
+    }
+    for _ in 0..3 {
+        let Ok(mut p) = store.load(team).await else {
+            return;
+        };
+        let mut fresh = new_suggestions(&p.sandbox, &repo, found.clone());
+        let existing = p.sandbox.suggestions.entry(repo.clone()).or_default();
+        fresh.retain(|f| !existing.iter().any(|e| e.command == f.command));
+        if fresh.is_empty() {
+            return;
+        }
+        existing.extend(fresh);
+        // Keep the list short enough to read.
+        let n = existing.len();
+        if n > 30 {
+            existing.drain(..n - 30);
+        }
+        let expect = p.version;
+        p.version += 1;
+        match store.save(team, &p, expect).await {
+            Ok(()) => return,
+            Err(super::store::StoreError::Conflict) => continue,
+            Err(_) => return,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +322,29 @@ mod tests {
             .map(|s| s.command)
             .collect();
         assert_eq!(s, vec!["cargo test -p common", "npm run lint"]);
+    }
+
+    #[tokio::test]
+    async fn remembered_suggestions_are_kept_once_and_allow_nothing() {
+        use super::super::model::{Agent, Call, Decision};
+        use super::super::store::{MemStore, PolicyStore};
+        let store = MemStore::new();
+        let found = vec![CommandSuggestion {
+            command: "npm run build".into(),
+            origin: "CI workflow".into(),
+        }];
+        remember(&store, "T", "Acme/Web", found.clone()).await;
+        remember(&store, "T", "acme/web", found).await;
+        let p = store.load("T").await.unwrap();
+        assert_eq!(p.sandbox.suggestions["acme/web"].len(), 1);
+        // A suggestion isn't the allowlist: with no command rule it still asks.
+        let mut bare = p.clone();
+        bare.rules.clear();
+        let call = Call::command(Agent::Coder, "npm run build").in_repo(Some("acme/web"));
+        assert_eq!(
+            super::super::engine::decide(&bare, &call, None, "2026-10-24T00:00:00Z").decision,
+            Decision::Ask
+        );
     }
 
     #[test]

@@ -1869,6 +1869,20 @@
               "null"
             ]
           },
+          "policy_approval": {
+            "description": "The approval card that timed out, when one did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "policy_note": {
+            "description": "Why an agent loop stopped: agents were paused, or an approval nobody\nanswered in time.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "pr_number": {
             "description": "That pull request's number.",
             "examples": [
@@ -1951,6 +1965,13 @@
               "null"
             ]
           },
+          "sign_in_prompts": {
+            "description": "Sign-in prompts the run raised: connections it could have used that\nits person hadn't made (or the team hadn't set up).",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
           "status": {
             "description": "Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,\n`failed`, `needs_input`, `needs_outside_change`, `cancelled`,\n`retried` or `closed`. Treat a value you don't know as in progress.",
             "examples": [
@@ -2026,7 +2047,8 @@
           "cache_read_tokens",
           "cache_write_tokens",
           "cost_usd",
-          "applied_standards"
+          "applied_standards",
+          "sign_in_prompts"
         ],
         "type": "object"
       },

@@ -86,6 +86,7 @@ Output format:
     let final_text = provider::converse(
         state,
         provider,
+        common::agent_policy::Agent::Reviewer,
         model_id,
         &system,
         &mut messages,

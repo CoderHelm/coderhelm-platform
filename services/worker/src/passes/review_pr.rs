@@ -841,7 +841,17 @@ async fn run_once(
     )
     .await
     {
-        Ok(p) => p,
+        Ok(p) => p
+            .for_run(
+                "",
+                &format!("{}/{}", msg.repo_owner, msg.repo_name),
+                "",
+                &format!("Review of pull request #{}", msg.pr_number),
+            )
+            .in_thread(&format!(
+                "review:{}/{}#{}",
+                msg.repo_owner, msg.repo_name, msg.pr_number
+            )),
         Err(e) => {
             tracing::error!(team_id = %msg.team_id, pr = msg.pr_number, error = %e, "Review skipped: no usable model provider");
             return Ok(DONE);
@@ -1083,6 +1093,7 @@ async fn run_once(
         let answer = provider::converse(
             state,
             &provider,
+            common::agent_policy::Agent::Reviewer,
             provider.heavy_model_id(),
             &system,
             &mut messages,
@@ -1833,6 +1844,7 @@ async fn run_once(
             .unwrap_or_default();
         if let Some((passed, md)) = review_agent::verify_in_sandbox(
             state,
+            &msg.team_id,
             &github,
             &msg.repo_owner,
             &msg.repo_name,

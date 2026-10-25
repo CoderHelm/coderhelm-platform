@@ -19,6 +19,10 @@ pub struct ModelProvider {
     /// Counts this team's model calls (set by `load_for_team`).
     #[serde(skip)]
     pub meter: Option<common::usage::UsageMeter>,
+    /// The team, run, repository and person every loop on this provider is
+    /// gated for (set by `load_for_team` and [`ModelProvider::for_run`]).
+    #[serde(skip)]
+    pub scope: super::policy::PolicyScope,
 }
 
 impl ModelProvider {
@@ -92,7 +96,35 @@ impl ModelProvider {
                 &analytics_table,
                 team_id,
             )),
+            scope: super::policy::PolicyScope {
+                team: team_id.to_string(),
+                ..Default::default()
+            },
         })
+    }
+
+    /// The run this provider works for: its id, repository (`owner/name`),
+    /// the person who asked (when one did) and what the run is about. Every
+    /// loop's decisions and approval cards are tied to it.
+    pub fn for_run(mut self, run_id: &str, repo: &str, person: &str, task: &str) -> Self {
+        self.scope.run_id = run_id.to_string();
+        self.scope.repo = repo.to_string();
+        self.scope.person = person.to_string();
+        self.scope.task = task.to_string();
+        self
+    }
+
+    /// Work that isn't a run (a pull request review), by a stable name.
+    pub fn in_thread(mut self, thread: &str) -> Self {
+        self.scope.thread = thread.to_string();
+        self
+    }
+
+    /// The agent a whole run belongs to (a fix started by an alert or a log
+    /// finding), so switching that agent off stops its runs.
+    pub fn with_origin(mut self, agent: Option<common::agent_policy::Agent>) -> Self {
+        self.scope.origin = agent;
+        self
     }
 
     /// Get the model ID for "light" tasks (analysis, feedback, etc.)
@@ -126,8 +158,9 @@ impl ModelProvider {
 /// Converse with tool use loop via Anthropic Messages API.
 #[allow(clippy::too_many_arguments)]
 pub async fn converse(
-    _state: &crate::WorkerState,
+    state: &crate::WorkerState,
     provider: &ModelProvider,
+    agent: common::agent_policy::Agent,
     model_id: &str,
     system_prompt: &str,
     messages: &mut Vec<(String, Vec<serde_json::Value>)>,
@@ -139,6 +172,9 @@ pub async fn converse(
     conversation_log: Option<&mut Vec<serde_json::Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = provider.client();
+    // Every call this loop makes is asked of the policy gate first.
+    let gate = super::policy::gate(state, provider.scope.ctx(agent), opts.deadline)
+        .offering(tools.iter().map(|t| t.name.clone()));
     anthropic::converse_tool_loop(
         &client,
         model_id,
@@ -146,6 +182,7 @@ pub async fn converse(
         messages,
         tools,
         tool_executor,
+        &gate,
         usage,
         opts.max_turns,
         opts.max_tokens,

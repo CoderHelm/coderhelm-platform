@@ -31,6 +31,7 @@
     "weekly_summary": {"type":"weekly_summary"},
     "usage_reconcile": {"type":"usage_reconcile"},
     "dlq_cleanup": {"type":"dlq_cleanup"},
-    "log_autofix": {"type":"log_autofix"}
+    "log_autofix": {"type":"log_autofix"},
+    "agent_resume_sweep": {"type":"agent_resume_sweep"}
   }
 }

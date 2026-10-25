@@ -29,6 +29,9 @@ pub const GRANT_PREFIX: &str = "AGENT_GRANT#";
 pub const SIGNIN_PREFIX: &str = "AGENT_SIGNIN#";
 pub const QUEUE_PREFIX: &str = "AGENT_QUEUE#";
 pub const LOG_PREFIX: &str = "AGENT_LOG#";
+/// One partition listing every paused team (sk = team id), so the
+/// scheduled sweep finds pauses whose until-time passed without a scan.
+pub const PAUSED_PK: &str = "AGENT_PAUSED_TEAMS";
 pub const APPROVAL_TTL_SECS: i64 = 30 * 86_400;
 pub const LOG_TTL_SECS: i64 = 90 * 86_400;
 
@@ -118,6 +121,11 @@ pub trait PolicyStore: Send + Sync {
     async fn list_queued(&self, team: &str) -> Result<Vec<QueuedWork>, String>;
     async fn remove_queued(&self, team: &str, id: &str) -> Result<(), String>;
 
+    /// Notes that a team is paused (or has kept work), for the sweep.
+    async fn mark_paused(&self, team: &str) -> Result<(), String>;
+    async fn unmark_paused(&self, team: &str) -> Result<(), String>;
+    async fn paused_teams(&self) -> Result<Vec<String>, String>;
+
     /// Appends an audit event; a failure is logged, never returned.
     async fn audit(&self, team: &str, e: Event);
     /// The newest audit events, newest first.
@@ -141,6 +149,7 @@ pub struct MemStore {
     grants: Mutex<HashMap<(String, String), String>>,
     sign_ins: Mutex<HashMap<(String, String, String), ThreadState>>,
     queue: Mutex<Vec<(String, QueuedWork)>>,
+    paused: Mutex<std::collections::BTreeSet<String>>,
     pub events: Mutex<Vec<(String, Event)>>,
 }
 
@@ -306,6 +315,17 @@ impl PolicyStore for MemStore {
             .retain(|(t, w)| !(t == team && w.id == id));
         Ok(())
     }
+    async fn mark_paused(&self, team: &str) -> Result<(), String> {
+        self.paused.lock().unwrap().insert(team.into());
+        Ok(())
+    }
+    async fn unmark_paused(&self, team: &str) -> Result<(), String> {
+        self.paused.lock().unwrap().remove(team);
+        Ok(())
+    }
+    async fn paused_teams(&self) -> Result<Vec<String>, String> {
+        Ok(self.paused.lock().unwrap().iter().cloned().collect())
+    }
     async fn audit(&self, team: &str, e: Event) {
         self.events.lock().unwrap().push((team.into(), e));
     }
@@ -368,11 +388,15 @@ impl DynamoStore {
                 .dynamo
                 .query()
                 .table_name(&self.table)
-                .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
                 .expression_attribute_values(":pk", s(team))
-                .expression_attribute_values(":p", s(prefix))
                 .scan_index_forward(!newest_first)
                 .set_exclusive_start_key(start.take());
+            q = if prefix.is_empty() {
+                q.key_condition_expression("pk = :pk")
+            } else {
+                q.key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+                    .expression_attribute_values(":p", s(prefix))
+            };
             if let Some(l) = limit {
                 q = q.limit(l);
             }
@@ -638,6 +662,38 @@ impl PolicyStore for DynamoStore {
             .await
             .map_err(err)?;
         Ok(())
+    }
+
+    async fn mark_paused(&self, team: &str) -> Result<(), String> {
+        self.dynamo
+            .put_item()
+            .table_name(&self.table)
+            .item("pk", s(PAUSED_PK))
+            .item("sk", s(team))
+            .send()
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    async fn unmark_paused(&self, team: &str) -> Result<(), String> {
+        self.dynamo
+            .delete_item()
+            .table_name(&self.table)
+            .key("pk", s(PAUSED_PK))
+            .key("sk", s(team))
+            .send()
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    async fn paused_teams(&self) -> Result<Vec<String>, String> {
+        let items = self.query_prefix(PAUSED_PK, "", false, None).await?;
+        Ok(items
+            .iter()
+            .filter_map(|i| i.get("sk").and_then(|v| v.as_s().ok()).cloned())
+            .collect())
     }
 
     async fn audit(&self, team: &str, e: Event) {

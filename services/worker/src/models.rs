@@ -236,6 +236,11 @@ pub enum WorkerMessage {
     /// comment is before anything runs.
     #[serde(rename = "jira_comment")]
     JiraComment(JiraCommentMessage),
+    /// Every few minutes (EventBridge → SQS): send again the work kept while
+    /// a team's agents were paused, once the pause has ended (an until-time
+    /// passing needs nobody to click anything).
+    #[serde(rename = "agent_resume_sweep")]
+    AgentResumeSweep,
 }
 
 /// A ticket comment to read (gateway → worker). `action` is what it would
@@ -345,7 +350,54 @@ impl WorkerMessage {
             | WorkerMessage::UsageReconcile(_)
             | WorkerMessage::UsageRecord(_)
             | WorkerMessage::DlqCleanup
+            | WorkerMessage::AgentResumeSweep
             | WorkerMessage::LogAutofix => f::OTHER,
+        }
+    }
+
+    /// Work that runs an agent for one team, as (team, what it is, run id):
+    /// what "Pause all agents" holds back. Sweeps and bookkeeping aren't.
+    pub fn agent_work(&self) -> Option<(&str, String, String)> {
+        match self {
+            WorkerMessage::Ticket(t) => Some((
+                &t.team_id,
+                format!(
+                    "Run for {}: {}",
+                    t.ticket_id,
+                    common::truncate_str(&t.title, 120)
+                ),
+                t.continuation_run_id.clone().unwrap_or_default(),
+            )),
+            WorkerMessage::Feedback(m) => Some((
+                &m.team_id,
+                format!("Feedback on pull request #{}", m.pr_number),
+                m.run_id.clone(),
+            )),
+            WorkerMessage::Resume(m) => Some((&m.team_id, "Resume a run".into(), m.run_id.clone())),
+            WorkerMessage::Review(m) => Some((
+                &m.team_id,
+                format!(
+                    "Review of {}/{} #{}",
+                    m.repo_owner, m.repo_name, m.pr_number
+                ),
+                String::new(),
+            )),
+            WorkerMessage::PlanExecute(m) => {
+                Some((&m.team_id, format!("Plan {}", m.plan_id), String::new()))
+            }
+            WorkerMessage::PlanTaskContinue(m) => Some((
+                &m.team_id,
+                format!("Plan {} tasks", m.plan_id),
+                String::new(),
+            )),
+            WorkerMessage::JiraComment(m) => {
+                Some((&m.team_id, "A ticket comment".into(), String::new()))
+            }
+            WorkerMessage::SkillAsk(m) => {
+                Some((&m.team_id, "Try a team agent".into(), String::new()))
+            }
+            WorkerMessage::TestAction(m) => Some((&m.team_id, "A test fix".into(), String::new())),
+            _ => None,
         }
     }
 }

@@ -43,6 +43,7 @@ pub async fn pause(
         p.updated_at = now.clone();
         match store.save(team, &p, expect).await {
             Ok(()) => {
+                let _ = store.mark_paused(team).await;
                 store
                     .audit(
                         team,
@@ -119,6 +120,7 @@ pub async fn resume_queued(
         return Ok(0);
     }
     let mut sent = 0;
+    let mut failed = false;
     for w in store.list_queued(team).await.map_err(StoreError::Other)? {
         match resender.send(&w.message).await {
             Ok(()) => {
@@ -139,9 +141,13 @@ pub async fn resume_queued(
                 sent += 1;
             }
             Err(e) => {
+                failed = true;
                 tracing::warn!(team, id = %w.id, error = %e, "Couldn't resume kept work; it stays kept");
             }
         }
+    }
+    if !failed {
+        let _ = store.unmark_paused(team).await;
     }
     Ok(sent)
 }
@@ -174,6 +180,7 @@ pub async fn keep(store: &dyn PolicyStore, team: &str, label: &str, run_id: &str
         tracing::error!(team, error = %e, "Couldn't keep paused work");
         return;
     }
+    let _ = store.mark_paused(team).await;
     store
         .audit(
             team,
@@ -187,4 +194,20 @@ pub async fn keep(store: &dyn PolicyStore, team: &str, label: &str, run_id: &str
             .detail(w.label),
         )
         .await;
+}
+
+/// The scheduled sweep: for every team that is (or was) paused, send kept
+/// work again once its pause has ended (an until-time passing needs nobody
+/// to click anything). Returns how many messages were sent.
+pub async fn sweep(store: &dyn PolicyStore, resender: &dyn Resender) -> usize {
+    let mut sent = 0;
+    for team in store.paused_teams().await.unwrap_or_default() {
+        match resume_queued(store, &team, resender).await {
+            Ok(n) => sent += n,
+            Err(e) => {
+                tracing::warn!(team = %team, error = %e, "Paused work sweep failed for a team")
+            }
+        }
+    }
+    sent
 }

