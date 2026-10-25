@@ -31,6 +31,8 @@ pub enum Limit {
     Metadata,
     /// MCP replies (tool lists and tool results).
     Mcp,
+    /// A knowledge source's page or file (a Drive PDF, a web page).
+    Document,
 }
 
 impl Limit {
@@ -38,12 +40,13 @@ impl Limit {
         match self {
             Limit::Metadata => 256 * 1024,
             Limit::Mcp => 4 * 1024 * 1024,
+            Limit::Document => crate::knowledge::MAX_FILE_BYTES as usize,
         }
     }
     pub fn timeout(self) -> Duration {
         match self {
             Limit::Metadata => Duration::from_secs(15),
-            Limit::Mcp => Duration::from_secs(60),
+            Limit::Mcp | Limit::Document => Duration::from_secs(60),
         }
     }
 }
@@ -192,6 +195,7 @@ pub trait Http: Send + Sync {
 pub struct GuardedHttps;
 
 const USER_AGENT: &str = "Coderhelm (MCP client)";
+const SOURCE_USER_AGENT: &str = "Coderhelm knowledge sync (+https://coderhelm.com)";
 
 /// Checks an address the way every hop is checked: HTTPS, no user info, not
 /// a private or local host. Returns the parsed endpoint.
@@ -220,7 +224,11 @@ impl Http for GuardedHttps {
                 .redirect(reqwest::redirect::Policy::none())
                 .resolve(&ep.host, addr)
                 .timeout(req.limit.timeout())
-                .user_agent(USER_AGENT)
+                .user_agent(if req.limit == Limit::Document {
+                    SOURCE_USER_AGENT
+                } else {
+                    USER_AGENT
+                })
                 .build()
                 .map_err(|e| HttpError::Unreachable(reach_text(&ep.host, &e)))?;
             let mut r = match req.method {

@@ -2782,6 +2782,8 @@ async fn handle_push(
     if git_ref != format!("refs/heads/{default_branch}") {
         return Ok(StatusCode::OK);
     }
+    // Knowledge sources reading this repository's docs sync now.
+    super::knowledge_sources::on_push(state, team_id, &format!("{owner}/{name}")).await;
     // Team tool definitions in `.coderhelm/tools/` become proposals waiting
     // for an admin's approval. A merge never turns a tool on by itself.
     let tool_paths = tool_definition_paths(payload);

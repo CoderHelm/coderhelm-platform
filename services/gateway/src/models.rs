@@ -112,6 +112,26 @@ pub struct Secrets {
     pub google_client_secret: Option<String>,
     #[serde(default)]
     pub jira_webhook_secret: Option<String>,
+    /// Knowledge sources: the install's own OAuth apps for one-click
+    /// sign-in. Each is optional; without one, that source uses the team's
+    /// saved key where it has one (docs/self-host/knowledge-sources.md).
+    #[serde(default)]
+    pub notion_client_id: Option<String>,
+    #[serde(default)]
+    pub notion_client_secret: Option<String>,
+    /// The verification token of the install's Notion webhook subscription.
+    #[serde(default)]
+    pub notion_webhook_token: Option<String>,
+    #[serde(default)]
+    pub atlassian_client_id: Option<String>,
+    #[serde(default)]
+    pub atlassian_client_secret: Option<String>,
+    /// Google Drive; falls back to `google_client_id` / `google_client_secret`
+    /// (the Google sign-in app) when unset.
+    #[serde(default)]
+    pub google_drive_client_id: Option<String>,
+    #[serde(default)]
+    pub google_drive_client_secret: Option<String>,
 }
 
 impl Secrets {

@@ -132,7 +132,7 @@ pub fn text_of(bytes: &[u8]) -> String {
 
 /// Markdown split at headings; each part is named by its heading trail
 /// ("Setup > Install").
-fn markdown_sections(text: &str) -> Vec<Section> {
+pub fn markdown_sections(text: &str) -> Vec<Section> {
     let mut out = Vec::new();
     let mut trail: Vec<(usize, String)> = Vec::new();
     let mut cur = String::new();

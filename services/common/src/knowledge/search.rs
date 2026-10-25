@@ -328,7 +328,7 @@ impl Store for AwsStore {
 // ── Ranking ─────────────────────────────────────────────────────────────────
 
 /// One passage found.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Hit {
     pub kb_id: String,
     pub kb_name: String,
@@ -344,6 +344,13 @@ pub struct Hit {
     /// From a base marked as a source of truth.
     pub authoritative: bool,
     pub ord: u32,
+    /// The original page (a synced item's Notion or Confluence address),
+    /// or empty for an uploaded file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// The connector it was synced from (`notion`), or empty for an upload.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_kind: String,
 }
 
 /// A file whose index was built with another embedding model or dimension:
@@ -658,6 +665,12 @@ pub async fn search(
             score,
             authoritative: base.authoritative,
             ord: c.ord,
+            url: file.url.clone(),
+            source_kind: if file.is_synced() {
+                file.kind.clone()
+            } else {
+                String::new()
+            },
         });
         if found.hits.len() >= k {
             break;

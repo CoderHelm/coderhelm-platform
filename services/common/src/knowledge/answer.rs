@@ -48,6 +48,13 @@ pub struct SourceRef {
     /// The knowledge base it came from.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base: String,
+    /// The original page outside Coderhelm (a synced Notion, Confluence or
+    /// Drive page), which the citation links to first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The connector a synced passage came from (`notion`, `confluence`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_kind: String,
 }
 
 /// The sources read while answering one question.
@@ -94,9 +101,11 @@ impl Registry {
                     loc: h.loc.clone(),
                     as_of: h.as_of.clone(),
                     passage: h.text.clone(),
-                    href: Some(format!("/brain/knowledge/base?id={}", h.kb_id)),
+                    href: Some(format!("/knowledge/base/?id={}", h.kb_id)),
                     authoritative: h.authoritative,
                     base: h.kb_name.clone(),
+                    url: original_url(&h.url),
+                    source_kind: h.source_kind.clone(),
                     ..Default::default()
                 })
             })
@@ -130,6 +139,13 @@ impl Registry {
         }
         out
     }
+}
+
+/// A synced item's address, only when it is a plain https link (never a
+/// `javascript:` or other scheme a page could be tricked into opening).
+pub fn original_url(raw: &str) -> Option<String> {
+    let u = reqwest::Url::parse(raw.trim()).ok()?;
+    (u.scheme() == "https" && u.host_str().is_some()).then(|| u.to_string())
 }
 
 fn attr(s: &str) -> String {
@@ -212,6 +228,17 @@ pub fn finalize(text: &str, reg: &Registry) -> Final {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_https_originals_are_linked() {
+        assert_eq!(
+            super::original_url("https://x.atlassian.net/wiki/spaces/ENG/pages/1"),
+            Some("https://x.atlassian.net/wiki/spaces/ENG/pages/1".into())
+        );
+        assert_eq!(super::original_url("javascript:alert(1)"), None);
+        assert_eq!(super::original_url("http://example.com"), None);
+        assert_eq!(super::original_url(""), None);
+    }
+
     use super::*;
 
     fn reg_with(n: usize) -> Registry {
@@ -293,13 +320,20 @@ mod tests {
             score: 0.9,
             authoritative: true,
             ord: 4,
+            url: "https://www.notion.so/Leave-policy-0a1b".into(),
+            source_kind: "notion".into(),
         }]);
         assert_eq!(ids, ["S1"]);
         let s = r.get("S1").unwrap();
         assert_eq!(s.kind, "knowledge");
         assert_eq!(s.base, "HR");
         assert!(s.authoritative);
-        assert_eq!(s.href.as_deref(), Some("/brain/knowledge/base?id=kb1"));
+        assert_eq!(
+            s.url.as_deref(),
+            Some("https://www.notion.so/Leave-policy-0a1b")
+        );
+        assert_eq!(s.source_kind, "notion");
+        assert_eq!(s.href.as_deref(), Some("/knowledge/base/?id=kb1"));
         assert!(s.passage.len() <= 1_600);
     }
 }

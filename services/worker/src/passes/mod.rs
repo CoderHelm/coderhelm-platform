@@ -704,6 +704,7 @@ mod implement;
 pub mod infra_analyze;
 pub mod jira_comment;
 pub mod knowledge;
+pub mod knowledge_sync;
 pub mod lessons;
 pub mod line_count;
 pub mod live_sources;

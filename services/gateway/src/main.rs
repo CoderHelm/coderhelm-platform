@@ -459,6 +459,36 @@ async fn main() -> Result<(), Error> {
             "/knowledge/:kb_id/files/:file_id",
             delete(routes::knowledge::delete_file),
         )
+        // Knowledge sources (connected apps that stay in sync).
+        .route(
+            "/knowledge/connectors",
+            get(routes::knowledge_sources::connectors),
+        )
+        .route(
+            "/knowledge/connectors/:kind",
+            delete(routes::knowledge_sources::disconnect),
+        )
+        .route(
+            "/knowledge/connectors/:kind/connect",
+            post(routes::knowledge_sources::connect),
+        )
+        .route(
+            "/knowledge/connectors/:kind/browse",
+            get(routes::knowledge_sources::browse),
+        )
+        .route(
+            "/knowledge/:kb_id/sources",
+            post(routes::knowledge_sources::create_source),
+        )
+        .route(
+            "/knowledge/:kb_id/sources/:source_id",
+            put(routes::knowledge_sources::update_source)
+                .delete(routes::knowledge_sources::delete_source),
+        )
+        .route(
+            "/knowledge/:kb_id/sources/:source_id/sync",
+            post(routes::knowledge_sources::sync_source),
+        )
         // The company brain chat (asking streams from /api/brain/stream)
         .route("/brain/threads", get(routes::brain::list_threads))
         .route(
@@ -884,6 +914,11 @@ async fn main() -> Result<(), Error> {
         .route("/jira/:token", post(routes::jira_webhook::handle))
         .route("/jira", post(routes::jira_webhook::handle_forge))
         .route("/alerts/sns", post(routes::alerts::handle_sns))
+        // Knowledge sources: a provider says pages changed (signed).
+        .route(
+            "/knowledge/:token",
+            post(routes::knowledge_sources::webhook),
+        )
         // CI calls signed with a GitHub Actions OIDC token
         .route("/ci/tests/results", post(routes::tests::ci_upload))
         .route("/ci/tests/quarantine", get(routes::tests::ci_quarantine));

@@ -261,7 +261,7 @@ pub const CAPABILITIES: &[Capability] = &[
     // ── Admins ──────────────────────────────────────────────────────
     Capability {
         key: "knowledge_manage",
-        label: "Create, change and delete knowledge bases, upload and remove their files, and attach them to agents",
+        label: "Create, change and delete knowledge bases, upload and remove their files, connect apps whose pages stay in sync, and attach them to agents",
         min_role: "admin",
         handlers: &[
             "knowledge::create_base",
@@ -270,6 +270,14 @@ pub const CAPABILITIES: &[Capability] = &[
             "knowledge::start_upload",
             "knowledge::finish_upload",
             "knowledge::delete_file",
+            "knowledge_sources::connectors",
+            "knowledge_sources::connect",
+            "knowledge_sources::disconnect",
+            "knowledge_sources::browse",
+            "knowledge_sources::create_source",
+            "knowledge_sources::update_source",
+            "knowledge_sources::sync_source",
+            "knowledge_sources::delete_source",
         ],
     },
     Capability {

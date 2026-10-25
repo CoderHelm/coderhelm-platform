@@ -390,6 +390,69 @@
         ],
         "type": "object"
       },
+      "KnowledgeWebhookBody": {
+        "description": "POST /webhooks/knowledge/:token — a provider says something changed.\nSanity posts to each source's own address (the token is also its\nsigning secret); Notion posts to `/webhooks/knowledge/notion` for the\nwhole install. A verified event only starts a sync; content is always\nread back with the source's own connection.\nA provider's change event (the fields Coderhelm reads; the rest is\nignored). Sanity sends the changed document's projection; Notion sends\nan event naming its workspace.",
+        "examples": [
+          {
+            "_id": "post-returns",
+            "_rev": "q8PZ1v3VaaO9ShV3lKgqXm",
+            "_type": "post"
+          }
+        ],
+        "properties": {
+          "_id": {
+            "description": "Sanity: the changed document's id.",
+            "examples": [
+              "post-returns"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "_rev": {
+            "description": "Sanity: the document's new revision.",
+            "examples": [
+              "q8PZ1v3VaaO9ShV3lKgqXm"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "_type": {
+            "description": "Sanity: the changed document's type.",
+            "examples": [
+              "post"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "description": "Notion: the event, such as `page.content_updated`.",
+            "examples": [
+              "page.content_updated"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "description": "Notion: the workspace the event is about.",
+            "examples": [
+              "1a2b3c4d-0000-4000-8000-5e6f7a8b9c0d"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "Me": {
         "description": "Who is calling: a person signed in to the dashboard, or a team API key.",
         "properties": {
@@ -2698,6 +2761,18 @@
         "in": "header",
         "name": "X-Hub-Signature",
         "type": "apiKey"
+      },
+      "notion_signature": {
+        "description": "`sha256=` and the hex HMAC-SHA256 of the raw body, keyed with the subscription's verification token.",
+        "in": "header",
+        "name": "X-Notion-Signature",
+        "type": "apiKey"
+      },
+      "sanity_signature": {
+        "description": "`t=<ms>,v1=` and the base64url HMAC-SHA256 of `<t>.<body>`, keyed with the token in the address.",
+        "in": "header",
+        "name": "sanity-webhook-signature",
+        "type": "apiKey"
       }
     }
   },
@@ -4809,6 +4884,57 @@
           "Webhooks"
         ]
       }
+    },
+    "/webhooks/knowledge/{token}": {
+      "post": {
+        "description": "Tells CoderHelm that pages of a connected knowledge source changed, so it syncs that source now instead of at its next scheduled sync. Sanity posts to the address shown for each Sanity source (CoderHelm registers it itself when the token may manage webhooks), signed with `sanity-webhook-signature`: `t=<ms>,v1=` and the base64url HMAC-SHA256 of `<t>.<body>`, keyed with the token in the address; a signature older than five minutes is refused. Notion posts to `/webhooks/knowledge/notion` for the whole install, signed with `X-Notion-Signature`: `sha256=` and the hex HMAC-SHA256 of the body, keyed with the subscription's verification token. An event only starts a sync: what changed is always read back from the provider with the source's own connection.",
+        "operationId": "receiveKnowledgeWebhook",
+        "parameters": [
+          {
+            "description": "The source's webhook token, or `notion` for the install's Notion subscription.",
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KnowledgeWebhookBody"
+              }
+            }
+          },
+          "description": "The provider's event.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted; a sync starts unless the source is paused."
+          },
+          "401": {
+            "description": "The signature is missing, wrong or too old."
+          },
+          "404": {
+            "description": "No source has this address."
+          }
+        },
+        "security": [
+          {
+            "sanity_signature": []
+          },
+          {
+            "notion_signature": []
+          }
+        ],
+        "summary": "Knowledge source change",
+        "tags": [
+          "Webhooks"
+        ]
+      }
     }
   },
   "servers": [
@@ -4854,7 +4980,7 @@
       "x-displayName": "CI"
     },
     {
-      "description": "Events CoderHelm receives from GitHub, Jira and AWS SNS. Each is verified before anything happens.",
+      "description": "Events CoderHelm receives from GitHub, Jira, AWS SNS, Sanity and Notion. Each is verified before anything happens.",
       "name": "Webhooks",
       "x-displayName": "Webhooks"
     }

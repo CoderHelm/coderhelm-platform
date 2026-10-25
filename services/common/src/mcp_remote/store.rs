@@ -156,6 +156,12 @@ pub struct OAuthSettings {
     /// `metadata_document`, `dynamic`, `manual`, or empty before one exists.
     pub registration: String,
     pub legacy: bool,
+    /// Extra query pairs for the authorization request (a provider's own
+    /// API used by a knowledge source: Notion's `owner=user`, Google's
+    /// `access_type=offline`). Empty for MCP servers.
+    pub extra_authorize: Vec<(String, String)>,
+    /// The token endpoint takes JSON instead of a form (Notion, Atlassian).
+    pub token_body_json: bool,
 }
 
 impl OAuthSettings {
@@ -208,6 +214,8 @@ impl OAuthSettings {
             "client_secret_sealed": self.client_secret_sealed,
             "registration": self.registration,
             "legacy": self.legacy,
+            "extra_authorize": self.extra_authorize,
+            "token_body_json": self.token_body_json,
         })
     }
 
@@ -239,6 +247,9 @@ impl OAuthSettings {
             client_secret_sealed: st("client_secret_sealed"),
             registration: st("registration"),
             legacy: v["legacy"].as_bool().unwrap_or(false),
+            extra_authorize: serde_json::from_value(v["extra_authorize"].clone())
+                .unwrap_or_default(),
+            token_body_json: v["token_body_json"].as_bool().unwrap_or(false),
         }
     }
 }
@@ -826,6 +837,9 @@ impl Store for DynamoStore {
             .await?
             .iter()
             .filter_map(ServerRecord::from_item)
+            // A knowledge source's sign-in is kept here too, but it is never
+            // an MCP server (`knowledge::sources::oauth`).
+            .filter(|s| !crate::knowledge::sources::oauth::is_source_connection(&s.catalog_id))
             .collect())
     }
 
@@ -1115,6 +1129,7 @@ pub mod fake {
                 .prefix(team, SERVER_PREFIX)
                 .iter()
                 .filter_map(ServerRecord::from_item)
+                .filter(|s| !crate::knowledge::sources::oauth::is_source_connection(&s.catalog_id))
                 .collect())
         }
         async fn put_server(&self, team: &str, s: &ServerRecord) -> Result<(), String> {

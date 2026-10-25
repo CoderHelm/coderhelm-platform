@@ -474,6 +474,7 @@ mod tests {
             score: 0.7,
             authoritative: true,
             ord: 0,
+            ..Default::default()
         }]);
         assert!(s.contains("HR — Leave.pdf, Page 4 (as of 2026-05-01) [source of truth]"));
         assert!(s.contains("Sixteen weeks."));

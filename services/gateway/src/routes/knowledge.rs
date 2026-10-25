@@ -91,6 +91,10 @@ pub struct BaseInput {
     pub agents: Vec<String>,
     #[serde(default)]
     pub authoritative: bool,
+    /// On create only: the base's first connected source, so a base is made
+    /// with what it holds in one step.
+    #[serde(default)]
+    pub source: Option<super::knowledge_sources::SourceInput>,
 }
 
 /// `input` applied to `base`, or why it can't be.
@@ -218,13 +222,33 @@ fn file_json(f: &FileMeta) -> Value {
         "uploaded_by": f.uploaded_by,
         "chunks": f.chunks,
         "truncated": f.truncated,
+        "source_id": f.source_id,
+        "url": common::knowledge::answer::original_url(&f.url),
+        "path": f.path,
     })
 }
 
-fn base_json(b: &Base, files: &[FileMeta]) -> Value {
+fn base_json(
+    b: &Base,
+    files: &[FileMeta],
+    sources: &[common::knowledge::sources::Source],
+) -> Value {
     let now = chrono::Utc::now();
     let count = |s: FileStatus| files.iter().filter(|f| f.shown_status(now).0 == s).count();
+    let secs = now.timestamp();
     json!({
+        "sources": sources.iter().map(|s| json!({
+            "id": s.id,
+            "kind": s.kind_key(),
+            "name": s.name,
+            "status": common::knowledge::sources::shown_status(s, secs),
+            "paused": s.paused,
+            "items": s.items,
+            "last_success_at": s.last_success_at,
+        })).collect::<Vec<_>>(),
+        "kinds": super::knowledge_sources::kinds(files, sources),
+        "uploads": files.iter().filter(|f| !f.is_synced()).count(),
+        "synced": files.iter().filter(|f| f.is_synced()).count(),
         "id": b.id,
         "name": b.name,
         "description": b.description,
@@ -265,7 +289,8 @@ pub async fn list_bases(
     let reader = reader_role(&claims.holder());
     for b in bases.iter().filter(|b| b.readable_by(reader)) {
         let files = st.files(&claims.team_id, &b.id).await.unwrap_or_default();
-        out.push(base_json(b, &files));
+        let sources = super::knowledge_sources::sources_of(&state, &claims.team_id, &b.id).await;
+        out.push(base_json(b, &files, &sources));
     }
     out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Ok(Json(json!({
@@ -291,9 +316,13 @@ pub async fn get_base(
         .await
         .map_err(|e| internal("knowledge files", e))?;
     files.sort_by(|a, b| b.uploaded_at.cmp(&a.uploaded_at));
+    let sources = super::knowledge_sources::sources_of(&state, &claims.team_id, &base.id).await;
+    let now = chrono::Utc::now().timestamp();
     Ok(Json(json!({
-        "base": base_json(&base, &files),
+        "base": base_json(&base, &files, &sources),
         "files": files.iter().map(file_json).collect::<Vec<_>>(),
+        "sources": sources.iter().map(|s| super::knowledge_sources::source_json(s, now)).collect::<Vec<_>>(),
+        "visibility_note": super::knowledge_sources::VISIBILITY_NOTE,
         "can_manage": claims.holder().holds("knowledge_manage"),
         "limits": limits(),
     })))
@@ -336,7 +365,23 @@ pub async fn create_base(
         .await
         .map_err(|e| internal("create knowledge base", e.to_string()))?;
     info!(team_id = %claims.team_id, kb = %base.id, "Knowledge base created");
-    Ok(Json(json!({ "base": base_json(&base, &[]) })))
+    let mut added = Value::Null;
+    if let Some(src) = input.source.as_ref().filter(|s| !s.kind.is_empty()) {
+        match super::knowledge_sources::add_source(&state, &claims, &base.id, src).await {
+            Ok(v) => added = v,
+            Err(e) => {
+                // Nothing half made: the new base goes again.
+                let _ = delete_record(&state, &claims.team_id, &kb::base_sk(&base.id)).await;
+                return Err(e);
+            }
+        }
+    }
+    let sources = super::knowledge_sources::sources_of(&state, &claims.team_id, &base.id).await;
+    Ok(Json(json!({
+        "base": base_json(&base, &[], &sources),
+        "source": added.get("source").cloned().unwrap_or(Value::Null),
+        "setup": added.get("setup").cloned().unwrap_or(Value::Null),
+    })))
 }
 
 /// PUT /api/knowledge/:kb_id — rename, re-describe, change who reads it and
@@ -366,7 +411,8 @@ pub async fn update_base(
         .files(&claims.team_id, &base.id)
         .await
         .unwrap_or_default();
-    Ok(Json(json!({ "base": base_json(&base, &files) })))
+    let sources = super::knowledge_sources::sources_of(&state, &claims.team_id, &base.id).await;
+    Ok(Json(json!({ "base": base_json(&base, &files, &sources) })))
 }
 
 /// Deletes every object under `prefix` (inside the team's folder).
@@ -431,6 +477,11 @@ pub async fn delete_base(
         .await
         .map_err(|e| internal("knowledge base", e))?
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such knowledge base."))?;
+    for src in super::knowledge_sources::sources_of(&state, &claims.team_id, &base.id).await {
+        super::knowledge_sources::remove_source(&state, &claims.team_id, &src)
+            .await
+            .map_err(|e| internal("delete knowledge source", e))?;
+    }
     let files = store(&state)
         .files(&claims.team_id, &base.id)
         .await
@@ -527,7 +578,9 @@ pub async fn start_upload(
                 .files(&claims.team_id, &base.id)
                 .await
                 .map_err(|e| internal("knowledge files", e))?
-                .len();
+                .iter()
+                .filter(|f| !f.is_synced())
+                .count();
             if count >= MAX_FILES_PER_BASE {
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
@@ -691,6 +744,12 @@ pub async fn delete_file(
         .await
         .map_err(|e| internal("knowledge file", e))?
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such file."))?;
+    if file.is_synced() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "This page is kept in sync with its app. Untick it in the source, or remove the source.",
+        ));
+    }
     delete_prefix(
         &state,
         &claims.team_id,

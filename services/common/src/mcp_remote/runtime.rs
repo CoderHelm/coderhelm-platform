@@ -387,7 +387,11 @@ impl Runtime {
             .as_ref()
             .ok_or_else(|| ConnError::Failed("No sign-in settings.".into()))?;
         let client = self.client(s).await.map_err(ConnError::Failed)?;
-        let req = oauth::refresh_request(&o.token_endpoint, &client, &refresh_token, &o.resource);
+        let mut req =
+            oauth::refresh_request(&o.token_endpoint, &client, &refresh_token, &o.resource);
+        if o.token_body_json {
+            req = oauth::as_json_body(req);
+        }
         let resp = self
             .http
             .send(req)
@@ -711,7 +715,7 @@ impl Runtime {
                 },
             )
             .await?;
-        oauth::authorize_url(
+        let url = oauth::authorize_url(
             &o.auth_server(),
             &o.client_id,
             redirect_uri,
@@ -719,7 +723,8 @@ impl Runtime {
             &state,
             &scopes,
             &o.resource,
-        )
+        )?;
+        oauth::with_extra_params(&url, &o.extra_authorize)
     }
 
     /// Finishes a sign-in from the callback. The `state` is consumed first
@@ -770,7 +775,7 @@ impl Runtime {
             .filter(|c| !c.is_empty())
             .ok_or("The sign-in page sent no code.")?;
         let client = self.client(&s).await?;
-        let req = oauth::token_request(
+        let mut req = oauth::token_request(
             &o.auth_server(),
             &client,
             code,
@@ -778,6 +783,9 @@ impl Runtime {
             &p.redirect_uri,
             &o.resource,
         );
+        if o.token_body_json {
+            req = oauth::as_json_body(req);
+        }
         let resp = self.http.send(req).await.map_err(|e| e.to_string())?;
         let now = self.now();
         let set = oauth::parse_token_response(&resp, now, None).map_err(|e| e.message)?;

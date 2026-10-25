@@ -304,7 +304,7 @@ async fn call(state: &WorkerState, req: &Request, l: &Loaded) -> Value {
     }
     if let Some(k) = &l.knowledge {
         if let Some(text) = k.handle(state, name, input).await {
-            return json!({ "text": text, "used": used("source", "Knowledge bases", "/brain/knowledge") });
+            return json!({ "text": text, "used": used("source", "Knowledge bases", "/knowledge/") });
         }
     }
     let sources = Sources {
@@ -325,7 +325,7 @@ async fn call(state: &WorkerState, req: &Request, l: &Loaded) -> Value {
     json!({ "text": text, "used": used("source", &label, "/data-sources/activity") })
 }
 
-async fn github_for(state: &WorkerState, team_id: &str) -> Option<GitHubClient> {
+pub(crate) async fn github_for(state: &WorkerState, team_id: &str) -> Option<GitHubClient> {
     let id = state
         .dynamo
         .get_item()

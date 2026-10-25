@@ -163,8 +163,12 @@ pub fn authorize_url(
             .append_pair("redirect_uri", redirect_uri)
             .append_pair("code_challenge", &pkce.challenge)
             .append_pair("code_challenge_method", "S256")
-            .append_pair("state", state)
-            .append_pair("resource", resource);
+            .append_pair("state", state);
+        // A provider's own API (a knowledge source) has no resource
+        // indicator; every MCP server has one.
+        if !resource.is_empty() {
+            q.append_pair("resource", resource);
+        }
         if !scopes.is_empty() {
             q.append_pair("scope", &scopes.join(" "));
         }
@@ -255,6 +259,7 @@ fn with_client(mut req: HttpRequest, pairs: &mut Vec<(String, String)>, c: &Clie
 }
 
 fn form(url: &str, mut pairs: Vec<(String, String)>, c: &Client) -> HttpRequest {
+    pairs.retain(|(k, v)| !(k == "resource" && v.is_empty()));
     let shell = HttpRequest::form(url, &[]);
     let shell = with_client(shell, &mut pairs, c);
     let refs: Vec<(&str, &str)> = pairs
@@ -321,6 +326,39 @@ pub fn revoke_request(
         ],
         c,
     )
+}
+
+/// The same token request with its fields as a JSON object instead of a
+/// form, for providers whose token endpoint takes JSON (Notion, Atlassian).
+pub fn as_json_body(req: HttpRequest) -> HttpRequest {
+    let pairs: serde_json::Map<String, serde_json::Value> =
+        url::form_urlencoded::parse(req.body.as_deref().unwrap_or_default())
+            .map(|(k, v)| (k.into_owned(), serde_json::Value::String(v.into_owned())))
+            .collect();
+    let mut out = req;
+    out.headers
+        .retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
+    out.headers
+        .push(("Content-Type".into(), "application/json".into()));
+    out.body = Some(serde_json::to_vec(&pairs).unwrap_or_default());
+    out
+}
+
+/// `url` with `extra` query pairs added (a provider's own sign-in options,
+/// like Google's `access_type=offline`).
+pub fn with_extra_params(url: &str, extra: &[(String, String)]) -> Result<String, String> {
+    if extra.is_empty() {
+        return Ok(url.to_string());
+    }
+    let mut u =
+        reqwest::Url::parse(url).map_err(|_| "The sign-in address isn't valid.".to_string())?;
+    {
+        let mut q = u.query_pairs_mut();
+        for (k, v) in extra {
+            q.append_pair(k, v);
+        }
+    }
+    Ok(u.to_string())
 }
 
 /// The tokens for one connection. Never printed, never logged, never given
@@ -455,6 +493,32 @@ mod tests {
     use super::super::http::fake::{json, resp};
     use super::*;
     use serde_json::json as j;
+
+    #[test]
+    fn provider_apis_without_a_resource_get_json_bodies_and_extra_params() {
+        let c = Client {
+            client_id: "cid".into(),
+            client_secret: Some("sec".into()),
+            auth: ClientAuth::ClientSecretBasic,
+        };
+        let r = refresh_request("https://api.notion.com/v1/oauth/token", &c, "rt", "");
+        assert!(!r.body_text().contains("resource"));
+        let r = as_json_body(r);
+        let v: serde_json::Value = serde_json::from_slice(r.body.as_ref().unwrap()).unwrap();
+        assert_eq!(v["grant_type"], "refresh_token");
+        assert_eq!(v["refresh_token"], "rt");
+        assert_eq!(r.header_value("content-type"), Some("application/json"));
+        assert!(r
+            .header_value("authorization")
+            .unwrap()
+            .starts_with("Basic "));
+        let u = with_extra_params(
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=a",
+            &[("access_type".into(), "offline".into())],
+        )
+        .unwrap();
+        assert!(u.ends_with("client_id=a&access_type=offline"));
+    }
 
     fn auth_server() -> AuthServer {
         AuthServer {
