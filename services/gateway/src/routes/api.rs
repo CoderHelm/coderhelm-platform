@@ -15,26 +15,157 @@ use crate::models::{
 use crate::AppState;
 use aws_sdk_dynamodb::types::AttributeValue;
 
-/// GET /api/me — return current user info.
+/// Who is calling: a person signed in to the dashboard, or a team API key.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct Me {
+    /// The caller's id: `USER#...` for a person, `APIKEY#<id>` for an API key.
+    #[schema(example = "APIKEY#01jb8x6f4m2c9qz3t7v5w1k0ha")]
+    pub user_id: String,
+    /// The team every request acts on.
+    #[schema(example = "TEAM#4817263")]
+    pub team_id: String,
+    /// The person's GitHub login. For an API key, its maker's.
+    #[schema(example = "octocat")]
+    pub github_login: Option<String>,
+    /// The person's email. For an API key, its maker's.
+    #[schema(example = "dev@example.com")]
+    pub email: String,
+    /// The person's picture. Always null for an API key.
+    pub avatar_url: Option<String>,
+    /// The built-in role requests run as: `viewer`, `member`, `admin` or
+    /// `owner`. For a custom role or an API key, the highest built-in role
+    /// whose capabilities are all held; `capabilities` says exactly what is.
+    #[schema(example = "viewer")]
+    pub role: String,
+    /// The person's custom role, when they have one. Null for an API key.
+    pub custom_role: Option<crate::permissions::CustomRoleRef>,
+    /// The capability keys held. For an API key, its scopes as they stand on
+    /// this request: never more than its maker holds now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!(["view", "runs"]))]
+    pub capabilities: Option<Vec<String>>,
+    /// The team's account status: `active` or `suspended`.
+    #[schema(example = "active")]
+    pub status: String,
+    /// How the caller signed in: `email`, `google`, `github`, or `api_key`.
+    #[schema(example = "api_key")]
+    pub auth_provider: String,
+    /// Whether the person turned on two-factor sign-in.
+    pub mfa_enabled: bool,
+    /// Whether the caller administers the whole CoderHelm install (its
+    /// operators, set in the install's configuration). Always false for an
+    /// API key.
+    pub platform_admin: bool,
+    /// Set only in a support view (dashboard only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
+    pub support_view: Option<Value>,
+    /// Set only when the caller is an API key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<MeApiKey>,
+}
+
+/// The API key a request was made with.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct MeApiKey {
+    /// The key's id, the part after `chk_` and before the next `_`.
+    #[schema(example = "01jb8x6f4m2c9qz3t7v5w1k0ha")]
+    pub id: String,
+    /// The name the admin gave it.
+    #[schema(example = "Deploy pipeline")]
+    pub name: String,
+    /// Who made it. The key acts within that person's access.
+    #[schema(example = "dev@example.com")]
+    pub created_by: String,
+    /// When it stops working (RFC 3339), or null if it doesn't expire.
+    #[schema(example = "2027-01-01T00:00:00Z")]
+    pub expires_at: Option<String>,
+    /// Requests the key may make in a minute.
+    #[schema(example = 600)]
+    pub rate_limit_per_minute: u32,
+}
+
+/// The team's account status (`active` unless suspended).
+async fn team_status(state: &AppState, team_id: &str) -> String {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s("META"))
+        .projection_expression("#s")
+        .expression_attribute_names("#s", "status")
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .and_then(|i| i.get("status").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_else(|| "active".to_string())
+}
+
+/// GET /api/me — who is calling.
+#[utoipa::path(
+    get,
+    path = "/api/me",
+    tag = "Account",
+    operation_id = "getMe",
+    summary = "Get the caller",
+    description = "Returns who the request is authenticated as. With an API key this is the key \
+        itself: its name, who made it, when it expires, its rate limit, and in `capabilities` the \
+        scopes it holds right now (cut down to what its maker holds). Call it first to check a key works.",
+    responses(
+        (status = 200, description = "The caller.", body = Me),
+    ),
+    security(("api_key" = [])),
+)]
 pub async fn me(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Me>, StatusCode> {
+    // An API key is no person: answer for the key and its maker.
+    if let Some(key) = &claims.api_key {
+        return Ok(Json(Me {
+            user_id: claims.sub.clone(),
+            team_id: claims.team_id.clone(),
+            github_login: claims.github_login.clone(),
+            email: claims.email.clone(),
+            avatar_url: None,
+            role: claims.holder().floor().to_string(),
+            custom_role: None,
+            capabilities: Some(key.scopes.clone()),
+            status: team_status(&state, &claims.team_id).await,
+            auth_provider: "api_key".into(),
+            mfa_enabled: false,
+            platform_admin: false,
+            support_view: None,
+            api_key: Some(MeApiKey {
+                id: key.id.clone(),
+                name: key.name.clone(),
+                created_by: key.created_by.clone(),
+                expires_at: key.expires_at.clone(),
+                rate_limit_per_minute: key.rate_limit_per_minute,
+            }),
+        }));
+    }
     // A support-view session is no person on the team: answer for the view
     // itself instead of looking up a member record.
     if let Some(sv) = &claims.support_view {
-        return Ok(Json(json!({
-            "user_id": claims.sub,
-            "team_id": claims.team_id,
-            "github_login": null,
-            "email": sv.admin_email,
-            "avatar_url": null,
-            "role": claims.role,
-            "status": "active",
-            "auth_provider": "support",
-            "mfa_enabled": false,
-            "support_view": { "team_id": sv.team_id, "until": sv.until },
-        })));
+        return Ok(Json(Me {
+            user_id: claims.sub.clone(),
+            team_id: claims.team_id.clone(),
+            github_login: None,
+            email: sv.admin_email.clone(),
+            avatar_url: None,
+            role: claims.role.clone(),
+            custom_role: None,
+            capabilities: None,
+            status: "active".into(),
+            auth_provider: "support".into(),
+            mfa_enabled: false,
+            platform_admin: false,
+            support_view: Some(json!({ "team_id": sv.team_id, "until": sv.until })),
+            api_key: None,
+        }));
     }
     let result = state
         .dynamo
@@ -51,21 +182,7 @@ pub async fn me(
 
     let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
 
-    // Load team status from META record
-    let team_status = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s("META"))
-        .projection_expression("#s")
-        .expression_attribute_names("#s", "status")
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item)
-        .and_then(|i| i.get("status").and_then(|v| v.as_s().ok()).cloned())
-        .unwrap_or_else(|| "active".to_string());
+    let team_status = team_status(&state, &claims.team_id).await;
 
     // Derive auth provider from user record
     let auth_provider = if item
@@ -97,32 +214,39 @@ pub async fn me(
         false
     };
 
-    Ok(Json(json!({
-        "user_id": claims.sub,
-        "team_id": claims.team_id,
-        "github_login": claims.github_login,
-        "email": claims.email,
-        "avatar_url": item.get("avatar_url").and_then(|v| v.as_s().ok()),
+    Ok(Json(Me {
+        user_id: claims.sub.clone(),
+        team_id: claims.team_id.clone(),
+        github_login: claims.github_login.clone(),
+        email: claims.email.clone(),
+        avatar_url: item.get("avatar_url").and_then(|v| v.as_s().ok()).cloned(),
         // For a custom role, `role` is the built-in role the member's requests
         // run as outside their role's capabilities (pages check it), and
         // `custom_role` and `capabilities` say what they hold.
-        "role": match &claims.custom {
-            Some(h) => h.floor(),
-            None => item.get("role").and_then(|v| v.as_s().ok()).map_or(claims.role.as_str(), |r| r.as_str()),
+        role: match &claims.custom {
+            Some(h) => h.floor().to_string(),
+            None => item
+                .get("role")
+                .and_then(|v| v.as_s().ok())
+                .map_or(claims.role.clone(), |r| r.clone()),
         },
-        "custom_role": claims.custom.as_ref().and_then(|h| h.custom.clone()),
-        "capabilities": crate::permissions::CAPABILITIES
-            .iter()
-            .filter(|c| claims.holder().holds(c.key))
-            .map(|c| c.key)
-            .collect::<Vec<_>>(),
-        "status": team_status,
-        "auth_provider": auth_provider,
+        custom_role: claims.custom.as_ref().and_then(|h| h.custom.clone()),
+        capabilities: Some(
+            crate::permissions::CAPABILITIES
+                .iter()
+                .filter(|c| claims.holder().holds(c.key))
+                .map(|c| c.key.to_string())
+                .collect(),
+        ),
+        status: team_status,
+        auth_provider: auth_provider.into(),
+        mfa_enabled,
         // Admin of the whole install (PLATFORM_ADMIN_EMAILS): the dashboard shows
         // the admin pages; every admin route checks again.
-        "platform_admin": is_platform_admin(&claims),
-        "mfa_enabled": mfa_enabled,
-    })))
+        platform_admin: is_platform_admin(&claims),
+        support_view: None,
+        api_key: None,
+    }))
 }
 
 /// GET /api/teams — list all teams the current user has access to.
@@ -505,18 +629,90 @@ pub async fn remove_from_allowlist(
     Ok(Json(json!({ "status": "removed", "email": email })))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct RunsQuery {
+    /// Only runs from this source, such as `github`, `jira` or `alert`.
+    #[param(example = "jira")]
     source: Option<String>,
+    /// Runs per page, 1 to 100. Default 50.
+    #[param(minimum = 1, maximum = 100, example = 20)]
     limit: Option<i32>,
     /// `next` from the previous page (the last run id it covered).
     cursor: Option<String>,
     /// Search words: ticket key or number, title, repo, PR number, status.
+    #[param(example = "WEB-42")]
     q: Option<String>,
     /// Comma-separated exact statuses, e.g. `failed,cancelled`.
+    #[param(example = "failed,cancelled")]
     status: Option<String>,
     /// One repo, `owner/name` (exact, case-insensitive).
+    #[param(example = "acme/web")]
     repo: Option<String>,
+}
+
+/// One run in a list.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunSummary {
+    /// The run's id, a ULID. Newer runs sort after older ones.
+    #[schema(example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")]
+    pub run_id: Option<String>,
+    /// Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,
+    /// `failed`, `needs_input`, `needs_outside_change`, `cancelled`,
+    /// `retried` or `closed`. Treat a value you don't know as in progress.
+    #[schema(example = "completed")]
+    pub status: Option<String>,
+    /// What started it, such as `github`, `jira` or `alert`.
+    #[schema(example = "jira")]
+    pub ticket_source: Option<String>,
+    /// The ticket's key or issue number in its source.
+    #[schema(example = "WEB-42")]
+    pub ticket_id: Option<String>,
+    /// The ticket's title.
+    #[schema(example = "Add rate limiting to the login form")]
+    pub title: Option<String>,
+    /// The repository, `owner/name`.
+    #[schema(example = "acme/web")]
+    pub repo: Option<String>,
+    /// The pull request the run opened.
+    #[schema(example = "https://github.com/acme/web/pull/318")]
+    pub pr_url: Option<String>,
+    /// That pull request's number.
+    #[schema(example = 318)]
+    pub pr_number: Option<u64>,
+    /// What the run cost in model usage, in US dollars, as recorded.
+    #[schema(example = 1.42)]
+    pub cost_usd: Option<f64>,
+    /// Input tokens used.
+    #[schema(example = 182340)]
+    pub tokens_in: Option<u64>,
+    /// Output tokens used.
+    #[schema(example = 20511)]
+    pub tokens_out: Option<u64>,
+    /// How long the run took, in seconds.
+    #[schema(example = 734)]
+    pub duration_s: Option<u64>,
+    /// The step the run is on or ended on, such as `triage`, `plan`,
+    /// `implement`, `review` or `pr`.
+    #[schema(example = "pr")]
+    pub current_pass: Option<String>,
+    /// When the run started (RFC 3339).
+    #[schema(example = "2026-10-22T14:03:11Z")]
+    pub created_at: Option<String>,
+}
+
+/// A page of runs.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunsPage {
+    /// Runs that match, newest first. Can be short, or empty, while `next`
+    /// is set: older runs are still unread.
+    pub runs: Vec<RunSummary>,
+    /// Pass as `cursor` to read on; null when there are no older runs.
+    #[schema(example = "01JB8W2Q7N4D6R8S0T2V4X6Z8A")]
+    pub next: Option<String>,
+    /// How many runs were read to fill this page (searches and filters skip some).
+    #[schema(example = 50)]
+    pub scanned: usize,
 }
 
 /// GET /api/runs — list runs for the team (from runs table).
@@ -525,11 +721,26 @@ pub struct RunsQuery {
 /// and filters (see `run_search`), until the page is full or `SCAN_BUDGET`
 /// runs are read. A page can be short or empty while `next` is set: older
 /// runs are still unread.
+#[utoipa::path(
+    get,
+    path = "/api/runs",
+    tag = "Runs",
+    operation_id = "listRuns",
+    summary = "List runs",
+    description = "Lists the team's runs, newest first, one page at a time. Search with `q` and \
+        filter by `status`, `source` and `repo`. Each page reads at most a few hundred runs, so a \
+        page can come back short, or empty, with `next` set: keep reading until `next` is null.",
+    params(RunsQuery),
+    responses(
+        (status = 200, description = "A page of runs.", body = RunsPage),
+    ),
+    security(("api_key" = ["view"])),
+)]
 pub async fn list_runs(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Query(params): Query<RunsQuery>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<RunsPage>, StatusCode> {
     let want = params.limit.unwrap_or(50).clamp(1, 100) as usize;
     let filter = run_search::RunFilter::new(
         params.q.as_deref(),
@@ -597,37 +808,179 @@ pub async fn list_runs(
         }
     }
 
-    let runs: Vec<Value> = matched
+    let str_of =
+        |item: &run_search::Item, k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
+    let num_of = |item: &run_search::Item, k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+    };
+    let runs: Vec<RunSummary> = matched
         .iter()
-        .map(|item| {
-            json!({
-                "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
-                "status": item.get("status").and_then(|v| v.as_s().ok()),
-                "ticket_source": item.get("ticket_source").and_then(|v| v.as_s().ok()),
-                "ticket_id": item.get("ticket_id").and_then(|v| v.as_s().ok()),
-                "title": item.get("title").and_then(|v| v.as_s().ok()),
-                "repo": item.get("repo").and_then(|v| v.as_s().ok()),
-                "pr_url": item.get("pr_url").and_then(|v| v.as_s().ok()),
-                "pr_number": item.get("pr_number").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-                "cost_usd": item.get("cost_usd").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<f64>().ok()),
-                "tokens_in": item.get("tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-                "tokens_out": item.get("tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-                "duration_s": item.get("duration_s").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-                "current_pass": item.get("current_pass").and_then(|v| v.as_s().ok()),
-                "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
-            })
+        .map(|item| RunSummary {
+            run_id: str_of(item, "run_id"),
+            status: str_of(item, "status"),
+            ticket_source: str_of(item, "ticket_source"),
+            ticket_id: str_of(item, "ticket_id"),
+            title: str_of(item, "title"),
+            repo: str_of(item, "repo"),
+            pr_url: str_of(item, "pr_url"),
+            pr_number: num_of(item, "pr_number"),
+            cost_usd: item
+                .get("cost_usd")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<f64>().ok()),
+            tokens_in: num_of(item, "tokens_in"),
+            tokens_out: num_of(item, "tokens_out"),
+            duration_s: num_of(item, "duration_s"),
+            current_pass: str_of(item, "current_pass"),
+            created_at: str_of(item, "created_at"),
         })
         .collect();
 
-    Ok(Json(json!({ "runs": runs, "next": next, "scanned": read })))
+    Ok(Json(RunsPage {
+        runs,
+        next,
+        scanned: read,
+    }))
+}
+
+/// One step a run went through.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunPass {
+    /// The step, such as `triage`, `plan`, `implement`, `test`, `security`,
+    /// `pr`, `review`, `feedback` or `ci_fix`.
+    #[schema(example = "implement")]
+    pub pass: Option<String>,
+    /// When it started (RFC 3339).
+    #[schema(example = "2026-10-22T14:05:40Z")]
+    pub started_at: Option<String>,
+}
+
+/// A note the run wrote while it worked.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunNote {
+    /// What it said.
+    #[schema(example = "Tests pass; opening the pull request.")]
+    pub message: Option<String>,
+    /// When (RFC 3339).
+    #[schema(example = "2026-10-22T14:15:02Z")]
+    pub timestamp: Option<String>,
+}
+
+/// One run, in full.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct Run {
+    /// Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,
+    /// `failed`, `needs_input`, `needs_outside_change`, `cancelled`,
+    /// `retried` or `closed`. Treat a value you don't know as in progress.
+    #[schema(example = "completed")]
+    pub status: Option<String>,
+    /// What started it, such as `github`, `jira` or `alert`.
+    #[schema(example = "jira")]
+    pub ticket_source: Option<String>,
+    /// The ticket's key or issue number in its source.
+    #[schema(example = "WEB-42")]
+    pub ticket_id: Option<String>,
+    /// The ticket's title.
+    #[schema(example = "Add rate limiting to the login form")]
+    pub title: Option<String>,
+    /// The repository, `owner/name`.
+    #[schema(example = "acme/web")]
+    pub repo: Option<String>,
+    /// The branch the run pushed.
+    #[schema(example = "coderhelm/web-42-login-rate-limit")]
+    pub branch: Option<String>,
+    /// The pull request the run opened.
+    #[schema(example = "https://github.com/acme/web/pull/318")]
+    pub pr_url: Option<String>,
+    /// That pull request's number.
+    #[schema(example = 318)]
+    pub pr_number: Option<u64>,
+    /// Every pull request, when the work spans several repositories.
+    pub pr_urls: Option<Vec<String>>,
+    /// Their numbers, in the same order.
+    pub pr_numbers: Option<Vec<u64>>,
+    /// Their branches, in the same order.
+    pub branches: Option<Vec<String>>,
+    /// The step the run is on or ended on.
+    #[schema(example = "pr")]
+    pub current_pass: Option<String>,
+    /// Input tokens, not counting cache reads and writes.
+    #[schema(example = 182340)]
+    pub tokens_in: u64,
+    /// Output tokens.
+    #[schema(example = 20511)]
+    pub tokens_out: u64,
+    /// Tokens read from the prompt cache.
+    #[schema(example = 905112)]
+    pub cache_read_tokens: u64,
+    /// Tokens written to the prompt cache.
+    #[schema(example = 64002)]
+    pub cache_write_tokens: u64,
+    /// What the run cost in model usage, in US dollars, as recorded.
+    #[schema(example = 1.42)]
+    pub cost_usd: f64,
+    /// The files the run changed.
+    #[schema(example = json!(["src/auth/login.ts", "src/auth/login.test.ts"]))]
+    pub files_modified: Option<Vec<String>>,
+    /// The MCP servers the run used.
+    pub mcp_servers: Option<Vec<String>>,
+    /// The team standards the run was given in full ("always apply").
+    pub applied_standards: Vec<String>,
+    /// How long the run took, in seconds.
+    #[schema(example = 734)]
+    pub duration_s: Option<u64>,
+    /// Why the run failed, when it did.
+    pub error: Option<String>,
+    /// Where the fix belongs: `code`, or somewhere outside the code.
+    pub fix_location: Option<String>,
+    /// The report written when (part of) the fix is a change outside the code.
+    pub outside_change_report: Option<String>,
+    /// A lesson recorded for the repository when the fix was elsewhere.
+    pub lesson: Option<String>,
+    /// Who closed the run on purpose.
+    pub closed_by: Option<String>,
+    /// When it was closed (RFC 3339).
+    pub closed_at: Option<String>,
+    /// Why it was closed.
+    pub close_reason: Option<String>,
+    /// The status it had when it was closed.
+    pub closed_from: Option<String>,
+    /// When the run started (RFC 3339).
+    #[schema(example = "2026-10-22T14:03:11Z")]
+    pub created_at: Option<String>,
+    /// When it last changed (RFC 3339).
+    #[schema(example = "2026-10-22T14:15:25Z")]
+    pub updated_at: Option<String>,
+    /// The steps it went through, in order.
+    pub pass_history: Option<Vec<RunPass>>,
+    /// Notes it wrote while working, in order.
+    pub progress_notes: Option<Vec<RunNote>>,
 }
 
 /// GET /api/runs/:run_id — get single run detail (from runs table).
+#[utoipa::path(
+    get,
+    path = "/api/runs/{run_id}",
+    tag = "Runs",
+    operation_id = "getRun",
+    summary = "Get a run",
+    description = "Returns one run in full: its status and current step, the pull requests and \
+        branches it opened, the files it changed, token use and cost, and the notes it wrote \
+        while working. Poll it to follow a run; a few seconds apart is plenty.",
+    params(("run_id" = String, Path, description = "The run's id.", example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")),
+    responses(
+        (status = 200, description = "The run.", body = Run),
+        (status = 404, description = "No run with this id in the team.", body = crate::openapi::ErrorBody),
+    ),
+    security(("api_key" = ["view"])),
+)]
 pub async fn get_run(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Run>, StatusCode> {
     let result = state
         .dynamo
         .get_item()
@@ -727,63 +1080,104 @@ pub async fn get_run(
         (tokens_in, tokens_out, cache_read, cache_write, cost_usd)
     };
 
-    Ok(Json(json!({
-        "status": item.get("status").and_then(|v| v.as_s().ok()),
-        "ticket_source": item.get("ticket_source").and_then(|v| v.as_s().ok()),
-        "ticket_id": item.get("ticket_id").and_then(|v| v.as_s().ok()),
-        "title": item.get("title").and_then(|v| v.as_s().ok()),
-        "repo": item.get("repo").and_then(|v| v.as_s().ok()),
-        "branch": item.get("branch").and_then(|v| v.as_s().ok()),
-        "pr_url": item.get("pr_url").and_then(|v| v.as_s().ok()),
-        "pr_number": item.get("pr_number").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-        "pr_urls": item.get("pr_urls").and_then(|v| v.as_l().ok()).map(|list| list.iter().filter_map(|v| v.as_s().ok().map(|s| s.as_str())).collect::<Vec<_>>()),
-        "pr_numbers": item.get("pr_numbers").and_then(|v| v.as_l().ok()).map(|list| list.iter().filter_map(|v| v.as_n().ok()).filter_map(|n| n.parse::<u64>().ok()).collect::<Vec<_>>()),
-        "branches": item.get("branches").and_then(|v| v.as_l().ok()).map(|list| list.iter().filter_map(|v| v.as_s().ok().map(|s| s.as_str())).collect::<Vec<_>>()),
-        "current_pass": item.get("current_pass").and_then(|v| v.as_s().ok()),
-        "tokens_in": tokens_in,
-        "tokens_out": tokens_out,
-        "cache_read_tokens": cache_read,
-        "cache_write_tokens": cache_write,
-        "cost_usd": cost_usd,
-        "files_modified": item.get("files_modified").and_then(|v| v.as_l().ok()).map(|list| list.iter().filter_map(|v| v.as_s().ok().map(|s| s.as_str())).collect::<Vec<_>>()),
-        "mcp_servers": item.get("mcp_servers").and_then(|v| v.as_l().ok()).map(|list| list.iter().filter_map(|v| v.as_s().ok().map(|s| s.as_str())).collect::<Vec<_>>()),
+    let st = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
+    let num = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+    };
+    let strings = |k: &str| {
+        item.get(k).and_then(|v| v.as_l().ok()).map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_s().ok().cloned())
+                .collect::<Vec<_>>()
+        })
+    };
+    let maps = |k: &str| {
+        item.get(k).and_then(|v| v.as_l().ok()).map(|list| {
+            list.iter()
+                .filter_map(|e| e.as_m().ok())
+                .map(|m| {
+                    let get = |f: &str| m.get(f).and_then(|v| v.as_s().ok()).cloned();
+                    (
+                        get("pass"),
+                        get("started_at"),
+                        get("message"),
+                        get("timestamp"),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    Ok(Json(Run {
+        status: st("status"),
+        ticket_source: st("ticket_source"),
+        ticket_id: st("ticket_id"),
+        title: st("title"),
+        repo: st("repo"),
+        branch: st("branch"),
+        pr_url: st("pr_url"),
+        pr_number: num("pr_number"),
+        pr_urls: strings("pr_urls"),
+        pr_numbers: item
+            .get("pr_numbers")
+            .and_then(|v| v.as_l().ok())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|v| v.as_n().ok())
+                    .filter_map(|n| n.parse::<u64>().ok())
+                    .collect()
+            }),
+        branches: strings("branches"),
+        current_pass: st("current_pass"),
+        tokens_in,
+        tokens_out,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        cost_usd,
+        files_modified: strings("files_modified"),
+        mcp_servers: strings("mcp_servers"),
         // Team standards the run's passes were given in full ("always apply").
-        "applied_standards": item.get("applied_standards").and_then(|v| v.as_ss().ok()).map(|set| { let mut v: Vec<&str> = set.iter().map(String::as_str).collect(); v.sort_unstable(); v }).unwrap_or_default(),
-        "duration_s": item.get("duration_s").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-        "error": item.get("error_message").and_then(|v| v.as_s().ok()),
+        applied_standards: item
+            .get("applied_standards")
+            .and_then(|v| v.as_ss().ok())
+            .map(|set| {
+                let mut v: Vec<String> = set.to_vec();
+                v.sort_unstable();
+                v
+            })
+            .unwrap_or_default(),
+        duration_s: num("duration_s"),
+        error: st("error_message"),
         // Where the fix belongs, and the report when (part of) it is a change
         // outside the code.
-        "fix_location": item.get("fix_location").and_then(|v| v.as_s().ok()),
-        "outside_change_report": item.get("outside_change_report").and_then(|v| v.as_s().ok()),
+        fix_location: st("fix_location"),
+        outside_change_report: st("outside_change_report"),
         // A lesson recorded for the repository when the fix was elsewhere.
-        "lesson": item.get("lesson").and_then(|v| v.as_s().ok()),
+        lesson: st("lesson"),
         // A person closed the run on purpose (`run_close`): who, when, why,
         // and the status it had then.
-        "closed_by": item.get("closed_by_name").or_else(|| item.get("closed_by")).and_then(|v| v.as_s().ok()),
-        "closed_at": item.get("closed_at").and_then(|v| v.as_s().ok()),
-        "close_reason": item.get("close_reason").and_then(|v| v.as_s().ok()),
-        "closed_from": item.get("closed_from").and_then(|v| v.as_s().ok()),
-        "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
-        "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
-        "pass_history": item.get("pass_history").and_then(|v| v.as_l().ok()).map(|list| {
-            list.iter().filter_map(|entry| {
-                let m = entry.as_m().ok()?;
-                Some(json!({
-                    "pass": m.get("pass").and_then(|v| v.as_s().ok()),
-                    "started_at": m.get("started_at").and_then(|v| v.as_s().ok()),
-                }))
-            }).collect::<Vec<_>>()
+        closed_by: item
+            .get("closed_by_name")
+            .or_else(|| item.get("closed_by"))
+            .and_then(|v| v.as_s().ok())
+            .cloned(),
+        closed_at: st("closed_at"),
+        close_reason: st("close_reason"),
+        closed_from: st("closed_from"),
+        created_at: st("created_at"),
+        updated_at: st("updated_at"),
+        pass_history: maps("pass_history").map(|v| {
+            v.into_iter()
+                .map(|(pass, started_at, _, _)| RunPass { pass, started_at })
+                .collect()
         }),
-        "progress_notes": item.get("progress_notes").and_then(|v| v.as_l().ok()).map(|list| {
-            list.iter().filter_map(|entry| {
-                let m = entry.as_m().ok()?;
-                Some(json!({
-                    "message": m.get("message").and_then(|v| v.as_s().ok()),
-                    "timestamp": m.get("timestamp").and_then(|v| v.as_s().ok()),
-                }))
-            }).collect::<Vec<_>>()
+        progress_notes: maps("progress_notes").map(|v| {
+            v.into_iter()
+                .map(|(_, _, message, timestamp)| RunNote { message, timestamp })
+                .collect()
         }),
-    })))
+    }))
 }
 
 /// What a pass kept about what it did (e.g. which team agents reviewed a
@@ -1024,12 +1418,39 @@ pub async fn get_run_openspec(
     Ok(Json(Value::Object(files)))
 }
 
+/// What a run action did.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunActionResult {
+    /// `retrying` after a retry, `cancelled` after a cancel.
+    #[schema(example = "retrying")]
+    pub status: String,
+}
+
 /// POST /api/runs/:run_id/retry — re-enqueue a failed run to the ticket queue.
+#[utoipa::path(
+    post,
+    path = "/api/runs/{run_id}/retry",
+    tag = "Runs",
+    operation_id = "retryRun",
+    summary = "Retry a run",
+    description = "Starts the run's ticket again as a new run. Only a run that is `failed`, \
+        `needs_input`, `needs_outside_change`, `cancelled` or `closed` can be retried; the old run \
+        becomes `retried`, so retrying it twice is refused with `400`. Find the new run with \
+        `GET /api/runs?q=<ticket id>`.",
+    params(("run_id" = String, Path, description = "The run's id.", example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")),
+    responses(
+        (status = 200, description = "The ticket is queued again.", body = RunActionResult,
+            example = json!({ "status": "retrying" })),
+        (status = 400, description = "The run is not in a state that can be retried.", body = crate::openapi::ErrorBody),
+        (status = 404, description = "No run with this id in the team.", body = crate::openapi::ErrorBody),
+    ),
+    security(("api_key" = ["runs"])),
+)]
 pub async fn retry_run(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<RunActionResult>, StatusCode> {
     claims.require_role(1)?; // member+
                              // Block if token limit exceeded
     if super::github_webhook::check_run_budget(&state, &claims.team_id)
@@ -1196,7 +1617,9 @@ pub async fn retry_run(
 
     info!(run_id, "Run retried — dispatched to SQS");
 
-    Ok(Json(json!({ "status": "retrying" })))
+    Ok(Json(RunActionResult {
+        status: "retrying".into(),
+    }))
 }
 
 /// Close a PR and delete a branch via the GitHub App token. Best-effort.
@@ -1568,11 +1991,28 @@ pub async fn re_review_run(
 }
 
 /// POST /api/runs/:run_id/cancel — cancel a running job.
+#[utoipa::path(
+    post,
+    path = "/api/runs/{run_id}/cancel",
+    tag = "Runs",
+    operation_id = "cancelRun",
+    summary = "Cancel a run",
+    description = "Stops a run that is `running`. The run becomes `cancelled`, and the work it \
+        has not done yet is dropped; a pull request it already opened stays open. A run in any \
+        other state answers `400`, so cancelling twice is harmless.",
+    params(("run_id" = String, Path, description = "The run's id.", example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")),
+    responses(
+        (status = 200, description = "The run is cancelled.", body = RunActionResult,
+            example = json!({ "status": "cancelled" })),
+        (status = 400, description = "The run is not running (or doesn't exist).", body = crate::openapi::ErrorBody),
+    ),
+    security(("api_key" = ["runs"])),
+)]
 pub async fn cancel_run(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<RunActionResult>, StatusCode> {
     claims.require_role(1)?; // member+
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -1601,14 +2041,60 @@ pub async fn cancel_run(
         })?;
 
     info!(run_id, "Run cancelled by user");
-    Ok(Json(json!({ "status": "cancelled" })))
+    Ok(Json(RunActionResult {
+        status: "cancelled".into(),
+    }))
+}
+
+/// A repository connected to the team.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct Repo {
+    /// `owner/name`.
+    #[schema(example = "acme/web")]
+    pub name: String,
+    /// Whether CoderHelm works on it.
+    #[schema(example = true)]
+    pub enabled: Option<bool>,
+    /// Where its tickets come from: `github` or `jira`.
+    #[schema(example = "github")]
+    pub ticket_source: Option<String>,
+    /// How far CoderHelm got reading it when it was connected, such as
+    /// `pending`, `ready` or `failed`.
+    #[schema(example = "ready")]
+    pub onboard_status: Option<String>,
+    /// Why reading it failed, when it did.
+    pub onboard_error: Option<String>,
+    /// What the repository is for, as the team set it, such as `web` or `backend`.
+    #[schema(example = "web")]
+    pub role: Option<String>,
+}
+
+/// The team's repositories.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct ReposList {
+    /// Every connected repository, in name order.
+    pub repos: Vec<Repo>,
 }
 
 /// GET /api/repos — list repos configured for this team.
+#[utoipa::path(
+    get,
+    path = "/api/repos",
+    tag = "Repositories",
+    operation_id = "listRepos",
+    summary = "List repositories",
+    description = "Lists the repositories connected to the team through the CoderHelm GitHub App, \
+        whether CoderHelm works on each, and where its tickets come from. Not paged: a team's \
+        repositories come back in one answer.",
+    responses(
+        (status = 200, description = "The team's repositories.", body = ReposList),
+    ),
+    security(("api_key" = ["view"])),
+)]
 pub async fn list_repos(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<ReposList>, StatusCode> {
     let result = state
         .dynamo
         .query()
@@ -1623,23 +2109,23 @@ pub async fn list_repos(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let repos: Vec<Value> = result
+    let repos: Vec<Repo> = result
         .items()
         .iter()
         .filter_map(|item| {
-            let name = item.get("repo_name").and_then(|v| v.as_s().ok())?;
-            Some(json!({
-                "name": name,
-                "enabled": item.get("enabled").and_then(|v| v.as_bool().ok()),
-                "ticket_source": item.get("ticket_source").and_then(|v| v.as_s().ok()),
-                "onboard_status": item.get("onboard_status").and_then(|v| v.as_s().ok()),
-                "onboard_error": item.get("onboard_error").and_then(|v| v.as_s().ok()),
-                "role": item.get("role").and_then(|v| v.as_s().ok()),
-            }))
+            let st = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
+            Some(Repo {
+                name: st("repo_name")?,
+                enabled: item.get("enabled").and_then(|v| v.as_bool().ok()).copied(),
+                ticket_source: st("ticket_source"),
+                onboard_status: st("onboard_status"),
+                onboard_error: st("onboard_error"),
+                role: st("role"),
+            })
         })
         .collect();
 
-    Ok(Json(json!({ "repos": repos })))
+    Ok(Json(ReposList { repos }))
 }
 
 /// POST /api/repos/sync — fetch repos from GitHub API and write missing ones to DynamoDB.
@@ -3761,10 +4247,25 @@ pub async fn update_budget(
 }
 
 /// GET /api/usage — token usage for the current month + configured limits.
+#[utoipa::path(
+    get,
+    path = "/api/usage",
+    tag = "Usage",
+    operation_id = "getUsage",
+    summary = "Get this month's usage",
+    description = "Returns the tokens the team used this calendar month (UTC), split into new \
+        input, output, cache reads and cache writes, per feature, and against each limit the team \
+        set. When a limit is reached, endpoints that start work answer `429` with \
+        `token_limit_reached` until the month turns or an admin raises it.",
+    responses(
+        (status = 200, description = "This month's usage.", body = Usage),
+    ),
+    security(("api_key" = ["view"])),
+)]
 pub async fn get_usage(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Usage>, StatusCode> {
     let month = chrono::Utc::now().format("%Y-%m").to_string();
 
     let (analytics_result, limit_result) = tokio::join!(
@@ -3791,7 +4292,7 @@ pub async fn get_usage(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(Json(usage_json(&month, analytics.item(), &limits)))
+    Ok(Json(usage_body(&month, analytics.item(), &limits)))
 }
 
 /// The usage body: tokens only (no money). `total_tokens` is all four parts.
@@ -3801,35 +4302,125 @@ pub async fn get_usage(
 /// `max_tokens` / `counted_tokens` / `limit_counts_cache` describe the old
 /// single limit for older clients (0 / new input + output once the new limits
 /// are saved).
+#[cfg(test)]
 pub fn usage_json(
     month: &str,
     analytics: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
     limits: &common::token_limits::TokenLimits,
 ) -> Value {
+    serde_json::to_value(usage_body(month, analytics, limits)).unwrap_or_default()
+}
+
+/// One feature's share of the month's tokens.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct UsageFeature {
+    /// The feature, such as `coder`, `reviewer`, `plan_chat` or `log_analyzer`.
+    #[schema(example = "reviewer")]
+    pub feature: String,
+    /// All four parts together.
+    #[schema(example = 2410022)]
+    pub total_tokens: u64,
+    /// New input tokens (not from the cache).
+    #[schema(example = 301200)]
+    pub tokens_in: u64,
+    /// Tokens read from the prompt cache.
+    #[schema(example = 1900410)]
+    pub cache_read_tokens: u64,
+    /// Tokens written to the prompt cache.
+    #[schema(example = 151002)]
+    pub cache_write_tokens: u64,
+    /// Output tokens.
+    #[schema(example = 57410)]
+    pub tokens_out: u64,
+}
+
+/// One limit the team set, and what it counts this month.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct UsageLimit {
+    /// What it counts: `new_tokens` (new input and output), `cache_read`,
+    /// `cache_write`, or `all_tokens` (an older single limit that counts cache too).
+    #[schema(example = "new_tokens")]
+    pub kind: String,
+    /// The limit.
+    #[schema(example = 20000000)]
+    pub max: u64,
+    /// What it counts so far this month.
+    #[schema(example = 4310227)]
+    pub used: u64,
+}
+
+/// The team's token usage this month.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct Usage {
+    /// The month, `YYYY-MM` (UTC).
+    #[schema(example = "2026-10")]
+    pub month: String,
+    /// All tokens: new input, cache reads, cache writes and output.
+    #[schema(example = 18233019)]
+    pub total_tokens: u64,
+    /// New input tokens (not from the cache).
+    #[schema(example = 3011022)]
+    pub tokens_in: u64,
+    /// Tokens read from the prompt cache.
+    #[schema(example = 13100400)]
+    pub cache_read_tokens: u64,
+    /// Tokens written to the prompt cache.
+    #[schema(example = 822392)]
+    pub cache_write_tokens: u64,
+    /// Output tokens.
+    #[schema(example = 1299205)]
+    pub tokens_out: u64,
+    /// New input plus output: what the `new_tokens` limit counts.
+    #[schema(example = 4310227)]
+    pub new_tokens: u64,
+    /// Cache reads divided by all input, from 0 to 1.
+    #[schema(example = 0.77)]
+    pub cache_hit_rate: f64,
+    /// Each limit that is set, in display order. Empty when none is.
+    pub limits: Vec<UsageLimit>,
+    /// True when the limits were read from the older single-limit setting.
+    pub limits_legacy: bool,
+    /// What the older single limit counts (kept for older clients).
+    #[schema(example = 4310227)]
+    pub counted_tokens: u64,
+    /// Whether the older single limit counts cache tokens (kept for older clients).
+    pub limit_counts_cache: bool,
+    /// Usage per feature.
+    pub features: Vec<UsageFeature>,
+    /// Runs started this month.
+    #[schema(example = 37)]
+    pub total_runs: u64,
+    /// The older single limit, 0 when it isn't used (kept for older clients).
+    #[schema(example = 0)]
+    pub max_tokens: u64,
+}
+
+/// The usage body as a type (see [`usage_json`]).
+pub fn usage_body(
+    month: &str,
+    analytics: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
+    limits: &common::token_limits::TokenLimits,
+) -> Usage {
     use common::token_limits::LimitKind;
     let t = common::usage::UsageTotals::from_item(analytics);
-    let features: Vec<Value> = common::usage::feature_totals(analytics)
+    let features: Vec<UsageFeature> = common::usage::feature_totals(analytics)
         .into_iter()
-        .map(|(f, ft)| {
-            json!({
-                "feature": f,
-                "total_tokens": ft.total(),
-                "tokens_in": ft.tokens_in_uncached,
-                "cache_read_tokens": ft.cache_read,
-                "cache_write_tokens": ft.cache_write,
-                "tokens_out": ft.tokens_out,
-            })
+        .map(|(f, ft)| UsageFeature {
+            feature: f,
+            total_tokens: ft.total(),
+            tokens_in: ft.tokens_in_uncached,
+            cache_read_tokens: ft.cache_read,
+            cache_write_tokens: ft.cache_write,
+            tokens_out: ft.tokens_out,
         })
         .collect();
     let uses = limits.uses(&t);
-    let limit_rows: Vec<Value> = uses
+    let limit_rows: Vec<UsageLimit> = uses
         .iter()
-        .map(|u| {
-            json!({
-                "kind": u.kind.key(),
-                "max": u.max,
-                "used": u.used,
-            })
+        .map(|u| UsageLimit {
+            kind: u.kind.key().to_string(),
+            max: u.max,
+            used: u.used,
         })
         .collect();
     let (max_tokens, counted, counts_cache) = uses
@@ -3839,27 +4430,27 @@ pub fn usage_json(
             _ => None,
         })
         .unwrap_or((0, t.uncached_total(), false));
-    json!({
-        "month": month,
-        "total_tokens": t.total(),
-        "tokens_in": t.tokens_in_uncached,
-        "cache_read_tokens": t.cache_read,
-        "cache_write_tokens": t.cache_write,
-        "tokens_out": t.tokens_out,
-        "new_tokens": t.uncached_total(),
-        "cache_hit_rate": t.cache_hit_rate(),
-        "limits": limit_rows,
-        "limits_legacy": limits.legacy,
-        "counted_tokens": counted,
-        "limit_counts_cache": counts_cache,
-        "features": features,
-        "total_runs": analytics
+    Usage {
+        month: month.to_string(),
+        total_tokens: t.total(),
+        tokens_in: t.tokens_in_uncached,
+        cache_read_tokens: t.cache_read,
+        cache_write_tokens: t.cache_write,
+        tokens_out: t.tokens_out,
+        new_tokens: t.uncached_total(),
+        cache_hit_rate: t.cache_hit_rate(),
+        limits: limit_rows,
+        limits_legacy: limits.legacy,
+        counted_tokens: counted,
+        limit_counts_cache: counts_cache,
+        features,
+        total_runs: analytics
             .and_then(|i| i.get("total_runs"))
             .and_then(|v| v.as_n().ok())
             .and_then(|n| n.parse::<u64>().ok())
             .unwrap_or(0),
-        "max_tokens": max_tokens,
-    })
+        max_tokens,
+    }
 }
 
 /// GET /api/settings/workflow — get workflow preferences.

@@ -15,17 +15,56 @@ fn attr_n(val: impl ToString) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
 }
 
+/// Query parameters of `GET /api/plans`.
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct PlansQuery {
+    /// Plans per page, 1 to 100. Default 20.
+    #[param(value_type = Option<u32>, minimum = 1, maximum = 100, example = 20)]
+    limit: Option<String>,
+    /// `next` from the previous page.
+    cursor: Option<String>,
+}
+
+/// A page of plans.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct PlansPage {
+    /// Plans, newest first.
+    pub plans: Vec<Plan>,
+    /// Pass as `cursor` to read the next page; null on the last page.
+    #[schema(example = "PLAN#01JB8V0K3M5P7R9T1W3Y5A7C9E")]
+    pub next: Option<String>,
+    /// The same as `next`, kept for older clients.
+    #[schema(deprecated)]
+    pub next_cursor: Option<String>,
+}
+
 /// GET /api/plans — list plans for the team (paginated).
+#[utoipa::path(
+    get,
+    path = "/api/plans",
+    tag = "Plans",
+    operation_id = "listPlans",
+    summary = "List plans",
+    description = "Lists the team's plans, newest first, one page at a time. A listed plan has \
+        no tasks; get one plan for its tasks.",
+    params(PlansQuery),
+    responses(
+        (status = 200, description = "A page of plans.", body = PlansPage),
+    ),
+    security(("api_key" = ["view"])),
+)]
 pub async fn list_plans(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, StatusCode> {
-    let limit: i32 = params
-        .get("limit")
+    axum::extract::Query(query): axum::extract::Query<PlansQuery>,
+) -> Result<Json<PlansPage>, StatusCode> {
+    let limit: i32 = query
+        .limit
+        .as_deref()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20)
-        .min(100);
+        .clamp(1, 100);
 
     // Plan rows (`PLAN#<id>`) share the partition with their task rows
     // (`PLAN#<id>#TASK#…`), and DynamoDB applies `Limit` before any filter.
@@ -34,8 +73,9 @@ pub async fn list_plans(
     // query pages until `limit` plans are collected, and hand back the sort
     // key of the last plan returned as the cursor.
     type Key = std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>;
-    let mut start: Option<Key> = params
-        .get("cursor")
+    let mut start: Option<Key> = query
+        .cursor
+        .as_deref()
         .filter(|c| !c.is_empty())
         .map(|cursor| {
             Key::from([
@@ -43,7 +83,7 @@ pub async fn list_plans(
                 ("sk".to_string(), attr_s(cursor)),
             ])
         });
-    let mut plans: Vec<Value> = Vec::new();
+    let mut plans: Vec<Plan> = Vec::new();
     let mut next_cursor: Option<String> = None;
     'pages: loop {
         let result = state
@@ -76,7 +116,7 @@ pub async fn list_plans(
                 break 'pages;
             }
             next_cursor = Some(sk.to_string());
-            plans.push(plan_from_item(item));
+            plans.push(plan_of(item));
         }
         match result.last_evaluated_key() {
             Some(key) => start = Some(key.clone()),
@@ -88,10 +128,11 @@ pub async fn list_plans(
         }
     }
 
-    Ok(Json(json!({
-        "plans": plans,
-        "next_cursor": next_cursor,
-    })))
+    Ok(Json(PlansPage {
+        plans,
+        next: next_cursor.clone(),
+        next_cursor,
+    }))
 }
 
 /// A plan's own row, as opposed to one of its task rows.
@@ -99,20 +140,116 @@ fn is_plan_row(sk: &str) -> bool {
     sk.starts_with("PLAN#") && !sk.contains("#TASK#")
 }
 
+/// A new plan.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[schema(example = json!({
+    "title": "Rate-limit the login form",
+    "description": "Brute-force attempts are showing up in the auth logs.",
+    "repo": "acme/web",
+    "tasks": [
+        {
+            "title": "Limit login attempts per IP",
+            "description": "Allow 10 attempts per IP per 15 minutes; answer 429 after that.",
+            "acceptance_criteria": "The 11th attempt within 15 minutes gets 429 and a Retry-After header."
+        }
+    ]
+}))]
+pub struct CreatePlan {
+    /// What the plan is for. 1 to 500 characters.
+    pub title: String,
+    /// More about it, in Markdown.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The repository its tasks work in, `owner/name`, unless a task names its own.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Where each task becomes a ticket: a GitHub issue (`github`, the
+    /// default) or a Jira ticket (`jira`).
+    #[serde(default)]
+    pub destination: Option<PlanDestination>,
+    /// The plan's tasks, in order. Each starts as `draft`.
+    #[serde(default)]
+    pub tasks: Option<Vec<NewPlanTask>>,
+    /// The plan chat it came from (dashboard only).
+    #[serde(default)]
+    #[schema(ignore)]
+    pub chat_id: Option<String>,
+    /// MCP servers used while planning (dashboard only).
+    #[serde(default)]
+    #[schema(ignore)]
+    pub mcp_servers: Option<Vec<String>>,
+}
+
+/// Where a plan's tasks become tickets: `github` (GitHub issues) or `jira`.
+#[derive(serde::Deserialize, utoipa::ToSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanDestination {
+    Github,
+    Jira,
+}
+
+/// A task in a new plan.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct NewPlanTask {
+    /// What to do. Defaults to "Untitled task".
+    #[serde(default)]
+    pub title: Option<String>,
+    /// How, in Markdown. The coder reads it as the ticket body.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// How to tell it is done.
+    #[serde(default)]
+    pub acceptance_criteria: Option<String>,
+    /// The repository for this task, `owner/name`, when not the plan's.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Where this task becomes a ticket, when not where the plan's do.
+    #[serde(default)]
+    pub destination: Option<PlanDestination>,
+    /// With `jira`: the Jira project key to file the ticket in.
+    #[serde(default)]
+    pub jira_project: Option<String>,
+}
+
+/// The plan that was made.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct CreatedPlan {
+    /// The new plan's id.
+    #[schema(example = "01JB8V0K3M5P7R9T1W3Y5A7C9E")]
+    pub plan_id: String,
+}
+
 /// POST /api/plans — create a new plan.
+#[utoipa::path(
+    post,
+    path = "/api/plans",
+    tag = "Plans",
+    operation_id = "createPlan",
+    summary = "Create a plan",
+    description = "Creates a plan, with its tasks if you send them. The plan and its tasks start \
+        as `draft`; nothing runs until the plan is executed. Not idempotent: sending the same \
+        request twice makes two plans.",
+    request_body(content = CreatePlan, description = "The plan.", content_type = "application/json"),
+    responses(
+        (status = 200, description = "The plan was made.", body = CreatedPlan),
+        (status = 400, description = "The body is not valid JSON, or the title is missing or longer than 500 characters.", body = crate::openapi::ErrorBody),
+    ),
+    security(("api_key" = ["plans"])),
+)]
 pub async fn create_plan(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Json(body): Json<Value>,
-) -> Result<Json<Value>, StatusCode> {
+    Json(raw): Json<Value>,
+) -> Result<Json<CreatedPlan>, StatusCode> {
     // plans.rs had NO role gates — any authed viewer could dispatch paid
     // agent runs or delete the team's plans.
     claims.require_role(1)?;
-    let title = body["title"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
-    let description = body["description"].as_str().unwrap_or("");
-    let repo = body["repo"].as_str().unwrap_or("");
-    let destination = match body["destination"].as_str() {
-        Some("jira") => "jira",
+    let body: CreatePlan = serde_json::from_value(raw).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let title = body.title.as_str();
+    let description = body.description.as_deref().unwrap_or("");
+    let repo = body.repo.as_deref().unwrap_or("");
+    let destination = match body.destination {
+        Some(PlanDestination::Jira) => "jira",
         _ => "github",
     };
 
@@ -141,18 +278,15 @@ pub async fn create_plan(
         .item("updated_at", attr_s(&now));
 
     // The chat the plan was made in, so its page can say what the chat used.
-    let chat_id = super::plan_chat_tools::chat_id(body["chat_id"].as_str());
+    let chat_id = super::plan_chat_tools::chat_id(body.chat_id.as_deref());
     if chat_id != "unsaved" {
         put = put.item("chat_id", attr_s(&chat_id));
     }
 
     // Store which MCP servers were used during chat planning
-    if let Some(servers) = body["mcp_servers"].as_array() {
-        let server_list: Vec<aws_sdk_dynamodb::types::AttributeValue> = servers
-            .iter()
-            .filter_map(|s| s.as_str())
-            .map(attr_s)
-            .collect();
+    if let Some(servers) = &body.mcp_servers {
+        let server_list: Vec<aws_sdk_dynamodb::types::AttributeValue> =
+            servers.iter().map(|s| attr_s(s)).collect();
         if !server_list.is_empty() {
             put = put.item(
                 "mcp_servers",
@@ -167,12 +301,12 @@ pub async fn create_plan(
     })?;
 
     // Create tasks if provided inline
-    if let Some(tasks) = body["tasks"].as_array() {
+    if let Some(tasks) = &body.tasks {
         for (i, task) in tasks.iter().enumerate() {
-            let task_title = task["title"].as_str().unwrap_or("Untitled task");
-            let task_desc = task["description"].as_str().unwrap_or("");
-            let task_criteria = task["acceptance_criteria"].as_str().unwrap_or("");
-            let task_repo = task["repo"].as_str().unwrap_or("");
+            let task_title = task.title.as_deref().unwrap_or("Untitled task");
+            let task_desc = task.description.as_deref().unwrap_or("");
+            let task_criteria = task.acceptance_criteria.as_deref().unwrap_or("");
+            let task_repo = task.repo.as_deref().unwrap_or("");
             let task_id = ulid::Ulid::new().to_string();
             let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
 
@@ -194,14 +328,13 @@ pub async fn create_plan(
             if !task_repo.is_empty() {
                 put = put.item("repo", attr_s(task_repo));
             }
-            if let Some(dest) = task["destination"].as_str().or(if destination.is_empty() {
-                None
-            } else {
-                Some(destination)
-            }) {
-                put = put.item("destination", attr_s(dest));
-            }
-            if let Some(jp) = task["jira_project"].as_str() {
+            let task_dest = match task.destination {
+                Some(PlanDestination::Jira) => "jira",
+                Some(PlanDestination::Github) => "github",
+                None => destination,
+            };
+            put = put.item("destination", attr_s(task_dest));
+            if let Some(jp) = task.jira_project.as_deref() {
                 put = put.item("jira_project", attr_s(jp));
             }
 
@@ -227,7 +360,7 @@ pub async fn create_plan(
 
     track_plan_usage(&state, &claims.team_id).await;
 
-    Ok(Json(json!({ "plan_id": plan_id })))
+    Ok(Json(CreatedPlan { plan_id }))
 }
 
 /// Increment total_plans in analytics (plans are unlimited, no overage billing).
@@ -247,12 +380,38 @@ async fn track_plan_usage(state: &Arc<AppState>, team_id: &str) {
     }
 }
 
+/// A plan with its tasks.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct PlanWithTasks {
+    #[serde(flatten)]
+    pub plan: Plan,
+    /// The plan's tasks, in order.
+    pub tasks: Vec<PlanTask>,
+}
+
 /// GET /api/plans/:plan_id — get plan with all tasks.
+#[utoipa::path(
+    get,
+    path = "/api/plans/{plan_id}",
+    tag = "Plans",
+    operation_id = "getPlan",
+    summary = "Get a plan",
+    description = "Returns one plan with its tasks in order. Once the plan runs, each task shows \
+        the ticket it became and the run working on it (`run_id`), which you can follow with \
+        `GET /api/runs/{run_id}`.",
+    params(("plan_id" = String, Path, description = "The plan's id.", example = "01JB8V0K3M5P7R9T1W3Y5A7C9E")),
+    responses(
+        (status = 200, description = "The plan and its tasks.", body = PlanWithTasks),
+        (status = 400, description = "The id is not a plan id.", body = crate::openapi::ErrorBody),
+        (status = 404, description = "No plan with this id in the team.", body = crate::openapi::ErrorBody),
+    ),
+    security(("api_key" = ["view"])),
+)]
 pub async fn get_plan(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<PlanWithTasks>, StatusCode> {
     validate_plan_id(&plan_id)?;
 
     let result = state
@@ -275,8 +434,8 @@ pub async fn get_plan(
     }
 
     // Separate plan from tasks
-    let mut plan_data: Option<Value> = None;
-    let mut tasks: Vec<Value> = Vec::new();
+    let mut plan_data: Option<Plan> = None;
+    let mut tasks: Vec<PlanTask> = Vec::new();
 
     for item in items {
         let sk = item
@@ -286,18 +445,17 @@ pub async fn get_plan(
             .unwrap_or("");
 
         if sk.contains("#TASK#") {
-            tasks.push(task_from_item(item));
+            tasks.push(task_of(item));
         } else {
-            plan_data = Some(plan_from_item(item));
+            plan_data = Some(plan_of(item));
         }
     }
 
-    let mut plan = plan_data.ok_or(StatusCode::NOT_FOUND)?;
+    let plan = plan_data.ok_or(StatusCode::NOT_FOUND)?;
     // Sort tasks by order
-    tasks.sort_by_key(|t| t["order"].as_u64().unwrap_or(0));
-    plan["tasks"] = json!(tasks);
+    tasks.sort_by_key(|t| t.order);
 
-    Ok(Json(plan))
+    Ok(Json(PlanWithTasks { plan, tasks }))
 }
 
 /// PUT /api/plans/:plan_id — update plan metadata.
@@ -837,11 +995,28 @@ pub async fn reject_task(
 }
 
 /// POST /api/plans/:plan_id/approve-and-execute — approve all draft tasks and execute.
+#[utoipa::path(
+    post,
+    path = "/api/plans/{plan_id}/approve-and-execute",
+    tag = "Plans",
+    operation_id = "approveAndExecutePlan",
+    summary = "Approve and run a plan",
+    description = "Approves every `draft` task of the plan and runs the plan: each approved task \
+        becomes a GitHub issue or Jira ticket and is queued as a run, in task order. The plan \
+        becomes `executing`. Rejected tasks are skipped. Answers `400` when no task is left to \
+        run, so calling it again after a successful call does not run anything twice.",
+    params(("plan_id" = String, Path, description = "The plan's id.", example = "01JB8V0K3M5P7R9T1W3Y5A7C9E")),
+    responses(
+        (status = 200, description = "The plan is running.", body = PlanExecution),
+        (status = 400, description = "The id is not a plan id, or the plan has no draft or approved tasks.", body = crate::openapi::ErrorBody),
+    ),
+    security(("api_key" = ["plans"])),
+)]
 pub async fn approve_all_and_execute(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     axum::extract::Path(plan_id): axum::extract::Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<PlanExecution>, StatusCode> {
     // plans.rs had NO role gates — any authed viewer could dispatch paid
     // agent runs or delete the team's plans.
     claims.require_role(1)?;
@@ -978,10 +1153,10 @@ pub async fn approve_all_and_execute(
             .ok();
     }
 
-    Ok(Json(json!({
-        "status": "executing",
-        "tasks_queued": task_ids.len(),
-    })))
+    Ok(Json(PlanExecution {
+        status: "executing".into(),
+        tasks_queued: task_ids.len(),
+    }))
 }
 
 /// POST /api/plans/:plan_id/tasks/:task_id/force-run — force-run a waiting task.
@@ -1208,6 +1383,17 @@ pub async fn execute_plan(
     })))
 }
 
+/// A plan that started running.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct PlanExecution {
+    /// Always `executing`.
+    #[schema(example = "executing")]
+    pub status: String,
+    /// How many tasks were queued.
+    #[schema(example = 3)]
+    pub tasks_queued: usize,
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────
 
 fn validate_plan_id(id: &str) -> Result<(), StatusCode> {
@@ -1220,62 +1406,174 @@ fn validate_plan_id(id: &str) -> Result<(), StatusCode> {
 fn plan_from_item(
     item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
 ) -> Value {
-    let mcp_servers: Vec<&str> = item
-        .get("mcp_servers")
-        .and_then(|v| v.as_l().ok())
-        .map(|list| {
-            list.iter()
-                .filter_map(|v| v.as_s().ok().map(|s| s.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    json!({
-        "plan_id": item.get("plan_id").and_then(|v| v.as_s().ok()),
-        "title": item.get("title").and_then(|v| v.as_s().ok()),
-        "description": item.get("description").and_then(|v| v.as_s().ok()),
-        "repo": item.get("repo").and_then(|v| v.as_s().ok()),
-        "status": item.get("status").and_then(|v| v.as_s().ok()),
-        "task_count": item.get("task_count").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
-        "tokens_in": item.get("total_tokens_in").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-        "tokens_out": item.get("total_tokens_out").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-        "destination": item.get("destination").and_then(|v| v.as_s().ok()),
-        "mcp_servers": if mcp_servers.is_empty() { Value::Null } else { json!(mcp_servers) },
-        "chat_id": item.get("chat_id").and_then(|v| v.as_s().ok()),
-        "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
-        "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
-        "executed_at": item.get("executed_at").and_then(|v| v.as_s().ok()),
-        "executed_by": item.get("executed_by").and_then(|v| v.as_s().ok()),
-    })
+    serde_json::to_value(plan_of(item)).unwrap_or_default()
 }
 
 fn task_from_item(
     item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
 ) -> Value {
-    json!({
-        "task_id": item.get("task_id").and_then(|v| v.as_s().ok()),
-        "plan_id": item.get("plan_id").and_then(|v| v.as_s().ok()),
-        "title": item.get("title").and_then(|v| v.as_s().ok()),
-        "description": item.get("description").and_then(|v| v.as_s().ok()),
-        "acceptance_criteria": item.get("acceptance_criteria").and_then(|v| v.as_s().ok()),
-        "status": item.get("status").and_then(|v| v.as_s().ok()),
-        "repo": item.get("repo").and_then(|v| v.as_s().ok()),
-        "order": item.get("task_order").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
-        "issue_number": item.get("issue_number").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
-        "issue_url": item.get("issue_url").and_then(|v| v.as_s().ok()),
-        "run_id": item.get("run_id").and_then(|v| v.as_s().ok()),
-        "pr_url": item.get("pr_url").and_then(|v| v.as_s().ok()),
-        "approved_at": item.get("approved_at").and_then(|v| v.as_s().ok()),
-        "approved_by": item.get("approved_by").and_then(|v| v.as_s().ok()),
-        "rejected_at": item.get("rejected_at").and_then(|v| v.as_s().ok()),
-        "rejected_by": item.get("rejected_by").and_then(|v| v.as_s().ok()),
-        "destination": item.get("destination").and_then(|v| v.as_s().ok()),
-        "jira_project": item.get("jira_project").and_then(|v| v.as_s().ok()),
-        "jira_ticket_key": item.get("jira_ticket_key").and_then(|v| v.as_s().ok()),
-        "jira_ticket_url": item.get("jira_ticket_url").and_then(|v| v.as_s().ok()),
-        "depends_on": item.get("depends_on").and_then(|v| v.as_s().ok()),
-        "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
-    })
+    serde_json::to_value(task_of(item)).unwrap_or_default()
+}
+
+/// A plan.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct Plan {
+    /// The plan's id.
+    #[schema(example = "01JB8V0K3M5P7R9T1W3Y5A7C9E")]
+    pub plan_id: Option<String>,
+    /// What the plan is for.
+    #[schema(example = "Rate-limit the login form")]
+    pub title: Option<String>,
+    /// More about it, in Markdown.
+    pub description: Option<String>,
+    /// The repository its tasks work in, `owner/name`.
+    #[schema(example = "acme/web")]
+    pub repo: Option<String>,
+    /// `draft`, `executing` or `completed`.
+    #[schema(example = "draft")]
+    pub status: Option<String>,
+    /// How many tasks it has.
+    #[schema(example = 3)]
+    pub task_count: u64,
+    /// Input tokens its runs used so far.
+    pub tokens_in: Option<u64>,
+    /// Output tokens its runs used so far.
+    pub tokens_out: Option<u64>,
+    /// `github` or `jira`: where its tasks become tickets.
+    #[schema(example = "github")]
+    pub destination: Option<String>,
+    /// MCP servers used while planning.
+    pub mcp_servers: Option<Vec<String>>,
+    /// The plan chat it came from.
+    pub chat_id: Option<String>,
+    /// When it was made (RFC 3339).
+    #[schema(example = "2026-10-22T13:40:00+00:00")]
+    pub created_at: Option<String>,
+    /// When it last changed (RFC 3339).
+    pub updated_at: Option<String>,
+    /// When it started running (RFC 3339).
+    pub executed_at: Option<String>,
+    /// Who started it running.
+    pub executed_by: Option<String>,
+}
+
+/// A task in a plan.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct PlanTask {
+    /// The task's id.
+    #[schema(example = "01JB8V0P8Q2S4U6W8Y0A2C4E6G")]
+    pub task_id: Option<String>,
+    /// The plan it belongs to.
+    pub plan_id: Option<String>,
+    /// What to do.
+    #[schema(example = "Limit login attempts per IP")]
+    pub title: Option<String>,
+    /// How, in Markdown.
+    pub description: Option<String>,
+    /// How to tell it is done.
+    pub acceptance_criteria: Option<String>,
+    /// `draft`, `approved`, `rejected`, `queued`, `waiting` (on a task it
+    /// depends on), `running`, `completed` or `failed`.
+    #[schema(example = "queued")]
+    pub status: Option<String>,
+    /// Its repository, when not the plan's.
+    pub repo: Option<String>,
+    /// Its place in the plan, from 0.
+    #[schema(example = 0)]
+    pub order: u64,
+    /// The GitHub issue it became.
+    pub issue_number: Option<u64>,
+    /// That issue's address.
+    pub issue_url: Option<String>,
+    /// The run working on it.
+    #[schema(example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")]
+    pub run_id: Option<String>,
+    /// The pull request that run opened.
+    pub pr_url: Option<String>,
+    /// When it was approved (RFC 3339).
+    pub approved_at: Option<String>,
+    /// Who approved it.
+    pub approved_by: Option<String>,
+    /// When it was rejected (RFC 3339).
+    pub rejected_at: Option<String>,
+    /// Who rejected it.
+    pub rejected_by: Option<String>,
+    /// `github` or `jira`.
+    pub destination: Option<String>,
+    /// The Jira project it is filed in.
+    pub jira_project: Option<String>,
+    /// The Jira ticket it became.
+    pub jira_ticket_key: Option<String>,
+    /// That ticket's address.
+    pub jira_ticket_url: Option<String>,
+    /// The task it waits for, when it depends on one.
+    pub depends_on: Option<String>,
+    /// When it was made (RFC 3339).
+    pub created_at: Option<String>,
+}
+
+type PlanItem = std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>;
+
+fn item_str(item: &PlanItem, k: &str) -> Option<String> {
+    item.get(k).and_then(|v| v.as_s().ok()).cloned()
+}
+
+fn item_u64(item: &PlanItem, k: &str) -> Option<u64> {
+    item.get(k)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+}
+
+fn plan_of(item: &PlanItem) -> Plan {
+    let mcp_servers: Vec<String> = item
+        .get("mcp_servers")
+        .and_then(|v| v.as_l().ok())
+        .map(|list| list.iter().filter_map(|v| v.as_s().ok().cloned()).collect())
+        .unwrap_or_default();
+    Plan {
+        plan_id: item_str(item, "plan_id"),
+        title: item_str(item, "title"),
+        description: item_str(item, "description"),
+        repo: item_str(item, "repo"),
+        status: item_str(item, "status"),
+        task_count: item_u64(item, "task_count").unwrap_or(0),
+        tokens_in: item_u64(item, "total_tokens_in"),
+        tokens_out: item_u64(item, "total_tokens_out"),
+        destination: item_str(item, "destination"),
+        mcp_servers: (!mcp_servers.is_empty()).then_some(mcp_servers),
+        chat_id: item_str(item, "chat_id"),
+        created_at: item_str(item, "created_at"),
+        updated_at: item_str(item, "updated_at"),
+        executed_at: item_str(item, "executed_at"),
+        executed_by: item_str(item, "executed_by"),
+    }
+}
+
+fn task_of(item: &PlanItem) -> PlanTask {
+    PlanTask {
+        task_id: item_str(item, "task_id"),
+        plan_id: item_str(item, "plan_id"),
+        title: item_str(item, "title"),
+        description: item_str(item, "description"),
+        acceptance_criteria: item_str(item, "acceptance_criteria"),
+        status: item_str(item, "status"),
+        repo: item_str(item, "repo"),
+        order: item_u64(item, "task_order").unwrap_or(0),
+        issue_number: item_u64(item, "issue_number"),
+        issue_url: item_str(item, "issue_url"),
+        run_id: item_str(item, "run_id"),
+        pr_url: item_str(item, "pr_url"),
+        approved_at: item_str(item, "approved_at"),
+        approved_by: item_str(item, "approved_by"),
+        rejected_at: item_str(item, "rejected_at"),
+        rejected_by: item_str(item, "rejected_by"),
+        destination: item_str(item, "destination"),
+        jira_project: item_str(item, "jira_project"),
+        jira_ticket_key: item_str(item, "jira_ticket_key"),
+        jira_ticket_url: item_str(item, "jira_ticket_url"),
+        depends_on: item_str(item, "depends_on"),
+        created_at: item_str(item, "created_at"),
+    }
 }
 
 // ─── Plan Openspec ────────────────────────────────────────────────────

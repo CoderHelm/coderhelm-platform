@@ -34,7 +34,10 @@ use crate::AppState;
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
 fn fail(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
-    (status, Json(json!({ "error": message })))
+    (
+        status,
+        Json(json!({ "error": message, "code": crate::openapi::default_code(status) })),
+    )
 }
 
 fn internal(context: &str, e: String) -> (StatusCode, Json<Value>) {
@@ -974,14 +977,74 @@ fn pr_of(git_ref: &str) -> Option<u64> {
         .ok()
 }
 
+/// A report that was taken in.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct CiUploadResult {
+    /// Always true: the report is stored and queued for reading.
+    #[schema(example = true)]
+    pub ok: bool,
+}
+
+/// A quarantined test.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct QuarantinedTest {
+    /// CoderHelm's id for the test.
+    id: String,
+    /// Its title, `describe › title`.
+    #[schema(example = "checkout › applies a discount code")]
+    title: String,
+    /// Its file.
+    #[schema(example = "e2e/checkout.spec.ts")]
+    file: String,
+    /// The Playwright project, when there is one.
+    project: Option<String>,
+    /// `playwright`, `cucumber` or `junit`.
+    #[schema(example = "playwright")]
+    framework: String,
+}
+
+/// The tests quarantined for the calling repository.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct Quarantine {
+    /// Every quarantined test.
+    #[schema(value_type = Vec<QuarantinedTest>)]
+    pub tests: Vec<Value>,
+    /// A pattern for Playwright's `--grep-invert` that skips them; empty when none are.
+    #[schema(example = "checkout applies a discount code")]
+    pub playwright_grep_invert: String,
+}
+
 /// POST /webhooks/ci/tests/results?name=report.json — a report from a CI job
 /// whose results never reach GitHub (a device farm, say).
+#[utoipa::path(
+    post,
+    path = "/webhooks/ci/tests/results",
+    tag = "CI",
+    operation_id = "uploadTestResults",
+    summary = "Upload a test report",
+    description = "Takes one test report from a CI job whose results never reach GitHub (a device \
+        farm, say), signed with the job's GitHub Actions OIDC token instead of a CoderHelm secret. \
+        Request the token with the audience `coderhelm`. CoderHelm checks it was issued for a \
+        workflow run of a repository connected to your team with E2E results turned on, then reads \
+        the report like one from GitHub: flaky tests, failure groups and quarantine.",
+    params(("name" = Option<String>, Query, description = "The report's file name. Must end in `.json` (Playwright or Cucumber JSON) or `.xml` (JUnit XML). Default `report.json`.", example = "results.json")),
+    request_body(content = String, description = "The report file, at most 6 MB.", content_type = "application/octet-stream"),
+    responses(
+        (status = 200, description = "The report is stored and queued.", body = CiUploadResult),
+        (status = 400, description = "Not a report CoderHelm can read, or it has no tests.", body = crate::openapi::ErrorBody),
+        (status = 401, description = "The token is not a valid GitHub Actions OIDC token for CoderHelm.", body = crate::openapi::ErrorBody),
+        (status = 403, description = "The repository is not connected, or E2E results are off.", body = crate::openapi::ErrorBody),
+        (status = 413, description = "Empty, or larger than 6 MB.", body = crate::openapi::ErrorBody),
+    ),
+    security(("github_oidc" = [])),
+)]
 pub async fn ci_upload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
-) -> Reply {
+) -> Result<Json<CiUploadResult>, (StatusCode, Json<Value>)> {
     let claims = signed(&state, &headers).await?;
     if body.is_empty() || body.len() > MAX_UPLOAD {
         return Err(fail(
@@ -1055,7 +1118,7 @@ pub async fn ci_upload(
             .map_err(|e| internal("e2e queue upload", e))?;
     }
     info!(repo = %claims.repository, run_id, "E2E report uploaded");
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(CiUploadResult { ok: true }))
 }
 
 /// Escapes a title for use inside a Playwright `--grep-invert` pattern.
@@ -1083,7 +1146,26 @@ fn grep_pattern(title: &str) -> String {
 
 /// GET /webhooks/ci/tests/quarantine — the tests quarantined for the calling
 /// repo, so a CI step can keep their failures from failing the build.
-pub async fn ci_quarantine(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Reply {
+#[utoipa::path(
+    get,
+    path = "/webhooks/ci/tests/quarantine",
+    tag = "CI",
+    operation_id = "listQuarantinedTests",
+    summary = "List quarantined tests",
+    description = "Returns the tests quarantined for the repository the OIDC token was issued to, \
+        so a CI step can keep their failures from failing the build. For Playwright, pass \
+        `playwright_grep_invert` to `--grep-invert`.",
+    responses(
+        (status = 200, description = "The quarantined tests.", body = Quarantine),
+        (status = 401, description = "The token is not a valid GitHub Actions OIDC token for CoderHelm.", body = crate::openapi::ErrorBody),
+        (status = 403, description = "The repository is not connected, or E2E results are off.", body = crate::openapi::ErrorBody),
+    ),
+    security(("github_oidc" = [])),
+)]
+pub async fn ci_quarantine(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Quarantine>, (StatusCode, Json<Value>)> {
     let claims = signed(&state, &headers).await?;
     let teams = teams_for(&state, &claims).await?;
     let st = store(&state)?;
@@ -1107,9 +1189,10 @@ pub async fn ci_quarantine(State(state): State<Arc<AppState>>, headers: HeaderMa
             .collect::<Vec<_>>()
             .join("|")
     };
-    Ok(Json(
-        json!({ "tests": tests, "playwright_grep_invert": grep_invert }),
-    ))
+    Ok(Json(Quarantine {
+        tests,
+        playwright_grep_invert: grep_invert,
+    }))
 }
 
 #[cfg(test)]

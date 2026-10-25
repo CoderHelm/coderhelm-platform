@@ -482,12 +482,132 @@ pub async fn update_config(
     Ok(StatusCode::OK)
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListReviewsQuery {
+    /// Only this repository, `owner/name`. Omit for the whole team.
+    #[param(example = "acme/web")]
     repo: Option<String>,
+    /// Reviews per page, 1 to 200. Default 50.
+    #[param(minimum = 1, maximum = 200, example = 50)]
     limit: Option<i32>,
     /// `next` from the previous page.
     cursor: Option<String>,
+}
+
+/// One finding in a review. Kept as the reviewer wrote it; fields beyond
+/// these may appear.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct ReviewFinding {
+    /// The file, relative to the repository root.
+    #[schema(example = "src/auth/login.ts")]
+    file: String,
+    /// The line it is about.
+    #[schema(example = 42)]
+    line: u64,
+    /// The last line, when it spans several.
+    end_line: Option<u64>,
+    /// `blocking`, `high`, `medium`, `low` or `nit`.
+    #[schema(example = "high")]
+    severity: String,
+    /// What kind of finding, such as `bug`, `security` or `manual-check`.
+    #[schema(example = "bug")]
+    category: String,
+    /// One line on what is wrong.
+    #[schema(example = "The attempt counter is never reset after a successful login")]
+    title: String,
+    /// The explanation, in Markdown.
+    body: String,
+    /// Replacement text for the line(s), when there is a concrete fix.
+    suggestion: Option<String>,
+    /// What it rests on: `verified-defect`, `unverified-concern` or `question`.
+    /// Only a verified defect holds the merge.
+    #[schema(example = "verified-defect")]
+    evidence: Option<String>,
+    /// The lookups the finding rests on.
+    lookups: Vec<String>,
+    /// For a question: whether the change's correctness depends on the answer.
+    blocks: Option<bool>,
+}
+
+/// A rating someone on the team gave a review, with their comment.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct RatingComment {
+    /// Who rated it.
+    #[schema(example = "octocat")]
+    by: String,
+    /// What they said.
+    #[schema(example = "Good catch on the counter.")]
+    text: String,
+    /// `up`, `down` or `none` (a comment without a rating).
+    #[schema(example = "up")]
+    rating: String,
+    /// When (RFC 3339).
+    at: String,
+}
+
+/// A pull request review by CoderHelm's reviewer.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct Review {
+    /// The review's key: pass it as `sk` to get the review.
+    #[schema(example = "REVIEW#acme/web#318#2026-10-22T14:20:05Z")]
+    pub sk: String,
+    /// The repository, `owner/name`.
+    #[schema(example = "acme/web")]
+    pub repo: String,
+    /// The pull request number.
+    #[schema(example = 318)]
+    pub pr_number: u64,
+    /// The commit reviewed.
+    #[schema(example = "9fceb02d0ae598e95dc970b74767f19372d61af8")]
+    pub head_sha: String,
+    /// The reviewer's verdict: `APPROVE` or `REQUEST_CHANGES`.
+    #[schema(example = "REQUEST_CHANGES")]
+    pub verdict: String,
+    /// The risk the reviewer gave the change: `LOW`, `MEDIUM` or `HIGH`.
+    #[schema(example = "MEDIUM")]
+    pub risk: String,
+    /// The review as posted, in Markdown. Cut to about 4,000 characters in a list.
+    pub body: String,
+    /// The GitHub review event it was posted as: `APPROVE`,
+    /// `REQUEST_CHANGES` or `COMMENT`.
+    #[schema(example = "REQUEST_CHANGES")]
+    pub posted_as: String,
+    /// What asked for it, such as `label`, `rerequest`, `reply` or `sweep`.
+    #[schema(example = "label")]
+    pub trigger: String,
+    /// What the reviewer did besides reviewing, such as arming auto-merge.
+    pub action_summary: String,
+    /// Thumbs up from the team.
+    pub thumbs_up: u64,
+    /// Thumbs down from the team.
+    pub thumbs_down: u64,
+    /// Ratings with comments.
+    #[schema(value_type = Vec<RatingComment>)]
+    pub rating_comments: Vec<Value>,
+    /// When it was written (RFC 3339).
+    #[schema(example = "2026-10-22T14:20:05Z")]
+    pub created_at: String,
+    /// The pull request's title. Empty on older reviews.
+    #[schema(example = "Rate-limit the login form")]
+    pub pr_title: String,
+    /// The structured findings. Null in a list (get the review for them) and
+    /// on older reviews.
+    #[schema(value_type = Option<Vec<ReviewFinding>>)]
+    pub findings: Value,
+    /// The team standards the review was given in full ("always apply").
+    pub applied_standards: Vec<String>,
+}
+
+/// A page of reviews.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct ReviewsPage {
+    /// Reviews, newest first. Findings are left out here.
+    pub reviews: Vec<Review>,
+    /// Pass as `cursor` to read the next page; null on the last page.
+    pub next: Option<String>,
 }
 
 /// Truncate to at most `max` bytes on a char boundary (String::truncate panics
@@ -514,7 +634,12 @@ fn review_findings(item: &HashMap<String, AttributeValue>) -> Value {
         .unwrap_or(Value::Null)
 }
 
+#[cfg(test)]
 fn review_item_to_json(item: &HashMap<String, AttributeValue>, truncate_body: bool) -> Value {
+    serde_json::to_value(review_of(item, truncate_body)).unwrap_or_default()
+}
+
+fn review_of(item: &HashMap<String, AttributeValue>, truncate_body: bool) -> Review {
     let mut body = item_str(item, "body", "");
     if truncate_body {
         truncate_on_boundary(&mut body, 4000);
@@ -529,41 +654,65 @@ fn review_item_to_json(item: &HashMap<String, AttributeValue>, truncate_body: bo
                 .collect()
         })
         .unwrap_or_default();
-    json!({
-        "sk": item_str(item, "sk", ""),
-        "repo": item_str(item, "repo", ""),
-        "pr_number": item_num(item, "pr_number", 0),
-        "head_sha": item_str(item, "head_sha", ""),
-        "verdict": item_str(item, "verdict", ""),
-        "risk": item_str(item, "risk", ""),
-        "body": body,
-        "posted_as": item_str(item, "posted_as", ""),
-        "trigger": item_str(item, "trigger", ""),
-        "action_summary": item_str(item, "action_summary", ""),
-        "thumbs_up": item_num(item, "thumbs_up", 0),
-        "thumbs_down": item_num(item, "thumbs_down", 0),
-        "rating_comments": comments,
-        "created_at": item_str(item, "created_at", ""),
+    Review {
+        sk: item_str(item, "sk", ""),
+        repo: item_str(item, "repo", ""),
+        pr_number: item_num(item, "pr_number", 0),
+        head_sha: item_str(item, "head_sha", ""),
+        verdict: item_str(item, "verdict", ""),
+        risk: item_str(item, "risk", ""),
+        body,
+        posted_as: item_str(item, "posted_as", ""),
+        trigger: item_str(item, "trigger", ""),
+        action_summary: item_str(item, "action_summary", ""),
+        thumbs_up: item_num(item, "thumbs_up", 0),
+        thumbs_down: item_num(item, "thumbs_down", 0),
+        rating_comments: comments,
+        created_at: item_str(item, "created_at", ""),
         // The PR's title and the structured findings, on reviews written
         // since they were kept; older records have neither.
-        "pr_title": item_str(item, "pr_title", ""),
-        "findings": if truncate_body { Value::Null } else { review_findings(item) },
+        pr_title: item_str(item, "pr_title", ""),
+        findings: if truncate_body {
+            Value::Null
+        } else {
+            review_findings(item)
+        },
         // Team standards the review was given in full ("always apply").
-        "applied_standards": item
+        applied_standards: item
             .get("applied_standards")
             .and_then(|v| v.as_l().ok())
-            .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect::<Vec<_>>())
+            .map(|l| {
+                l.iter()
+                    .filter_map(|v| v.as_s().ok().cloned())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default(),
-    })
+    }
 }
 
 /// GET /api/reviewer/reviews?repo=&limit=&cursor= — reviews, newest first, one
 /// page at a time. `repo` filters to one repo; omitted lists the whole team.
+#[utoipa::path(
+    get,
+    path = "/api/reviewer/reviews",
+    tag = "Reviews",
+    operation_id = "listReviews",
+    summary = "List reviews",
+    description = "Lists the reviewer's pull request reviews, newest first, one page at a time, \
+        for the whole team or one repository. Bodies are cut to about 4,000 characters and \
+        findings are left out; get a review by its `sk` for both.",
+    params(ListReviewsQuery),
+    responses(
+        (status = 200, description = "A page of reviews.", body = ReviewsPage),
+        (status = 400, description = "`repo` is not `owner/name`.", body = crate::openapi::ErrorBody),
+    ),
+    security(("api_key" = ["view"])),
+)]
 pub async fn list_reviews(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Query(q): Query<ListReviewsQuery>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<ReviewsPage>, StatusCode> {
     let prefix = match q.repo.as_deref() {
         Some(r) => {
             validate_repo(r)?;
@@ -582,12 +731,11 @@ pub async fn list_reviews(
         limit,
     )
     .await?;
-    let reviews: Vec<Value> = page
-        .items
-        .iter()
-        .map(|i| review_item_to_json(i, true))
-        .collect();
-    Ok(Json(json!({ "reviews": reviews, "next": page.next })))
+    let reviews: Vec<Review> = page.items.iter().map(|i| review_of(i, true)).collect();
+    Ok(Json(ReviewsPage {
+        reviews,
+        next: page.next,
+    }))
 }
 
 #[derive(serde::Deserialize)]
@@ -1000,17 +1148,36 @@ pub async fn control_gate(
     })))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ReviewKeyQuery {
+    /// The review's `sk`, from a list of reviews.
+    #[param(example = "REVIEW#acme/web#318#2026-10-22T14:20:05Z")]
     sk: String,
 }
 
 /// GET /api/reviewer/review?sk= — one review, full body.
+#[utoipa::path(
+    get,
+    path = "/api/reviewer/review",
+    tag = "Reviews",
+    operation_id = "getReview",
+    summary = "Get a review",
+    description = "Returns one review in full: the whole body, the structured findings with \
+        file, line, severity and what each rests on, and the team's ratings.",
+    params(ReviewKeyQuery),
+    responses(
+        (status = 200, description = "The review.", body = Review),
+        (status = 400, description = "`sk` is not a review key.", body = crate::openapi::ErrorBody),
+        (status = 404, description = "No such review in the team.", body = crate::openapi::ErrorBody),
+    ),
+    security(("api_key" = ["view"])),
+)]
 pub async fn get_review(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Query(q): Query<ReviewKeyQuery>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Review>, StatusCode> {
     if !q.sk.starts_with("REVIEW#") || q.sk.len() > 400 {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -1027,7 +1194,7 @@ pub async fn get_review(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(review_item_to_json(item, false)))
+    Ok(Json(review_of(item, false)))
 }
 
 #[derive(serde::Deserialize)]

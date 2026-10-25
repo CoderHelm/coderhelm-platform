@@ -429,6 +429,7 @@ pub fn view_claims(sv: &SupportView) -> Claims {
         exp: sv.until,
         support_view: Some(sv.clone()),
         custom: None,
+        api_key: None,
     }
 }
 

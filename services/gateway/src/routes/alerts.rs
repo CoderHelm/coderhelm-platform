@@ -531,7 +531,75 @@ async fn load_route(state: &AppState, topic_arn: &str) -> Result<Option<Route>, 
 
 // ─── Webhook ────────────────────────────────────────────────────────────────
 
+/// An Amazon SNS message, as SNS posts it to an HTTPS subscription.
+#[derive(utoipa::ToSchema)]
+#[schema(example = json!({
+    "Type": "Notification",
+    "MessageId": "6c3f7c6e-2f4b-5b8e-9b0e-1f0a2b3c4d5e",
+    "TopicArn": "arn:aws:sns:us-east-1:123456789012:prod-alarms",
+    "Subject": "ALARM: \"api-5xx\" in US East (N. Virginia)",
+    "Message": "{\"AlarmName\":\"api-5xx\",\"NewStateValue\":\"ALARM\"}",
+    "Timestamp": "2026-10-22T14:00:00.000Z",
+    "SignatureVersion": "2",
+    "Signature": "EXAMPLE...",
+    "SigningCertURL": "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-0000.pem"
+}))]
+#[allow(dead_code)]
+pub struct SnsEnvelope {
+    /// `SubscriptionConfirmation`, `Notification` or `UnsubscribeConfirmation`.
+    #[schema(rename = "Type", example = "Notification")]
+    kind: String,
+    /// SNS's id for the message.
+    #[schema(rename = "MessageId")]
+    message_id: String,
+    /// The topic. It must have an enabled alert route in the dashboard.
+    #[schema(rename = "TopicArn")]
+    topic_arn: String,
+    /// The subject, when the publisher set one.
+    #[schema(rename = "Subject")]
+    subject: Option<String>,
+    /// The message: a CloudWatch alarm, an AWS Chatbot custom notification,
+    /// an EventBridge event (as JSON text) or plain text.
+    #[schema(rename = "Message")]
+    message: String,
+    /// When SNS sent it.
+    #[schema(rename = "Timestamp")]
+    timestamp: String,
+    /// `1` (SHA1) or `2` (SHA256).
+    #[schema(rename = "SignatureVersion")]
+    signature_version: String,
+    /// SNS's signature over the message's fields.
+    #[schema(rename = "Signature")]
+    signature: String,
+    /// The certificate that signed it; must be served by SNS.
+    #[schema(rename = "SigningCertURL")]
+    signing_cert_url: String,
+    /// For a subscription confirmation: the address CoderHelm visits to confirm.
+    #[schema(rename = "SubscribeURL")]
+    subscribe_url: Option<String>,
+}
+
 /// POST /webhooks/alerts/sns — SNS HTTPS subscription endpoint.
+#[utoipa::path(
+    post,
+    path = "/webhooks/alerts/sns",
+    tag = "Webhooks",
+    operation_id = "receiveSnsAlert",
+    summary = "AWS SNS alerts",
+    description = "Subscribe CoderHelm to an SNS topic with an HTTPS subscription to this address \
+        and add the topic under Alert routes in the dashboard. Every message's SNS signature is \
+        checked (signature versions 1 and 2) and the signing certificate must come from SNS. The \
+        subscription is confirmed automatically once the topic has an enabled route; messages from \
+        topics without one are accepted and ignored. A message that matches one of the route's \
+        rules becomes a run that opens a pull request.",
+    request_body(content = SnsEnvelope, description = "The SNS message.", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Accepted."),
+        (status = 400, description = "Not an SNS message."),
+        (status = 403, description = "The SNS signature did not verify."),
+    ),
+    security(()),
+)]
 pub async fn handle_sns(
     State(state): State<Arc<AppState>>,
     body: Bytes,

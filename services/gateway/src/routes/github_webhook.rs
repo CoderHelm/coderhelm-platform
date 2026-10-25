@@ -184,6 +184,30 @@ pub async fn resolve_all_teams_by_installation(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/webhooks/github",
+    tag = "Webhooks",
+    operation_id = "receiveGithubEvent",
+    summary = "GitHub App events",
+    description = "Where GitHub sends every event of the CoderHelm GitHub App. Installing the app \
+        sets this up; you only call it yourself when you self-host. Each request is signed with \
+        the app's webhook secret in `X-Hub-Signature-256` (`sha256=` and the hex HMAC-SHA256 of \
+        the raw body), compared in constant time. The event type comes from `X-GitHub-Event` and \
+        the body must name an installation. Events CoderHelm doesn't act on, and events from an \
+        installation not linked to a team, are accepted with `200` and ignored.",
+    params(
+        ("X-GitHub-Event" = String, Header, description = "The event type, such as `issues`, `pull_request` or `push`.", example = "issues"),
+        ("X-GitHub-Delivery" = Option<String>, Header, description = "GitHub's id for this delivery."),
+    ),
+    request_body(content = Object, description = "The event payload, as GitHub defines it for each event type. It must include `installation.id`.", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Accepted."),
+        (status = 400, description = "The body is not JSON or names no installation."),
+        (status = 401, description = "The signature is missing or wrong."),
+    ),
+    security(("github_signature" = [])),
+)]
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
